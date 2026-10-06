@@ -24,8 +24,9 @@ server: reject digests with a negative size
 Signed-off-by: Your Name <you@example.com>
 ```
 
-The name and email must match the commit author. A pull request with an
-unsigned commit cannot be merged.
+The name and email must match the commit author. Maintainers do not merge a
+pull request with an unsigned commit. An automated DCO check will enforce this
+once it is set up; until then, reviewers check the trailer by hand.
 
 ## The mutant rule
 
@@ -54,7 +55,8 @@ lines.
 
 ## Building and testing
 
-kbf is a Cargo workspace. All builds and tests use `cargo`:
+kbf will be a Cargo workspace; the repository has no Rust code yet. Once the
+first crate lands, all builds and tests will use `cargo`:
 
 ```sh
 cargo build --workspace
@@ -65,9 +67,14 @@ There is no other build system in this repository.
 
 ## Continuous integration
 
-CI runs only on GitHub-hosted runners. A pull request is merged only when CI is
-green on its head commit. Changes under `.github/workflows/` need a review from
-the code owners listed in [.github/CODEOWNERS](.github/CODEOWNERS).
+There is no CI workflow yet. When CI is added, it will run only on
+GitHub-hosted runners, and a pull request will be merged only when CI is green
+on its head commit.
+
+Changes under `.github/workflows/` will need a review from the code owners
+listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder
+today: the owners line is commented out until a maintainers team exists, and
+nothing enforces the review yet.
 
 ## Reporting security issues
 
