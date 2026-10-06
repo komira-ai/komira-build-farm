@@ -1,0 +1,10 @@
+# Code owners. GitHub requests a review from these owners on any pull request
+# that touches a matching path; with branch protection, their approval is
+# required.
+#
+# Workflows run with repository credentials, so every change to them needs an
+# owner's review.
+#
+# Placeholder: the organization has no maintainers team yet. Once it exists,
+# uncomment the line below (or name the owning user instead).
+# /.github/workflows/ @komira-ai/maintainers
