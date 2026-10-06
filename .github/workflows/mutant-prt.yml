@@ -1,0 +1,10 @@
+# Planted mutant: never runs (head-branch workflows do not fire on this trigger; job disabled).
+name: mutant-prt
+on: pull_request_target
+permissions: {}
+jobs:
+  a:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: true

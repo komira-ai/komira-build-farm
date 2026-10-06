@@ -1,0 +1,10 @@
+# Planted mutant: never runs (manual trigger only, job disabled).
+name: mutant-runner
+on: workflow_dispatch
+permissions: {}
+jobs:
+  a:
+    if: false
+    runs-on: self-hosted
+    steps:
+      - run: true
