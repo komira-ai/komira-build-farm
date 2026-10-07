@@ -291,7 +291,10 @@ async fn a_failing_action_is_answered_but_not_cached() {
 
 /// Catches: an attempt's failure passed to the callers as the daemon's status rather
 /// than the RFC's (INTERNAL for the farm's failure, DEADLINE_EXCEEDED for a timeout);
-/// an OK result whose outputs were never uploaded, or that carries no result at all,
+/// an INVALID_ARGUMENT (the action's own fault, such as an image named by tag) turned
+/// into INTERNAL, which a client retries, or answered without the daemon's reason; a
+/// failed attempt placed again instead of answered (each case's Start must name its
+/// own action); an OK result whose outputs were never uploaded, or that carries no result at all,
 /// accepted as a result (callers would get files nobody can fetch); a failed attempt
 /// that also carries a valid `ActionResult` taken as completed (the protocol sets
 /// `action_result` only with OK); and a failure written to the action cache.
@@ -304,6 +307,7 @@ async fn failed_attempts_answer_with_the_rfc_codes() {
         ..Default::default()
     };
     let stored = output(&cell, "stored, but the attempt failed", 0).await;
+    let stored_too = stored.clone();
     let cases = [
         (
             "aborted with a result",
@@ -331,18 +335,40 @@ async fn failed_attempts_answer_with_the_rfc_codes() {
             Code::Internal,
         ),
         ("OK without a result", Some(Code::Ok), None, Code::Internal),
+        (
+            "invalid",
+            Some(Code::InvalidArgument),
+            None,
+            Code::InvalidArgument,
+        ),
+        (
+            "invalid with a result",
+            Some(Code::InvalidArgument),
+            Some(stored_too),
+            Code::InvalidArgument,
+        ),
     ];
     for (name, code, result, want) in cases {
         let job = Job::new(name, &[]);
         cell.upload(&job.blobs()).await;
         let mut ops = cell.execute(&job.action).await;
         let start = daemon.start().await;
+        assert_eq!(
+            start.action_digest.as_ref(),
+            Some(&job.action.proto),
+            "{name}"
+        );
         let mut report = failed(start.lease_id, code.expect("a code"));
         report.action_result = result;
         assert!(daemon.report(report).await.accepted, "{name}");
         let answer = response(&done(&mut ops).await);
         assert_eq!(answer.result, None, "{name}");
-        assert_eq!(answer.status.map(|s| s.code), Some(want as i32), "{name}");
+        let status = answer.status.expect("a status");
+        assert_eq!(status.code, want as i32, "{name}");
+        if want == Code::InvalidArgument {
+            // The daemon's reason (`failed` sends "test") reaches the client.
+            assert_eq!(status.message, "test", "{name}");
+        }
         assert_eq!(
             cell.cached(&job.action).await,
             Err(Code::NotFound),

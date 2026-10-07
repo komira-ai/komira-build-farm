@@ -123,6 +123,10 @@ pub enum Failure {
     Timeout,
     /// The farm failed the action (a kernel OOM, a lost container), not the action itself.
     Infra,
+    /// The action itself cannot run as written (an image named by tag, an output that
+    /// is also an input): the client's error, answered INVALID_ARGUMENT. Running it
+    /// elsewhere would fail the same way, so it is never retried and never cached.
+    Invalid,
 }
 
 /// How an attempt ended, as its worker reports it.
