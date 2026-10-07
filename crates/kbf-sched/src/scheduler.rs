@@ -320,8 +320,7 @@ impl Scheduler {
             .held
             .get(&lease)
             .is_some_and(|h| h.start_sent.is_some());
-        let attempt = start_sent; // MUTANT M6: a reported lease counts
-        let _ = op.result_proposed;
+        let attempt = start_sent && !op.result_proposed;
         if attempt {
             op.lost_on.push(worker.clone());
         }
@@ -330,10 +329,7 @@ impl Scheduler {
         if attempt {
             // The worker may be running it: its room stays booked until a heartbeat
             // from the worker leaves the lease out.
-            if let Some(w) = self.workers.get_mut(&worker) {
-                w.late.insert(lease, resources);
-                w.booked = w.booked.saturating_add(resources);
-            }
+            // MUTANT M7: a lease lost is not booked until a heartbeat lists it.
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
         let op = self.ops.get_mut(&id).expect("checked above");
