@@ -259,7 +259,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// Writes the action-cache entry, if any, then answers the callers.
     async fn deliver(&self, settled: Settled) {
-        if let Some((action, record)) = settled.write
+        // MUTANT: the accepted result never reaches the action cache.
+        if let Some((action, record)) = settled.write.filter(|_| false)
             && let Err(e) = self
                 .cache
                 .commit_action_record(Role::Daemon, action, record)
