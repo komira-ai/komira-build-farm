@@ -295,21 +295,23 @@ fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
             assert!(answers[&op] > lost, "seed {seed}: {op} answered by {lost}");
         }
 
-        let adopted: Vec<&Run> = worker(&sim, "worker-2")
+        // A run worker-2 re-adopted may itself be the retry of a lease worker-1 lost in
+        // the reboot; either way no newer lease may follow it.
+        let adopted: Vec<(&LeaseId, &Run)> = worker(&sim, "worker-2")
             .runs
-            .values()
-            .filter(|r| r.started < restart)
+            .iter()
+            .filter(|(_, r)| r.started < restart)
             .collect();
         assert!(
             !adopted.is_empty(),
             "seed {seed}: worker-2 re-adopted no run"
         );
-        for run in adopted {
+        for (lease, run) in adopted {
             let op = run.operation;
             assert_eq!(
-                grants[&op].len(),
-                1,
-                "seed {seed}: {op}, re-adopted by worker-2, was granted again"
+                grants[&op].keys().next_back(),
+                Some(lease),
+                "seed {seed}: {op}, re-adopted by worker-2 as {lease}, was granted again"
             );
         }
     }
@@ -398,10 +400,8 @@ fn a_worker_that_drops_every_start_loses_its_operations_to_another() {
         let grants = grants_on(&sim);
         let outcomes = outcomes(&sim);
         for &(lease, op) in lost {
-            let on: Vec<(LeaseId, &str)> = grants[&op]
-                .iter()
-                .map(|(l, w)| (*l, w.as_str()))
-                .collect();
+            let on: Vec<(LeaseId, &str)> =
+                grants[&op].iter().map(|(l, w)| (*l, w.as_str())).collect();
             let [(first, "worker-1"), (second, "worker-2")] = on.as_slice() else {
                 panic!("seed {seed}: {op} lost {lease} on worker-1; granted {on:?}");
             };
