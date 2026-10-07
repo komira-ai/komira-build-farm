@@ -1,4 +1,4 @@
-//! Lint for GitHub Actions workflow files.
+//! Lint for GitHub Actions workflow files and the repository's own action files.
 //!
 //! CI for this repository runs on GitHub-hosted runners only and never runs pull
 //! request code with repository write access. The lint parses each workflow with a
@@ -14,28 +14,53 @@
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`;
-//! - a job calls a reusable workflow outside this repository (its runners are not in
-//!   this file);
+//! - a job calls a reusable workflow that is not one of this repository's linted
+//!   workflow files (its runners are not in a file this lint read);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
 //!   same line by a version comment, written as a plain (unquoted) scalar so the
-//!   comment's place is exact (local `./` actions are exempt);
+//!   comment's place is exact;
+//! - a step's local `uses: ./<dir>` does not name a directory of this repository
+//!   holding a linted action file ([`Repo::action_dirs`]), or sits in a steps list
+//!   where some step passes `repository:` under `with:` (a checkout of another
+//!   repository, whose `./<dir>` this lint never read);
 //! - it lacks a top-level `permissions: {}`, so jobs start with no token rights;
 //! - any key or value names `self-hosted` or `pull_request_target`, whatever key it
 //!   sits under (a second line of defence behind the structural checks).
+//!
+//! Every tracked `action.yml` or `action.yaml` (any directory, any case) is linted by
+//! [`scan_action`] with the same step, local-path and whole-document rules: its
+//! `runs.using` must be `composite` (whose steps are checked as above), `node*`
+//! (code in the action's own directory) or `docker` with a local Dockerfile or a
+//! `docker://` image pinned by `@sha256:` digest.
 //!
 //! Keys are matched ignoring ASCII case. So that no spelling is read one way here and
 //! another way by GitHub, it also refuses what it does not evaluate: a YAML tag, a
 //! second document, a merge key (`<<`), a key that is not a scalar, a key repeated in
 //! one mapping (ignoring case), an unknown top-level key, a trigger list or `on`
-//! value of an unexpected shape, and a file that does not parse.
+//! value of an unexpected shape, and a file that does not parse. [`decode`] refuses a
+//! file holding a NUL byte or invalid UTF-8 rather than skip it.
 //!
-//! What this lint cannot cover: GitHub routes a job to a self-hosted runner whose
-//! labels match before a hosted one, so a self-hosted runner registered with the label
-//! `ubuntu-latest` would take a job this lint accepts. The control for that is the
-//! repository (or organization) setting that disallows self-hosted runners; this lint
-//! keeps the workflow files from asking for one. [`HOSTED_LABELS`] is a copy of
-//! GitHub's published table: when GitHub retires an image its label becomes a custom
-//! label, so drop it here when it is retired.
+//! # What this lint cannot cover
+//!
+//! - **Self-hosted runners with hosted labels.** GitHub routes a job to a self-hosted
+//!   runner whose labels match before a hosted one, so a self-hosted runner registered
+//!   with the label `ubuntu-latest` would take a job this lint accepts.
+//! - **Imposter commits.** GitHub serves a commit from any fork of an action's
+//!   repository under the parent's name, so `owner/action@<sha>` may name a commit the
+//!   owner never published. The lint checks the shape of a pin, not where the commit
+//!   came from; the reviewer of a pin change checks that the SHA is on the action's
+//!   own tagged release.
+//! - **Code a step fetches at run time.** A `run:` script can clone or download
+//!   anything into the workspace before a local `./` action runs.
+//! - **Retired images.** [`HOSTED_LABELS`] is a copy of GitHub's published table:
+//!   when GitHub retires an image its label becomes a custom label, so drop it here
+//!   when it is retired.
+//!
+//! The real guarantee does not come from this file. It rests on two repository
+//! settings: no self-hosted runner registered for the repository (or allowed to it by
+//! the organization), and an approving review required for every change to workflow
+//! and action files before it merges. This lint keeps those files from asking for
+//! anything else, so that review has less to catch.
 
 mod yaml;
 
@@ -78,28 +103,71 @@ const HOSTED_LABELS: &[&str] = &[
     "macos-15-intel",
 ];
 
+/// The keys GitHub reads at the top of an action file.
+const ACTION_KEYS: &[&str] = &[
+    "name",
+    "author",
+    "description",
+    "inputs",
+    "outputs",
+    "runs",
+    "branding",
+];
+
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it.
 const REFUSED_TRIGGERS: &[&str] = &["pull_request_target", "workflow_run"];
 
 /// Parses one workflow text and returns one message per problem, each prefixed with
 /// its 1-based line number (0 for a whole-file problem).
-pub fn scan(text: &str) -> Vec<String> {
+pub fn scan(text: &str, repo: &Repo) -> Vec<String> {
+    run(text, repo, |lint, root| lint.workflow(root))
+}
+
+/// Parses one action file (`action.yml`) and returns its problems as [`scan`] does.
+pub fn scan_action(text: &str, repo: &Repo) -> Vec<String> {
+    run(text, repo, |lint, root| lint.action(root))
+}
+
+/// What a local `uses: ./...` may name: the repository's linted files.
+#[derive(Debug, Default)]
+pub struct Repo {
+    /// Directories, relative to the root and without a trailing `/` (`""` for the root
+    /// itself), that hold a linted `action.yml` or `action.yaml`.
+    pub action_dirs: Vec<String>,
+    /// Paths, relative to the root, of the linted workflow files.
+    pub workflows: Vec<String>,
+}
+
+/// The text of a workflow or action file: refuses a file holding a NUL byte or one
+/// that is not valid UTF-8, and drops a leading UTF-8 byte order mark.
+pub fn decode(bytes: &[u8]) -> Result<&str, String> {
+    if bytes.contains(&0) {
+        return Err("line 0: the file holds a NUL byte, so it is not read".to_owned());
+    }
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    std::str::from_utf8(bytes)
+        .map_err(|e| format!("line 0: the file is not valid UTF-8 ({e}), so it is not read"))
+}
+
+fn run(text: &str, repo: &Repo, check: impl FnOnce(&mut Lint<'_>, &Node)) -> Vec<String> {
     let root = match yaml::load(text) {
         Ok(root) => root,
         Err(e) => return vec![e],
     };
     let mut lint = Lint {
         text,
+        repo,
         out: Vec::new(),
     };
     lint.every_node(&root);
-    lint.workflow(&root);
+    check(&mut lint, &root);
     lint.out
 }
 
 struct Lint<'a> {
     text: &'a str,
+    repo: &'a Repo,
     out: Vec<String>,
 }
 
@@ -148,14 +216,7 @@ impl Lint<'_> {
             self.refuse(root, "a workflow must be a mapping");
             return;
         };
-        for (k, _) in top {
-            let known = k
-                .as_str()
-                .is_some_and(|key| TOP_LEVEL_KEYS.iter().any(|t| key.eq_ignore_ascii_case(t)));
-            if !known {
-                self.refuse(k, "an unknown top-level key is not evaluated");
-            }
-        }
+        self.known_keys(top, TOP_LEVEL_KEYS);
         match get(top, "permissions") {
             Some(p) if p.is_empty_map() => {}
             Some(p) => self.refuse(p, "top-level `permissions` must be `{}`"),
@@ -178,6 +239,54 @@ impl Lint<'_> {
             }
             Some(other) => self.refuse(other, "`jobs` must be a mapping"),
             None => self.out.push("line 0: no `jobs:`".to_owned()),
+        }
+    }
+
+    fn known_keys(&mut self, top: &[(Node, Node)], keys: &[&str]) {
+        for (k, _) in top {
+            let known = k
+                .as_str()
+                .is_some_and(|key| keys.iter().any(|t| key.eq_ignore_ascii_case(t)));
+            if !known {
+                self.refuse(k, "an unknown top-level key is not evaluated");
+            }
+        }
+    }
+
+    fn action(&mut self, root: &Node) {
+        let Value::Map(top) = &root.value else {
+            self.refuse(root, "an action must be a mapping");
+            return;
+        };
+        self.known_keys(top, ACTION_KEYS);
+        let Some(runs) = get(top, "runs") else {
+            self.out.push("line 0: no `runs:`".to_owned());
+            return;
+        };
+        let Value::Map(r) = &runs.value else {
+            self.refuse(runs, "`runs` must be a mapping");
+            return;
+        };
+        let using = get(r, "using")
+            .and_then(Node::as_str)
+            .map(str::to_ascii_lowercase);
+        match using.as_deref() {
+            Some("composite") => match get(r, "steps") {
+                Some(steps) => self.steps(steps),
+                None => self.refuse(runs, "a composite action without `steps`"),
+            },
+            Some("docker") => match get(r, "image").and_then(Node::as_str) {
+                Some(image) if is_docker_image_pinned(image) => {}
+                Some(image) => self.refuse(
+                    runs,
+                    format_args!(
+                        "the image `{image}` is neither a local Dockerfile nor pinned by `@sha256:` digest"
+                    ),
+                ),
+                None => self.refuse(runs, "a docker action without `image`"),
+            },
+            Some(u) if u.starts_with("node") => {}
+            _ => self.refuse(runs, "`runs.using` must be composite, node or docker"),
         }
     }
 
@@ -208,13 +317,18 @@ impl Lint<'_> {
             self.refuse(job, "a job must be a mapping");
             return;
         };
-        if let Some(called) = get(job_map, "uses")
-            && !called.as_str().is_some_and(|w| w.starts_with("./"))
-        {
-            self.refuse(
-                called,
-                "a reusable workflow outside this repository runs where this lint cannot see",
-            );
+        if let Some(called) = get(job_map, "uses") {
+            match called.as_str().and_then(|w| w.strip_prefix("./")) {
+                None => self.refuse(
+                    called,
+                    "a reusable workflow outside this repository runs where this lint cannot see",
+                ),
+                Some(path) if self.repo.workflows.iter().any(|w| w == path) => {}
+                Some(path) => self.refuse(
+                    called,
+                    format_args!("`./{path}` is not a linted workflow file of this repository"),
+                ),
+            }
         }
         if let Some(p) = get(job_map, "permissions") {
             self.job_permissions(p);
@@ -224,17 +338,21 @@ impl Lint<'_> {
             None if get(job_map, "uses").is_some() => {}
             None => self.refuse(job, "a job without `runs-on` is not evaluated"),
         }
-        match get(job_map, "steps") {
-            Some(Node {
-                value: Value::Seq(steps),
-                ..
-            }) => {
-                for step in steps {
-                    self.step(step);
-                }
-            }
-            Some(other) => self.refuse(other, "`steps` must be a list"),
-            None => {}
+        if let Some(steps) = get(job_map, "steps") {
+            self.steps(steps);
+        }
+    }
+
+    /// Checks each step. A local `./` action reads the workspace, so it is refused in a
+    /// steps list where any step checks out another repository (`with: repository:`).
+    fn steps(&mut self, steps: &Node) {
+        let Value::Seq(list) = &steps.value else {
+            self.refuse(steps, "`steps` must be a list");
+            return;
+        };
+        let foreign = list.iter().find_map(checkout_repository);
+        for step in list {
+            self.step(step, foreign);
         }
     }
 
@@ -310,7 +428,7 @@ impl Lint<'_> {
         }
     }
 
-    fn step(&mut self, step: &Node) {
+    fn step(&mut self, step: &Node, foreign: Option<&Node>) {
         let Value::Map(step_map) = &step.value else {
             self.refuse(step, "a step must be a mapping");
             return;
@@ -322,7 +440,24 @@ impl Lint<'_> {
             self.refuse(uses, "`uses` must be a string");
             return;
         };
-        if v.starts_with("./") {
+        if let Some(rest) = v.strip_prefix("./") {
+            if let Some(checkout) = foreign {
+                self.refuse(
+                    uses,
+                    format_args!(
+                        "`{v}` reads the workspace, and the step on line {} checks out another repository there",
+                        checkout.line()
+                    ),
+                );
+            } else if !local_dir(rest).is_some_and(|d| self.repo.action_dirs.iter().any(|a| a == d))
+            {
+                self.refuse(
+                    uses,
+                    format_args!(
+                        "`{v}` is not a directory of this repository holding a linted action file"
+                    ),
+                );
+            }
             return;
         }
         if !matches!(uses.value, Value::Scalar { plain: true, .. }) {
@@ -360,19 +495,57 @@ fn trailing_comment<'a>(text: &'a str, node: &Node) -> Option<&'a str> {
     line.trim_start_matches([' ', '\t']).strip_prefix('#')
 }
 
+/// The `repository:` key a step passes under `with:`, if any.
+fn checkout_repository(step: &Node) -> Option<&Node> {
+    let Value::Map(step_map) = &step.value else {
+        return None;
+    };
+    match &get(step_map, "with")?.value {
+        Value::Map(with) => with
+            .iter()
+            .find(|(k, _)| {
+                k.as_str()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("repository"))
+            })
+            .map(|(k, _)| k),
+        _ => None,
+    }
+}
+
+/// The directory a local `uses: ./<rest>` names, without a trailing `/`; `None` for a
+/// path with an empty, `.` or `..` component or a backslash.
+fn local_dir(rest: &str) -> Option<&str> {
+    let dir = rest.strip_suffix('/').unwrap_or(rest);
+    let plain = |c: &str| !c.is_empty() && c != "." && c != ".." && !c.contains('\\');
+    (dir.is_empty() || dir.split('/').all(plain)).then_some(dir)
+}
+
+/// A docker action's image is a local Dockerfile path or `docker://...@sha256:<hex>`.
+fn is_docker_image_pinned(image: &str) -> bool {
+    if image.contains("${{") {
+        return false;
+    }
+    match image.strip_prefix("docker://") {
+        Some(reference) => reference
+            .rsplit_once("@sha256:")
+            .is_some_and(|(name, hex)| !name.is_empty() && is_lower_hex(hex, 64)),
+        None => !image.contains("://"),
+    }
+}
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
 fn is_hosted_label(v: &str) -> bool {
     HOSTED_LABELS.contains(&v)
 }
 
 fn is_sha_pinned(v: &str) -> bool {
     match v.rsplit_once('@') {
-        Some((action, sha)) => {
-            !action.is_empty()
-                && sha.len() == 40
-                && sha
-                    .bytes()
-                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        }
+        Some((action, sha)) => !action.is_empty() && is_lower_hex(sha, 40),
         None => false,
     }
 }
