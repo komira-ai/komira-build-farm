@@ -153,12 +153,13 @@ async fn serve<M: MetaLog, O: ObjectStore + 'static>(
             Some(daemon_message::Message::Result(result)) => {
                 // Checked and written off the stream: a slow output check or cache
                 // write must not hold back the heartbeats behind it. Order between
-                // results does not matter: the scheduler takes one per operation, and
-                // a daemon lists a result's lease as running until it is acknowledged
-                // (#26), so the heartbeats meanwhile do not give the lease up.
+                // results does not matter: the scheduler takes one per operation.
+                // Until it has the report, the farm counts the lease as running for
+                // this stream's heartbeats, which no longer list it.
                 tokio::spawn(report(
                     Arc::clone(&farm),
                     worker.clone(),
+                    stream,
                     result,
                     outbound.clone(),
                 ));
@@ -185,10 +186,11 @@ async fn serve<M: MetaLog, O: ObjectStore + 'static>(
 async fn report<M: MetaLog, O: ObjectStore + 'static>(
     farm: Arc<Farm<M, O>>,
     worker: WorkerId,
+    stream: StreamId,
     result: kbf_proto::worker::Result,
     outbound: Outbound,
 ) {
-    if let Some(ack) = farm.report(&worker, result).await {
+    if let Some(ack) = farm.report(&worker, stream, result).await {
         // A stream that has ended drops it; the daemon sends the result again.
         let _ = outbound.send(Ok(message(server_message::Message::ResultAck(ack))));
     }

@@ -81,6 +81,9 @@ struct State {
     /// Leases whose `Start` was sent and that the scheduler still holds, and their
     /// operations.
     started: BTreeMap<LeaseId, OperationId>,
+    /// Leases whose `Result` is being checked, and the stream it came on (one entry
+    /// per `Result`, so a resent copy is counted on its own).
+    reporting: Vec<(StreamId, LeaseId)>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -106,6 +109,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 names: BTreeMap::new(),
                 links: BTreeMap::new(),
                 started: BTreeMap::new(),
+                reporting: Vec::new(),
             }),
         }
     }
@@ -163,13 +167,27 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     }
 
     /// A heartbeat on `stream`. Returns whether it was taken (and is to be
-    /// acknowledged): a heartbeat from a replaced stream is dropped.
-    pub fn heartbeat(&self, worker: &WorkerId, stream: StreamId, running: Vec<LeaseId>) -> bool {
+    /// acknowledged): a heartbeat from a replaced stream is dropped. A lease whose
+    /// `Result` came on this stream and is still being checked counts as running: the
+    /// daemon has reported it, so it no longer lists it.
+    pub fn heartbeat(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        mut running: Vec<LeaseId>,
+    ) -> bool {
         let now = self.now();
         let mut state = self.lock();
         if !state.is_current(worker, stream) {
             return false;
         }
+        running.extend(
+            state
+                .reporting
+                .iter()
+                .filter(|(from, _)| *from == stream)
+                .map(|(_, lease)| *lease),
+        );
         let event = Event::Heartbeat {
             worker: worker.clone(),
             running,
@@ -188,22 +206,37 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// current lease; an accepted OK result is written to the action cache (unless the
     /// action is `do_not_cache` or exited non-zero) before its callers are answered.
     /// Returns the acknowledgement, or `None` for a `Result` without a lease id.
-    pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
+    /// `stream` is the stream it came on: until the scheduler has the report, the
+    /// lease counts as running for that stream's heartbeats.
+    pub async fn report(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        result: worker::Result,
+    ) -> Option<ResultAck> {
         let wire_lease = result.lease_id?;
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
         let refused = ResultAck {
             lease_id: Some(wire_lease),
             accepted: false,
         };
-        let Some(operation) = self.lock().holder(lease, worker) else {
-            tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
-            return Some(refused);
+        let operation = {
+            let mut state = self.lock();
+            let Some(operation) = state.holder(lease, worker) else {
+                tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
+                return Some(refused);
+            };
+            state.reporting.push((stream, lease));
+            operation
         };
         let (outcome, mut pending) = self.outcome(lease, result).await;
 
         let now = self.now();
         let (answers, accepted) = {
             let mut state = self.lock();
+            if let Some(at) = state.reporting.iter().position(|r| *r == (stream, lease)) {
+                state.reporting.swap_remove(at);
+            }
             let answers = state.feed(
                 now,
                 Event::Report {

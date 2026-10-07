@@ -264,6 +264,49 @@ async fn a_slow_result_does_not_hold_back_heartbeats() {
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
 }
 
+/// Catches: a lease given up by a heartbeat that arrives on the same stream while the
+/// lease's own `Result` is still being checked. A daemon does not list a lease it has
+/// reported as running, and the `Result` is checked off the stream, so the server has
+/// to count the lease as running for that stream until the scheduler has the report;
+/// otherwise the result is refused and the action runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heartbeat_while_a_result_is_checked_keeps_its_lease() {
+    let cell = Cell::start().await;
+    let mut first = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("reported", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = first.start().await;
+    // The daemon reconnects and re-adopts the lease. Its `Start` went to an earlier
+    // session, so from now on a heartbeat that does not list it gives it up at once.
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let running: Vec<_> = start.lease_id.into_iter().collect();
+    assert!(daemon.heartbeat(&running).await);
+    let result = output(&cell, "checked while a heartbeat arrives", 0).await;
+
+    cell.cache.meta().close_on_next_query();
+    daemon.send(daemon_message::Message::Result(ran(
+        start.lease_id,
+        &result,
+    )));
+    cell.cache.meta().held().await;
+    // Reported, so no longer listed as running.
+    assert!(daemon.heartbeat_within(&[], PROMPT).await);
+    cell.cache.meta().open();
+
+    let ack = daemon
+        .expect("ResultAck", |m| match m {
+            Message::ResultAck(a) => Some(*a),
+            _ => None,
+        })
+        .await;
+    assert!(
+        ack.accepted,
+        "the lease was given up while its result was checked"
+    );
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+}
+
 /// Catches: a result written to the action cache before the scheduler accepts it. The
 /// result arrives while its lease is current, and the lease is given up while the
 /// server checks the result's outputs: the scheduler then refuses it, and the cache
