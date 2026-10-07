@@ -661,7 +661,9 @@ fn leases_lost_to_silence_count_toward_the_budget() {
 
     for attempt in 1..=3 {
         let t = 100 * attempt;
+        // `a` reboots: it registers again, and its first heartbeat lists nothing.
         h.at_secs(t).worker("a", 1_000, GIB);
+        h.heartbeat("a");
         let [grant] = h.tick().try_into().unwrap();
         h.commit_and_start(&grant);
         let expired = h.at_secs(t + 60).feed(Event::Tick);
@@ -715,4 +717,79 @@ fn a_lease_given_up_but_still_running_keeps_its_room() {
     assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
     let [next] = h.tick().try_into().unwrap();
     assert_eq!(next.operation, OperationId(1));
+}
+
+/// Catches: a lease expired to silence after its worker reported a result, given up all
+/// the same (`reconcile` keeps such a lease; `expire` must too). That counts a finished
+/// run as an `INFRA` attempt, and on the last attempt proposes a second result record
+/// for the lease: if the appends are reordered, that record reaches the log first and a
+/// completed action is answered `INFRA`.
+#[test]
+fn a_lease_whose_result_was_reported_is_kept_through_silence() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.worker("b", 1_000, GIB);
+    h.submit(1, request(1));
+    // Attempts 1 and 2: `a`, then `b`, never list their lease.
+    let [first] = h.tick().try_into().unwrap();
+    h.commit_and_start(&first);
+    h.at_secs(60).heartbeat("b");
+    h.heartbeat("a");
+    let [second] = h.tick().try_into().unwrap();
+    assert_eq!(second.worker, w("b"));
+    h.commit_and_start(&second);
+    h.at_secs(120).heartbeat("a");
+    h.heartbeat("b");
+    let [third] = h.tick().try_into().unwrap();
+    h.commit_and_start(&third);
+
+    // The third lease's worker reports success, then goes silent for G before the
+    // result commits.
+    let result = h.propose(&third, ok(1));
+    h.at_secs(180).heartbeat("a");
+    h.heartbeat("b");
+    let expired = h.at_secs(240).feed(Event::Tick);
+    assert!(expired.is_empty(), "gave up a reported lease: {expired:?}");
+    assert!(h.running(&third), "gave up a reported lease");
+
+    let answered = h.commit(result);
+    let [Effect::Answer(answer)] = answered.as_slice() else {
+        panic!("committing the result gave {answered:?}");
+    };
+    assert_eq!((answer.lease, answer.outcome), (third.lease, ok(1)));
+    assert_eq!(h.s.booked(&third.worker), Some(Resources::default()));
+}
+
+/// Catches (issue #23): a lease lost to silence left unbooked although its worker may
+/// still be running it. When the worker registers again, a tick before its first
+/// heartbeat places new work into that room. The room is freed once a heartbeat leaves
+/// the lease out.
+#[test]
+fn a_lease_lost_to_silence_keeps_its_room_until_a_heartbeat_leaves_it_out() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.submit(1, request(1));
+    let [lost] = h.tick().try_into().unwrap();
+    h.commit_and_start(&lost);
+
+    assert!(h.at_secs(60).tick().is_empty());
+    assert_eq!(h.s.state(lost.operation), Some(&OpState::Queued));
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::new(1_000, GIB)),
+        "a lease lost to silence is not booked"
+    );
+
+    // `a` comes back (a partition healed, the run went on) and registers again.
+    h.at_secs(70).worker("a", 1_000, GIB);
+    assert!(h.tick().is_empty(), "placed into the room of a run that may go on");
+    h.heartbeat_running("a", &[lost.lease]);
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
+    assert!(h.tick().is_empty(), "placed into the late run's room");
+
+    // The run ends and leaves the running set.
+    h.at_secs(71).heartbeat("a");
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+    let [retry] = h.tick().try_into().unwrap();
+    assert_eq!(retry.operation, lost.operation);
 }
