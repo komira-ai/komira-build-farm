@@ -3,7 +3,8 @@
 //!
 //! Catches:
 //! - a workflow that can run on a non-hosted runner, uses `pull_request_target`, uses
-//!   an action not pinned by commit SHA, or lacks top-level `permissions: {}`, and an
+//!   an action not pinned by commit SHA or outside the allowed set (`actions/*` and
+//!   `tailscale/github-action`), or lacks top-level `permissions: {}`, and an
 //!   `action.yml` in any directory with an unpinned step; a local `uses: ./...` that
 //!   names no linted action or workflow; a workflow or action file that is not valid
 //!   UTF-8 or holds a NUL byte (rules in `workflows/mod.rs`, which parses each file as
