@@ -409,6 +409,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Every blob an `ActionResult` needs besides itself. The empty blob is left out:
     /// it is always present.
+    ///
+    /// An output directory's `root_directory_digest`, when set, is required as well, so
+    /// a hit never names a root `Directory` a client cannot fetch. REAPI does not make
+    /// the server hold that blob; here the writer (the daemon) must upload it with the
+    /// tree, or the entry is refused as absent.
     async fn closure_of(&self, result: &reapi::ActionResult) -> Result<Closure, CacheError> {
         let mut closure = Closure::new();
         for file in &result.output_files {

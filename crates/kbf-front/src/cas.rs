@@ -144,6 +144,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
     /// Every directory reachable from the root, breadth first, each distinct digest
     /// once. A missing child is left out with its subtree (REAPI's rule); a missing
     /// root is NOT_FOUND. The page token is the number of directories already sent.
+    ///
+    /// Each call walks the tree again from the root and skips what earlier pages sent.
+    /// The token is an offset, not a snapshot: if a directory in the tree is collected
+    /// or uploaded between pages, later pages can repeat or leave out a directory.
+    /// Pages from one call come from one walk and are consistent with each other.
     async fn get_tree(
         &self,
         request: Request<GetTreeRequest>,

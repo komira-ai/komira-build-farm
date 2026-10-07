@@ -8,9 +8,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use bytes::Bytes;
 use kbf_front::{Cache, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
-use kbf_meta::{Applied, BlobAnswer, Command, MetaState, Retention};
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_meta::{Applied, BlobAnswer, Command, Location, MetaState, Retention};
+use kbf_objstore::{ByteRange, Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
@@ -191,6 +192,39 @@ impl Farm {
         };
         let key = self.cache.object_key(location.object()).expect("key");
         self.cache.objects().delete(&key).await.expect("delete");
+    }
+
+    /// Replaces the store object that holds `blob` with the same bytes but one bit of
+    /// `blob`'s record flipped, as a broken disk might. The object's length and footer
+    /// are unchanged, so only a read that hashes what it got can tell.
+    pub async fn corrupt_object_of(&self, blob: &Blob) {
+        let d = blob.digest;
+        let answer = self
+            .cache
+            .meta()
+            .query(move |s| s.blob(&d))
+            .await
+            .expect("query");
+        let BlobAnswer::Present(location) = answer else {
+            panic!("{d} is not present: {answer:?}");
+        };
+        let offset = match location {
+            Location::Segment { offset, .. } => offset,
+            Location::Object(_) => 0,
+        };
+        let key = self.cache.object_key(location.object()).expect("key");
+        let objects = self.cache.objects();
+        // A range past the end reads what exists: the whole object.
+        let whole = ByteRange::new(0, u64::from(u32::MAX)).expect("range");
+        let mut bytes = objects.get_range(&key, whole).await.expect("get").to_vec();
+        let at = usize::try_from(offset).expect("offset");
+        assert!(at < bytes.len(), "{d} at {offset} in {} bytes", bytes.len());
+        bytes[at] ^= 0x01;
+        objects.delete(&key).await.expect("delete");
+        objects
+            .put_new(&key, Bytes::from(bytes), None)
+            .await
+            .expect("put");
     }
 }
 

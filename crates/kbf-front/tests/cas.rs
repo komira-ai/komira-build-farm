@@ -5,6 +5,7 @@ mod common;
 use common::{Blob, Farm, days};
 use kbf_front::MAX_BATCH_TOTAL_BYTES;
 use kbf_meta::Command;
+use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::reapi::{
     self, BatchReadBlobsRequest, BatchUpdateBlobsRequest, Directory, DirectoryNode, FileNode,
     FindMissingBlobsRequest, GetCapabilitiesRequest, GetTreeRequest,
@@ -105,6 +106,101 @@ async fn find_missing_asks_again_when_a_collection_wins_the_touch_race() {
         .meta()
         .before_next_touch(vec![Command::Tick(days(30)), Command::Collect]);
     assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches: re-upload of a blob that a collection removes between the "already
+/// present?" check and its touch being acknowledged without storing anything. The
+/// upload says OK, the blob is gone, and an upload is no longer durable when
+/// acknowledged. The upload must store the blob again.
+#[tokio::test]
+async fn reupload_stores_again_when_a_collection_wins_the_touch_race() {
+    let farm = Farm::start().await;
+    let blob = Blob::new("collected under the uploader");
+    farm.upload(&[&blob]).await;
+    // Old enough that the re-upload must touch it, young enough to be held.
+    farm.cache.tick(days(4)).await.expect("tick");
+    farm.cache
+        .meta()
+        .before_next_touch(vec![Command::Tick(days(30)), Command::Collect]);
+    farm.upload(&[&blob]).await;
+
+    assert!(
+        farm.find_missing(&[&blob]).await.is_empty(),
+        "the acknowledged upload is present"
+    );
+    let read = farm.cache.read_blob(&blob.digest).await.expect("readable");
+    assert_eq!(read.as_ref(), blob.data.as_slice());
+}
+
+/// Catches: a read that serves stored bytes without hashing them (RFC 9.1: never
+/// corrupt results; verified on read). Each read path gets its own corrupted object,
+/// so the first read of each is the one that must notice; the blobs must then be
+/// reported missing (unreachable), so clients upload them again. A sound neighbour in
+/// its own object still reads.
+#[tokio::test]
+async fn corrupted_bytes_are_never_served_and_are_reported_missing() {
+    let farm = Farm::start().await;
+    let via_batch = Blob::new("corrupted under BatchReadBlobs");
+    let via_stream = Blob::new("corrupted under ByteStream Read");
+    let sound = Blob::new("left alone");
+    farm.upload(&[&via_batch]).await;
+    farm.upload(&[&via_stream]).await;
+    farm.upload(&[&sound]).await;
+    farm.corrupt_object_of(&via_batch).await;
+    farm.corrupt_object_of(&via_stream).await;
+
+    let read = farm
+        .cas()
+        .batch_read_blobs(BatchReadBlobsRequest {
+            digests: vec![via_batch.proto.clone(), sound.proto.clone()],
+            ..Default::default()
+        })
+        .await
+        .expect("BatchReadBlobs")
+        .into_inner();
+    let answers: Vec<(i32, &[u8])> = read
+        .responses
+        .iter()
+        .map(|r| (r.status.as_ref().expect("status").code, r.data.as_slice()))
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            (Code::Unavailable as i32, &[][..]),
+            (0, sound.data.as_slice())
+        ]
+    );
+
+    let streamed = async {
+        let mut stream = farm
+            .bytestream()
+            .read(ReadRequest {
+                resource_name: format!(
+                    "main/blobs/{}/{}",
+                    via_stream.digest.hash_hex(),
+                    via_stream.digest.size_bytes
+                ),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let mut data = Vec::new();
+        while let Some(m) = stream.message().await? {
+            data.extend(m.data);
+        }
+        Ok::<_, tonic::Status>(data)
+    }
+    .await;
+    assert_eq!(
+        streamed.map_err(|s| s.code()),
+        Err(Code::Unavailable),
+        "ByteStream Read of corrupted bytes"
+    );
+
+    assert_eq!(
+        farm.find_missing(&[&via_batch, &sound, &via_stream]).await,
+        [via_batch.digest, via_stream.digest]
+    );
 }
 
 /// Catches: BatchUpdateBlobs storing bytes under a digest they do not hash to (which

@@ -20,7 +20,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::cache::{Cache, VerifiedBlob};
 use crate::meta_log::MetaLog;
-use crate::{READ_CHUNK_BYTES, wire};
+use crate::{MAX_BLOB_BYTES, READ_CHUNK_BYTES, wire};
 
 /// The `ByteStream` service over a [`Cache`].
 #[derive(Debug)]
@@ -92,6 +92,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
                 committed_size: i64::try_from(size).unwrap_or(i64::MAX),
             })
         };
+        if size > MAX_BLOB_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "{digest} is larger than the largest blob this cache accepts \
+                 ({MAX_BLOB_BYTES} bytes)"
+            )));
+        }
         // The cheapest upload is the one we skip (RFC 9.4).
         if self.cache.is_durable(&digest).await? {
             return Ok(committed(size));

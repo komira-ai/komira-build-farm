@@ -121,6 +121,44 @@ async fn get_action_result_misses_when_an_output_blob_is_missing() {
     assert_eq!(get(&farm, &action).await, Err(Code::NotFound));
 }
 
+/// Catches: a hit served while stdout has been collected (the closure leaves stdout and
+/// stderr out, so a client gets a result whose stdout it cannot fetch). The mirror of
+/// the case above: the result blob and the output file are kept fresh, so only
+/// stdout's absence can turn the hit into a miss.
+#[tokio::test]
+async fn get_action_result_misses_when_stdout_is_missing() {
+    let farm = Farm::start().await;
+    let output = Blob::new("output bytes");
+    let stdout = Blob::new("stdout bytes");
+    farm.upload(&[&output, &stdout]).await;
+    let action = Blob::new("compile util.c");
+    let result = ActionResult {
+        output_files: vec![output_file("util.o", &output)],
+        stdout_digest: Some(stdout.proto.clone()),
+        ..Default::default()
+    };
+    farm.cache
+        .write_action_result(Role::Daemon, action.digest, &result)
+        .await
+        .expect("daemon write");
+    assert_eq!(get(&farm, &action).await, Ok(result.clone()));
+
+    // Keep the result blob and the output fresh, then let stdout expire.
+    let result_blob = Blob::of(&result);
+    farm.cache.tick(days(5)).await.expect("tick");
+    assert!(farm.find_missing(&[&result_blob, &output]).await.is_empty());
+    farm.cache.tick(days(9)).await.expect("tick");
+    farm.cache.collect().await.expect("collect");
+    assert!(farm.find_missing(&[&result_blob, &output]).await.is_empty());
+    assert_eq!(
+        farm.find_missing(&[&stdout]).await,
+        [stdout.digest],
+        "stdout was collected"
+    );
+
+    assert_eq!(get(&farm, &action).await, Err(Code::NotFound));
+}
+
 /// Catches: a hit served while a file inside an output directory's tree is
 /// unreachable (the closure includes the tree blob but not the files it names), and
 /// a miss that stays a miss after the file is uploaded again.

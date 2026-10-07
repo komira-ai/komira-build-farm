@@ -2,9 +2,11 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{Blob, Farm, pseudo_random};
 use futures::channel::mpsc;
-use kbf_front::READ_CHUNK_BYTES;
+use kbf_front::{MAX_BLOB_BYTES, READ_CHUNK_BYTES};
 use kbf_proto::google::bytestream::{QueryWriteStatusRequest, ReadRequest, WriteRequest};
 use tonic::Code;
 
@@ -177,6 +179,37 @@ async fn bytestream_write_refuses_wrong_bytes_and_offsets() {
 
     assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
     assert_eq!(status(&farm, &blob).await, (0, false));
+}
+
+/// Catches: a write whose resource name claims more than `MAX_BLOB_BYTES` being
+/// accepted and buffered, so any client can make the front hold as much memory as it
+/// names. The stream is left open after its first message: a front without the cap
+/// waits for the rest and never answers; one with it refuses at once.
+#[tokio::test]
+async fn bytestream_write_refuses_a_blob_over_the_cap_before_buffering() {
+    let farm = Farm::start().await;
+    let size = MAX_BLOB_BYTES + 1;
+    let name = format!(
+        "main/uploads/7d5e6f1a-test/blobs/{}/{size}",
+        "ab".repeat(32)
+    );
+    let (tx, rx) = mpsc::unbounded();
+    tx.unbounded_send(WriteRequest {
+        resource_name: name,
+        write_offset: 0,
+        finish_write: false,
+        data: vec![0; 1024],
+    })
+    .expect("send");
+    let mut client = farm.bytestream();
+    let answer = tokio::time::timeout(Duration::from_secs(10), client.write(rx))
+        .await
+        .expect("refused without waiting for the rest of the blob");
+    assert_eq!(
+        answer.expect_err("over the cap").code(),
+        Code::InvalidArgument
+    );
+    drop(tx);
 }
 
 /// Catches: QueryWriteStatus claiming progress that is not durable: bytes a live
