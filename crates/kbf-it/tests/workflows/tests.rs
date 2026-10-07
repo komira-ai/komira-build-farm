@@ -45,7 +45,7 @@ fn a_clean_workflow_passes() {
     // Catches: a lint that refuses the forms ci.yml relies on, or reads `#` inside a
     // value, a word inside a block scalar or a comment as code.
     clean(&workflow(&format!(
-        "    runs-on: ubuntu-24.04-arm\n    steps:\n      - uses: a/b@{SHA} # v1.2.3\n        with:\n          save-if: ${{{{ github.ref == 'refs/heads/main' }}}}\n      - uses: ./local\n      - name: 'a # not a comment'\n        run: |\n          echo causes  # runs-on: big-box is script text\n    # never pull_request_target, never self-hosted\n"
+        "    runs-on: ubuntu-24.04-arm\n    steps:\n      - uses: actions/b@{SHA} # v1.2.3\n        with:\n          save-if: ${{{{ github.ref == 'refs/heads/main' }}}}\n      - uses: ./local\n      - name: 'a # not a comment'\n        run: |\n          echo causes  # runs-on: big-box is script text\n    # never pull_request_target, never self-hosted\n"
     )));
     clean(
         "on:\n  pull_request:\n  push:\n    branches: [main]\npermissions: {}\njobs:\n  a:\n    runs-on: [ubuntu-latest]\n  b:\n    runs-on: {labels: [macos-15]}\n  c:\n    uses: ./.github/workflows/c.yml\n",
@@ -118,9 +118,9 @@ fn regression_respelled_keys_are_read() {
         refused(body, "runs-on must name hosted");
     }
     for body in [
-        "    runs-on: ubuntu-latest\n    steps:\n      - \"uses\": a/b@v1\n",
-        "    runs-on: ubuntu-latest\n    steps:\n      - uses : a/b@v1\n",
-        "    runs-on: ubuntu-latest\n    steps: [{uses: a/b@v1}]\n",
+        "    runs-on: ubuntu-latest\n    steps:\n      - \"uses\": actions/b@v1\n",
+        "    runs-on: ubuntu-latest\n    steps:\n      - uses : actions/b@v1\n",
+        "    runs-on: ubuntu-latest\n    steps: [{uses: actions/b@v1}]\n",
     ] {
         refused(body, "not pinned");
     }
@@ -129,7 +129,8 @@ fn regression_respelled_keys_are_read() {
 #[test]
 fn regression_flow_style_jobs_are_read() {
     // A non-hosted runner and an unpinned action inside flow collections.
-    let w = "on: push\npermissions: {}\njobs: {a: {runs-on: big-box, steps: [{uses: a/b@v1}]}}\n";
+    let w =
+        "on: push\npermissions: {}\njobs: {a: {runs-on: big-box, steps: [{uses: actions/b@v1}]}}\n";
     refused_text(w, "runs-on must name hosted");
     refused_text(w, "not pinned");
 }
@@ -251,11 +252,11 @@ fn unpinned_actions_are_refused() {
     let short = &SHA[..12];
     let upper = SHA.to_uppercase();
     for v in [
-        "a/b@v4",
-        "a/b@main",
-        "a/b",
-        &format!("a/b@{short}"),
-        &format!("a/b@{upper}"),
+        "actions/b@v4",
+        "actions/b@main",
+        "actions/b",
+        &format!("actions/b@{short}"),
+        &format!("actions/b@{upper}"),
     ] {
         let found = scan(&workflow(&format!(
             "    runs-on: ubuntu-latest\n    steps:\n      - uses: {v} # v4\n"
@@ -270,10 +271,10 @@ fn pins_need_a_version_comment() {
     // Catches: a bare SHA, which hides which release it is, including a comment that
     // only looks like one because it sits on another line or inside quotes.
     for step in [
-        format!("      - uses: a/b@{SHA}\n"),
-        format!("      - uses: a/b@{SHA} #\n"),
-        format!("      - uses: a/b@{SHA}\n        # v1\n"),
-        format!("      - name: 'é # v1'\n        uses: a/b@{SHA}\n"),
+        format!("      - uses: actions/b@{SHA}\n"),
+        format!("      - uses: actions/b@{SHA} #\n"),
+        format!("      - uses: actions/b@{SHA}\n        # v1\n"),
+        format!("      - name: 'é # v1'\n        uses: actions/b@{SHA}\n"),
     ] {
         let found = scan(&workflow(&format!(
             "    runs-on: ubuntu-latest\n    steps:\n{step}"
@@ -283,13 +284,64 @@ fn pins_need_a_version_comment() {
     }
     // Catches: character offsets used as byte offsets after a multi-byte character.
     clean(&workflow(&format!(
-        "    runs-on: ubuntu-latest\n    steps:\n      - {{name: é, uses: ./x}}\n      - uses: a/b@{SHA} # v1\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - {{name: é, uses: ./x}}\n      - uses: actions/b@{SHA} # v1\n"
     )));
     // A quoted value's span runs past its comment, so only a plain value is read.
     refused(
-        &format!("    runs-on: ubuntu-latest\n    steps:\n      - uses: 'a/b@{SHA}' # v1\n"),
+        &format!("    runs-on: ubuntu-latest\n    steps:\n      - uses: 'actions/b@{SHA}' # v1\n"),
         "must be a plain scalar",
     );
+}
+
+#[test]
+fn actions_outside_the_allowed_set_are_refused() {
+    // Catches: a pinned action the repository's Actions policy refuses, which GitHub
+    // answers with startup_failure before any job runs (the rust-cache and
+    // cargo-deny-action steps that silenced CI), including look-alike owners and a
+    // repository of the allowed owner `tailscale` other than github-action.
+    for v in [
+        "Swatinem/rust-cache",
+        "EmbarkStudios/cargo-deny-action",
+        "actions-rs/toolchain",
+        "action/checkout",
+        "Actions/checkout",
+        "tailscale/other-action",
+        "tailscale/github-action-fork",
+        "tailscale",
+        "actions/",
+        "/actions/checkout",
+        "o/actions/checkout",
+    ] {
+        let found = scan(&workflow(&format!(
+            "    runs-on: ubuntu-latest\n    steps:\n      - uses: {v}@{SHA} # v1\n"
+        )));
+        assert_eq!(found.len(), 1, "{v}: {found:?}");
+        assert!(found[0].contains("Actions policy allows"), "{v}: {found:?}");
+    }
+    // The same rule holds in a composite action's steps.
+    action_refused(
+        &format!(
+            "name: a\nruns:\n  using: composite\n  steps:\n    - uses: Swatinem/rust-cache@{SHA} # v2\n"
+        ),
+        "Actions policy allows",
+    );
+}
+
+#[test]
+fn actions_inside_the_allowed_set_pass() {
+    // Catches: an allow-list that refuses an allowed action, a sub-path action of an
+    // allowed repository (actions/cache/restore) or tailscale's own action.
+    for v in [
+        "actions/checkout",
+        "actions/cache/restore",
+        "actions/cache/save",
+        "actions/upload-artifact",
+        "tailscale/github-action",
+    ] {
+        clean(&workflow(&format!(
+            "    runs-on: ubuntu-latest\n    steps:\n      - uses: {v}@{SHA} # v1\n"
+        )));
+    }
 }
 
 #[test]
@@ -499,12 +551,12 @@ fn action_files_follow_the_step_rules() {
     // Catches: a composite action whose steps escape the pin, local-path and word
     // rules that hold in a workflow.
     let ok = format!(
-        "name: a\ndescription: d\nruns:\n  using: composite\n  steps:\n    - uses: a/b@{SHA} # v1\n    - uses: ./local\n    - run: echo\n      shell: bash\n"
+        "name: a\ndescription: d\nruns:\n  using: composite\n  steps:\n    - uses: actions/b@{SHA} # v1\n    - uses: ./local\n    - run: echo\n      shell: bash\n"
     );
     assert_eq!(action(&ok), Vec::<String>::new());
     for (steps, want) in [
-        ("    - uses: a/b@v1\n".to_owned(), "not pinned"),
-        (format!("    - uses: a/b@{SHA}\n"), "version comment"),
+        ("    - uses: actions/b@v1\n".to_owned(), "not pinned"),
+        (format!("    - uses: actions/b@{SHA}\n"), "version comment"),
         ("    - uses: ./missing\n".to_owned(), "linted action file"),
         (
             format!(
