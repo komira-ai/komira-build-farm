@@ -211,7 +211,8 @@ impl<C: Cas> NativeRuntime<C> {
                 }
                 _ = tick.tick() => {
                     let used = group.measure().await?;
-                    if let Some(limit) = limit && used > limit {
+                    // MUTANT: the limit is never reached.
+                    if let Some(limit) = limit && used > limit.saturating_mul(1 << 10) {
                         break Ended::OutOfMemory { used, limit };
                     }
                 }
