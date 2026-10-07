@@ -858,6 +858,11 @@ dependencies = [
 [[package]]
 name = "kbf-raft"
 version = "0.1.0"
+dependencies = [
+ "kbf-sim",
+ "kbf-types",
+ "thiserror",
+]
 
 [[package]]
 name = "kbf-sched"
