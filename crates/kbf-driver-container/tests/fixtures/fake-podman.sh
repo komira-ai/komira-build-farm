@@ -5,7 +5,9 @@
 # any machine. Real Podman behaviour is tested in tests/podman.rs.
 #
 # Knobs (files in $STATE the test writes):
-#   image-digest     what `image inspect` prints; absent: the image is not in the store
+#   image-id         what `image inspect` prints; absent: the image is not in the store
+#   info-fails       `info` fails
+#   store/           the image store `info` names (store/fake-images/<id>/=<key>)
 #   action.sh        what `start --attach` runs (env: ROOT, UPPER, CG)
 #   create-fails     `create` fails
 #   status           written by `start`; a test may preset `status-override`
@@ -26,8 +28,12 @@ echo "$verb" >>"$STATE/calls"
 
 case $verb in
 image)
-    [ -f "$STATE/image-digest" ] || { echo "Error: image not known" >&2; exit 125; }
-    cat "$STATE/image-digest"
+    [ -f "$STATE/image-id" ] || { echo "Error: image not known" >&2; exit 125; }
+    cat "$STATE/image-id"
+    ;;
+info)
+    [ -f "$STATE/info-fails" ] && { echo "Error: info refused" >&2; exit 125; }
+    echo "$STATE/store/fake-images"
     ;;
 create)
     printf '%s\n' "$@" >"$STATE/create.args"

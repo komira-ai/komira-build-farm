@@ -5,8 +5,9 @@
 #
 # - a systemd user session for the runner user (lingering), so rootless Podman has a
 #   run directory;
-# - busybox pulled once by its image index digest; the per-architecture manifest
-#   digest is read back from the local store;
+# - busybox pulled once by its image index digest, so the store holds both the index
+#   and this architecture's manifest; the manifest's digest is read from the registry's
+#   index (Podman's own `.Digest` is the digest of the first pull, here the index);
 # - the tests run inside a system unit with Delegate=yes, as the runner user: the
 #   user manager alone gets no io controller and a daemon must own its subtree. The
 #   unit moves itself into a leaf and enables cpu, memory and pids for `actions`
@@ -31,16 +32,27 @@ export XDG_RUNTIME_DIR=/run/user/$uid
 
 podman --version
 podman pull -q "$BUSYBOX" >/dev/null
-manifest=$(podman image inspect --format '{{.Digest}}' "$BUSYBOX")
+case $(uname -m) in
+x86_64) arch=amd64 ;;
+aarch64) arch=arm64 ;;
+*) echo "no busybox architecture for $(uname -m)" >&2; exit 1 ;;
+esac
+manifest=$(podman manifest inspect "$BUSYBOX" | python3 -I -c '
+import json, sys
+index = json.load(sys.stdin)
+arch = sys.argv[1]
+print(next(m["digest"] for m in index["manifests"]
+           if m["platform"]["os"] == "linux" and m["platform"]["architecture"] == arch))
+' "$arch")
 case $manifest in
 sha256:*) ;;
-*) echo "no manifest digest for $BUSYBOX: $manifest" >&2; exit 1 ;;
+*) echo "no $arch manifest in $BUSYBOX: $manifest" >&2; exit 1 ;;
 esac
 if [ "docker.io/library/busybox@$manifest" = "$BUSYBOX" ]; then
-    echo "the store reports the index digest as the manifest digest; the index test would mean nothing" >&2
+    echo "the manifest digest equals the index digest; the index test would mean nothing" >&2
     exit 1
 fi
-echo "busybox manifest for $(uname -m): $manifest"
+echo "busybox manifest for $arch: $manifest"
 
 cargo test -p kbf-driver-container --test podman --locked --no-run
 

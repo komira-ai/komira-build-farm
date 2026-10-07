@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 
 use crate::cas::Cas;
 use crate::cgroup::LeaseCgroup;
-use crate::image::{ImageRef, PROPERTY};
+use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::podman::{ContainerSpec, Podman};
 use crate::tree::{TreeError, check_relative, collect, fetch_message, materialize, output_paths};
 
@@ -91,6 +91,8 @@ pub struct PodmanRuntime<C> {
     podman: Podman,
     cas: Arc<C>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
+    /// The image store's per-image directories, asked of Podman once.
+    images: tokio::sync::OnceCell<PathBuf>,
 }
 
 impl<C: Cas> PodmanRuntime<C> {
@@ -108,6 +110,7 @@ impl<C: Cas> PodmanRuntime<C> {
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
+            images: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -149,25 +152,7 @@ impl<C: Cas> PodmanRuntime<C> {
         let outputs = output_paths(&command).map_err(tree_error)?;
         let timeout = timeout_of(&action, self.config.default_timeout)?;
 
-        match self
-            .podman
-            .image_digest(&image.to_string())
-            .await
-            .map_err(RuntimeError::Failed)?
-        {
-            None => {
-                return Err(RuntimeError::Failed(format!(
-                    "image {image} is not in this node's image store"
-                )));
-            }
-            Some(held) if held != image.digest() => {
-                return Err(RuntimeError::Invalid(format!(
-                    "container-image {image} is not a per-architecture manifest digest (an \
-                     image index?): the image it names has manifest {held}"
-                )));
-            }
-            Some(_) => {}
-        }
+        self.check_image(&image).await?;
 
         let root = lease.dir.join("root");
         let upper = lease.dir.join("upper");
@@ -272,6 +257,40 @@ impl<C: Cas> PodmanRuntime<C> {
             *slot = Some(cas.put(bytes).await.map_err(|e| tree_error(e.into()))?);
         }
         Ok(result)
+    }
+
+    /// Checks that this node's image store holds `image` and that its digest names one
+    /// image, not an index: by reading the manifest the store keeps under that digest.
+    async fn check_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        let Some(id) = self
+            .podman
+            .image_id(&image.to_string())
+            .await
+            .map_err(RuntimeError::Failed)?
+        else {
+            return Err(RuntimeError::Failed(format!(
+                "image {image} is not in this node's image store"
+            )));
+        };
+        let images = self
+            .images
+            .get_or_try_init(|| self.podman.images_dir())
+            .await
+            .map_err(RuntimeError::Failed)?;
+        let path = images.join(&id).join(manifest_file(image.digest()));
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            RuntimeError::Failed(format!(
+                "the image store holds no manifest {} for image {id}: {e}",
+                image.digest()
+            ))
+        })?;
+        match manifest_kind(&bytes, image.digest()).map_err(RuntimeError::Failed)? {
+            ManifestKind::Image => Ok(()),
+            ManifestKind::Index => Err(RuntimeError::Invalid(format!(
+                "container-image {image} names an image index; name the per-architecture \
+                 manifest digest"
+            ))),
+        }
     }
 
     /// The kill path (RFC 10.10): SIGTERM, the grace period, `cgroup.kill`, then the

@@ -116,16 +116,33 @@ impl Podman {
             .map_err(|e| format!("run {}: {e}", self.program.display()))
     }
 
-    /// The manifest digest of the local image `reference`, or `None` if this node's
-    /// image store does not hold it.
-    pub(crate) async fn image_digest(&self, reference: &str) -> Result<Option<String>, String> {
-        let args = ["image", "inspect", "--format={{.Digest}}", reference].map(OsString::from);
+    /// The id of the local image `reference`, or `None` if this node's image store does
+    /// not hold it.
+    pub(crate) async fn image_id(&self, reference: &str) -> Result<Option<String>, String> {
+        let args = ["image", "inspect", "--format={{.Id}}", reference].map(OsString::from);
         let output = self.output(&args).await?;
         if !output.status.success() {
             return Ok(None);
         }
         Ok(Some(
             String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        ))
+    }
+
+    /// The directory of the image store's per-image directories:
+    /// `<graph root>/<driver>-images`.
+    pub(crate) async fn images_dir(&self) -> Result<PathBuf, String> {
+        let args = [
+            "info",
+            "--format={{.Store.GraphRoot}}/{{.Store.GraphDriverName}}-images",
+        ]
+        .map(OsString::from);
+        let output = self.output(&args).await?;
+        if !output.status.success() {
+            return Err(failure("info", &output));
+        }
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
         ))
     }
 

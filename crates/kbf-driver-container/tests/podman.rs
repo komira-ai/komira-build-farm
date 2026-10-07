@@ -8,7 +8,8 @@
 //! test fails (it never skips silently):
 //!
 //! - `KBF_TEST_IMAGE`: `docker://<repo>@sha256:<per-architecture manifest digest>`;
-//! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest;
+//! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest (pulled by it,
+//!   so the store holds the index too);
 //! - `KBF_TEST_CGROUP`: the delegated cgroup, relative to `/sys/fs/cgroup`.
 
 mod support;
@@ -192,7 +193,7 @@ async fn tags_and_index_digests_are_refused() {
     let index = Spec::new(&var("KBF_TEST_INDEX_IMAGE"), "true");
     let outcome = cell.run(2, &index).await;
     assert!(
-        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("per-architecture")),
+        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("image index")),
         "{outcome:?}"
     );
     cell.assert_clean(1);

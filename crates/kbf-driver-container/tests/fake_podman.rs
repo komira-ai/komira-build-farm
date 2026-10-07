@@ -14,10 +14,26 @@ use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
 use kbf_types::Resources;
 use support::{Spec, blob, exists, store_action, tree, work};
 
-const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The per-architecture manifest every fake image store holds.
+const MANIFEST: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+/// An image index over it.
+const INDEX: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+
+fn sha256(bytes: &[u8]) -> String {
+    format!(
+        "sha256:{}",
+        kbf_driver_container::cas::digest_of(bytes).hash
+    )
+}
+
+fn image_by(digest: &str) -> String {
+    format!("docker://registry.test/tools/busybox@{digest}")
+}
 
 fn image() -> String {
-    format!("docker://registry.test/tools/busybox@sha256:{HEX}")
+    image_by(&sha256(MANIFEST))
 }
 
 /// One test's fake Podman, fake cgroup mount, scratch directory and runtime.
@@ -44,7 +60,7 @@ impl Fake {
         // fail with ETXTBSY while another test thread forks.
         let program = dir.join("podman");
         std::os::unix::fs::symlink(&fixture, &program).expect("link podman");
-        std::fs::write(state.join("image-digest"), format!("sha256:{HEX}\n")).expect("digest");
+        std::fs::write(state.join("image-id"), "img1\n").expect("image id");
         let mut config = PodmanConfig::new(scratch.clone(), "/actions".to_owned());
         config.podman = program;
         config.cgroup_root = cgroup.clone();
@@ -52,14 +68,24 @@ impl Fake {
         config.kill_grace = Duration::from_millis(300);
         let cas = Arc::new(MemoryCas::new());
         let runtime = Arc::new(PodmanRuntime::new(config, Arc::clone(&cas)).expect("runtime"));
-        Self {
+        let fake = Self {
             dir,
             state,
             cgroup,
             scratch,
             cas,
             runtime,
-        }
+        };
+        fake.store_manifest(&sha256(MANIFEST), MANIFEST);
+        fake
+    }
+
+    /// Puts `bytes` in the fake image store as image img1's manifest under `digest`.
+    fn store_manifest(&self, digest: &str, bytes: &[u8]) {
+        let dir = self.state.join("store/fake-images/img1");
+        std::fs::create_dir_all(&dir).expect("mkdir store");
+        let file = kbf_driver_container::image::manifest_file(digest);
+        std::fs::write(dir.join(file), bytes).expect("write manifest");
     }
 
     fn knob(&self, name: &str, contents: &str) {
@@ -266,34 +292,66 @@ async fn a_tag_is_refused_before_anything_runs() {
     fake.assert_clean(1);
 }
 
-/// Catches an image index digest being run: the node's store holds a different
-/// (per-architecture) manifest digest for it, so one action digest could mean a
-/// different image on each architecture.
+/// Catches an image index digest being run (the store holds the image, pulled through
+/// the index): one action digest would mean a different image on each architecture.
 #[tokio::test]
 async fn an_index_digest_is_refused() {
     let fake = Fake::new("index");
-    fake.knob("image-digest", &format!("sha256:{}\n", "f".repeat(64)));
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    let index = sha256(INDEX);
+    fake.store_manifest(&index, INDEX);
+    let outcome = fake
+        .run(1, &Spec::new(&image_by(&index), "unused"), "exit 0")
+        .await;
     assert!(
-        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("per-architecture")),
+        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("image index")),
         "{outcome:?}"
     );
-    assert_eq!(fake.calls(), ["image"]);
+    assert_eq!(fake.calls(), ["image", "info"]);
     fake.assert_clean(1);
 }
 
-/// Catches a missing image being pulled or run anyway: nodes never pull at action
-/// time, and a node without the image is the farm's failure, not the client's.
+/// Catches a missing image being pulled or run anyway (nodes never pull at action
+/// time; a node without the image is the farm's failure, not the client's), and an
+/// image store that cannot vouch for the manifest being trusted.
 #[tokio::test]
-async fn a_missing_image_is_an_infrastructure_failure() {
+async fn an_image_the_store_cannot_vouch_for_is_an_infrastructure_failure() {
     let fake = Fake::new("no-image");
-    std::fs::remove_file(fake.state.join("image-digest")).expect("rm");
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("image store")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(1);
+    let spec = Spec::new(&image(), "unused");
+    // (what the failure says, how to break the store, how to mend it)
+    type Case<'a> = (&'a str, &'a dyn Fn(), &'a dyn Fn());
+    let cases: [Case; 4] = [
+        (
+            "not in this node's image store",
+            &|| std::fs::remove_file(fake.state.join("image-id")).expect("rm"),
+            &|| fake.knob("image-id", "img1\n"),
+        ),
+        ("info refused", &|| fake.knob("info-fails", ""), &|| {
+            std::fs::remove_file(fake.state.join("info-fails")).expect("rm")
+        }),
+        (
+            "holds no manifest",
+            &|| fake.knob("image-id", "img2\n"),
+            &|| fake.knob("image-id", "img1\n"),
+        ),
+        (
+            "hashes to",
+            &|| fake.store_manifest(&sha256(MANIFEST), INDEX),
+            &|| fake.store_manifest(&sha256(MANIFEST), MANIFEST),
+        ),
+    ];
+    for (seq, (want, break_it, mend_it)) in cases.iter().enumerate() {
+        let seq = seq as u64 + 1;
+        break_it();
+        let outcome = fake.run(seq, &spec, "exit 0").await;
+        assert!(
+            matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains(want)),
+            "{want}: {outcome:?}"
+        );
+        fake.assert_clean(seq);
+        mend_it();
+    }
+    let result = fake.run(9, &spec, "exit 0").await.expect("mended");
+    assert_eq!(result.exit_code, 0);
 }
 
 /// Catches a timeout that is not enforced, or that leaves the container behind.
