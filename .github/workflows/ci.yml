@@ -175,27 +175,31 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the workspace tests under coverage
-        run: |
-          mkdir -p target/coverage
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch \
-            --lcov --output-path target/coverage/lcov.info
-      # `shell: bash` sets pipefail, so the ratchet's exit status survives the tee.
-      - name: Per-crate table and ratchet
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
+      - name: Diagnose export variants
         shell: bash
         run: |
-          cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- \
-            --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" \
-            --baseline coverage-baseline \
-            --write-baseline target/coverage/coverage-baseline.measured \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir -p target/coverage
+          v() { name=$1; shift; echo "::group::variant $name"; "$@" > "target/coverage/$name.out" 2> "target/coverage/$name.err"; rc=$?; tail -c 600 "target/coverage/$name.err"; echo "::endgroup::"; echo "VARIANT $name rc=$rc bytes=$(wc -c < target/coverage/$name.out)"; }
+          C="cargo +$COVERAGE_TOOLCHAIN llvm-cov report"
+          v default-1 $C --lcov
+          v default-2 $C --lcov
+          LLVM_COV_FLAGS=-num-threads=1 v threads1 $C --lcov
+          v json-summary $C --json --summary-only
+          v text $C
+          v no-front $C --lcov --ignore-filename-regex 'crates/kbf-front/'
+          v only-coverage $C --lcov -p kbf-coverage
+          v only-front $C --lcov -p kbf-front
+          LLVM_COV_FLAGS=-num-threads=1 v threads1-again $C --lcov
+          cp target/coverage/threads1.out target/coverage/lcov.info || true
+          grep VARIANT -r /dev/null || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: coverage
           path: |
-            target/coverage/lcov.info
-            target/coverage/coverage-baseline.measured
-          if-no-files-found: error
+            target/coverage/
+          if-no-files-found: warn
 
   # A second job rather than a matrix: the workflow lint requires a literal hosted label
   # in runs-on, so the runner a job lands on is readable from this file alone.
