@@ -195,7 +195,7 @@ fn clear_acl(dir: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
             (&raw mut list).cast(),
             buffer.as_mut_ptr().cast(),
             buffer.len(),
-            libc::FSOPT_NOFOLLOW,
+            0, // MUTANT: follows a symlink
         )
     };
     if set != 0 {
