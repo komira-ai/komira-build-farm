@@ -95,24 +95,25 @@ impl<R: Runtime> Leases<R> {
         Some(result_of(id, outcome))
     }
 
-    /// Kills every running lease and returns one ABORTED Result for each. Returns
-    /// once every lease's work has stopped.
+    /// Kills every running lease and returns one ABORTED Result for each, oldest
+    /// first. The kills run together, so fencing takes as long as the slowest lease's
+    /// kill, not the sum. Returns once every lease's work has stopped.
     pub(crate) async fn fence(&mut self) -> Vec<worker::Result> {
         let fenced = std::mem::take(&mut self.running);
-        let mut results = Vec::with_capacity(fenced.len());
-        for (id, task) in fenced {
-            self.runtime.kill(id).await;
+        let runtime = &*self.runtime;
+        let kills = fenced.into_iter().map(|(id, task)| async move {
+            runtime.kill(id).await;
             // The run reports Killed on `done`; `finished` drops it, since the lease is
             // no longer running. Waiting for the task proves the work has ended.
             let _ = task.await;
             tracing::warn!(lease = %id, "lease fenced: contact with the server lost");
-            results.push(failure(
+            failure(
                 id,
                 Code::Aborted,
                 "self-fenced: no acknowledged heartbeat within the fence time",
-            ));
-        }
-        results
+            )
+        });
+        futures::future::join_all(kills).await
     }
 }
 
@@ -204,6 +205,65 @@ mod tests {
         assert_eq!(work.resources, Resources::new(1500, 1 << 30));
         assert_eq!(work.kind, "action");
         assert_eq!(work.action_digest.size_bytes, 7);
+    }
+
+    /// A runtime whose kills meet: no kill returns until every lease's kill has begun.
+    /// Each run ends once a kill has returned.
+    struct Rendezvous {
+        kills: tokio::sync::Barrier,
+        stopped: tokio::sync::Semaphore,
+    }
+
+    impl Runtime for Rendezvous {
+        fn driver(&self) -> &'static str {
+            "rendezvous"
+        }
+
+        fn serves(&self, _kind: &str) -> bool {
+            true
+        }
+
+        async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
+            let permit = self.stopped.acquire().await.expect("open");
+            permit.forget();
+            Err(RuntimeError::Killed)
+        }
+
+        async fn kill(&self, _lease_id: LeaseId) {
+            self.kills.wait().await;
+            self.stopped.add_permits(1);
+        }
+    }
+
+    /// Catches a fence that kills leases one after another: a node with many leases
+    /// would take the sum of their kill times (each up to twice the kill grace plus
+    /// cleanup) to fence. Here each kill waits for the other, so a serial fence never
+    /// ends; the fence must end, with one ABORTED Result per lease, oldest first.
+    #[tokio::test]
+    async fn fence_kills_every_lease_at_once() {
+        let runtime = Arc::new(Rendezvous {
+            kills: tokio::sync::Barrier::new(2),
+            stopped: tokio::sync::Semaphore::new(0),
+        });
+        let (done, _done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(runtime, done);
+        let ids = [LeaseId::new(1, 1), LeaseId::new(1, 2)];
+        for id in ids {
+            let start = Start {
+                lease_id: Some(proto_lease_id(id)),
+                kind: "action".to_owned(),
+                action_digest: Some(Digest::default()),
+                ..Start::default()
+            };
+            assert_eq!(leases.start(start), None);
+        }
+        let results = tokio::time::timeout(std::time::Duration::from_secs(10), leases.fence())
+            .await
+            .expect("the fence killed one lease at a time");
+        let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
+        assert_eq!(fenced, ids.map(|id| Some(proto_lease_id(id))));
+        assert!(results.iter().all(|r| code(r) == Code::Aborted as i32));
+        assert!(leases.running().is_empty());
     }
 
     /// Catches a Start without an action being run anyway.
