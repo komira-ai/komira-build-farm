@@ -283,12 +283,19 @@ fn late_and_duplicate_reports_are_not_proposed() {
     let [second] = h.tick().try_into().unwrap();
     assert_eq!(second.worker, w("b"));
     assert!(second.lease > first.lease);
-    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+    // `a` may still run the lost lease: its room stays booked until `a` says otherwise.
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
     h.commit_and_start(&second);
 
     assert!(h.report(&first, ok(1)).is_empty(), "late result proposed");
     assert_eq!(h.report(&second, ok(2)).len(), 1);
     assert!(h.report(&second, ok(2)).is_empty(), "duplicate proposed");
+    h.heartbeat("a");
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::default()),
+        "booking leaked"
+    );
 }
 
 /// Catches: a committed result accepted from a lease the log had already superseded
@@ -719,13 +726,13 @@ fn a_lease_given_up_but_still_running_keeps_its_room() {
     assert_eq!(next.operation, OperationId(1));
 }
 
-/// Catches: a lease expired to silence after its worker reported a result, given up all
-/// the same (`reconcile` keeps such a lease; `expire` must too). That counts a finished
-/// run as an `INFRA` attempt, and on the last attempt proposes a second result record
-/// for the lease: if the appends are reordered, that record reaches the log first and a
-/// completed action is answered `INFRA`.
+/// Catches: a lease expired to silence after its worker reported a result counted as an
+/// `INFRA` attempt. Its run finished; on the last attempt that proposes a second result
+/// record for the lease, and if the appends are reordered that record reaches the log
+/// first and a completed action is answered `INFRA`. The lease is still given up, as a
+/// silent worker's is, and its result wins if it commits before a new grant.
 #[test]
-fn a_lease_whose_result_was_reported_is_kept_through_silence() {
+fn a_reported_lease_lost_to_silence_is_not_an_attempt() {
     let mut h = Harness::new();
     h.worker("a", 1_000, GIB);
     h.worker("b", 1_000, GIB);
@@ -749,8 +756,8 @@ fn a_lease_whose_result_was_reported_is_kept_through_silence() {
     h.at_secs(180).heartbeat("a");
     h.heartbeat("b");
     let expired = h.at_secs(240).feed(Event::Tick);
-    assert!(expired.is_empty(), "gave up a reported lease: {expired:?}");
-    assert!(h.running(&third), "gave up a reported lease");
+    assert!(expired.is_empty(), "a reported lease counted: {expired:?}");
+    assert_eq!(h.s.state(third.operation), Some(&OpState::Queued));
 
     let answered = h.commit(result);
     let [Effect::Answer(answer)] = answered.as_slice() else {

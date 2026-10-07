@@ -146,6 +146,6 @@ pub enum Event {
     /// Time passed: expire leases on silent workers and run one placement round. An
     /// expired lease counts as a lost one, as in [`Event::Heartbeat`], and stays booked
     /// on its worker until a heartbeat from the worker leaves it out. A lease whose
-    /// result was reported does not expire.
+    /// result was reported expires too, but is not an `INFRA` attempt and books nothing.
     Tick,
 }
