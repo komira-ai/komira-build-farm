@@ -17,11 +17,12 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kbf_daemon::{Runtime, RuntimeError};
+use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
-use kbf_proto::reapi::ActionResult;
+use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_types::{LeaseId, Resources};
 use support::{Spec, blob, exists, store_action, work};
 
@@ -33,14 +34,20 @@ fn var(name: &str) -> String {
 
 /// One test's cgroup parent (under the delegated cgroup), scratch and runtime.
 struct Cell {
+    /// The lease term this test's leases use. Container names are unique per Podman
+    /// store, and the tests share one, so each test gets its own term.
+    term: u64,
     cgroup: PathBuf,
     scratch: PathBuf,
     cas: Arc<MemoryCas>,
     runtime: Arc<PodmanRuntime<MemoryCas>>,
 }
 
+static TERMS: AtomicU64 = AtomicU64::new(1);
+
 impl Cell {
     fn new(name: &str) -> Self {
+        let term = TERMS.fetch_add(1, Ordering::Relaxed);
         let parent = format!("{}/{name}", var("KBF_TEST_CGROUP"));
         let cgroup = Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/'));
         if exists(&cgroup) {
@@ -56,6 +63,7 @@ impl Cell {
         let cas = Arc::new(MemoryCas::new());
         let runtime = Arc::new(PodmanRuntime::new(config, Arc::clone(&cas)).expect("runtime"));
         Self {
+            term,
             cgroup,
             scratch,
             cas,
@@ -63,16 +71,28 @@ impl Cell {
         }
     }
 
+    /// Lease (`term`, `seq`) running `action`.
+    fn work(&self, seq: u64, action: Digest, resources: Resources) -> Work {
+        let mut work = work(seq, action, resources);
+        work.lease_id = LeaseId::new(self.term, seq);
+        work
+    }
+
+    /// The container and lease cgroup name of lease `seq`.
+    fn name(&self, seq: u64) -> String {
+        format!("kbf-lease-{}-{seq}", self.term)
+    }
+
     async fn run(&self, seq: u64, spec: &Spec) -> Result<ActionResult, RuntimeError> {
         let action = store_action(&self.cas, spec);
         self.runtime
-            .run(work(seq, action, Resources::new(1000, 256 << 20)))
+            .run(self.work(seq, action, Resources::new(1000, 256 << 20)))
             .await
     }
 
-    /// Asserts lease (1, `seq`) left no container, cgroup or scratch directory.
+    /// Asserts lease `seq` left no container, cgroup or scratch directory.
     fn assert_clean(&self, seq: u64) {
-        let name = format!("kbf-lease-1-{seq}");
+        let name = self.name(seq);
         assert!(!exists(&self.scratch.join(&name)), "scratch left");
         assert!(!exists(&self.cgroup.join(&name)), "lease cgroup left");
         let names = podman(&["ps", "--all", "--format={{.Names}}"]);
@@ -208,13 +228,10 @@ async fn tags_and_index_digests_are_refused() {
 async fn the_lease_cgroup_carries_the_soft_limits() {
     let cell = Cell::new("limits");
     let action = store_action(&cell.cas, &sh("sleep 5"));
+    let work = cell.work(1, action, Resources::new(2000, 1 << 30));
     let runtime = Arc::clone(&cell.runtime);
-    let run = tokio::spawn(async move {
-        runtime
-            .run(work(1, action, Resources::new(2000, 1 << 30)))
-            .await
-    });
-    let lease = cell.cgroup.join("kbf-lease-1-1");
+    let run = tokio::spawn(async move { runtime.run(work).await });
+    let lease = cell.cgroup.join(cell.name(1));
     let container = wait_for_container_cgroup(&lease).await;
     let read = |dir: &Path, file: &str| {
         std::fs::read_to_string(dir.join(file))
@@ -295,12 +312,12 @@ async fn kill_and_cancel_remove_the_container() {
     let cell = Cell::new("kill");
     for seq in [1, 2] {
         let action = store_action(&cell.cas, &sh("sleep 60"));
+        let work = cell.work(seq, action, Resources::default());
         let runtime = Arc::clone(&cell.runtime);
-        let run =
-            tokio::spawn(async move { runtime.run(work(seq, action, Resources::default())).await });
-        wait_for_container_cgroup(&cell.cgroup.join(format!("kbf-lease-1-{seq}"))).await;
+        let run = tokio::spawn(async move { runtime.run(work).await });
+        wait_for_container_cgroup(&cell.cgroup.join(cell.name(seq))).await;
         if seq == 1 {
-            cell.runtime.kill(LeaseId::new(1, seq)).await;
+            cell.runtime.kill(LeaseId::new(cell.term, seq)).await;
             cell.assert_clean(seq);
             let outcome = run.await.expect("join");
             assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
