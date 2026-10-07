@@ -132,6 +132,7 @@ impl Peer {
             lease_id: Some(LeaseId { term, seq }),
             kind: kind.to_owned(),
             action_digest: Some(digest()),
+            ..Start::default()
         }));
     }
 

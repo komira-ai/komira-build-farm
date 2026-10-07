@@ -15,7 +15,7 @@ use std::sync::Arc;
 use kbf_proto::google::rpc::{Code, Status};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{self, Start};
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, Resources};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -64,17 +64,12 @@ impl<R: Runtime> Leases<R> {
                 format!("no driver here serves lease kind {:?}", start.kind),
             ));
         }
-        let Some(action_digest) = start.action_digest else {
+        let Some(work) = work(id, start) else {
             return Some(failure(
                 id,
                 Code::InvalidArgument,
                 "Start has no action digest",
             ));
-        };
-        let work = Work {
-            lease_id: id,
-            kind: start.kind,
-            action_digest,
         };
         let runtime = Arc::clone(&self.runtime);
         let done = self.done.clone();
@@ -97,15 +92,7 @@ impl<R: Runtime> Leases<R> {
     ) -> Option<worker::Result> {
         self.running.remove(&id)?;
         tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
-        Some(match outcome {
-            Ok(action_result) => worker::Result {
-                lease_id: Some(proto_lease_id(id)),
-                status: Some(Status::default()),
-                action_result: Some(action_result),
-            },
-            Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
-            Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
-        })
+        Some(result_of(id, outcome))
     }
 
     /// Kills every running lease and returns one ABORTED Result for each. Returns
@@ -126,6 +113,38 @@ impl<R: Runtime> Leases<R> {
             ));
         }
         results
+    }
+}
+
+/// The work a Start describes; `None` if it names no action.
+fn work(id: LeaseId, start: Start) -> Option<Work> {
+    Some(Work {
+        lease_id: id,
+        kind: start.kind,
+        action_digest: start.action_digest?,
+        resources: Resources::new(start.millicpus, start.memory_bytes),
+    })
+}
+
+/// The Result that reports a finished run.
+fn result_of(
+    id: LeaseId,
+    outcome: std::result::Result<ActionResult, RuntimeError>,
+) -> worker::Result {
+    match outcome {
+        Ok(action_result) => worker::Result {
+            lease_id: Some(proto_lease_id(id)),
+            status: Some(Status::default()),
+            action_result: Some(action_result),
+        },
+        Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
+        Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
+        Err(RuntimeError::Invalid(why)) => failure(id, Code::InvalidArgument, why),
+        Err(RuntimeError::TimedOut) => failure(
+            id,
+            Code::DeadlineExceeded,
+            "the action ran past its timeout",
+        ),
     }
 }
 
@@ -150,5 +169,71 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
     worker::LeaseId {
         term: id.term,
         seq: id.seq,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_proto::reapi::Digest;
+
+    use super::*;
+
+    fn id() -> LeaseId {
+        LeaseId::new(3, 4)
+    }
+
+    fn code(result: &worker::Result) -> i32 {
+        result.status.as_ref().expect("status").code
+    }
+
+    /// Catches a Start whose booking never reaches the runtime: the container driver
+    /// sizes the lease's cgroup from `Work::resources`.
+    #[test]
+    fn work_carries_the_booked_resources() {
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest {
+                hash: "ab".repeat(32),
+                size_bytes: 7,
+            }),
+            millicpus: 1500,
+            memory_bytes: 1 << 30,
+        };
+        let work = work(id(), start).expect("work");
+        assert_eq!(work.resources, Resources::new(1500, 1 << 30));
+        assert_eq!(work.kind, "action");
+        assert_eq!(work.action_digest.size_bytes, 7);
+    }
+
+    /// Catches a Start without an action being run anyway.
+    #[test]
+    fn a_start_without_an_action_is_no_work() {
+        assert_eq!(work(id(), Start::default()), None);
+    }
+
+    /// Catches an outcome reported under the wrong status: a client error reported as
+    /// INTERNAL would be retried as an infrastructure failure, and a timeout reported
+    /// as OK would be cached.
+    #[test]
+    fn each_outcome_maps_to_its_status() {
+        let ok = result_of(id(), Ok(ActionResult::default()));
+        assert_eq!(code(&ok), Code::Ok as i32);
+        assert!(ok.action_result.is_some());
+        let cases = [
+            (RuntimeError::Killed, Code::Aborted),
+            (RuntimeError::Failed("x".to_owned()), Code::Internal),
+            (
+                RuntimeError::Invalid("tag".to_owned()),
+                Code::InvalidArgument,
+            ),
+            (RuntimeError::TimedOut, Code::DeadlineExceeded),
+        ];
+        for (error, want) in cases {
+            let result = result_of(id(), Err(error));
+            assert_eq!(code(&result), want as i32);
+            assert!(result.action_result.is_none());
+            assert_eq!(result.lease_id, Some(proto_lease_id(id())));
+        }
     }
 }

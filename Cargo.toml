@@ -46,6 +46,7 @@ tracing-subscriber = "0.3.23"
 
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-caps = { path = "crates/kbf-caps" }
+kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
