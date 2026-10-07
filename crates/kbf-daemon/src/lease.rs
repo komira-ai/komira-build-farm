@@ -212,6 +212,8 @@ mod tests {
     struct Rendezvous {
         kills: tokio::sync::Barrier,
         stopped: tokio::sync::Semaphore,
+        /// How many runs have begun.
+        runs: std::sync::atomic::AtomicUsize,
     }
 
     impl Runtime for Rendezvous {
@@ -224,6 +226,7 @@ mod tests {
         }
 
         async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let permit = self.stopped.acquire().await.expect("open");
             permit.forget();
             Err(RuntimeError::Killed)
@@ -244,6 +247,7 @@ mod tests {
         let runtime = Arc::new(Rendezvous {
             kills: tokio::sync::Barrier::new(2),
             stopped: tokio::sync::Semaphore::new(0),
+            runs: std::sync::atomic::AtomicUsize::new(0),
         });
         let (done, _done_rx) = mpsc::unbounded_channel();
         let mut leases = Leases::new(runtime, done);
@@ -264,6 +268,55 @@ mod tests {
         assert_eq!(fenced, ids.map(|id| Some(proto_lease_id(id))));
         assert!(results.iter().all(|r| code(r) == Code::Aborted as i32));
         assert!(leases.running().is_empty());
+    }
+
+    /// Catches a Start that should change nothing starting work anyway: one without a
+    /// lease id, and a resend for a lease already running (a second run of one lease).
+    /// Also a Start with no action answered with anything but INVALID_ARGUMENT, or
+    /// leaving the lease marked running.
+    #[tokio::test]
+    async fn starts_that_change_nothing_or_are_refused() {
+        let runtime = Arc::new(Rendezvous {
+            kills: tokio::sync::Barrier::new(1),
+            stopped: tokio::sync::Semaphore::new(0),
+            runs: std::sync::atomic::AtomicUsize::new(0),
+        });
+        // Rendezvous is only a stand-in; its name is not under test.
+        assert_eq!(runtime.driver(), "rendezvous");
+        let (done, _done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(Arc::clone(&runtime), done);
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..Start::default()
+        };
+        let anonymous = Start {
+            lease_id: None,
+            ..start.clone()
+        };
+        assert_eq!(leases.start(anonymous), None);
+        assert!(leases.running().is_empty());
+        assert_eq!(leases.start(start.clone()), None);
+        assert_eq!(leases.start(start), None);
+        assert_eq!(leases.running(), [id()]);
+
+        let other = LeaseId::new(3, 5);
+        let no_action = Start {
+            lease_id: Some(proto_lease_id(other)),
+            kind: "action".to_owned(),
+            ..Start::default()
+        };
+        let refused = leases.start(no_action).expect("refused at once");
+        assert_eq!(code(&refused), Code::InvalidArgument as i32);
+        assert_eq!(leases.running(), [id()]);
+        // One kill ends one run. Were the resend a second run, the fence would wait
+        // for a run nothing stops (or, if the kill ended that one, `runs` would be 2).
+        let fenced = tokio::time::timeout(std::time::Duration::from_secs(5), leases.fence())
+            .await
+            .expect("the fence waited for a second run of one lease");
+        assert_eq!(fenced.len(), 1);
+        assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Catches a Start without an action being run anyway.
