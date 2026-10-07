@@ -286,11 +286,10 @@ impl Scheduler {
                 let Some(sent) = held.start_sent else {
                     return false;
                 };
-                // MUTANT M5: the grace ends one tick late (> for >=).
-                let due = registered || now > sent.saturating_add(START_GRACE);
+                let due = registered || now >= sent.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
                 due && !running.contains(lease)
-                    && !op.result_proposed
+                    // MUTANT M6: a lease with a reported result is not kept.
                     && op.state.holding().is_some_and(|(_, w)| w == worker)
             })
             .map(|(_, held)| held.operation)
