@@ -174,6 +174,50 @@ async fn programs_are_found_as_reapi_says() {
     assert_eq!(local.text(result.stdout_digest.as_ref()), "bare\n");
 }
 
+/// Catches a program that cannot be executed only because another process still
+/// holds it open for writing (ETXTBSY) failing the lease at once. Any thread that
+/// forks while an input file is being written makes this happen: the child holds the
+/// write descriptor until it execs. Seen as a flake of the test above, with leases
+/// running in parallel.
+#[tokio::test]
+async fn a_program_busy_for_a_moment_still_runs() {
+    let local = Local::new("local-busy");
+    let busy = scratch("local-busy-program").join("busy.sh");
+    let mut writer = std::fs::File::create(&busy).expect("create");
+    std::io::Write::write_all(&mut writer, b"#!/bin/sh\necho ran\n").expect("write");
+    std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut spec = Spec::sh("");
+    spec.argv = vec![busy.display().to_string()];
+    let action = spec.store(&local.cas);
+    let runtime = Arc::clone(&local.runtime);
+    let run = tokio::spawn(async move { runtime.run(work(1, action)).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(writer);
+    let result = run
+        .await
+        .expect("no panic")
+        .expect("ran once the file was closed");
+    assert_eq!(local.text(result.stdout_digest.as_ref()), "ran\n");
+}
+
+/// Catches a program that stays busy being waited for forever.
+#[tokio::test]
+async fn a_program_busy_for_good_fails() {
+    let local = Local::new("local-busy-long");
+    let busy = scratch("local-busy-long-program").join("busy.sh");
+    let _writer = std::fs::File::create(&busy).expect("create");
+    std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut spec = Spec::sh("");
+    spec.argv = vec![busy.display().to_string()];
+    let outcome = tokio::time::timeout(Duration::from_secs(10), local.run_spec(1, &spec))
+        .await
+        .expect("gives up in time");
+    assert!(
+        matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("busy")),
+        "{outcome:?}"
+    );
+}
+
 /// Catches an action that breaks a rule being run anyway, or reported as the farm's
 /// failure (it would be retried elsewhere) instead of the client's.
 #[tokio::test]

@@ -23,6 +23,9 @@ pub const USAGE_TYPE_URL: &str = "type.googleapis.com/kbf.worker.v1.ResourceUsag
 /// reports is late by at most this much.
 pub const POLL: Duration = Duration::from_millis(2);
 
+/// How long [`Child::spawn`] waits for a busy program file to be closed.
+pub const BUSY_WAIT: Duration = Duration::from_secs(2);
+
 /// `usage` as an `auxiliary_metadata` entry.
 #[must_use]
 pub fn usage_any(usage: &ResourceUsage) -> Any {
@@ -64,16 +67,32 @@ pub struct Child {
 impl Child {
     /// Spawns `command` as the leader of a new process group.
     ///
+    /// A program that is still open for writing somewhere cannot be executed
+    /// (ETXTBSY). A just-written input file is, for a moment, whenever another thread
+    /// forks: the child holds the write descriptor until it execs. So a busy program
+    /// is retried every [`POLL`] for up to [`BUSY_WAIT`].
+    ///
     /// # Errors
     /// The process could not be started.
-    pub fn spawn(mut command: Command) -> io::Result<Self> {
+    pub async fn spawn(mut command: Command) -> io::Result<Self> {
         use std::os::unix::process::CommandExt as _;
-        let started = Instant::now();
-        let child = command.process_group(0).spawn()?;
-        // Dropping a `std::process::Child` neither waits for it nor kills it: the
-        // process is this type's to reap. A pid always fits `pid_t`.
-        let pid = child.id() as libc::pid_t;
-        Ok(Self { pid, started })
+        command.process_group(0);
+        let give_up = Instant::now() + BUSY_WAIT;
+        loop {
+            let started = Instant::now();
+            match command.spawn() {
+                Ok(child) => {
+                    // Dropping a `std::process::Child` neither waits for it nor kills
+                    // it: the process is this type's to reap. A pid always fits `pid_t`.
+                    let pid = child.id() as libc::pid_t;
+                    return Ok(Self { pid, started });
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && started < give_up => {
+                    tokio::time::sleep(POLL).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Waits for the process to exit, polling every [`POLL`]. When `stop` completes

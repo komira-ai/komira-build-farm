@@ -157,7 +157,9 @@ impl<C: Cas> LocalRuntime<C> {
             .stdout(stdout)
             .stderr(stderr);
         clock.0.execution_start_timestamp = now();
-        let child = Child::spawn(process).map_err(|e| failed(&program, &e))?;
+        let child = Child::spawn(process)
+            .await
+            .map_err(|e| failed(&program, &e))?;
         let stopped = async {
             // The sender is dropped only after `run` is done with this receiver.
             let _ = stop.await;
