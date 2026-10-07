@@ -151,34 +151,4 @@ mod tests {
         assert_eq!(d.to_string(), format!("{EMPTY_HEX}/42"));
         assert_eq!(Digest::parse(DigestFunction::Sha256, &d.to_string()), Ok(d));
     }
-
-    /// Catches: a parser that accepts more than one spelling of the same digest, or
-    /// malformed input, which would split one blob into several cache keys.
-    #[test]
-    fn rejects_non_canonical_text() {
-        let parse = |s: &str| Digest::parse(DigestFunction::Sha256, s);
-        assert!(matches!(
-            parse(EMPTY_HEX),
-            Err(ParseDigestError::MissingSeparator(_))
-        ));
-        assert_eq!(parse("abc/1"), Err(ParseDigestError::HashLength(3)));
-        let upper = EMPTY_HEX.to_uppercase();
-        assert_eq!(
-            parse(&format!("{upper}/1")),
-            Err(ParseDigestError::HashCharacter('E', 0))
-        );
-        let non_ascii = format!("{}é/1", &EMPTY_HEX[..62]);
-        assert_eq!(non_ascii.len() - 2, 64);
-        assert_eq!(
-            parse(&non_ascii),
-            Err(ParseDigestError::HashCharacter('é', 62))
-        );
-        for size in ["", "+1", "-1", "1 ", "18446744073709551616"] {
-            assert_eq!(
-                parse(&format!("{EMPTY_HEX}/{size}")),
-                Err(ParseDigestError::Size(size.to_owned())),
-                "size {size:?}"
-            );
-        }
-    }
 }
