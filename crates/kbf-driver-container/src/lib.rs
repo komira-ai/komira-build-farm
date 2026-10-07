@@ -5,7 +5,9 @@
 //! - the image named by digest in the action's `container-image` platform property
 //!   (`docker://<repo>@sha256:<d>`); a tag, or an index digest, is `INVALID_ARGUMENT`;
 //! - the input root as a read-only overlay lower layer at `/kbf/root`, every write in
-//!   a per-lease upper directory that the outputs are read from;
+//!   a per-lease upper directory that the outputs are read from. The upper directory
+//!   holds only what the action created or changed, so an output path that is already
+//!   in the input root is refused as `INVALID_ARGUMENT` before anything runs;
 //! - no network (`--network=none`: loopback only);
 //! - a lease cgroup under the daemon's delegated `actions/` cgroup, with
 //!   `memory.high` = reservation x 1.5 + 512 MiB, swap allowed, no per-lease hard cap,

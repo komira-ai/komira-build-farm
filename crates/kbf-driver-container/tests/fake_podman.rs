@@ -419,6 +419,12 @@ async fn a_dropped_run_still_cleans_up() {
     assert!(run.await.expect_err("cancelled").is_cancelled());
     fake.assert_clean(1);
     assert!(fake.calls().contains(&"rm".to_owned()));
+    // On real Podman a run dropped mid-start leaves `crun create` in the lease, and
+    // `podman rm --force` does not wait for it; the clean kills the cgroup first.
+    assert!(
+        fake.state.join("killed-before-rm").exists(),
+        "podman rm ran before cgroup.kill"
+    );
 
     // A dropped run whose clean fails still removes what it can (and logs the rest).
     fake.knob("rm-fails", "");
@@ -767,4 +773,78 @@ async fn unreadable_outputs_fail_and_shadowed_ones_are_absent() {
         "{outcome:?}"
     );
     fake.assert_clean(2);
+}
+
+/// Catches an output that is already an input being run and cached incomplete: the
+/// driver reads outputs from the overlay's upper layer, so an output directory `pkg`
+/// over the input `pkg/in.txt` would come back holding only what the action wrote, and
+/// an unchanged input named as an output file would come back missing. Each is the
+/// client's error, refused before Podman creates anything.
+#[tokio::test]
+async fn outputs_that_are_inputs_are_refused_before_anything_runs() {
+    let fake = Fake::new("overlap");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = vec![("pkg/in.txt", b"input bytes", false)];
+    let script = r#"echo x > "$UPPER/pkg/new""#;
+    for (seq, (wd, output)) in [("", "pkg"), ("", "pkg/in.txt"), ("pkg", "in.txt")]
+        .into_iter()
+        .enumerate()
+    {
+        let seq = seq as u64 + 1;
+        spec.working_directory = wd.to_owned();
+        spec.outputs = vec![output.to_owned()];
+        let outcome = fake.run(seq, &spec, script).await;
+        assert!(
+            matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains(output)),
+            "{wd:?} {output:?}: {outcome:?}"
+        );
+        fake.assert_clean(seq);
+    }
+    assert!(
+        !fake.calls().contains(&"create".to_owned()),
+        "{:?}",
+        fake.calls()
+    );
+
+    // An output beside the inputs, under an input directory, still runs.
+    spec.working_directory = String::new();
+    spec.outputs = vec!["pkg/new".to_owned()];
+    let result = fake.run(4, &spec, script).await.expect("ran");
+    assert_eq!(result.output_files.len(), 1, "{result:?}");
+    assert_eq!(
+        blob(&fake.cas, result.output_files[0].digest.as_ref()),
+        b"x\n"
+    );
+    fake.assert_clean(4);
+}
+
+/// Catches a kill that waits for a slow prepare step (an input fetch, an image store
+/// query) to finish before it stops the lease: the fence of a node that lost contact
+/// would wait as long. Here `podman image inspect` hangs for 30 s; the kill must
+/// return, with the lease Killed and clean, well before that.
+#[tokio::test]
+async fn a_kill_during_prepare_stops_it_at_once() {
+    let fake = Fake::new("kill-prepare");
+    fake.knob("image-hangs", "");
+    let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
+    let runtime = Arc::clone(&fake.runtime);
+    let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
+    for _ in 0..500 {
+        if fake.calls().contains(&"image".to_owned()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fake.calls(),
+        ["image"],
+        "prepare never reached the image check"
+    );
+    let kill = fake.runtime.kill(kbf_types::LeaseId::new(1, 1));
+    tokio::time::timeout(Duration::from_secs(10), kill)
+        .await
+        .expect("the kill waited for the prepare step");
+    let outcome = run.await.expect("join");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    fake.assert_clean(1);
 }

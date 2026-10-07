@@ -41,7 +41,8 @@ pub(crate) struct ContainerSpec {
 /// - **Entrypoint:** the action's argv as a JSON array, so the image's `ENTRYPOINT`
 ///   and `CMD` are both ignored (RFC 10.5) and no argument is re-split.
 /// - **Files:** the input root as an overlay: the host copy is never written, and
-///   every write lands in `upper`, which the driver reads outputs from.
+///   every write lands in `upper`, which the driver reads outputs from (no output may
+///   already be an input, so each is whole there).
 /// - **Memory:** `memory.oom.group=1` on the container, so an OOM kill takes the whole
 ///   action. Limits live on the lease cgroup (see `cgroup`), never `--memory`.
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {

@@ -6,6 +6,7 @@
 #
 # Knobs (files in $STATE the test writes):
 #   image-id         what `image inspect` prints; absent: the image is not in the store
+#   image-hangs      `image inspect` hangs (a slow prepare step)
 #   info-fails       `info` fails
 #   store/           the image store `info` names (store/fake-images/<id>/=<key>)
 #   action.sh        what `start --attach` runs (env: ROOT, UPPER, CG)
@@ -17,7 +18,8 @@
 #   rm-fails         `rm` fails
 #   unshare-noop     `unshare rm` succeeds without removing anything
 #   unshare-fails    `unshare rm` fails
-# Records: create.args (one argument per line), calls (one verb per line), removed.
+# Records: create.args (one argument per line), calls (one verb per line), removed,
+#   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written).
 set -u
 here=$(dirname "$0")
 STATE=$here/state
@@ -31,6 +33,7 @@ echo "$verb" >>"$STATE/calls"
 
 case $verb in
 image)
+    [ -f "$STATE/image-hangs" ] && exec sleep 30
     [ -f "$STATE/image-id" ] || { echo "Error: image not known" >&2; exit 125; }
     cat "$STATE/image-id"
     ;;
@@ -89,6 +92,9 @@ kill)
 rm)
     [ -f "$STATE/rm-fails" ] && { echo "Error: rm refused" >&2; exit 125; }
     touch "$STATE/removed"
+    if [ -f "$STATE/cgroup" ] && [ -e "$CGROOT$(cat "$STATE/cgroup")/cgroup.kill" ]; then
+        touch "$STATE/killed-before-rm"
+    fi
     # --force: a container still running is killed.
     [ -f "$STATE/pid" ] && kill -KILL "$(cat "$STATE/pid")" 2>/dev/null
     # Interface files are not files to rmdir on cgroupfs; here they are, so the fake

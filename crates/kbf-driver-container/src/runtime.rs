@@ -2,7 +2,8 @@
 //!
 //! Each lease goes through the six driver steps (RFC 10.1):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
-//!    input root into the lease's scratch directory, make the lease cgroup;
+//!    input root into the lease's scratch directory, refuse outputs that are inputs,
+//!    make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
 //! 4. **collect:** the exit code from Podman's record, OOM from the lease cgroup's
@@ -30,7 +31,10 @@ use crate::cas::Cas;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::podman::{ContainerSpec, Podman};
-use crate::tree::{TreeError, check_relative, collect, fetch_message, materialize, output_paths};
+use crate::tree::{
+    TreeError, check_relative, collect, fetch_message, materialize, output_paths,
+    refuse_outputs_in_inputs,
+};
 
 /// The driver name in the node report.
 pub const DRIVER: &str = "container";
@@ -84,6 +88,15 @@ pub enum ConfigError {
 /// A killer waiting for a lease's work to stop.
 type Stop = oneshot::Sender<()>;
 
+/// A prepared lease: what `podman create` needs and what collecting needs.
+struct Prepared {
+    spec: ContainerSpec,
+    outputs: Vec<String>,
+    /// The working directory in the overlay's upper layer, where outputs are read.
+    out_dir: PathBuf,
+    timeout: Duration,
+}
+
 /// Runs `action` leases in rootless Podman.
 #[derive(Debug)]
 pub struct PodmanRuntime<C> {
@@ -119,14 +132,8 @@ impl<C: Cas> PodmanRuntime<C> {
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Steps 1 to 4. `killer` receives the sender of a kill that stopped the work.
-    async fn attempt(
-        &self,
-        work: &Work,
-        lease: &mut Lease,
-        stop: &mut oneshot::Receiver<Stop>,
-        killer: &mut Option<Stop>,
-    ) -> Result<ActionResult, RuntimeError> {
+    /// Step 1: everything up to `podman create`.
+    async fn prepare(&self, work: &Work, lease: &mut Lease) -> Result<Prepared, RuntimeError> {
         let cas = &*self.cas;
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
@@ -165,6 +172,10 @@ impl<C: Cas> PodmanRuntime<C> {
         materialize(cas, input_root, &root)
             .await
             .map_err(tree_error)?;
+        // Outputs are read from the upper layer, so none may already be an input.
+        refuse_outputs_in_inputs(&root, &command.working_directory, &outputs)
+            .await
+            .map_err(tree_error)?;
         // REAPI: the worker makes the working directory and each output's parent.
         let out_dir = upper.join(&command.working_directory);
         let parents = outputs
@@ -195,6 +206,38 @@ impl<C: Cas> PodmanRuntime<C> {
                 .collect(),
             argv: command.arguments.clone(),
         };
+        Ok(Prepared {
+            spec,
+            outputs,
+            out_dir,
+            timeout,
+        })
+    }
+
+    /// Steps 1 to 4. `killer` receives the sender of a kill that stopped the work.
+    async fn attempt(
+        &self,
+        work: &Work,
+        lease: &mut Lease,
+        stop: &mut oneshot::Receiver<Stop>,
+        killer: &mut Option<Stop>,
+    ) -> Result<ActionResult, RuntimeError> {
+        // A kill during prepare (a long input fetch) stops it at once: dropping the
+        // future drops any Podman query with it (`kill_on_drop`), and the clean step
+        // removes whatever was written.
+        let Prepared {
+            spec,
+            outputs,
+            out_dir,
+            timeout,
+        } = tokio::select! {
+            prepared = self.prepare(work, lease) => prepared?,
+            Ok(by) = &mut *stop => {
+                *killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        };
+        let cas = &*self.cas;
         lease.created = true;
         self.podman
             .create(&spec)

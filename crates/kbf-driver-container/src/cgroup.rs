@@ -115,7 +115,7 @@ impl LeaseCgroup {
     }
 
     /// Removes the cgroup and any cgroups left below it, deepest first. A cgroup still
-    /// emptying is retried for up to two seconds. Blocking: run it off the async threads.
+    /// emptying is retried for up to five seconds. Blocking: run it off the async threads.
     pub(crate) fn remove(&self) -> io::Result<()> {
         remove_tree(&self.dir)
     }

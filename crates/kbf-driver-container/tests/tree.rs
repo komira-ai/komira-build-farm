@@ -4,7 +4,7 @@
 mod support;
 
 use kbf_driver_container::cas::digest_of;
-use kbf_driver_container::tree::{TreeError, materialize, output_paths};
+use kbf_driver_container::tree::{TreeError, materialize, output_paths, refuse_outputs_in_inputs};
 use kbf_driver_container::{CasError, MemoryCas};
 use kbf_proto::reapi::{Command, Directory, DirectoryNode, FileNode, SymlinkNode};
 use prost::Message;
@@ -177,4 +177,60 @@ fn output_paths_old_and_new() {
             "{bad:?}"
         );
     }
+}
+
+/// Catches an output that is already an input being run: the driver reads outputs from
+/// the overlay's upper layer, which lacks the unchanged inputs, so the result would be
+/// cached incomplete. Also catches the opposite defect, a path that only passes
+/// through an input (a parent that is an input directory, or a component that is an
+/// input file or symlink the driver's upper directory hides) being refused, a symlink
+/// in the input root being followed out of it, and an unreadable input directory read
+/// as "no overlap".
+#[tokio::test]
+async fn outputs_that_are_inputs_are_refused() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = support::scratch("tree-overlap");
+    let outside = support::scratch("tree-overlap-outside");
+    std::fs::create_dir_all(root.join("pkg/sub")).expect("mkdir");
+    std::fs::create_dir_all(outside.join("x")).expect("mkdir outside");
+    std::fs::write(root.join("pkg/in.txt"), b"in").expect("write");
+    std::fs::write(root.join("file"), b"f").expect("write");
+    symlink(&outside, root.join("pkg/escape")).expect("symlink");
+    let check = |wd: &'static str, output: &str| {
+        let root = root.clone();
+        let outputs = vec![output.to_owned()];
+        async move { refuse_outputs_in_inputs(&root, wd, &outputs).await }
+    };
+    for (wd, output) in [
+        ("", "pkg"),
+        ("", "pkg/in.txt"),
+        ("pkg", "in.txt"),
+        ("pkg", "sub"),
+        ("pkg", "escape"),
+    ] {
+        let outcome = check(wd, output).await;
+        assert!(
+            matches!(outcome, Err(TreeError::Invalid(ref why)) if why.contains(output)),
+            "{wd:?} {output:?}: {outcome:?}"
+        );
+    }
+    for (wd, output) in [
+        ("", "out"),
+        ("", "pkg/new"),
+        ("pkg", "sub/new/deeper"),
+        ("absent", "pkg"),
+        ("", "file/x"),
+        ("pkg", "escape/x"),
+    ] {
+        let outcome = check(wd, output).await;
+        assert!(outcome.is_ok(), "{wd:?} {output:?}: {outcome:?}");
+    }
+
+    std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod");
+    let outcome = check("", "pkg/in.txt").await;
+    std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod back");
+    assert!(matches!(outcome, Err(TreeError::Io { .. })), "{outcome:?}");
 }

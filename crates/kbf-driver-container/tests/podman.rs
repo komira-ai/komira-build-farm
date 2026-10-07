@@ -190,6 +190,63 @@ async fn an_action_runs_and_its_results_are_collected() {
     cell.assert_clean(1);
 }
 
+/// Outputs are read from the overlay's upper layer. Catches an output that is already
+/// an input being run (it would come back partial), and an input moved into an output
+/// coming back partial: if the overlay recorded the move as a redirect, or a chmod as
+/// a metadata-only copy-up, the upper layer would hold the directory without its
+/// files, the file without its bytes, or a deleted file as a whiteout.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn outputs_are_whole_and_never_inputs() {
+    let cell = Cell::new("overlap");
+    let mut spec = sh("echo x > in/new");
+    spec.inputs = vec![("in/a.txt", b"a", false)];
+    spec.outputs = vec!["in".to_owned()];
+    let outcome = cell.run(1, &spec).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Invalid(_))),
+        "{outcome:?}"
+    );
+    cell.assert_clean(1);
+
+    let mut spec = sh(
+        "set -e; mv src/a.txt out/moved.txt; chmod +x out/moved.txt; \
+         mv lib out/dir; rm out/dir/b.txt",
+    );
+    spec.inputs = vec![
+        ("src/a.txt", b"a bytes", false),
+        ("lib/b.txt", b"b", false),
+        ("lib/c/d.txt", b"d bytes", false),
+    ];
+    spec.outputs = vec!["out/moved.txt".to_owned(), "out/dir".to_owned()];
+    let result = cell.run(2, &spec).await.expect("ran");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&blob(&cell.cas, result.stderr_digest.as_ref()))
+    );
+    assert_eq!(result.output_files.len(), 1, "{result:?}");
+    let moved = &result.output_files[0];
+    assert_eq!(blob(&cell.cas, moved.digest.as_ref()), b"a bytes");
+    assert!(moved.is_executable);
+    assert_eq!(result.output_directories.len(), 1, "{result:?}");
+    let tree = support::tree(&cell.cas, result.output_directories[0].tree_digest.as_ref());
+    let root = tree.root.expect("root");
+    assert!(
+        root.files.is_empty() && root.symlinks.is_empty(),
+        "{root:?}"
+    );
+    assert_eq!(root.directories.len(), 1, "{root:?}");
+    assert_eq!(root.directories[0].name, "c");
+    assert_eq!(tree.children.len(), 1);
+    let d = &tree.children[0].files;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].name, "d.txt");
+    assert_eq!(blob(&cell.cas, d[0].digest.as_ref()), b"d bytes");
+    cell.assert_clean(2);
+}
+
 /// The marker test. The action writes a uniquely named marker outside its output
 /// directory: in the container's root, its /tmp, and beside its inputs. Catches a
 /// skipped or partial clean step: after the lease ends no file of that name may exist

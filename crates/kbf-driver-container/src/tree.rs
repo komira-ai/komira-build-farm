@@ -163,11 +163,61 @@ pub fn output_paths(command: &kbf_proto::reapi::Command) -> Result<Vec<String>, 
     Ok(paths)
 }
 
+/// Refuses an output path that names an entry of the input root `root` (seen from
+/// `working_directory`).
+///
+/// The driver reads outputs from the overlay's upper directory, which holds only what
+/// the action created or changed. An output that is already an input would come back
+/// partial: an unchanged input file missing, an output directory without its unchanged
+/// inputs, a deleted file as a skipped whiteout. REAPI allows such actions; Bazel and
+/// Buck2 never send them. So they are refused as the client's error rather than run and
+/// cached incomplete.
+///
+/// The walk follows no symlink. A component that is absent, or that is not a
+/// directory, ends it with "no overlap": the driver makes each output's parent a
+/// directory in the upper layer, and an upper directory hides a lower file or symlink
+/// of the same name instead of merging with it.
+pub async fn refuse_outputs_in_inputs(
+    root: &Path,
+    working_directory: &str,
+    outputs: &[String],
+) -> Result<(), TreeError> {
+    for output in outputs {
+        // Collected before the walk: a closure-holding iterator kept across an await
+        // makes the future not `Send` for every lifetime.
+        let parts: Vec<&str> = working_directory
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .chain(output.split('/'))
+            .collect();
+        let mut host = root.to_owned();
+        for (i, part) in parts.iter().enumerate() {
+            host.push(part);
+            let meta = match fs::symlink_metadata(&host).await {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io(&host)(e)),
+            };
+            if i + 1 == parts.len() {
+                return Err(TreeError::Invalid(format!(
+                    "output path {output:?} names an entry of the input root; outputs that \
+                     overlap the inputs are not supported"
+                )));
+            }
+            if !meta.is_dir() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads each output path under `dir` (the action's working directory as the action
 /// left it) into the CAS and records it in `result`. A path the action did not create
 /// is left out, including one whose parent the action replaced with a file; an entry
-/// that is not a file, directory or symlink (an overlay whiteout, a socket) is left
-/// out too.
+/// that is not a file, directory or symlink (a socket, a FIFO) is left out too. No
+/// output overlaps the input root (`refuse_outputs_in_inputs`), so every output is
+/// whole in the upper directory.
 pub async fn collect(
     cas: &impl Cas,
     dir: &Path,
