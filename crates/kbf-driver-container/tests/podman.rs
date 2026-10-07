@@ -45,8 +45,38 @@ struct Cell {
 
 static TERMS: AtomicU64 = AtomicU64::new(1);
 
+/// Each cgroup under `dir` with the processes in it, for a failure message.
+fn describe(dir: &Path) -> String {
+    let mut out = String::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(d) = pending.pop() {
+        let procs = std::fs::read_to_string(d.join("cgroup.procs")).unwrap_or_default();
+        let commands: Vec<String> = procs
+            .split_whitespace()
+            .map(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                    .unwrap_or_default()
+                    .replace('\0', " ")
+            })
+            .collect();
+        out.push_str(&format!("\n  {}: {commands:?}", d.display()));
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// Shows the driver's logs (its clean errors among them) in a failing test's output.
+fn trace() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+}
+
 impl Cell {
     fn new(name: &str) -> Self {
+        trace();
         let term = TERMS.fetch_add(1, Ordering::Relaxed);
         let parent = format!("{}/{name}", var("KBF_TEST_CGROUP"));
         let cgroup = Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/'));
@@ -93,8 +123,13 @@ impl Cell {
     /// Asserts lease `seq` left no container, cgroup or scratch directory.
     fn assert_clean(&self, seq: u64) {
         let name = self.name(seq);
-        assert!(!exists(&self.scratch.join(&name)), "scratch left");
-        assert!(!exists(&self.cgroup.join(&name)), "lease cgroup left");
+        assert!(!exists(&self.scratch.join(&name)), "{name}: scratch left");
+        let lease = self.cgroup.join(&name);
+        assert!(
+            !exists(&lease),
+            "{name}: lease cgroup left: {}",
+            describe(&lease)
+        );
         let names = podman(&["ps", "--all", "--format={{.Names}}"]);
         assert!(!names.lines().any(|n| n == name), "container left: {names}");
     }
@@ -312,13 +347,14 @@ async fn a_timeout_stops_the_container() {
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn kill_and_cancel_remove_the_container() {
     let cell = Cell::new("kill");
-    for seq in [1, 2] {
+    // Several rounds: a lease cgroup left after kill or cancel showed up once in hosted CI.
+    for seq in 1..=6 {
         let action = store_action(&cell.cas, &sh("sleep 60"));
         let work = cell.work(seq, action, Resources::default());
         let runtime = Arc::clone(&cell.runtime);
         let run = tokio::spawn(async move { runtime.run(work).await });
         wait_for_container_cgroup(&cell.cgroup.join(cell.name(seq))).await;
-        if seq == 1 {
+        if seq % 2 == 1 {
             cell.runtime.kill(LeaseId::new(cell.term, seq)).await;
             cell.assert_clean(seq);
             let outcome = run.await.expect("join");
