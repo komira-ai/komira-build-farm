@@ -179,7 +179,7 @@ jobs:
       - name: Diagnose export variants
         shell: bash
         run: |
-          mkdir -p target/coverage
+          set +e; mkdir -p target/coverage
           v() { name=$1; shift; echo "::group::variant $name"; "$@" > "target/coverage/$name.out" 2> "target/coverage/$name.err"; rc=$?; tail -c 600 "target/coverage/$name.err"; echo "::endgroup::"; echo "VARIANT $name rc=$rc bytes=$(wc -c < target/coverage/$name.out)"; }
           C="cargo +$COVERAGE_TOOLCHAIN llvm-cov report"
           v default-1 $C --lcov
