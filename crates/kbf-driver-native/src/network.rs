@@ -10,6 +10,20 @@
 //! **not enforced**: the action runs with the node's network. Which of the two a node
 //! has is reported as the capability `network_isolation` (`sandbox-exec` or `none`),
 //! so nothing about it is hidden.
+//!
+//! What "off" does not cover:
+//! - Unix sockets are allowed, any of them, so a local service that talks to the
+//!   network on the action's behalf is reachable. The plainest is the system's
+//!   resolver (`mDNSResponder`): DNS lookups still go out, and a name an action looks
+//!   up can carry data out of the node. Loopback services likewise.
+//! - The profile also denies job submission to launchd and Launch Services opens
+//!   ([`NO_NETWORK_PROFILE`]), the two plain ways to start a process launchd runs
+//!   outside the sandbox and the action's tree. Anything else the daemon's user can
+//!   schedule (a `LaunchAgents` plist that runs at its next login, `at`, `cron`, a
+//!   loopback `ssh`) is not covered; a per-lease user is the follow-up that closes
+//!   this class.
+//! - An action that asks for the network runs without `sandbox-exec` at all, so none
+//!   of the above applies to it.
 
 use std::path::{Path, PathBuf};
 
@@ -26,9 +40,15 @@ pub const CAPABILITY: &str = "network_isolation";
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// The sandbox profile for an action without the network: everything allowed but
-/// network operations, which are allowed only to loopback and Unix sockets.
+/// network operations, which are allowed only to loopback and Unix sockets, and
+/// handing work to launchd, which would run it outside the sandbox and outside the
+/// action's process tree: submitting or loading a job (`launchctl submit`,
+/// `bootstrap`, `load`: the `job-creation` operation) and opening an application or
+/// document through Launch Services (`open`: `lsopen`).
 pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
+(deny job-creation)\n\
+(deny lsopen)\n\
 (deny network*)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
 (allow network* (remote ip \"localhost:*\"))\n\
