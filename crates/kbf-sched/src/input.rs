@@ -92,6 +92,12 @@ pub enum Event {
     /// no longer runs it). A lease whose `Start` is not yet sent, or whose result has
     /// already been reported, is kept whether listed or not.
     ///
+    /// Each lease given up this way after its `Start` went out is one `INFRA` attempt;
+    /// the one that spends the last of [`INFRA_ATTEMPTS`] makes this input propose an
+    /// `INFRA` failure for its operation. A lease `running` lists that the scheduler gave
+    /// up on this worker (its `Start` arrived late) is booked on the worker until a
+    /// heartbeat leaves it out.
+    ///
     /// Worker contract: a lease whose `Start` went to an earlier session is requeued on
     /// the first heartbeat that leaves it out, with no grace. So a restarted daemon must
     /// finish re-adopting its lease units before it sends its first heartbeat on the new
@@ -102,6 +108,7 @@ pub enum Event {
     ///
     /// [`START_GRACE`]: crate::fence::START_GRACE
     /// [`SELF_FENCE`]: crate::fence::SELF_FENCE
+    /// [`INFRA_ATTEMPTS`]: crate::INFRA_ATTEMPTS
     Heartbeat {
         /// The worker.
         worker: WorkerId,
@@ -136,6 +143,7 @@ pub enum Event {
         /// What happened.
         outcome: Outcome,
     },
-    /// Time passed: expire leases on silent workers and run one placement round.
+    /// Time passed: expire leases on silent workers and run one placement round. An
+    /// expired lease counts as a lost one, as in [`Event::Heartbeat`].
     Tick,
 }

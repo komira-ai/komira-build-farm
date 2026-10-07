@@ -618,6 +618,11 @@ fn lost_leases_are_retried_elsewhere_then_fail_after_three() {
         [Effect::Commit(infra_failure(&third))],
         "attempt 3 did not fail it"
     );
+    let lease = third.lease;
+    assert_eq!(
+        h.s.state(third.operation),
+        Some(&OpState::Failing { lease })
+    );
     assert!(h.tick().is_empty(), "granted a fourth time");
     assert_eq!(h.s.queued().count(), 0);
     let late = h.report(&third, ok(1));

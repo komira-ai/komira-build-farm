@@ -27,7 +27,9 @@ pub const LEASE_GRACE: Duration = Duration::from_secs(60);
 /// still be on its way, and a heartbeat sent before it arrived rightly omits it; after
 /// that the lease is taken as lost and its operation requeued. RFC section 5.8 has one
 /// wait before re-dispatch, G; this is G, counted from the `Start`. It assumes a `Start`
-/// reaches a connected worker within G or never.
+/// reaches a connected worker within G or never. A `Start` that arrives later runs a
+/// lease the scheduler gave up: its result is fenced, and the scheduler books it on the
+/// worker once a heartbeat lists it, but a self-fenced action can run twice meanwhile.
 pub const START_GRACE: Duration = LEASE_GRACE;
 
 /// T: how long after sending its newest acknowledged heartbeat a worker keeps running a
