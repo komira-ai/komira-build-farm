@@ -23,8 +23,14 @@ gh run view <run id> --log | grep ' SPIKE '
 ## Where the numbers come from
 
 All numbers below come from run `37585958715` (commit `7f8a6f4`) unless a row says
-otherwise. Earlier runs `37584012663` and `37584743766` repeated the I/O and memory
-probes with the same results, within the ranges given.
+otherwise. Earlier runs `37583366334` (`a7a58ae`), `37584012663` (`01aaadb`) and
+`37584743766` (`429a7b4`) ran the I/O probe on earlier versions of the scripts; the
+"over four runs" bounds below take all four runs. Their p99 ranges, where they differ
+from the measurement run: x86 baseline 0.85 to 1.98 ms and `io.max` set 3.02 to
+3.4 ms; arm `io.max` set 17.7 to 18.3 ms in `37583366334` and `37584743766`, and 23.2
+to 23.8 ms in `37584012663` (before the CPU and I/O halves of the hog were split into
+separate arms in `429a7b4`); arm `CPUWeight=1000` arm 18.5 to 19.1 ms in
+`37584743766`. None of them changes a verdict.
 
 | | x86 job | arm job |
 |---|---|---|
@@ -40,7 +46,7 @@ probes with the same results, within the ranges given.
 
 | Test | Verdict | Measured (x86 / arm) |
 |---|---|---|
-| **Converged slices.** A CPU and disk hog runs in the actions slice. A Raft-style fsync probe in the server slice must keep p99 under 10 ms. The mutant drops the `io.max` and `io.latency` lines. | **x86: fits with limits.** It covers the `io.max` half only. **`io.latency` half: farm probe.** **arm: farm probe.** | x86, `io.max` set: p99 2.8 to 3.0 ms (at most 3.4 ms over four runs). Lines dropped: 686 to 1331 ms (at least 59.9 ms over four runs). The kernel has no `io.latency` (see Limits). arm, `io.max` set: p99 16.8 to 18.9 ms at either cap, even with the probe on its own filesystem. Lines dropped: 107 to 1040 ms (at least 35.8 ms over four runs). |
+| **Converged slices.** A CPU and disk hog runs in the actions slice. A Raft-style fsync probe in the server slice must keep p99 under 10 ms. The mutant drops the `io.max` and `io.latency` lines. | **x86: fits with limits.** It covers the `io.max` half only. **`io.latency` half: farm probe.** **arm: farm probe.** | x86, `io.max` only: p99 3.0 to 3.2 ms; `io.max` and `io.latency` lines: 2.8 to 3.0 ms (at most 3.4 ms over four runs). Lines dropped: 686 to 1331 ms (at least 59.9 ms over four runs). The kernel has no `io.latency` (see Limits). arm, `io.max` set: p99 16.8 to 18.9 ms at either cap, even with the probe on its own filesystem (up to 23.8 ms in an earlier run). Lines dropped: 107 to 1040 ms (at least 35.8 ms over four runs). |
 | **Memory pressure.** A hog under `memory.high` beside small actions. The neighbours finish and the hog lives. | **fits** | The hog asked for 512 MiB under a 256 MiB high mark with no swap. It stayed at 271 MiB, alive, with 274 / 864 `high` events and 0 `oom_kill`. Neighbours took 203 to 208 ms with the hog, against 203 to 306 ms alone (arm: 131 to 137 against 131 to 201). Control: the same hog under `memory.max` was OOM-killed on both. |
 | **No network for an action.** DNS and outbound connect fail, and the store's port is unreachable. The mutant runs the action on the host network. | **fits** | `--network=none`: DNS fails and the connect to MinIO fails, on both. The host-network mutant reaches MinIO. See "Networked actions" below for the default network. |
 | **Node readiness check, PSI off.** | **fits with limits** | PSI cannot be switched off: it is a boot-time kernel setting, and `/proc/pressure/{cpu,memory,io}` and the per-cgroup `*.pressure` files exist on both. A test feeds the check a planted pressure source or a planted cgroupfs kubelet config. A real PSI-off kernel needs a farm probe. |
@@ -82,8 +88,10 @@ anything. The step fails if a control comes out wrong.
   is a 200 MiB buffer under `--memory 64m`, which must be killed (exit 137 and one
   memory-cgroup OOM in the kernel log), while 16 MiB under the same limit succeeds.
 - **No network** (`no_network.sh`). Runs the same busybox checks under `none`,
-  slirp4netns, pasta and `host`. The step fails if the host-network mutant cannot reach
-  MinIO, because then the check could never go red.
+  slirp4netns and pasta (each named explicitly), podman's default with no `--network`
+  flag (the helper it starts is read from the process table), and `host`. The step
+  fails if the `none` arm reaches DNS or MinIO, and if the host-network mutant cannot
+  reach MinIO, because then the check could never go red.
 - **Delegation** (`delegation.sh`, `delegated_inner.sh`). Records each controller
   write and the container's cgroup as seen from the host.
 - **Footprint** (`several_servers.sh`). The step fails unless all seven endpoints
@@ -107,7 +115,8 @@ The controls were seen failing during the spike:
   protected nothing: x86 p99 551 to 1304 ms, arm 148 to 183 ms.
 - **The arm disk misses the 10 ms target under any write load we tried.** The CPU half
   of the hog alone costs about 3 ms of p99 on both arches. With `io.max` the x86 probe
-  holds 3 ms. The arm probe sits at 17 to 19 ms, and these did not change it:
+  holds 3 ms. The arm probe sat at 16.8 to 18.9 ms in the measurement run (17.7 to 19.1 ms and
+  23.2 to 23.8 ms in earlier runs), and these did not bring it under 10 ms:
   - a 41 MB/s cap instead of 82 MB/s;
   - `CPUWeight=1000` on the server slice;
   - a separate filesystem for the probe (18.2 to 18.9 ms).
