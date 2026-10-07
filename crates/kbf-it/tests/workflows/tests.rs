@@ -5,6 +5,19 @@ use super::*;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// The files a local `uses: ./...` in these tests may name.
+fn repo() -> Repo {
+    Repo {
+        action_dirs: vec!["local".to_owned(), "x".to_owned(), ".github/a".to_owned()],
+        workflows: vec![".github/workflows/c.yml".to_owned()],
+    }
+}
+
+/// Lints a workflow against [`repo`].
+fn scan(text: &str) -> Vec<String> {
+    super::scan(text, &repo())
+}
+
 fn workflow(body: &str) -> String {
     format!("name: t\non: push\npermissions: {{}}\njobs:\n  a:\n{body}")
 }
@@ -378,4 +391,201 @@ fn job_permissions_may_not_widen_the_token() {
             "    runs-on: ubuntu-latest\n    permissions: {p}\n"
         )));
     }
+}
+
+#[test]
+fn pull_request_target_is_refused_outside_on() {
+    // Catches: a lint that looks for pull_request_target only among the triggers,
+    // so a job gated on it (as if the workflow ran for that event) or a value naming
+    // it passed.
+    for body in [
+        "    if: github.event_name == 'pull_request_target'\n    runs-on: ubuntu-latest\n",
+        "    runs-on: ubuntu-latest\n    env:\n      EVENT: Pull_Request_Target\n",
+    ] {
+        refused(body, "names pull_request_target");
+    }
+}
+
+#[test]
+fn a_trigger_name_with_blanks_is_refused() {
+    // Catches: a trigger compared without trimming, so a quoted name with a blank
+    // GitHub might trim was not read as the refused trigger.
+    for on in ["on: [\"workflow_run \"]", "on: {' workflow_run': {}}"] {
+        refused_text(
+            &format!("{on}\npermissions: {{}}\njobs: {{}}\n"),
+            "triggers on workflow_run",
+        );
+    }
+}
+
+/// A job whose steps are `steps` (each a full `- ...` line).
+fn job_steps(steps: &str) -> String {
+    workflow(&format!("    runs-on: ubuntu-latest\n    steps:\n{steps}"))
+}
+
+#[test]
+fn a_local_action_must_be_a_linted_action_directory() {
+    // Catches: `./` exempt from every check, so a step ran a directory holding no
+    // linted action file (or one outside the repository).
+    for dir in ["local", "local/", ".github/a", "x/"] {
+        clean(&job_steps(&format!("      - uses: ./{dir}\n")));
+    }
+    for dir in [
+        "missing",
+        "local/sub",
+        "../local",
+        "./local",
+        ".//local",
+        "x/../local",
+        "",
+    ] {
+        let w = job_steps(&format!("      - uses: ./{dir}\n"));
+        refused_text(&w, "holding a linted action file");
+    }
+    // The root counts only when it holds an action file.
+    let root = Repo {
+        action_dirs: vec![String::new()],
+        ..Repo::default()
+    };
+    assert_eq!(
+        super::scan(&job_steps("      - uses: ./\n"), &root),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_local_reusable_workflow_must_be_a_linted_workflow() {
+    // Catches: a job-level `./` call to a file the workflow lint never read.
+    refused(
+        "    uses: ./.github/workflows/other.yml\n",
+        "not a linted workflow file",
+    );
+}
+
+#[test]
+fn a_local_action_after_a_foreign_checkout_is_refused() {
+    // Catches: `./x` run from a workspace that a step filled with another repository,
+    // whichever order the steps come in and however the key is spelled.
+    let checkout = format!("      - uses: actions/checkout@{SHA} # v7\n        with:\n");
+    for steps in [
+        format!("{checkout}          repository: o/r\n      - uses: ./local\n"),
+        format!("      - uses: ./local\n{checkout}          Repository: o/r\n"),
+        format!(
+            "{checkout}          repository: ${{{{ github.repository }}}}\n      - uses: ./x\n"
+        ),
+    ] {
+        refused_text(&job_steps(&steps), "checks out another repository");
+    }
+    clean(&job_steps(&format!(
+        "{checkout}          persist-credentials: false\n      - uses: ./local\n"
+    )));
+}
+
+/// Lints an action file against [`repo`].
+fn action(text: &str) -> Vec<String> {
+    scan_action(text, &repo())
+}
+
+fn action_refused(text: &str, want: &str) {
+    let found = action(text);
+    assert!(
+        found.iter().any(|m| m.contains(want)),
+        "want `{want}`:\n{text}\n-> {found:?}"
+    );
+}
+
+#[test]
+fn action_files_follow_the_step_rules() {
+    // Catches: a composite action whose steps escape the pin, local-path and word
+    // rules that hold in a workflow.
+    let ok = format!(
+        "name: a\ndescription: d\nruns:\n  using: composite\n  steps:\n    - uses: a/b@{SHA} # v1\n    - uses: ./local\n    - run: echo\n      shell: bash\n"
+    );
+    assert_eq!(action(&ok), Vec::<String>::new());
+    for (steps, want) in [
+        ("    - uses: a/b@v1\n".to_owned(), "not pinned"),
+        (format!("    - uses: a/b@{SHA}\n"), "version comment"),
+        ("    - uses: ./missing\n".to_owned(), "linted action file"),
+        (
+            format!(
+                "    - uses: actions/checkout@{SHA} # v7\n      with: {{repository: o/r}}\n    - uses: ./x\n"
+            ),
+            "checks out another repository",
+        ),
+        (
+            "    - run: echo pull_request_target\n".to_owned(),
+            "names pull_request_target",
+        ),
+    ] {
+        action_refused(
+            &format!("name: a\nruns:\n  using: composite\n  steps:\n{steps}"),
+            want,
+        );
+    }
+}
+
+#[test]
+fn action_files_refuse_what_they_cannot_evaluate() {
+    // Catches: an action read as clean when its runtime pulls an unpinned image, its
+    // shape is unknown, or it has no steps to check.
+    let digest = "0".repeat(64);
+    for runs in [
+        "{using: node24, main: index.js}".to_owned(),
+        "{using: docker, image: Dockerfile}".to_owned(),
+        format!("{{using: docker, image: 'docker://alpine@sha256:{digest}'}}"),
+    ] {
+        assert_eq!(
+            action(&format!("name: a\nruns: {runs}\n")),
+            Vec::<String>::new(),
+            "{runs}"
+        );
+    }
+    for (text, want) in [
+        (
+            "runs: {using: docker, image: 'docker://alpine:3'}\n",
+            "neither a local",
+        ),
+        (
+            "runs: {using: docker, image: 'docker://alpine@sha256:ab'}\n",
+            "neither a local",
+        ),
+        (
+            "runs: {using: docker, image: '${{ inputs.i }}'}\n",
+            "neither a local",
+        ),
+        ("runs: {using: docker}\n", "without `image`"),
+        ("runs: {using: composite}\n", "without `steps`"),
+        ("runs: {using: wasm}\n", "must be composite"),
+        ("runs: [x]\n", "must be a mapping"),
+        ("name: a\n", "no `runs:`"),
+        ("runs: {using: node24}\non: push\n", "unknown top-level key"),
+        ("[a]\n", "an action must be a mapping"),
+    ] {
+        action_refused(text, want);
+    }
+}
+
+#[test]
+fn unreadable_bytes_are_refused_and_a_bom_is_dropped() {
+    // Catches: a file skipped (and so never linted) because it holds a NUL or is not
+    // UTF-8, and a BOM read as part of the first key.
+    let w = workflow("    runs-on: ubuntu-latest\n");
+    let mut bom = b"\xEF\xBB\xBF".to_vec();
+    bom.extend(w.as_bytes());
+    let text = decode(&bom).expect("a UTF-8 BOM is dropped");
+    assert_eq!(scan(text), Vec::<String>::new());
+    let mut nul = w.clone().into_bytes();
+    nul.push(0);
+    assert!(decode(&nul).unwrap_err().contains("NUL byte"));
+    assert!(
+        decode(b"on: \xFF\n")
+            .unwrap_err()
+            .contains("not valid UTF-8")
+    );
+    // UTF-16 holds NUL bytes for every ASCII character.
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(w.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    assert!(decode(&utf16).is_err());
 }

@@ -3,9 +3,13 @@
 //!
 //! Catches:
 //! - a workflow that can run on a non-hosted runner, uses `pull_request_target`, uses
-//!   an action not pinned by commit SHA, or lacks top-level `permissions: {}`
-//!   (rules in `workflows/mod.rs`, which parses each file as YAML);
-//! - a text file carrying a non-documentation IPv4 address or an absolute home path
+//!   an action not pinned by commit SHA, or lacks top-level `permissions: {}`, and an
+//!   `action.yml` in any directory with an unpinned step; a local `uses: ./...` that
+//!   names no linted action or workflow; a workflow or action file that is not valid
+//!   UTF-8 or holds a NUL byte (rules in `workflows/mod.rs`, which parses each file as
+//!   YAML; its module docs say what it cannot cover);
+//! - a text file carrying a non-documentation IPv4 address or an absolute home path,
+//!   and a file holding a NUL byte whose extension is not on the binary allow list
 //!   (rules in `kbf_it::hygiene`);
 //! - the scans passing vacuously because git listed nothing or the workflows moved.
 
@@ -50,38 +54,62 @@ fn listed_files(root: &Path) -> Vec<String> {
     files
 }
 
-/// The file's text, or `None` for a binary file (one holding a NUL byte) or a
-/// tracked file deleted in the working tree.
-fn read_text(path: &Path) -> Option<String> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+/// The file's bytes, or `None` for a tracked file deleted in the working tree.
+fn read_bytes(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => panic!("read {}: {e}", path.display()),
-    };
-    (!bytes.contains(&0)).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+fn is_workflow(f: &str) -> bool {
+    let lower = f.to_ascii_lowercase();
+    f.starts_with(".github/workflows/") && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
+}
+
+/// An `action.yml` or `action.yaml` in any directory, any case.
+fn is_action_file(f: &str) -> bool {
+    let name = f.rsplit('/').next().unwrap_or(f);
+    name.eq_ignore_ascii_case("action.yml") || name.eq_ignore_ascii_case("action.yaml")
 }
 
 #[test]
 fn workflows_are_hosted_pinned_and_least_privilege() {
     let root = repo_root();
-    let workflows: Vec<String> = listed_files(&root)
-        .into_iter()
-        .filter(|f| {
-            f.starts_with(".github/workflows/") && (f.ends_with(".yml") || f.ends_with(".yaml"))
-        })
+    let listed = listed_files(&root);
+    let present = |f: &&String| root.join(f.as_str()).exists();
+    let workflows: Vec<String> = listed.iter().filter(|f| is_workflow(f)).cloned().collect();
+    let actions: Vec<String> = listed
+        .iter()
+        .filter(|f| is_action_file(f))
+        .cloned()
         .collect();
     assert!(
         workflows.iter().any(|f| f == ".github/workflows/ci.yml"),
         "ci.yml not found; the workflow lint would check nothing: {workflows:?}"
     );
+    // A local `uses: ./...` may name only a file this test lints below.
+    let repo = workflows::Repo {
+        action_dirs: actions
+            .iter()
+            .filter(present)
+            .map(|f| f.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
+            .collect(),
+        workflows: workflows.iter().filter(present).cloned().collect(),
+    };
     let mut problems = Vec::new();
-    for f in &workflows {
-        let Some(text) = read_text(&root.join(f)) else {
+    let files = workflows.iter().map(|f| (f, false));
+    for (f, is_action) in files.chain(actions.iter().map(|f| (f, true))) {
+        let Some(bytes) = read_bytes(&root.join(f)) else {
             continue;
         };
-        for p in workflows::scan(&text) {
-            problems.push(format!("{f}: {p}"));
-        }
+        let found = match workflows::decode(&bytes) {
+            Ok(text) if is_action => workflows::scan_action(text, &repo),
+            Ok(text) => workflows::scan(text, &repo),
+            Err(e) => vec![e],
+        };
+        problems.extend(found.into_iter().map(|p| format!("{f}: {p}")));
     }
     assert!(
         problems.is_empty(),
@@ -97,8 +125,16 @@ fn text_files_carry_no_addresses_or_home_paths() {
     let mut scanned = 0;
     let mut problems = Vec::new();
     for f in &files {
-        let Some(text) = read_text(&root.join(f)) else {
+        let Some(bytes) = read_bytes(&root.join(f)) else {
             continue;
+        };
+        let text = match kbf_it::hygiene::decode(f, &bytes) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(e) => {
+                problems.push(format!("{f}: {e}"));
+                continue;
+            }
         };
         scanned += 1;
         for p in kbf_it::hygiene::scan(&text) {
