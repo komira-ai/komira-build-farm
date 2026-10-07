@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# A stand-in for `podman`. Each test links `<dir>/podman` to this file; the fake keeps
+# its state and the test's knobs in `<dir>/state` and uses `<dir>/cgroup` as the cgroup
+# mount. It runs the action as a plain process, so the driver's steps can be tested on
+# any machine. Real Podman behaviour is tested in tests/podman.rs.
+#
+# Knobs (files in $STATE the test writes):
+#   image-id         what `image inspect` prints; absent: the image is not in the store
+#   image-hangs      `image inspect` hangs (a slow prepare step)
+#   info-fails       `info` fails
+#   store/           the image store `info` names (store/fake-images/<id>/=<key>)
+#   action.sh        what `start --attach` runs (env: ROOT, UPPER, CG)
+#   create-fails     `create` fails
+#   block-log        `create` makes a directory where the log file this knob names
+#                    (stdout or stderr) goes, so the driver cannot create it
+#   vanish-after-create  `create` unlinks the podman program it was run as
+#   status           written by `start`; a test may preset `status-override`
+#   inspect-fails    `inspect` fails
+#   kill-fails       `kill` fails
+#   rm-fails         `rm` fails
+#   unshare-noop     `unshare rm` succeeds without removing anything
+#   unshare-fails    `unshare rm` fails
+# Records: create.args (one argument per line), calls (one verb per line), removed,
+#   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
+#   events (in order: `cgroup.kill ended the action`, `start ended` once `start` has
+#   waited for the action and written its status, `rm`).
+set -u
+here=$(dirname "$0")
+STATE=$here/state
+CGROOT=$here/cgroup
+
+[ "${1:-}" = --cgroup-manager=cgroupfs ] || { echo "fake podman: missing --cgroup-manager" >&2; exit 125; }
+shift
+verb=$1
+shift
+echo "$verb" >>"$STATE/calls"
+
+case $verb in
+image)
+    [ -f "$STATE/image-hangs" ] && exec sleep 30
+    [ -f "$STATE/image-id" ] || { echo "Error: image not known" >&2; exit 125; }
+    cat "$STATE/image-id"
+    ;;
+info)
+    [ -f "$STATE/info-fails" ] && { echo "Error: info refused" >&2; exit 125; }
+    echo "$STATE/store/fake-images"
+    ;;
+create)
+    printf '%s\n' "$@" >"$STATE/create.args"
+    for arg in "$@"; do
+        case $arg in
+        --cgroup-parent=*) echo "${arg#--cgroup-parent=}" >"$STATE/cgroup" ;;
+        --volume=*)
+            v=${arg#--volume=}
+            echo "${v%%:*}" >"$STATE/root"
+            u=${v#*upperdir=}
+            echo "${u%%,*}" >"$STATE/upper"
+            ;;
+        esac
+    done
+    [ -f "$STATE/create-fails" ] && { echo "Error: create refused" >&2; exit 125; }
+    [ -f "$STATE/block-log" ] && mkdir "$(dirname "$(cat "$STATE/root")")/$(cat "$STATE/block-log")"
+    # The podman program disappears once the container exists.
+    [ -f "$STATE/vanish-after-create" ] && unlink "$0"
+    echo 0123456789ab
+    ;;
+start)
+    CG="$CGROOT$(cat "$STATE/cgroup")" ROOT=$(cat "$STATE/root") UPPER=$(cat "$STATE/upper") \
+        bash "$STATE/action.sh" &
+    pid=$!
+    echo "$pid" >"$STATE/pid"
+    cg="$CGROOT$(cat "$STATE/cgroup")"
+    # cgroup.kill: a write to the file kills the action, as the kernel would.
+    (while kill -0 "$pid" 2>/dev/null; do
+        if [ -e "$cg/cgroup.kill" ]; then
+            # Recorded before the kill, so it precedes `start ended`.
+            echo "cgroup.kill ended the action" >>"$STATE/events"
+            kill -KILL "$pid" 2>/dev/null
+            break
+        fi
+        sleep 0.02
+    done) &
+    wait "$pid"
+    code=$?
+    if [ -f "$STATE/status-override" ]; then
+        cp "$STATE/status-override" "$STATE/status"
+    else
+        echo "exited $code" >"$STATE/status"
+    fi
+    echo "start ended" >>"$STATE/events"
+    exit "$code"
+    ;;
+inspect)
+    [ -f "$STATE/inspect-fails" ] && { echo "Error: inspect refused" >&2; exit 125; }
+    [ -f "$STATE/status" ] || { echo "Error: no such container" >&2; exit 125; }
+    cat "$STATE/status"
+    ;;
+kill)
+    [ -f "$STATE/kill-fails" ] && { echo "Error: kill refused" >&2; exit 125; }
+    [ -f "$STATE/pid" ] || { echo "Error: no such container" >&2; exit 125; }
+    kill "-${1#--signal=}" "$(cat "$STATE/pid")"
+    ;;
+rm)
+    [ -f "$STATE/rm-fails" ] && { echo "Error: rm refused" >&2; exit 125; }
+    touch "$STATE/removed"
+    echo rm >>"$STATE/events"
+    if [ -f "$STATE/cgroup" ] && [ -e "$CGROOT$(cat "$STATE/cgroup")/cgroup.kill" ]; then
+        touch "$STATE/killed-before-rm"
+    fi
+    # --force: a container still running is killed.
+    [ -f "$STATE/pid" ] && kill -KILL "$(cat "$STATE/pid")" 2>/dev/null
+    # Interface files are not files to rmdir on cgroupfs; here they are, so the fake
+    # removes them the way the kernel would make them vanish.
+    if [ -f "$STATE/cgroup" ]; then
+        find "$CGROOT$(cat "$STATE/cgroup")" -type f -delete 2>/dev/null
+    fi
+    exit 0
+    ;;
+unshare)
+    [ -f "$STATE/unshare-fails" ] && { echo "Error: unshare refused" >&2; exit 1; }
+    [ -f "$STATE/unshare-noop" ] && exit 0
+    # rm -rf -- DIR
+    dir=${4:?}
+    chmod -R u+rwx "$dir"
+    rm -rf -- "$dir"
+    ;;
+*)
+    echo "fake podman: unexpected verb $verb" >&2
+    exit 125
+    ;;
+esac

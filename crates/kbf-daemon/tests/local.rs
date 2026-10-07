@@ -14,7 +14,7 @@ use kbf_daemon::cas::digest_of;
 use kbf_daemon::usage::usage_of;
 use kbf_daemon::{LOCAL_DRIVER, LocalRuntime, Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, Digest};
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, Resources};
 use support::memory::{MemoryCas, Spec};
 use support::scratch;
 
@@ -60,6 +60,8 @@ fn work(seq: u64, action: Digest) -> Work {
         lease_id: LeaseId::new(1, seq),
         kind: "action".to_owned(),
         action_digest: action,
+        // LocalRuntime bounds nothing, so the booking is not under test here.
+        resources: Resources::default(),
     }
 }
 

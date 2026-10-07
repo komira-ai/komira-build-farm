@@ -18,8 +18,9 @@
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
 //!
 //! The `kbf-daemon` binary still offers only [`FakeRuntime`]: the container driver
-//! (`kbf-driver-container`) is the runtime for farm nodes, and [`LocalRuntime`]
-//! isolates nothing.
+//! (`kbf-driver-container`) is the runtime for farm nodes, but it depends on this crate
+//! and Cargo refuses the cycle a binary here naming the driver would make; and
+//! [`LocalRuntime`] isolates nothing.
 
 pub mod cas;
 pub mod config;

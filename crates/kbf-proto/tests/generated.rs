@@ -121,6 +121,8 @@ fn worker_messages_round_trip() {
             lease_id: Some(LeaseId { term: 2, seq: 9 }),
             kind: "action".to_owned(),
             action_digest: Some(digest(&"ef".repeat(32), 140)),
+            millicpus: 1500,
+            memory_bytes: 1 << 30,
         })),
     };
     let back = ServerMessage::decode(start.encode_to_vec().as_slice()).expect("decode");
