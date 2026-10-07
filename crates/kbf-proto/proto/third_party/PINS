@@ -1,0 +1,24 @@
+# Vendored upstream files, one per line:
+#   <directory> <upstream repository> <commit> <sha256> <path>
+#
+# <directory> is the subdirectory of proto/third_party that holds the file. <path> is the
+# file's path both inside that directory and inside the upstream repository at <commit>.
+# Every file of a directory comes from the same repository and commit.
+#
+# tests/pins.rs fails if a listed file is missing, a file is present but unlisted, or a
+# file's sha256 differs from its line. To bump a pin, replace the files with the ones
+# from the new commit and rewrite their lines.
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 LICENSE
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 e79ea741cb605a65e78ca322174764a4af9fde1962c1631e12b84c4934ba9a6c google/api/annotations.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 5e9fc117290fe7d3472791543c979bec7cf4497f3fe6ffaf9de9ae99cc4f1804 google/api/client.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 bb7ed77725c95f751ec2c47cd92359d0137c39383b8a62aef41bab7aa7478da5 google/api/field_behavior.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 ead99129aa15dd5f6233942030c72eec33bc0d7b1c7c260dc143293ef66c5b78 google/api/http.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 68e22c9821227b4e84c7029569fce1055c21e6ccab991e0986bc75f12ef4dd82 google/api/launch_stage.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 961b833f35f4bdc51df4bca017cffdba299893e89762bf8041465560106dd3d6 google/bytestream/bytestream.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 5d2e7f9eeb55b8417b50e0a536a092babd32d26e4fbeb7099c6cdcda6e16db9c google/longrunning/operations.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 83a63185b83cf7332196fc5ead0ec91b93ac207fbe91b3d5bc3d72f461b0bb31 google/rpc/code.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 5c18d42e6924f447622534b4b7cdb8b53c0606c8ce729b912ee5edf88d1c5520 google/rpc/error_details.proto
+googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b05532d97b68e0 f5bfd262e6705c7ae73f32e0ad8ee20ce8c0a2578df8c4f76ebf76b572f295ed google/rpc/status.proto
+remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 LICENSE
+remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 1f54f664eafff14de492248a8bdbf1878efc741afbc4c7b5b9ff2157af92c02f build/bazel/remote/execution/v2/remote_execution.proto
+remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 22b2af125690142af1c8152ba3a4ca15ffaa1265111dedc6e39b5412989b5be1 build/bazel/semver/semver.proto
