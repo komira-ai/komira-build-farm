@@ -70,6 +70,15 @@ struct Pending {
     record: ActionRecord,
 }
 
+/// What a report carries beyond its scheduler outcome, from the report to the answer.
+#[derive(Debug)]
+enum Detail {
+    /// An OK result to answer with and maybe cache.
+    Ran(Box<Pending>),
+    /// The daemon's reason the action is invalid, passed to the callers.
+    Invalid(String),
+}
+
 #[derive(Debug)]
 struct State {
     sched: Scheduler,
@@ -198,7 +207,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
             return Some(refused);
         };
-        let (outcome, mut pending) = self.outcome(lease, result).await;
+        let (outcome, mut detail) = self.outcome(lease, result).await;
 
         let now = self.now();
         let (answers, accepted) = {
@@ -218,7 +227,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             let accepted = answers.iter().any(|a| a.lease == lease);
             let settled: Vec<Settled> = answers
                 .iter()
-                .map(|a| state.settle(a, pending.take()))
+                .map(|a| state.settle(a, detail.take()))
                 .collect();
             (settled, accepted)
         };
@@ -231,10 +240,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         })
     }
 
-    /// The scheduler's outcome for a `Result`, and the cache record of an OK one. An OK
-    /// result whose outputs are not all stored is an infrastructure failure: accepting
-    /// it would answer callers with files nobody can fetch.
-    async fn outcome(&self, lease: LeaseId, result: worker::Result) -> (Outcome, Option<Pending>) {
+    /// The scheduler's outcome for a `Result`, with the cache record of an OK one or
+    /// the reason for an INVALID_ARGUMENT one. An OK result whose outputs are not all
+    /// stored is an infrastructure failure: accepting it would answer callers with files
+    /// nobody can fetch.
+    async fn outcome(&self, lease: LeaseId, result: worker::Result) -> (Outcome, Option<Detail>) {
         let code = result.status.as_ref().map_or(Code::Ok as i32, |s| s.code);
         match (Code::from_i32(code), result.action_result) {
             (Code::Ok, Some(result)) => match self.cache.prepare_action_result(&result).await {
@@ -242,7 +252,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                     let outcome = Outcome::Completed {
                         action_result: record.result,
                     };
-                    (outcome, Some(Pending { result, record }))
+                    (
+                        outcome,
+                        Some(Detail::Ran(Box::new(Pending { result, record }))),
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(%lease, error = %e, "an OK result whose outputs are not stored");
@@ -250,6 +263,13 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 }
             },
             (Code::DeadlineExceeded, _) => (Outcome::Failed(Failure::Timeout), None),
+            (Code::InvalidArgument, _) => {
+                let why = result.status.map(|s| s.message).unwrap_or_default();
+                (
+                    Outcome::Failed(Failure::Invalid),
+                    Some(Detail::Invalid(why)),
+                )
+            }
             (code, _) => {
                 tracing::info!(%lease, ?code, "lease failed");
                 (Outcome::Failed(Failure::Infra), None)
@@ -429,6 +449,8 @@ impl State {
                 lease_id: Some(wire_lease(start.lease)),
                 kind: w.kind.clone(),
                 action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
+                millicpus: start.resources.cpu_millis,
+                memory_bytes: start.resources.memory_bytes,
             })
         });
         let waiters = self.sched.waiters(start.operation).unwrap_or_default();
@@ -438,9 +460,9 @@ impl State {
         self.started.insert(start.lease, start.operation);
     }
 
-    /// Forgets a finished operation and works out what its callers get. `pending` is
-    /// the OK result the answer accepted, if it accepted one.
-    fn settle(&mut self, answer: &Answer, pending: Option<Pending>) -> Settled {
+    /// Forgets a finished operation and works out what its callers get. `detail` is
+    /// what the accepted report carried beyond its outcome, if anything.
+    fn settle(&mut self, answer: &Answer, detail: Option<Detail>) -> Settled {
         self.started.retain(|_, op| *op != answer.operation);
         let waiters: Vec<Waiter> = answer
             .waiters
@@ -450,8 +472,9 @@ impl State {
         for w in &waiters {
             self.names.remove(&w.name);
         }
-        let (finished, write) = match (pending, answer.outcome) {
-            (Some(Pending { result, record }), _) => {
+        let (finished, write) = match (detail, answer.outcome) {
+            (Some(Detail::Ran(pending)), _) => {
+                let Pending { result, record } = *pending;
                 let cacheable =
                     result.exit_code == 0 && waiters.first().is_some_and(|w| !w.do_not_cache);
                 let write = waiters
@@ -460,10 +483,11 @@ impl State {
                     .map(|w| (w.key.action, record));
                 (Finished::Ran(Box::new(result)), write)
             }
-            (None, Outcome::Failed(Failure::Timeout)) => {
+            (_, Outcome::Failed(Failure::Timeout)) => {
                 (failed(Code::DeadlineExceeded, "the action timed out"), None)
             }
-            (None, _) => (
+            (Some(Detail::Invalid(why)), _) => (failed(Code::InvalidArgument, &why), None),
+            _ => (
                 failed(Code::Internal, "the farm could not run the action"),
                 None,
             ),

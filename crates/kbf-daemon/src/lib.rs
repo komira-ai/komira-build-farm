@@ -4,8 +4,10 @@
 //! its node (detected through `kbf-caps`), sends heartbeats, and runs a lease manager:
 //! work starts only on `Start`, each lease reports one `Result`, and every running
 //! lease is killed and reported when no heartbeat has been acknowledged for the fence
-//! time T. Execution goes through the [`Runtime`] trait; [`FakeRuntime`] is the only
-//! runtime until the container driver lands.
+//! time T. Execution goes through the [`Runtime`] trait. The container driver
+//! (`kbf-driver-container`) implements it; the `kbf-daemon` binary still offers only
+//! [`FakeRuntime`], because the driver depends on this crate and Cargo refuses the
+//! cycle a binary here naming the driver would make.
 //!
 //! - [`config`]: command-line flags and TLS files.
 //! - [`report`]: the node report and its hash.
