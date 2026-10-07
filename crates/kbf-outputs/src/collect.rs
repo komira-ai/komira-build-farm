@@ -641,20 +641,6 @@ mod tests {
         rustix::fs::openat(CWD, dir, DIRECTORY, Mode::empty()).expect("open")
     }
 
-    /// What `read_file` found, comparable: the bytes (a file's read from where it is
-    /// handed over), the digest a file comes with (`None` for bytes), and the
-    /// executable bit.
-    fn contents(found: Option<(Blob, bool)>) -> Option<(Vec<u8>, Option<Digest>, bool)> {
-        found.map(|(blob, executable)| match blob {
-            Blob::Bytes(bytes) => (bytes, None, executable),
-            Blob::File(mut file, digest) => {
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).expect("read back");
-                (bytes, Some(digest), executable)
-            }
-        })
-    }
-
     /// Catches a file read through a descriptor that is not a regular file: an entry
     /// replaced by a FIFO between the `stat` and the `open` must fail, not block or be
     /// stored as a file.
@@ -683,11 +669,11 @@ mod tests {
         let fd = open(&dir);
         std::fs::write(dir.join("small"), b"bytes").expect("write");
         let read = |name: &str, max| read_file(&fd, OsStr::new(name), max).expect("read");
-        // A small file within the bound is read whole, as bytes.
-        assert_eq!(
-            contents(read("small", 5)),
-            Some((b"bytes".to_vec(), None, false))
-        );
+        let (blob, executable) = read("small", 5).expect("within the bound");
+        assert!(!executable);
+        let (bytes, file) = blob.into_parts();
+        assert_eq!(bytes.as_deref(), Some(&b"bytes"[..]), "read whole");
+        assert!(file.is_none());
         assert!(read("small", 4).is_none());
 
         let large: Vec<u8> = (0..(2 * CHUNK_BYTES + 7))
@@ -695,12 +681,14 @@ mod tests {
             .collect();
         std::fs::write(dir.join("large"), &large).expect("write");
         let size = large.len() as u64;
-        // A large file within the bound is handed over as a file, at its start, with
-        // the digest of its bytes.
-        assert_eq!(
-            contents(read("large", size)),
-            Some((large.clone(), Some(digest_of(&large)), false))
-        );
+        let (blob, _) = read("large", size).expect("within the bound");
+        let (bytes, file) = blob.into_parts();
+        assert!(bytes.is_none(), "handed over as a file");
+        let (mut file, digest) = file.expect("a file");
+        assert_eq!(digest, digest_of(&large));
+        let mut stored = Vec::new();
+        file.read_to_end(&mut stored).expect("read back");
+        assert_eq!(stored, large, "the file is handed over at its start");
         assert!(read("large", size - 1).is_none());
         // Past the bound within the first chunk of a large file.
         assert!(read("large", 10).is_none());
@@ -710,6 +698,16 @@ mod tests {
             read("chunk", u64::MAX),
             Some((Blob::File(..), false))
         ));
+    }
+
+    impl Blob {
+        /// The bytes, or the file and its digest.
+        fn into_parts(self) -> (Option<Vec<u8>>, Option<(std::fs::File, Digest)>) {
+            match self {
+                Self::Bytes(bytes) => (Some(bytes), None),
+                Self::File(file, digest) => (None, Some((file, digest))),
+            }
+        }
     }
 
     /// Catches the walk going back up into a directory other than the one it came

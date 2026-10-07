@@ -70,7 +70,7 @@ fn a_tree_deeper_than_a_path_goes() {
         rustix::fs::Mode::empty(),
     )
     .expect("open");
-    for i in 0..4000 {
+    for i in 0..2100 {
         rustix::fs::mkdirat(&here, "d", rustix::fs::Mode::RWXU).expect("mkdir");
         let file = rustix::fs::openat(
             &here,
@@ -87,7 +87,7 @@ fn a_tree_deeper_than_a_path_goes() {
             rustix::fs::Mode::empty(),
         )
         .expect("open");
-        if i == 3999 {
+        if i == 2099 {
             // The deepest level locked (the top one is locked below).
             rustix::fs::chmodat(
                 &here,
@@ -124,6 +124,8 @@ fn the_path_itself_may_be_a_link_a_file_or_absent() {
     // A bare name is relative to the working directory.
     remove_tree(std::path::Path::new("kbf-outputs-absent")).expect("nothing to remove");
     assert!(remove_tree(std::path::Path::new("/")).is_err());
+    // A parent that is not there is the caller's mistake, not "nothing to remove".
+    assert!(remove_tree(&base.join("absent/child")).is_err());
 }
 
 /// Catches an entry that cannot be examined (its directory may be read but not

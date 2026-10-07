@@ -186,8 +186,10 @@ pub fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// A configuration for tests: a fast poll, everything else the default.
+/// A configuration for tests: a fast poll, everything else the default. Also turns on
+/// logging to the test's output, so the driver's warnings are written (and run).
 pub fn config(scratch: &Path) -> NativeConfig {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let mut config = NativeConfig::new(scratch.join("leases"));
     config.poll = Duration::from_millis(20);
     config

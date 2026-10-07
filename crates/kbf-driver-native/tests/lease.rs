@@ -126,6 +126,13 @@ async fn bad_actions_are_the_clients_errors() {
         matches!(&outcome, Err(RuntimeError::Invalid(why)) if why.contains("negative")),
         "{outcome:?}"
     );
+    // A lease directory that is already there is not this run's to use.
+    std::fs::create_dir_all(config.scratch.join("lease-1-14")).expect("mkdir");
+    let outcome = run(&rt, &cas, 14, &Spec::sh("true")).await;
+    assert!(
+        matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("lease-1-14")),
+        "{outcome:?}"
+    );
     let outcome = run(&rt, &cas, 13, &Spec::argv(&["/nonexistent/program"])).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("/nonexistent/program")),
