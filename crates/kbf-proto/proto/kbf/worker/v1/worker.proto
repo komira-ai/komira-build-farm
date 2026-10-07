@@ -89,6 +89,14 @@ message Heartbeat {
   // Equal to the report_hash of the newest Hello.
   bytes report_hash = 2;
   // The leases this daemon is running now.
+  //
+  // Contract: the server requeues a lease granted to an earlier stream as soon as
+  // a heartbeat on the new stream leaves it out. A restarted daemon must therefore
+  // finish re-adopting its lease units before it sends its first Heartbeat on the
+  // new stream, and list every unit it re-adopted; otherwise a unit still running
+  // within its self-fence window is requeued at once and runs twice. Issue #26:
+  // this set must also include leases whose result is not yet acknowledged.
+  // Issue #25: only the first Hello of a stream registers the worker again.
   repeated LeaseId running = 3;
 }
 

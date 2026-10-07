@@ -12,6 +12,9 @@
 //! - commit before Start, and one accepted result per operation, fenced by lease id
 //!   `(term, seq)` (see [`Scheduler`]);
 //! - re-dispatch after the lease grace G and the worker's self-fence T ([`fence`]);
+//! - reconciliation of held leases with the running set each worker's heartbeats
+//!   send: a lease they leave out is requeued at once if its `Start` went to a session
+//!   before the worker registered again, else once its `Start` has been out for G;
 //! - first-fit placement of a CPU and memory request onto worker capacity;
 //! - in-flight dedup by instance and action digest, with waiters attached to one
 //!   operation;

@@ -63,16 +63,51 @@ impl Input {
 pub enum Event {
     /// A worker registered (or registered again) with `capacity` for actions: its CPUs
     /// and RAM minus protected floors. Counts as hearing from it.
+    ///
+    /// A registration is the first `Hello` of a new stream, and opens a new session. A
+    /// `Hello` the daemon resends on the same stream because its node report changed is
+    /// not a registration. `Hello` carries no running set, so a registration requeues
+    /// nothing by itself: the worker's next heartbeat decides (see [`Event::Heartbeat`]).
+    ///
+    /// The caller must keep two things true. A `Start` emitted before this input is sent
+    /// on the earlier stream, never on the new one. A heartbeat from an earlier stream
+    /// that arrives after this input is not fed. The server does not yet hold either
+    /// (issue #25: only the first `Hello` of a stream may become `WorkerUp`).
+    ///
+    /// Because the new session's first heartbeat decides at once, a restarted daemon
+    /// must finish re-adopting its leases before it sends that heartbeat; see
+    /// [`Event::Heartbeat`].
     WorkerUp {
         /// The worker.
         worker: WorkerId,
         /// What placement may book on it.
         capacity: Resources,
     },
-    /// A worker's heartbeat arrived.
+    /// A worker's heartbeat arrived on its newest stream, with the leases it holds.
+    ///
+    /// A committed lease the scheduler holds on the worker that `running` leaves out goes
+    /// back to the queue if its `Start` was sent to an earlier session (the worker either
+    /// received it before registering again, and then lists it, or never will), or once
+    /// its `Start` has been out for [`START_GRACE`] (the `Start` was lost, or the worker
+    /// no longer runs it). A lease whose `Start` is not yet sent, or whose result has
+    /// already been reported, is kept whether listed or not.
+    ///
+    /// Worker contract: a lease whose `Start` went to an earlier session is requeued on
+    /// the first heartbeat that leaves it out, with no grace. So a restarted daemon must
+    /// finish re-adopting its lease units before it sends its first heartbeat on the new
+    /// stream, and list every unit it re-adopted. Otherwise a unit still running inside
+    /// its [`SELF_FENCE`] window is requeued at once and the operation runs twice. The
+    /// set must also include leases that ended with a result not yet acknowledged
+    /// (issue #26); the server side of the session boundary is issue #25.
+    ///
+    /// [`START_GRACE`]: crate::fence::START_GRACE
+    /// [`SELF_FENCE`]: crate::fence::SELF_FENCE
     Heartbeat {
         /// The worker.
         worker: WorkerId,
+        /// The leases it holds: running (a restarted daemon re-adopts its runs; after a
+        /// reboot there are none), or ended with a result not yet acknowledged.
+        running: Vec<LeaseId>,
     },
     /// A caller asks for `request` to run. A joinable request with a running twin
     /// attaches `waiter` to the twin instead of queueing a new operation.
