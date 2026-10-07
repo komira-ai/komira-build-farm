@@ -284,13 +284,10 @@ impl Scheduler {
     }
 
     /// Sends back to the queue every committed lease held on `worker` that `running`
-    /// leaves out, if its `Start` went to an earlier session of the worker or has been
-    /// out for [`START_GRACE`]. A lease whose result was reported is kept: that result
-    /// is on its way to the log.
-    fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) {
-        let Some(session) = self.workers.get(worker).map(|w| w.session) else {
-            return;
-        };
+    /// leaves out, if its `Start` went to a session of the worker before `session` (its
+    /// current one) or has been out for [`START_GRACE`]. A lease whose result was
+    /// reported is kept: that result is on its way to the log.
+    fn reconcile(&mut self, worker: &WorkerId, session: u64, running: &[LeaseId]) {
         let running: BTreeSet<LeaseId> = running.iter().copied().collect();
         let now = self.now;
         let lost: Vec<OperationId> = self
@@ -376,13 +373,15 @@ impl Scheduler {
             && !*committed
         {
             *committed = true;
-            if let Some(held) = self.held.get_mut(lease) {
-                let session = self.workers.get(&*worker).map_or(0, |w| w.session);
-                held.start_sent = Some(StartSent {
-                    at: self.now,
-                    session,
-                });
-            }
+            // A leased operation's lease is always held: no branch on it.
+            let session = self.workers.get(&*worker).map_or(0, |w| w.session);
+            let sent = StartSent {
+                at: self.now,
+                session,
+            };
+            self.held
+                .entry(*lease)
+                .and_modify(|held| held.start_sent = Some(sent));
             effects.push(Effect::Start(StartLease {
                 worker: worker.clone(),
                 lease: *lease,
@@ -501,7 +500,8 @@ impl StateMachine for Scheduler {
             Event::Heartbeat { worker, running } => {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.last_heard = w.last_heard.max(self.now);
-                    self.reconcile(&worker, &running);
+                    let session = w.session;
+                    self.reconcile(&worker, session, &running);
                 }
                 Vec::new()
             }

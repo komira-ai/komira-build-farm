@@ -23,7 +23,9 @@ pub trait StateMachine {
 ///
 /// Variants arrive with the cores that emit them; today that is the scheduler
 /// (`kbf-sched`). Effects are carried out in list order.
-#[non_exhaustive]
+///
+/// Exhaustive on purpose: a caller matches every variant, so a new effect is a compile
+/// error in each place that carries effects out, not an arm that logs and drops it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Append the record to the control log, and feed it back to the machine once it is

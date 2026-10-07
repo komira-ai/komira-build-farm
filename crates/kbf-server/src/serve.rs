@@ -59,11 +59,11 @@ pub struct Bound<F> {
 }
 
 fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
-    let incoming = TcpIncoming::bind(addr).map_err(|source| ServeError::Bind { addr, source })?;
-    let local = incoming
-        .local_addr()
-        .map_err(|source| ServeError::Bind { addr, source })?;
-    Ok((incoming, local))
+    let bound = TcpIncoming::bind(addr).and_then(|incoming| {
+        let local = incoming.local_addr()?;
+        Ok((incoming, local))
+    });
+    bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
 /// Binds both listeners for a farm over `cache`. Nothing is served until the returned

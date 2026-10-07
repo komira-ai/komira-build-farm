@@ -263,3 +263,45 @@ async fn list_sends_the_token_and_reads_the_next_one() {
         heads[1]
     );
 }
+
+/// Catches: `create_bucket` that does not ask for Object Lock when the store claims it
+/// (a retained put would then fail) or asks when it does not; that takes a bucket this
+/// key pair already owns as an error (setup is not repeatable); or that hides any other
+/// refusal, such as a bucket name another account holds.
+#[tokio::test]
+async fn create_bucket_asks_for_object_lock_and_accepts_its_own_bucket() {
+    let owned = "<Error><Code>BucketAlreadyOwnedByYou</Code><Message>yours</Message></Error>";
+    let taken = "<Error><Code>BucketAlreadyExists</Code><Message>taken</Message></Error>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], ""),
+        answer("409 Conflict", &[], owned),
+        answer("409 Conflict", &[], taken),
+    ])
+    .await;
+    let locked = store(
+        endpoint.clone(),
+        Capabilities {
+            conditional_put: false,
+            object_lock: true,
+        },
+    );
+    locked.create_bucket().await.unwrap();
+    let plain = store(endpoint, Capabilities::default());
+    plain.create_bucket().await.unwrap();
+    let err = plain.create_bucket().await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Service { status: 409, code, .. } if code == "BucketAlreadyExists"),
+        "{err}"
+    );
+
+    let heads = seen.lock().unwrap();
+    let first = heads[0].to_ascii_lowercase();
+    assert!(first.starts_with("put /kbf-test http/1.1\r\n"), "{first}");
+    assert!(
+        first.contains("\r\nx-amz-bucket-object-lock-enabled: true\r\n"),
+        "{first}"
+    );
+    let second = heads[1].to_ascii_lowercase();
+    assert!(second.starts_with("put /kbf-test http/1.1\r\n"), "{second}");
+    assert!(!second.contains("object-lock"), "{second}");
+}
