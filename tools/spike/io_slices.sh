@@ -11,7 +11,10 @@
 # - maxonly: the hog under an io.max write cap at a quarter of the disk's measured
 #   direct-write rate;
 # - latonly: the probe's slice with an io.latency target of 5 ms;
-# - both: io.max and io.latency together (the configuration under test).
+# - both: io.max and io.latency together (the configuration under test);
+# - cpuonly: only the CPU half of the hog, no I/O lines (how much of the delay is CPU);
+# - bothw: both, plus CPUWeight=1000 on the server slice;
+# - bothw8: bothw with the io.max cap at an eighth of the disk rate.
 # The slices are runtime unit files written under /run/systemd/system; the io.max and
 # io.latency values systemd wrote are read back from cgroupfs.
 . "$(dirname "$0")/lib.sh"
@@ -33,8 +36,11 @@ mbps=$((1024 * 1000 / ms))
 sudo rm -f "$dir/speed"
 cap=$((mbps / 4))
 [ "$cap" -lt 5 ] && cap=5
+cap8=$((mbps / 8))
+[ "$cap8" -lt 5 ] && cap8=5
 kv io_direct_write_mbps "$mbps"
 kv io_cap_mbps "$cap"
+kv io_cap8_mbps "$cap8"
 
 # Slice names carry no dash: systemd reads a dash as nesting (a-b.slice sits inside
 # a.slice), and io.latency only throttles siblings, so all four sit directly under the
@@ -44,7 +50,16 @@ unit kbfsrv.slice
 unit kbfact.slice
 unit kbfsrvlat.slice "IODeviceLatencyTargetSec=$dev 5ms"
 unit kbfactcap.slice "IOWriteBandwidthMax=$dev ${cap}M"
+unit kbfactcap8.slice "IOWriteBandwidthMax=$dev ${cap8}M"
+unit kbfsrvlatw.slice "IODeviceLatencyTargetSec=$dev 5ms
+CPUWeight=1000"
 sudo systemctl daemon-reload
+
+# Keep every slice active (so its cgroup, and anything written to it, lives for the
+# whole step) with an idle unit in each.
+for sl in kbfsrv kbfact kbfsrvlat kbfactcap kbfactcap8 kbfsrvlatw; do
+    sudo systemd-run --quiet --collect --unit="kbf-spike-keep-$sl" --slice="$sl.slice" sleep infinity
+done
 
 # cgpath UNIT: the unit's cgroup directory.
 cgpath() { printf '/sys/fs/cgroup%s' "$(systemctl show -p ControlGroup --value "$1")"; }
@@ -54,13 +69,25 @@ wbytes() {
         "$(cgpath "$1")/io.stat" 2>/dev/null || true
 }
 
-# arm SERVER-SLICE [ACTIONS-SLICE]: prints the probe line plus the hog's write rate.
+# What systemd wrote for the io.latency target, read back raw. If the kernel offers
+# io.latency but systemd left it empty, write the target directly (recorded).
+for sl in kbfsrvlat kbfsrvlatw; do
+    f=$(cgpath "$sl.slice")/io.latency
+    kv "io_latency_file_$sl" "$(if [ -e "$f" ]; then printf 'present: [%s]' "$(cat "$f")"; else echo absent; fi)"
+    if [ -e "$f" ] && ! grep -q "^$dmm" "$f"; then
+        kv "io_latency_direct_write_$sl" "$(try sudo sh -c "echo '$dmm target=5000' > $f") now [$(cat "$f")]"
+    fi
+done
+kv io_files_kbfsrvlat "$(cd "$(cgpath kbfsrvlat.slice)" && ls -d io.* | tr '\n' ' ')"
+kv io_root_subtree_control "$(cat /sys/fs/cgroup/cgroup.subtree_control)"
+
+# arm SERVER-SLICE [ACTIONS-SLICE] [HOG-MODE]: prints the probe line plus the hog's write rate.
 # The io.max and io.latency files are read back (to stderr) while both run.
 arm() {
-    local server=$1 actions=${2:-} w0=0 w1=0 res
+    local server=$1 actions=${2:-} mode=${3:-all} w0=0 w1=0 res
     if [ -n "$actions" ]; then
         sudo systemd-run --quiet --collect --unit=kbf-spike-hog --slice="$actions" \
-            bash "$SPIKE_DIR/io_hog.sh" "$dir"
+            bash "$SPIKE_DIR/io_hog.sh" "$dir" "$mode"
         sleep 3
         w0=$(wbytes "$actions")
     fi
@@ -83,7 +110,7 @@ arm() {
     printf '%s' "$res"
 }
 
-arms="baseline open maxonly latonly both"
+arms="baseline open cpuonly maxonly latonly both bothw bothw8"
 declare -A worst best
 for r in $(seq "$rounds"); do
     for a in $arms; do
@@ -93,6 +120,9 @@ for r in $(seq "$rounds"); do
             maxonly) line=$(arm kbfsrv.slice kbfactcap.slice) ;;
             latonly) line=$(arm kbfsrvlat.slice kbfact.slice) ;;
             both) line=$(arm kbfsrvlat.slice kbfactcap.slice) ;;
+            cpuonly) line=$(arm kbfsrv.slice kbfact.slice cpu) ;;
+            bothw) line=$(arm kbfsrvlatw.slice kbfactcap.slice) ;;
+            bothw8) line=$(arm kbfsrvlatw.slice kbfactcap8.slice) ;;
         esac
         kv "io_${a}_round$r" "$line"
         p99=$(printf '%s' "$line" | sed -n 's/.*p99_ms=\([0-9.]*\).*/\1/p')
@@ -104,13 +134,16 @@ for a in $arms; do
     kv "io_${a}_p99_ms_range" "${best[$a]}..${worst[$a]}"
 done
 
-# Verdict: the test fits a hosted runner only if every round with both lines holds
-# the target and every open round (the mutant: both lines dropped) breaks it.
-held=$(python3 -c "print(${worst[both]} < $target_ms)")
+# Verdict per guarded configuration: the test fits a hosted runner only if every round
+# of that configuration holds the target and every open round (the mutant: both lines
+# dropped) breaks it.
 broke=$(python3 -c "print(${best[open]} >= $target_ms)")
-if [ "$held" = True ] && [ "$broke" = True ]; then
-    v="fits: with both lines p99 <= ${worst[both]} ms < $target_ms ms; dropped, p99 >= ${best[open]} ms"
-else
-    v="does not separate (both held: $held, open broke: $broke)"
-fi
-kv io_verdict "$v"
+for g in both bothw bothw8; do
+    held=$(python3 -c "print(${worst[$g]} < $target_ms)")
+    if [ "$held" = True ] && [ "$broke" = True ]; then
+        v="fits: guarded p99 <= ${worst[$g]} ms < $target_ms ms; lines dropped, p99 >= ${best[open]} ms"
+    else
+        v="does not separate (guarded held: $held, open broke: $broke)"
+    fi
+    kv "io_verdict_$g" "$v"
+done

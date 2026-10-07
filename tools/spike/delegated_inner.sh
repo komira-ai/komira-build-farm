@@ -31,7 +31,7 @@ rmdir "$cg/actions/iotest"
 # Rootless Podman placing a container under the delegated subtree (cgroupfs manager:
 # the daemon owns this subtree, not the user's systemd). The container's cgroup is
 # found from the host side and its limits are read there.
-parent=$(self_cgroup)/actions
+parent=${cg#/sys/fs/cgroup}/actions
 cid=$(podman --cgroup-manager=cgroupfs run -d --cgroup-parent="$parent" \
     --memory 64m --memory-swap 64m --cpus 0.5 --pids-limit 64 "$SPIKE_BUSYBOX" sleep 60 2>"$SPIKE_TMP/deleg-podman.err") || {
     kv deleg_podman_leaf "FAILED: $(tail -n 3 "$SPIKE_TMP/deleg-podman.err")"
