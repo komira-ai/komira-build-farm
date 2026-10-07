@@ -352,15 +352,16 @@ async fn a_lease_directory_left_behind_fails_the_lease() {
     std::fs::set_permissions(stuck, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-/// Catches a kill that does not stop the action (its process group), that is not
-/// reported as Killed, or that leaves the lease directory; and a kill of a lease that
-/// is not running doing anything.
+/// Catches a kill that does not stop the whole action (a background process of the
+/// shell lives on unless the process group is killed), that is not reported as
+/// Killed, or that leaves the lease directory; and a kill of a lease that is not
+/// running doing anything.
 #[tokio::test]
 async fn a_kill_stops_the_action() {
     let local = Local::new("local-kill");
     local.runtime.kill(LeaseId::new(9, 9)).await;
     let marker = scratch("local-kill-marker").join("survived");
-    let script = format!("sleep 1; touch {}", marker.display());
+    let script = format!("(sleep 1; touch {}) & wait", marker.display());
     let action = Spec::sh(&script).store(&local.cas);
     let runtime = Arc::clone(&local.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action)).await });
