@@ -471,8 +471,9 @@ impl StateMachine for Scheduler {
                         booked: Resources::default(),
                         last_heard: now,
                     });
-                // MUTANT M2: the running set is ignored on WorkerUp (no reconciliation).
-                let _ = &running;
+                // MUTANT M3: WorkerUp treats the running set as empty.
+                let _ = running;
+                self.reconcile(&worker, &[], true);
                 Vec::new()
             }
             Event::Heartbeat { worker, running } => {
