@@ -31,6 +31,11 @@
 //! other than Linux or macOS, an architecture other than x86-64 or arm64) is
 //! FAILED_PRECONDITION at once, with no `PreconditionFailure` detail: there is nothing
 //! for the client to upload, and Bazel and Buck2 do not retry it.
+//!
+//! Every property name kbf reads is read without regard to case
+//! (`kbf_caps::property_name`): `GPU`, `Kbf-Lease` and `osfamily` are `gpu`,
+//! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
+//! INVALID_ARGUMENT.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
@@ -315,11 +320,25 @@ fn required(d: Option<&reapi::Digest>, field: &str) -> Result<Digest, Status> {
     }
 }
 
-/// The platform's properties, or INVALID_ARGUMENT for a repeated one.
+/// The platform's properties that kbf reads, each under the name kbf reads it by
+/// (`kbf_caps::property_name`), or INVALID_ARGUMENT for a repeated one, also when
+/// repeated in another spelling (`gpu` and `GPU`).
 fn properties(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
     let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
-    Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
-        .map_err(|e| Status::invalid_argument(e.to_string()))
+    let sent = Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let mut read = Platform::new();
+    for (name, value) in sent.canonical() {
+        let Some(key) = kbf_caps::property_name(name) else {
+            continue;
+        };
+        read.insert(&*key, value).map_err(|_| {
+            Status::invalid_argument(format!(
+                "platform property {key:?} is given twice, in two spellings (one is {name:?})"
+            ))
+        })?;
+    }
+    Ok(read)
 }
 
 /// The number of GPUs a platform asks for, or INVALID_ARGUMENT.

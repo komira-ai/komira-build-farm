@@ -17,7 +17,26 @@ These properties change how kbf schedules an action today:
 Any other value of `kbf-lease` or `gpu` is refused with `INVALID_ARGUMENT`. kbf's own
 capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
 [capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
-are accepted and not acted on by the scheduler.
+(`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
+
+### Property names are read in any case
+
+kbf reads every property name it knows without regard to ASCII case, so a property
+meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
+`OSFAMILY=Darwin` and `OSFamily=darwin` all ask for a Mac. This holds for the REAPI
+names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
+(`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
+reserved `kbf-lease`, `kbf-cpu` and `kbf-mac-admin`. In `label.<k>` only `label.` is
+read in any case; the label's own name `<k>` is compared exactly, as its value is.
+`arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
+other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
+table. Values are compared as described for each key: `OSFamily`, `ISA` and `Arch`
+values in any case, kbf's own keys' values exactly.
+
+One property sent under two spellings of its name (`gpu` and `GPU`, `OSFamily` and
+`osfamily`) is refused with `INVALID_ARGUMENT`, as is one requirement named twice
+through two names (`OSFamily` and `os`, `ISA` and `arch`). A name kbf does not know,
+in any case, is not acted on.
 
 ## Where an action runs
 

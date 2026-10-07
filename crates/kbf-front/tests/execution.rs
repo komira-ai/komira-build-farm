@@ -673,6 +673,45 @@ async fn the_platform_says_which_workers_may_run_it() {
     assert_eq!(script.submitted().len(), 3);
 }
 
+/// Catches: a property kbf reads ignored because of its case, so `osfamily=darwin`
+/// runs anywhere, `GPU=1` on a node without a GPU, `KBF-LEASE=whole_machine` beside
+/// other work; and one property sent in two spellings resolved silently by order.
+#[tokio::test]
+async fn property_names_are_read_in_any_case() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let props = [
+        ("osfamily", "darwin"),
+        ("isa", "arm-a64"),
+        ("GPU", "1"),
+        ("KBF-Lease", "whole_machine"),
+        ("Pool", "default"),
+    ];
+    let any_case = job("any case", &props, false);
+    farm.upload(&any_case.blobs.iter().collect::<Vec<_>>())
+        .await;
+    start(&farm, &any_case.action).await.expect("Execute");
+    let [submitted] = script.submitted().try_into().expect("one submission");
+    let want = kbf_caps::Request::parse([("os", "macos"), ("arch", "arm64")]).unwrap();
+    assert_eq!(submitted.request.needs, want);
+    assert_eq!(submitted.request.resources, DEFAULT_RESOURCES.with_gpus(1));
+    assert_eq!(submitted.kind, "whole_machine");
+
+    for props in [
+        vec![("gpu", "1"), ("GPU", "2")],
+        vec![("kbf-lease", "action"), ("Kbf-Lease", "whole_machine")],
+        vec![("OSFamily", "linux"), ("osfamily", "darwin")],
+    ] {
+        let why = format!("{props:?}");
+        let bad = job(&why, &props, false);
+        farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &bad.action).await.expect_err(&why);
+        assert_eq!(status.code(), Code::InvalidArgument, "{why}");
+        assert!(status.message().contains("two spellings"), "{status:?}");
+    }
+    assert_eq!(script.submitted().len(), 1);
+}
+
 /// Catches: an operation no worker can run streamed as plainly QUEUED, so a build
 /// hangs with no word of why, and a reason left in the metadata once it is gone.
 #[tokio::test]

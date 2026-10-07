@@ -136,6 +136,108 @@ fn own_keys_pass_through_and_others_are_left_alone() {
     assert_eq!(from(&[]), Ok(Request::default()));
 }
 
+/// Catches: a property name kbf reads ignored because of its case (`osfamily=darwin`,
+/// `isa=arm-a64`, `OS=macos` dropped as unknown, so the action may run on any worker,
+/// Linux included); a label's own name folded to lower case (labels are compared
+/// exactly); and a property kbf does not read taken as one it does.
+#[test]
+fn property_names_are_read_in_any_case() {
+    for (sent, read) in [
+        ("OSFamily", "OSFamily"),
+        ("osfamily", "OSFamily"),
+        ("OSFAMILY", "OSFamily"),
+        ("isa", "ISA"),
+        ("Isa", "ISA"),
+        ("Arch", "Arch"),
+        ("ARCH", "Arch"),
+        ("arch", "arch"),
+        ("OS", "os"),
+        ("Os_Image", "os_image"),
+        ("ISA_Level", "isa_level"),
+        ("CPU.Feature", "cpu.feature"),
+        ("Cpus", "cpus"),
+        ("GPU", "gpu"),
+        ("gpu", "gpu"),
+        ("KBF-Lease", "kbf-lease"),
+        ("label.pool", "label.pool"),
+        ("Label.Pool", "label.Pool"),
+        ("LABEL.x", "label.x"),
+    ] {
+        assert_eq!(
+            kbf_caps::property_name(sent).as_deref(),
+            Some(read),
+            "{sent}"
+        );
+    }
+    for ignored in [
+        "container-image",
+        "Pool",
+        "dockerNetwork",
+        "LABEL.",
+        "label.",
+        "labels",
+        "Label",
+        "",
+        "ÖS",
+        "label\u{e9}x",
+    ] {
+        assert_eq!(kbf_caps::property_name(ignored), None, "{ignored:?}");
+    }
+    assert_eq!(kbf_caps::REAPI_KEYS, ["OSFamily", "ISA", "Arch"]);
+
+    // Read as requests: each spelling asks for what the canonical one asks for.
+    for (props, want) in [
+        (vec![("osfamily", "darwin")], vec![("os", "macos")]),
+        (vec![("OSFAMILY", "Linux")], vec![("os", "linux")]),
+        (vec![("isa", "arm-a64")], vec![("arch", "arm64")]),
+        (vec![("ARCH", "amd64")], vec![("arch", "x86_64")]),
+        (
+            vec![("Isa", "x86-64-v3")],
+            vec![("arch", "x86_64"), ("isa_level", "x86-64-v3")],
+        ),
+        (vec![("OS", "macos")], vec![("os", "macos")]),
+        (
+            vec![("Label.Pool", "darwin")],
+            vec![("label.Pool", "darwin")],
+        ),
+        (vec![("CPUS", "4"), ("GPU", "1")], vec![("cpus", "4")]),
+    ] {
+        assert_eq!(from(&props), Ok(req(&want)), "{props:?}");
+    }
+    let mac_only = from(&[("osfamily", "darwin")]).unwrap();
+    assert!(mac_only.matches(&mac()));
+    assert!(
+        !mac_only.matches(&linux_v3()),
+        "a lowercase osfamily ignored"
+    );
+    assert!(!from(&[("isa", "arm-a64")]).unwrap().matches(&linux_v3()));
+
+    // In another case, a value no daemon runs is still never served, and named as sent.
+    let Err(FromPlatformError::NeverServed(why)) = from(&[("isa", "x86-32")]) else {
+        panic!("isa=x86-32 was not refused as never served");
+    };
+    assert!(why.contains("isa=\"x86-32\""), "{why}");
+    assert!(matches!(
+        from(&[("osfamily", "Windows")]),
+        Err(FromPlatformError::NeverServed(_))
+    ));
+
+    // One name in two spellings is one key given twice.
+    for props in [
+        [("OSFamily", "linux"), ("osfamily", "linux")],
+        [("os", "linux"), ("OS", "linux")],
+        [("ISA", "arm-a64"), ("arch", "arm64")],
+    ] {
+        assert!(
+            matches!(
+                from(&props),
+                Err(FromPlatformError::Invalid(RequestError::Repeated(_)))
+            ),
+            "{props:?}"
+        );
+    }
+}
+
 /// Catches: one requirement named twice (through `OSFamily` and `os`) silently
 /// resolved by order, and a malformed kbf value accepted.
 #[test]

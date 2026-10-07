@@ -70,8 +70,14 @@ pub(crate) fn is_exact_key(key: &str) -> bool {
     EXACT_KEYS.contains(&key) || key.strip_prefix("label.").is_some_and(|k| !k.is_empty())
 }
 
+/// Whether `key` is one of kbf's own platform keys: a capability key, or a reserved
+/// key [`Request::parse`] skips.
+pub(crate) fn is_own_key(key: &str) -> bool {
+    is_capability_key(key) || RESERVED_KEYS.contains(&key)
+}
+
 /// Whether [`Request::parse`] reads `key` as a capability (reserved keys are not).
-pub(crate) fn is_capability_key(key: &str) -> bool {
+fn is_capability_key(key: &str) -> bool {
     matches!(key, "arch" | "isa_level" | "cpu.feature")
         || Consumable::from_name(key).is_some()
         || is_exact_key(key)

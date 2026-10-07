@@ -143,6 +143,12 @@ booked (see [platform-properties.md](../platform-properties.md#gpu)). Every othe
 property is not a capability and is left to whoever reads it (`kbf-lease`,
 `container-image`, ...). One requirement named twice (`OSFamily` and `os`) is refused.
 
+Property names are read without regard to ASCII case (`kbf_caps::property_name`): the
+REAPI names above and every kbf key (`osfamily`, `OS`, `GPU`, `Kbf-Lease`), so a
+property meant for kbf is never dropped for its spelling and the action run anywhere.
+A label's own name keeps its case. `arch` spelled exactly so is kbf's key; any other
+spelling is REAPI's `Arch`. One name in two spellings is refused.
+
 ## What the code enforces today
 
 - The front reads `kbf-lease` from the action's platform (on the `Action`, or on the
