@@ -16,8 +16,9 @@ use futures::Stream;
 use kbf_daemon::{Daemon, DaemonConfig, Event, FakeRuntime, NodeReport, Runtime, TlsFiles};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
-    DaemonMessage, Heartbeat, HeartbeatAck, Hello, LeaseId, LeaseOffer, Result as WorkerResult,
-    ResultAck, ServerMessage, Start, Welcome, daemon_message, server_message,
+    Cancel, DaemonMessage, Heartbeat, HeartbeatAck, Hello, LeaseId, LeaseOffer,
+    Result as WorkerResult, ResultAck, ServerMessage, Start, Welcome, daemon_message,
+    server_message,
     worker_server::{Worker, WorkerServer},
 };
 use rcgen::{
@@ -169,6 +170,26 @@ impl Peer {
         }));
     }
 
+    /// A Start of lease `term.seq`, or of no lease, that names heartbeat
+    /// `heartbeat_seq` (0: the Hello) and the window after it in which it may run.
+    pub fn start_within(&self, lease: Option<(u64, u64)>, heartbeat_seq: u64, valid_for: Duration) {
+        self.send(server_message::Message::Start(Start {
+            lease_id: lease.map(|(term, seq)| LeaseId { term, seq }),
+            kind: "action".to_owned(),
+            action_digest: Some(digest()),
+            heartbeat_seq,
+            valid_for_ms: valid_for.as_millis() as u64,
+            ..Start::default()
+        }));
+    }
+
+    /// Cancels lease `term.seq`, or no lease at all.
+    pub fn cancel(&self, lease: Option<(u64, u64)>) {
+        self.send(server_message::Message::Cancel(Cancel {
+            lease_id: lease.map(|(term, seq)| LeaseId { term, seq }),
+        }));
+    }
+
     /// Acknowledges the Result of lease `term.seq`, or of no lease at all.
     pub fn ack_result(&self, lease: Option<(u64, u64)>, accepted: bool) {
         self.send(server_message::Message::ResultAck(ResultAck {
@@ -207,6 +228,22 @@ impl Peer {
         .await
         .expect("a Hello")
         .1
+    }
+
+    /// The first Heartbeat that arrives at or after `after`, skipping older ones.
+    pub async fn heartbeat_after(&mut self, after: Instant) -> Heartbeat {
+        loop {
+            let (at, heartbeat) = self
+                .expect(PROMPT, |m| match m {
+                    daemon_message::Message::Heartbeat(h) => Some(h.clone()),
+                    _ => None,
+                })
+                .await
+                .expect("a Heartbeat");
+            if at >= after {
+                return heartbeat;
+            }
+        }
     }
 
     pub async fn heartbeat(&mut self) -> Heartbeat {

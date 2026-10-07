@@ -19,7 +19,10 @@ use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::{self, LeaseOffer, ResultAck, ServerMessage, Start, server_message};
+use kbf_proto::worker::{
+    self, Cancel, LeaseOffer, ResultAck, ServerMessage, Start, server_message,
+};
+use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Event, Input, OpState, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
@@ -61,6 +64,10 @@ struct Waiter {
 struct Link {
     stream: StreamId,
     outbound: Outbound,
+    /// The seq of the newest heartbeat taken on the stream; 0 before the first. Each
+    /// `Start` names it, and the daemon acts on the `Start` only within
+    /// [`START_VALIDITY`] of having sent that heartbeat (or, for 0, its `Hello`).
+    newest_beat: u64,
 }
 
 /// An OK result and its action-cache record, from the report to the answer.
@@ -145,9 +152,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         state.next_stream += 1;
         // The receiver is the stream's own response, alive until the stream ends.
         let _ = outbound.send(Ok(welcome));
-        state
-            .links
-            .insert(worker.clone(), Link { stream, outbound });
+        let link = Link {
+            stream,
+            outbound,
+            newest_beat: 0,
+        };
+        state.links.insert(worker.clone(), link);
         let event = Event::WorkerUp {
             worker: worker.clone(),
             capacity,
@@ -170,19 +180,39 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         }
     }
 
-    /// A heartbeat on `stream`. Returns whether it was taken (and is to be
-    /// acknowledged): a heartbeat from a replaced stream is dropped.
-    pub fn heartbeat(&self, worker: &WorkerId, stream: StreamId, running: Vec<LeaseId>) -> bool {
+    /// Heartbeat `seq` on `stream`. Returns whether it was taken (and is to be
+    /// acknowledged): a heartbeat from a replaced stream is dropped. Each lease it
+    /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`.
+    pub fn heartbeat(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        seq: u64,
+        running: Vec<LeaseId>,
+    ) -> bool {
         let now = self.now();
         let mut state = self.lock();
-        if !state.is_current(worker, stream) {
+        let Some(link) = state.links.get_mut(worker).filter(|l| l.stream == stream) else {
             return false;
-        }
+        };
+        link.newest_beat = link.newest_beat.max(seq);
+        let outbound = link.outbound.clone();
         let event = Event::Heartbeat {
             worker: worker.clone(),
-            running,
+            running: running.clone(),
         };
         state.feed_quiet(now, event);
+        for lease in state.sched.not_held(worker, &running) {
+            tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
+            let cancel = server_message::Message::Cancel(Cancel {
+                lease_id: Some(wire_lease(lease)),
+            });
+            // A stream that has just ended drops it; the next heartbeat listing the
+            // lease, on the next stream, sends it again.
+            let _ = outbound.send(Ok(ServerMessage {
+                message: Some(cancel),
+            }));
+        }
         true
     }
 
@@ -442,8 +472,11 @@ impl State {
         });
     }
 
-    /// Sends the `Start` of a committed lease and marks its callers executing.
+    /// Sends the `Start` of a committed lease and marks its callers executing. The
+    /// `Start` names the newest heartbeat taken on the worker's stream and the window
+    /// after it in which the daemon may still act on the `Start` (issue #23).
     fn start(&mut self, start: StartLease) {
+        let heartbeat_seq = self.links.get(&start.worker).map_or(0, |l| l.newest_beat);
         self.send_for(&start.worker, start.operation, |w| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
@@ -451,6 +484,8 @@ impl State {
                 action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
                 millicpus: start.resources.cpu_millis,
                 memory_bytes: start.resources.memory_bytes,
+                heartbeat_seq,
+                valid_for_ms: START_VALIDITY_MS,
             })
         });
         let waiters = self.sched.waiters(start.operation).unwrap_or_default();
@@ -507,6 +542,9 @@ fn failed(code: Code, message: &str) -> Finished {
         details: Vec::new(),
     })
 }
+
+/// [`START_VALIDITY`] in milliseconds, as `Start.valid_for_ms` carries it.
+const START_VALIDITY_MS: u64 = START_VALIDITY.as_millis() as u64;
 
 fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     worker::LeaseId {

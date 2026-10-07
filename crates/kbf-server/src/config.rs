@@ -13,6 +13,10 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::serve::Listeners;
 
+/// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
+/// [`kbf_sched::fence::START_VALIDITY`].
+pub const MAX_HEARTBEAT_INTERVAL_MS: u64 = kbf_sched::fence::START_VALIDITY.as_millis() as u64 / 2;
+
 /// The roles a server can run. A single node runs them all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Role {
@@ -56,9 +60,14 @@ pub struct Args {
     /// PEM CA that daemon client certificates must chain to.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
-    /// The heartbeat interval daemons are asked for, in milliseconds. Must be under
-    /// half the daemon's fence time.
-    #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..))]
+    /// The heartbeat interval daemons are asked for, in milliseconds, at most half the
+    /// window in which a daemon may act on a `Start` (each `Start` names the newest
+    /// heartbeat the server took, so a longer interval would leave it too little).
+    #[arg(
+        long,
+        default_value_t = 5_000,
+        value_parser = clap::value_parser!(u64).range(1..=MAX_HEARTBEAT_INTERVAL_MS)
+    )]
     pub heartbeat_interval_ms: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
