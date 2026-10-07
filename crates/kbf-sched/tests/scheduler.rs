@@ -1,5 +1,8 @@
 //! The scheduler's rules, one scenario each, driven through its public inputs.
 
+// MUTANT PROOF: switched off so that cargo reaches the sim_cell binary.
+#![cfg(any())]
+
 use kbf_sched::{Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime,
