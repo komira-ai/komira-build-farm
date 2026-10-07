@@ -63,16 +63,34 @@ impl Input {
 pub enum Event {
     /// A worker registered (or registered again) with `capacity` for actions: its CPUs
     /// and RAM minus protected floors. Counts as hearing from it.
+    ///
+    /// A registration opens a new session. Every committed lease the scheduler holds on
+    /// the worker that `running` leaves out goes back to the queue at once: its `Start`
+    /// was sent to an earlier session, so the worker either received it and would list
+    /// it, or never will. The caller must keep that true: a `Start` emitted before this
+    /// input is sent on the earlier session, never on the new one.
     WorkerUp {
         /// The worker.
         worker: WorkerId,
         /// What placement may book on it.
         capacity: Resources,
+        /// The leases the worker holds as it registers (a restarted daemon re-adopts
+        /// its runs; after a reboot there are none).
+        running: Vec<LeaseId>,
     },
-    /// A worker's heartbeat arrived.
+    /// A worker's heartbeat arrived, with the leases it holds.
+    ///
+    /// A committed lease the scheduler holds on the worker that `running` leaves out goes
+    /// back to the queue once its `Start` has been out for [`START_GRACE`]: the `Start`
+    /// was lost, or the worker no longer runs it. A lease whose result has already been
+    /// reported is kept whether listed or not.
+    ///
+    /// [`START_GRACE`]: crate::fence::START_GRACE
     Heartbeat {
         /// The worker.
         worker: WorkerId,
+        /// The leases it holds: running, or ended with a result not yet acknowledged.
+        running: Vec<LeaseId>,
     },
     /// A caller asks for `request` to run. A joinable request with a running twin
     /// attaches `waiter` to the twin instead of queueing a new operation.

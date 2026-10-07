@@ -55,7 +55,11 @@ impl Harness {
     }
 
     fn at_secs(&mut self, secs: u64) -> &mut Self {
-        self.now = FarmTime::from_millis(secs * 1_000);
+        self.at_millis(secs * 1_000)
+    }
+
+    fn at_millis(&mut self, millis: u64) -> &mut Self {
+        self.now = FarmTime::from_millis(millis);
         self
     }
 
@@ -64,11 +68,18 @@ impl Harness {
     }
 
     fn worker(&mut self, name: &str, cpu_millis: u64, memory: u64) {
+        self.register(name, cpu_millis, memory, &[]);
+    }
+
+    /// Registers `name` (again), holding `running`.
+    fn register(&mut self, name: &str, cpu_millis: u64, memory: u64, running: &[LeaseId]) {
         let capacity = Resources::new(cpu_millis, memory);
+        let running = running.to_vec();
         assert!(
             self.feed(Event::WorkerUp {
                 worker: w(name),
-                capacity
+                capacity,
+                running,
             })
             .is_empty()
         );
@@ -79,8 +90,20 @@ impl Harness {
         assert!(self.feed(Event::Submit { waiter, request }).is_empty());
     }
 
+    /// A heartbeat from `name` listing nothing running.
     fn heartbeat(&mut self, name: &str) {
-        assert!(self.feed(Event::Heartbeat { worker: w(name) }).is_empty());
+        self.heartbeat_running(name, &[]);
+    }
+
+    fn heartbeat_running(&mut self, name: &str, running: &[LeaseId]) {
+        let running = running.to_vec();
+        assert!(
+            self.feed(Event::Heartbeat {
+                worker: w(name),
+                running,
+            })
+            .is_empty()
+        );
     }
 
     /// Ticks and returns the grants proposed.
@@ -438,4 +461,98 @@ fn qos_orders_the_queue_and_a_join_promotes() {
     h.worker("a", 1_000, GIB);
     let [g] = h.tick().try_into().unwrap();
     assert_eq!(g.operation, OperationId(2));
+}
+
+/// Catches: a committed lease that a worker the scheduler still hears from leaves out of
+/// its running set kept for good (the booking leaks and the waiters wait forever), or
+/// given up before its `Start` has been out for the Start grace, while that `Start` may
+/// still be on its way (one millisecond early is too early). Once it is given up, the
+/// old lease's late report is not proposed and the new lease answers.
+#[test]
+fn a_lease_left_out_of_the_running_set_is_requeued_after_the_start_grace() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.submit(1, request(1));
+    let [first] = h.tick().try_into().unwrap();
+    // The Start goes out at 1 s.
+    h.at_secs(1).commit_and_start(&first);
+
+    h.at_secs(30).heartbeat_running("a", &[first.lease]);
+    h.at_millis(60_999).heartbeat("a");
+    assert!(
+        matches!(h.s.state(first.operation), Some(OpState::Running { .. })),
+        "requeued before the Start grace"
+    );
+    h.at_secs(61).heartbeat("a");
+    assert_eq!(h.s.state(first.operation), Some(&OpState::Queued));
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+
+    let [second] = h.tick().try_into().unwrap();
+    assert!(second.lease > first.lease);
+    h.commit_and_start(&second);
+    assert!(h.report(&first, ok(1)).is_empty(), "late result proposed");
+    let answer = h.finish(&second, ok(2));
+    assert_eq!(answer.lease, second.lease);
+}
+
+/// Catches: a lease requeued because the running set leaves it out while its reported
+/// result is on its way to the log (a worker stops listing a lease once its result is
+/// acknowledged), which would run the action again for nothing.
+#[test]
+fn a_lease_whose_result_was_reported_is_kept_when_left_out() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.submit(1, request(1));
+    let [grant] = h.tick().try_into().unwrap();
+    h.commit_and_start(&grant);
+    let result = h.propose(&grant, ok(1));
+
+    h.at_secs(60).heartbeat("a");
+    h.register("a", 1_000, GIB, &[]);
+    assert!(
+        matches!(h.s.state(grant.operation), Some(OpState::Running { .. })),
+        "requeued with its result on the way"
+    );
+    let answered = h.commit(result);
+    assert!(matches!(answered.as_slice(), [Effect::Answer(a)] if a.lease == grant.lease));
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+}
+
+/// Catches: a worker that registers again keeping, until a grace or G, a committed lease
+/// it no longer holds (its run is gone with the old session); one that drops a lease
+/// the worker lists as re-adopted (it would run twice); and one that drops a grant
+/// whose `Start` was never sent (its commit starts it on the new session).
+#[test]
+fn registering_again_requeues_at_once_only_what_the_worker_no_longer_holds() {
+    let mut h = Harness::new();
+    h.worker("a", 3_000, 3 * GIB);
+    h.submit(1, request(1));
+    h.submit(2, request(2));
+    h.submit(3, request(3));
+    let [kept, lost, pending] = h.tick().try_into().unwrap();
+    h.commit_and_start(&kept);
+    h.commit_and_start(&lost);
+
+    // The daemon restarts 10 s later and re-adopts `kept`.
+    h.at_secs(10).register("a", 3_000, 3 * GIB, &[kept.lease]);
+    assert!(matches!(
+        h.s.state(kept.operation),
+        Some(OpState::Running { .. })
+    ));
+    assert_eq!(h.s.state(lost.operation), Some(&OpState::Queued));
+    assert!(matches!(
+        h.s.state(pending.operation),
+        Some(OpState::Leased {
+            committed: false,
+            ..
+        })
+    ));
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(2_000, 2 * GIB)));
+
+    let start = h.commit_and_start(&pending);
+    assert_eq!(start.lease, pending.lease);
+    let [again] = h.tick().try_into().unwrap();
+    assert_eq!(again.operation, lost.operation);
+    h.commit_and_start(&again);
+    assert!(h.report(&lost, ok(2)).is_empty(), "late result proposed");
 }

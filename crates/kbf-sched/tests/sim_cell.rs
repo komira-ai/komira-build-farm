@@ -30,12 +30,13 @@
 //! or acknowledgement sent to an earlier session never arrives, the leader drops
 //! heartbeats of a session older than the newest, and a duplicated `Hello` registers
 //! once. Workers send their running set with `Hello` and every heartbeat: runs not
-//! ended, and ended runs whose result is not yet acknowledged.
+//! ended, and ended runs whose result is not yet acknowledged. The leader passes it
+//! to the scheduler.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kbf_sched::fence::LEASE_GRACE;
+use kbf_sched::fence::START_GRACE;
 use kbf_sched::{Event as SchedEvent, Input, Request, Scheduler, SelfFence};
 use kbf_sim::{Chance, Event, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, TraceHash};
 use kbf_types::{
@@ -72,13 +73,11 @@ enum Msg {
     Hello {
         capacity: Resources,
         session: u64,
-        #[expect(dead_code, reason = "the scheduler takes no running set yet")]
         running: Vec<LeaseId>,
     },
     Heartbeat {
         sent_at: FarmTime,
         session: u64,
-        #[expect(dead_code, reason = "the scheduler takes no running set yet")]
         running: Vec<LeaseId>,
     },
     Ack {
@@ -454,32 +453,38 @@ impl StateMachine for Cell {
                     }
                     effects
                 }
-                // A duplicated Hello registers once. The scheduler takes no running
-                // set yet: the one on the wire is dropped here.
+                // A duplicated Hello registers once.
                 Msg::Hello {
                     capacity,
                     session,
-                    running: _,
+                    running,
                 } => {
                     if session <= l.session(&from) {
                         return Vec::new();
                     }
                     l.sessions.insert(from.clone(), session);
                     let worker = WorkerId::new(from.as_str());
-                    l.feed(now, SchedEvent::WorkerUp { worker, capacity })
+                    l.feed(
+                        now,
+                        SchedEvent::WorkerUp {
+                            worker,
+                            capacity,
+                            running,
+                        },
+                    )
                 }
                 // A heartbeat of an older session belongs to a closed stream.
                 Msg::Heartbeat {
                     sent_at,
                     session,
-                    running: _,
+                    running,
                 } => {
                     if session < l.session(&from) {
                         return Vec::new();
                     }
                     let worker = WorkerId::new(from.as_str());
                     l.send(from, Msg::Ack { sent_at, session });
-                    l.feed(now, SchedEvent::Heartbeat { worker })
+                    l.feed(now, SchedEvent::Heartbeat { worker, running })
                 }
                 Msg::Started { operation, lease } => {
                     l.feed(now, SchedEvent::Started { operation, lease })
@@ -730,7 +735,7 @@ fn assert_replaced_after_grace(
     let committed = grants[&op][&lost];
     let again = grants[&op].iter().find(|(l, _)| **l > lost);
     assert!(
-        again.is_some_and(|(_, t)| *t >= committed.saturating_add(LEASE_GRACE)),
+        again.is_some_and(|(_, t)| *t >= committed.saturating_add(START_GRACE)),
         "seed {seed}: {op} lost {lost} committed at {committed:?}; granted again {again:?}"
     );
     assert!(
