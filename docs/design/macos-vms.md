@@ -11,7 +11,12 @@ unless it says otherwise; what exists on `main` today is named as such.
 version. That stays true for Linux: Linux actions run in containers on bare metal.
 For macOS only, it changes: simulator, GUI and UI-test work needs a logged-in GUI
 session, and the way to give each such lease a fresh one, beside other work on the
-same Mac, is a macOS VM. Builds and unit tests stay on bare metal.
+same Mac, is a macOS VM. Builds and unit tests stay on bare metal. **GPU work never
+runs in a VM** ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
+
+Isolating what installing a desktop app does to a bare-metal Mac, and fleet-wide
+updates, device management and UI, are a separate design:
+[fleet-updates.md](fleet-updates.md) (in progress).
 
 Claims about Apple's software and other projects are marked **[V]** (read in the
 source linked) or **[A]** (an assumption or a number nobody has measured on our
@@ -23,11 +28,11 @@ hardware). The table in [section 11](#11-verified-and-assumed) lists them togeth
 |---|---|
 | Why VMs on a Mac at all | Simulator, GUI and UI tests need a logged-in GUI session. A launch daemon has none. A VM gives each lease a fresh one and is destroyed afterwards. |
 | How many | At most **2 running macOS guests per Mac**: the macOS licence allows two, and macOS refuses a third. |
-| What stays on bare metal | Compiling and linking (Swift, C, Objective-C), `swift build`, `swift test` and `xcodebuild build`/`build-for-testing`, logic unit tests, and GPU tests. |
-| Default VM size | 6 vCPU and 16 GiB, booked in full against the host while the VM runs; an action may ask for 4 to 12 vCPU and 8 to 32 GiB. |
-| How the scheduler knows | The action says `kbf-lease=vm` and names a pinned image. Nodes report `vm_slots` and the images they hold. A VM books `vms=1` plus its vCPU and memory. |
+| What stays on bare metal | Compiling and linking (Swift, C, Objective-C), `swift build`, `swift test`, `xcodebuild build`/`build-for-testing` of Swift packages, frameworks and macOS targets, logic unit tests, and all GPU work. iOS app builds with storyboards or asset catalogs wait for a probe ([section 3.2](#32-do-swift-and-xcode-builds-need-a-vm)). |
+| Default VM size | A 6 vCPU, 16 GiB guest; with 1 GiB for its helper it books 6 cores and 17 GiB in full while it runs. An action may ask for 4 to 12 vCPU and 8 to 32 GiB, which books 4-12 cores and 9-33 GiB. |
+| How the scheduler knows | The action says `kbf-lease=vm` and names a pinned image (`vm.image`). Nodes report `vm.slots`, `vm` in `drivers`, and the images they hold. A VM books `vms=1` plus its cores and memory. |
 | VM lifetime | Clone the golden image, boot, run one action, collect outputs, destroy. A VM is never reused. |
-| GPU | GPU tests run on bare metal, one GPU lease per Mac at a time, with the model's memory booked. Not in a VM. |
+| GPU | Never in a VM: a stock guest runs LLM inference at about 4-15% of bare-metal speed (7-25 times slower). GPU tests, including tests that install the desktop app and drive it with a local LLM, run on bare metal with the whole Mac, one at a time. |
 | Order | 1: builds and unit tests on bare metal. 2: VMs. 3: GPU. |
 
 ## 2. Why VMs on a Mac
@@ -39,10 +44,9 @@ Apple's rule for daemons: a launch daemon "is not allowed to connect to the wind
 server"; only agents running in a logged-in (Aqua) session get GUI services
 ([TN2083](https://developer.apple.com/library/archive/technotes/tn2083/_index.html))
 **[V]**. Booting a simulator, running XCUITest, and UI-testing a macOS app all need
-that session **[A]**: reports of CoreSimulator failing with `launchd_sim: could not bind
-to session` when no user is logged in point that way
-([actions/runner-images#7971](https://github.com/actions/runner-images/issues/7971)).
-Other farms run their Mac agents as LaunchAgents in an auto-logged-in session
+that session **[A]**: there is no direct source, and the `simctl boot` probe of
+[section 3.2](#32-do-swift-and-xcode-builds-need-a-vm) settles it. BuildBuddy runs its
+Mac executor as a LaunchAgent and recommends auto-login so it survives reboots
 ([BuildBuddy](https://www.buildbuddy.io/docs/enterprise-mac-rbe/)) **[V]**.
 
 There are two ways to give a lease a GUI session:
@@ -82,9 +86,13 @@ What follows for kbf:
   only after the previous VM has stopped.
 - A single-tenant farm building and testing its own software is purposes (a) and (b)
   **[A]** (not a legal opinion).
-- A farm offered as a service to third parties would fall under section 3 instead
-  (24-hour leases to one customer). kbf does not change for that; the operator's use
-  does **[A]**.
+- A farm offered as a service to third parties falls under section 3 instead, which
+  requires notice to Apple, gives the lessee "sole and exclusive use and control of the
+  Apple Software and the Apple-branded hardware" for at least 24 hours, and lets a
+  lessor virtualize "only a single instance ... as a provisioning tool" (section
+  3A(i)-(iii) and 3D) **[V]**. So a third-party service must lease whole Macs, at least
+  24 hours each, to one lessee, with notice to Apple. Per-action VM leases from
+  different customers on one Mac are not permitted.
 - Simulators run inside macOS; they are not iOS VMs, so the licence's ban on running
   iOS "in virtual operating system environments" is not what a simulator is **[A]**.
 
@@ -99,7 +107,9 @@ asks for the network runs **without** `sandbox-exec`
 (`crates/kbf-driver-native/src/network.rs`) **[V]**. Open
 [#77](https://github.com/komira-ai/komira-build-farm/pull/77) sandboxes every action.
 Each lease gets its own scratch directory, its process tree is killed at the end, and
-removal clears file flags and ACLs.
+removal gives back permissions the action took away and clears the immutable and
+append-only flags (`crates/kbf-driver-native/src/lib.rs`) **[V]**. Clearing ACLs on
+removal is part of open #77.
 
 macOS refuses to apply a sandbox inside a sandbox: a tool that runs `sandbox-exec`
 itself fails with `sandbox-exec: sandbox_apply: Operation not permitted`
@@ -117,11 +127,11 @@ a sandbox has a switch to turn its own off, and kbf's outer sandbox stays on.
 |---|---|---|
 | `swiftc`, `clang`, `ld` called directly, no macros (Buck2 and Bazel Apple rules) | bare metal | nothing **[A]** (Bazel runs them under its macOS sandbox) |
 | `swiftc` with macros (including `@Observable`, `#Preview`) | bare metal | `-disable-sandbox`, in the Swift driver since Swift 5.10 ([swift-driver#1493](https://github.com/swiftlang/swift-driver/pull/1493)) **[V]**. rules_swift sends it by default on macOS ([feature_names.bzl](https://github.com/bazelbuild/rules_swift/blob/master/swift/internal/feature_names.bzl)) **[V]** |
-| `swift build`, `swift test` (logic tests) | bare metal | `--disable-sandbox` ("Disable the sandbox when executing subprocesses", [Options.swift](https://github.com/swiftlang/swift-package-manager/blob/main/Sources/CoreCommands/Options.swift)) **[V]**, and `-Xswiftc -disable-sandbox` if macros are used **[A]**. Packages resolved beforehand into the inputs |
-| `xcodebuild build` / `build-for-testing` (simulator, macOS, unsigned) | bare metal | `-derivedDataPath` inside the lease ([xcodebuild(1)](https://keith.github.io/xcode-man-pages/xcodebuild.1.html)) **[V]**; `OTHER_SWIFT_FLAGS='$(inherited) -disable-sandbox' -IDEPackageSupportDisableManifestSandbox=1 -IDEPackageSupportDisablePluginExecutionSandbox=1` ([Homebrew](https://github.com/orgs/Homebrew/discussions/59)) **[V]**; `-skipMacroValidation -skipPackagePluginValidation` **[A]**; `CODE_SIGNING_ALLOWED=NO` **[A]**; `ENABLE_USER_SCRIPT_SANDBOXING` to be tested, `NO` if it nests **[A]** |
-| iOS storyboards and asset catalogs (`ibtool`, `actool`) | VM until a probe shows bare metal works | `ibtool` uses CoreSimulator device sets ([Apple forums](https://developer.apple.com/forums/thread/76989)) **[A]** |
+| `swift build`, `swift test` (logic tests) | bare metal | `--disable-sandbox` ("Disable the sandbox when executing subprocesses", [Options.swift](https://github.com/swiftlang/swift-package-manager/blob/main/Sources/CoreCommands/Options.swift)) **[V]**, plus `-Xswiftc -disable-sandbox` when macros are used: the compiler sandboxed macro plugins regardless of SwiftPM's `--disable-sandbox`, and the driver's `-disable-sandbox` was the fix ([SwiftPM#7098](https://github.com/swiftlang/swift-package-manager/issues/7098)) **[V]**. Packages resolved beforehand into the inputs |
+| `xcodebuild build` / `build-for-testing` of Swift packages, frameworks and macOS targets (unsigned) | bare metal | `-derivedDataPath` inside the lease ([xcodebuild(1)](https://keith.github.io/xcode-man-pages/xcodebuild.1.html)) **[V]**; `OTHER_SWIFT_FLAGS='$(inherited) -disable-sandbox' -IDEPackageSupportDisableManifestSandbox=1 -IDEPackageSupportDisablePluginExecutionSandbox=1`, reported working by a user in Homebrew discussions ([Homebrew](https://github.com/orgs/Homebrew/discussions/59)) **[V]**; `-skipMacroValidation -skipPackagePluginValidation` **[A]** until checked with `xcodebuild -help` on our Xcode; `CODE_SIGNING_ALLOWED=NO` **[A]**; `ENABLE_USER_SCRIPT_SANDBOXING` to be tested, `NO` if it nests **[A]** |
+| Unsigned iOS Simulator builds of apps with storyboards or asset catalogs (`xcodebuild` runs `ibtool`, `actool`) | VM until the `ibtool`/`actool` probe shows bare metal works | the same flags as the row above. `ibtool` may use CoreSimulator device sets **[A]** (the [Apple forums](https://developer.apple.com/forums/thread/76989) thread is about Interface Builder in Xcode 8.3.2, not the `ibtool` command line) |
 | XCTest or XCUITest on a simulator, macOS UI tests | **VM** | the image has the simulator runtimes and an auto-logged-in user |
-| Signing with a real identity, archive, notarize | not on the shared pool | a keychain in a user session; from a daemon `codesign` fails with `errSecInternalComponent` ([Apple forums](https://developer.apple.com/forums/thread/685967)) **[V]**. A separate release lane, out of scope here |
+| Signing with a real identity, archive, notarize | not on the shared pool | a keychain in a user session; from a non-GUI session (SSH) `codesign` fails with `errSecInternalComponent` ([Apple forums](https://developer.apple.com/forums/thread/685967)) **[V]**, and from a launch daemon **[A]**. A separate release lane, out of scope here |
 
 Rules that follow:
 
@@ -132,16 +142,32 @@ Rules that follow:
   manifest or plugin from writing outside its cache; kbf's profile today allows every
   write the daemon's user can make. Phase 1 therefore denies writes outside the lease
   directory, its `TMPDIR` and a per-lease `HOME`, and adds the per-lease user
-  ([section 9](#9-phased-plan)) **[A]** design.
+  ([section 9](#9-phased-plan)) **[A]** design. `swiftc`, `clang` and `xcodebuild` write
+  module caches and logs under the per-user cache folder (`/var/folders/.../C`) and
+  `~/Library`, so the action also sets `-module-cache-path` /
+  `CLANG_MODULE_CACHE_PATH` and the per-user cache folder inside the lease **[A]**.
 - **Several Xcodes on one host** are selected per action with `DEVELOPER_DIR`
   ([xcode-select(1)](https://keith.github.io/xcode-man-pages/xcode-select.1.html))
-  **[V]**. A node reports each installed Xcode build as a capability; the action asks
-  for one. A VM image holds exactly one Xcode, and its digest names it.
+  **[V]**. On `main`, `xcode` is already an exact capability key with one value, and a
+  report with two `xcode` entries is refused as repeated (`crates/kbf-caps/src/matching.rs`,
+  `crates/kbf-caps/src/report.rs`) **[V]**. Phase 1 therefore changes `xcode` in
+  `kbf-caps` to a set the node reports, matched by membership: the action asks for one
+  build and any node that has it serves it. A VM image holds exactly one Xcode, and its
+  digest names it.
+- **This supersedes these points of the Mac node provisioning design in open #76:**
+  "exactly one Xcode (or one Command Line Tools version) per pool" becomes several
+  Xcodes per host; simulator runtimes live in the VM image, not in the host profile; and
+  GUI work moves from the whole-machine lease with host auto-login to the VM lease, whose
+  guest logs itself in (the host needs auto-login only if the first probe of
+  [section 6](#6-the-vm-driver-one-vm-per-lease-never-reused) fails). #76's "there is no
+  disk image" stays true for the host, but VM golden images now live on Mac nodes.
 
 Four probes on one Mac settle the **[A]** rows above before phase 1 closes:
 `xcodebuild` with user-script sandboxing on, inside kbf's profile; `ibtool`/`actool`
 for iOS from the daemon's role user; `simctl boot` from that user (expected to fail);
-and whether `swift build --disable-sandbox` alone covers macros.
+and writes of `swiftc`, `clang` and `xcodebuild` under the write-deny profile. Whether
+`swift build --disable-sandbox -Xswiftc -disable-sandbox` builds a package with macros is
+a confirmation, not an open question.
 
 ## 4. VM sizing
 
@@ -206,8 +232,13 @@ subtracts nothing (`crates/kbf-daemon/src/report.rs`) **[V]**.
 Rules common to every option, all **[A]** design:
 
 - **Host floor:** 2 cores and 8 GiB are not offered (macOS, `kbf-daemon`, the VM
-  helpers, page cache). The node offers 26 or 30 cores and 88 GiB.
-- **A running VM books** its vCPUs and its memory plus 1 GiB for the helper process.
+  helpers, page cache). The node offers 26 or 30 cores and 88 GiB. The report keeps
+  `cpus` and `mem_gib` as the whole machine, as
+  [capabilities.md](capabilities.md) defines them; the server subtracts the floor from
+  the node's capacity before placement (the planned "Protected floors" of
+  [capabilities.md](capabilities.md#planned) and [scheduler.md](scheduler.md)).
+- **A running VM books** its vCPUs as cores and its memory plus 1 GiB for the helper
+  process: 6 cores and 17 GiB by default, 4-12 cores and 9-33 GiB within the bounds.
 - **An idle slot books nothing:** its CPU and memory serve bare-metal leases.
 - **No overcommit** of memory. CPU is booked in full too: a starved simulator makes UI
   tests time out, and quality comes before throughput. Booking is admission control;
@@ -224,14 +255,16 @@ Rules common to every option, all **[A]** design:
 | Costs | big apps may need more | a third of bare-metal capacity while both run | fragmentation; capacity varies |
 
 **Recommendation:** C as the mechanism, with A as the default. An action that says
-nothing gets 6 vCPU and 16 GiB; one that needs more asks for it, up to 12 and 32 GiB
-(both bounds are server configuration). The VM is configured at boot from what was
+nothing gets a 6 vCPU, 16 GiB guest (6 cores and 17 GiB booked); one that needs more
+asks for it, up to 12 vCPU and 32 GiB (both bounds are server configuration). The VM is configured at boot from what was
 booked, so one golden image serves every size.
 
 **Disk:** a VM lease also needs local disk for its clone's growth (DerivedData,
 simulator data), about 40 GiB **[A]**, checked against the node's free scratch space
 before the VM starts. Golden images live on the same APFS volume as the clones,
-because `clonefile` fails with `EXDEV` across file systems
+because `clonefile` fails with `EXDEV` across file systems, and each file of the image
+is cloned on its own, not the directory: "Cloning directories with these functions is
+strongly discouraged"
 ([clonefile(2)](https://keith.github.io/xcode-man-pages/clonefile.2.html)) **[V]**.
 
 ## 5. How the scheduler knows a VM is needed
@@ -240,26 +273,51 @@ The action says so, the node says what it can do, and the scheduler books it.
 
 ### 5.1 Platform properties (planned)
 
-| Key | Values | Meaning |
-|---|---|---|
-| `kbf-lease` | `vm` (new; beside `action` and `whole_machine`) | run in a fresh macOS VM |
-| `kbf-vm-image` | `<name>@sha256:<digest>` | the golden image; a tag without a digest is refused, as for container images |
-| `kbf-vm-cpus` | 4-12, default 6 | vCPUs |
-| `kbf-vm-mem-gib` | 8-32, default 16 | guest memory |
+| Key | Kind | Values | Meaning |
+|---|---|---|---|
+| `kbf-lease` | reserved | `vm` (new; beside `action` and `whole_machine`) | run in a fresh macOS VM |
+| `vm.image` | capability, membership | `<name>@sha256:<digest>` | the golden image; a value without a digest is refused, as for container images |
+| `kbf-book-cores` | reserved | whole cores | what the lease books. For `kbf-lease=vm` it is also the guest's vCPU count: 4-12, default 6 |
+| `kbf-book-mem-gib` | reserved | GiB | what the lease books. For `kbf-lease=vm`: 9-33, default 17, and the guest's `memorySize` is this minus 1 GiB for the helper (8-32 GiB, default 16) |
 
-All of them are part of the action digest, which is wanted: a result from a VM and one
-from bare metal never share a cache entry. They join the reserved keys the matcher
-skips (`kbf-lease`, `kbf-cpu`, `kbf-mac-admin` today, `crates/kbf-caps/src/matching.rs`
-**[V]**). The front checks the bounds and turns them into a booking.
+**One size convention for every lease kind.** `kbf-book-cores` and `kbf-book-mem-gib`
+are what a lease books, on bare metal and in a VM alike: on an `action` lease they
+replace the 1 core and 1 GiB every action books today (and so raise the native
+driver's memory kill, which is 150% + 512 MiB of the booking); on a `vm` lease they
+size the guest. A `whole_machine` lease books the whole node, so the front refuses
+either key on it. They are not `cpus` and `mem_gib`: those two are capability keys that
+ask for a node whose *whole machine* has at least that much, and they book nothing.
+They are also not `kbf-cpu`, which is planned as the value `dedicated` (whole physical
+cores for quiet performance runs), not a size. When learned sizes (`kbf-estimator`,
+[scheduler.md](scheduler.md)) land, an action without the keys gets a learned size
+instead of the default, and an explicit key wins over the estimate. A VM's size is
+fixed at boot, so a VM lease always uses the key or the VM default, never an estimate.
+
+**`vm.image` is a capability key**, the same name in the request and the report, like
+`xcode` and `os_image`. Its comparison is membership on the digest only: the request
+carries `<name>@sha256:<digest>`, the node reports the digests it holds, and the
+matcher compares the digest part. It is not a reserved key, and the scheduler has no
+image rule of its own.
+
+All of these are part of the action digest, which is wanted: a result from a VM and
+one from bare metal never share a cache entry. `kbf-book-cores` and `kbf-book-mem-gib`
+join the reserved keys the matcher skips (`kbf-lease`, `kbf-cpu`, `kbf-mac-admin`
+today, `crates/kbf-caps/src/matching.rs` **[V]**). The front checks the bounds and
+turns them into a booking.
 
 ### 5.2 Node report (planned)
 
 | Entry | Meaning |
 |---|---|
-| `vm_slots=2` | reported only when Virtualization.framework is usable: a boot check of a tiny VM at daemon start passes |
-| `lease_kind=<kind>`, one per kind | the kinds the daemon's drivers serve: `action`, `vm` |
-| `vm_image=<digest>`, one per image | golden images already on the node's disk |
+| `drivers` gains `vm` | the existing repeated `drivers` key ([capabilities.md](capabilities.md)); `vm` is listed only when Virtualization.framework is usable: a boot check of a tiny VM at daemon start passes |
+| `vm.slots=2` | how many VMs may run at once; fills the `vms` dimension |
+| `vm.image=<digest>`, one per image | golden images already on the node's disk |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start |
+
+No new key names the lease kinds a node serves: the scheduler maps each lease kind to
+the drivers that serve it (`vm` to `vm`; `action` and `whole_machine` to `native` or
+`container`) and reads `drivers`. That is the planned "Drivers in placement" of
+[capabilities.md](capabilities.md#planned) and [scheduler.md](scheduler.md).
 
 ### 5.3 Booking and placement (planned)
 
@@ -269,21 +327,26 @@ On `main`, `Resources` has three dimensions (`cpu_millis`, `memory_bytes`, `gpus
 and placement is first fit in worker-name order with no reservation **[V]**. The
 changes:
 
-1. **A `vms` dimension** in `Resources`, filled from `vm_slots`, checked by `fits` like
-   `gpus`. A VM lease books `vms=1`, its vCPUs and its memory plus 1 GiB. The scheduler
-   therefore never asks for a third VM, and the driver still maps
+1. **A `vms` dimension** in `Resources`, filled from `vm.slots`, checked by `fits` like
+   `gpus`. A VM lease books `vms=1`, `kbf-book-cores` and `kbf-book-mem-gib`. The
+   scheduler therefore never asks for a third VM, and the driver still maps
    `VZErrorVirtualMachineLimitExceeded` to an infrastructure failure that is retried
    elsewhere.
-2. **The kind in the request.** A node is feasible only if its `lease_kind` set has
-   the kind. This also stops `whole_machine` reaching a daemon that refuses it.
-3. **Image locality is a hard requirement.** `kbf-vm-image` matches only nodes whose
-   `vm_image` set has the digest. An image is tens of gigabytes; it is never fetched at
-   action time. Images are placed on nodes ahead of time ([section 7](#7-images)).
-4. **Reservation for VM leases.** A VM lease needs 7-17 cores and 17-33 GiB in one
-   piece; a stream of 1-core actions would starve it. When a VM lease at the head of
-   its queue fits no node, the scheduler reserves the best candidate (a node with a
-   free slot and the image) and stops placing new bare-metal work there until the VM
-   fits, bounded by a timeout. Running leases finish; nothing is killed.
+2. **The kind in the request.** A node is feasible only if its `drivers` include one
+   that serves the kind. This also stops `whole_machine` reaching a daemon that refuses
+   it.
+3. **Image locality is a hard requirement.** `vm.image` matches only nodes that report
+   the digest. An image is tens of gigabytes; it is never fetched at action time.
+   Images are placed on nodes ahead of time ([section 7](#7-images)).
+4. **Reservation for VM leases.** A VM lease needs 4-12 cores and 9-33 GiB in one piece
+   (6 cores and 17 GiB by default); a stream of 1-core actions would starve it. When a
+   VM lease at the head of its queue fits no node, the scheduler reserves the best
+   candidate (a node with a free slot and the image) and stops placing new bare-metal
+   work there until the VM fits, bounded by a timeout. Running leases finish; nothing
+   is killed. A reservation follows the queue's QoS order and is not a quota: only the
+   highest-priority waiting VM lease may hold a node, so a `batch` VM lease never
+   blocks `ci` work. A GPU test's whole-machine lease
+   ([section 8.1](#81-on-bare-metal-never-in-a-vm)) drains a Mac the same way.
 
 This is all pure scheduler code, testable in the simulator crate.
 
@@ -307,15 +370,17 @@ Per lease:
    have a unique auxiliaryStorage and machineIdentifier"
    ([VZMacPlatformConfiguration](https://developer.apple.com/documentation/virtualization/vzmacplatformconfiguration))
    **[V]**.
-2. **Configure.** `cpuCount` and `memorySize` from the booking, so `Start` needs no new
-   field. Devices: one virtio socket; two virtiofs shares, inputs read-only and outputs
+2. **Configure.** From the booking, so `Start` needs no new field: `cpuCount` is the
+   booked cores, and `memorySize` is the booked memory minus the 1 GiB booked for the
+   helper (16 GiB for the default 17 GiB booking), so the guest is not 1 GiB too large. Devices: one virtio socket; two virtiofs shares, inputs read-only and outputs
    read-write; a network device only when the action asks for the network; a graphics
    device (`VZMacGraphicsDeviceConfiguration`) and display for GUI work.
 3. **Boot.** Wait for the guest agent to report ready over the socket. Boot time is not
    charged to the action's timeout; the boot timeout is 120 s **[A]** until boot is
    measured (expected 20-60 s **[A]**).
 4. **Run.** Send argv, environment and working directory over the socket to
-   `kbf-guest`, a small static Rust agent baked into the image, running in the guest's
+   `kbf-guest`, a small self-contained Rust binary (dynamically linked only to
+   libSystem, since macOS does not support fully static executables) baked into the image, running in the guest's
    auto-logged-in user session. It runs the command, writes stdout and stderr into the
    output share, and returns the exit code and usage. Not SSH: no keys, no `sshd`, no
    network needed.
@@ -344,7 +409,10 @@ Rules:
 ## 7. Images
 
 A golden image is a directory: the disk image, auxiliary storage, the hardware model
-and a configuration file. It is built in a fixed order:
+and a configuration file. kbf builds images with its own tool, `kbf-vmm` driving
+`VZMacOSInstaller`, never with Packer or Tart: Packer is under BUSL-1.1 and its Tart
+plugin depends on Tart (FSL), so neither is open source. Cirrus's Packer templates are
+read as a reference for the steps. An image is built in a fixed order:
 
 1. **macOS**: a pinned restore image (`.ipsw`) by URL and SHA-256, installed with
    [`VZMacOSInstaller`](https://developer.apple.com/documentation/virtualization/vzmacosinstaller)
@@ -362,61 +430,77 @@ and a configuration file. It is built in a fixed order:
    the VM lease's host identity.
 
 Size: Cirrus's Xcode template uses a 140 GB disk **[V]**; plan 100-140 GB per golden
-image **[A]**. A node keeps at most two (Xcode N and N-1) **[A]**, plus 40 GiB per
-running clone.
+image **[A]**. A node keeps at most two (Xcode N and N-1) **[A]**, 200-280 GB, plus up
+to 40 GiB per running clone (up to 80 GiB with both VMs running).
 
 Distribution, two options (a decision, [section 10](#10-open-decisions)):
 
 - **Build once, ship by digest** through the CAS as a chunked blob, imported on each
-  Mac by an operator command, then reported as `vm_image`. One build, identical bytes
+  Mac by an operator command, then reported as `vm.image`. One build, identical bytes
   everywhere. Needs chunked upload, which `kbf-segments` has and the cache does not use
-  yet.
+  yet. This copies an image holding macOS and Xcode from one Mac to another; whether
+  the macOS and Xcode licences allow that has not been checked by a lawyer **[A]**.
 - **Build on each Mac** from the same pinned inputs. No large transfers; the bytes may
   differ per Mac, so the digest is per node.
 
 macOS 27 adds DiskImageKit with read-only base layers shared by several VMs plus
 copy-on-write overlays ([DiskImageKit](https://developer.apple.com/documentation/diskimagekit))
-**[V]**. It is Swift-only **[A]**; `clonefile` is enough to start.
+**[V]**. Apple documents it for Swift only **[V]**; `clonefile` is enough to start.
 
 ## 8. GPU
 
-### 8.1 On bare metal, not in a VM
+### 8.1 On bare metal, never in a VM
 
-On Apple silicon the GPU shares the system's memory: "The CPU and GPU have direct
-access to the same memory pool"
+**GPU work never runs in a VM.** A stock macOS guest runs LLM inference at about 4-15%
+of bare-metal speed, 7 to 25 times slower, which is not acceptable. GPU tests, including
+tests that install the desktop app and drive it with a local LLM, run on bare metal with
+the whole Mac, one at a time. There is no GPU-in-VM option.
+
+The evidence: on Apple silicon the GPU shares the system's memory: "The CPU and GPU
+have direct access to the same memory pool"
 ([MLX](https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html)) **[V]**.
-A macOS guest gets a paravirtualized Metal device. A third-party measurement on an M1
-Ultra found the guest's Metal device reports an older GPU family without SIMD-group
-matrix or bfloat16 support. llama.cpp generated 12.63 tokens/s in the stock guest;
-their patched guest reached 206.6 tokens/s, which they put at 72% of bare metal, so the
-stock guest ran at about 4% of the host
+A macOS guest gets a paravirtualized Metal device. One published test on an M1 Ultra
+(llama.cpp) found the stock guest's Metal device reports an older ("Apple 5-era") GPU
+family without SIMD-group matrix or bfloat16 support, and measured it at 4-15% of bare
+metal: TinyLlama generation 12.63 tokens/s against 286.71 on bare metal (4.4%), Gemma
+12B generation 6.5%, prompt processing 9-15%
 ([measurements](https://github.com/trycua/cua/blob/main/blog/gpu-passthrough-macos-vms.md))
-**[V]** for their numbers, **[A]** for ours.
+**[V]** for their numbers, **[A]** for ours. MLX may not run in a stock guest at all
+**[A]**.
 
-So GPU tests run on bare metal:
+So a GPU test is a whole-machine lease:
 
+- It asks for `kbf-lease=whole_machine` and `gpu=1`. No other lease, bare-metal or VM,
+  runs on the Mac while it does: the GPU and the unified memory are the test's alone,
+  macOS has no way to partition the GPU between processes **[A]**, and performance
+  numbers from a shared machine are noise. The scheduler drains the Mac first
+  ([section 5.3](#53-booking-and-placement-planned)); GPU tests on one Mac run one at a
+  time.
 - The daemon reports `gpu=1` on Apple silicon. Today it reports 0
   (`crates/kbf-daemon/src/report.rs`) **[V]**.
-- A GPU lease books `gpu=1`, exclusively: macOS has no way to partition the GPU between
-  processes **[A]**, and performance numbers from a shared GPU are noise.
-- A GPU lease also books memory: weights + KV cache + activations + process. Example,
+- The model must fit: weights + KV cache + activations + process. Example,
   Qwen2.5-7B-Instruct at 4 bits: 4.3 GB of weights; its KV cache is 2 × 28 layers ×
-  4 KV heads × 128 × 2 bytes = 56 KiB per token, 0.47 GB at 8k tokens; book 8 GiB.
+  4 KV heads × 128 × 2 bytes = 56 KiB per token, 0.47 GB at 8k tokens; about 8 GiB.
 - macOS caps GPU-wired memory (`iogpu.wired_limit_mb`,
   [mlx-lm](https://github.com/ml-explore/mlx-lm/blob/main/README.md)) **[V]**; the
   default is about three quarters of RAM on large Macs **[A]**. The daemon reports the
-  cap; memory booked by GPU leases on a node stays under it. An action never changes
-  the sysctl.
-- A VM is used for GPU work only when the test is also a GUI test, and then its numbers
-  are not performance numbers.
+  cap; a test checks that its model fits under it and fails loudly if it does not. An
+  action never changes the sysctl.
+- A test that installs the desktop app needs a GUI session on the host, and what the
+  install leaves behind must not reach the next lease. That isolation, and fleet-wide
+  updates, device management and UI, are designed in
+  [fleet-updates.md](fleet-updates.md) (in progress).
 
 ### 8.2 Testing a local LLM on the GPU
 
-A language model's output cannot be checked against one fixed string: low-precision
-arithmetic makes near-ties common, and a change in batch size or kernel changes the
+A language model's output cannot be checked against one fixed string unless the
+runtime, batch size and hardware are fixed: low-precision arithmetic makes near-ties
+common, and a change in batch size or kernel changes the
 order of floating-point sums, which can flip one token and everything after it
 ([Thinking Machines](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/),
-[llama.cpp#3014](https://github.com/ggml-org/llama.cpp/issues/3014)) **[V]**. Metal's
+[llama.cpp#3014](https://github.com/ggml-org/llama.cpp/issues/3014)) **[V]**. The forward
+pass itself is run-to-run deterministic at a fixed batch size (same sources), which
+layer 2 below relies on. Metal's
 `relaxed` and `fast` math modes allow "aggressive, potentially lossy assumptions"
 ([MTLMathMode](https://developer.apple.com/documentation/metal/mtlmathmode)) **[V]**, so
 the runtime build is part of the result's identity. One study found mlx-lm
@@ -429,9 +513,9 @@ bottom:
 
 | Layer | What it checks | Pass rule | Example | Planted defect that must turn it red |
 |---|---|---|---|---|
-| **1. Kernels** | each GPU operation against a float32 CPU reference on seeded random inputs | exact for integer work; per-type tolerance otherwise (starting at bf16 rtol 1e-2, fp32 rtol 1e-5, then set at twice the worst error seen over 10,000 inputs) | dequantize a 4-bit block of 64 weights: exactly equal; a 1×4096 × 4096×4096 bf16 matmul: max relative error ≤ 1e-2 | swap two scale factors in dequantize |
-| **2. Golden outputs, tiny model** | a pinned 0.3 GB model (Qwen2.5-0.5B-Instruct, 4-bit) gives the recorded tokens | first a determinism check: 20 prompts in 5 fresh processes, identical tokens. If it passes, exact tokens; if not, top-5 log-probabilities within 0.05, failing only where the golden's margin was clear | "List the first five primes as JSON:", greedy, 32 tokens; golden keyed by model digest and runtime version, updated only in a reviewed commit | drop RoPE scaling: tokens diverge at once |
-| **3. Behaviour** | properties, not strings: parses as JSON, matches a schema, is a valid tool call, answers yes/no correctly against labels | run N different inputs; pass when the lower bound of the 95% Wilson interval of the pass rate is at or above the committed bar; never retry a failed case | 100 pinned texts through a 7B model; each output must parse and every relation's ends must be in its entity list; bar 0.90 | break the prompt's JSON instruction: the rate collapses |
+| **1. Kernels** | each GPU operation against a float32 CPU reference on seeded random inputs | exact for integer work; per-type tolerance otherwise (starting at bf16 rtol 1e-2, fp32 rtol 1e-5, then set at twice the worst error seen over 10,000 inputs) | dequantize a 4-bit block of 64 weights: exactly equal; a 1×4096 × 4096×4096 bf16 matmul: every element within `\|got − ref\| ≤ atol + rtol·\|ref\|`, rtol 1e-2 and atol scaled by √K·max\|input\| (an element-wise relative error is unstable for outputs near zero; the error relative to each row's norm is the alternative) | swap two scale factors in dequantize |
+| **2. Golden outputs, tiny model** | a pinned 0.3 GB model (Qwen2.5-0.5B-Instruct, 4-bit) gives the recorded tokens | first a determinism check: 20 prompts in 5 fresh processes, identical tokens. If it passes, exact tokens; if not, top-5 log-probabilities within 0.05, failing only where the golden's margin was clear | "List the first five primes as JSON:", greedy, 32 tokens; golden keyed by model digest, runtime digest, chip/GPU family and macOS build (the hardware key below), since Metal kernels are compiled per GPU family and macOS build; across keys only the log-prob comparison applies; updated only in a reviewed commit | change `rope_theta`, or skip RoPE on one layer: tokens diverge at once (the model's config has no `rope_scaling` to drop) |
+| **3. Behaviour** | properties, not strings: parses as JSON, matches a schema, is a valid tool call, answers yes/no correctly against labels | run N different inputs; pass when the 95% Wilson lower bound of the pass rate is at or above the committed bar; choose N so a model at its expected rate passes at least 95% of the time; never retry a failed case | 200 pinned texts through a 7B model; each output must parse and every relation's ends must be in its entity list; bar 0.90, so at least 189 of 200 must pass | break the prompt's JSON instruction: the rate collapses |
 | **4. Performance** | load time, time to first token on a 512-token prompt, decode tokens/s over 256 tokens, peak memory | median of 5 runs; fail if more than a set margin (start at 7%) below the trailing median on the same hardware key | 7B 4-bit decode tokens/s on one Mac model and macOS build | add a sleep in the decode loop |
 
 The Wilson bounds that set N **[V]** (arithmetic):
@@ -441,8 +525,17 @@ The Wilson bounds that set N **[V]** (arithmetic):
 | 50 / 50 | 0.929 - 1.000 |
 | 48 / 50 | 0.865 - 0.989 |
 | 95 / 100 | 0.888 - 0.978 |
+| 96 / 100 | 0.902 - 0.984 |
+| 188 / 200 | 0.898 - 0.965 |
+| 189 / 200 | 0.904 - 0.969 |
 
-So a bar of 0.90 needs about 100 cases or more; with 50, one failure already fails it.
+Pass when the 95% Wilson lower bound is at or above the bar. Choose N so a model at its
+expected rate passes at least 95% of the time. For bar 0.90 and an expected rate of
+about 0.97, that is N ≈ 200 (189/200 needed; a 0.97 model passes 98% of runs); at
+N = 100 the bar needs 96/100, which a 0.97 model passes only 82% of the time and a 0.95
+model 44%, so the gate would be flaky. With 50 cases, one failure already fails it. The
+alternative is a bar about 5 points below the measured baseline. The lower end of a
+two-sided 95% interval is a 97.5% one-sided bound.
 
 Rules for all four layers:
 
@@ -450,8 +543,9 @@ Rules for all four layers:
   by digest, never downloaded in the action, which runs with the network off. Loopback
   stays open, so a test can start a local model server; the process-tree kill reaps
   it.
-- **A fresh process per case,** or the runtime's prompt cache off: reusing MLX's prompt
-  cache changed outputs for the same prompt
+- **A fresh process per case,** or the runtime's prompt cache off: Ollama's MLX runner
+  returned different outputs for the same prompt after restoring its prompt cache
+  (fixed by disabling that restore)
   ([ollama#16860](https://github.com/ollama/ollama/issues/16860)) **[V]**.
 - **Caching.** Layers 1-3 cache normally; a cache hit for layer 3 replays a measured
   rate on identical inputs. The macOS build and chip must be in the platform so a
@@ -472,33 +566,37 @@ Rules for all four layers:
 ### Phase 1: builds and unit tests on bare metal (now)
 
 Done on `main`: the native driver with `sandbox-exec`, per-lease scratch, process-tree
-kill and ACL-proof removal ([#64](https://github.com/komira-ai/komira-build-farm/pull/64)),
-and platform routing ([#71](https://github.com/komira-ai/komira-build-farm/pull/71)).
-Open: sandbox every action ([#77](https://github.com/komira-ai/komira-build-farm/pull/77)),
+kill and removal that clears the immutable and append-only flags
+([#64](https://github.com/komira-ai/komira-build-farm/pull/64)), and platform routing
+([#71](https://github.com/komira-ai/komira-build-farm/pull/71)).
+Open: sandbox every action and ACL-proof removal ([#77](https://github.com/komira-ai/komira-build-farm/pull/77)),
 Mac node provisioning ([#76](https://github.com/komira-ai/komira-build-farm/pull/76)),
 the fence clock during suspend ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)),
 the node id checked against the certificate ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
 
 | Crate | Change |
 |---|---|
-| `kbf-front`, `kbf-caps` | a memory booking key (`kbf-mem`, by analogy with `kbf-cpu`): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
-| `kbf-driver-native` | deny file writes outside the lease, `TMPDIR` and a per-lease `HOME`; set `HOME` and `TMPDIR` per lease; per-lease user; fill usage |
-| `kbf-daemon` | subtract the host floor; report Xcode builds and SDKs; set `DEVELOPER_DIR` from the action |
-| `kbf-sched`, `kbf-caps` | lease kind in placement (`lease_kind`) |
+| `kbf-front`, `kbf-caps` | the size keys `kbf-book-cores` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-planned)): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
+| `kbf-caps` | `xcode` becomes a set the node reports, matched by membership (today an exact key, and a repeated entry is refused) |
+| `kbf-driver-native` | deny file writes outside the lease, `TMPDIR` and a per-lease `HOME`; set `HOME`, `TMPDIR`, the module cache paths and the per-user cache folder per lease; per-lease user; fill usage |
+| `kbf-daemon` | report each Xcode build (several `xcode` entries) and SDKs; set `DEVELOPER_DIR` from the action |
+| `kbf-server`, `kbf-sched` | subtract the host floor from capacity, not from the report (the planned "Protected floors"); lease kind in placement from `drivers` (the planned "Drivers in placement") |
 | docs | the Swift and Xcode flags in [section 3.2](#32-do-swift-and-xcode-builds-need-a-vm), as guidance for build rules |
 
-Exit: a real Swift package and an `xcodebuild build-for-testing` build on a Mac node,
-the four probes of section 3.2 answered, and their logic tests pass.
+Exit: a real Swift package and an `xcodebuild build-for-testing` of a framework or
+macOS target build on a Mac node, the four probes of section 3.2 answered, and their
+logic tests pass. iOS app targets with storyboards or asset catalogs are in the exit
+only if the `ibtool`/`actool` probe passes.
 
 ### Phase 2: macOS VMs
 
 | Crate | Change | Rough size |
 |---|---|---|
 | `kbf-types` | `Resources.vms` | ~60 lines |
-| `kbf-caps` | reserved `kbf-vm-*` keys; `vm_image` and `lease_kind` sets; membership match | ~250 |
-| `kbf-sched` | kind in `Request`, reservation; simulator tests | ~900 |
-| `kbf-front` | lease kind `vm`, VM size bounds | ~150 |
-| `kbf-server` | read `vm_slots` | ~80 |
+| `kbf-caps` | `vm.image`, matched by membership on the digest; `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` | ~250 |
+| `kbf-sched` | kind in `Request`, reservation in QoS order; simulator tests | ~900 |
+| `kbf-front` | lease kind `vm`, VM bounds on `kbf-book-cores` and `kbf-book-mem-gib` | ~150 |
+| `kbf-server` | read `vm.slots` | ~80 |
 | `kbf-daemon`, `kbf-node` | a runtime that dispatches by kind across several drivers; VM flags (image directory, boot timeout) | ~370 |
 | `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
 | `kbf-vmm`, `kbf-guest` (new) | the VM helper and the guest agent | ~1,000 |
@@ -515,7 +613,7 @@ app's peak are recorded and replace the **[A]** numbers in section 4.
 |---|---|
 | `kbf-daemon` | report `gpu=1`, GPU core count and the wired-memory cap on macOS |
 | `kbf-proto`, `kbf-server` | GPUs in `Start` |
-| `kbf-sched` | GPU leases' memory under the wired cap |
+| `kbf-sched` | GPU tests as whole-machine leases with `gpu=1`: drain the Mac, one at a time |
 | `kbf-daemon`, `kbf-server` | carry `auxiliary_metadata`; store series per test and hardware key |
 | front / CAS | model weights as chunked CAS inputs, kept from eviction on nodes that run GPU tests |
 
@@ -526,12 +624,14 @@ model, then layer 4.
 
 | Decision | Options | Lean |
 |---|---|---|
-| Default VM size | 4 vCPU / 12 GiB; **6 / 16**; 8 / 24 | 6 / 16, per-action up to 12 / 32 |
+| Default VM size | 4 vCPU / 12 GiB; **6 / 16**; 8 / 24 | a 6 vCPU / 16 GiB guest (6 cores / 17 GiB booked), per-action up to 12 vCPU / 32 GiB |
 | VM CPU booking | full vCPU count; half | full |
-| Image distribution | ship by digest through the CAS; build on each Mac | ship by digest |
-| Images per node | one Xcode; two (N and N-1) | two |
+| Image distribution | ship by digest through the CAS; build on each Mac | ship by digest, if copying an image holding macOS and Xcode between our Macs is allowed by their licences (not checked by a lawyer) |
+| Images per node | one Xcode; two (N and N-1) | two (200-280 GB) |
 | `ibtool`/`actool` | VM; bare metal | bare metal if the probe passes |
-| GPU sharing | exclusive; a shared class for kernel tests | exclusive first |
+
+Decided, not open: GPU work never runs in a VM; a GPU test takes the whole Mac on bare
+metal, one at a time ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
 
 ## 11. Verified and assumed
 
@@ -541,10 +641,14 @@ model, then layer 4.
 | macOS refuses a VM beyond the limit | V | [VZError](https://developer.apple.com/documentation/virtualization/vzerror/code/virtualmachinelimitexceeded), [forums](https://developer.apple.com/forums/thread/729580) |
 | Our single-tenant use is "development / testing" | A | not a legal opinion |
 | A launch daemon cannot use the window server | V | [TN2083](https://developer.apple.com/library/archive/technotes/tn2083/_index.html) |
-| Simulators need a logged-in GUI session | A | [runner-images#7971](https://github.com/actions/runner-images/issues/7971) |
+| Simulators need a logged-in GUI session | A | no direct source; settled by the `simctl boot` probe |
 | Nested `sandbox-exec` fails | V | [SwiftPM#7098](https://github.com/swiftlang/swift-package-manager/issues/7098) |
 | `swiftc -disable-sandbox`, SwiftPM `--disable-sandbox` exist | V | [swift-driver#1493](https://github.com/swiftlang/swift-driver/pull/1493), [Options.swift](https://github.com/swiftlang/swift-package-manager/blob/main/Sources/CoreCommands/Options.swift) |
-| xcodebuild's IDEPackageSupport flags avoid nested sandboxes | V (as used by Homebrew) | [Homebrew](https://github.com/orgs/Homebrew/discussions/59) |
+| xcodebuild's IDEPackageSupport flags avoid nested sandboxes | V (reported working by a user in Homebrew discussions) | [Homebrew](https://github.com/orgs/Homebrew/discussions/59) |
+| `-skipMacroValidation`, `-skipPackagePluginValidation` exist | A | to be checked with `xcodebuild -help` |
+| SwiftPM `--disable-sandbox` alone does not cover macros; `-Xswiftc -disable-sandbox` does | V | [SwiftPM#7098](https://github.com/swiftlang/swift-package-manager/issues/7098) |
+| `codesign` fails with `errSecInternalComponent` from a non-GUI SSH session | V; A for a launch daemon | [Apple forums](https://developer.apple.com/forums/thread/685967) |
+| A third-party service must lease whole Macs, 24 hours or more, to one lessee | V | [macOS 27 SLA §3](https://www.apple.com/legal/sla/docs/macOS27.pdf) |
 | User-script sandboxing nests-fails | A | probe |
 | Network-on actions run without `sandbox-exec` on `main` | V | `crates/kbf-driver-native/src/network.rs` |
 | VM memory is reserved, not shrinkable without guest help | V | [memorySize](https://developer.apple.com/documentation/virtualization/vzvirtualmachineconfiguration/memorysize), [balloon](https://developer.apple.com/documentation/virtualization/vzvirtiotraditionalmemoryballoondevice) |
@@ -559,7 +663,9 @@ model, then layer 4.
 | Guest idle memory 3-4 GiB; boot 20-60 s; clone growth 40 GiB | A | to be measured |
 | GitHub arm64 runners: 3 CPU / 7 GB; xlarge 5 / 14 GB | V | [GitHub](https://docs.github.com/en/actions/reference/runners/larger-runners) |
 | M3 Ultra 28-core is 20P + 8E | V | [Apple](https://support.apple.com/en-us/122211) |
-| Guest Metal is a reduced device, far slower for LLM work | V for the cited M1 Ultra numbers; A for ours | [measurements](https://github.com/trycua/cua/blob/main/blog/gpu-passthrough-macos-vms.md) |
+| Guest Metal is a reduced device, 4-15% of bare metal for LLM work | V for the cited M1 Ultra numbers; A for ours | [measurements](https://github.com/trycua/cua/blob/main/blog/gpu-passthrough-macos-vms.md) |
+| MLX may not run in a stock guest | A | no bfloat16 or SIMD-group matrix in the guest's GPU family |
+| DiskImageKit is documented for Swift only | V | [DiskImageKit](https://developer.apple.com/documentation/diskimagekit) |
 | CPU and GPU share memory | V | [MLX](https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html) |
 | GPU-wired memory is capped by `iogpu.wired_limit_mb` | V that it exists; A for the default | [mlx-lm](https://github.com/ml-explore/mlx-lm/blob/main/README.md) |
 | No per-process GPU partitioning on macOS | A | |
