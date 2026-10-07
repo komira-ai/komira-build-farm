@@ -149,6 +149,12 @@ message Start {
   string kind = 2;
   // The action to run. Its inputs are fetched from the CAS.
   build.bazel.remote.execution.v2.Digest action_digest = 3;
+  // What the scheduler booked for the lease on this daemon: CPU in thousandths of a
+  // CPU. The container driver turns it into the lease's cpu.weight. 0 means not booked.
+  uint64 millicpus = 4;
+  // Memory booked for the lease, in bytes. The container driver sets the lease's soft
+  // limit (memory.high) from it; there is no hard per-lease cap. 0 means not booked.
+  uint64 memory_bytes = 5;
 }
 
 // Placeholder. The outcome of one lease. The server accepts at most one Result for an

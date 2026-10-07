@@ -1,6 +1,7 @@
 //! Execution: the [`Runtime`] trait the lease manager runs work through, and
 //! [`FakeRuntime`], which runs nothing. [`crate::LocalRuntime`] (tests only) runs
-//! actions as plain processes; the container driver implements the trait for farm nodes.
+//! actions as plain processes; the container driver (`kbf-driver-container`)
+//! implements the trait for farm nodes.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -8,7 +9,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, Resources};
 use tokio::sync::oneshot;
 
 /// One lease's work, as the server's Start describes it.
@@ -18,6 +19,8 @@ pub struct Work {
     /// The lease kind (`action`, `whole_machine`).
     pub kind: String,
     pub action_digest: Digest,
+    /// What the scheduler booked for the lease here; zero on an axis it did not book.
+    pub resources: Resources,
 }
 
 /// Why work did not produce an action result.
@@ -29,14 +32,17 @@ pub enum RuntimeError {
     /// The runtime could not run the work (an infrastructure failure, not the action's).
     #[error("{0}")]
     Failed(String),
-    /// The action asks for something no node may run (an output path that leaves the
-    /// working directory, a Command without arguments): the client's error, not the
-    /// farm's.
+    /// The action asks for something no node may run (an image named by tag, an output
+    /// path that leaves the working directory, a Command without arguments): the
+    /// client's error, not the farm's.
     #[error("invalid action: {0}")]
     Invalid(String),
     /// A blob the action needs (`hash/size`) is not in the CAS: the client's to upload.
     #[error("blob {0} is not in the CAS")]
     MissingBlob(String),
+    /// The action ran past its timeout and was stopped.
+    #[error("timed out")]
+    TimedOut,
 }
 
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it
