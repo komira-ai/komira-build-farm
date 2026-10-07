@@ -9,9 +9,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 /// (RFC 5.8). The scheduler re-dispatches after G = 60 s; safety needs T + 5 s < G.
 pub const FENCE_AFTER: Duration = Duration::from_secs(40);
 
-/// The `kbf-daemon` command line.
-#[derive(Clone, Debug, clap::Parser)]
-#[command(name = "kbf-daemon", version, about = "The kbf worker daemon.")]
+/// The session flags of the `kbf-daemon` command line: where to connect, as whom, and
+/// how this node is labelled. The binary (crate `kbf-node`) adds the driver flags.
+#[derive(Clone, Debug, clap::Args)]
 pub struct Args {
     /// The kbf-server front to connect to, as an `https://host:port` URL.
     #[arg(long)]
@@ -31,19 +31,47 @@ pub struct Args {
     /// A stable name for this node, unique within the cell.
     #[arg(long)]
     pub node_id: String,
-    /// The execution runtime.
-    #[arg(long, value_enum)]
-    pub runtime: RuntimeKind,
     /// How long to wait between connection attempts, in milliseconds.
     #[arg(long, default_value_t = 1000)]
     pub reconnect_ms: u64,
+    /// A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in
+    /// komira's pool runs with `--label pool=darwin-sized`.
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub labels: Vec<(String, String)>,
 }
 
-/// The runtimes this build can run leases through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum RuntimeKind {
-    /// Runs nothing; every action succeeds with an empty result. For bring-up only.
-    Fake,
+impl Args {
+    /// The node report entries the labels add: `(label.<key>, value)`.
+    #[must_use]
+    pub fn label_entries(&self) -> Vec<(String, String)> {
+        self.labels
+            .iter()
+            .map(|(key, value)| (format!("label.{key}"), value.clone()))
+            .collect()
+    }
+}
+
+/// A `--label` value: `key=value`, the key made of ASCII letters, digits, `.`, `_`
+/// and `-`, the value non-empty and without whitespace.
+fn parse_label(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not key=value"))?;
+    let key_ok = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !key_ok {
+        return Err(format!(
+            "label key {key:?} must be ASCII letters, digits, '.', '_' or '-'"
+        ));
+    }
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return Err(format!(
+            "label value {value:?} must be non-empty and contain no whitespace"
+        ));
+    }
+    Ok((key.to_owned(), value.to_owned()))
 }
 
 /// The TLS files a daemon authenticates with: the server's CA, and its own
@@ -137,5 +165,63 @@ impl DaemonConfig {
         let mut config = Self::new(args.server.clone(), tls, args.node_id.clone());
         config.reconnect_after = Duration::from_millis(args.reconnect_ms);
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(clap::Parser)]
+    struct Line {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let base = [
+            "kbf-daemon",
+            "--server=https://front:7070",
+            "--ca-cert=ca.pem",
+            "--cert=c.pem",
+            "--key=c.key",
+            "--node-id=mac-1",
+        ];
+        <Line as clap::Parser>::try_parse_from(base.iter().chain(extra)).map(|l| l.args)
+    }
+
+    /// Catches: a label flag that is not repeatable, reports under another key than
+    /// `label.<key>`, or accepts a key or value the matcher could not compare exactly
+    /// (empty, spaced, or without `=`).
+    #[test]
+    fn labels_are_checked_and_reported_under_label_keys() {
+        let args = parse(&["--label", "pool=darwin-sized", "--label=rack=r1"]).expect("labels");
+        assert_eq!(
+            args.label_entries(),
+            [
+                ("label.pool".to_owned(), "darwin-sized".to_owned()),
+                ("label.rack".to_owned(), "r1".to_owned())
+            ]
+        );
+        assert!(parse(&[]).expect("no labels").label_entries().is_empty());
+        for bad in ["pool", "=x", "po ol=x", "pool=", "pool=a b", "p/l=x"] {
+            assert!(parse(&["--label", bad]).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Catches: flags that do not reach the configuration (a reconnect wait ignored,
+    /// TLS files swapped).
+    #[test]
+    fn the_flags_reach_the_configuration() {
+        let args = parse(&["--reconnect-ms=250", "--tls-server-name=front"]).expect("flags");
+        let config = DaemonConfig::from_args(&args);
+        assert_eq!(config.server, "https://front:7070");
+        assert_eq!(config.node_id, "mac-1");
+        assert_eq!(config.reconnect_after, Duration::from_millis(250));
+        assert_eq!(config.tls.ca_cert, PathBuf::from("ca.pem"));
+        assert_eq!(config.tls.cert, PathBuf::from("c.pem"));
+        assert_eq!(config.tls.key, PathBuf::from("c.key"));
+        assert_eq!(config.tls.server_name.as_deref(), Some("front"));
+        assert_eq!(config.fence_after, FENCE_AFTER);
     }
 }

@@ -11,7 +11,10 @@ kbf is written in Rust. Its programs are named `kbf-*`:
 - `kbf-server`: the REAPI v2 service. It serves the action cache and the
   content-addressable storage, and schedules actions onto workers.
 - `kbf-daemon`: the worker. It runs on each build machine, fetches inputs,
-  runs actions in isolation, and uploads outputs.
+  runs actions in isolation, and uploads outputs. A Linux node runs each action
+  in a rootless container (`--driver container`); a Mac runs it as plain
+  processes (`--driver native`), with its process tree, memory and network
+  watched by the daemon.
 
 ## Status
 
