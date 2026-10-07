@@ -324,7 +324,7 @@ impl Scheduler {
             .get(&lease)
             .is_some_and(|h| h.start_sent.is_some())
         {
-            op.lost_on.push(worker.clone());
+            // MUTANT M1: a lost lease is not counted as an attempt.
             let resources = op.request.resources;
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
