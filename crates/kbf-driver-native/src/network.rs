@@ -16,9 +16,10 @@
 //!   network on the action's behalf is reachable. The plainest is the system's
 //!   resolver (`mDNSResponder`): DNS lookups still go out, and a name an action looks
 //!   up can carry data out of the node. Loopback services likewise.
-//! - The profile also denies job submission to launchd and Launch Services opens
-//!   ([`NO_NETWORK_PROFILE`]), the two plain ways to start a process launchd runs
-//!   outside the sandbox and the action's tree. Anything else the daemon's user can
+//! - Launchd runs what it is handed outside the sandbox and the action's tree. The
+//!   two plain ways in are closed for a sandboxed action: launchd refuses a job from
+//!   it (`launchctl submit`, `load`, `bootstrap`), and the profile denies Launch
+//!   Services opens (`open`; [`NO_NETWORK_PROFILE`]). Anything else the daemon's user can
 //!   schedule (a `LaunchAgents` plist that runs at its next login, `at`, `cron`, a
 //!   loopback `ssh`) is not covered; a per-lease user is the follow-up that closes
 //!   this class.
@@ -41,13 +42,16 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// The sandbox profile for an action without the network: everything allowed but
 /// network operations, which are allowed only to loopback and Unix sockets, and
-/// handing work to launchd, which would run it outside the sandbox and outside the
-/// action's process tree: submitting or loading a job (`launchctl submit`,
-/// `bootstrap`, `load`: the `job-creation` operation) and opening an application or
-/// document through Launch Services (`open`: `lsopen`).
+/// opening an application or document through Launch Services (`open`: the `lsopen`
+/// operation), which launchd would start outside the sandbox and outside the action's
+/// process tree.
+///
+/// Giving launchd a job (`launchctl submit`, `load`, `bootstrap`) needs no rule here:
+/// launchd refuses it from a sandboxed process, as `tests/launchd.rs` shows on the
+/// macOS runner (and a `(deny job-creation)` rule was dropped after its mutant stayed
+/// green: it changed nothing a test could see).
 pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
-(deny job-creation)\n\
 (deny lsopen)\n\
 (deny network*)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
