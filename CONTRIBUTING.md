@@ -74,12 +74,19 @@ only on GitHub-hosted runners: formatting, clippy, the repository lints,
 `cargo deny`, and the workspace tests on x86-64 and arm64. A pull request is
 merged only when CI is green on its head commit.
 
-The `coverage` job measures line and branch coverage per crate and checks it
-against [coverage-baseline](coverage-baseline): it fails when any crate falls
-below its recorded values. The target is 100% for every crate, so a pull
-request fully covers the code it adds or changes. When a crate's coverage
-rises, or you add a crate, copy `coverage-baseline.measured` from the job's
-`coverage` artifact over `coverage-baseline` in the same pull request.
+The target is 100% line and branch coverage for every crate, so a pull
+request fully covers the code it adds or changes. The `coverage` job measures
+line and branch coverage per crate and checks it against
+[coverage-baseline](coverage-baseline), which records how many lines and
+branches of each crate no test runs. The job fails when either count rises.
+That is what it enforces, and it is slightly weaker than the target: a pull
+request that leaves some new code uncovered still passes if it also covers at
+least as many lines or branches that were uncovered before. Reviewers hold the
+rest of the target. When a count falls, the job passes and marks the crate
+`passes; update the baseline`; a crate missing from the file fails. In either
+case copy `coverage-baseline.measured` from the job's `coverage` artifact over
+`coverage-baseline` in the same pull request, so a later change cannot spend
+the slack a stale count leaves.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

@@ -4,13 +4,20 @@
 //! `members = ["crates/*"]`). A crate whose code no test binary instruments (an empty
 //! skeleton) has no records and nothing to measure; it is still listed, as `-`.
 //!
-//! A crate fails the ratchet when, for lines or branches, it measures below its
-//! baseline value, it has no data where the baseline has a value (its code moved out
-//! of every test binary, or the report lost it), or the baseline says `-` and it now
-//! measures below 100% (new code that tests do not fully cover). A workspace crate
-//! missing from the baseline, and a baseline crate missing from the workspace, fail
-//! too, so the file always names exactly the workspace's crates. A crate that measures
-//! above its baseline passes and is marked so the baseline can be raised.
+//! The ratchet compares missed counts (items no test runs), not percentages: a crate
+//! fails when, for lines or branches, it misses more than its baseline value, it has
+//! no data where the baseline has a value (its code moved out of every test binary, or
+//! the report lost it), or the baseline says `-` and it now misses anything (new code
+//! that tests do not fully cover). A workspace crate missing from the baseline, and a
+//! baseline crate missing from the workspace, fail too, so the file always names
+//! exactly the workspace's crates. A crate that passes but no longer matches its
+//! baseline (fewer misses, or measured code where the baseline says `-`) is marked so
+//! the baseline can be updated; that is a notice, not a failure.
+//!
+//! What this enforces: no change raises a crate's uncovered count. A change that adds
+//! partly covered code fails unless it also covers as many existing items as it leaves
+//! uncovered. Deleting covered code lowers a crate's percentage without failing, since
+//! no item lost its test.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -87,11 +94,11 @@ impl fmt::Display for Metric {
 pub enum Status {
     /// Measured exactly as recorded.
     Ok,
-    /// At or above the baseline everywhere and above it somewhere: passes; the
-    /// baseline can be raised.
-    Above,
-    /// Below the baseline for these metrics: fails.
-    Below(Vec<Metric>),
+    /// Passes, but differs from the baseline (fewer misses, or measured code where the
+    /// baseline says `-`): the baseline can be updated.
+    Outdated,
+    /// Misses more than the baseline for these metrics: fails.
+    MoreMissed(Vec<Metric>),
     /// A workspace crate the baseline does not list: fails.
     Unrecorded,
     /// A baseline crate the workspace does not have: fails.
@@ -100,7 +107,10 @@ pub enum Status {
 
 impl Status {
     pub fn fails(&self) -> bool {
-        matches!(self, Status::Below(_) | Status::Unrecorded | Status::Stale)
+        matches!(
+            self,
+            Status::MoreMissed(_) | Status::Unrecorded | Status::Stale
+        )
     }
 }
 
@@ -108,10 +118,10 @@ impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Status::Ok => f.write_str("ok"),
-            Status::Above => f.write_str("above baseline: raise it"),
-            Status::Below(m) => {
+            Status::Outdated => f.write_str("passes; update the baseline"),
+            Status::MoreMissed(m) => {
                 let m: Vec<String> = m.iter().map(Metric::to_string).collect();
-                write!(f, "BELOW BASELINE ({})", m.join(", "))
+                write!(f, "MORE MISSED THAN BASELINE ({})", m.join(", "))
             }
             Status::Unrecorded => f.write_str("NOT IN BASELINE"),
             Status::Stale => f.write_str("NOT IN WORKSPACE"),
@@ -119,12 +129,12 @@ impl fmt::Display for Status {
     }
 }
 
-/// True when `measured` fails a recorded value; see the module docs.
-fn below(recorded: Option<Percent>, measured: Option<Percent>) -> bool {
+/// True when a `measured` missed count fails the `recorded` one; see the module docs.
+fn more_missed(recorded: Option<u64>, measured: Option<u64>) -> bool {
     match (recorded, measured) {
-        (Some(r), Some(m)) => m < r,
+        (Some(r), Some(m)) => m > r,
         (Some(_), None) => true,
-        (None, Some(m)) => m < Percent::FULL,
+        (None, Some(m)) => m > 0,
         (None, None) => false,
     }
 }
@@ -148,16 +158,16 @@ impl Row {
         };
         let now = Entry::of(m);
         let mut failed = Vec::new();
-        if below(r.lines, now.lines) {
+        if more_missed(r.lines, now.lines) {
             failed.push(Metric::Lines);
         }
-        if below(r.branches, now.branches) {
+        if more_missed(r.branches, now.branches) {
             failed.push(Metric::Branches);
         }
         if !failed.is_empty() {
-            Status::Below(failed)
+            Status::MoreMissed(failed)
         } else if now != r {
-            Status::Above
+            Status::Outdated
         } else {
             Status::Ok
         }
@@ -177,16 +187,17 @@ pub fn rows(measured: &BTreeMap<String, CrateCoverage>, baseline: &Baseline) -> 
         .collect()
 }
 
-/// `hit/found`, the percentage and the gap to 100% for one metric.
-fn cells(c: Option<Counts>) -> [String; 3] {
+/// `hit/found`, the percentage, the gap to 100% and the missed count for one metric.
+fn cells(c: Option<Counts>) -> [String; 4] {
     let Some(c) = c else {
-        return ["-".into(), "-".into(), "-".into()];
+        return ["-".into(), "-".into(), "-".into(), "-".into()];
     };
     let p = c.percent();
     [
         format!("{}/{}", c.hit(), c.found()),
         show(p),
         show(p.map(Percent::gap)),
+        show(c.missed()),
     ]
 }
 
@@ -195,16 +206,16 @@ fn cells(c: Option<Counts>) -> [String; 3] {
 pub fn render(rows: &[Row]) -> String {
     let mut out = String::new();
     out.push_str(
-        "| crate | lines | line % | line gap to 100% | branches | branch % | branch gap to 100% | baseline lines / branches | status |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        "| crate | lines | line % | line gap to 100% | lines missed | branches | branch % | branch gap to 100% | branches missed | baseline missed lines / branches | status |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
     );
     let mut line = |name: &str, m: Option<CrateCoverage>, recorded: String, status: String| {
-        let [l, lp, lg] = cells(m.map(|m| m.lines));
-        let [b, bp, bg] = cells(m.map(|m| m.branches));
+        let [l, lp, lg, lm] = cells(m.map(|m| m.lines));
+        let [b, bp, bg, bm] = cells(m.map(|m| m.branches));
         // Writing to a String cannot fail.
         let _ = writeln!(
             out,
-            "| {name} | {l} | {lp} | {lg} | {b} | {bp} | {bg} | {recorded} | {status} |"
+            "| {name} | {l} | {lp} | {lg} | {lm} | {b} | {bp} | {bg} | {bm} | {recorded} | {status} |"
         );
     };
     let mut total = CrateCoverage::default();
@@ -247,11 +258,7 @@ mod tests {
         }
     }
 
-    fn pct(s: &str) -> Option<Percent> {
-        Some(s.parse().expect(s))
-    }
-
-    fn rec(lines: Option<Percent>, branches: Option<Percent>) -> Option<Entry> {
+    fn rec(lines: Option<u64>, branches: Option<u64>) -> Option<Entry> {
         Some(Entry { lines, branches })
     }
 
@@ -306,49 +313,67 @@ mod tests {
         );
     }
 
-    /// Catches: each rule of the ratchet inverted or dropped (module docs): a drop
-    /// passing, data lost passing, uncovered new code passing under `-`, a rise
+    /// Catches: each rule of the ratchet inverted or dropped (module docs): more misses
+    /// passing, data lost passing, uncovered new code passing under `-`, fewer misses
     /// failing, and an unlisted or stale crate passing.
     #[test]
     fn status_follows_the_ratchet_rules() {
-        let half = cov(2, 1, 4, 2); // 50.00 / 50.00
-        let at = |l: &str, b: &str| rec(pct(l), pct(b));
-        assert_eq!(row(Some(half), at("50.00", "50.00")).status(), Status::Ok);
+        let half = cov(4, 2, 6, 3); // 2 lines and 3 branches missed
+        let at = |l: u64, b: u64| rec(Some(l), Some(b));
+        assert_eq!(row(Some(half), at(2, 3)).status(), Status::Ok);
+        assert_eq!(row(Some(half), at(3, 3)).status(), Status::Outdated);
+        assert_eq!(row(Some(half), at(2, 4)).status(), Status::Outdated);
         assert_eq!(
-            row(Some(half), at("49.99", "50.00")).status(),
-            Status::Above
-        );
-        assert_eq!(row(Some(half), at("50.00", "0.00")).status(), Status::Above);
-        assert_eq!(
-            row(Some(half), at("50.01", "50.00")).status(),
-            Status::Below(vec![Metric::Lines])
+            row(Some(half), at(1, 3)).status(),
+            Status::MoreMissed(vec![Metric::Lines])
         );
         assert_eq!(
-            row(Some(half), at("50.00", "50.01")).status(),
-            Status::Below(vec![Metric::Branches])
+            row(Some(half), at(2, 2)).status(),
+            Status::MoreMissed(vec![Metric::Branches])
         );
         assert_eq!(
-            row(Some(half), at("100.00", "100.00")).status(),
-            Status::Below(vec![Metric::Lines, Metric::Branches])
+            row(Some(half), at(0, 0)).status(),
+            Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
         );
         // Data lost: the baseline has values, the crate now has nothing measured.
         let none = CrateCoverage::default();
         assert_eq!(
-            row(Some(none), at("10.00", "10.00")).status(),
-            Status::Below(vec![Metric::Lines, Metric::Branches])
+            row(Some(none), at(0, 0)).status(),
+            Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
         );
         // `-` recorded: new code must be fully covered to pass.
         assert_eq!(row(Some(none), rec(None, None)).status(), Status::Ok);
         assert_eq!(
             row(Some(cov(1, 1, 0, 0)), rec(None, None)).status(),
-            Status::Above
+            Status::Outdated
         );
         assert_eq!(
             row(Some(cov(3, 2, 0, 0)), rec(None, None)).status(),
-            Status::Below(vec![Metric::Lines])
+            Status::MoreMissed(vec![Metric::Lines])
         );
         assert_eq!(row(Some(half), None).status(), Status::Unrecorded);
-        assert_eq!(row(None, at("1.00", "1.00")).status(), Status::Stale);
+        assert_eq!(row(None, at(1, 1)).status(), Status::Stale);
+    }
+
+    /// Catches: a ratchet on percentages, which passes partly covered new code whenever
+    /// it raises the crate's share. 586/682 lines (85.92%) plus 20 new lines with 19
+    /// covered is 605/702 (86.18%): the percentage rises, but one more line is missed.
+    #[test]
+    fn partly_covered_new_code_fails_even_when_the_percentage_rises() {
+        let before = cov(682, 586, 0, 0);
+        let after = cov(702, 605, 0, 0);
+        assert!(after.lines.percent() > before.lines.percent());
+        assert_eq!(
+            row(Some(after), Some(Entry::of(before))).status(),
+            Status::MoreMissed(vec![Metric::Lines])
+        );
+        // Deleting covered code lowers the percentage but misses nothing new.
+        let deleted = cov(672, 576, 0, 0);
+        assert!(deleted.lines.percent() < before.lines.percent());
+        assert_eq!(
+            row(Some(deleted), Some(Entry::of(before))).status(),
+            Status::Ok
+        );
     }
 
     /// Catches: a failing status reported as passing (or the reverse), which decides
@@ -356,8 +381,8 @@ mod tests {
     #[test]
     fn only_problems_fail() {
         assert!(!Status::Ok.fails());
-        assert!(!Status::Above.fails());
-        assert!(Status::Below(vec![Metric::Lines]).fails());
+        assert!(!Status::Outdated.fails());
+        assert!(Status::MoreMissed(vec![Metric::Lines]).fails());
         assert!(Status::Unrecorded.fails());
         assert!(Status::Stale.fails());
     }
@@ -395,12 +420,12 @@ mod tests {
         assert_eq!(got[1].status(), Status::Ok);
     }
 
-    /// Catches: a table that misplaces a column, hides the gap to 100%, totals the
-    /// wrong rows or prints PASS while a crate fails.
+    /// Catches: a table that misplaces a column, hides the gap to 100% or the missed
+    /// counts, totals the wrong rows or prints PASS while a crate fails.
     #[test]
     fn renders_the_table() {
         let rows = [
-            row(Some(cov(4, 3, 2, 1)), rec(pct("75.00"), pct("50.00"))),
+            row(Some(cov(4, 3, 4, 2)), rec(Some(1), Some(2))),
             Row {
                 krate: "gone".into(),
                 measured: None,
@@ -411,15 +436,15 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[2],
-            "| k | 3/4 | 75.00 | 25.00 | 1/2 | 50.00 | 50.00 | 75.00 / 50.00 | ok |"
+            "| k | 3/4 | 75.00 | 25.00 | 1 | 2/4 | 50.00 | 50.00 | 2 | 1 / 2 | ok |"
         );
         assert_eq!(
             lines[3],
-            "| gone | - | - | - | - | - | - | - / - | NOT IN WORKSPACE |"
+            "| gone | - | - | - | - | - | - | - | - | - / - | NOT IN WORKSPACE |"
         );
         assert_eq!(
             lines[4],
-            "| **workspace** | 3/4 | 75.00 | 25.00 | 1/2 | 50.00 | 50.00 |  |  |"
+            "| **workspace** | 3/4 | 75.00 | 25.00 | 1 | 2/4 | 50.00 | 50.00 | 2 |  |  |"
         );
         assert_eq!(
             lines[6],
@@ -429,7 +454,7 @@ mod tests {
         assert!(pass.ends_with("\ncoverage ratchet: PASS\n"), "{pass}");
         let empty = render(&[row(Some(CrateCoverage::default()), None)]);
         assert!(
-            empty.contains("| k | 0/0 | - | - | 0/0 | - | - | - | NOT IN BASELINE |"),
+            empty.contains("| k | 0/0 | - | - | - | 0/0 | - | - | - | - | NOT IN BASELINE |"),
             "{empty}"
         );
     }
@@ -439,8 +464,8 @@ mod tests {
     fn status_labels() {
         let labels: Vec<String> = [
             Status::Ok,
-            Status::Above,
-            Status::Below(vec![Metric::Lines, Metric::Branches]),
+            Status::Outdated,
+            Status::MoreMissed(vec![Metric::Lines, Metric::Branches]),
             Status::Unrecorded,
             Status::Stale,
         ]
@@ -451,8 +476,8 @@ mod tests {
             labels,
             [
                 "ok",
-                "above baseline: raise it",
-                "BELOW BASELINE (lines, branches)",
+                "passes; update the baseline",
+                "MORE MISSED THAN BASELINE (lines, branches)",
                 "NOT IN BASELINE",
                 "NOT IN WORKSPACE",
             ]

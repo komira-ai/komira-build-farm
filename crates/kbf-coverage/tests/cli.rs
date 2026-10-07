@@ -5,15 +5,39 @@
 //! bad input instead of 2, a measured baseline that the binary cannot read back as
 //! passing, a directory under `crates/` without `Cargo.toml` taken for a crate, and a
 //! crate with no records left out of the table.
+//!
+//! Each test builds its own workspace in a fresh directory named for the test and the
+//! process, so no test reads a file an earlier run (or a concurrent one) left behind.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// A fixture workspace, removed when dropped.
+struct Workspace(PathBuf);
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for Workspace {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// A workspace with crates `a`, `b` and `empty` (no records), plus a loose file and a
-/// directory without `Cargo.toml` under `crates/`, which are not crates.
-fn workspace(name: &str) -> PathBuf {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    // A previous run's files are rewritten below; nothing else depends on them.
+/// directory without `Cargo.toml` under `crates/`, which are not crates. It lives in
+/// `<name>-<pid>`, emptied first: a directory left by a run that was killed, or by an
+/// earlier process with the same pid, never leaks files into this one.
+fn workspace(name: &str) -> Workspace {
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    // Absent on a normal run; anything else surfaces as the create or write below
+    // failing, or as the `measured` freshness check.
+    let _ = std::fs::remove_dir_all(&root);
     for krate in ["a", "b", "empty"] {
         let dir = root.join("crates").join(krate);
         std::fs::create_dir_all(&dir).expect("create crate dir");
@@ -27,7 +51,7 @@ fn workspace(name: &str) -> PathBuf {
          SF:{r}/crates/b/src/main.rs\nLF:10\nLH:10\nend_of_record\n"
     );
     std::fs::write(root.join("lcov.info"), lcov).expect("write lcov");
-    root
+    Workspace(root)
 }
 
 fn run(root: &Path, baseline: &str, extra: &[&str]) -> Output {
@@ -52,7 +76,8 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-const MATCHING: &str = "a 75.00 100.00\nb 100.00 -\nempty - -\n";
+/// `a` misses 1 of 4 lines and none of 2 branches; `b` misses none of 10 lines.
+const MATCHING: &str = "a 1 0\nb 0 -\nempty - -\n";
 
 #[test]
 fn passes_when_coverage_matches_the_baseline() {
@@ -61,11 +86,11 @@ fn passes_when_coverage_matches_the_baseline() {
     assert_eq!(o.status.code(), Some(0), "{}{}", stdout(&o), stderr(&o));
     let out = stdout(&o);
     assert!(
-        out.contains("| a | 3/4 | 75.00 | 25.00 | 2/2 | 100.00 | 0.00 | 75.00 / 100.00 | ok |"),
+        out.contains("| a | 3/4 | 75.00 | 25.00 | 1 | 2/2 | 100.00 | 0.00 | 0 | 1 / 0 | ok |"),
         "{out}"
     );
     assert!(
-        out.contains("| empty | 0/0 | - | - | 0/0 | - | - | - / - | ok |"),
+        out.contains("| empty | 0/0 | - | - | - | 0/0 | - | - | - | - / - | ok |"),
         "{out}"
     );
     assert!(
@@ -79,10 +104,10 @@ fn passes_when_coverage_matches_the_baseline() {
 #[test]
 fn fails_when_a_crate_drops_below_its_baseline() {
     let root = workspace("drops");
-    let o = run(&root, "a 100.00 100.00\nb 100.00 -\nempty - -\n", &[]);
+    let o = run(&root, "a 0 0\nb 0 -\nempty - -\n", &[]);
     assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
     assert!(
-        stdout(&o).contains("BELOW BASELINE (lines)"),
+        stdout(&o).contains("MORE MISSED THAN BASELINE (lines)"),
         "{}",
         stdout(&o)
     );
@@ -92,6 +117,7 @@ fn fails_when_a_crate_drops_below_its_baseline() {
 fn measured_baseline_reads_back_as_passing() {
     let root = workspace("writes");
     let measured = root.join("measured");
+    assert!(!measured.exists(), "fresh workspace");
     // An empty baseline fails (every crate unrecorded) but still writes the file.
     let o = run(
         &root,
@@ -100,7 +126,7 @@ fn measured_baseline_reads_back_as_passing() {
     );
     assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
     assert!(stdout(&o).contains("NOT IN BASELINE"), "{}", stdout(&o));
-    let written = std::fs::read_to_string(&measured).expect("measured file");
+    let written = std::fs::read_to_string(&measured).expect("a failing run writes the file");
     let o = run(&root, &written, &[]);
     assert_eq!(o.status.code(), Some(0), "{written}\n{}", stdout(&o));
 }
@@ -113,8 +139,8 @@ fn bad_inputs_exit_2_with_a_reason() {
         assert!(stderr(&o).contains(want), "{want}: {}", stderr(&o));
     };
     expect_2(
-        run(&root, "a 75 -\n", &[]),
-        "coverage-baseline: line 1: not a percentage",
+        run(&root, "a 75.00 -\n", &[]),
+        "coverage-baseline: line 1: not a count",
     );
     expect_2(
         run(&root, MATCHING, &["--write-baseline", "/nonexistent-dir/x"]),
@@ -125,7 +151,7 @@ fn bad_inputs_exit_2_with_a_reason() {
         .arg("--lcov")
         .arg(root.join("lcov.info"))
         .arg("--root")
-        .arg(&root)
+        .arg(&*root)
         .arg("--baseline")
         .arg(root.join("coverage-baseline"))
         .output()

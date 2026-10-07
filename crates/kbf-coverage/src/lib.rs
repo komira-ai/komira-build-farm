@@ -4,9 +4,12 @@
 //! CI runs the workspace tests under `cargo llvm-cov --branch`, which writes an lcov
 //! tracefile. This crate reads it ([`lcov`]), sums its per-file counts into one
 //! [`CrateCoverage`] per directory under `crates/` ([`ratchet::by_crate`]), and compares
-//! each crate with its line in the `coverage-baseline` file ([`baseline`]). CI fails
-//! when a crate's line or branch coverage is below its recorded value; the table it
-//! prints also shows each crate's gap to 100%, the project's target.
+//! each crate with its line in the `coverage-baseline` file ([`baseline`]). The baseline
+//! records how many lines and branches of each crate no test runs, and CI fails when
+//! either count rises: new code must be covered, or the change must cover as much
+//! existing code as it leaves uncovered. A percentage cannot enforce that, since
+//! partly covered new code can still raise it. The table CI prints also shows each
+//! crate's percentages and gap to 100%, the project's target.
 //!
 //! Percentages are floored to hundredths ([`Percent`]), so one uncovered line in a
 //! large crate shows as 99.99% and a gap of 0.01%, never as a rounded-up 100.00%.
@@ -16,7 +19,6 @@ pub mod lcov;
 pub mod ratchet;
 
 use std::fmt;
-use std::str::FromStr;
 
 /// How many items (lines or branches) a source holds and how many of them ran.
 /// `hit <= found` always holds.
@@ -38,6 +40,11 @@ impl Counts {
 
     pub fn hit(self) -> u64 {
         self.hit
+    }
+
+    /// How many items did not run, or `None` when there is nothing to measure.
+    pub fn missed(self) -> Option<u64> {
+        (self.found > 0).then(|| self.found - self.hit)
     }
 
     /// The sum of two counts; saturates rather than wrapping.
@@ -97,85 +104,61 @@ impl fmt::Display for Percent {
     }
 }
 
-/// Why a string is not a [`Percent`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("not a percentage with two decimals from 0.00 to 100.00: {0:?}")]
-pub struct BadPercent(String);
-
-impl FromStr for Percent {
-    type Err = BadPercent;
-
-    /// Accepts exactly the form [`Percent`]'s `Display` writes: one to three digits, a
-    /// dot and two digits, at most `100.00`.
-    fn from_str(s: &str) -> Result<Self, BadPercent> {
-        let bad = || BadPercent(s.to_owned());
-        let (whole, frac) = s.split_once('.').ok_or_else(bad)?;
-        let digits = |p: &str, len: std::ops::RangeInclusive<usize>| {
-            len.contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit())
-        };
-        if !digits(whole, 1..=3) || !digits(frac, 2..=2) {
-            return Err(bad());
-        }
-        // Both parts are checked digit strings of at most three digits, so this cannot
-        // overflow, and `value <= 10_000` after the range check fits a `u16`.
-        let number = |p: &str| p.bytes().fold(0u32, |n, b| n * 10 + u32::from(b - b'0'));
-        let value = number(whole) * 100 + number(frac);
-        if value > u32::from(Self::FULL.0) {
-            return Err(bad());
-        }
-        Ok(Percent(value as u16))
-    }
-}
-
-/// Formats an optional percentage as the baseline file and the table write it: `-`
-/// when there is nothing to measure.
-pub fn show(p: Option<Percent>) -> String {
-    p.map_or_else(|| "-".to_owned(), |p| p.to_string())
+/// Formats an optional value as the baseline file and the table write it: `-` when
+/// there is nothing to measure.
+pub fn show<T: fmt::Display>(v: Option<T>) -> String {
+    v.map_or_else(|| "-".to_owned(), |v| v.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pct(s: &str) -> Percent {
-        s.parse().expect(s)
+    fn counts(found: u64, hit: u64) -> Counts {
+        Counts::new(found, hit).expect("valid")
+    }
+
+    fn pct(c: Counts) -> String {
+        show(c.percent())
     }
 
     /// Catches: a percentage rounded up, which would show one uncovered line in a large
     /// crate as 100.00% with no gap.
     #[test]
     fn percent_floors_so_a_miss_is_never_hidden() {
-        let c = Counts::new(100_000, 99_999).expect("valid");
-        assert_eq!(c.percent(), Some(pct("99.99")));
-        assert_eq!(c.percent().map(Percent::gap), Some(pct("0.01")));
-        assert_eq!(
-            Counts::new(3, 2).expect("valid").percent(),
-            Some(pct("66.66"))
-        );
-        assert_eq!(
-            Counts::new(4, 4).expect("valid").percent(),
-            Some(Percent::FULL)
-        );
-        assert_eq!(
-            Counts::new(4, 0).expect("valid").percent(),
-            Some(pct("0.00"))
-        );
+        let c = counts(100_000, 99_999);
+        assert_eq!(pct(c), "99.99");
+        assert_eq!(show(c.percent().map(Percent::gap)), "0.01");
+        assert_eq!(pct(counts(3, 2)), "66.66");
+        assert_eq!(pct(counts(20, 1)), "5.00");
+        assert_eq!(counts(4, 4).percent(), Some(Percent::FULL));
+        assert_eq!(pct(counts(4, 0)), "0.00");
     }
 
-    /// Catches: a crate with nothing to measure reported as 0% (a false drop) or 100%
-    /// (a value the baseline could not tell from a real one).
+    /// Catches: a crate with nothing to measure reported as 0% or 0 missed (values the
+    /// baseline could not tell from a real measurement).
     #[test]
-    fn nothing_found_has_no_percentage() {
+    fn nothing_found_has_no_percentage_and_no_miss_count() {
         assert_eq!(Counts::default().percent(), None);
-        assert_eq!(show(None), "-");
-        assert_eq!(show(Some(pct("7.50"))), "7.50");
+        assert_eq!(Counts::default().missed(), None);
+        assert_eq!(show::<Percent>(None), "-");
+        assert_eq!(show(Some(7)), "7");
+    }
+
+    /// Catches: the missed count computed from the wrong field, which would let a drop
+    /// in hits pass the ratchet.
+    #[test]
+    fn missed_is_found_minus_hit() {
+        assert_eq!(counts(10, 7).missed(), Some(3));
+        assert_eq!(counts(4, 4).missed(), Some(0));
+        assert_eq!(counts(4, 0).missed(), Some(4));
     }
 
     /// Catches: counts that claim more hits than items, which would yield over 100%.
     #[test]
     fn hits_above_found_are_refused() {
         assert_eq!(Counts::new(1, 2), None);
-        let c = Counts::new(2, 1).expect("valid");
+        let c = counts(2, 1);
         assert_eq!((c.found(), c.hit()), (2, 1));
     }
 
@@ -183,41 +166,18 @@ mod tests {
     #[test]
     fn counts_add_field_by_field_and_saturate() {
         let a = CrateCoverage {
-            lines: Counts::new(10, 4).expect("valid"),
-            branches: Counts::new(2, 1).expect("valid"),
+            lines: counts(10, 4),
+            branches: counts(2, 1),
         };
         let b = CrateCoverage {
-            lines: Counts::new(5, 5).expect("valid"),
-            branches: Counts::new(3, 0).expect("valid"),
+            lines: counts(5, 5),
+            branches: counts(3, 0),
         };
         let sum = a.plus(b);
-        assert_eq!(sum.lines, Counts::new(15, 9).expect("valid"));
-        assert_eq!(sum.branches, Counts::new(5, 1).expect("valid"));
-        let max = Counts::new(u64::MAX, u64::MAX).expect("valid");
+        assert_eq!(sum.lines, counts(15, 9));
+        assert_eq!(sum.branches, counts(5, 1));
+        let max = counts(u64::MAX, u64::MAX);
         assert_eq!(max.plus(max), max);
         assert_eq!(max.percent(), Some(Percent::FULL));
-    }
-
-    /// Catches: a baseline value read in a form the writer never produces, or out of
-    /// range, so two spellings of one value could disagree.
-    #[test]
-    fn percent_parses_only_its_own_format() {
-        for ok in ["0.00", "5.07", "99.99", "100.00"] {
-            assert_eq!(pct(ok).to_string(), ok);
-        }
-        for bad in [
-            "", "100", "1.5", "1.500", ".50", "1000.00", "100.01", "999.99", "-1.00", "1,00",
-            "a.00", "1.0a", "+1.00",
-        ] {
-            assert_eq!(
-                bad.parse::<Percent>(),
-                Err(BadPercent(bad.to_owned())),
-                "{bad}"
-            );
-        }
-        assert_eq!(
-            BadPercent("x".into()).to_string(),
-            "not a percentage with two decimals from 0.00 to 100.00: \"x\""
-        );
     }
 }
