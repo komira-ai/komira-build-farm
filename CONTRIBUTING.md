@@ -74,6 +74,13 @@ only on GitHub-hosted runners: formatting, clippy, the repository lints,
 `cargo deny`, and the workspace tests on x86-64 and arm64. A pull request is
 merged only when CI is green on its head commit.
 
+The `coverage` job measures line and branch coverage per crate and checks it
+against [coverage-baseline](coverage-baseline): it fails when any crate falls
+below its recorded values. The target is 100% for every crate, so a pull
+request fully covers the code it adds or changes. When a crate's coverage
+rises, or you add a crate, copy `coverage-baseline.measured` from the job's
+`coverage` artifact over `coverage-baseline` in the same pull request.
+
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder
 today: the owners line is commented out until a maintainers team exists, and

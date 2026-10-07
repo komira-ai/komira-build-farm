@@ -885,6 +885,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-coverage"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-daemon"
 version = "0.1.0"
 dependencies = [
