@@ -205,3 +205,72 @@ async fn get_action_result_misses_when_a_tree_file_is_unreachable() {
     farm.upload(&[&inner]).await;
     assert_eq!(get(&farm, &action).await, Ok(result), "healed by re-upload");
 }
+
+/// Catches: a result prepared (its blob stored, ready to be accepted) while an output
+/// it names is absent or unreachable, which would let the server accept a result whose
+/// files nobody can fetch; and a prepared record committed for a client.
+#[tokio::test]
+async fn prepare_refuses_outputs_that_are_not_held() {
+    let farm = Farm::start().await;
+    let absent = Blob::new("an output never uploaded");
+    let result = ActionResult {
+        output_files: vec![output_file("out", &absent)],
+        ..Default::default()
+    };
+    let refused = farm.cache.prepare_action_result(&result).await;
+    assert!(
+        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if d == absent.digest),
+        "{refused:?}"
+    );
+    let result_blob = Blob::of(&result);
+    assert_eq!(
+        farm.find_missing(&[&result_blob]).await,
+        [result_blob.digest],
+        "a refused result stored"
+    );
+
+    let gone = Blob::new("an output whose object is lost");
+    farm.upload(&[&gone]).await;
+    farm.delete_object_of(&gone).await;
+    assert!(farm.cache.read_blob(&gone.digest).await.is_err());
+    let result = ActionResult {
+        output_files: vec![output_file("out", &gone)],
+        ..Default::default()
+    };
+    let refused = farm.cache.prepare_action_result(&result).await;
+    assert!(
+        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if d == gone.digest),
+        "{refused:?}"
+    );
+
+    let fine = Blob::new("an output that is held");
+    farm.upload(&[&fine]).await;
+    let result = ActionResult {
+        output_files: vec![output_file("out", &fine)],
+        ..Default::default()
+    };
+    let record = farm
+        .cache
+        .prepare_action_result(&result)
+        .await
+        .expect("prepare");
+    assert_eq!(record.result, Blob::of(&result).digest);
+    let action = Blob::new("prepared");
+    let as_client = farm
+        .cache
+        .commit_action_record(Role::Client, action.digest, record.clone())
+        .await;
+    assert!(
+        matches!(
+            as_client,
+            Err(CacheError::ActionWrite(ActionWriteError::NotDaemon))
+        ),
+        "{as_client:?}"
+    );
+    assert_eq!(get(&farm, &action).await, Err(Code::NotFound));
+    farm.cache
+        .commit_action_record(Role::Daemon, action.digest, record)
+        .await
+        .expect("daemon commit");
+    assert_eq!(get(&farm, &action).await, Ok(result));
+}

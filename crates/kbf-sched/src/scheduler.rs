@@ -9,7 +9,7 @@ use kbf_types::{
     WorkerId,
 };
 
-use crate::fence::LEASE_GRACE;
+use crate::fence::{LEASE_GRACE, START_GRACE};
 use crate::input::{Event, Input, Request};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
@@ -86,11 +86,29 @@ struct Operation {
     result_proposed: bool,
 }
 
+/// A lease currently held (leased or running).
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    operation: OperationId,
+    /// When and to which session its `Start` was emitted; `None` until its grant is
+    /// committed.
+    start_sent: Option<StartSent>,
+}
+
+/// When a `Start` was emitted, and the worker session it was sent to.
+#[derive(Clone, Copy, Debug)]
+struct StartSent {
+    at: FarmTime,
+    session: u64,
+}
+
 #[derive(Clone, Debug)]
 struct Worker {
     capacity: Resources,
     booked: Resources,
     last_heard: FarmTime,
+    /// Counts the worker's registrations: the session a `Start` emitted now goes to.
+    session: u64,
 }
 
 impl Worker {
@@ -119,6 +137,12 @@ impl Worker {
 ///   A committed result is accepted only if its lease is the operation's newest
 ///   committed grant (log order decides) and the operation is not finished. Results
 ///   from an expired lease, duplicates and late arrivals are dropped.
+///
+/// A lease is given up, and its operation requeued, when its worker is silent for G,
+/// and when a worker it still hears from does not list it as running (see
+/// [`Event::WorkerUp`] and [`Event::Heartbeat`]). A given-up lease can no longer have a
+/// result proposed, and once the operation is granted again its result loses to the
+/// new grant in the log.
 #[derive(Clone, Debug)]
 pub struct Scheduler {
     term: u64,
@@ -131,8 +155,8 @@ pub struct Scheduler {
     /// Joinable operations not yet finished, by dedup key.
     in_flight: BTreeMap<ActionKey, OperationId>,
     workers: BTreeMap<WorkerId, Worker>,
-    /// Every lease currently held (leased or running), to its operation.
-    held: BTreeMap<LeaseId, OperationId>,
+    /// Every lease currently held (leased or running).
+    held: BTreeMap<LeaseId, Held>,
 }
 
 impl Scheduler {
@@ -228,6 +252,17 @@ impl Scheduler {
         op.result_proposed = false;
     }
 
+    /// Releases `operation`'s holding and puts it back in the queue.
+    fn requeue(&mut self, id: OperationId) {
+        self.release(id);
+        let op = self
+            .ops
+            .get_mut(&id)
+            .expect("held leases name live operations");
+        op.state = OpState::Queued;
+        self.queue.insert((Reverse(op.request.qos.clone()), id));
+    }
+
     /// Sends every lease held on a worker not heard from for [`LEASE_GRACE`] back to
     /// the queue.
     fn expire(&mut self) {
@@ -235,7 +270,7 @@ impl Scheduler {
         let expired: Vec<OperationId> = self
             .held
             .values()
-            .copied()
+            .map(|held| held.operation)
             .filter(|id| {
                 let worker = self.ops[id].state.holding().map(|(_, w)| w);
                 worker
@@ -244,13 +279,39 @@ impl Scheduler {
             })
             .collect();
         for id in expired {
-            self.release(id);
-            let op = self
-                .ops
-                .get_mut(&id)
-                .expect("held leases name live operations");
-            op.state = OpState::Queued;
-            self.queue.insert((Reverse(op.request.qos.clone()), id));
+            self.requeue(id);
+        }
+    }
+
+    /// Sends back to the queue every committed lease held on `worker` that `running`
+    /// leaves out, if its `Start` went to an earlier session of the worker or has been
+    /// out for [`START_GRACE`]. A lease whose result was reported is kept: that result
+    /// is on its way to the log.
+    fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) {
+        let Some(session) = self.workers.get(worker).map(|w| w.session) else {
+            return;
+        };
+        let running: BTreeSet<LeaseId> = running.iter().copied().collect();
+        let now = self.now;
+        let lost: Vec<OperationId> = self
+            .held
+            .iter()
+            .filter(|(lease, held)| {
+                let Some(sent) = held.start_sent else {
+                    return false;
+                };
+                // A `Start` sent to an earlier session reached the worker before it
+                // registered again, and then the worker lists it, or it never will.
+                let due = sent.session < session || now >= sent.at.saturating_add(START_GRACE);
+                let op = &self.ops[&held.operation];
+                due && !running.contains(*lease)
+                    && !op.result_proposed
+                    && op.state.holding().is_some_and(|(_, w)| w == worker)
+            })
+            .map(|(_, held)| held.operation)
+            .collect();
+        for id in lost {
+            self.requeue(id);
         }
     }
 
@@ -283,7 +344,13 @@ impl Scheduler {
                 worker: worker.clone(),
                 committed: false,
             };
-            self.held.insert(lease, id);
+            self.held.insert(
+                lease,
+                Held {
+                    operation: id,
+                    start_sent: None,
+                },
+            );
             effects.push(Effect::Commit(ControlRecord::Lease(LeaseGrant {
                 lease,
                 operation: id,
@@ -309,6 +376,13 @@ impl Scheduler {
             && !*committed
         {
             *committed = true;
+            if let Some(held) = self.held.get_mut(lease) {
+                let session = self.workers.get(&*worker).map_or(0, |w| w.session);
+                held.start_sent = Some(StartSent {
+                    at: self.now,
+                    session,
+                });
+            }
             effects.push(Effect::Start(StartLease {
                 worker: worker.clone(),
                 lease: *lease,
@@ -407,17 +481,27 @@ impl StateMachine for Scheduler {
                     .and_modify(|w| {
                         w.capacity = capacity;
                         w.last_heard = now;
+                        w.session += 1;
                     })
                     .or_insert(Worker {
                         capacity,
                         booked: Resources::default(),
                         last_heard: now,
+                        session: 0,
                     });
                 Vec::new()
             }
-            Event::Heartbeat { worker } => {
+            Event::Capacity { worker, capacity } => {
+                if let Some(w) = self.workers.get_mut(&worker) {
+                    w.capacity = capacity;
+                    w.last_heard = w.last_heard.max(self.now);
+                }
+                Vec::new()
+            }
+            Event::Heartbeat { worker, running } => {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.last_heard = w.last_heard.max(self.now);
+                    self.reconcile(&worker, &running);
                 }
                 Vec::new()
             }

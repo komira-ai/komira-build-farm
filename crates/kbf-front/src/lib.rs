@@ -1,8 +1,9 @@
 //! The front end: the gRPC services that clients and daemons talk to,
 //! authentication, and the HTTP endpoints for health and status.
 //!
-//! This is the cache half: `Capabilities`, `ContentAddressableStorage`, `ByteStream`
-//! and `ActionCache`, served by [`routes`] over one [`Cache`]. The cache keeps its
+//! The cache half: `Capabilities`, `ContentAddressableStorage`, `ByteStream` and
+//! `ActionCache`, served by [`routes`] over one [`Cache`]. The execution half adds
+//! `Execution` over a [`Dispatch`], the scheduler's seam ([`routes_with_execution`]). The cache keeps its
 //! index and action cache in a [`MetaLog`] and its bytes in a
 //! [`kbf_objstore::ObjectStore`], packed into `kbf-segments` segments. Both are traits:
 //! [`Cache::memory`] runs them in this process ([`MemoryMetaLog`] and the fake store),
@@ -19,12 +20,15 @@
 //! - **Every byte is verified,** on upload and on read.
 //! - **Clients never write the action cache:** `UpdateActionResult` is
 //!   PERMISSION_DENIED.
+//! - **Work never run:** Execute answers a hit from the action cache and joins a
+//!   running twin before anything is queued (RFC 5.3).
 
 mod action_cache;
 mod bytestream;
 mod cache;
 mod capabilities;
 mod cas;
+mod execution;
 mod meta_log;
 mod wire;
 
@@ -35,6 +39,7 @@ use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::reapi::action_cache_server::ActionCacheServer;
 use kbf_proto::reapi::capabilities_server::CapabilitiesServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
+use kbf_proto::reapi::execution_server::ExecutionServer;
 use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
@@ -42,6 +47,10 @@ pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::{Cache, CacheError, VerifiedBlob};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
+pub use crate::execution::{
+    DEFAULT_RESOURCES, Dispatch, ExecutionService, Finished, LEASE_KIND_KEY, LEASE_KINDS,
+    OperationStream, Stage, Submission, Ticket,
+};
 pub use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
@@ -68,7 +77,29 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    Routes::new(CapabilitiesServer::new(CapabilitiesService))
+    cache_routes(cache, CapabilitiesService::cache_only())
+}
+
+/// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
+/// that advertise execution.
+pub fn routes_with_execution<M, O, D>(cache: Arc<Cache<M, O>>, dispatch: Arc<D>) -> Routes
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+    D: Dispatch,
+{
+    let execution = ExecutionServer::new(ExecutionService::new(Arc::clone(&cache), dispatch))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    cache_routes(cache, CapabilitiesService::with_execution()).add_service(execution)
+}
+
+fn cache_routes<M, O>(cache: Arc<Cache<M, O>>, capabilities: CapabilitiesService) -> Routes
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    Routes::new(CapabilitiesServer::new(capabilities))
         .add_service(
             ContentAddressableStorageServer::new(CasService::new(Arc::clone(&cache)))
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -80,4 +111,20 @@ where
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         )
         .add_service(ActionCacheServer::new(ActionCacheService::new(cache)))
+}
+
+/// A REAPI digest as kbf's [`kbf_types::Digest`], or INVALID_ARGUMENT naming why not.
+///
+/// # Errors
+/// The digest is absent, has a negative size or is not lowercase SHA-256 hex.
+pub fn digest_from_proto(
+    d: Option<&kbf_proto::reapi::Digest>,
+) -> Result<kbf_types::Digest, tonic::Status> {
+    wire::digest(d)
+}
+
+/// kbf's [`kbf_types::Digest`] as a REAPI digest.
+#[must_use]
+pub fn digest_to_proto(d: &kbf_types::Digest) -> kbf_proto::reapi::Digest {
+    wire::digest_to_proto(d)
 }

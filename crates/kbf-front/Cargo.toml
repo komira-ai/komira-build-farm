@@ -13,10 +13,13 @@ futures.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true
+kbf-sched.workspace = true
 kbf-segments.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tonic.workspace = true
 tracing.workspace = true
 

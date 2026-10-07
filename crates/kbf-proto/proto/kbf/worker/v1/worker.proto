@@ -8,6 +8,9 @@
 // and to time its fence; Offer, LeaseOffer, Start and Result are placeholders whose
 // fields will grow with the scheduler and the daemon. A server accepts protocol versions
 // N-1 and N.
+//
+// Additions within version 1 (a daemon that ignores them keeps working):
+// - ResultAck: the server's answer to a Result.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -40,6 +43,7 @@ message ServerMessage {
     HeartbeatAck heartbeat_ack = 2;
     Start start = 3;
     LeaseOffer lease_offer = 4;
+    ResultAck result_ack = 5;
   }
 }
 
@@ -52,6 +56,12 @@ message Capability {
 }
 
 // The first message of a session, and resent whenever the node report changes.
+//
+// Only the first Hello of a stream registers the node: it opens a new session, and the
+// server sends Start messages for this node on this stream from then on. A Hello resent
+// on the same stream changes the node report, and with it the capacity placement sees,
+// and nothing else (issue #25). The server reads the capacity from the `cpus` and
+// `mem_gib` entries, which a Hello must carry.
 message Hello {
   // The protocol version the daemon speaks. This file defines version 1.
   uint32 protocol_version = 1;
@@ -91,6 +101,14 @@ message Heartbeat {
   // Equal to the report_hash of the newest Hello.
   bytes report_hash = 2;
   // The leases this daemon is running now.
+  //
+  // Contract: the server requeues a lease granted to an earlier stream as soon as
+  // a heartbeat on the new stream leaves it out. A restarted daemon must therefore
+  // finish re-adopting its lease units before it sends its first Heartbeat on the
+  // new stream, and list every unit it re-adopted; otherwise a unit still running
+  // within its self-fence window is requeued at once and runs twice. Issue #26:
+  // this set must also include leases whose result is not yet acknowledged.
+  // Issue #25: only the first Hello of a stream registers the worker again.
   repeated LeaseId running = 3;
 }
 
@@ -100,8 +118,8 @@ message HeartbeatAck {
   uint64 seq = 1;
 }
 
-// Placeholder. The capacity the daemon offers for actions now, after its protected
-// floors. Resources are not capabilities: there are no slots.
+// Placeholder, not read by the server yet. The capacity the daemon offers for actions
+// now, after its protected floors. Resources are not capabilities: there are no slots.
 message Offer {
   // Free CPU, in thousandths of a CPU.
   uint64 millicpus = 1;
@@ -133,11 +151,29 @@ message Start {
 }
 
 // Placeholder. The outcome of one lease. The server accepts at most one Result for an
-// operation.
+// operation, and only from the node that holds the operation's current lease; it
+// answers each Result with a ResultAck. An OK result's outputs (every output file,
+// stdout and stderr, every output tree and the files it names) must already be in the
+// CAS, or the result is taken as an infrastructure failure. The server writes an
+// accepted OK result with exit code 0 to the action cache, unless the action is
+// `do_not_cache`, before it answers the operation's callers.
 message Result {
   LeaseId lease_id = 1;
   // OK when the action ran, whatever its exit code; otherwise why it could not run.
   google.rpc.Status status = 2;
   // The action's result when status is OK. Its outputs are already in the CAS.
   build.bazel.remote.execution.v2.ActionResult action_result = 3;
+}
+
+// The server's answer to a Result: it has decided that Result, so the daemon may forget
+// it. Until a daemon receives the ResultAck for a lease, it resends the Result on its
+// next stream and lists the lease in Heartbeat.running (issue #26).
+message ResultAck {
+  LeaseId lease_id = 1;
+  // Whether this Result became the operation's result. False when the lease is
+  // unknown, held by another node, or no longer the operation's current lease (it was
+  // given up and granted again), and for a copy of a Result that was already accepted
+  // (its operation is finished). A refused result is never written to the action
+  // cache. Either way the daemon may forget the Result.
+  bool accepted = 2;
 }

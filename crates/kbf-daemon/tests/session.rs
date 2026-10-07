@@ -222,3 +222,21 @@ async fn a_lease_survives_a_reconnect_shorter_than_t() {
         "the reconnect fenced the lease"
     );
 }
+
+/// Catches: a daemon that drops the server's `ResultAck` (or fails on it), and one that
+/// reports an acknowledgement without a lease id as if it named a lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_ack_is_reported() {
+    let mut h = Harness::start("result-ack", LONG, LONG).await;
+    let peer = h.welcomed().await;
+    peer.ack_result(None, true);
+    peer.ack_result(Some((1, 6)), false);
+    let (_, (lease, accepted)) = h
+        .event(PROMPT, |e| match e {
+            Event::ResultAcknowledged { lease, accepted } => Some((*lease, *accepted)),
+            _ => None,
+        })
+        .await
+        .expect("a ResultAcknowledged event");
+    assert_eq!((lease, accepted), (kbf_types::LeaseId::new(1, 6), false));
+}

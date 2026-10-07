@@ -385,14 +385,61 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         if role != Role::Daemon {
             return Err(ActionWriteError::NotDaemon.into());
         }
+        let record = self.prepare_action_result(result).await?;
+        self.commit_action_record(role, action, record).await
+    }
+
+    /// The first half of [`Cache::write_action_result`]: works out the closure of
+    /// `result`, checks every blob in it is held, and stores `result` as a blob. The
+    /// action cache is not touched; [`Cache::commit_action_record`] writes the entry.
+    ///
+    /// The server runs this when a daemon reports a result, before the scheduler accepts
+    /// it, and commits the entry only once the result is accepted: so a result whose
+    /// outputs are not all stored is never accepted, and a result that is not accepted
+    /// never reaches the action cache.
+    ///
+    /// # Errors
+    /// [`CacheError::ActionWrite`] naming the first blob of the closure that is not
+    /// held; a missing tree, a malformed result, or an unavailable store or log.
+    pub async fn prepare_action_result(
+        &self,
+        result: &reapi::ActionResult,
+    ) -> Result<ActionRecord, CacheError> {
         let closure = self.closure_of(result).await?;
+        let lack = self
+            .meta
+            .query(|s| {
+                closure.iter().find_map(|d| match s.blob(d) {
+                    BlobAnswer::Present(_) => None,
+                    BlobAnswer::Absent => Some(ActionWriteError::Absent(*d)),
+                    BlobAnswer::Unavailable => Some(ActionWriteError::Unreachable(*d)),
+                })
+            })
+            .await?;
+        if let Some(lack) = lack {
+            return Err(lack.into());
+        }
         let blob = VerifiedBlob::hashed(Bytes::from(result.encode_to_vec()));
         let digest = blob.digest;
         self.store_blobs(vec![blob]).await?;
-        let record = ActionRecord {
+        Ok(ActionRecord {
             result: digest,
             closure,
-        };
+        })
+    }
+
+    /// The second half of [`Cache::write_action_result`]: commits the action-cache
+    /// entry for `action`. Only [`Role::Daemon`] may write, and the log checks again
+    /// that every blob the entry needs is held.
+    ///
+    /// # Errors
+    /// [`CacheError::ActionWrite`] if refused; an unavailable log.
+    pub async fn commit_action_record(
+        &self,
+        role: Role,
+        action: Digest,
+        record: ActionRecord,
+    ) -> Result<(), CacheError> {
         match self
             .meta
             .commit(Command::PutAction {
