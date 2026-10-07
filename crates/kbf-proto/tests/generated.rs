@@ -123,10 +123,20 @@ fn worker_messages_round_trip() {
             action_digest: Some(digest(&"ef".repeat(32), 140)),
             millicpus: 1500,
             memory_bytes: 1 << 30,
+            heartbeat_seq: 12,
+            valid_for_ms: 14_000,
         })),
     };
     let back = ServerMessage::decode(start.encode_to_vec().as_slice()).expect("decode");
     assert_eq!(back, start);
+
+    let cancel = ServerMessage {
+        message: Some(server_message::Message::Cancel(worker::Cancel {
+            lease_id: Some(LeaseId { term: 2, seq: 8 }),
+        })),
+    };
+    let back = ServerMessage::decode(cancel.encode_to_vec().as_slice()).expect("decode");
+    assert_eq!(back, cancel);
 
     let result = DaemonMessage {
         message: Some(daemon_message::Message::Result(WorkerResult {

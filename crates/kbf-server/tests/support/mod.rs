@@ -437,6 +437,15 @@ impl FakeDaemon {
         start
     }
 
+    /// The lease of the next `Cancel` within [`QUIET`], if one arrives.
+    pub async fn cancelled(&mut self) -> Option<LeaseId> {
+        self.expect_within(QUIET, |m| match m {
+            server_message::Message::Cancel(c) => Some(c.lease_id.expect("a lease id")),
+            _ => None,
+        })
+        .await
+    }
+
     /// Asserts no Offer or Start arrives within [`QUIET`].
     pub async fn no_work(&mut self) {
         let work = self

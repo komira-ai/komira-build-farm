@@ -2,10 +2,11 @@
 //!
 //! It holds one outbound mutual-TLS `kbf.worker.v1` stream to a server front, reports
 //! its node (detected through `kbf-caps`), sends heartbeats, and runs a lease manager:
-//! work starts only on `Start`, each lease reports one `Result`, kept until the server
-//! acknowledges it, and every running lease is killed and reported when no heartbeat
-//! has been acknowledged for the fence time T. Execution goes through the [`Runtime`]
-//! trait. A runtime reads an action and its inputs from the front's CAS and writes the
+//! work starts only on `Start`, and only while the `Start` is inside the window it
+//! names (issue #23); each lease reports one `Result`, kept until the server
+//! acknowledges it; a lease the server cancels is killed; and every running lease is
+//! killed and reported when no heartbeat has been acknowledged for the fence time T.
+//! Execution goes through the [`Runtime`] trait. A runtime reads an action and its inputs from the front's CAS and writes the
 //! outputs back through a [`Cas`]; [`CasClient`] is the one that talks to a front.
 //!
 //! - [`config`]: command-line flags and TLS files.
@@ -34,6 +35,7 @@ pub mod runtime;
 pub mod tree;
 #[cfg(target_os = "linux")]
 pub mod usage;
+mod window;
 
 pub use cas::{Cas, CasClient, CasError};
 pub use config::{Args, DaemonConfig, FENCE_AFTER, RuntimeKind, TlsFiles};

@@ -122,6 +122,14 @@ the heartbeat leaves out is requeued:
 A lease whose result has already been reported is kept either way: that result is on
 its way to the log.
 
+The second rule assumes that a `Start` arriving after `START_GRACE` is never run. The
+daemon makes this hold: it acts on a `Start` only within `START_VALIDITY` (W = 14 s) of
+sending the heartbeat the `Start` names, and `W + T + 5 s < G` is checked at compile
+time beside the other fence condition (see [worker-protocol.md](worker-protocol.md)).
+The other way round, `Scheduler::not_held` names the leases a heartbeat lists that the
+scheduler granted and no longer holds on that worker, and the server sends a `Cancel`
+for each.
+
 Sessions matter here. Only the first `Hello` on a stream registers a worker and opens
 a new session. The server feeds heartbeats only from a worker's newest stream; a
 heartbeat that arrives on a replaced stream is dropped and not acknowledged, so a

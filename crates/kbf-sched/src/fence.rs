@@ -2,7 +2,8 @@
 //! on the worker's side.
 //!
 //! G also bounds how long the scheduler keeps a committed lease that a worker it still
-//! hears from does not list as running ([`START_GRACE`]).
+//! hears from does not list as running ([`START_GRACE`]), and with T it bounds how late
+//! a worker may act on a `Start` ([`START_VALIDITY`]).
 //!
 //! The scheduler re-dispatches a worker's leases once it has heard nothing from the
 //! worker for G. A worker holding a [`FencePolicy::SelfFence`] lease stops it once its
@@ -27,7 +28,8 @@ pub const LEASE_GRACE: Duration = Duration::from_secs(60);
 /// still be on its way, and a heartbeat sent before it arrived rightly omits it; after
 /// that the lease is taken as lost and its operation requeued. RFC section 5.8 has one
 /// wait before re-dispatch, G; this is G, counted from the `Start`. It assumes a `Start`
-/// reaches a connected worker within G or never.
+/// that arrives later than that is not run: a worker that refuses a `Start` older than
+/// [`START_VALIDITY`] makes it hold.
 pub const START_GRACE: Duration = LEASE_GRACE;
 
 /// T: how long after sending its newest acknowledged heartbeat a worker keeps running a
@@ -41,6 +43,27 @@ pub const LEADER_LEASE_MARGIN: Duration = Duration::from_secs(5);
 // compile error, not a silent overlap of two runs.
 const _: () =
     assert!(SELF_FENCE.as_millis() + LEADER_LEASE_MARGIN.as_millis() < LEASE_GRACE.as_millis());
+
+/// W: how late a worker may act on a `Start`, counted from when it sent the newest
+/// heartbeat the scheduler had heard when the `Start` went out. The `Start` left after
+/// that heartbeat arrived, so a `Start` acted on inside W was in flight for less than W,
+/// whatever the delay, and the worker measures it on its own clock.
+///
+/// Why `W + T + LEADER_LEASE_MARGIN < START_GRACE` keeps a late `Start` from running
+/// beside its retry. A lease given up to silence is covered by the self-fence, and one
+/// given up to a new session by the old stream having ended. That leaves a heartbeat of
+/// the same session, taken [`START_GRACE`] or more after the `Start` was sent, that
+/// leaves the lease out. A heartbeat sent after the worker started the lease
+/// lists it, so that heartbeat was sent earlier, less than W after the `Start` left.
+/// Heartbeats on a stream are taken in order, so no heartbeat sent after it is
+/// acknowledged before the scheduler gives the lease up, and the worker's self-fence
+/// stops the run less than `W + T` after the `Start` left: before the retry exists.
+pub const START_VALIDITY: Duration = Duration::from_secs(14);
+
+const _: () = assert!(
+    START_VALIDITY.as_millis() + SELF_FENCE.as_millis() + LEADER_LEASE_MARGIN.as_millis()
+        < START_GRACE.as_millis()
+);
 
 /// A worker's self-fence clock, kept by the daemon.
 ///

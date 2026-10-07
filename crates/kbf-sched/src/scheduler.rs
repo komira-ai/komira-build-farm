@@ -205,6 +205,29 @@ impl Scheduler {
         self.workers.get(worker).map(|w| w.booked)
     }
 
+    /// The leases in `running` (a heartbeat's running set) that this scheduler granted
+    /// and no longer holds on `worker`: given up, granted elsewhere, or finished. Their
+    /// results can no longer be accepted, so a run of one is wasted, and a run of one
+    /// whose operation was granted again runs beside the retry. The caller cancels
+    /// them. A lease of another term is never named: this scheduler does not know
+    /// whether a newer leader granted it.
+    pub fn not_held<'a>(
+        &'a self,
+        worker: &'a WorkerId,
+        running: &'a [LeaseId],
+    ) -> impl Iterator<Item = LeaseId> + 'a {
+        running.iter().copied().filter(move |lease| {
+            let granted = lease.term == self.term && lease.seq < self.next_seq;
+            let held_here = self.held.get(lease).is_some_and(|held| {
+                self.ops[&held.operation]
+                    .state
+                    .holding()
+                    .is_some_and(|(_, w)| w == worker)
+            });
+            granted && !held_here
+        })
+    }
+
     fn submit(&mut self, waiter: WaiterId, request: Request) {
         if request.joinable()
             && let Some(&id) = self.in_flight.get(&request.key)

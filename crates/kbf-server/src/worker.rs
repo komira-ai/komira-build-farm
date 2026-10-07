@@ -6,7 +6,8 @@
 //! - a resent `Hello` changes the node's capacity and nothing else;
 //! - a `Heartbeat` is fed to the scheduler and acknowledged, unless a newer stream of
 //!   the same node has registered since: then it is dropped unacknowledged, so a
-//!   daemon still talking on the old stream fences on time;
+//!   daemon still talking on the old stream fences on time. A lease it lists that the
+//!   scheduler no longer holds on the node is sent a `Cancel` (issue #23);
 //! - a `Result` is accepted only from the node holding the operation's current lease,
 //!   and answered with a `ResultAck`;
 //! - an `Offer` is not read yet.
@@ -145,9 +146,10 @@ async fn serve<M: MetaLog, O: ObjectStore>(
                     .iter()
                     .map(|l| LeaseId::new(l.term, l.seq))
                     .collect();
-                farm.heartbeat(&worker, stream, running).then_some(
-                    server_message::Message::HeartbeatAck(HeartbeatAck { seq: beat.seq }),
-                )
+                farm.heartbeat(&worker, stream, beat.seq, running)
+                    .then_some(server_message::Message::HeartbeatAck(HeartbeatAck {
+                        seq: beat.seq,
+                    }))
             }
             Some(daemon_message::Message::Result(result)) => farm
                 .report(&worker, result)

@@ -12,6 +12,8 @@
 // Additions within version 1 (a daemon that ignores them keeps working):
 // - ResultAck: the server's answer to a Result.
 // - ResourceUsage: what an action used, carried inside its ActionResult.
+// - Start.heartbeat_seq and Start.valid_for_ms: how late a Start may still be acted on.
+// - Cancel: the server stops a lease it no longer holds on the daemon.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -45,6 +47,7 @@ message ServerMessage {
     Start start = 3;
     LeaseOffer lease_offer = 4;
     ResultAck result_ack = 5;
+    Cancel cancel = 6;
   }
 }
 
@@ -156,6 +159,27 @@ message Start {
   // Memory booked for the lease, in bytes. The container driver sets the lease's soft
   // limit (memory.high) from it; there is no hard per-lease cap. 0 means not booked.
   uint64 memory_bytes = 5;
+  // The newest Heartbeat of this stream the server had taken when it sent this Start,
+  // by its seq; 0 when it had taken none, which names the stream's Hello instead.
+  uint64 heartbeat_seq = 6;
+  // How long after the daemon sent that Heartbeat (or Hello) it may still act on this
+  // Start, in milliseconds. The server sent the Start after it took the Heartbeat, so
+  // a Start the daemon receives within this window was in flight for less than it,
+  // measured on the daemon's clock alone. A daemon refuses a Start that arrives later,
+  // or that names a seq it did not send on this stream: it does not run it, sends no
+  // Result and does not list it, so the scheduler gives the lease up as a Start that
+  // never arrived. The bound keeps a late Start from running beside the retry of its
+  // lease. 0 means no bound (a server that predates this field).
+  uint64 valid_for_ms = 7;
+}
+
+// The server no longer holds this lease on the daemon (it gave the lease up and the
+// operation may already run elsewhere), yet the daemon's Heartbeat lists it. The daemon
+// stops the lease if it is running; its run ends like any killed run, with a Result
+// the server refuses. A lease the daemon is not running is ignored. The server sends a
+// Cancel for every Heartbeat that lists such a lease, so a lost Cancel is sent again.
+message Cancel {
+  LeaseId lease_id = 1;
 }
 
 // Placeholder. The outcome of one lease. The server accepts at most one Result for an
