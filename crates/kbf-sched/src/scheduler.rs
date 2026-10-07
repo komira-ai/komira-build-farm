@@ -320,7 +320,8 @@ impl Scheduler {
             .held
             .get(&lease)
             .is_some_and(|h| h.start_sent.is_some());
-        let attempt = start_sent && !op.result_proposed;
+        let attempt = start_sent; // MUTANT M6: a reported lease counts
+        let _ = op.result_proposed;
         if attempt {
             op.lost_on.push(worker.clone());
         }
