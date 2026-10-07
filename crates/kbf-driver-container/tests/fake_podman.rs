@@ -484,6 +484,69 @@ async fn podman_failures_are_infrastructure_failures() {
         "{outcome:?}"
     );
     fake.assert_clean(2);
+
+    fake.knob("status-override", "exited many\n");
+    let outcome = fake.run(3, &spec, "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("exit code")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(3);
+
+    std::fs::remove_file(fake.state.join("status-override")).expect("rm knob");
+    fake.knob("inspect-fails", "");
+    let outcome = fake.run(4, &spec, "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("inspect refused")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(4);
+}
+
+/// Catches a failing clean step hiding the lease's own failure: the first error is
+/// the one reported (the clean error is logged).
+#[tokio::test]
+async fn a_failed_run_with_a_failed_clean_reports_the_run() {
+    let fake = Fake::new("both-fail");
+    fake.knob("create-fails", "");
+    fake.knob("rm-fails", "");
+    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("create refused")),
+        "{outcome:?}"
+    );
+}
+
+/// Catches a missing Podman program being reported as anything but the farm's
+/// failure.
+#[tokio::test]
+async fn a_missing_podman_is_an_infrastructure_failure() {
+    let fake = Fake::new("no-podman");
+    std::fs::remove_file(fake.dir.join("podman")).expect("unlink podman");
+    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("run ")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
+}
+
+/// Catches the kill path giving up early: when SIGTERM cannot be sent and the
+/// container survives `cgroup.kill`, the driver still stops `podman start` and
+/// removes the container by force.
+#[tokio::test]
+async fn the_kill_path_ends_even_when_every_signal_fails() {
+    let fake = Fake::new("stubborn");
+    fake.knob("kill-fails", "");
+    fake.knob("cgroup-kill-ignored", "");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.timeout = Some(Duration::from_millis(200));
+    let outcome = fake.run(1, &spec, "sleep 30").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::TimedOut)),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
 }
 
 /// Catches a failed clean step being ignored: a dirty node must fail the lease.
