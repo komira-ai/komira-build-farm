@@ -12,10 +12,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kbf_proto::google::rpc::{Code, Status};
+use kbf_proto::google::rpc::precondition_failure::Violation;
+use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{self, Start};
 use kbf_types::{LeaseId, Resources};
+use prost::Message;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -128,9 +130,9 @@ fn work(id: LeaseId, start: Start) -> Option<Work> {
 }
 
 /// The Result that reports a finished run.
-fn result_of(
+pub(crate) fn result_of(
     id: LeaseId,
-    outcome: std::result::Result<ActionResult, RuntimeError>,
+    outcome: Result<ActionResult, RuntimeError>,
 ) -> worker::Result {
     match outcome {
         Ok(action_result) => worker::Result {
@@ -141,11 +143,36 @@ fn result_of(
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
         Err(RuntimeError::Invalid(why)) => failure(id, Code::InvalidArgument, why),
+        Err(RuntimeError::MissingBlob(blob)) => missing(id, &blob),
         Err(RuntimeError::TimedOut) => failure(
             id,
             Code::DeadlineExceeded,
             "the action ran past its timeout",
         ),
+    }
+}
+
+/// FAILED_PRECONDITION with a `MISSING` violation for `blob` (`hash/size`), as REAPI
+/// reports an input that is not in the CAS.
+fn missing(id: LeaseId, blob: &str) -> worker::Result {
+    let detail = PreconditionFailure {
+        violations: vec![Violation {
+            r#type: "MISSING".to_owned(),
+            subject: format!("blobs/{blob}"),
+            description: String::new(),
+        }],
+    };
+    worker::Result {
+        lease_id: Some(proto_lease_id(id)),
+        status: Some(Status {
+            code: Code::FailedPrecondition as i32,
+            message: format!("blob {blob} is not in the CAS"),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/google.rpc.PreconditionFailure".to_owned(),
+                value: detail.encode_to_vec(),
+            }],
+        }),
+        action_result: None,
     }
 }
 
@@ -325,28 +352,44 @@ mod tests {
         assert_eq!(work(id(), Start::default()), None);
     }
 
-    /// Catches an outcome reported under the wrong status: a client error reported as
-    /// INTERNAL would be retried as an infrastructure failure, and a timeout reported
-    /// as OK would be cached.
+    /// Catches an outcome reported with the wrong status: a run killed while its lease
+    /// still runs (no fence took it; the runtime stopped it) as anything but ABORTED,
+    /// the farm's failure as the client's, or the reverse (a client error reported as
+    /// INTERNAL would be retried as an infrastructure failure), and a timeout reported
+    /// as OK, which would be cached. Every arm in one test, so each code is checked
+    /// against the others.
     #[test]
-    fn each_outcome_maps_to_its_status() {
-        let ok = result_of(id(), Ok(ActionResult::default()));
-        assert_eq!(code(&ok), Code::Ok as i32);
-        assert!(ok.action_result.is_some());
-        let cases = [
+    fn each_outcome_has_its_status() {
+        let id = LeaseId::new(3, 4);
+        let ok = result_of(
+            id,
+            Ok(ActionResult {
+                exit_code: 2,
+                ..ActionResult::default()
+            }),
+        );
+        assert_eq!(ok.lease_id, Some(proto_lease_id(id)));
+        assert_eq!(ok.status, Some(Status::default()));
+        assert_eq!(ok.action_result.map(|r| r.exit_code), Some(2));
+        let codes = [
             (RuntimeError::Killed, Code::Aborted),
-            (RuntimeError::Failed("x".to_owned()), Code::Internal),
+            (RuntimeError::Failed("disk".to_owned()), Code::Internal),
             (
-                RuntimeError::Invalid("tag".to_owned()),
+                RuntimeError::Invalid("argv".to_owned()),
                 Code::InvalidArgument,
+            ),
+            (
+                RuntimeError::MissingBlob("ab/1".to_owned()),
+                Code::FailedPrecondition,
             ),
             (RuntimeError::TimedOut, Code::DeadlineExceeded),
         ];
-        for (error, want) in cases {
-            let result = result_of(id(), Err(error));
-            assert_eq!(code(&result), want as i32);
-            assert!(result.action_result.is_none());
-            assert_eq!(result.lease_id, Some(proto_lease_id(id())));
+        for (error, code) in codes {
+            let why = error.to_string();
+            let result = result_of(id, Err(error));
+            assert_eq!(result.lease_id, Some(proto_lease_id(id)), "{why}");
+            assert!(result.action_result.is_none(), "{why}");
+            assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
         }
     }
 }

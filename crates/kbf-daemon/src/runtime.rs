@@ -1,6 +1,7 @@
 //! Execution: the [`Runtime`] trait the lease manager runs work through, and
-//! [`FakeRuntime`], a runtime that runs nothing. The container driver
-//! (`kbf-driver-container`) implements the same trait.
+//! [`FakeRuntime`], which runs nothing. [`crate::LocalRuntime`] (tests only) runs
+//! actions as plain processes; the container driver (`kbf-driver-container`)
+//! implements the trait for farm nodes.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -32,9 +33,13 @@ pub enum RuntimeError {
     #[error("{0}")]
     Failed(String),
     /// The action asks for something no node may run (an image named by tag, an output
-    /// path that leaves the working directory): the client's error, not the farm's.
+    /// path that leaves the working directory, a Command without arguments): the
+    /// client's error, not the farm's.
     #[error("invalid action: {0}")]
     Invalid(String),
+    /// A blob the action needs (`hash/size`) is not in the CAS: the client's to upload.
+    #[error("blob {0} is not in the CAS")]
+    MissingBlob(String),
     /// The action ran past its timeout and was stopped.
     #[error("timed out")]
     TimedOut,

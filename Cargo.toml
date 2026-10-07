@@ -20,6 +20,9 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 futures = "0.3.34"
 hex = "0.4.3"
+# `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
+# standard library reaps children without returning their resource usage.
+libc = "0.2.190"
 hmac = "0.13.0"
 md-5 = "0.11.0"
 prost = "0.14.4"
@@ -58,6 +61,7 @@ kbf-proto = { path = "crates/kbf-proto" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-sched = { path = "crates/kbf-sched" }
 kbf-segments = { path = "crates/kbf-segments" }
+kbf-server = { path = "crates/kbf-server" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-store = { path = "crates/kbf-store" }

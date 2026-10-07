@@ -147,4 +147,13 @@ fn worker_messages_round_trip() {
     };
     let back = DaemonMessage::decode(heartbeat.encode_to_vec().as_slice()).expect("decode");
     assert_eq!(back, heartbeat);
+
+    let usage = worker::ResourceUsage {
+        cpu_user_micros: 1,
+        cpu_system_micros: 2,
+        peak_memory_bytes: 3,
+        wall_micros: 4,
+    };
+    let back = worker::ResourceUsage::decode(usage.encode_to_vec().as_slice()).expect("decode");
+    assert_eq!(back, usage);
 }

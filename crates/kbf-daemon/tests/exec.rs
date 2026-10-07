@@ -1,0 +1,232 @@
+//! A real server and a real daemon in one process, end to end: a REAPI client uploads
+//! an action and calls Execute; the server places it on the daemon over mutual TLS; the
+//! daemon fetches the action and its inputs from the server's CAS, runs it with the
+//! test-only local runtime, uploads the outputs, and reports the result with its
+//! resource usage; the client reads the result and the outputs back.
+
+#![cfg(target_os = "linux")]
+
+mod support;
+
+use std::future::pending;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use kbf_daemon::cas::{Cas, CasClient, digest_of};
+use kbf_daemon::usage::usage_of;
+use kbf_daemon::{Daemon, DaemonConfig, LocalRuntime, NodeReport};
+use kbf_front::{Cache, MemoryMetaLog};
+use kbf_objstore::{KeyPrefix, MemoryStore, ObjectKey, ObjectStore, PageSize};
+use kbf_proto::google::longrunning::{Operation, operation};
+use kbf_proto::reapi::execution_client::ExecutionClient;
+use kbf_proto::reapi::{Digest, ExecuteRequest, ExecuteResponse};
+use kbf_server::{Listeners, bind_server};
+use prost::Message;
+use support::memory::Spec;
+use support::{PROMPT, pki, scratch};
+use tokio::time::timeout;
+use tonic::Code;
+use tonic::transport::{Channel, Endpoint};
+
+type MemoryCache = Cache<MemoryMetaLog, MemoryStore>;
+
+/// A server and a daemon on loopback ports, and a REAPI channel to the server.
+struct Farm {
+    cache: Arc<MemoryCache>,
+    reapi: Channel,
+    cas: CasClient,
+}
+
+impl Farm {
+    async fn start(name: &str) -> Self {
+        let pki = pki(name);
+        let cache = Arc::new(Cache::memory());
+        let listeners = Listeners {
+            reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
+            worker: SocketAddr::from(([127, 0, 0, 1], 0)),
+            worker_tls: Some(pki.server_tls()),
+            heartbeat_interval: Duration::from_millis(100),
+            hello_wait: Duration::from_secs(2),
+            tick: Duration::from_millis(50),
+        };
+        let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
+        let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);
+        tokio::spawn(async move { bound.serving.await.expect("serve") });
+        let reapi = Endpoint::from_shared(format!("http://{reapi_addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+
+        // The daemon reads and writes blobs over its own connection to the front.
+        let runtime = Arc::new(LocalRuntime::new(
+            Arc::new(CasClient::new(reapi.clone())),
+            scratch(name),
+        ));
+        let report = NodeReport::new([("cpus", "4"), ("drivers", "local"), ("mem_gib", "8")]);
+        let mut config = DaemonConfig::new(
+            format!("https://127.0.0.1:{}", worker_addr.port()),
+            pki.client,
+            "node-1".to_owned(),
+        );
+        config.reconnect_after = Duration::from_millis(100);
+        let daemon = Daemon::new(config, runtime, report).expect("daemon config");
+        tokio::spawn(daemon.run(pending()));
+        Self {
+            cache,
+            cas: CasClient::new(reapi.clone()),
+            reapi,
+        }
+    }
+
+    /// Uploads every blob of `spec` through the REAPI CAS; returns the action digest.
+    async fn upload(&self, spec: &Spec) -> Digest {
+        let mut blobs = Vec::new();
+        let action = spec.store_with(&mut |bytes| {
+            let digest = digest_of(&bytes);
+            blobs.push(bytes);
+            digest
+        });
+        for bytes in blobs {
+            self.cas.put(bytes).await.expect("upload");
+        }
+        action
+    }
+
+    /// Executes `action` and returns the ExecuteResponse of the done operation.
+    async fn execute(&self, action: &Digest) -> ExecuteResponse {
+        let mut ops = ExecutionClient::new(self.reapi.clone())
+            .execute(ExecuteRequest {
+                action_digest: Some(action.clone()),
+                skip_cache_lookup: true,
+                ..ExecuteRequest::default()
+            })
+            .await
+            .expect("Execute")
+            .into_inner();
+        let done: Operation = timeout(PROMPT, async {
+            loop {
+                let op = ops.message().await.expect("stream").expect("an update");
+                if op.done {
+                    return op;
+                }
+            }
+        })
+        .await
+        .expect("the operation finishes in time");
+        let Some(operation::Result::Response(any)) = done.result else {
+            panic!("no response: {done:?}");
+        };
+        ExecuteResponse::decode(any.value.as_slice()).expect("an ExecuteResponse")
+    }
+
+    async fn text(&self, digest: Option<&Digest>) -> String {
+        let bytes = self
+            .cas
+            .get(digest.expect("digest"))
+            .await
+            .expect("readable");
+        String::from_utf8(bytes).expect("UTF-8")
+    }
+
+    /// Every object in the store.
+    async fn objects(&self) -> Vec<ObjectKey> {
+        let page = self
+            .cache
+            .objects()
+            .list(&KeyPrefix::default(), None, PageSize::MAX)
+            .await
+            .expect("list");
+        page.objects.into_iter().map(|o| o.key).collect()
+    }
+}
+
+/// Catches a daemon that does not execute what the server starts: the action must
+/// really run (its output is computed from an input file), its outputs, stdout and
+/// stderr must be readable from the server's CAS, the result must reach the client
+/// and the action cache, and it must carry the resource usage the runtime measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_action_runs_on_the_daemon_and_its_outputs_are_in_the_cas() {
+    let farm = Farm::start("exec-run").await;
+    let spec = Spec::sh(
+        "mkdir -p out; tr a-z A-Z < in.txt > out/greeting; echo ran; echo warned >&2; \
+         i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done",
+    )
+    .outputs(&["out/greeting"])
+    .inputs(&[("in.txt", b"hello from the cas\n", false)]);
+    let action = farm.upload(&spec).await;
+
+    let response = farm.execute(&action).await;
+    assert_eq!(response.status.map(|s| s.code), Some(Code::Ok as i32));
+    let result = response.result.expect("a result");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.output_files.len(), 1);
+    assert_eq!(result.output_files[0].path, "out/greeting");
+    assert_eq!(
+        farm.text(result.output_files[0].digest.as_ref()).await,
+        "HELLO FROM THE CAS\n"
+    );
+    assert_eq!(farm.text(result.stdout_digest.as_ref()).await, "ran\n");
+    assert_eq!(farm.text(result.stderr_digest.as_ref()).await, "warned\n");
+
+    let usage = usage_of(&result).expect("resource usage reported");
+    assert!(usage.cpu_user_micros > 0, "{usage:?}");
+    assert!(usage.peak_memory_bytes > 0, "{usage:?}");
+    assert!(usage.wall_micros >= usage.cpu_user_micros, "{usage:?}");
+
+    let cached = kbf_proto::reapi::action_cache_client::ActionCacheClient::new(farm.reapi.clone())
+        .get_action_result(kbf_proto::reapi::GetActionResultRequest {
+            action_digest: Some(action),
+            ..Default::default()
+        })
+        .await
+        .expect("an action-cache hit")
+        .into_inner();
+    assert_eq!(cached, result);
+}
+
+/// Catches a daemon that hangs, reports success, or stops serving when an input it
+/// was started with cannot be read from the CAS (the front checked it was present,
+/// then its object was lost): the operation must end with an error and no action-cache
+/// entry, and the next action must still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_input_lost_from_the_cas_fails_the_action_cleanly() {
+    let farm = Farm::start("exec-lost").await;
+    let spec = Spec::sh("cat data").inputs(&[("data", b"soon gone", false)]);
+    let before = farm.objects().await;
+    farm.cas
+        .put(b"soon gone".to_vec())
+        .await
+        .expect("upload the input alone");
+    let lost: Vec<ObjectKey> = farm
+        .objects()
+        .await
+        .into_iter()
+        .filter(|k| !before.contains(k))
+        .collect();
+    assert_eq!(lost.len(), 1, "one object holds the input");
+    let action = farm.upload(&spec).await;
+    farm.cache.objects().delete(&lost[0]).await.expect("delete");
+
+    let response = farm.execute(&action).await;
+    assert_eq!(response.result, None);
+    let status = response.status.expect("a status");
+    assert_eq!(status.code, Code::Internal as i32, "{status:?}");
+    let miss = kbf_proto::reapi::action_cache_client::ActionCacheClient::new(farm.reapi.clone())
+        .get_action_result(kbf_proto::reapi::GetActionResultRequest {
+            action_digest: Some(action),
+            ..Default::default()
+        })
+        .await
+        .expect_err("no action-cache entry");
+    assert_eq!(miss.code(), Code::NotFound);
+
+    let after = farm.upload(&Spec::sh("echo still here")).await;
+    let response = farm.execute(&after).await;
+    let result = response.result.expect("the daemon still runs actions");
+    assert_eq!(
+        farm.text(result.stdout_digest.as_ref()).await,
+        "still here\n"
+    );
+}

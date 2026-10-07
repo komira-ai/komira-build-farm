@@ -10,18 +10,24 @@ publish.workspace = true
 [dependencies]
 clap.workspace = true
 futures.workspace = true
+hex.workspace = true
 kbf-caps.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
+libc.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+kbf-front.workspace = true
+kbf-objstore.workspace = true
+kbf-server.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["net"] }
 
