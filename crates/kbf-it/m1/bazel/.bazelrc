@@ -1,0 +1,12 @@
+# Remote-only against the integration cell (crates/kbf-it/m1/run.sh starts it): every
+# action executes on the farm or is answered from its action cache; nothing runs here.
+common --color=no --curses=no
+common --lockfile_mode=off
+
+build --symlink_prefix=/
+build --remote_executor=grpc://127.0.0.1:8980
+build --remote_cache=grpc://127.0.0.1:8980
+build --spawn_strategy=remote
+build --noremote_local_fallback
+build --remote_timeout=120
+build --incompatible_strict_action_env

@@ -1,0 +1,27 @@
+# Three actions in a chain. `shout` runs an executable input file, so the farm must
+# keep its mode; `digest` reads two outputs of earlier actions.
+
+genrule(
+    name = "words",
+    srcs = ["data/words.txt"],
+    outs = ["words.sorted"],
+    cmd = "sort $< > $@",
+)
+
+genrule(
+    name = "shout",
+    srcs = [":words"],
+    outs = ["words.upper"],
+    cmd = "$(location tools/upper.sh) < $(location :words) > $@",
+    tools = ["tools/upper.sh"],
+)
+
+genrule(
+    name = "digest",
+    srcs = [
+        ":shout",
+        ":words",
+    ],
+    outs = ["digest.txt"],
+    cmd = "cat $(location :words) $(location :shout) | sha256sum > $@",
+)

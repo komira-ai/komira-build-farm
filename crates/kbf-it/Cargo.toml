@@ -7,11 +7,32 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# `kbf-cell`, the M1 integration harness's helper binary: test certificates, the
+# test-only daemon (the daemon library with its local runtime) and the build-summary
+# check. `m1/run.sh` drives it; see the library docs.
+[[bin]]
+name = "kbf-cell"
+path = "src/bin/kbf-cell.rs"
+
 [dependencies]
+clap.workspace = true
+kbf-daemon.workspace = true
+rcgen.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tonic.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
+kbf-front.workspace = true
+kbf-proto.workspace = true
+kbf-server.workspace = true
+prost.workspace = true
 saphyr-parser.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

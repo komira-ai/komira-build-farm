@@ -1,0 +1,91 @@
+# The M1 exit test on a hosted runner: MinIO (pinned by digest), one kbf-server and one
+# daemon, and the sample projects in crates/kbf-it/m1 built remote-only with pinned
+# Bazel and buck2, twice each. The second build of each must be all remote cache hits
+# (crates/kbf-it/m1/run.sh says exactly what is checked).
+#
+# Its own workflow, using GitHub-owned actions only, so that it starts under the
+# repository's Actions policy whatever the other workflows use. Same hosted-runner,
+# pinning and permission rules as ci.yml (crates/kbf-it/tests/repo_lints.rs).
+name: integration
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  m1-cell:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      minio:
+        # The digest the objstore-s3 job in ci.yml pins (Chainguard's build of MinIO).
+        image: cgr.dev/chainguard/minio@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa
+        command: server /data
+        env:
+          MINIO_ROOT_USER: kbf-ci-access
+          MINIO_ROOT_PASSWORD: kbf-ci-throwaway
+        ports:
+          - 9000:9000
+    env:
+      # A throwaway key pair for the service container, which lives only for this job.
+      AWS_ACCESS_KEY_ID: kbf-ci-access
+      AWS_SECRET_ACCESS_KEY: kbf-ci-throwaway
+      BAZEL_VERSION: 8.8.1
+      BAZEL_SHA256: 5b5bab2095065817d3416ca9a0678bd39c10c9ede432dbe8187bfe74de285160
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build -p kbf-server -p kbf-it --bins --locked
+      - name: Fetch Bazel and buck2 (pinned versions, checked by SHA-256)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$tools/bazel" \
+            "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64"
+          echo "$BAZEL_SHA256  $tools/bazel" | sha256sum --check --strict
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$tools/buck2.zst" \
+            "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst"
+          echo "$BUCK2_SHA256  $tools/buck2.zst" | sha256sum --check --strict
+          zstd -q -d "$tools/buck2.zst" -o "$tools/buck2"
+          chmod +x "$tools/bazel" "$tools/buck2"
+          "$tools/bazel" --version
+          "$tools/buck2" --version
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 60); do
+            curl -s -o /dev/null http://127.0.0.1:9000/ && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: M1 cell, Bazel and buck2 twice each
+        run: |
+          crates/kbf-it/m1/run.sh --bin-dir target/debug --work "$RUNNER_TEMP/m1" \
+            --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 \
+            --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: m1-cell-logs
+          path: ${{ runner.temp }}/m1/logs
+          if-no-files-found: warn
