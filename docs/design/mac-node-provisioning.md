@@ -7,6 +7,12 @@ headless rack Mac needs, how macOS and Xcode updates are rolled out, how a Mac m
 from a desk to a rack, how it takes over from another farm's worker, and how it
 joins and leaves the farm.
 
+It covers the bare-metal host. Simulator, GUI and UI tests run in macOS VMs on that
+host (two guests per Mac), and GPU work runs on bare metal with the whole Mac; both are
+designed in the [macOS VMs design](https://github.com/komira-ai/komira-build-farm/pull/85) (`docs/design/macos-vms.md`, in review). Where the two designs touch, this one defers to it:
+Xcodes per host and the `xcode` key, simulator runtimes, VM golden images, and GUI
+leases.
+
 The rules this design keeps:
 
 - **One profile, applied by a script, checked by the same script.** A node is a
@@ -27,13 +33,13 @@ The rules this design keeps:
 
 | Topic | Recommendation |
 |---|---|
-| Baseline | A pinned macOS version and build. A fresh state comes from *Erase All Content and Settings*, or from an Apple Configurator restore when the version must change or the Mac is new. There is no disk image. |
+| Baseline | A pinned macOS version and build. A fresh state comes from *Erase All Content and Settings*, or from an Apple Configurator restore when the version must change or the Mac is new. There is no disk image for the host; VM golden images do live on Mac nodes (macOS VMs design). |
 | Provisioning layer | A plain, idempotent shell script with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
 | `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
-| Toolchains | One pinned Xcode (or one CLT version) per pool, in the worker profile. The node reports its host identity, and a changed identity takes the node out until it re-qualifies. |
+| Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. The node reports a host identity per Xcode, and a changed identity takes that Xcode out until it re-qualifies. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is optional ([section 6](#6-updates-pinned-and-rolled-out)). |
-| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Auto-login stays off until GUI leases need it ([section 5.4](#54-filevault-and-auto-login)). |
+| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login stays off: GUI work runs in VM guests that log themselves in. It becomes necessary only if a VM cannot be started from a launch daemon, an open probe of the macOS VMs design ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
@@ -124,8 +130,9 @@ A node's baseline is three things, all of them named in the profile:
 3. **The profile applied.** That includes the worker profile (section 3). Then the
    deployment installs the `kbf-daemon` artifact (section 4).
 
-There is no image file to build, store or patch. Rebuilding a node means erase, then
-apply. The only manual steps are Setup Assistant, which creates the admin account, and
+There is no image file to build, store or patch for the host. (VM golden images do
+live on Mac nodes; they are the macOS VMs design's, not part of the host baseline.)
+Rebuilding a node means erase, then apply. The only manual steps are Setup Assistant, which creates the admin account, and
 turning on Remote Login. Without MDM both need a person at the Mac once; with automated
 device enrollment, neither does (section 6.3).
 
@@ -228,11 +235,13 @@ needs only what macOS ships.
 
 **The worker profile** holds what actions run with:
 
-- exactly one Xcode, or exactly one Command Line Tools version, per pool. A pool
-  needs Xcode.app if any of its actions use `xcodebuild` or simulators. The developer
-  directory `xcode-select -p` prints is pinned too, because it decides which `cc` and
-  SDK an action gets;
-- the simulator runtimes, if the pool runs simulator tests;
+- the pinned Xcodes, each at its own path. Several can sit side by side on one host,
+  and an action chooses one with `DEVELOPER_DIR`; the node reports them as a set
+  (`xcode`, matched by membership). That model, and why, is the macOS VMs design's
+  (section 3.2 there). The default developer directory (`xcode-select -p`) is pinned
+  too, for actions that name none;
+- no simulator runtimes: simulator, GUI and UI tests run in VMs, and their runtimes
+  live in the VM image;
 - nothing else. Tools that come bundled with Xcode or the CLT (`git`, `python3`,
   `make`) are part of the worker profile because that is where they come from. The
   host side must not use them.
@@ -266,12 +275,14 @@ compilers changed must not keep serving cache keys computed for the old ones.
 
 **Planned, in kbf:**
 
-- The daemon reports, on macOS, `os_build`, `xcode` (the Xcode build, or the CLT
-  version) and `host_identity` (the digest above). They are detected, never typed in,
+- The daemon reports, on macOS, `os_build`, `xcode` (a set: the build of each pinned
+  Xcode, per the macOS VMs design) and `host_identity` (the digest above, computed once
+  per Xcode with `DEVELOPER_DIR` set to it, so also a set). They are detected, never typed in,
   as [capabilities.md](capabilities.md) requires.
 - **One key set.** capabilities.md plans `os_image` and `xcode`. A Mac has no image,
   and `os_build` is what `os_image` would carry, so a Mac reports `os_build` and not
-  `os_image`. `xcode` keeps its planned meaning, and `host_identity` is new.
+  `os_image`. `xcode` becomes a set, as the macOS VMs design changes it, and
+  `host_identity` is new.
   capabilities.md lists `os_build` and `host_identity` as planned exact keys.
 - **Which key a client matches decides how often its cache goes cold,** because every
   platform property is part of the action digest:
@@ -563,10 +574,11 @@ the rack's physical security and short certificate lifetimes. A Mac on a desk, o
 a locked room, may keep FileVault on if the operator accepts that it waits for a person
 after every reboot.
 
-**Auto-login** is not needed: `kbf-daemon` is a LaunchDaemon. It becomes necessary only
-for leases that drive a GUI session, which belong to the whole-machine lease design. If
-that design needs it, auto-login is for a non-admin lease account, never the admin
-account.
+**Auto-login** is not needed on the host: `kbf-daemon` is a LaunchDaemon, and GUI work
+runs in VM leases (`kbf-lease=vm`) whose guests log themselves in (macOS VMs design).
+The host needs auto-login only if Virtualization.framework cannot start a VM from a
+launch daemon, an open probe there. If so, it is for that design's dedicated non-admin
+user, never the admin account.
 
 One more consequence of running with nobody logged in: **anything the node needs at
 boot must be a system daemon.** In particular, an overlay-network client whose app
@@ -619,7 +631,9 @@ stderr to the file `StandardErrorPath` names.
 
 ### 6.1 The policy
 
-- One macOS version and build, and one Xcode, per pool, named in the profile.
+- One macOS version and build per pool, and its pinned Xcodes, named in the profile.
+- How the server rolls host updates out (macOS and Xcode, MDM, the update UI) is being
+  designed in `docs/design/fleet-updates.md` (**in progress**).
 - Nothing installs by itself (section 5.2).
 - A scheduled check outside the farm notices new Apple releases and opens a review
   item. It reports Xcode and macOS together, because each Xcode sets a minimum macOS: "Xcode X is out; it needs macOS Y; the pool runs Z."
@@ -627,7 +641,7 @@ stderr to the file `StandardErrorPath` names.
   1. One canary node: drain, update macOS first if needed, then Xcode, re-apply,
      re-qualify (section 3.1), back in the pool.
   2. The rest one at a time, each drained, so the pool loses one node at a time.
-  3. The old Xcode is removed when no node uses it.
+  3. An old Xcode is removed when no action asks for it any more.
 - A security fix takes the same path, sooner.
 
 ### 6.2 Without MDM
