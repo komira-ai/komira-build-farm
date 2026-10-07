@@ -16,3 +16,18 @@ These are reconstructed from each CPU model's published feature set, not capture
 from one of our nodes. When a node of a class first registers, its real output
 replaces the file here, and any test that then changes is a finding, not a fixture
 to edit.
+
+## PCI functions
+
+`pci/<node class>/` mirrors `/sys/bus/pci/devices` on a Linux node: one directory per
+PCI function (named for its address, `:` written as `-`), holding its `class` and
+`vendor` files as sysfs prints them. Only the files the GPU count reads are kept.
+
+| Directory | Node class | GPUs |
+|---|---|---|
+| `pci/gpu_server_4x` | four NVIDIA 3D controllers, the management controller's VGA function, a NIC | 4 |
+| `pci/cpu_server` | the management controller's VGA function and a NIC | 0 |
+| `pci/workstation_amd` | one AMD card (its VGA and HDMI audio functions) beside integrated graphics | 1 |
+
+Like the CPU fixtures, these are reconstructed from the devices' published PCI ids,
+not captured from one of our nodes.

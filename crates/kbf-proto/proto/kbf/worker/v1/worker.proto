@@ -62,7 +62,8 @@ message Capability {
 // server sends Start messages for this node on this stream from then on. A Hello resent
 // on the same stream changes the node report, and with it the capacity placement sees,
 // and nothing else (issue #25). The server reads the capacity from the `cpus` and
-// `mem_gib` entries, which a Hello must carry.
+// `mem_gib` entries, which a Hello must carry, and the GPU count from its `gpu` entry
+// (0 when absent).
 message Hello {
   // The protocol version the daemon speaks. This file defines version 1.
   uint32 protocol_version = 1;

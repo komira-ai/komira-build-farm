@@ -48,7 +48,7 @@ pub use crate::cache::{Cache, CacheError, VerifiedBlob};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::execution::{
-    DEFAULT_RESOURCES, Dispatch, ExecutionService, Finished, LEASE_KIND_KEY, LEASE_KINDS,
+    DEFAULT_RESOURCES, Dispatch, ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS,
     OperationStream, Stage, Submission, Ticket,
 };
 pub use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};

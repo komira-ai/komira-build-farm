@@ -1,10 +1,13 @@
 //! Worker capabilities: parsers over the text a node's OS publishes about its CPU
-//! (Linux `/proc/cpuinfo`, macOS `sysctl hw.optional`), the ISA levels that text
+//! (Linux `/proc/cpuinfo`, macOS `sysctl hw.optional`) and GPUs (Linux PCI functions
+//! in sysfs), the ISA levels that text
 //! implies, and matching of an action's capability request against a node.
 //!
 //! - [`CpuCaps`] holds a node's architecture, every feature it reports (kernel names)
 //!   and its highest ISA level: an x86-64 psABI level ([`X86Level`]) or an Armv8
 //!   version ([`ArmVersion`]).
+//! - [`gpus_from_linux_pci`] and [`gpus_from_macos_sysctl`] count a node's GPUs, the
+//!   `gpu` capacity a request books whole and exclusively.
 //! - [`Request`] and [`NodeCaps`] match with typed comparisons: exact, at least for
 //!   ordered levels, subset for feature sets, and minimums for countable resources.
 //!
@@ -14,10 +17,12 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod cpu;
+mod gpu;
 mod level;
 mod macos;
 mod matching;
 
 pub use cpu::{Arch, CpuCaps, ParseError, UnknownArch};
+pub use gpu::{PciFunction, gpus_from_linux_pci, gpus_from_macos_sysctl};
 pub use level::{ArmVersion, IsaLevel, UnknownIsaLevel, X86Level};
 pub use matching::{Consumable, NodeCaps, Request, RequestError, Unmet};
