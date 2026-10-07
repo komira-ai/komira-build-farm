@@ -150,8 +150,11 @@ The controls were seen failing during the spike:
   `unshare --user` fails for the runner user. Rootless Podman works: one subuid range of
   65536. The runner user already has lingering enabled and a user bus. Both cgroup
   managers applied the limits.
-- **Networked actions.** Podman 4.9's default rootless network here is slirp4netns. From
-  it, a container reaches a port published on the host's own address (MinIO answered).
+- **Networked actions.** Podman 4.9's default rootless network here is slirp4netns:
+  run `37588003106` (`8ba9601`) started a container with no `--network` flag and found
+  a `slirp4netns` helper and no pasta, on both arches. From it, and from an explicit
+  slirp4netns container, a container reaches a port published on the host's own
+  address (MinIO answered).
   With pasta it did not. So a `networked` action is kept off the store's port only by
   the network mode or a firewall rule, and the integration test must check it.
 - **Ports.** Unprivileged ports start at 1024. The ephemeral range is 32768 to 60999.
