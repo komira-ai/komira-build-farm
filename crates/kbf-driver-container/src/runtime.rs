@@ -422,6 +422,7 @@ impl Lease {
 
     fn clean_blocking(&mut self) -> Result<(), String> {
         self.armed = false;
+        if !self.armed { return Ok(()); } // MUTANT: skip clean
         let mut errors = Vec::new();
         if self.created
             && let Err(e) = self.podman.remove_blocking(&self.name)
