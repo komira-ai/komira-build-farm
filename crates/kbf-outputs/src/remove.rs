@@ -101,7 +101,7 @@ fn chmod_dir(dir: &OwnedFd, name: &OsStr, mode: Mode) -> std::io::Result<()> {
 /// Linux's equivalents (`chattr +i`, `+a`) need `CAP_LINUX_IMMUTABLE`, which an
 /// action run as an unprivileged user does not have, so Linux has nothing to undo.
 #[cfg(target_os = "macos")]
-const LOCKING_FLAGS: u32 = libc::UF_IMMUTABLE | libc::UF_APPEND;
+const LOCKING_FLAGS: u32 = 0; // MUTANT: no flag is cleared
 
 /// Clears the [`LOCKING_FLAGS`] of `name` in `dir`, whose flags are `flags`, without
 /// following a symlink (`setattrlistat` with `FSOPT_NOFOLLOW`; macOS has no
