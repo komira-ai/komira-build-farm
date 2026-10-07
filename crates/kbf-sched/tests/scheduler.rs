@@ -617,3 +617,44 @@ fn a_capacity_change_counts_as_hearing_from_the_worker() {
     let [grant] = h.at_secs(100).tick().try_into().unwrap();
     assert_eq!(grant.worker, w("a"), "a resend did not count as hearing");
 }
+
+/// Catches (issue #23): a lease the worker lists that the scheduler gave up, granted
+/// to another worker, or finished, not named for cancelling (its run goes on beside
+/// the retry); a lease the worker holds named (its only run would be killed), even
+/// while its retry's grant is not committed yet; and a lease this scheduler never
+/// granted named, whether a later sequence number of its term or another term's (a
+/// newer leader's grant is not this scheduler's to cancel).
+#[test]
+fn not_held_names_the_listed_leases_given_up_on_the_worker() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.worker("b", 1_000, GIB);
+    h.submit(1, request(1));
+    h.submit(2, request(2));
+    let [on_a, on_b] = h.tick().try_into().unwrap();
+    assert_eq!((&on_a.worker, &on_b.worker), (&w("a"), &w("b")));
+    h.at_secs(1).commit_and_start(&on_a);
+    h.commit_and_start(&on_b);
+    let not_held = |h: &Harness, worker: &str, running: &[LeaseId]| -> Vec<LeaseId> {
+        h.s.not_held(&w(worker), running).collect()
+    };
+    let never = [LeaseId::new(1, 99), LeaseId::new(2, 0), LeaseId::new(0, 0)];
+    let mut listed = vec![on_a.lease, on_b.lease];
+    listed.extend(never);
+    assert_eq!(not_held(&h, "a", &listed), [on_b.lease]);
+    assert_eq!(not_held(&h, "b", &listed), [on_a.lease]);
+
+    // `on_a` is given up: its Start has been out for the grace and `a` leaves it out.
+    h.at_secs(61).heartbeat("a");
+    h.heartbeat_running("b", &[on_b.lease]);
+    assert_eq!(not_held(&h, "a", &[on_a.lease]), [on_a.lease]);
+    let [retry] = h.tick().try_into().unwrap();
+    assert_eq!(retry.worker, w("a"));
+    assert_eq!(not_held(&h, "a", &[on_a.lease, retry.lease]), [on_a.lease]);
+    h.commit_and_start(&retry);
+    assert_eq!(not_held(&h, "a", &[on_a.lease, retry.lease]), [on_a.lease]);
+
+    // A finished operation's lease is held nowhere.
+    h.finish(&on_b, ok(2));
+    assert_eq!(not_held(&h, "b", &[on_b.lease]), [on_b.lease]);
+}
