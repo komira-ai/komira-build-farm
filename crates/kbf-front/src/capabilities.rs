@@ -47,7 +47,8 @@ impl CapabilitiesService {
 ///   properties are advertised yet; QoS is a header, never a property (RFC 4.5).
 #[must_use]
 pub fn server_capabilities(execution: bool) -> ServerCapabilities {
-    let sha256 = reapi::digest_function::Value::Sha256 as i32;
+    // MUTANT: the capabilities advertise SHA-1, not the SHA-256 the cache uses.
+    let sha256 = reapi::digest_function::Value::Sha1 as i32;
     let version = |minor| SemVer {
         major: 2,
         minor,
