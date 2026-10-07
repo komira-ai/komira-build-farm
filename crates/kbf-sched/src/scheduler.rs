@@ -325,7 +325,7 @@ impl Scheduler {
             let fit = self
                 .workers
                 .iter_mut()
-                .find(|(_, w)| w.alive(now) && w.free().fits(request));
+                .find(|(_, w)| w.alive(now) && w.free().fits(&request.with_gpus(0)));
             if let Some((name, w)) = fit {
                 w.booked = w.booked.saturating_add(*request);
                 placed.push((id, name.clone()));
