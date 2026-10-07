@@ -272,25 +272,26 @@ mod tests {
         let no_bus = linux_gpus(&pci_fixture("tests/fixtures/pci/no-such-directory"));
         assert_eq!(no_bus.expect("no PCI bus"), 0);
 
-        let no_vendor = linux_gpus(&pci_fixture("tests/fixtures/pci/no_vendor"));
-        assert!(
-            matches!(&no_vendor, Err(DetectError::ReadPci { path, .. }) if path.ends_with("vendor")),
-            "{no_vendor:?}"
+        // Errors are compared as text: a guard in the test would be a branch the
+        // coverage ratchet counts and no run takes.
+        let error = |dir: &Path| linux_gpus(dir).expect_err("refused").to_string();
+        let no_vendor = pci_fixture("tests/fixtures/pci/no_vendor");
+        let text = error(&no_vendor);
+        let want = format!("read {}: ", no_vendor.join("0000-00-00.0/vendor").display());
+        assert!(text.starts_with(&want), "{text}");
+        let malformed = pci_fixture("tests/fixtures/pci/malformed");
+        assert_eq!(
+            error(&malformed),
+            format!(
+                "parse PCI functions: {}",
+                kbf_caps::ParseError::PciValue("0x3d\n".to_owned())
+            )
         );
-        let malformed = linux_gpus(&pci_fixture("tests/fixtures/pci/malformed"));
+        let a_file = malformed.join("0000-00-00.0/class");
+        let text = error(&a_file);
         assert!(
-            matches!(
-                &malformed,
-                Err(DetectError::Pci(kbf_caps::ParseError::PciValue(v))) if v == "0x3d\n"
-            ),
-            "{malformed:?}"
-        );
-        let a_file = linux_gpus(&pci_fixture(
-            "tests/fixtures/pci/malformed/0000-00-00.0/class",
-        ));
-        assert!(
-            matches!(&a_file, Err(DetectError::ReadPci { path, .. }) if path.ends_with("class")),
-            "{a_file:?}"
+            text.starts_with(&format!("read {}: ", a_file.display())),
+            "{text}"
         );
     }
 
