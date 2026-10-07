@@ -305,7 +305,8 @@ impl<R: Runtime> Daemon<R> {
             tracing::warn!(lease = %id, "a Start for a lease already reported ignored");
             return;
         }
-        let valid_for = Duration::from_millis(start.valid_for_ms);
+        // MUTANT: the window is ignored, as by a daemon that predates it.
+        let valid_for = Duration::ZERO;
         if !self
             .window
             .allows(start.heartbeat_seq, valid_for, Instant::now())
