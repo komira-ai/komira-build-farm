@@ -4,27 +4,29 @@
 //! `off` or `none` keeps it off (loopback still works); `on` or `standard` turns it
 //! on. Anything else is the client's error.
 //!
-//! On macOS the driver keeps the network off with `sandbox-exec` and a profile that
-//! denies every network operation except loopback and Unix sockets (the profile Bazel's
-//! macOS sandbox uses). Where `sandbox-exec` is missing, and on Linux, the network is
-//! **not enforced**: the action runs with the node's network. Which of the two a node
-//! has is reported as the capability `network_isolation` (`sandbox-exec` or `none`),
-//! so nothing about it is hidden.
+//! On macOS every action runs under `sandbox-exec`. An action without the network
+//! gets [`NO_NETWORK_PROFILE`], which denies every network operation except loopback
+//! and Unix sockets (the profile Bazel's macOS sandbox uses); one with the network gets
+//! [`BASE_PROFILE`]. Both keep the action from handing work to launchd, which would run
+//! it outside the sandbox and outside the action's process tree ([`BASE_PROFILE`]).
+//! Where `sandbox-exec` is missing, and on Linux, nothing is enforced: the action runs
+//! with the node's network. Which of the two a node has is reported as the capability
+//! `network_isolation` (`sandbox-exec` or `none`), so nothing about it is hidden.
 //!
-//! What "off" does not cover:
+//! What the sandbox does not cover:
 //! - Unix sockets are allowed, any of them, so a local service that talks to the
 //!   network on the action's behalf is reachable. The plainest is the system's
 //!   resolver (`mDNSResponder`): DNS lookups still go out, and a name an action looks
 //!   up can carry data out of the node. Loopback services likewise.
-//! - Launchd runs what it is handed outside the sandbox and the action's tree. The
-//!   two plain ways in are closed for a sandboxed action: launchd refuses a job from
-//!   it (`launchctl submit`, `load`, `bootstrap`), and the profile denies Launch
-//!   Services opens (`open`; [`NO_NETWORK_PROFILE`]). Anything else the daemon's user can
-//!   schedule (a `LaunchAgents` plist that runs at its next login, `at`, `cron`, a
-//!   loopback `ssh`) is not covered; a per-lease user is the follow-up that closes
-//!   this class.
-//! - An action that asks for the network runs without `sandbox-exec` at all, so none
-//!   of the above applies to it.
+//! - Other mach and XPC services stay reachable (`(allow default)`), Apple Events
+//!   among them (`osascript`, the `appleevent-send` operation): an action can ask
+//!   another application, such as Terminal or Finder, to run something for it outside
+//!   the sandbox, where the user's session allows Apple Events.
+//! - Anything else the daemon's user can schedule (a `LaunchAgents` plist that runs at
+//!   its next login, `at`, `cron`, a loopback `ssh`). A per-lease user is the
+//!   follow-up that closes this class.
+//! - A program that itself uses `sandbox-exec` (macOS refuses a sandbox inside a
+//!   sandbox) fails under the driver; that now includes actions with the network.
 
 use std::path::{Path, PathBuf};
 
@@ -40,18 +42,27 @@ pub const CAPABILITY: &str = "network_isolation";
 /// Where macOS keeps `sandbox-exec`.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// The sandbox profile for an action without the network: everything allowed but
-/// network operations, which are allowed only to loopback and Unix sockets, and
-/// opening an application or document through Launch Services (`open`: the `lsopen`
-/// operation), which launchd would start outside the sandbox and outside the action's
-/// process tree.
+/// The sandbox profile every action runs under: everything allowed but handing work
+/// to launchd, which would run it outside the sandbox and outside the action's process
+/// tree. `lsopen` is opening an application or document through Launch Services
+/// (`open`); `job-creation` is giving launchd a job (`launchctl submit`, `load`,
+/// `bootstrap`).
 ///
-/// Giving launchd a job (`launchctl submit`, `load`, `bootstrap`) needs no rule here:
-/// launchd refuses it from a sandboxed process, as `tests/launchd.rs` shows on the
-/// macOS runner (and a `(deny job-creation)` rule was dropped after its mutant stayed
-/// green: it changed nothing a test could see).
+/// Launchd already refuses a job from any sandboxed process, `(allow default)` alone
+/// included, as `tests/launchd.rs` shows on the macOS runner (and the mutants that
+/// dropped `(deny job-creation)` stayed green). The rule stays as defence in depth: it
+/// keeps the refusal in this profile rather than in launchd's current behaviour.
+/// `(deny lsopen)` is load-bearing: without it an action opens an application.
+pub const BASE_PROFILE: &str = "(version 1)\n\
+(allow default)\n\
+(deny job-creation)\n\
+(deny lsopen)\n";
+
+/// The sandbox profile for an action without the network: [`BASE_PROFILE`], and no
+/// network operation but to loopback and Unix sockets.
 pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
+(deny job-creation)\n\
 (deny lsopen)\n\
 (deny network*)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
@@ -136,18 +147,20 @@ impl Isolation {
         program: PathBuf,
         args: &[String],
     ) -> (PathBuf, Vec<String>) {
-        match (self, network) {
-            (Self::Sandbox(sandbox), Network::Off) => {
-                let mut wrapped = vec![
-                    "-p".to_owned(),
-                    NO_NETWORK_PROFILE.to_owned(),
-                    program.to_string_lossy().into_owned(),
-                ];
-                wrapped.extend(args.iter().cloned());
-                (sandbox.clone(), wrapped)
-            }
-            _ => (program, args.to_vec()),
-        }
+        let Self::Sandbox(sandbox) = self else {
+            return (program, args.to_vec());
+        };
+        let profile = match network {
+            Network::Off => NO_NETWORK_PROFILE,
+            Network::On => BASE_PROFILE,
+        };
+        let mut wrapped = vec![
+            "-p".to_owned(),
+            profile.to_owned(),
+            program.to_string_lossy().into_owned(),
+        ];
+        wrapped.extend(args.iter().cloned());
+        (sandbox.clone(), wrapped)
     }
 }
 
@@ -209,11 +222,12 @@ mod tests {
         assert_eq!(network_of(&action, &command).ok(), Some(Network::Off));
     }
 
-    /// Catches: a sandbox applied to an action that asked for the network, or left
-    /// off one that did not; the program or its arguments lost or reordered inside
-    /// the wrapper; and a node without `sandbox-exec` claiming isolation.
+    /// Catches: the network denied to an action that asked for it, or allowed one that
+    /// did not; an action with the network left unsandboxed (free to hand work to
+    /// launchd); the program or its arguments lost or reordered inside the wrapper;
+    /// and a node without `sandbox-exec` claiming isolation.
     #[test]
-    fn only_an_action_without_network_is_wrapped() {
+    fn every_action_is_wrapped_and_only_the_network_differs() {
         let args = vec!["-c".to_owned(), "echo hi".to_owned()];
         let program = PathBuf::from("/bin/sh");
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
@@ -224,10 +238,13 @@ mod tests {
             wrapped_args,
             ["-p", NO_NETWORK_PROFILE, "/bin/sh", "-c", "echo hi"]
         );
+        let (wrapped, wrapped_args) = sandbox.wrap(Network::On, program.clone(), &args);
+        assert_eq!(wrapped, PathBuf::from(SANDBOX_EXEC));
         assert_eq!(
-            sandbox.wrap(Network::On, program.clone(), &args),
-            (program.clone(), args.clone())
+            wrapped_args,
+            ["-p", BASE_PROFILE, "/bin/sh", "-c", "echo hi"]
         );
+        assert!(NO_NETWORK_PROFILE.starts_with(BASE_PROFILE));
         assert_eq!(Isolation::None.name(), "none");
         assert_eq!(
             Isolation::None.wrap(Network::Off, program.clone(), &args),
