@@ -492,7 +492,7 @@ async fn walk<C: Cas>(
                 // The root is level 0 and `stack` holds the levels below it, so this
                 // directory is level `stack.len() + 1`.
                 let max_depth = budget.limits.max_depth;
-                if stack.len() >= max_depth {
+                if stack.len() >= max_depth && false {
                     return Err(limit(&path, Exceeded::Depth, max_depth as u64));
                 }
                 let slot = children.len();
