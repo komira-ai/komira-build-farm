@@ -6,6 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_daemon::Event;
 use kbf_proto::google::rpc::{Code, PreconditionFailure};
 use kbf_proto::worker::{LeaseId, daemon_message::Message};
 use prost::Message as _;
@@ -106,6 +107,47 @@ async fn a_result_finished_offline_is_sent_after_welcome() {
         result.status.as_ref().map(|s| s.code),
         Some(Code::Ok as i32)
     );
+}
+
+/// Catches a daemon that does not fence while no stream is up (its work would run on
+/// beside the copy the scheduler re-dispatches), that loses the fenced lease's ABORTED
+/// Result instead of sending it after the next Welcome, or that also reports the
+/// killed run's own outcome (a second Result for the lease, or one that replaces the
+/// fence's: the lease was fenced, not killed by the server).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_fenced_offline_is_reported_once_after_welcome() {
+    let t = Duration::from_millis(600);
+    let mut h = Harness::start("fenced-offline", LONG, t).await;
+    let first = h.welcomed().await;
+    first.start(5, 1, "action");
+    h.started(1).await;
+    first.close();
+
+    let mut second = h.session().await;
+    second.hello().await;
+    // No Welcome: the daemon fences while it waits for one.
+    h.event(t + PROMPT, |e| {
+        matches!(e, Event::Fenced(ids) if ids == &[kbf_types::LeaseId::new(5, 1)]).then_some(())
+    })
+    .await
+    .expect("fenced while offline");
+    assert_eq!(h.runtime.killed(), [kbf_types::LeaseId::new(5, 1)]);
+    // Long enough for the killed run's outcome to reach the daemon, still offline.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        second.result(Duration::ZERO).await.is_none(),
+        "a Result before Welcome"
+    );
+    second.welcome();
+    let seen = up_to_first_heartbeat(&mut second).await;
+    let [Message::Result(result), Message::Heartbeat(heartbeat)] = seen.as_slice() else {
+        panic!("expected one Result, then a Heartbeat: {seen:?}");
+    };
+    assert_eq!(result.lease_id, Some(lease(5, 1)));
+    let status = result.status.as_ref().expect("a status");
+    assert_eq!(status.code, Code::Aborted as i32);
+    assert!(status.message.contains("self-fenced"), "{}", status.message);
+    assert_eq!(heartbeat.running, [lease(5, 1)]);
 }
 
 /// Catches a Start for a lease whose Result is still unacknowledged being run again

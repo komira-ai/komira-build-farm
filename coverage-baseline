@@ -8,7 +8,7 @@
 kbf-alert                 -      -
 kbf-caps                  9      2
 kbf-coverage              0      0
-kbf-daemon               85     22
+kbf-daemon               78     19
 kbf-driver-container      -      -
 kbf-estimator             -      -
 kbf-front                88     10

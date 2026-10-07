@@ -3,8 +3,9 @@
 //! upload, report) can be tested end to end where no container driver is available.
 //!
 //! It isolates nothing: the action runs as the daemon's user, with the daemon's
-//! filesystem, network and limits, and a process it leaves behind keeps running. No
-//! timeout is applied. Farm nodes run actions through the container driver
+//! filesystem, network and limits, and a process it leaves behind keeps running (so it
+//! breaks the rule [`crate::tree::collect`] asks of a runtime, that no process of the
+//! action is left when the outputs are read). No timeout is applied. Farm nodes run actions through the container driver
 //! (`kbf-driver-container`); the `kbf-daemon` binary does not offer this runtime.
 //!
 //! One lease, in order: fetch the Action and Command and check them; write the input
@@ -75,10 +76,8 @@ impl<C: Cas> LocalRuntime<C> {
     async fn make_dir(&self, dir: &Path) -> Result<(), RuntimeError> {
         tokio::fs::create_dir_all(&self.scratch)
             .await
-            .map_err(|e| failed(&self.scratch, &e))?;
-        tokio::fs::create_dir(dir)
-            .await
-            .map_err(|e| failed(dir, &e))
+            .map_err(failed(&self.scratch))?;
+        tokio::fs::create_dir(dir).await.map_err(failed(dir))
     }
 
     /// Everything but the clean-up.
@@ -115,9 +114,7 @@ impl<C: Cas> LocalRuntime<C> {
         let outputs = output_paths(&command).map_err(tree_error)?;
 
         let root = dir.join("root");
-        tokio::fs::create_dir(&root)
-            .await
-            .map_err(|e| failed(&root, &e))?;
+        tokio::fs::create_dir(&root).await.map_err(failed(&root))?;
         materialize(cas, input_root, &root)
             .await
             .map_err(tree_error)?;
@@ -133,12 +130,15 @@ impl<C: Cas> LocalRuntime<C> {
 
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
-        let stdout = std::fs::File::create(&stdout_path).map_err(|e| failed(&stdout_path, &e))?;
-        let stderr = std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
-        // REAPI: a relative program path is relative to the input root; a bare name is
-        // looked up in the Command's PATH.
+        let stdout = std::fs::File::create(&stdout_path).map_err(failed(&stdout_path))?;
+        let stderr = std::fs::File::create(&stderr_path).map_err(failed(&stderr_path))?;
+        // REAPI v2.3 (the newest version kbf-front advertises): a program path with a
+        // slash is relative to the working directory, and a bare name is looked up in
+        // the Command's PATH. (v2.2 and older resolved it from the input root.) The
+        // join is explicit because `Command::current_dir` leaves it unspecified which
+        // directory a relative program path is resolved from.
         let program = if program.contains('/') {
-            root.join(program)
+            work_dir.join(program)
         } else {
             PathBuf::from(program)
         };
@@ -157,18 +157,12 @@ impl<C: Cas> LocalRuntime<C> {
             .stdout(stdout)
             .stderr(stderr);
         clock.0.execution_start_timestamp = now();
-        let child = Child::spawn(process)
-            .await
-            .map_err(|e| failed(&program, &e))?;
+        let child = Child::spawn(process).await.map_err(failed(&program))?;
         let stopped = async {
             // The sender is dropped only after `run` is done with this receiver.
             let _ = stop.await;
         };
-        let Some(exited) = child
-            .wait(stopped)
-            .await
-            .map_err(|e| failed(&program, &e))?
-        else {
+        let Some(exited) = child.wait(stopped).await.map_err(failed(&program))? else {
             return Err(RuntimeError::Killed);
         };
         clock.0.execution_completed_timestamp = now();
@@ -178,15 +172,23 @@ impl<C: Cas> LocalRuntime<C> {
             exit_code: exited.exit_code,
             ..ActionResult::default()
         };
-        collect(cas, &work_dir, &outputs, &mut result)
-            .await
-            .map_err(tree_error)?;
+        // From the input root: the action may have replaced its working directory.
+        collect(
+            cas,
+            &root,
+            &command.working_directory,
+            &outputs,
+            &mut result,
+        )
+        .await
+        .map_err(tree_error)?;
         for (path, slot) in [
             (&stdout_path, &mut result.stdout_digest),
             (&stderr_path, &mut result.stderr_digest),
         ] {
-            let bytes = tokio::fs::read(path).await.map_err(|e| failed(path, &e))?;
-            *slot = Some(cas.put(bytes).await.map_err(|e| tree_error(e.into()))?);
+            let bytes = tokio::fs::read(path).await.map_err(failed(path))?;
+            let digest = cas.put(bytes).await.map_err(TreeError::from);
+            *slot = Some(digest.map_err(tree_error)?);
         }
         clock.0.output_upload_completed_timestamp = now();
         clock.0.worker_completed_timestamp = now();
@@ -206,8 +208,9 @@ fn tree_error(error: TreeError) -> RuntimeError {
     }
 }
 
-fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
-    RuntimeError::Failed(format!("{}: {error}", path.display()))
+/// An I/O failure at `path` as the lease reports it: the farm's.
+fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
+    move |error| RuntimeError::Failed(format!("{}: {error}", path.display()))
 }
 
 impl<C: Cas> Runtime for LocalRuntime<C> {

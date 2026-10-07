@@ -188,3 +188,46 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
         seq: id.seq,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches an outcome reported with the wrong status: a run killed while its lease
+    /// still runs (no fence took it; the runtime stopped it) as anything but ABORTED,
+    /// the farm's failure as the client's, or the reverse. Every arm in one test, so
+    /// each code is checked against the others.
+    #[test]
+    fn each_outcome_has_its_status() {
+        let id = LeaseId::new(3, 4);
+        let ok = result_of(
+            id,
+            Ok(ActionResult {
+                exit_code: 2,
+                ..ActionResult::default()
+            }),
+        );
+        assert_eq!(ok.lease_id, Some(proto_lease_id(id)));
+        assert_eq!(ok.status, Some(Status::default()));
+        assert_eq!(ok.action_result.map(|r| r.exit_code), Some(2));
+        let codes = [
+            (RuntimeError::Killed, Code::Aborted),
+            (RuntimeError::Failed("disk".to_owned()), Code::Internal),
+            (
+                RuntimeError::Invalid("argv".to_owned()),
+                Code::InvalidArgument,
+            ),
+            (
+                RuntimeError::MissingBlob("ab/1".to_owned()),
+                Code::FailedPrecondition,
+            ),
+        ];
+        for (error, code) in codes {
+            let why = error.to_string();
+            let result = result_of(id, Err(error));
+            assert_eq!(result.lease_id, Some(proto_lease_id(id)), "{why}");
+            assert!(result.action_result.is_none(), "{why}");
+            assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
+        }
+    }
+}

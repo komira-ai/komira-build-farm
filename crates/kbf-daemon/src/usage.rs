@@ -188,6 +188,22 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     }
 
+    /// Catches a process that is still running taken as exited (`wait4` returns 0
+    /// under WNOHANG until it exits), and its exit status lost.
+    #[tokio::test]
+    async fn a_running_process_is_waited_for() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 0.1; exit 5"]);
+        let child = Child::spawn(command).await.expect("spawned");
+        let exited = child
+            .wait(std::future::pending())
+            .await
+            .expect("waited")
+            .expect("not stopped");
+        assert_eq!(exited.exit_code, 5);
+        assert!(exited.usage.wall_micros >= 100_000, "{:?}", exited.usage);
+    }
+
     /// Catches usage written to the wrong field, or not found again by its type URL.
     #[test]
     fn usage_round_trips_through_the_result() {
@@ -202,6 +218,12 @@ mod tests {
             value: vec![0xff],
         };
         let mut result = ActionResult::default();
+        assert_eq!(usage_of(&result), None);
+        // Metadata, but no usage in it: another entry is not read as usage.
+        result.execution_metadata = Some(ExecutedActionMetadata {
+            auxiliary_metadata: vec![other.clone()],
+            ..ExecutedActionMetadata::default()
+        });
         assert_eq!(usage_of(&result), None);
         result.execution_metadata = Some(ExecutedActionMetadata {
             auxiliary_metadata: vec![other, usage_any(&usage)],

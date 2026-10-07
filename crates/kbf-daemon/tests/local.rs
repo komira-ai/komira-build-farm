@@ -99,6 +99,35 @@ async fn an_action_runs_and_its_outputs_are_stored() {
     assert!(local.clean(), "the lease directory is removed");
 }
 
+/// Catches the outputs read from the working directory's host path after the action
+/// replaced that directory with a symlink to a host directory: the daemon uploaded
+/// the host's file as the action's output.
+#[tokio::test]
+async fn a_working_directory_replaced_by_a_link_yields_no_outputs() {
+    let local = Local::new("local-wd-link");
+    let host = scratch("local-wd-link-host");
+    std::fs::write(host.join("secret"), b"HOST SECRET").expect("host file");
+    let script = format!(
+        "cd .. && mv work work.real && ln -s {} work",
+        host.display()
+    );
+    let mut spec = Spec::sh(&script).outputs(&["secret"]);
+    spec.working_directory = "work".to_owned();
+    let result = local.run_spec(1, &spec).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    let uploaded: Vec<String> = result
+        .output_files
+        .iter()
+        .map(|f| local.text(f.digest.as_ref()))
+        .collect();
+    assert!(
+        uploaded.is_empty(),
+        "host file uploaded as an output: {uploaded:?}"
+    );
+    assert!(local.clean());
+    assert!(host.join("secret").exists(), "clean-up stays in the lease");
+}
+
 /// Catches usage that is not measured or is measured wrongly: CPU time must cover a
 /// busy loop and stay within the wall time, wall time must cover a sleep, and peak
 /// memory must count the action's own allocation; and REAPI's timestamps out of order.
@@ -154,13 +183,17 @@ async fn a_signal_is_reported_as_128_plus_its_number() {
     assert_eq!(result.exit_code, 137);
 }
 
-/// Catches a program path read relative to the working directory rather than the
-/// input root, an executable bit lost on the way in, and a bare program name not
-/// looked up in the Command's PATH.
+/// Catches a program path read relative to the input root rather than the working
+/// directory (REAPI v2.3; v2.2 and older said the input root, and both trees here hold
+/// a `tools/hi` so the wrong one shows), an executable bit lost on the way in, and a
+/// bare program name not looked up in the Command's PATH.
 #[tokio::test]
 async fn programs_are_found_as_reapi_says() {
     let local = Local::new("local-program");
-    let mut relative = Spec::sh("").inputs(&[("tools/hi", b"#!/bin/sh\necho hi\n", true)]);
+    let mut relative = Spec::sh("").inputs(&[
+        ("tools/hi", b"#!/bin/sh\necho from the input root\n", true),
+        ("deep/er/tools/hi", b"#!/bin/sh\necho hi\n", true),
+    ]);
     relative.argv = vec!["tools/hi".to_owned()];
     relative.working_directory = "deep/er".to_owned();
     let result = local.run_spec(1, &relative).await.expect("ran");

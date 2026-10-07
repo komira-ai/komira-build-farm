@@ -275,7 +275,9 @@ async fn real_dirs_never_pass_through_a_link() {
 
 /// Catches outputs read wrongly: a file's bytes or executable bit, a directory's
 /// tree (sorted, nested, with its symlinks), a symlink output's target; and outputs
-/// the action never made, or made as a FIFO, being reported.
+/// the action never made, or made as a FIFO, being reported. The tree holds 22 files
+/// written in an unsorted order, so a missing sort cannot pass by the directory
+/// happening to list them sorted (ext4's hash order, tmpfs's newest-first order).
 #[tokio::test]
 async fn outputs_are_read_back_as_the_action_left_them() {
     let cas = MemoryCas::default();
@@ -286,6 +288,11 @@ async fn outputs_are_read_back_as_the_action_left_them() {
     std::fs::create_dir_all(dir.join("tree/sub")).expect("tree");
     std::fs::write(dir.join("tree/b"), b"b").expect("b");
     std::fs::write(dir.join("tree/a"), b"a").expect("a");
+    // n00..n19 in the order 0, 7, 14, 1, 8, ...: neither sorted nor reversed.
+    for i in 0..20 {
+        let n = i * 7 % 20;
+        std::fs::write(dir.join(format!("tree/n{n:02}")), b"n").expect("n");
+    }
     std::fs::write(dir.join("tree/sub/c"), b"c").expect("c");
     std::os::unix::fs::symlink("a", dir.join("tree/l")).expect("link in tree");
     std::os::unix::fs::symlink("file", dir.join("link")).expect("link");
@@ -301,7 +308,7 @@ async fn outputs_are_read_back_as_the_action_left_them() {
         .map(str::to_owned)
         .to_vec();
     let mut result = ActionResult::default();
-    collect(&cas, &dir, &paths, &mut result)
+    collect(&cas, &dir, "", &paths, &mut result)
         .await
         .expect("collected");
 
@@ -334,7 +341,9 @@ async fn outputs_are_read_back_as_the_action_left_them() {
         Some(digest_of(&root.encode_to_vec()))
     );
     let names: Vec<&str> = root.files.iter().map(|f| f.name.as_str()).collect();
-    assert_eq!(names, ["a", "b"], "sorted, FIFO left out");
+    let mut sorted = vec!["a".to_owned(), "b".to_owned()];
+    sorted.extend((0..20).map(|n| format!("n{n:02}")));
+    assert_eq!(names, sorted, "sorted, FIFO left out");
     assert!(!root.files[0].is_executable);
     assert_eq!(root.directories.len(), 1);
     assert_eq!(root.directories[0].name, "sub");
@@ -366,10 +375,49 @@ async fn outputs_under_a_link_or_a_file_are_left_out() {
     std::fs::write(dir.join("f"), b"").expect("file");
     let paths = ["d/secret", "f/below"].map(str::to_owned).to_vec();
     let mut result = ActionResult::default();
-    collect(&cas, &dir, &paths, &mut result)
+    collect(&cas, &dir, "", &paths, &mut result)
         .await
         .expect("collected");
     assert_eq!(result, ActionResult::default());
+}
+
+/// Catches outputs read through a working directory, or a directory above it, that
+/// the action replaced with a symlink: only the output path's own components were
+/// checked, so `cd .. && mv work w && ln -s /host/dir work` uploaded host files. Also
+/// catches the working directory left out of the output's path (the control: a real
+/// working directory's output is read, and reported relative to it).
+#[tokio::test]
+async fn outputs_under_a_replaced_working_directory_are_left_out() {
+    let cas = MemoryCas::default();
+    let outside = scratch("collect-wd-outside");
+    std::fs::write(outside.join("secret"), b"HOST SECRET").expect("secret");
+    let dir = scratch("collect-wd");
+    std::os::unix::fs::symlink(&outside, dir.join("work")).expect("work is a link");
+    std::fs::create_dir(dir.join("up")).expect("up");
+    std::os::unix::fs::symlink(&outside, dir.join("up/work")).expect("up/work is a link");
+    std::os::unix::fs::symlink(&outside, dir.join("above")).expect("above is a link");
+    std::fs::create_dir_all(dir.join("real/work")).expect("real");
+    std::fs::write(dir.join("real/work/secret"), b"the action's").expect("output");
+    let secret = ["secret".to_owned()];
+    for working_directory in ["work", "up/work", "above/work"] {
+        let mut result = ActionResult::default();
+        collect(&cas, &dir, working_directory, &secret, &mut result)
+            .await
+            .expect("collected");
+        assert_eq!(result, ActionResult::default(), "{working_directory}");
+    }
+    let mut result = ActionResult::default();
+    collect(&cas, &dir, "real/work", &secret, &mut result)
+        .await
+        .expect("collected");
+    let [out] = result.output_files.as_slice() else {
+        panic!("one output: {result:?}");
+    };
+    assert_eq!(out.path, "secret");
+    assert_eq!(
+        cas.blob(out.digest.as_ref().expect("digest")),
+        Some(b"the action's".to_vec())
+    );
 }
 
 /// Catches an output the daemon cannot read being left out silently instead of
@@ -390,7 +438,7 @@ async fn an_unreadable_output_fails() {
     // cannot be read.
     for path in ["closed/inner/x", "shut/x", "tree"] {
         let mut result = ActionResult::default();
-        let outcome = collect(&cas, &dir, &[path.to_owned()], &mut result).await;
+        let outcome = collect(&cas, &dir, "", &[path.to_owned()], &mut result).await;
         assert!(
             matches!(outcome, Err(TreeError::Io { .. })),
             "{path}: {outcome:?}"

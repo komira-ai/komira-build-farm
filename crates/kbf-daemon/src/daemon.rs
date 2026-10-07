@@ -10,6 +10,12 @@
 //! scheduler does not take it as lost, and each new stream resends it right after
 //! Welcome, before its first Heartbeat. A Result produced while disconnected is sent
 //! the same way.
+//!
+//! A v1 assumption: the server acknowledges every Result. ResultAck is an addition
+//! within protocol version 1 (worker.proto), so Welcome's version check does not rule
+//! out a server built before it; such a server would leave every Result kept, resent
+//! on every stream and listed in every Heartbeat for the daemon's lifetime. No server
+//! without ResultAck has been released, which is why the version was not raised for it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
