@@ -12,7 +12,7 @@ use kbf_daemon::{Daemon, DaemonConfig, Event, FakeRuntime, NodeReport, Runtime, 
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
     DaemonMessage, Heartbeat, HeartbeatAck, Hello, LeaseId, LeaseOffer, Result as WorkerResult,
-    ServerMessage, Start, Welcome, daemon_message, server_message,
+    ResultAck, ServerMessage, Start, Welcome, daemon_message, server_message,
     worker_server::{Worker, WorkerServer},
 };
 use rcgen::{
@@ -133,6 +133,14 @@ impl Peer {
             kind: kind.to_owned(),
             action_digest: Some(digest()),
             ..Start::default()
+        }));
+    }
+
+    /// Acknowledges the Result of lease `term.seq`, or of no lease at all.
+    pub fn ack_result(&self, lease: Option<(u64, u64)>, accepted: bool) {
+        self.send(server_message::Message::ResultAck(ResultAck {
+            lease_id: lease.map(|(term, seq)| LeaseId { term, seq }),
+            accepted,
         }));
     }
 

@@ -143,6 +143,67 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9100 --bucket kbf-conformance-lock --create-bucket --conditional-put --object-lock
 
+  # Line and branch coverage per crate, and the ratchet in `coverage-baseline`
+  # (crates/kbf-coverage). Branch coverage (`--branch`, rustc's
+  # `-Zcoverage-options=branch`) is unstable, so this job alone builds with a pinned
+  # nightly; every other job stays on the toolchain in rust-toolchain.toml. The nightly
+  # may warn where stable does not, so `-D warnings` is off here (clippy enforces it).
+  # cargo-llvm-cov is the release binary, checked against its SHA-256 before use.
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: ""
+      COVERAGE_TOOLCHAIN: nightly-2026-10-01
+      LLVM_COV_VERSION: 0.9.1
+      LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
+      - name: Install cargo-llvm-cov (pinned version and checksum)
+        run: |
+          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$LLVM_COV_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$HOME/.cargo/bin" cargo-llvm-cov
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
+      # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
+      # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
+      # it looks like LLVM issue 220574). Lines and branches, all the ratchet reads, are
+      # unaffected: their totals match llvm-cov's own text report.
+      - name: Run the workspace tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: |
+          mkdir -p target/coverage
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch \
+            --lcov --output-path target/coverage/lcov.info
+      # `shell: bash` sets pipefail, so the ratchet's exit status survives the tee.
+      - name: Per-crate table and ratchet
+        shell: bash
+        run: |
+          cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- \
+            --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" \
+            --baseline coverage-baseline \
+            --write-baseline target/coverage/coverage-baseline.measured \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage
+          path: |
+            target/coverage/lcov.info
+            target/coverage/coverage-baseline.measured
+          if-no-files-found: error
+
   # A second job rather than a matrix: the workflow lint requires a literal hosted label
   # in runs-on, so the runner a job lands on is readable from this file alone.
   test-arm:

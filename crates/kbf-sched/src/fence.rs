@@ -1,6 +1,9 @@
 //! Lease timing: the re-dispatch grace G on the scheduler's side and the self-fence T
 //! on the worker's side.
 //!
+//! G also bounds how long the scheduler keeps a committed lease that a worker it still
+//! hears from does not list as running ([`START_GRACE`]).
+//!
 //! The scheduler re-dispatches a worker's leases once it has heard nothing from the
 //! worker for G. A worker holding a [`FencePolicy::SelfFence`] lease stops it once its
 //! newest acknowledged heartbeat was *sent* more than T ago. A heartbeat's send time is
@@ -18,6 +21,14 @@ use kbf_types::FarmTime;
 /// G: how long the scheduler waits after last hearing a worker before it re-dispatches
 /// that worker's leases.
 pub const LEASE_GRACE: Duration = Duration::from_secs(60);
+
+/// How long after sending a lease's `Start` the scheduler keeps the lease while the
+/// worker's heartbeats leave it out of their running set. Until then the `Start` may
+/// still be on its way, and a heartbeat sent before it arrived rightly omits it; after
+/// that the lease is taken as lost and its operation requeued. RFC section 5.8 has one
+/// wait before re-dispatch, G; this is G, counted from the `Start`. It assumes a `Start`
+/// reaches a connected worker within G or never.
+pub const START_GRACE: Duration = LEASE_GRACE;
 
 /// T: how long after sending its newest acknowledged heartbeat a worker keeps running a
 /// self-fenced lease.

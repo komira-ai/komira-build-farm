@@ -885,6 +885,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-coverage"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-daemon"
 version = "0.1.0"
 dependencies = [
@@ -935,9 +943,11 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-sched",
  "kbf-segments",
  "kbf-types",
  "prost",
+ "prost-types",
  "thiserror",
  "tokio",
  "tonic",
@@ -1021,6 +1031,24 @@ dependencies = [
 [[package]]
 name = "kbf-server"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "kbf-front",
+ "kbf-meta",
+ "kbf-objstore",
+ "kbf-proto",
+ "kbf-sched",
+ "kbf-segments",
+ "kbf-types",
+ "prost",
+ "rcgen",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "kbf-sim"
