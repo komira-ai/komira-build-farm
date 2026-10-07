@@ -1,0 +1,5 @@
+# Mutant: never runs (workflow_dispatch only, job if: false). The workflow lint must refuse it.
+name: mutant-flow
+on: workflow_dispatch
+permissions: {}
+jobs: {a: {if: false, runs-on: big-box, steps: [{uses: a/b@v1}]}}
