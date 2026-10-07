@@ -80,6 +80,9 @@ version = "0.1.0"
 [[package]]
 name = "kbf-caps"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "kbf-daemon"
