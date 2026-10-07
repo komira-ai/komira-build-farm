@@ -294,7 +294,8 @@ impl Scheduler {
             })
             .map(|(_, held)| held.operation)
             .collect();
-        for id in lost {
+        // MUTANT M1: reconciliation disabled; no lost lease is requeued.
+        for id in lost.into_iter().take(0) {
             self.requeue(id);
         }
     }
