@@ -40,6 +40,9 @@ pub enum Event {
     Welcomed { heartbeat_interval: Duration },
     /// The server placed a lease here; nothing runs until its Start.
     Offered(LeaseId),
+    /// The server decided a Result: `accepted` says whether it became the operation's
+    /// result. v0 only reports it; resending unacknowledged Results is issue #26.
+    ResultAcknowledged { lease: LeaseId, accepted: bool },
     /// No heartbeat sent in the last two intervals has been acknowledged.
     HeartbeatGap { silent_for: Duration },
     /// An acknowledgement arrived after a gap.
@@ -255,6 +258,15 @@ impl<R: Runtime> Daemon<R> {
                 };
                 if let Some(result) = refused {
                     self.send(tx, daemon_message::Message::Result(result));
+                }
+            }
+            Some(server_message::Message::ResultAck(ack)) => {
+                if let Some(id) = ack.lease_id.map(lease_id) {
+                    tracing::info!(lease = %id, accepted = ack.accepted, "result acknowledged");
+                    self.emit(Event::ResultAcknowledged {
+                        lease: id,
+                        accepted: ack.accepted,
+                    });
                 }
             }
             Some(server_message::Message::Welcome(_)) => {

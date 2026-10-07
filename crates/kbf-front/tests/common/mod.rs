@@ -9,15 +9,17 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_front::{Cache, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
+use kbf_front::{Cache, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
 use kbf_meta::{Applied, BlobAnswer, Command, Location, MetaState, Retention};
 use kbf_objstore::{ByteRange, Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
+use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{self, BatchUpdateBlobsRequest, FindMissingBlobsRequest};
 use kbf_types::{Digest, DigestFunction, FarmTime};
+use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
 
@@ -86,6 +88,15 @@ pub struct Farm {
 
 impl Farm {
     pub async fn start() -> Self {
+        Self::serve(kbf_front::routes).await
+    }
+
+    /// The cache services and `Execution` over `dispatch`.
+    pub async fn with_execution<D: Dispatch>(dispatch: Arc<D>) -> Self {
+        Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch)).await
+    }
+
+    async fn serve(routes: impl FnOnce(Arc<TestCache>) -> Routes) -> Self {
         let cache = Arc::new(Cache::new(
             RaceLog::new(),
             MemoryStore::new(Capabilities::default()),
@@ -93,7 +104,7 @@ impl Farm {
         ));
         let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = incoming.local_addr().expect("local address");
-        let routes = kbf_front::routes(Arc::clone(&cache));
+        let routes = routes(Arc::clone(&cache));
         tokio::spawn(async move {
             Server::builder()
                 .add_routes(routes)
@@ -123,6 +134,10 @@ impl Farm {
         ByteStreamClient::new(self.channel.clone())
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
+    }
+
+    pub fn exec(&self) -> ExecutionClient<Channel> {
+        ExecutionClient::new(self.channel.clone())
     }
 
     pub fn ac(&self) -> ActionCacheClient<Channel> {

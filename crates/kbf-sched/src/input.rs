@@ -71,8 +71,9 @@ pub enum Event {
     ///
     /// The caller must keep two things true. A `Start` emitted before this input is sent
     /// on the earlier stream, never on the new one. A heartbeat from an earlier stream
-    /// that arrives after this input is not fed. The server does not yet hold either
-    /// (issue #25: only the first `Hello` of a stream may become `WorkerUp`).
+    /// that arrives after this input is not fed. `kbf-server` holds both: a resent
+    /// `Hello` becomes [`Event::Capacity`], and a stream replaced by a newer one has its
+    /// heartbeats dropped (issue #25).
     ///
     /// Because the new session's first heartbeat decides at once, a restarted daemon
     /// must finish re-adopting its leases before it sends that heartbeat; see
@@ -81,6 +82,17 @@ pub enum Event {
         /// The worker.
         worker: WorkerId,
         /// What placement may book on it.
+        capacity: Resources,
+    },
+    /// A registered worker's capacity changed without a new registration: the daemon
+    /// resent `Hello` on the same stream because its node report changed. Counts as
+    /// hearing from it. Opens no session, so it requeues nothing and leaves every
+    /// `Start` counted against the session it was sent to (issue #25). Ignored for a
+    /// worker that never registered.
+    Capacity {
+        /// The worker.
+        worker: WorkerId,
+        /// What placement may book on it from now on.
         capacity: Resources,
     },
     /// A worker's heartbeat arrived on its newest stream, with the leases it holds.

@@ -491,6 +491,13 @@ impl StateMachine for Scheduler {
                     });
                 Vec::new()
             }
+            Event::Capacity { worker, capacity } => {
+                if let Some(w) = self.workers.get_mut(&worker) {
+                    w.capacity = capacity;
+                    w.last_heard = w.last_heard.max(self.now);
+                }
+                Vec::new()
+            }
             Event::Heartbeat { worker, running } => {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.last_heard = w.last_heard.max(self.now);

@@ -558,3 +558,62 @@ fn a_heartbeat_after_registering_again_requeues_at_once_only_what_the_worker_los
     h.commit_and_start(&again);
     assert!(h.report(&lost, ok(2)).is_empty(), "late result proposed");
 }
+
+/// Catches (issue #25): a resent `Hello` treated as a registration, which would count
+/// every `Start` already sent as sent to an earlier session and requeue it on the next
+/// heartbeat that has not listed it yet (an unfenced second run for self-fenced work);
+/// a capacity change that placement does not see; a resend that does not count as
+/// hearing from the worker; and a capacity change that registers an unknown worker.
+#[test]
+fn a_capacity_change_resizes_the_worker_and_opens_no_session() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, 4 * GIB);
+    h.submit(1, request(1));
+    h.submit(2, request(2));
+    let [first] = h.tick().try_into().unwrap();
+    h.commit_and_start(&first);
+    assert!(h.tick().is_empty(), "placed beyond the capacity");
+
+    // The node report changes 50 s in: twice the CPUs.
+    let capacity = Resources::new(2_000, 4 * GIB);
+    let resend = Event::Capacity {
+        worker: w("a"),
+        capacity,
+    };
+    assert!(h.at_secs(50).feed(resend).is_empty());
+    // A heartbeat that has not listed `first` yet keeps it: same session, inside G.
+    h.at_secs(51).heartbeat("a");
+    assert!(h.running(&first), "a capacity change opened a session");
+    // Heard at 51 s at the latest: alive at 100 s, and roomier.
+    let [second] = h.at_secs(100).tick().try_into().unwrap();
+    assert_eq!(second.worker, w("a"));
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(2_000, 2 * GIB)));
+
+    let unknown = Event::Capacity {
+        worker: w("z"),
+        capacity,
+    };
+    assert!(h.feed(unknown).is_empty());
+    assert_eq!(
+        h.s.booked(&w("z")),
+        None,
+        "a capacity change registered a worker"
+    );
+}
+
+/// Catches: a capacity change that does not count as hearing from the worker, so a
+/// worker whose daemon resends `Hello` but whose heartbeats are delayed is taken for
+/// silent and gets no work.
+#[test]
+fn a_capacity_change_counts_as_hearing_from_the_worker() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    let resend = Event::Capacity {
+        worker: w("a"),
+        capacity: Resources::new(1_000, GIB),
+    };
+    assert!(h.at_secs(50).feed(resend).is_empty());
+    h.submit(1, request(1));
+    let [grant] = h.at_secs(100).tick().try_into().unwrap();
+    assert_eq!(grant.worker, w("a"), "a resend did not count as hearing");
+}
