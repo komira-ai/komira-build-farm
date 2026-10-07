@@ -87,4 +87,23 @@ mod tests {
         assert!(read[0].is_err());
         std::fs::remove_file(&path).expect("remove");
     }
+
+    /// Catches a read whose blocking task never ran (its runtime shut down) taken for
+    /// the end of the file, or the stream going on past it.
+    #[test]
+    fn a_read_on_a_shut_down_runtime_is_an_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let _entered = handle.enter();
+        let file =
+            std::fs::File::open(std::env::current_exe().expect("test binary")).expect("open");
+        let read: Vec<std::io::Result<Vec<u8>>> =
+            futures::executor::block_on(chunks(file).collect());
+        assert_eq!(read.len(), 1);
+        let error = read[0].as_ref().expect_err("the read never ran");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
 }

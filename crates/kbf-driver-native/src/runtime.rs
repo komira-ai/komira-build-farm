@@ -364,7 +364,8 @@ impl Group {
         let tracker = Arc::clone(&self.tracker);
         let members = tokio::task::spawn_blocking(move || members_now(&tracker)).await;
         members
-            .map_err(task_failed("process table"))?
+            .map_err(unfinished("process table"))
+            .map_err(RuntimeError::Failed)?
             .map_err(failed(Path::new("process table")))
     }
 
@@ -378,7 +379,8 @@ impl Group {
                 .fold(0_u64, u64::saturating_add)
         })
         .await
-        .map_err(task_failed("memory"))
+        .map_err(unfinished("memory"))
+        .map_err(RuntimeError::Failed)
     }
 
     /// Ends every process of the action: SIGKILL to the group and to each process
@@ -450,9 +452,10 @@ async fn spawn(command: &mut tokio::process::Command) -> std::io::Result<(Child,
             }
             spawned => {
                 let child = spawned?;
-                // A child that has not been waited for always has its pid.
+                // A child that has not been waited for always has its pid, and a pid
+                // fits an i32.
                 let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
-                let pid = pid.ok_or_else(|| std::io::Error::other("the child has no pid"))?;
+                let pid = pid.ok_or(std::io::Error::other("the child has no pid"))?;
                 return Ok((child, pid));
             }
         }
@@ -516,7 +519,7 @@ impl LeaseDir {
         self.armed = false;
         let path = self.path.clone();
         let cleaned = tokio::task::spawn_blocking(move || clean(&path)).await;
-        cleaned.map_err(|e| format!("clean task: {e}"))?
+        cleaned.map_err(unfinished("clean task"))?
     }
 }
 
@@ -597,9 +600,9 @@ fn outputs_error(error: OutputsError) -> RuntimeError {
 }
 
 /// A blocking-pool task for `what` that did not finish (it panicked, or the runtime
-/// shut down) as the lease reports it: the farm's.
-fn task_failed(what: &'static str) -> impl FnOnce(tokio::task::JoinError) -> RuntimeError {
-    move |error| RuntimeError::Failed(format!("{what}: {error}"))
+/// shut down), as text; the lease reports it as the farm's failure.
+fn unfinished(what: &'static str) -> impl FnOnce(tokio::task::JoinError) -> String {
+    move |error| format!("{what}: {error}")
 }
 
 /// An I/O failure at `path` as the lease reports it: the farm's.
@@ -665,6 +668,19 @@ mod tests {
             source: std::io::Error::other("disk"),
         };
         assert_eq!(shown(outputs_error(io)), "Failed(\"p: disk\")");
+        let io = failed(Path::new("q"))(std::io::Error::other("full"));
+        assert_eq!(shown(io), "Failed(\"q: full\")");
+    }
+
+    /// Catches a blocking-pool task that did not finish reported without naming the
+    /// task or without its reason.
+    #[tokio::test]
+    async fn an_unfinished_task_is_named() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let why = unfinished("memory")(task.await.expect_err("aborted"));
+        assert!(why.starts_with("memory: task "), "{why}");
+        assert!(why.ends_with(" was cancelled"), "{why}");
     }
 
     /// Catches a bare program name not looked up in the Command's PATH (or looked up in
@@ -693,6 +709,8 @@ mod tests {
             Path::new("/bin/sh")
         );
         assert!(resolve("./tool", wd, &[]).is_err());
+        // A directory has its x bits but is not an executable file.
+        assert!(resolve("/bin", wd, &[]).is_err(), "a directory");
         let err = resolve("/etc/hosts", wd, &[]).expect_err("not executable");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
@@ -704,13 +722,7 @@ mod tests {
     async fn a_busy_program_is_retried() {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let program = dir.join(format!("busy-{}", std::process::id()));
+        let program = unit_file("busy");
         let _ = std::fs::remove_file(&program);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -739,5 +751,38 @@ mod tests {
         assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
         drop(held);
         std::fs::remove_file(&program).expect("remove");
+    }
+
+    /// Catches a program that cannot start for any reason but ETXTBSY (here its
+    /// interpreter does not exist) retried until the busy wait runs out, or reported
+    /// with an error other than the one the spawn met.
+    #[tokio::test]
+    async fn a_program_that_cannot_start_is_not_retried() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let program = unit_file("no-interpreter");
+        std::fs::write(&program, "#!/nonexistent/interpreter\n").expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let started = Instant::now();
+        let mut command = tokio::process::Command::new(&program);
+        let error = spawn(&mut command).await.expect_err("no interpreter");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+        assert!(
+            started.elapsed() < BUSY_WAIT,
+            "retried: {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_file(&program).expect("remove");
+    }
+
+    /// A path for a file named after `name` and this process, in a directory next to
+    /// the test binary.
+    fn unit_file(name: &str) -> PathBuf {
+        let dir = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir.join(format!("{name}-{}", std::process::id()))
     }
 }
