@@ -5,8 +5,12 @@ mod support;
 
 use futures::channel::mpsc::unbounded;
 use kbf_proto::worker::worker_client::WorkerClient;
-use kbf_proto::worker::{Capability, DaemonMessage, Offer, daemon_message};
-use support::{Blob, Cell, FakeDaemon, Job, done, done_within_quiet, hello, output, ran, response};
+use kbf_proto::worker::{
+    Capability, DaemonMessage, Heartbeat, LeaseId, Offer, daemon_message, server_message,
+};
+use support::{
+    Blob, Cell, FakeDaemon, Job, done, done_within_quiet, failed, hello, output, ran, response,
+};
 use tonic::Code;
 use tonic::transport::Endpoint;
 
@@ -260,5 +264,95 @@ async fn a_result_for_a_lease_given_up_while_queued_is_refused() {
     assert_ne!(again.lease_id, given_up.lease_id);
     let result = output(&cell, "from the new lease", 0).await;
     assert!(back.report(ran(again.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+}
+
+/// Catches (issue #23): a `Start` that names no heartbeat, or not the newest one the
+/// server took on the stream (a daemon would measure the `Start`'s age from an older
+/// send and refuse it, or from a newer one and accept a late one); a late, older seq
+/// moving it back; a window other than the scheduler's 14 s; and a new stream that
+/// carries the old stream's seq instead of naming its own Hello.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_names_the_newest_heartbeat_taken_and_the_window() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let first_job = Job::new("before any heartbeat", &[]);
+    cell.upload(&first_job.blobs()).await;
+    let _first_ops = cell.execute(&first_job.action).await;
+    let first = daemon.start().await;
+    assert_eq!((first.heartbeat_seq, first.valid_for_ms), (0, 14_000));
+
+    let running = [first.lease_id.expect("a lease id")];
+    assert!(daemon.heartbeat(&running).await);
+    assert!(daemon.heartbeat(&running).await);
+    daemon.send(daemon_message::Message::Heartbeat(Heartbeat {
+        seq: 1,
+        report_hash: Vec::new(),
+        running: running.to_vec(),
+    }));
+    daemon
+        .expect("the late heartbeat's ack", |m| match m {
+            server_message::Message::HeartbeatAck(a) if a.seq == 1 => Some(()),
+            _ => None,
+        })
+        .await;
+    let second_job = Job::new("after two heartbeats", &[]);
+    cell.upload(&second_job.blobs()).await;
+    let _second_ops = cell.execute(&second_job.action).await;
+    let second = daemon.start().await;
+    assert_eq!((second.heartbeat_seq, second.valid_for_ms), (2, 14_000));
+
+    let mut again = cell.daemon("node-a", 4, 8).await;
+    let third_job = Job::new("on a new stream", &[]);
+    cell.upload(&third_job.blobs()).await;
+    let _third_ops = cell.execute(&third_job.action).await;
+    let third = again.start().await;
+    assert_eq!(
+        third.heartbeat_seq, 0,
+        "the old stream's seq on the new one"
+    );
+}
+
+/// Catches (issue #23): a lease the daemon lists after the server gave it up and placed
+/// its operation again (a late `Start` ran after all) left running beside the retry,
+/// with no `Cancel`; a `Cancel` of the retry the daemon rightly holds, or of a lease
+/// the server never granted; and the cancelled run's Result accepted over the retry's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listed_lease_the_server_gave_up_is_cancelled() {
+    let cell = Cell::start().await;
+    let mut first = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("cancelled", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let lost = first.start().await.lease_id.expect("a lease id");
+
+    // The daemon returns and its first heartbeat leaves the lease out: given up and
+    // placed again.
+    let mut back = cell.daemon("node-a", 4, 8).await;
+    assert!(back.heartbeat(&[]).await);
+    let retry = back.start().await.lease_id.expect("a lease id");
+    assert_ne!(retry, lost);
+    assert_eq!(
+        back.cancelled().await,
+        None,
+        "a Cancel before any lease is listed"
+    );
+
+    // The lost lease's Start ran after all: the daemon lists both.
+    assert!(back.heartbeat(&[lost, retry]).await);
+    assert_eq!(back.cancelled().await, Some(lost));
+    assert_eq!(back.cancelled().await, None, "the retry was cancelled too");
+    let never = [LeaseId { term: 1, seq: 99 }, LeaseId { term: 2, seq: 0 }];
+    assert!(back.heartbeat(&[retry, never[0], never[1]]).await);
+    assert_eq!(
+        back.cancelled().await,
+        None,
+        "a lease never granted was cancelled"
+    );
+
+    let aborted = back.report(failed(Some(lost), Code::Aborted)).await;
+    assert!(!aborted.accepted, "the cancelled run's Result was accepted");
+    let result = output(&cell, "from the retry", 0).await;
+    assert!(back.report(ran(Some(retry), &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
 }

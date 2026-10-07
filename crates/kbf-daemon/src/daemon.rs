@@ -4,12 +4,13 @@
 //!
 //! A session sends Hello, waits for Welcome, then sends a Heartbeat at the interval
 //! Welcome names and handles what the server sends: `HeartbeatAck` renews contact,
-//! `LeaseOffer` is logged and runs nothing, `Start` runs a lease. Results go out on the
-//! stream. Every Result is kept until the server's `ResultAck` names its lease
-//! (issue #26): until then each Heartbeat lists the lease in `running`, so the
-//! scheduler does not take it as lost, and each new stream resends it right after
-//! Welcome, before its first Heartbeat. A Result produced while disconnected is sent
-//! the same way.
+//! `LeaseOffer` is logged and runs nothing, `Start` runs a lease if it arrived within
+//! the window it names (see `window`; a late one is dropped without a Result), and
+//! `Cancel` kills a running lease. Results go out on the stream. Every Result is kept
+//! until the server's `ResultAck` names its lease (issue #26): until then each
+//! Heartbeat lists the lease in `running`, so the scheduler does not take it as lost,
+//! and each new stream resends it right after Welcome, before its first Heartbeat. A
+//! Result produced while disconnected is sent the same way.
 //!
 //! A v1 assumption: the server acknowledges every Result. ResultAck is an addition
 //! within protocol version 1 (worker.proto), so Welcome's version check does not rule
@@ -38,6 +39,7 @@ use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::report::NodeReport;
 use crate::runtime::Runtime;
+use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -49,6 +51,11 @@ pub enum Event {
     Welcomed { heartbeat_interval: Duration },
     /// The server placed a lease here; nothing runs until its Start.
     Offered(LeaseId),
+    /// A Start arrived after the window it names, or names a heartbeat this stream
+    /// did not send: the lease was not run, and no Result is sent (issue #23).
+    StartExpired(LeaseId),
+    /// The server cancelled a running lease; its kill has begun.
+    Cancelled(LeaseId),
     /// The server decided a Result: `accepted` says whether it became the operation's
     /// result. Either way the daemon forgets the Result: it is neither resent nor
     /// listed in heartbeats any more.
@@ -85,6 +92,8 @@ pub struct Daemon<R> {
     leases: Leases<R>,
     done: mpsc::UnboundedReceiver<Done>,
     contact: Contact,
+    /// Send times of this stream's Hello and heartbeats, which Starts name.
+    window: StartWindow,
     /// Results the server has not acknowledged yet, by lease.
     unacked: BTreeMap<LeaseId, worker::Result>,
 }
@@ -117,6 +126,7 @@ impl<R: Runtime> Daemon<R> {
             leases: Leases::new(runtime, done_tx),
             done,
             contact,
+            window: StartWindow::default(),
             unacked: BTreeMap::new(),
         })
     }
@@ -172,6 +182,7 @@ impl<R: Runtime> Daemon<R> {
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
         let interval = self.welcome(first)?;
         self.contact.new_stream(interval);
+        self.window.new_stream(hello_sent);
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -196,7 +207,9 @@ impl<R: Runtime> Daemon<R> {
                 },
                 _ = beat.tick() => {
                     seq += 1;
-                    self.contact.sent(seq, Instant::now());
+                    let now = Instant::now();
+                    self.contact.sent(seq, now);
+                    self.window.sent(seq, now);
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
@@ -245,6 +258,7 @@ impl<R: Runtime> Daemon<R> {
     fn on_message(&mut self, msg: ServerMessage, tx: &UnboundedSender<DaemonMessage>) {
         match msg.message {
             Some(server_message::Message::HeartbeatAck(ack)) => {
+                self.window.acknowledged(ack.seq);
                 if self.contact.acknowledged(ack.seq).restored {
                     tracing::info!("contact restored");
                     self.emit(Event::ContactRestored);
@@ -256,29 +270,7 @@ impl<R: Runtime> Daemon<R> {
                     self.emit(Event::Offered(id));
                 }
             }
-            Some(server_message::Message::Start(start)) => {
-                let done = start.lease_id.map(lease_id);
-                if let Some(id) = done.filter(|id| self.unacked.contains_key(id)) {
-                    // Its Result stands until acknowledged; running it again could
-                    // produce a second one.
-                    tracing::warn!(lease = %id, "a Start for a lease already reported ignored");
-                    return;
-                }
-                let refused = if self.contact.lost(Instant::now()) {
-                    start.lease_id.map(|id| {
-                        failure(
-                            lease_id(id),
-                            Code::Unavailable,
-                            "contact with the server is lost; not starting",
-                        )
-                    })
-                } else {
-                    self.leases.start(start)
-                };
-                if let Some(result) = refused {
-                    self.report(Some(tx), result);
-                }
-            }
+            Some(server_message::Message::Start(start)) => self.on_start(start, tx),
             Some(server_message::Message::ResultAck(ack)) => {
                 if let Some(id) = ack.lease_id.map(lease_id) {
                     self.unacked.remove(&id);
@@ -289,10 +281,56 @@ impl<R: Runtime> Daemon<R> {
                     });
                 }
             }
+            Some(server_message::Message::Cancel(cancel)) => {
+                if let Some(id) = cancel.lease_id.map(lease_id)
+                    && self.leases.cancel(id)
+                {
+                    self.emit(Event::Cancelled(id));
+                }
+            }
             Some(server_message::Message::Welcome(_)) => {
                 tracing::warn!("a second Welcome on one stream ignored");
             }
             None => tracing::warn!("an empty server message ignored"),
+        }
+    }
+
+    /// Runs the lease a Start names, unless its Result is still unacknowledged, it
+    /// arrived after its window, or contact is lost (then it is refused with a Result).
+    fn on_start(&mut self, start: worker::Start, tx: &UnboundedSender<DaemonMessage>) {
+        let done = start.lease_id.map(lease_id);
+        if let Some(id) = done.filter(|id| self.unacked.contains_key(id)) {
+            // Its Result stands until acknowledged; running it again could
+            // produce a second one.
+            tracing::warn!(lease = %id, "a Start for a lease already reported ignored");
+            return;
+        }
+        let valid_for = Duration::from_millis(start.valid_for_ms);
+        if !self
+            .window
+            .allows(start.heartbeat_seq, valid_for, Instant::now())
+        {
+            // The scheduler may have given the lease up and granted it again; it
+            // gives it up here too, as a Start that never arrived.
+            if let Some(id) = done {
+                tracing::warn!(lease = %id, "a Start that arrived after its window not run");
+                self.emit(Event::StartExpired(id));
+            }
+            return;
+        }
+        let refused = if self.contact.lost(Instant::now()) {
+            start.lease_id.map(|id| {
+                failure(
+                    lease_id(id),
+                    Code::Unavailable,
+                    "contact with the server is lost; not starting",
+                )
+            })
+        } else {
+            self.leases.start(start)
+        };
+        if let Some(result) = refused {
+            self.report(Some(tx), result);
         }
     }
 

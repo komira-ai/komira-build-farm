@@ -8,8 +8,12 @@
 //!
 //! v0 fences every lease (`SELF_FENCE`); the `RUN_ON` policy for hermetic actions
 //! arrives when Start carries a fence policy.
+//!
+//! A `Cancel` (the server no longer holds the lease here) kills a running lease
+//! without waiting: the lease stays running, and listed, until its run has stopped,
+//! and then reports its outcome (ABORTED, killed) like any other run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kbf_proto::google::rpc::precondition_failure::Violation;
@@ -30,6 +34,8 @@ pub(crate) type Done = (LeaseId, Result<ActionResult, RuntimeError>);
 pub(crate) struct Leases<R> {
     runtime: Arc<R>,
     running: BTreeMap<LeaseId, JoinHandle<()>>,
+    /// Running leases being killed on the server's `Cancel`.
+    cancelled: BTreeSet<LeaseId>,
     done: mpsc::UnboundedSender<Done>,
 }
 
@@ -39,6 +45,7 @@ impl<R: Runtime> Leases<R> {
         Self {
             runtime,
             running: BTreeMap::new(),
+            cancelled: BTreeSet::new(),
             done,
         }
     }
@@ -85,6 +92,19 @@ impl<R: Runtime> Leases<R> {
         None
     }
 
+    /// Starts killing lease `id` because the server cancelled it, and returns at once.
+    /// Returns whether a kill began: not for a lease that is not running or is already
+    /// being cancelled. The run reports through `done` once it has stopped.
+    pub(crate) fn cancel(&mut self, id: LeaseId) -> bool {
+        if !self.running.contains_key(&id) || !self.cancelled.insert(id) {
+            return false;
+        }
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move { runtime.kill(id).await });
+        tracing::warn!(lease = %id, "lease cancelled: the server no longer holds it here");
+        true
+    }
+
     /// Turns a finished run into its Result. `None` if the lease was already reported
     /// (it was fenced).
     pub(crate) fn finished(
@@ -93,6 +113,9 @@ impl<R: Runtime> Leases<R> {
         outcome: Result<ActionResult, RuntimeError>,
     ) -> Option<worker::Result> {
         self.running.remove(&id)?;
+        // A cancelled run ends ABORTED (killed), or as it ended if it beat the kill;
+        // the server refuses either.
+        self.cancelled.remove(&id);
         tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
         Some(result_of(id, outcome))
     }
@@ -102,6 +125,7 @@ impl<R: Runtime> Leases<R> {
     /// kill, not the sum. Returns once every lease's work has stopped.
     pub(crate) async fn fence(&mut self) -> Vec<worker::Result> {
         let fenced = std::mem::take(&mut self.running);
+        self.cancelled.clear();
         let runtime = &*self.runtime;
         let kills = fenced.into_iter().map(|(id, task)| async move {
             runtime.kill(id).await;
@@ -230,6 +254,7 @@ mod tests {
             }),
             millicpus: 1500,
             memory_bytes: 1 << 30,
+            ..Start::default()
         };
         let work = work(id(), start).expect("work");
         assert_eq!(work.resources, Resources::new(1500, 1 << 30));
@@ -347,6 +372,38 @@ mod tests {
             .expect("the fence waited for a second run of one lease");
         assert_eq!(fenced.len(), 1);
         assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Catches a `Cancel` that kills a lease twice (a second kill of a run already
+    /// stopping), or one that does not kill: the run must end and be reported once,
+    /// after which the lease is neither running nor being cancelled, and a later
+    /// `Cancel` of it, or of a lease never started, begins nothing.
+    #[tokio::test]
+    async fn a_cancel_kills_a_running_lease_once() {
+        let runtime = Arc::new(crate::FakeRuntime::new(std::time::Duration::from_secs(60)));
+        let (done, mut done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(Arc::clone(&runtime), done);
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..Start::default()
+        };
+        assert_eq!(leases.start(start), None);
+        assert!(!leases.cancel(LeaseId::new(3, 9)), "a lease never started");
+        assert!(leases.cancel(id()));
+        assert!(!leases.cancel(id()), "a lease already being cancelled");
+        let (ended, outcome) = done_rx.recv().await.expect("the run ends");
+        assert_eq!(ended, id());
+        let result = leases.finished(ended, outcome).expect("reported");
+        assert_eq!(code(&result), Code::Aborted as i32);
+        assert_eq!(runtime.killed(), [id()]);
+        assert!(leases.running().is_empty());
+        assert!(
+            leases.cancelled.is_empty(),
+            "a finished lease is still cancelled"
+        );
+        assert!(!leases.cancel(id()), "a finished lease");
     }
 
     /// Catches a Start without an action being run anyway.
