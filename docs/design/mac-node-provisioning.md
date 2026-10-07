@@ -11,9 +11,9 @@ The rules this design keeps:
 
 - **One profile, applied by a script, checked by the same script.** A node is a
   pinned macOS build, plus a profile applied to a freshly erased Mac, plus the
-  `kbf-daemon` artifact the profile names. Nothing else is on it.
+  `kbf-daemon` artifact the deployment installs. Nothing else is on it.
 - **No toolchains on a node unless actions need them.** `kbf-daemon` arrives as a
-  built, signed and attested `darwin-arm64` artifact from kbf's CI. It is never
+  built, signed and attested `darwin-arm64` artifact from kbf's CI on `main`. It is never
   compiled on the node. The toolchains actions use (Xcode or the Command Line Tools,
   at pinned versions) belong to the node's *worker profile*, and nothing on the host
   side may depend on them.
@@ -29,13 +29,13 @@ The rules this design keeps:
 |---|---|
 | Baseline | A pinned macOS version and build. A fresh state comes from *Erase All Content and Settings*, or from an Apple Configurator restore when the version must change or the Mac is new. There is no disk image. |
 | Provisioning layer | A plain, idempotent shell script with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
-| `kbf-daemon` | Built by a release job on a hosted macOS arm64 runner, signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with SHA-256 sums, an SBOM and build provenance. A node pins the version and SHA-256 in its profile. |
+| `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
 | Toolchains | One pinned Xcode (or one CLT version) per pool, in the worker profile. The node reports its host identity, and a changed identity takes the node out until it re-qualifies. |
-| Power | `sleep 0` (also needed for correctness: the daemon's fence clock stops while a Mac sleeps), `autorestart 1`, `womp 1`. |
+| Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is optional ([section 6](#6-updates-pinned-and-rolled-out)). |
 | FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Auto-login stays off until GUI leases need it ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
-| Join and leave | The node's certificate names its node id. Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
+| Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
 ## What kbf has today
 
@@ -61,7 +61,9 @@ This design builds on the code on `main`, read at the time of writing.
   `isa_level`, `drivers`, and the driver's `network_isolation`. It reports nothing about
   the macOS build or Xcode yet. ([capabilities.md](capabilities.md) still says a
   non-Linux daemon refuses to start and that macOS detection is planned; the code on
-  `main` detects macOS. That document should be brought up to date.)
+  `main` detects macOS. This design does not edit that file, because the
+  platform-routing change under review rewrites it; it should be brought up to date
+  there or right after.)
 - **Platform routing,** under review at the time of writing, matches an action's
   `OSFamily`/`ISA`/`Arch` and kbf keys against node reports. Until it lands, any
   action can go to any registered worker.
@@ -71,13 +73,16 @@ This design builds on the code on `main`, read at the time of writing.
 - **The worker protocol** has no drain message (listed as planned in
   [worker-protocol.md](worker-protocol.md#planned)). The server registers a node by the
   `node_id` its `Hello` carries and **does not check it against the client
-  certificate**. Any certificate the cell CA signed can claim any node id, and because
-  only the newest stream of a worker counts, it can take over that node's session.
-  There is no certificate revocation.
-- **Fencing.** The daemon fences on `tokio::time::Instant`. On macOS, Rust's `Instant` is
-  `clock_gettime(CLOCK_UPTIME_RAW)`
-  ([std::time::Instant](https://doc.rust-lang.org/std/time/struct.Instant.html)), and
-  per macOS's `clock_gettime(3)` that clock does not advance while the system sleeps.
+  certificate** (`kbf-server`, `worker.rs`, `session`). Any certificate the cell CA
+  signed can claim any node id, and because only the newest stream of a worker counts,
+  it can take over that node's session. There is no certificate revocation. Tracked in
+  [#79](https://github.com/komira-ai/komira-build-farm/issues/79).
+- **Fencing.** The daemon fences on `tokio::time::Instant`. Rust's `Instant` is
+  `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS
+  ([std::time::Instant](https://doc.rust-lang.org/std/time/struct.Instant.html)).
+  Neither advances while the machine is suspended, so on any OS a node that sleeps
+  past T wakes up with its leases still running. Tracked in
+  [#78](https://github.com/komira-ai/komira-build-farm/issues/78); see section 5.1.
 
 ## 1. The baseline
 
@@ -93,8 +98,10 @@ supported way:
 - There is no network boot. The supported ways to put a Mac in a known state are:
   - **Erase All Content and Settings** erases data, settings and apps and keeps the
     installed macOS version. It takes minutes. It needs an administrator's credentials
-    at the Mac
-    ([Apple](https://support.apple.com/en-us/102664)).
+    at the Mac and, if an Apple Account is signed in, that account's password, because
+    erasing turns off Activation Lock
+    ([Apple](https://support.apple.com/en-us/102664)). So the operator must know whose
+    Apple Account, if any, is on each Mac before it can be erased.
   - **An Apple Configurator restore** over a USB-C cable in DFU mode. It replaces the
     firmware and recoveryOS, erases the internal storage, and installs macOS from an
     IPSW file. It needs a second Mac running Apple Configurator
@@ -117,8 +124,8 @@ A node's baseline is three things, all of them named in the profile:
    version. Use an Apple Configurator restore for a new Mac, a Mac at another version,
    or a Mac that will not boot. A Mac that was a workstation is always erased: a node
    is clean only if nothing was ever installed on it that the profile does not name.
-3. **The profile applied.** That includes the worker profile (section 3) and the
-   `kbf-daemon` artifact (section 4).
+3. **The profile applied.** That includes the worker profile (section 3). Then the
+   deployment installs the `kbf-daemon` artifact (section 4).
 
 There is no image file to build, store or patch. Rebuilding a node means erase, then
 apply. The only manual steps are Setup Assistant, which creates the admin account, and
@@ -138,7 +145,7 @@ The profile is applied by something. The three candidates:
 | **Rollback** | generations: switch to the previous one | re-run with the previous playbook. No built-in undo | re-run `apply` with the previous profile version. Every setting is absolute, never a delta |
 | **Fit with "no toolchains on nodes"** | poor: a package manager and a store on every node, and actions can find `/nix/store` | poor: the provisioner's runtime is the action toolchain's Python, so updating Xcode changes the provisioner, and provisioning cannot run before Xcode exists | good: the provisioner needs nothing the worker profile installs, and is the same before and after an Xcode change |
 | **Fit with "CI deploys; no new deployment tool"** | a new tool | a new tool | a script a CI job runs, like the rest of a deployment |
-| **Testable in kbf's CI** | needs Nix on the hosted runner | needs Ansible on the runner and Python on the target | runs as is on a hosted macOS runner, which has passwordless sudo |
+| **Testable in kbf's CI** | needs Nix on the hosted runner | needs Ansible on the runner and Python on the target | runs as is on a hosted macOS runner (a VM with passwordless sudo). Some keys can only be proven on a real Mac ([section 10](#10-how-each-part-is-tested)) |
 | **Familiarity** | Nix is a language of its own | widely known | shell, like kbf's existing CI scripts |
 
 **Recommendation: the plain idempotent script.** nix-darwin is the most reproducible
@@ -152,7 +159,7 @@ are how that cost is paid.
 
 ### 2.1 Shape of the script (planned)
 
-`kbf-mac-provision` is one POSIX `sh` script, shipped in the same release as
+`kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):
 
 ```text
@@ -171,6 +178,10 @@ kbf-mac-provision print   --profile FILE   # the profile as resolved, and its SH
 - The node reports `label.profile=<name>@<first 12 hex digits of the profile's
   SHA-256>` (a `--label`), so the server and the farm's UI see which profile each node
   runs.
+- **The profile holds host settings only.** The `kbf-daemon` commit and its SHA-256
+  are not in it: they are the deployment job's input for each commit it rolls out
+  (section 4.3). A daemon upgrade is then not a profile change, and every green
+  commit on `main` can deploy without a reviewed edit to each node's profile.
 
 An example profile, with values that are illustrative only:
 
@@ -202,8 +213,6 @@ xcode_build=17A000
 xcode_xip_sha256=<sha256 of the .xip>
 developer_dir=/Applications/Xcode-26.5.app/Contents/Developer
 host_identity=26.5-0123456789abcdef
-kbf_daemon_version=0.4.0
-kbf_daemon_sha256=<sha256 of the release asset>
 kbf_server=https://farm.example.net:8981
 kbf_cas=https://farm.example.net:8980
 kbf_labels=pool=mac rack=r2
@@ -215,7 +224,8 @@ The profile has two halves with different owners and different rates of change.
 
 **The host profile** holds what every Mac node has, whatever its actions need: power,
 updates, admin access, accounts, time, logs, the hostname, the scratch volume and the
-`kbf-daemon` artifact. It holds **no toolchain**: no Homebrew, no Rust, no Python, no
+launchd job that runs `kbf-daemon` (the binary itself is the deployment's, section 4).
+It holds **no toolchain**: no Homebrew, no Rust, no Python, no
 package manager. `kbf-daemon` links only system libraries, and the provisioning script
 needs only what macOS ships.
 
@@ -259,11 +269,25 @@ compilers changed must not keep serving cache keys computed for the old ones.
 
 **Planned, in kbf:**
 
-- The daemon reports `os_build`, `xcode` (the Xcode build, or the CLT version) and
-  `host_identity` (the digest above) in its node report. They are detected, never
-  typed in, as [capabilities.md](capabilities.md) requires. A client that wants an
-  exact match sends `host_identity` as a platform property. Then the identity is part
-  of the action digest, which is correct: the output depends on it.
+- The daemon reports, on macOS, `os_build`, `xcode` (the Xcode build, or the CLT
+  version) and `host_identity` (the digest above). They are detected, never typed in,
+  as [capabilities.md](capabilities.md) requires.
+- **One key set.** capabilities.md plans `os_image` and `xcode`. A Mac has no image,
+  and `os_build` is what `os_image` would carry, so a Mac reports `os_build` and not
+  `os_image`. `xcode` keeps its planned meaning, and `host_identity` is new.
+  capabilities.md should list these three when it is next updated.
+- **Which key a client matches decides how often its cache goes cold,** because every
+  platform property is part of the action digest:
+  - A client matching only `xcode` keeps its Mac cache across macOS patches and loses
+    it once per Xcode upgrade.
+  - A client matching `host_identity` or `os_build` gets a cold Mac cache on **every
+    macOS patch, security responses included**, because `os_build` changes each time.
+    That is correct only when outputs depend on the OS build. A test that loads the OS's
+    libraries does; most compiles do not.
+  - A client that lists identities inside its action inputs pays the same, and more.
+    komira's build writes the whole sorted list into every darwin compile, so adding or
+    removing *any* identity cold-misses its entire darwin cache. Such a client should
+    batch identity changes into one change per rollout (section 8).
 - `kbf-daemon --expect-host-identity VALUE` (the profile's `host_identity`). At start,
   and before each lease, the daemon compares the detected identity with the expected
   one. On a mismatch it refuses new leases and reports why. A Mac that changed behind
@@ -278,7 +302,8 @@ compilers changed must not keep serving cache keys computed for the old ones.
    link and run a small C program; the client's canary targets; the native driver's
    freshness test (a marker left by one lease is never seen by the next).
 4. Record the identity the node now prints in the profile, and in each client's list
-   of allowed identities, in the same reviewed change.
+   of allowed identities, in the same reviewed change. An identity is listed before its
+   host serves, and removed only after the host has stopped serving.
 5. Put the node back in its pool label.
 
 The second and later nodes with the same new identity skip step 4: their identity is
@@ -286,36 +311,46 @@ already listed, and step 3 checks that they print it.
 
 ## 4. Shipping `kbf-daemon`
 
-### 4.1 The release job (planned)
+### 4.1 Build and attest on `main` (planned)
 
-No workflow publishes a binary today. The release job:
+No workflow publishes a binary today. The model:
+
+- **Every green commit on `main` is built and attested** by CI, and is a candidate for
+  deployment. The operator's farm runs these per-commit artifacts.
+- **A release only tags.** After a commit's artifacts have run in a production
+  deployment for the project's soak period, the release workflow tags them. It checks
+  their digests against the attested `main` build and never rebuilds: a rebuild would
+  ship bytes that never ran anywhere.
+
+The `main` build job:
 
 - **Runs on a hosted macOS arm64 runner** named by a literal label (the workflow lint
-  requires one). It runs with `contents: write` for the release, and `id-token: write`
-  and `attestations: write` for the provenance, and nothing else.
+  requires one). It gets `id-token: write` and `attestations: write` for the provenance
+  and `contents: read`, and nothing else.
 - **Builds** `cargo build --locked --release -p kbf-node --target aarch64-apple-darwin`
   with `MACOSX_DEPLOYMENT_TARGET` set to the oldest macOS kbf supports. That is a
-  property of the release, not of the runner's OS.
+  property of the build, not of the runner's OS.
 - **Signs** (section 4.2).
-- **Packages** two assets: `kbf-daemon-<version>-darwin-arm64.tar.gz` (the binary and
-  `kbf-mac-provision`), and `kbf-daemon-<version>-darwin-arm64.pkg`, built with
-  `pkgbuild` with a fixed identifier. The `.pkg` installs to a versioned path, and its
-  receipt (`pkgutil --pkg-info`) gives `check` the installed version. Neither asset
-  holds configuration.
-- **Sums:** one `SHA256SUMS` over every asset of the release, every platform.
+- **Packages** one asset for nodes: `kbf-daemon-<commit>-darwin-arm64.tar.gz`, with the
+  binary and `kbf-mac-provision` and no configuration.
+  - A `.pkg` is built only if the project takes Developer ID: a signed installer
+    package is what an MDM delivers.
+  - It is not the node install path, because a pkg receipt keeps naming the installed
+    version after a symlink rollback (section 4.3).
+- **Sums:** the asset's SHA-256, and one `SHA256SUMS` per commit over every platform's
+  asset.
 - **SBOM:** a CycloneDX document from `Cargo.lock`, made by a tool pinned by version
   and SHA-256 (as CI pins `cargo-deny`).
 - **Provenance:** `actions/attest-build-provenance` for each asset and
-  `actions/attest-sbom` for the SBOM. Both are in the allowed `actions/*` set, and
-  `gh attestation verify` checks the result
-  ([gh attestation verify](https://cli.github.com/manual/gh_attestation_verify)).
-- **Checks itself:** a last step downloads the release's own assets and checks the
-  sums and the attestations. A wrong sum fails the release.
+  `actions/attest-sbom` for the SBOM. Both are in the allowed `actions/*` set.
+- **Keeps** the assets as workflow artifacts, for as long as the deployment needs them.
+- **Checks itself:** a last step downloads its own assets and verifies the sums and the
+  attestations. A wrong sum fails the job.
 
-The same job builds the Linux binaries. Only binaries built by this job are released.
-A build on a developer's machine is never shipped.
+The same job builds the Linux binaries. Only binaries this job built are deployed or
+released. A build on a developer's machine never ships.
 
-### 4.2 Signing
+### 4.2 Signing and verification
 
 On Apple silicon every executable must carry a code signature. The linker adds an
 *ad-hoc* signature to anything it links for arm64, which is why a `cargo build` on a Mac
@@ -325,41 +360,62 @@ runs at all (Apple:
 
 | | Ad-hoc (`codesign -s -`) | Developer ID, hardened runtime, notarized |
 |---|---|---|
-| Needs | nothing | membership in the Apple Developer Program for an organization, a Developer ID Application certificate (Developer ID Installer for the `.pkg`), and a notary credential, all as secrets of a protected CI environment |
+| Needs | nothing | membership in the Apple Developer Program for an organization, a Developer ID Application certificate (Developer ID Installer for a `.pkg`), and a notary credential, all as secrets of a protected CI environment |
 | The kernel checks page hashes against the signature | yes | yes |
 | Says *who* built it | no: anyone can ad-hoc sign anything | yes: a Team ID a node can require with `codesign --verify -R '<requirement>'` |
 | Gatekeeper, for a file a browser downloaded (quarantined) | refused | allowed |
 | Apple's malware scan | no | yes ([notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)) |
-| Ticket stapled to the asset | n/a | the `.pkg` only; a bare Mach-O cannot carry a stapled ticket |
+| Ticket stapled to the asset | n/a | a `.pkg` only; a bare Mach-O cannot carry a stapled ticket |
 
 A node never gets a quarantined file. The deployment job fetches the asset with a
 command-line tool, and **assumed, to verify on the pinned macOS:** command-line
 downloads are not quarantined, so Gatekeeper is not consulted. For kbf's own nodes,
-Developer ID therefore adds an identity check and a scan, and authenticity comes from
+Developer ID therefore adds an identity check and a scan. Authenticity comes from
 elsewhere in either case:
 
-1. The operator's deployment pins `kbf_daemon_sha256` in the profile, in a reviewed
-   change, after `gh attestation verify` passed for that asset. The check runs in CI
-   or on an admin machine, never on the node, which has no `gh`.
-2. On the node, `apply` downloads the asset, compares its SHA-256 with the pin, and
-   refuses on a mismatch before anything is installed. With Developer ID, it also runs
-   `codesign --verify --strict` against the Team ID requirement.
+1. **The deployment job verifies the attestation** before it touches any node. It does
+   this in CI, never on the node, which has no `gh`. It pins the signer, the branch and
+   the runner type, not just the repository:
 
-**Recommendation:** release ad-hoc signed assets with attestations now. Developer ID is
-a decision for the project, since it is a paid account and a signing key to guard. It
-mainly helps people who download kbf by hand, and kbf's own nodes do not need it. The
-release job is written so that adding it is a step behind a secret's presence.
+   ```text
+   gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
+     --repo <owner>/<repo> \
+     --signer-workflow <owner>/<repo>/.github/workflows/<build workflow file> \
+     --source-ref refs/heads/main \
+     --deny-self-hosted-runners
+   ```
+
+   ([gh attestation verify](https://cli.github.com/manual/gh_attestation_verify)).
+   Without `--signer-workflow` and `--source-ref`, any workflow of the repository,
+   including one on a pull request branch, could produce an asset that verifies.
+2. **On the node,** the job hands `apply` the asset and its SHA-256. `apply` compares
+   them and refuses on a mismatch before anything is installed. With Developer ID it
+   also runs `codesign --verify --strict` against the Team ID requirement.
+
+**Recommendation:** ship ad-hoc signed assets with attestations now. Developer ID is a
+decision for the project, since it is a paid account and a signing key to guard. It
+mainly helps people who download kbf by hand; kbf's own nodes do not need it. The build
+job is written so that adding it is one step, which runs when the signing secret exists.
 
 ### 4.3 Install, upgrade and rollback on the node
 
-- Installed at `/usr/local/kbf/<version>/kbf-daemon`. `/usr/local/kbf/current` is a
-  symlink to the version in use, and the launchd job runs `current/kbf-daemon`.
-- An upgrade stages the new version beside the old, drains the node, switches the
-  symlink, restarts the job (`launchctl kickstart -k system/<label>`), and waits for
-  the daemon's `welcomed` log line. If it never comes, it switches back. The previous
-  version stays on disk until the next upgrade.
-- `check` compares the `current` target with `kbf_daemon_version` and the file's
-  SHA-256 with `kbf_daemon_sha256`.
+- The deployment job's input names a commit. The job verifies that commit's asset
+  (4.2), then runs on each node, one at a time.
+- The binary is installed at `/usr/local/kbf/<commit>/kbf-daemon`.
+  `/usr/local/kbf/current` is a symlink to the one in use, and the launchd job runs
+  `current/kbf-daemon`. A small file, `/usr/local/kbf/deployed`, records the commit and
+  SHA-256 the job installed.
+- An upgrade:
+  1. stages the new binary beside the old;
+  2. drains the node;
+  3. switches the symlink;
+  4. restarts the job (`launchctl kickstart -k system/<label>`);
+  5. waits for the daemon's `welcomed` log line, and switches back if it never comes.
+
+  The previous binary stays on disk until the next upgrade.
+- Rollback is the same job with an older commit as its input.
+- `check` compares the `current` target's SHA-256 with `/usr/local/kbf/deployed`, so a
+  binary changed by hand shows as drift.
 
 ## 5. Headless and rack settings
 
@@ -367,13 +423,12 @@ Every row is a profile key. `apply` sets it, and `check` reads it back.
 
 | Setting | Value | Applied with | Why |
 |---|---|---|---|
-| System sleep | never | `pmset -a sleep 0 standby 0 powernap 0` | capacity, and **correctness** (5.1) |
-| Disk sleep | never | `pmset -a disksleep 0` | lease I/O never waits for a spin-up |
+| System sleep | never | `pmset -a sleep 0 standby 0 powernap 0` | capacity: a node that sleeps serves nothing (5.1) |
 | Restart after power loss | on | `pmset -a autorestart 1` | a rack power cut must not need a person at each Mac |
-| Wake for network access | on | `pmset -a womp 1` | lets an operator wake a node that slept anyway |
-| Automatic update download and install | off | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall` = 0 | section 6 |
-| Security data files (XProtect and similar) | on | `ConfigDataInstall` = 1 | malware definitions. **Assumed:** they do not change the OS build |
-| App Store auto-update | off | `com.apple.commerce AutoUpdate` = 0 | Xcode never comes from the App Store |
+| Wake for network access | on | `pmset -a womp 1` | wakes a node that slept anyway. A magic packet reaches only the same L2 segment, not across an overlay network or a router |
+| Automatic update download and install | off | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall` = 0 | section 6. **Verify on the pinned version:** Apple's device-management reference marks the SoftwareUpdate payload keys deprecated from macOS 26 (5.2) |
+| Security data files (XProtect and similar) | on | `ConfigDataInstall` = 1 | malware definitions. **Assumed:** they do not change the OS build, and this key still applies separately from `CriticalUpdateInstall` (5.2) |
+| App Store auto-update | off | `AutomaticallyInstallAppUpdates` = 0 (the older `com.apple.commerce AutoUpdate` is legacy) | Xcode never comes from the App Store |
 | Remote Login | on, key only | `systemsetup -setremotelogin on`, and `/etc/ssh/sshd_config.d/` with `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no` | the only admin path |
 | Screen Sharing, other remote-desktop servers | off, not installed | | SSH is the only way in |
 | Firewall | on | `socketfilterfw --setglobalstate on` | `kbf-daemon` never listens. The farm network is the real boundary |
@@ -382,30 +437,66 @@ Every row is a profile key. `apply` sets it, and `check` reads it back.
 | Scratch volume | its own APFS volume, with a quota and indexing off | `diskutil apfs addVolume … -quota`, `mdutil -i off` | a lease cannot fill the system's data volume, and Spotlight does not index lease directories |
 | Time Machine, Spotlight on scratch, login items, third-party updaters | off, none | | nothing runs that the profile does not name |
 
-`pmset` keys are as documented in `man pmset` on the pinned macOS
-([archived man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man1/pmset.1.html)).
-The node's own man page is the authority for its version.
+`pmset` keys are as documented in `man pmset` on the pinned macOS; the node's own man
+page is the authority for its version. Disk sleep is not set: a Mac's internal SSD has
+nothing to spin up.
 
-### 5.1 Why sleep must be off
+### 5.1 Sleep
 
-A daemon that loses contact with the server kills its leases once 40 s (T) have
-passed, and the scheduler gives those leases to another worker after 60 s (G)
-([worker-protocol.md](worker-protocol.md)). Both sides measure elapsed time, and the
-protocol holds because the daemon's T expires before the server's G. On macOS, the
-daemon's clock is `CLOCK_UPTIME_RAW`, which stops during sleep. A Mac that sleeps for
-ten minutes wakes up believing almost no time has passed. Meanwhile the server has
-already re-run its leases elsewhere. So `sleep 0` is a precondition of the fencing
-argument on macOS, not just a capacity setting. **Planned:** the daemon reads the
-`pmset` sleep setting at start and refuses `--driver native` on a Mac whose system sleep
-is not 0. Separately, the daemon's fence could move to a clock that counts sleep
-(`CLOCK_MONOTONIC`, which macOS documents as counting it). That change is worth making
-whatever the setting; it is a code change tracked apart from this design.
+A sleeping node serves nothing, and it drifts from what the scheduler believes about
+it. So `sleep 0` is in the profile as a capacity setting.
+
+It is not what keeps fencing correct. A daemon that loses contact with the server
+kills its leases once T = 40 s have passed, and the scheduler gives those leases to
+another worker after G = 60 s ([worker-protocol.md](worker-protocol.md)). That
+argument needs the daemon's clock to count all elapsed time. Rust's `Instant` reads
+`CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS, and neither advances while
+the machine is suspended. A node of either OS that sleeps or suspends past T wakes up
+believing almost no time has passed, with its leases still running, while the
+scheduler may already have placed them elsewhere.
+
+What bounds the harm today:
+
+- The server accepts a result only from the holder of the operation's current lease
+  (`kbf-server`, `farm.rs`, `report`), so a stale lease's result is refused and never
+  reaches the action cache.
+- A heartbeat that lists a lease the scheduler no longer holds gets a `Cancel`.
+
+The harm is duplicate execution. It lasts until the woken node's next heartbeat is
+answered or, if the server is unreachable, until its own fence fires T = 40 s later on
+a clock that is running again.
+
+**The fix is in code, on every OS**
+([#78](https://github.com/komira-ai/komira-build-farm/issues/78)):
+
+- fence against a clock that counts suspend (`CLOCK_BOOTTIME` on Linux;
+  `CLOCK_MONOTONIC_RAW` or `mach_continuous_time` on macOS);
+- re-check the fence on a short tick;
+- check it before sending any `Result`.
+
+A daemon-side "refuse to start unless sleep is off" check would not fix it, and is not
+proposed.
 
 ### 5.2 Updates are off: what the settings do and do not do
 
-Without MDM these are preferences. An administrator can change them, and macOS can
-still show upgrade notices. They stop the automatic download and install, and `check`
-reports any change to them as drift. With MDM they can be enforced (section 6.3).
+- **They are preferences.** Without MDM, an administrator can change them, and macOS
+  can still show upgrade notices. They stop the automatic download and install, and
+  `check` reports any change to them as drift. With MDM they can be enforced
+  (section 6.3).
+- **Verify the keys on the pinned version (27.x).** Apple's device-management
+  reference marks every `com.apple.SoftwareUpdate` payload key deprecated from macOS 26
+  ([SoftwareUpdate](https://developer.apple.com/documentation/devicemanagement/softwareupdate)),
+  in favour of declarative device management. Whether the matching local preferences
+  are still honoured must be tested on a node of the pinned version, not assumed.
+- **The security split may not hold.** Rapid Security Responses became *Background
+  Security Improvements* in macOS 26. **Assumed, to verify:** `CriticalUpdateInstall` =
+  0 still stops them, while `ConfigDataInstall` = 1 still allows malware definitions.
+  The two may now move together.
+- **A security response changes the build.** A Rapid Security Response changed
+  `sw_vers -buildVersion` (it appended a letter), and with it any host identity
+  (section 3.1). **Assumed, to verify:** a Background Security Improvement does the
+  same. If it does, each one is a re-qualification and, for a client that matches
+  `os_build`, a cold Mac cache.
 
 ### 5.3 The launchd job
 
@@ -423,18 +514,27 @@ daemon starts at boot with nobody logged in
 <key>KeepAlive</key>         <true/>
 <key>ThrottleInterval</key>  <integer>10</integer>
 <key>ExitTimeOut</key>       <integer>30</integer>
-<key>ProcessType</key>       <string>Standard</string>
+<key>ProcessType</key>       <string>Interactive</string>
 <key>StandardErrorPath</key> <string>/Library/Logs/kbf/kbf-daemon.err.log</string>
 <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
 <key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
 ```
 
 - `UserName` is a hidden role account (uid below 500, no login shell, no password),
-  never a person's account. Today that account also runs the actions. A per-lease user
-  will change that (**planned**, see "What kbf has today").
-- `ProcessType` must not be `Background`. **Assumed:** a background job's processes,
-  and the actions they start, get a lower scheduling class and are kept on the
-  efficiency cores.
+  never a person's account. Today that account also runs the actions.
+- **Per-lease users change this.** Creating and removing a user per lease
+  (`sysadminctl`, `dscl`), and starting its processes, needs root, which the role
+  account does not have. When per-lease users land, there are two shapes:
+  - the daemon runs as root;
+  - the daemon keeps the role account and talks to a small root helper, its own
+    LaunchDaemon, that does only user creation, removal and spawn.
+
+  The lean is the helper, because it keeps root's surface small.
+- **`ProcessType` is `Interactive`.** `launchd.plist(5)` says "Standard jobs are
+  equivalent to no ProcessType being set". A job without one gets "light resource
+  limitations ... throttling its CPU usage and I/O bandwidth". `Interactive` jobs "run
+  with the same resource limitations as apps, that is to say, none". A build node's
+  daemon and the actions it starts must not be throttled.
 - `ExitTimeOut` gives the daemon time to kill its leases on SIGTERM before launchd
   sends SIGKILL.
 - The server's address, the node id, the labels and the certificate paths are flags in
@@ -470,10 +570,9 @@ account.
 
 One more consequence of running with nobody logged in: **anything the node needs at
 boot must be a system daemon.** In particular, an overlay-network client whose app
-variant runs only after a user logs in (for example, the app variants of Tailscale; the
-command-line `tailscaled` runs before login,
-[Tailscale](https://tailscale.com/docs/concepts/macos-variants)) leaves a rebooted node
-unreachable until someone logs in.
+variant runs only after a user logs in leaves a rebooted node unreachable until someone
+logs in. Some vendors ship both a GUI app and a command-line system daemon; a node uses
+the daemon.
 
 ### 5.5 Time
 
@@ -501,10 +600,12 @@ Today `kbf-daemon` writes human-readable `tracing` lines to stderr, and launchd 
 stderr to the file `StandardErrorPath` names.
 
 - **Planned:** `--log-format json` and `--log-dir DIR` (daily files, a kept count). The
-  daemon then owns its own rotation. **Assumed:** launchd opens `StandardErrorPath`
-  once, so a file rotated underneath it keeps receiving writes under its old name.
-  launchd's file then only catches what is printed before logging starts (bad flags, a
-  panic) and stays small. `newsyslog` (`/etc/newsyslog.d/kbf.conf`) bounds it.
+  daemon then owns its own rotation.
+- launchd's `StandardErrorPath` file then only catches what is printed before logging
+  starts (bad flags, a panic), and stays small. **It is not rotated.** launchd opens it
+  once and keeps the descriptor, so a renamed file keeps receiving writes, and
+  `newsyslog` has no copy-and-truncate mode. Instead, the deployment job truncates it
+  while the job is stopped, at each restart and upgrade.
 - **Shipping:** one log shipper, chosen by the operator, tails `--log-dir` and forwards
   to the farm's log store. It is infrastructure, not a toolchain, and arrives the way
   `kbf-daemon` does: a pinned artifact checked by SHA-256, as a LaunchDaemon under its
@@ -547,7 +648,8 @@ Apple Business Manager plus an MDM service adds:
 - **Software update control through declarative device management:** `AutomaticActions`
   (`Download`, `InstallOSUpdates`, `InstallSecurityUpdates`) can be set `AlwaysOff`;
   deferrals of 1 to 90 days (`MajorPeriodInDays`, `MinorPeriodInDays`,
-  `SystemPeriodInDays`); `RapidSecurityResponse` `Enable`; and enforcement of a
+  `SystemPeriodInDays`); turning off automatic Background Security Improvements
+  (formerly Rapid Security Responses); and enforcement of a
   specific version at a set time
   ([settings](https://support.apple.com/guide/deployment/software-update-settings-declarative-dep0578d8b8a/web),
   [enforcement](https://support.apple.com/guide/deployment/install-and-enforce-software-updates-depd30715cbb/web)).
@@ -642,6 +744,9 @@ farms' lists and the client's are updated in the same reviewed change.
 
 ### 9.2 Join (planned)
 
+The binding and the deny list below are tracked in
+[#79](https://github.com/komira-ai/komira-build-farm/issues/79).
+
 1. `check` passes on the node: the profile is applied, and the identity is the
    expected one.
 2. The node makes its key pair itself; the private key never leaves the node. Its CSR
@@ -668,7 +773,8 @@ farms' lists and the client's are updated in the same reviewed change.
   lost and re-run after G.
 - **Fencing during a leave:** a node that disappears keeps running its leases until its
   own fence fires at T = 40 s; the scheduler gives them away at G = 60 s; an action
-  never runs on two nodes at once. On a Mac this holds only with sleep off (section
+  never runs on two nodes at once. A node that suspended is the exception until
+  [#78](https://github.com/komira-ai/komira-build-farm/issues/78) is fixed (section
   5.1).
 - **Deregistration:** remove the node from the cell configuration, delete its key on the
   node, and add its certificate serial to the server's **deny list** (planned; checked at
@@ -699,15 +805,37 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 
 | Part | Test | Mutant it must catch |
 |---|---|---|
-| `kbf-mac-provision` | on a hosted macOS runner (passwordless sudo): `apply` with a test profile, `apply` again prints no change, `check` passes. Then change one setting by hand (`pmset -a sleep 10`, `AutomaticDownload` = 1) and `check` must fail naming it | a `check` that skips a key; an `apply` that is not idempotent (writes on every run) |
+| `kbf-mac-provision` | on a hosted macOS runner: `apply` with a test profile, `apply` again prints no change, `check` passes. Then change one setting by hand (`AutomaticDownload` = 1, a name) and `check` must fail naming it | a `check` that skips a key; an `apply` that is not idempotent (writes on every run) |
 | Profile parsing | unknown key, duplicate key, a value with `$(...)` | a profile that is sourced; an unknown key ignored |
-| Release job | its last step re-downloads its own assets and verifies sums and attestations | one flipped byte in the asset before the check |
-| Node install | `apply` with a wrong `kbf_daemon_sha256` refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
+| Build job | its last step re-downloads its own assets and verifies sums and attestations with the flags of 4.2 | one flipped byte in the asset before the check; an attestation from another workflow file accepted |
+| Node install | `apply` with a wrong SHA-256 refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
 | `--expect-host-identity` | fixture fields, a changed `os_build` | comparing only the SDK version prefix |
-| Sleep refusal | fixture `pmset -g` output with `sleep 10` | the check reading `displaysleep` |
-| Node-id binding | a server test: a certificate for node A sending `Hello` as node B is refused | the binding not checked on a resent `Hello` |
+| Fence clock ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
+| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | a server test: a certificate for node A sending `Hello` as node B is refused | the binding not checked on a resent `Hello` |
 | Drain | scheduler simulation: a drained node gets no new lease; running leases finish or are re-placed after the deadline | placement that ignores the drained flag |
 | Deny list | a denied serial's `Hello` is refused, also on reconnect | the list read only at server start |
+
+**What a hosted runner can and cannot prove.** Hosted macOS runners are virtual
+machines.
+
+- **Exercised there:**
+  - profile parsing;
+  - the software-update and App Store preferences;
+  - `sshd_config.d`;
+  - the three names;
+  - the firewall;
+  - the role account and the launchd job;
+  - the scratch volume and its quota;
+  - the tarball install, with its SHA-256 refusal and the `current` switch.
+- **Only on a real node of the pinned version.** The operator runs these as a canary
+  checklist on each new profile version:
+  - `pmset` sleep, `autorestart` and `womp`, which a VM may accept and ignore;
+  - FileVault state;
+  - Remote Login (`systemsetup` needs Full Disk Access, and the runner's own access
+    depends on it);
+  - the time server;
+  - whether the update preferences are honoured on that version (5.2);
+  - the Xcode install from a `.xip`.
 
 ## 11. Verified and assumed
 
@@ -716,20 +844,23 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 | The daemon's flags, LaunchDaemon fit, SIGTERM behaviour, macOS report entries, native driver gaps | read in the code on `main` |
 | No workflow publishes or signs a binary | read in `.github/workflows` |
 | The server does not tie node id to certificate; no revocation | read in `kbf-server` and `worker.proto` |
-| `Instant` on macOS is `CLOCK_UPTIME_RAW` | Rust documentation |
-| `CLOCK_UPTIME_RAW` stops during sleep | macOS `clock_gettime(3)`. Not tested on a node |
-| Erase All Content and Settings keeps the macOS version; a Configurator restore installs from an IPSW | Apple documentation |
+| A result is accepted only from the current lease holder | read in `kbf-server` (`farm.rs`, `report`) |
+| `Instant` is `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS | Rust documentation |
+| Neither clock advances during suspend | Linux `clock_gettime(2)`, macOS `clock_gettime(3)`. Not tested on a node |
+| Erase All Content and Settings keeps the macOS version and needs the signed-in Apple Account's password; a Configurator restore installs from an IPSW | Apple documentation |
 | An old macOS version that Apple no longer signs cannot be restored | **assumed** |
 | FileVault: SSH unlock on macOS 26 or later; the bootstrap token does not unlock at boot; no auto-login with FileVault | Apple documentation |
 | Storage is encrypted without FileVault, keyed to the Secure Enclave | Apple documentation |
-| `CriticalUpdateInstall` = 0 stops automatic security responses; `ConfigDataInstall` does not change the OS build | **assumed**; verify on the pinned version |
+| `ProcessType`: unset or `Standard` is throttled; `Interactive` is not | `launchd.plist(5)` |
+| SoftwareUpdate payload keys are deprecated from macOS 26 | Apple's device-management reference; the local preferences' effect on 27.x is **to verify** |
+| `CriticalUpdateInstall` = 0 stops Background Security Improvements while `ConfigDataInstall` = 1 keeps definitions | **assumed**; verify on the pinned version |
+| A Background Security Improvement changes `sw_vers -buildVersion` | **assumed** (a Rapid Security Response did); verify |
 | Command-line downloads are not quarantined, so Gatekeeper is not consulted | **assumed**; verify on the pinned version |
-| A `Background` launchd job's actions are kept on efficiency cores | **assumed**; measure |
-| launchd keeps `StandardErrorPath` open across rotation | **assumed** |
+| launchd keeps the `StandardErrorPath` descriptor; `newsyslog` cannot copy and truncate | `launchd.plist(5)`, `newsyslog.conf(5)` |
 | A macOS update on Apple silicon needs a volume owner's authorisation without MDM | **assumed**; verify |
 | Unattended Xcode downloads with an Apple Account are not reliable | **assumed** |
 | DDM software-update keys and their enrollment requirements | Apple documentation |
-| The app variants of one common overlay-network client run only after login | that vendor's documentation |
+| Some overlay-network clients' app variants run only after login | vendor documentation |
 
 ## 12. Decisions for the project
 
@@ -737,7 +868,8 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
    guard a signing key, or ship ad-hoc signed assets with attestations (the lean).
 2. **MDM:** none for now (the lean), or Apple Business Manager plus an MDM.
 3. **FileVault on rack nodes:** off (the lean), or on, with a person to unlock every
-   node after every reboot.
+   node after every reboot. On Apple silicon, turning it off only re-wraps the volume
+   key (the data stays hardware-encrypted); it is not a long decryption.
 4. **The macOS pin and how often it moves:** which version and build each pool starts
    on, and whether security updates go to the canary within a set number of days.
 5. **Where `kbf-mac-provision` lives:** in this repository, shipped with each release
