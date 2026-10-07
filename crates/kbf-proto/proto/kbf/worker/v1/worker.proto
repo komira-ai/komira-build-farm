@@ -1,0 +1,129 @@
+// kbf.worker.v1: the protocol between a kbf-daemon and kbf-server.
+//
+// Each daemon opens one outbound stream to any server front; no daemon listens on an
+// inbound port. The front relays the stream to the scheduler. Blob bytes never travel on
+// this stream: the daemon reads and writes the CAS over separate ByteStream connections.
+//
+// This is the first cut. Hello and Heartbeat carry what the scheduler needs to see a node
+// and to time its fence; Offer, Start and Result are placeholders whose fields will grow
+// with the scheduler and the daemon. A server accepts protocol versions N-1 and N.
+syntax = "proto3";
+
+package kbf.worker.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+import "google/rpc/status.proto";
+
+// The service a kbf-server front exposes to daemons.
+service Worker {
+  // The daemon's session. The daemon's first message is Hello; the server answers
+  // Welcome or ends the stream with an error status. While the stream is open the
+  // daemon sends a Heartbeat at the interval Welcome names.
+  rpc Session(stream DaemonMessage) returns (stream ServerMessage);
+}
+
+// Everything a daemon sends.
+message DaemonMessage {
+  oneof message {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    Offer offer = 3;
+    Result result = 4;
+  }
+}
+
+// Everything the server sends.
+message ServerMessage {
+  oneof message {
+    Welcome welcome = 1;
+    HeartbeatAck heartbeat_ack = 2;
+    Start start = 3;
+  }
+}
+
+// One entry of a node report, for example `arch` = `x86_64` or `drivers` = `container`.
+// A list-valued capability (`isa_level`, `cpu.features`, `drivers`) repeats its key, one
+// entry per value.
+message Capability {
+  string key = 1;
+  string value = 2;
+}
+
+// The first message of a session, and resent whenever the node report changes.
+message Hello {
+  // The protocol version the daemon speaks. This file defines version 1.
+  uint32 protocol_version = 1;
+  // A stable name for the node, unique within the cell.
+  string node_id = 2;
+  // The daemon's own version string, for logs and the UI.
+  string daemon_version = 3;
+  // The node report: what the daemon detected about this machine. Sorted by key,
+  // then value, so equal reports encode to equal bytes.
+  repeated Capability capabilities = 4;
+  // SHA-256 of the encoded `capabilities` entries, in order. Heartbeats repeat it so
+  // the server notices a changed report without receiving the report again.
+  bytes report_hash = 5;
+}
+
+// The server's answer to Hello.
+message Welcome {
+  // The protocol version the server will speak on this stream.
+  uint32 protocol_version = 1;
+  // How often the daemon sends a Heartbeat, in milliseconds.
+  uint64 heartbeat_interval_ms = 2;
+}
+
+// A lease: a numbered permission to run, ordered by (term, seq).
+message LeaseId {
+  // The scheduler term that granted the lease.
+  uint64 term = 1;
+  // The lease's sequence number within that term.
+  uint64 seq = 2;
+}
+
+// Sent by the daemon at the interval Welcome names.
+message Heartbeat {
+  // Increases by one with each heartbeat on a stream; the server echoes it in
+  // HeartbeatAck. A daemon that fences counts from its newest acknowledged heartbeat.
+  uint64 seq = 1;
+  // Equal to the report_hash of the newest Hello.
+  bytes report_hash = 2;
+  // The leases this daemon is running now.
+  repeated LeaseId running = 3;
+}
+
+// The server's acknowledgement of a Heartbeat.
+message HeartbeatAck {
+  // The seq of the acknowledged Heartbeat.
+  uint64 seq = 1;
+}
+
+// Placeholder. The capacity the daemon offers for actions now, after its protected
+// floors. Resources are not capabilities: there are no slots.
+message Offer {
+  // Free CPU, in thousandths of a CPU.
+  uint64 millicpus = 1;
+  // Free memory, in bytes.
+  uint64 memory_bytes = 2;
+}
+
+// Placeholder. The server tells the daemon to run one lease. The scheduler commits the
+// lease before it sends Start.
+message Start {
+  LeaseId lease_id = 1;
+  // The lease kind, the value of the reserved platform key `kbf-lease`: `action` or
+  // `whole_machine`. The daemon refuses a kind it has no driver for.
+  string kind = 2;
+  // The action to run. Its inputs are fetched from the CAS.
+  build.bazel.remote.execution.v2.Digest action_digest = 3;
+}
+
+// Placeholder. The outcome of one lease. The server accepts at most one Result for an
+// operation.
+message Result {
+  LeaseId lease_id = 1;
+  // OK when the action ran, whatever its exit code; otherwise why it could not run.
+  google.rpc.Status status = 2;
+  // The action's result when status is OK. Its outputs are already in the CAS.
+  build.bazel.remote.execution.v2.ActionResult action_result = 3;
+}
