@@ -19,6 +19,12 @@ Early development. The project is design-first: interfaces and tests land
 before features, and nothing here is ready for production use yet. Expect
 breaking changes.
 
+## Design
+
+[ARCHITECTURE.md](ARCHITECTURE.md) describes how kbf is put together, and links the
+design documents in [docs/design](docs/design): the scheduler, storage, the worker
+protocol, the daemon and execution, and capabilities.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a DCO sign-off, and
