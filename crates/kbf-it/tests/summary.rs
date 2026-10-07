@@ -53,6 +53,7 @@ fn bazel_lines_that_do_not_add_up_are_refused() {
         "INFO: 1 processes: one remote.",
         "INFO: 1 processes: 1.",
         "INFO: +1 processes: 1 remote.",
+        "INFO:  processes: 1 remote.",
     ] {
         assert!(
             matches!(parse(Tool::Bazel, bad), Err(SummaryError::Malformed(_))),
@@ -119,6 +120,7 @@ fn the_exit_rule_holds_only_for_all_remote_then_all_hits() {
     assert!(broken(spawns(3, 0, &[]), spawns(0, 3, &[("local", 1)]))[0].contains("second"));
     assert!(broken(spawns(3, 0, &[]), spawns(1, 2, &[]))[0].contains("2 of the first"));
     assert!(broken(spawns(3, 0, &[]), spawns(1, 3, &[]))[0].contains("ran 1 again"));
+    assert!(broken(spawns(3, 0, &[]), spawns(0, 2, &[]))[0].contains("2 of the first"));
 }
 
 /// Catches: a report that says OK when the rule failed or a log did not parse, or

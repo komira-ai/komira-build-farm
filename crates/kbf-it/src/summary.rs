@@ -34,11 +34,8 @@ pub struct Spawns {
 
 impl fmt::Display for Spawns {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "remote {}, remote cache hit {}",
-            self.remote, self.cached
-        )?;
+        let counts = format!("remote {}, remote cache hit {}", self.remote, self.cached);
+        f.write_str(&counts)?;
         for (kind, n) in &self.other {
             write!(f, ", {kind} {n}")?;
         }
