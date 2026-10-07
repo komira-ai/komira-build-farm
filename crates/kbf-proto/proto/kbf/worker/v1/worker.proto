@@ -5,8 +5,9 @@
 // this stream: the daemon reads and writes the CAS over separate ByteStream connections.
 //
 // This is the first cut. Hello and Heartbeat carry what the scheduler needs to see a node
-// and to time its fence; Offer, Start and Result are placeholders whose fields will grow
-// with the scheduler and the daemon. A server accepts protocol versions N-1 and N.
+// and to time its fence; Offer, LeaseOffer, Start and Result are placeholders whose
+// fields will grow with the scheduler and the daemon. A server accepts protocol versions
+// N-1 and N.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -38,6 +39,7 @@ message ServerMessage {
     Welcome welcome = 1;
     HeartbeatAck heartbeat_ack = 2;
     Start start = 3;
+    LeaseOffer lease_offer = 4;
   }
 }
 
@@ -105,6 +107,18 @@ message Offer {
   uint64 millicpus = 1;
   // Free memory, in bytes.
   uint64 memory_bytes = 2;
+}
+
+// Placeholder. The scheduler has placed a lease on this daemon but not yet committed
+// it. The daemon may prepare for it (fetch inputs) and must not run anything: work
+// starts only on Start, which the scheduler sends after the lease commits. An offer
+// that is never followed by a Start lapses; a Start needs no earlier offer.
+message LeaseOffer {
+  LeaseId lease_id = 1;
+  // The lease kind, as in Start.
+  string kind = 2;
+  // The action the lease would run.
+  build.bazel.remote.execution.v2.Digest action_digest = 3;
 }
 
 // Placeholder. The server tells the daemon to run one lease. The scheduler commits the
