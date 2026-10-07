@@ -95,6 +95,15 @@ impl Harness {
         );
     }
 
+    /// A heartbeat from `name` listing nothing running; returns what it proposed.
+    fn beat(&mut self, name: &str) -> Vec<Effect> {
+        let worker = w(name);
+        self.feed(Event::Heartbeat {
+            worker,
+            running: Vec::new(),
+        })
+    }
+
     /// Ticks and returns the grants proposed.
     fn tick(&mut self) -> Vec<LeaseGrant> {
         self.feed(Event::Tick)
@@ -274,12 +283,19 @@ fn late_and_duplicate_reports_are_not_proposed() {
     let [second] = h.tick().try_into().unwrap();
     assert_eq!(second.worker, w("b"));
     assert!(second.lease > first.lease);
-    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+    // `a` may still run the lost lease: its room stays booked until `a` says otherwise.
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
     h.commit_and_start(&second);
 
     assert!(h.report(&first, ok(1)).is_empty(), "late result proposed");
     assert_eq!(h.report(&second, ok(2)).len(), 1);
     assert!(h.report(&second, ok(2)).is_empty(), "duplicate proposed");
+    h.heartbeat("a");
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::default()),
+        "booking leaked"
+    );
 }
 
 /// Catches: a committed result accepted from a lease the log had already superseded
@@ -557,4 +573,233 @@ fn a_heartbeat_after_registering_again_requeues_at_once_only_what_the_worker_los
     assert_eq!(again.operation, lost.operation);
     h.commit_and_start(&again);
     assert!(h.report(&lost, ok(2)).is_empty(), "late result proposed");
+}
+
+/// The record failing `grant`'s operation once its lost leases spent the infra budget.
+fn infra_failure(grant: &LeaseGrant) -> ControlRecord {
+    ControlRecord::Result(ResultRecord {
+        lease: grant.lease,
+        operation: grant.operation,
+        outcome: Outcome::Failed(Failure::Infra),
+    })
+}
+
+/// Catches: a lost lease not counted as an `INFRA` attempt, its retry placed on the
+/// worker that lost it while one that has not has room, no retry when only workers that
+/// lost it have room, and a budget off by one. RFC section 5.8: `INFRA` retries
+/// elsewhere, up to three attempts, then the waiters get `INTERNAL`. The scheduler
+/// commits an `INFRA` failure from the third lost lease, which answers them.
+#[test]
+fn lost_leases_are_retried_elsewhere_then_fail_after_three() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.worker("b", 2_000, 2 * GIB);
+    h.submit(1, request(1));
+    let [first] = h.tick().try_into().unwrap();
+    assert_eq!(first.worker, w("a"));
+    h.commit_and_start(&first);
+
+    // `a` never lists it: at the Start grace it is lost, attempt 1. `a` has room again,
+    // but the retry goes to `b`, which has not lost it.
+    let lost = h.at_secs(60).beat("a");
+    assert!(lost.is_empty(), "attempt 1 failed it: {lost:?}");
+    h.heartbeat("b");
+    let [second] = h.tick().try_into().unwrap();
+    assert_eq!(second.worker, w("b"), "retried on the worker that lost it");
+    h.commit_and_start(&second);
+
+    // `b` loses it too, attempt 2. Only workers that lost it are left: first fit, `a`.
+    h.at_secs(120).heartbeat("a");
+    let lost = h.beat("b");
+    assert!(lost.is_empty(), "attempt 2 failed it: {lost:?}");
+    let [third] = h.tick().try_into().unwrap();
+    assert_eq!(third.worker, w("a"));
+    h.commit_and_start(&third);
+
+    // Attempt 3 ends it: the heartbeat proposes the failure instead of a requeue.
+    h.at_secs(180).heartbeat("b");
+    let lost = h.beat("a");
+    assert_eq!(
+        lost,
+        [Effect::Commit(infra_failure(&third))],
+        "attempt 3 did not fail it"
+    );
+    let lease = third.lease;
+    assert_eq!(
+        h.s.state(third.operation),
+        Some(&OpState::Failing { lease })
+    );
+    assert!(h.tick().is_empty(), "granted a fourth time");
+    assert_eq!(h.s.queued().count(), 0);
+    let late = h.report(&third, ok(1));
+    assert!(late.is_empty(), "a lost lease's report proposed");
+
+    let answered = h.commit(infra_failure(&third));
+    let [Effect::Answer(answer)] = answered.as_slice() else {
+        panic!("committing the failure gave {answered:?}");
+    };
+    assert_eq!(answer.lease, third.lease);
+    assert_eq!(answer.outcome, Outcome::Failed(Failure::Infra));
+    assert_eq!(answer.waiters, [WaiterId(1)]);
+    assert_eq!(
+        h.s.state(third.operation),
+        Some(&OpState::Failed {
+            lease: third.lease,
+            failure: Failure::Infra
+        })
+    );
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+    assert_eq!(h.s.booked(&w("b")), Some(Resources::default()));
+}
+
+/// Catches: a lease lost to silence (no heartbeat for G, as when a machine reboots) not
+/// counted as an `INFRA` attempt, and a grant lost before it committed counted as one
+/// (no `Start` went out, so nothing ran). The tick that expires the third committed
+/// lease proposes the failure.
+#[test]
+fn leases_lost_to_silence_count_toward_the_budget() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.submit(1, request(1));
+    let [uncommitted] = h.tick().try_into().unwrap();
+    let expired = h.at_secs(60).feed(Event::Tick);
+    assert!(expired.is_empty(), "{expired:?}");
+    assert!(h.commit(ControlRecord::Lease(uncommitted)).is_empty());
+
+    for attempt in 1..=3 {
+        let t = 100 * attempt;
+        // `a` reboots: it registers again, and its first heartbeat lists nothing.
+        h.at_secs(t).worker("a", 1_000, GIB);
+        h.heartbeat("a");
+        let [grant] = h.tick().try_into().unwrap();
+        h.commit_and_start(&grant);
+        let expired = h.at_secs(t + 60).feed(Event::Tick);
+        if attempt < 3 {
+            assert!(
+                expired.is_empty(),
+                "attempt {attempt} failed it: {expired:?}"
+            );
+            assert_eq!(h.s.state(grant.operation), Some(&OpState::Queued));
+        } else {
+            assert_eq!(
+                expired,
+                [Effect::Commit(infra_failure(&grant))],
+                "attempt 3 did not fail it"
+            );
+        }
+    }
+}
+
+/// Catches (issue #23, scheduler side): a lease the scheduler gave up but its worker
+/// lists as running (its `Start` arrived after the Start grace) left unbooked, so new
+/// work is booked into room that run still uses; that booking kept after the run leaves
+/// the running set; and a listed lease the scheduler holds, or never granted, booked.
+#[test]
+fn a_lease_given_up_but_still_running_keeps_its_room() {
+    let mut h = Harness::new();
+    h.worker("a", 2_000, 2 * GIB);
+    h.submit(1, request(1));
+    let [late] = h.tick().try_into().unwrap();
+    // The grant commits and its Start goes out, but reaches `a` only after the grace.
+    assert_eq!(h.commit(ControlRecord::Lease(late.clone())).len(), 1);
+    h.at_secs(60).heartbeat("a");
+    let [retry] = h.tick().try_into().unwrap();
+    h.commit_and_start(&retry);
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
+
+    // The late Start arrives: `a` lists the given-up lease next to the retry, and a
+    // lease nobody granted.
+    let running = [late.lease, retry.lease, LeaseId::new(1, 99)];
+    h.at_secs(61).heartbeat_running("a", &running);
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::new(2_000, 2 * GIB)),
+        "the late run is not booked, or a lease is booked twice"
+    );
+    h.submit(2, request(2));
+    assert!(h.tick().is_empty(), "booked into the late run's room");
+
+    // The late run ends and leaves the running set: its room is free again.
+    h.at_secs(62).heartbeat_running("a", &[retry.lease]);
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
+    let [next] = h.tick().try_into().unwrap();
+    assert_eq!(next.operation, OperationId(1));
+}
+
+/// Catches: a lease expired to silence after its worker reported a result counted as an
+/// `INFRA` attempt. Its run finished; on the last attempt that proposes a second result
+/// record for the lease, and if the appends are reordered that record reaches the log
+/// first and a completed action is answered `INFRA`. The lease is still given up, as a
+/// silent worker's is, and its result wins if it commits before a new grant.
+#[test]
+fn a_reported_lease_lost_to_silence_is_not_an_attempt() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.worker("b", 1_000, GIB);
+    h.submit(1, request(1));
+    // Attempts 1 and 2: `a`, then `b`, never list their lease.
+    let [first] = h.tick().try_into().unwrap();
+    h.commit_and_start(&first);
+    h.at_secs(60).heartbeat("b");
+    h.heartbeat("a");
+    let [second] = h.tick().try_into().unwrap();
+    assert_eq!(second.worker, w("b"));
+    h.commit_and_start(&second);
+    h.at_secs(120).heartbeat("a");
+    h.heartbeat("b");
+    let [third] = h.tick().try_into().unwrap();
+    h.commit_and_start(&third);
+
+    // The third lease's worker reports success, then goes silent for G before the
+    // result commits.
+    let result = h.propose(&third, ok(1));
+    h.at_secs(180).heartbeat("a");
+    h.heartbeat("b");
+    let expired = h.at_secs(240).feed(Event::Tick);
+    assert!(expired.is_empty(), "a reported lease counted: {expired:?}");
+    assert_eq!(h.s.state(third.operation), Some(&OpState::Queued));
+
+    let answered = h.commit(result);
+    let [Effect::Answer(answer)] = answered.as_slice() else {
+        panic!("committing the result gave {answered:?}");
+    };
+    assert_eq!((answer.lease, answer.outcome), (third.lease, ok(1)));
+    assert_eq!(h.s.booked(&third.worker), Some(Resources::default()));
+}
+
+/// Catches (issue #23): a lease lost to silence left unbooked although its worker may
+/// still be running it. When the worker registers again, a tick before its first
+/// heartbeat places new work into that room. The room is freed once a heartbeat leaves
+/// the lease out.
+#[test]
+fn a_lease_lost_to_silence_keeps_its_room_until_a_heartbeat_leaves_it_out() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.submit(1, request(1));
+    let [lost] = h.tick().try_into().unwrap();
+    h.commit_and_start(&lost);
+
+    assert!(h.at_secs(60).tick().is_empty());
+    assert_eq!(h.s.state(lost.operation), Some(&OpState::Queued));
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::new(1_000, GIB)),
+        "a lease lost to silence is not booked"
+    );
+
+    // `a` comes back (a partition healed, the run went on) and registers again.
+    h.at_secs(70).worker("a", 1_000, GIB);
+    assert!(
+        h.tick().is_empty(),
+        "placed into the room of a run that may go on"
+    );
+    h.heartbeat_running("a", &[lost.lease]);
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
+    assert!(h.tick().is_empty(), "placed into the late run's room");
+
+    // The run ends and leaves the running set.
+    h.at_secs(71).heartbeat("a");
+    assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
+    let [retry] = h.tick().try_into().unwrap();
+    assert_eq!(retry.operation, lost.operation);
 }
