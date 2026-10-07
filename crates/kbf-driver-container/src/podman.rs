@@ -48,7 +48,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "create",
         "--pull=never",
-        "--network=none",
+        // MUTANT: network on by default "--network=none",
         "--hostname=localhost",
         "--cgroup-conf=memory.oom.group=1",
     ]
