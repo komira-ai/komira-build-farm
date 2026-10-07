@@ -17,8 +17,9 @@ leases.
 (macOS VMs design, section 8.1); that includes tests that install the desktop app and
 drive it with a local LLM. They take the whole Mac on bare metal and need a GUI session
 on the host. Their runtime is planned in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**): a throwaway per-lease
-user, logged in automatically for that lease only. This design does not cover that
-runtime.
+user, non-admin unless the lease is privileged (`kbf-mac-admin=true`, which always
+ends in an erase). A root helper, `kbf-mac-session`, logs that user in automatically
+for that lease only. This design does not cover that runtime.
 
 The rules this design keeps:
 
@@ -43,10 +44,10 @@ The rules this design keeps:
 | Baseline | A pinned macOS version and build. A fresh state comes from *Erase All Content and Settings*, or from an Apple Configurator restore when the version must change or the Mac is new. There is no disk image for the host; VM golden images do live on Mac nodes (macOS VMs design). |
 | Provisioning layer | A plain, idempotent shell script with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
 | `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
-| Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. The node reports a host identity per Xcode, and a changed identity takes that Xcode out until it re-qualifies. |
+| Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is optional ([section 6](#6-updates-pinned-and-rolled-out)). |
-| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests, which auto-login a throwaway non-admin user for one whole-machine lease (fleet-updates design, in progress), and the case where a VM cannot be started from a launch daemon, an open probe of the macOS VMs design ([section 5.4](#54-filevault-and-auto-login)). |
+| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards (fleet-updates design, in progress). The other exception is the case where a VM cannot be started from a launch daemon, an open probe of the macOS VMs design ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
@@ -180,7 +181,8 @@ kbf-mac-provision print   --profile FILE   # the profile as resolved, and its SH
 ```
 
 - **The profile is data:** `KEY=VALUE` lines, parsed and never sourced. An unknown key is
-  refused, so a typo fails instead of doing nothing. Every value is absolute (`sleep=0`,
+  refused, so a typo fails instead of doing nothing. A few keys (`xcode`, `probe`,
+  `expect_probe`) may repeat, one line per item; any other key may appear once. Every value is absolute (`sleep=0`,
   not "turn sleep off"). Nothing in the profile is secret.
 - `apply` runs as root. It is run by the operator's deployment job (a CI runner on the
   node, or a CI job over SSH), never by hand on a node once the node exists.
@@ -219,11 +221,12 @@ firewall=on
 time_server=time.example.net
 scratch_volume=kbf
 scratch_quota_gib=2048
-xcode_version=26.5
-xcode_build=17A000
-xcode_xip_sha256=<sha256 of the .xip>
-developer_dir=/Applications/Xcode-26.5.app/Contents/Developer
-host_identity=26.5-0123456789abcdef
+xcode=17A000:/Applications/Xcode-26.5.app/Contents/Developer:<sha256 of the .xip>
+xcode=17B000:/Applications/Xcode-26.6.app/Contents/Developer:<sha256 of the .xip>
+default_developer_dir=/Applications/Xcode-26.5.app/Contents/Developer
+probe=host_identity:<path of the client's probe script>:<sha256 of the script>
+expect_probe=host_identity:17A000=26.5-0123456789abcdef
+expect_probe=host_identity:17B000=26.5-fedcba9876543210
 kbf_server=https://farm.example.net:8981
 kbf_cas=https://farm.example.net:8980
 kbf_labels=pool=mac rack=r2
@@ -247,8 +250,8 @@ needs only what macOS ships.
   (`xcode`, matched by membership). That model, and why, is the macOS VMs design's
   (section 3.2 there). The default developer directory (`xcode-select -p`) is pinned
   too, for actions that name none;
-- no simulator runtimes: simulator, GUI and UI tests run in VMs, and their runtimes
-  live in the VM image;
+- no simulator runtimes, ever: simulator, GUI and UI tests run in VMs, and their
+  runtimes live in VM images only, never on the host;
 - nothing else. Tools that come bundled with Xcode or the CLT (`git`, `python3`,
   `make`) are part of the worker profile because that is where they come from. The
   host side must not use them.
@@ -263,9 +266,11 @@ verifying it is the script's.
 
 A compile on macOS uses more of the host than its inputs name: the compiler driver, the
 linker, the SDK, and the OS whose libraries a test loads. Two Macs can print the same
-SDK version and still differ in any of these. A client that compiles on Mac nodes can
-therefore pin a **host identity**: a digest over the fields below. komira's build does
-this, listing allowed identities and refusing to compile anywhere else.
+SDK version and still differ in any of these. A client that compiles on Mac nodes may
+therefore want a **host identity**: a value its own script computes from the host. What
+goes into it is the client's choice; kbf never embeds a client's field list.
+
+For example, komira's script prints the SDK version and a digest of these fields:
 
 | Field | Read with |
 |---|---|
@@ -276,53 +281,71 @@ this, listing allowed identities and refusing to compile anywhere else.
 | linker | `ld -v`, first line |
 | OS build | `sw_vers -buildVersion` |
 
-The identity changes on any macOS update (a security response included), any Xcode or
-CLT update, and any `xcode-select` switch. That is the point of it: a node whose
+Such a value changes on any macOS update (a security response included), any Xcode
+update, and any change of developer directory. That is the point of it: a node whose
 compilers changed must not keep serving cache keys computed for the old ones.
 
-**Planned, in kbf:**
+**Planned, in kbf: client-defined probes, reported, never matched.**
 
-- The daemon reports, on macOS, `os_build`, `xcode` (a set: the build of each pinned
-  Xcode, per the macOS VMs design) and `host_identity` (the digest above, computed once
-  per Xcode with `DEVELOPER_DIR` set to it, so also a set). They are detected, never typed in,
-  as [capabilities.md](capabilities.md) requires.
-- **One key set.** capabilities.md plans `os_image` and `xcode`. A Mac has no image,
-  and `os_build` is what `os_image` would carry, so a Mac reports `os_build` and not
-  `os_image`. `xcode` becomes a set, as the macOS VMs design changes it, and
-  `host_identity` is new.
-  capabilities.md lists `os_build` and `host_identity` as planned exact keys.
-- **Which key a client matches decides how often its cache goes cold,** because every
-  platform property is part of the action digest:
+- **Routing keys.** On macOS the daemon reports `os_build` and `xcode`. `xcode` is a
+  set, the build of each pinned Xcode, matched by membership (macOS VMs design).
+  Clients route on `xcode`, and on `os_build` if their outputs depend on it. Both are
+  detected, never typed in, as [capabilities.md](capabilities.md) requires. A Mac has no
+  image, and `os_build` is what `os_image` would carry, so a Mac reports `os_build` and
+  not `os_image`.
+- **Probes.** The node's provisioned config names client probes: `probe.<k>`, a script
+  pinned by SHA-256 (for example `probe.host_identity`, a copy of the client's own
+  script). The daemon runs each probe once per pinned Xcode, at start and after any
+  change to the profile, exactly as an action would run under that Xcode:
+  - with the environment cleared;
+  - with `DEVELOPER_DIR` set to the same full `…/Contents/Developer` string the daemon
+    gives actions that select that Xcode;
+  - with `SDKROOT` unset.
+
+  It reports each result as `probe.<k>` = `<xcode build>=<value>`.
+  **Assumed, to check on a Mac:** `xcode-select -p` honours `DEVELOPER_DIR`, so the
+  developer-directory field differs per Xcode.
+- **Report-only.** A `probe.<k>` entry is never a request key. The front does not accept
+  it as a platform property. A client that wants an identity checks it in its own
+  action, as komira's does today, and routes on `xcode`.
+- **Expected values.** The provisioned config also names the expected value of each
+  probe per Xcode (`--expect-probe host_identity:<xcode build>=<value>`, repeated). The
+  daemon compares at start, after each probe run, and before each lease. On a mismatch
+  it **stops reporting that Xcode**: its `xcode` value and its probe entries leave the
+  report, and the reason is logged. The node's other Xcodes keep serving. An Xcode that
+  changed behind the operator's back drops out instead of serving the wrong compiler.
+- **What a client's list holds, and what it costs.** Every platform property is part of
+  the action digest:
   - A client matching only `xcode` keeps its Mac cache across macOS patches and loses
     it once per Xcode upgrade.
-  - A client matching `host_identity` or `os_build` gets a cold Mac cache on **every
-    macOS patch, security responses included**, because `os_build` changes each time.
-    That is correct only when outputs depend on the OS build. A test that loads the OS's
-    libraries does; most compiles do not.
-  - A client that lists identities inside its action inputs pays the same, and more.
-    komira's build writes the whole sorted list into every darwin compile, so adding or
-    removing *any* identity cold-misses its entire darwin cache. Such a client should
-    batch identity changes into one change per rollout (section 8).
-- `kbf-daemon --expect-host-identity VALUE` (the profile's `host_identity`). At start,
-  and before each lease, the daemon compares the detected identity with the expected
-  one. On a mismatch it refuses new leases and reports why. A Mac that changed behind
-  the operator's back drops out of the pool instead of serving the wrong compiler.
+  - A client matching `os_build` gets a cold Mac cache on **every macOS patch, security
+    responses included**. That is correct only when outputs depend on the OS build. A
+    test that loads the OS's libraries does; most compiles do not.
+  - A client that checks identities in its own actions lists only the identities of the
+    Xcode its actions select (for a client that selects none, the default developer
+    directory's), never a node's whole set. If the list is part of the actions' inputs
+    (komira writes the whole sorted list into every darwin compile), adding or
+    removing any listed identity cold-misses that client's darwin cache. Such a client
+    batches identity changes into one change per rollout (section 8).
 
-**Re-qualifying a node** whose identity is about to change:
+**Re-qualifying an Xcode on a node** whose probe value is about to change:
 
 1. Drain the node (section 9).
-2. Apply the new profile. Its `host_identity` is left empty for a first-of-its-kind
-   change.
-3. Run the qualification set on the node through a label only it carries: compile,
-   link and run a small C program; the client's canary targets; the native driver's
-   freshness test (a marker left by one lease is never seen by the next).
-4. Record the identity the node now prints in the profile, and in each client's list
-   of allowed identities, in the same reviewed change. An identity is listed before its
-   host serves, and removed only after the host has stopped serving.
+2. Apply the new profile. For a first-of-its-kind change, that Xcode's `expect_probe`
+   is left empty, so the Xcode is not reported.
+3. Run the qualification set on the node, for that Xcode, through a label only the node
+   carries:
+   - compile, link and run a small C program;
+   - the client's canary targets;
+   - the native driver's freshness test (a marker left by one lease is never seen by
+     the next).
+4. Record the value the probe now prints, in the profile's `expect_probe` and in each
+   client's list of allowed identities, in the same reviewed change. An identity is
+   listed before its host serves, and removed only after the host has stopped serving.
 5. Put the node back in its pool label.
 
-The second and later nodes with the same new identity skip step 4: their identity is
-already listed, and step 3 checks that they print it.
+The second and later nodes with the same new value skip step 4: their value is already
+listed, and step 3 checks that they print it.
 
 ## 4. Shipping `kbf-daemon`
 
@@ -587,11 +610,23 @@ host needs auto-login in two cases, and in neither for the admin account:
 
 - **Bare-metal GPU tests.** GPU work never runs in a VM (macOS VMs design, section 8.1),
   so a GPU test that drives the desktop app needs a GUI session on the host. The
-  planned bare-metal whole-machine runtime makes a throwaway non-admin user per lease
-  and logs that user in automatically for the lease only. The same runtime covers MDM
-  privacy profiles and a leak scan that erases the node on a leak. All of this is
-  designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**), not here. FileVault off (above) is what makes
-  that auto-login possible.
+  planned bare-metal whole-machine runtime makes a throwaway user per lease. That user
+  is non-admin, except for a privileged lease (`kbf-mac-admin=true`), whose user may be
+  admin and which always ends in an erase.
+  - **Who sets auto-login.** A root helper, `kbf-mac-session`, sets auto-login to that
+    user for the one lease and clears it afterwards. The unprivileged runtime never
+    does.
+  - **The switch is not instant.** Each switch costs a userspace restart or a reboot,
+    about 1 to 4 minutes.
+  - **After a power loss mid-lease,** `kbf-mac-session` resets auto-login at boot,
+    before the daemon sends `Hello`.
+  - **The same runtime covers** MDM privacy profiles and a leak scan that erases the
+    node on a leak.
+
+  All of this is designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**), not here. FileVault off (above) is
+  what makes that auto-login possible. The profile's `autologin` key accepts it:
+  `check` passes when auto-login is off, or set to a user in the lease uid range while
+  a `whole_machine` lease holds the node, and `apply` never clears it mid-lease.
 - **A VM cannot be started from a launch daemon.** This is an open probe of the macOS
   VMs design. If it fails, auto-login is for that design's dedicated non-admin user.
 
@@ -783,7 +818,7 @@ The binding and the deny list below are tracked in
    lifetime (30 days is a starting point), as an operator step for now, and later
    through an enrollment endpoint.
 3. The operator adds the node to the cell's configuration: node id, labels, profile
-   name, expected host identity.
+   name, expected probe values per Xcode.
 4. The daemon starts. **The server checks that the certificate names the node id the
    `Hello` carries** and refuses the stream otherwise. Then a certificate taken from
    one node can impersonate only that node.
@@ -838,7 +873,7 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 | Profile parsing | unknown key, duplicate key, a value with `$(...)` | a profile that is sourced; an unknown key ignored |
 | Build job | its last step re-downloads its own assets and verifies sums and attestations with the flags of 4.2 | one flipped byte in the asset before the check; an attestation from another workflow file accepted |
 | Node install | `apply` with a wrong SHA-256 refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
-| `--expect-host-identity` | fixture fields, a changed `os_build` | comparing only the SDK version prefix |
+| `--expect-probe` | two Xcodes with fixture probe outputs; one probe's value changes. That Xcode's `xcode` value and probe entry leave the report, and the other Xcode's stay | the whole node dropped on one mismatch; the mismatched Xcode still reported; the probe run with the daemon's environment or `SDKROOT` set instead of an action's |
 | Fence clock ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
 | Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (today a resent `Hello` only updates capacity and its `node_id` is never read) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
 | Drain | scheduler simulation: a drained node gets no new lease; running leases finish or are re-placed after the deadline | placement that ignores the drained flag |
@@ -888,6 +923,7 @@ machines.
 | launchd keeps the `StandardErrorPath` descriptor; `newsyslog` cannot copy and truncate | `launchd.plist(5)`, `newsyslog.conf(5)` |
 | A macOS update on Apple silicon needs a volume owner's authorisation without MDM | **assumed**; verify |
 | Unattended Xcode downloads with an Apple Account are not reliable | **assumed** |
+| `xcode-select -p` honours `DEVELOPER_DIR`, so a probe run per Xcode sees that Xcode's directory | **assumed**; check on a Mac |
 | DDM software-update keys and their enrollment requirements | Apple documentation |
 | Some overlay-network clients' app variants run only after login | vendor documentation |
 
