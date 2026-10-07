@@ -1,0 +1,17 @@
+# The M1 sample project for buck2: built remote-only against the integration cell
+# (crates/kbf-it/m1/run.sh starts it). No prelude: the rules are in this project.
+[cells]
+  root = .
+
+[buck2]
+  digest_algorithms = SHA256
+
+[buck2_re_client]
+  engine_address = grpc://127.0.0.1:8980
+  action_cache_address = grpc://127.0.0.1:8980
+  cas_address = grpc://127.0.0.1:8980
+  tls = false
+  instance_name = kbf-m1
+
+[build]
+  execution_platforms = root//platforms:remote

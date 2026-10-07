@@ -1,0 +1,27 @@
+# Three commands in a chain, as in the Bazel sample. `shout` runs an executable input
+# file, so the farm must keep its mode; `digest` reads two outputs of earlier commands.
+load(":defs.bzl", "step")
+
+step(
+    name = "words",
+    srcs = ["data/words.txt"],
+    script = 'sort "$2" > "$1"',
+)
+
+step(
+    name = "shout",
+    srcs = [
+        "tools/upper.sh",
+        ":words",
+    ],
+    script = '"$2" < "$3" > "$1"',
+)
+
+step(
+    name = "digest",
+    srcs = [
+        ":words",
+        ":shout",
+    ],
+    script = 'cat "$2" "$3" | sha256sum > "$1"',
+)

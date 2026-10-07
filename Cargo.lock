@@ -966,8 +966,21 @@ dependencies = [
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "hex",
+ "kbf-daemon",
+ "kbf-front",
+ "kbf-proto",
+ "kbf-server",
+ "prost",
+ "rcgen",
  "saphyr-parser",
  "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,0 +1,3 @@
+# The M1 sample project for Bazel: built remote-only against the integration cell
+# (crates/kbf-it/m1/run.sh). It needs no external module.
+module(name = "kbf_m1_sample")
