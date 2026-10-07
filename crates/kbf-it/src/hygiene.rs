@@ -9,6 +9,10 @@
 //! A dotted run is read as an address only when it has exactly four parts of one to
 //! three digits, each at most 255, so `1.2.3` (a version) and `1.2.3.4.5` are not
 //! addresses.
+//!
+//! [`decode`] turns a file's bytes into the text to scan, so that no file escapes the
+//! scan by its encoding: UTF-16 with a byte order mark is decoded, and a file holding
+//! a NUL byte is refused unless its extension is on [`BINARY_EXTENSIONS`].
 
 use std::fmt;
 
@@ -56,6 +60,53 @@ pub fn is_allowed(a: [u8; 4]) -> bool {
         (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
     ) || a == [127, 0, 0, 1]
         || a == [0, 0, 0, 0]
+}
+
+/// Extensions (compared ignoring ASCII case) of files that may hold a NUL byte; the
+/// scan skips such a file as binary. Any other file holding a NUL byte is refused.
+pub const BINARY_EXTENSIONS: &[&str] = &[
+    "gif", "gz", "ico", "jpeg", "jpg", "pdf", "png", "wasm", "webp", "zip", "zst",
+];
+
+/// The text of the file at `path` (relative, used for its extension) to scan:
+/// `Ok(None)` for a binary file on [`BINARY_EXTENSIONS`], an error for a file the scan
+/// cannot read. A file that starts with a UTF-16 byte order mark is decoded as UTF-16
+/// (and refused if that fails or yields a NUL); any other file holding a NUL byte is
+/// refused unless its extension is on the allow list; the rest is read as UTF-8, with
+/// invalid bytes replaced.
+pub fn decode(path: &str, bytes: &[u8]) -> Result<Option<String>, String> {
+    let utf16 = match bytes {
+        [0xFF, 0xFE, rest @ ..] => Some((rest, u16::from_le_bytes as fn([u8; 2]) -> u16)),
+        [0xFE, 0xFF, rest @ ..] => Some((rest, u16::from_be_bytes as fn([u8; 2]) -> u16)),
+        _ => None,
+    };
+    if let Some((rest, unit)) = utf16 {
+        if rest.len() % 2 != 0 {
+            return Err("a UTF-16 file with an odd number of bytes is not read".to_owned());
+        }
+        let units = rest.chunks_exact(2).map(|c| unit([c[0], c[1]]));
+        let text: String = char::decode_utf16(units)
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("not valid UTF-16 ({e}), so it is not read"))?;
+        if text.contains('\0') {
+            return Err("a UTF-16 file holding a NUL character is not read".to_owned());
+        }
+        return Ok(Some(text));
+    }
+    if bytes.contains(&0) {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let binary = name.rsplit_once('.').is_some_and(|(_, ext)| {
+            BINARY_EXTENSIONS
+                .iter()
+                .any(|b| ext.eq_ignore_ascii_case(b))
+        });
+        return if binary {
+            Ok(None)
+        } else {
+            Err("holds a NUL byte, and its extension is not on the binary allow list".to_owned())
+        };
+    }
+    Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 /// Scans one text and returns every finding, in line order.
@@ -218,6 +269,56 @@ mod tests {
                 Kind::HomePath(format!("/{}/bob", "Users")),
             ]
         );
+    }
+
+    fn utf16(text: &str, le: bool) -> Vec<u8> {
+        let mut out = if le {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for u in text.encode_utf16() {
+            out.extend(if le { u.to_le_bytes() } else { u.to_be_bytes() });
+        }
+        out
+    }
+
+    #[test]
+    fn utf16_files_are_decoded_and_scanned() {
+        // Catches: a UTF-16 file skipped as binary (its ASCII holds NUL bytes), which
+        // hid an address from the scan; and a decoder that ignores the byte order.
+        let planted = format!("host {}", ip(10, "1.2.3"));
+        for le in [true, false] {
+            let text = decode("notes.txt", &utf16(&planted, le))
+                .expect("UTF-16 is read")
+                .expect("UTF-16 is text");
+            assert_eq!(text, planted, "le={le}");
+            assert_eq!(scan(&text).len(), 1, "le={le}");
+        }
+        assert!(decode("a.txt", &[0xFF, 0xFE, b'a']).is_err(), "odd length");
+        assert!(
+            decode("a.txt", &[0xFF, 0xFE, 0x00, 0xD8]).is_err(),
+            "lone surrogate"
+        );
+        // UTF-32LE starts like UTF-16LE and decodes to NUL characters.
+        assert!(
+            decode("a.txt", &[0xFF, 0xFE, 0, 0, b'a', 0, 0, 0]).is_err(),
+            "UTF-32"
+        );
+    }
+
+    #[test]
+    fn nul_bytes_are_refused_unless_the_extension_is_binary() {
+        // Catches: any file holding a NUL skipped as binary, so a text file with one
+        // planted NUL escaped the scan.
+        let bytes = b"host\0 text";
+        for path in ["a.txt", "Makefile", "dir.png/Makefile", "a.png.txt"] {
+            assert!(decode(path, bytes).is_err(), "{path}");
+        }
+        for path in ["logo.png", "docs/x.PDF", "a.tar.gz"] {
+            assert_eq!(decode(path, bytes), Ok(None), "{path}");
+        }
+        assert_eq!(decode("a.txt", b"plain"), Ok(Some("plain".to_owned())));
     }
 
     #[test]

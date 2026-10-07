@@ -560,6 +560,9 @@ version = "0.1.0"
 [[package]]
 name = "kbf-caps"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "kbf-daemon"
@@ -622,6 +625,11 @@ version = "0.1.0"
 [[package]]
 name = "kbf-segments"
 version = "0.1.0"
+dependencies = [
+ "kbf-types",
+ "sha2",
+ "thiserror",
+]
 
 [[package]]
 name = "kbf-server"

@@ -1,1 +1,5 @@
+# Cargo build output (/target matches the directory and any file of that name)
 /target
+
+# Backup files written by rustfmt
+**/*.rs.bk
