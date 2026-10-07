@@ -286,7 +286,8 @@ impl Scheduler {
                 let Some(sent) = held.start_sent else {
                     return false;
                 };
-                let due = registered || now >= sent.saturating_add(START_GRACE);
+                // MUTANT M4: no Start grace on a heartbeat.
+                let due = registered || now >= sent.saturating_add(START_GRACE.saturating_sub(START_GRACE));
                 let op = &self.ops[&held.operation];
                 due && !running.contains(lease)
                     && !op.result_proposed
@@ -471,9 +472,7 @@ impl StateMachine for Scheduler {
                         booked: Resources::default(),
                         last_heard: now,
                     });
-                // MUTANT M3: WorkerUp treats the running set as empty.
-                let _ = running;
-                self.reconcile(&worker, &[], true);
+                self.reconcile(&worker, &running, true);
                 Vec::new()
             }
             Event::Heartbeat { worker, running } => {
