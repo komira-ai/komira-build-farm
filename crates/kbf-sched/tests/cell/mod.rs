@@ -168,6 +168,8 @@ pub enum Fault {
     Restart(u64),
     /// Every copy of the first `Start` sent to this worker is lost.
     DropFirstStart,
+    /// Every copy of every `Start` sent to this worker is lost.
+    DropEveryStart,
     /// The first hermetic lease this worker starts runs, but never appears in its
     /// running set.
     HideFirstHermetic,
@@ -190,8 +192,9 @@ pub struct Worker {
     capacity: Resources,
     fault: Fault,
     session: u64,
-    /// The lease whose `Start` was lost, and its operation ([`Fault::DropFirstStart`]).
-    pub dropped: Option<(LeaseId, OperationId)>,
+    /// The leases whose `Start` was lost, with their operations, in the order they
+    /// were lost ([`Fault::DropFirstStart`], [`Fault::DropEveryStart`]).
+    pub dropped: Vec<(LeaseId, OperationId)>,
     /// The lease left out of the running set ([`Fault::HideFirstHermetic`]).
     pub hidden: Option<LeaseId>,
     fence: SelfFence,
@@ -208,7 +211,7 @@ impl Worker {
             capacity,
             fault,
             session: 1,
-            dropped: None,
+            dropped: Vec::new(),
             hidden: None,
             fence: SelfFence::new(),
             runs: BTreeMap::new(),
@@ -241,10 +244,15 @@ impl Worker {
         if session != self.session {
             return;
         }
-        if self.fault == Fault::DropFirstStart
-            && self.dropped.is_none_or(|(lease, _)| lease == s.lease)
-        {
-            self.dropped = Some((s.lease, s.operation));
+        let lose = match self.fault {
+            Fault::DropFirstStart => self.dropped.first().is_none_or(|(l, _)| *l == s.lease),
+            Fault::DropEveryStart => true,
+            _ => false,
+        };
+        if lose {
+            if !self.dropped.iter().any(|(l, _)| *l == s.lease) {
+                self.dropped.push((s.lease, s.operation));
+            }
             return;
         }
         self.starts.push((now, s.lease));

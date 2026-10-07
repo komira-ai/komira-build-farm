@@ -26,6 +26,12 @@
 //! - worker-1 runs one hermetic lease but leaves it out of every heartbeat's running
 //!   set, and reports it late.
 //!
+//! Two runs lose every `Start` sent to a worker, so each lease granted there is lost
+//! (RFC section 5.8: an `INFRA` attempt). With only worker-1 losing them, every
+//! operation it lost must be retried on worker-2 and answered by that run. With both
+//! workers losing them, every operation must be granted three times and then answered
+//! with an `INFRA` failure.
+//!
 //! Each registration opens a new session, as a new stream does on the wire: a `Start`
 //! or acknowledgement sent to an earlier session never arrives, the leader drops
 //! heartbeats of a session older than the newest, and a duplicated `Hello` registers
@@ -44,7 +50,10 @@ use std::collections::BTreeMap;
 
 use kbf_sched::fence::START_GRACE;
 use kbf_sim::{Sim, TraceHash};
-use kbf_types::{ControlRecord, FarmTime, FencePolicy, LeaseId, OperationId, Resources, WorkerId};
+use kbf_types::{
+    ControlRecord, Failure, FarmTime, FencePolicy, LeaseId, OperationId, Outcome, Resources,
+    WorkerId,
+};
 
 mod cell;
 
@@ -66,6 +75,26 @@ fn grants(sim: &Sim<Cell>) -> BTreeMap<OperationId, BTreeMap<LeaseId, FarmTime>>
         }
     }
     grants
+}
+
+/// Every grant in the log: per operation, each lease (in lease order) with its worker.
+fn grants_on(sim: &Sim<Cell>) -> BTreeMap<OperationId, BTreeMap<LeaseId, WorkerId>> {
+    let mut grants: BTreeMap<OperationId, BTreeMap<LeaseId, WorkerId>> = BTreeMap::new();
+    for (_, r) in &log(sim).records {
+        if let ControlRecord::Lease(g) = r {
+            grants
+                .entry(g.operation)
+                .or_default()
+                .insert(g.lease, g.worker.clone());
+        }
+    }
+    grants
+}
+
+/// The outcome each operation was answered with.
+fn outcomes(sim: &Sim<Cell>) -> BTreeMap<OperationId, Outcome> {
+    let answers = leader(sim).answers.iter();
+    answers.map(|(_, a)| (a.operation, a.outcome)).collect()
 }
 
 /// Checks that every operation was answered exactly once, by the lease of the newest
@@ -303,6 +332,8 @@ fn a_start_lost_on_a_live_session_is_granted_again_after_the_grace() {
         assert_never_twice_at_once(&sim, seed);
         let (lost, op) = worker(&sim, "worker-1")
             .dropped
+            .first()
+            .copied()
             .expect("worker-1 lost a Start");
         assert_replaced_after_grace(&sim, seed, &answers, op, lost);
     }
@@ -343,5 +374,72 @@ fn a_lease_missing_from_the_running_set_is_granted_again_and_its_late_result_fen
             !proposed,
             "seed {seed}: the late result of {hidden} was proposed"
         );
+    }
+}
+
+/// Catches: a lease lost on a worker that drops every `Start` retried on that same
+/// worker although worker-2 has room (today first fit sends it back to worker-1 for
+/// ever, and its waiters are never answered). Each operation worker-1 lost must be
+/// granted there once, then on worker-2, and answered by worker-2's run.
+#[test]
+fn a_worker_that_drops_every_start_loses_its_operations_to_another() {
+    let scenario = Scenario {
+        cut: false,
+        worker_1: Fault::DropEveryStart,
+        worker_2: Fault::None,
+    };
+    for seed in 0..SEEDS {
+        let sim = run_scenario(seed, scenario);
+        let answers = assert_answered_once(&sim, seed);
+        assert_bookings_released(&sim, seed);
+        assert_never_twice_at_once(&sim, seed);
+        let lost = &worker(&sim, "worker-1").dropped;
+        assert!(!lost.is_empty(), "seed {seed}: worker-1 lost no Start");
+        let grants = grants_on(&sim);
+        let outcomes = outcomes(&sim);
+        for &(lease, op) in lost {
+            let on: Vec<(LeaseId, &str)> = grants[&op]
+                .iter()
+                .map(|(l, w)| (*l, w.as_str()))
+                .collect();
+            let [(first, "worker-1"), (second, "worker-2")] = on.as_slice() else {
+                panic!("seed {seed}: {op} lost {lease} on worker-1; granted {on:?}");
+            };
+            assert_eq!(*first, lease, "seed {seed}: {op}");
+            assert_eq!(answers[&op], *second, "seed {seed}: {op}");
+            assert!(
+                matches!(outcomes[&op], Outcome::Completed { .. }),
+                "seed {seed}: {op} answered {:?}",
+                outcomes[&op]
+            );
+        }
+    }
+}
+
+/// Catches: an operation whose every lease is lost retried for ever (its waiters are
+/// never answered), and an infra budget off by one. Each operation must be granted
+/// exactly three times, then answered with an `INFRA` failure by its third lease.
+#[test]
+fn an_operation_that_loses_every_start_fails_after_three_attempts() {
+    let scenario = Scenario {
+        cut: false,
+        worker_1: Fault::DropEveryStart,
+        worker_2: Fault::DropEveryStart,
+    };
+    for seed in 0..SEEDS {
+        let sim = run_scenario(seed, scenario);
+        let answers = assert_answered_once(&sim, seed);
+        assert_bookings_released(&sim, seed);
+        let outcomes = outcomes(&sim);
+        for (op, leases) in grants_on(&sim) {
+            assert_eq!(leases.len(), 3, "seed {seed}: {op} granted {leases:?}");
+            let third = leases.last_key_value().map(|(l, _)| *l);
+            assert_eq!(Some(answers[&op]), third, "seed {seed}: {op}");
+            assert_eq!(
+                outcomes[&op],
+                Outcome::Failed(Failure::Infra),
+                "seed {seed}: {op}"
+            );
+        }
     }
 }
