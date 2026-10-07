@@ -257,6 +257,14 @@ mod platform {
 
 /// Sends SIGKILL to the action's process group, unless a snapshot has shown it empty,
 /// and to each of `members`. A process that is already gone is not an error.
+///
+/// Known race: a pid (or the group id) is checked in a snapshot and signalled a moment
+/// later by number. A member that exits in between and whose pid the kernel hands to
+/// a new process of the same user gets that process killed instead; the daemon's user
+/// only, since `kill` cannot reach another user's processes. Closing it needs a
+/// handle that cannot be recycled (`pidfd_send_signal` on Linux; macOS has none for
+/// arbitrary processes) or a per-lease user whose every process may be killed. The
+/// window is the time between the snapshot and the signal.
 pub fn kill_all(tracker: &Tracker, members: &[Proc]) {
     if !tracker.group_gone {
         // SAFETY: kill(2) takes plain integers. The group id is the leader's pid, and

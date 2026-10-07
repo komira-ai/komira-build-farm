@@ -66,19 +66,11 @@ impl<C: Cas> NativeRuntime<C> {
     /// directory, and removes any lease directory a previous daemon left in it.
     ///
     /// # Errors
-    /// The scratch directory cannot be made or read, or a leftover cannot be removed.
+    /// The scratch directory cannot be made or read. A leftover that cannot be
+    /// removed is moved aside instead (see the crate documentation), not an error.
     pub fn new(config: NativeConfig, cas: Arc<C>) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.scratch)?;
-        for entry in std::fs::read_dir(&config.scratch)? {
-            let path = entry?.path();
-            if path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("lease-"))
-            {
-                tracing::warn!(dir = %path.display(), "removing a lease directory left behind");
-                kbf_outputs::remove_tree(&path)?;
-            }
-        }
+        crate::sweep::sweep(&config.scratch, &kbf_outputs::remove_tree)?;
         Ok(Self {
             config,
             cas,
