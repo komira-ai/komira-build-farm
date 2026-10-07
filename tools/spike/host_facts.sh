@@ -31,6 +31,8 @@ psi=""
 for r in cpu memory io; do
     if [ -r "/proc/pressure/$r" ]; then psi="$psi $r"; fi
 done
+kv kernel_blk_cgroup_config "$(grep -E '^(# )?CONFIG_BLK_CGROUP_(IOLATENCY|IOCOST|IOPRIO|THROTTLE|IOLATENCY)[ =]' "/boot/config-$(uname -r)" 2>/dev/null | sed 's/^# //; s/ is not set/=n/' | sort -u | tr '\n' ' ' || echo 'no /boot config')"
+kv io_cost_qos_at_root "$([ -e /sys/fs/cgroup/io.cost.qos ] && echo present || echo absent)"
 kv psi_files "${psi:- none}"
 kv psi_cgroup_files "$(ls /sys/fs/cgroup/system.slice/*.pressure 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
 

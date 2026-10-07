@@ -13,8 +13,10 @@
 # - latonly: the probe's slice with an io.latency target of 5 ms;
 # - both: io.max and io.latency together (the configuration under test);
 # - cpuonly: only the CPU half of the hog, no I/O lines (how much of the delay is CPU);
-# - bothw: both, plus CPUWeight=1000 on the server slice;
-# - bothw8: bothw with the io.max cap at an eighth of the disk rate.
+# - bothw8: both, plus CPUWeight=1000 on the server slice and the io.max cap at an
+#   eighth of the disk rate;
+# - sepopen, sepboth: open and both, with the probe on its own ext4 filesystem (a loop
+#   image on the same disk), so it shares the device but not the hog's journal.
 # The slices are runtime unit files written under /run/systemd/system; the io.max and
 # io.latency values systemd wrote are read back from cgroupfs.
 . "$(dirname "$0")/lib.sh"
@@ -81,10 +83,19 @@ done
 kv io_files_kbfsrvlat "$(cd "$(cgpath kbfsrvlat.slice)" && ls -d io.* | tr '\n' ' ')"
 kv io_root_subtree_control "$(cat /sys/fs/cgroup/cgroup.subtree_control)"
 
-# arm SERVER-SLICE [ACTIONS-SLICE] [HOG-MODE]: prints the probe line plus the hog's write rate.
+# A separate filesystem for the probe: same disk, own journal.
+img=$SPIKE_TMP/raftfs.img
+sepdir=$SPIKE_TMP/raftfs
+sudo truncate -s 2G "$img"
+sudo mkfs.ext4 -q -F "$img"
+sudo mkdir -p "$sepdir"
+sudo mount -o loop "$img" "$sepdir"
+kv io_sepfs "$(findmnt -no SOURCE,FSTYPE "$sepdir" | sed 's|^/dev/||')"
+
+# arm SERVER-SLICE [ACTIONS-SLICE] [HOG-MODE] [PROBE-DIR]: prints the probe line plus the hog's write rate.
 # The io.max and io.latency files are read back (to stderr) while both run.
 arm() {
-    local server=$1 actions=${2:-} mode=${3:-all} w0=0 w1=0 res
+    local server=$1 actions=${2:-} mode=${3:-all} pdir=${4:-$dir} w0=0 w1=0 res
     if [ -n "$actions" ]; then
         sudo systemd-run --quiet --collect --unit=kbf-spike-hog --slice="$actions" \
             bash "$SPIKE_DIR/io_hog.sh" "$dir" "$mode"
@@ -92,7 +103,7 @@ arm() {
         w0=$(wbytes "$actions")
     fi
     sudo systemd-run --quiet --wait --pipe --collect --unit=kbf-spike-probe --slice="$server" \
-        python3 "$SPIKE_DIR/fsync_probe.py" "$dir" "$secs" >"$SPIKE_TMP/probe.out" &
+        python3 "$SPIKE_DIR/fsync_probe.py" "$pdir" "$secs" >"$SPIKE_TMP/probe.out" &
     sleep 2
     if [ -n "$actions" ]; then
         kv "io_readback_${actions%.slice}_io_max" "$(cat "$(cgpath "$actions")/io.max" 2>&1 | grep "^$dmm" || echo none)" >&2
@@ -110,7 +121,7 @@ arm() {
     printf '%s' "$res"
 }
 
-arms="baseline open cpuonly maxonly latonly both bothw bothw8"
+arms="baseline open cpuonly maxonly latonly both bothw8 sepopen sepboth"
 declare -A worst best
 for r in $(seq "$rounds"); do
     for a in $arms; do
@@ -121,8 +132,9 @@ for r in $(seq "$rounds"); do
             latonly) line=$(arm kbfsrvlat.slice kbfact.slice) ;;
             both) line=$(arm kbfsrvlat.slice kbfactcap.slice) ;;
             cpuonly) line=$(arm kbfsrv.slice kbfact.slice cpu) ;;
-            bothw) line=$(arm kbfsrvlatw.slice kbfactcap.slice) ;;
             bothw8) line=$(arm kbfsrvlatw.slice kbfactcap8.slice) ;;
+            sepopen) line=$(arm kbfsrv.slice kbfact.slice all "$sepdir") ;;
+            sepboth) line=$(arm kbfsrvlat.slice kbfactcap.slice all "$sepdir") ;;
         esac
         kv "io_${a}_round$r" "$line"
         p99=$(printf '%s' "$line" | sed -n 's/.*p99_ms=\([0-9.]*\).*/\1/p')
@@ -138,7 +150,7 @@ done
 # of that configuration holds the target and every open round (the mutant: both lines
 # dropped) breaks it.
 broke=$(python3 -c "print(${best[open]} >= $target_ms)")
-for g in both bothw bothw8; do
+for g in both bothw8 sepboth; do
     held=$(python3 -c "print(${worst[$g]} < $target_ms)")
     if [ "$held" = True ] && [ "$broke" = True ]; then
         v="fits: guarded p99 <= ${worst[$g]} ms < $target_ms ms; lines dropped, p99 >= ${best[open]} ms"
