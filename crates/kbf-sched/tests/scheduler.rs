@@ -67,22 +67,11 @@ impl Harness {
         self.s.apply(Input::new(self.now, event))
     }
 
+    /// Registers `name` (again).
     fn worker(&mut self, name: &str, cpu_millis: u64, memory: u64) {
-        self.register(name, cpu_millis, memory, &[]);
-    }
-
-    /// Registers `name` (again), holding `running`.
-    fn register(&mut self, name: &str, cpu_millis: u64, memory: u64, running: &[LeaseId]) {
         let capacity = Resources::new(cpu_millis, memory);
-        let running = running.to_vec();
-        assert!(
-            self.feed(Event::WorkerUp {
-                worker: w(name),
-                capacity,
-                running,
-            })
-            .is_empty()
-        );
+        let worker = w(name);
+        assert!(self.feed(Event::WorkerUp { worker, capacity }).is_empty());
     }
 
     fn submit(&mut self, waiter: u64, request: Request) {
@@ -150,6 +139,11 @@ impl Harness {
             panic!("report of {grant:?} proposed {proposed:?}");
         };
         record.clone()
+    }
+
+    /// Whether `grant`'s operation is running under some lease.
+    fn running(&self, grant: &LeaseGrant) -> bool {
+        matches!(self.s.state(grant.operation), Some(OpState::Running { .. }))
     }
 
     /// Reports, commits the proposed result, and returns the answer.
@@ -508,7 +502,8 @@ fn a_lease_whose_result_was_reported_is_kept_when_left_out() {
     let result = h.propose(&grant, ok(1));
 
     h.at_secs(60).heartbeat("a");
-    h.register("a", 1_000, GIB, &[]);
+    h.worker("a", 1_000, GIB);
+    h.heartbeat("a");
     assert!(
         matches!(h.s.state(grant.operation), Some(OpState::Running { .. })),
         "requeued with its result on the way"
@@ -519,11 +514,13 @@ fn a_lease_whose_result_was_reported_is_kept_when_left_out() {
 }
 
 /// Catches: a worker that registers again keeping, until a grace or G, a committed lease
-/// it no longer holds (its run is gone with the old session); one that drops a lease
-/// the worker lists as re-adopted (it would run twice); and one that drops a grant
-/// whose `Start` was never sent (its commit starts it on the new session).
+/// its heartbeats leave out (its `Start` went to the old session, so its run is gone or
+/// never began); a registration that requeues by itself, though `Hello` carries no
+/// running set (the leases the daemon re-adopted would run twice); one that drops a
+/// lease the worker lists as re-adopted; and one that gives up, before the Start grace,
+/// a grant whose `Start` went to the new session (it may still be on its way).
 #[test]
-fn registering_again_requeues_at_once_only_what_the_worker_no_longer_holds() {
+fn a_heartbeat_after_registering_again_requeues_at_once_only_what_the_worker_lost() {
     let mut h = Harness::new();
     h.worker("a", 3_000, 3 * GIB);
     h.submit(1, request(1));
@@ -533,24 +530,29 @@ fn registering_again_requeues_at_once_only_what_the_worker_no_longer_holds() {
     h.commit_and_start(&kept);
     h.commit_and_start(&lost);
 
-    // The daemon restarts 10 s later and re-adopts `kept`.
-    h.at_secs(10).register("a", 3_000, 3 * GIB, &[kept.lease]);
-    assert!(matches!(
-        h.s.state(kept.operation),
-        Some(OpState::Running { .. })
-    ));
+    // The daemon restarts 10 s later and re-adopts `kept`. Its Hello lists nothing.
+    h.at_secs(10).worker("a", 3_000, 3 * GIB);
+    assert!(h.running(&kept) && h.running(&lost), "requeued on Hello");
+    // `pending` is committed after the registration: its Start goes to the new session.
+    let started = h.commit(ControlRecord::Lease(pending.clone()));
+    assert!(matches!(started.as_slice(), [Effect::Start(s)] if s.lease == pending.lease));
+
+    // The first heartbeat lists `kept`; it has not received `pending` yet.
+    h.at_secs(11).heartbeat_running("a", &[kept.lease]);
+    assert!(h.running(&kept), "a re-adopted lease requeued");
     assert_eq!(h.s.state(lost.operation), Some(&OpState::Queued));
-    assert!(matches!(
-        h.s.state(pending.operation),
-        Some(OpState::Leased {
-            committed: false,
-            ..
-        })
-    ));
+    assert!(
+        matches!(
+            h.s.state(pending.operation),
+            Some(OpState::Leased {
+                committed: true,
+                ..
+            })
+        ),
+        "requeued before the Start grace"
+    );
     assert_eq!(h.s.booked(&w("a")), Some(Resources::new(2_000, 2 * GIB)));
 
-    let start = h.commit_and_start(&pending);
-    assert_eq!(start.lease, pending.lease);
     let [again] = h.tick().try_into().unwrap();
     assert_eq!(again.operation, lost.operation);
     h.commit_and_start(&again);

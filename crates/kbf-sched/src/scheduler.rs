@@ -90,8 +90,16 @@ struct Operation {
 #[derive(Clone, Copy, Debug)]
 struct Held {
     operation: OperationId,
-    /// When its `Start` was emitted; `None` until its grant is committed.
-    start_sent: Option<FarmTime>,
+    /// When and to which session its `Start` was emitted; `None` until its grant is
+    /// committed.
+    start_sent: Option<StartSent>,
+}
+
+/// When a `Start` was emitted, and the worker session it was sent to.
+#[derive(Clone, Copy, Debug)]
+struct StartSent {
+    at: FarmTime,
+    session: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +107,8 @@ struct Worker {
     capacity: Resources,
     booked: Resources,
     last_heard: FarmTime,
+    /// Counts the worker's registrations: the session a `Start` emitted now goes to.
+    session: u64,
 }
 
 impl Worker {
@@ -274,10 +284,14 @@ impl Scheduler {
     }
 
     /// Sends back to the queue every committed lease held on `worker` that `running`
-    /// leaves out: all of them if the worker has just registered, else those whose
-    /// `Start` has been out for [`START_GRACE`]. A lease whose result was reported is
-    /// kept: that result is on its way to the log.
-    fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId], registered: bool) {
+    /// leaves out, if its `Start` went to an earlier session of the worker or has been
+    /// out for [`START_GRACE`]. A lease whose result was reported is kept: that result
+    /// is on its way to the log.
+    fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) {
+        let Some(session) = self.workers.get(worker).map(|w| w.session) else {
+            return;
+        };
+        let running: BTreeSet<LeaseId> = running.iter().copied().collect();
         let now = self.now;
         let lost: Vec<OperationId> = self
             .held
@@ -286,9 +300,11 @@ impl Scheduler {
                 let Some(sent) = held.start_sent else {
                     return false;
                 };
-                let due = registered || now >= sent.saturating_add(START_GRACE);
+                // A `Start` sent to an earlier session reached the worker before it
+                // registered again, and then the worker lists it, or it never will.
+                let due = sent.session < session || now >= sent.at.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
-                due && !running.contains(lease)
+                due && !running.contains(*lease)
                     && !op.result_proposed
                     && op.state.holding().is_some_and(|(_, w)| w == worker)
             })
@@ -361,7 +377,11 @@ impl Scheduler {
         {
             *committed = true;
             if let Some(held) = self.held.get_mut(lease) {
-                held.start_sent = Some(self.now);
+                let session = self.workers.get(&*worker).map_or(0, |w| w.session);
+                held.start_sent = Some(StartSent {
+                    at: self.now,
+                    session,
+                });
             }
             effects.push(Effect::Start(StartLease {
                 worker: worker.clone(),
@@ -454,30 +474,27 @@ impl StateMachine for Scheduler {
     fn apply(&mut self, input: Input) -> Vec<Effect> {
         self.now = self.now.max(input.now);
         match input.event {
-            Event::WorkerUp {
-                worker,
-                capacity,
-                running,
-            } => {
+            Event::WorkerUp { worker, capacity } => {
                 let now = self.now;
                 self.workers
-                    .entry(worker.clone())
+                    .entry(worker)
                     .and_modify(|w| {
                         w.capacity = capacity;
                         w.last_heard = now;
+                        w.session += 1;
                     })
                     .or_insert(Worker {
                         capacity,
                         booked: Resources::default(),
                         last_heard: now,
+                        session: 0,
                     });
-                self.reconcile(&worker, &running, true);
                 Vec::new()
             }
             Event::Heartbeat { worker, running } => {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.last_heard = w.last_heard.max(self.now);
-                    self.reconcile(&worker, &running, false);
+                    self.reconcile(&worker, &running);
                 }
                 Vec::new()
             }

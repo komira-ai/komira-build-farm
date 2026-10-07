@@ -64,32 +64,35 @@ pub enum Event {
     /// A worker registered (or registered again) with `capacity` for actions: its CPUs
     /// and RAM minus protected floors. Counts as hearing from it.
     ///
-    /// A registration opens a new session. Every committed lease the scheduler holds on
-    /// the worker that `running` leaves out goes back to the queue at once: its `Start`
-    /// was sent to an earlier session, so the worker either received it and would list
-    /// it, or never will. The caller must keep that true: a `Start` emitted before this
-    /// input is sent on the earlier session, never on the new one.
+    /// A registration is the first `Hello` of a new stream, and opens a new session. A
+    /// `Hello` the daemon resends on the same stream because its node report changed is
+    /// not a registration. `Hello` carries no running set, so a registration requeues
+    /// nothing by itself: the worker's next heartbeat decides (see [`Event::Heartbeat`]).
+    ///
+    /// The caller must keep two things true. A `Start` emitted before this input is sent
+    /// on the earlier stream, never on the new one. A heartbeat from an earlier stream
+    /// that arrives after this input is not fed.
     WorkerUp {
         /// The worker.
         worker: WorkerId,
         /// What placement may book on it.
         capacity: Resources,
-        /// The leases the worker holds as it registers (a restarted daemon re-adopts
-        /// its runs; after a reboot there are none).
-        running: Vec<LeaseId>,
     },
-    /// A worker's heartbeat arrived, with the leases it holds.
+    /// A worker's heartbeat arrived on its newest stream, with the leases it holds.
     ///
     /// A committed lease the scheduler holds on the worker that `running` leaves out goes
-    /// back to the queue once its `Start` has been out for [`START_GRACE`]: the `Start`
-    /// was lost, or the worker no longer runs it. A lease whose result has already been
-    /// reported is kept whether listed or not.
+    /// back to the queue if its `Start` was sent to an earlier session (the worker either
+    /// received it before registering again, and then lists it, or never will), or once
+    /// its `Start` has been out for [`START_GRACE`] (the `Start` was lost, or the worker
+    /// no longer runs it). A lease whose `Start` is not yet sent, or whose result has
+    /// already been reported, is kept whether listed or not.
     ///
     /// [`START_GRACE`]: crate::fence::START_GRACE
     Heartbeat {
         /// The worker.
         worker: WorkerId,
-        /// The leases it holds: running, or ended with a result not yet acknowledged.
+        /// The leases it holds: running (a restarted daemon re-adopts its runs; after a
+        /// reboot there are none), or ended with a result not yet acknowledged.
         running: Vec<LeaseId>,
     },
     /// A caller asks for `request` to run. A joinable request with a running twin

@@ -468,15 +468,7 @@ impl StateMachine for Cell {
                     }
                     l.sessions.insert(from.clone(), session);
                     let worker = WorkerId::new(from.as_str());
-                    l.feed(
-                        now,
-                        SchedEvent::WorkerUp {
-                            worker,
-                            capacity,
-                            // The wire's Hello carries no running set.
-                            running: Vec::new(),
-                        },
-                    )
+                    l.feed(now, SchedEvent::WorkerUp { worker, capacity })
                 }
                 // A heartbeat of an older session belongs to a closed stream.
                 Msg::Heartbeat {
@@ -820,7 +812,8 @@ fn a_seed_replays_exactly() {
 /// (worker-1 rebooted, so their runs are gone: the operations are never answered and
 /// the bookings leak), a re-registration that waits for a grace before letting them go,
 /// and one that drops the leases a restarted daemon re-adopted and still runs (they
-/// would run twice).
+/// would run twice), as a registration fed the running set the wire's `Hello` lacks
+/// would.
 #[test]
 fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
     let scenario = Scenario {
