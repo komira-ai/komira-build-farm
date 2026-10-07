@@ -147,7 +147,7 @@ impl Isolation {
         program: PathBuf,
         args: &[String],
     ) -> (PathBuf, Vec<String>) {
-        let Self::Sandbox(sandbox) = self else {
+        let (Self::Sandbox(sandbox), Network::Off) = (self, network) else { // MUTANT
             return (program, args.to_vec());
         };
         let profile = match network {
