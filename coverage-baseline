@@ -1,1 +1,25 @@
-# Seeded from the first coverage run.
+# Coverage ratchet, checked by the CI coverage job (crates/kbf-coverage). One line per workspace
+# crate: line and branch coverage in percent, floored to hundredths; `-` means the crate
+# has nothing to measure. CI fails when a crate measures below its line here. The
+# target is 100.00 everywhere. The coverage job uploads the measured file as
+# `coverage-baseline.measured`; copy it here when coverage rises or a crate is added.
+# crate lines branches
+kbf-alert                  -        -
+kbf-caps               97.37    95.83
+kbf-coverage          100.00   100.00
+kbf-daemon             86.59    63.33
+kbf-driver-container       -        -
+kbf-estimator              -        -
+kbf-front              85.92    74.07
+kbf-it                 98.98    94.82
+kbf-meta               95.45    95.45
+kbf-objstore           92.00    81.96
+kbf-proto                  -        -
+kbf-raft               95.66    82.14
+kbf-sched              97.06    85.71
+kbf-segments           97.46    91.66
+kbf-server            100.00        -
+kbf-sim                97.51    89.28
+kbf-sim-cell               -        -
+kbf-store                  -        -
+kbf-types              97.63    91.66

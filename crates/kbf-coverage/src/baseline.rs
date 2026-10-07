@@ -81,7 +81,7 @@ pub fn parse(text: &str) -> Result<Baseline, BaselineError> {
 }
 
 const HEADER: &str = "\
-# Coverage ratchet for kbf-coverage (see crates/kbf-coverage). One line per workspace
+# Coverage ratchet, checked by the CI coverage job (crates/kbf-coverage). One line per workspace
 # crate: line and branch coverage in percent, floored to hundredths; `-` means the crate
 # has nothing to measure. CI fails when a crate measures below its line here. The
 # target is 100.00 everywhere. The coverage job uploads the measured file as

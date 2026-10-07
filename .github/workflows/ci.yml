@@ -174,7 +174,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
+      # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
+      # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
+      # it looks like LLVM issue 220574). Lines and branches, all the ratchet reads, are
+      # unaffected: their totals match llvm-cov's own text report.
       - name: Run the workspace tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
         run: |
           mkdir -p target/coverage
           cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch \
