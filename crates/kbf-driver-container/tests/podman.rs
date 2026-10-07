@@ -176,6 +176,8 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
         "find",
         graph_root.trim(),
         &cell.scratch.to_string_lossy(),
+        // Other tests remove their containers while this walks the store.
+        "-ignore_readdir_race",
         "-name",
         &marker,
     ]);
