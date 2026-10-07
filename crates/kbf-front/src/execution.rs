@@ -19,6 +19,8 @@
 //! estimator), and every action is hermetic, so it may be joined (a `networked` property
 //! does not exist yet). The lease kind is the platform's `kbf-lease` value, `action`
 //! when absent; any other value than `action` or `whole_machine` is INVALID_ARGUMENT.
+//! The platform's `gpu` value is the number of whole GPUs to book on top (0 when
+//! absent); a value that is not a whole number is INVALID_ARGUMENT.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
@@ -51,7 +53,11 @@ pub const LEASE_KIND_KEY: &str = "kbf-lease";
 /// The lease kinds a request may name. The default is the first.
 pub const LEASE_KINDS: [&str; 2] = ["action", "whole_machine"];
 
-/// What v0 books for every action: one core and 1 GiB.
+/// The platform key that asks for whole GPUs, each booked for the lease alone.
+pub const GPU_KEY: &str = "gpu";
+
+/// What v0 books for every action: one core and 1 GiB, plus the GPUs its `gpu`
+/// property asks for.
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler: the scheduler's request and the
@@ -210,12 +216,14 @@ where
             return Err(missing(&absent));
         }
 
-        let kind = lease_kind(platform(&decoded, command.as_ref()))?;
+        let platform = properties(platform(&decoded, command.as_ref()))?;
+        let kind = lease_kind(&platform)?;
+        let gpus = gpus(&platform)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
-                resources: DEFAULT_RESOURCES,
+                resources: DEFAULT_RESOURCES.with_gpus(gpus),
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
             },
@@ -284,11 +292,27 @@ fn required(d: Option<&reapi::Digest>, field: &str) -> Result<Digest, Status> {
     }
 }
 
-/// The lease kind a platform names, or INVALID_ARGUMENT.
-fn lease_kind(platform: Option<&reapi::Platform>) -> Result<String, Status> {
+/// The platform's properties, or INVALID_ARGUMENT for a repeated one.
+fn properties(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
     let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
-    let platform = Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
+        .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+/// The number of GPUs a platform asks for, or INVALID_ARGUMENT.
+fn gpus(platform: &Platform) -> Result<u64, Status> {
+    let Some(n) = platform.get(GPU_KEY) else {
+        return Ok(0);
+    };
+    n.parse().map_err(|_| {
+        Status::invalid_argument(format!(
+            "platform property {GPU_KEY}={n:?} is not a whole number of GPUs"
+        ))
+    })
+}
+
+/// The lease kind a platform names, or INVALID_ARGUMENT.
+fn lease_kind(platform: &Platform) -> Result<String, Status> {
     match platform.get(LEASE_KIND_KEY) {
         None => Ok(LEASE_KINDS[0].to_owned()),
         Some(kind) if LEASE_KINDS.contains(&kind) => Ok(kind.to_owned()),

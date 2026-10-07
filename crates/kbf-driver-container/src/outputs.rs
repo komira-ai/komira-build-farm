@@ -21,10 +21,19 @@
 //! being read holds a descriptor: the walk returns to a parent through the child's
 //! `..`, and refuses a `..` that is not the directory it came from (device and inode).
 //!
+//! No file is read into memory whole: each is hashed and then stored one chunk at a
+//! time ([`FileBlob`]), and one past the byte limit is refused after `limit + 1` bytes.
+//! The action's stdout and stderr are stored the same way, each within its own limit
+//! ([`collect_log`]).
+//!
+//! REAPI names are UTF-8 strings, sorted by code point. A name or symlink target in an
+//! output that is not UTF-8 fails the action ([`TreeError::NotUtf8`]) rather than
+//! being recorded altered: two such names could become one, and the sort order would
+//! no longer be REAPI's.
+//!
 //! Each system call runs on tokio's blocking pool.
 
 use std::ffi::OsStr;
-use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -38,7 +47,7 @@ use prost::Message;
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
-use crate::cas::{Cas, digest_of};
+use crate::cas::{Cas, FileBlob, digest_of};
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -56,14 +65,21 @@ pub struct OutputLimits {
     /// The most bytes one action's output files may hold together.
     #[arg(long = "output-max-bytes", default_value_t = OutputLimits::DEFAULT.max_bytes)]
     pub max_bytes: u64,
+    /// The most bytes each of the action's stdout and stderr may hold.
+    #[arg(
+        long = "output-max-stdio-bytes",
+        default_value_t = OutputLimits::DEFAULT.max_stdio_bytes
+    )]
+    pub max_stdio_bytes: u64,
 }
 
 impl OutputLimits {
-    /// 512 levels, a million entries, 16 GiB.
+    /// 512 levels, a million entries, 16 GiB of files, 1 GiB each of stdout and stderr.
     pub const DEFAULT: Self = Self {
         max_depth: 512,
         max_entries: 1_000_000,
         max_bytes: 16 << 30,
+        max_stdio_bytes: 1 << 30,
     };
 }
 
@@ -106,17 +122,17 @@ impl Budget {
         Ok(())
     }
 
-    /// Counts the bytes of the file read at `shown`; `None` is one that did not fit.
+    /// Counts the bytes of the file hashed at `shown`; `None` is one that did not fit.
     fn file(
         &mut self,
-        read: Option<(Vec<u8>, bool)>,
+        read: Option<(FileBlob, bool)>,
         shown: &Path,
-    ) -> Result<(Vec<u8>, bool), TreeError> {
-        let Some((bytes, executable)) = read else {
+    ) -> Result<(FileBlob, bool), TreeError> {
+        let Some((blob, executable)) = read else {
             return Err(limit(shown, Exceeded::Bytes, self.limits.max_bytes));
         };
-        self.bytes += bytes.len() as u64;
-        Ok((bytes, executable))
+        self.bytes += blob.size();
+        Ok((blob, executable))
     }
 }
 
@@ -129,7 +145,7 @@ fn limit(shown: &Path, what: Exceeded, limit: u64) -> TreeError {
 }
 
 /// Opens a directory, refusing a symlink in its place.
-const DIRECTORY: OFlags = OFlags::RDONLY
+pub(crate) const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
@@ -166,7 +182,7 @@ fn kind(stat: &Stat) -> Kind {
 
 /// Runs `f` on the blocking pool; a system call error is reported against `shown`
 /// (a path for the message only, never opened).
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     shown: &Path,
     f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
 ) -> Result<T, TreeError> {
@@ -208,31 +224,56 @@ fn examine(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<Kind>> {
     }
 }
 
-/// The bytes and executable bit of the regular file `name` in `dir`, or `None` when it
-/// holds more than `max` bytes (at most `max + 1` are read). The type is checked again
-/// on the open descriptor: an entry that stopped being a regular file after it was
-/// examined is an error, never read.
-fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(Vec<u8>, bool)>> {
-    let fd = rustix::fs::openat(dir, name, FILE, Mode::empty())?;
+/// The regular file `name` in `dir`, hashed, and its executable bit; `None` when it
+/// holds more than `max` bytes (see [`hash_regular`]).
+fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(FileBlob, bool)>> {
+    hash_regular(rustix::fs::openat(dir, name, FILE, Mode::empty())?, max)
+}
+
+/// The file open as `fd`, hashed ([`FileBlob::hash`]: at most `max + 1` bytes read,
+/// one chunk held at a time), and its executable bit. The type is checked on the
+/// descriptor: an entry that stopped being a regular file after it was examined is an
+/// error, never read.
+fn hash_regular(fd: OwnedFd, max: u64) -> std::io::Result<Option<(FileBlob, bool)>> {
     let Kind::File { executable } = kind(&rustix::fs::fstat(&fd)?) else {
         return Err(std::io::Error::other(
             "is no longer a regular file once opened",
         ));
     };
-    // The read itself is bounded, not trusted to `st_size`: a file can grow.
-    let mut bytes = Vec::new();
-    std::fs::File::from(fd)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= max).then_some((bytes, executable)))
+    Ok(FileBlob::hash(std::fs::File::from(fd), max)?.map(|blob| (blob, executable)))
 }
 
 /// The target of the symlink `name` in `dir`, as written; never followed.
-fn read_link(dir: &OwnedFd, name: &OsStr) -> std::io::Result<String> {
-    let target = rustix::fs::readlinkat(dir, name, Vec::new())?;
-    Ok(OsStr::from_bytes(target.as_bytes())
-        .to_string_lossy()
-        .into_owned())
+fn read_link(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Vec<u8>> {
+    Ok(rustix::fs::readlinkat(dir, name, Vec::new())?.into_bytes())
+}
+
+/// `bytes` as a REAPI string, or [`TreeError::NotUtf8`] naming `what` at `shown`.
+fn utf8(bytes: Vec<u8>, shown: &Path, what: &'static str) -> Result<String, TreeError> {
+    String::from_utf8(bytes).map_err(|_| TreeError::NotUtf8 {
+        path: shown.to_owned(),
+        what,
+    })
+}
+
+/// Stores the log the driver captured at `path` (the action's stdout or stderr) in
+/// the CAS one chunk at a time, and returns its digest. A log of more than `max` bytes
+/// fails with [`TreeError::Limit`] once `max + 1` bytes are read. The log is opened
+/// without following a symlink.
+pub(crate) async fn collect_log(
+    cas: &impl Cas,
+    path: &Path,
+    max: u64,
+) -> Result<kbf_proto::reapi::Digest, TreeError> {
+    let open = path.to_owned();
+    let read = blocking(path, move || {
+        hash_regular(rustix::fs::openat(CWD, &open, FILE, Mode::empty())?, max)
+    })
+    .await?;
+    let Some((blob, _)) = read else {
+        return Err(limit(path, Exceeded::Stdio, max));
+    };
+    Ok(cas.put_file(blob).await?)
 }
 
 /// An entry of a directory being walked: its name and what it is.
@@ -259,9 +300,9 @@ fn list(dir: &OwnedFd, max: u64) -> std::io::Result<Vec<Entry>> {
 }
 
 /// A directory's device and inode.
-type Identity = (u64, u64);
+pub(crate) type Identity = (u64, u64);
 
-fn identity(fd: &OwnedFd) -> std::io::Result<Identity> {
+pub(crate) fn identity(fd: &OwnedFd) -> std::io::Result<Identity> {
     let stat = rustix::fs::fstat(fd)?;
     Ok((stat.st_dev, stat.st_ino))
 }
@@ -281,7 +322,7 @@ fn open_listed(
 
 /// Opens the parent of `dir` through its `..`, refusing any directory but `expected`:
 /// the walk goes back only where it came from.
-fn back_to_parent(dir: &OwnedFd, expected: Identity) -> std::io::Result<OwnedFd> {
+pub(crate) fn back_to_parent(dir: &OwnedFd, expected: Identity) -> std::io::Result<OwnedFd> {
     let fd = rustix::fs::openat(dir, "..", DIRECTORY, Mode::empty())?;
     if identity(&fd)? != expected {
         return Err(std::io::Error::other(
@@ -350,10 +391,10 @@ pub(crate) async fn collect(
                 let max = budget.bytes_left();
                 let read =
                     blocking(&shown, move || read_file(&parent, name.as_os_str(), max)).await?;
-                let (bytes, executable) = budget.file(read, &shown)?;
+                let (blob, executable) = budget.file(read, &shown)?;
                 result.output_files.push(OutputFile {
                     path: path.clone(),
-                    digest: Some(cas.put(bytes).await?),
+                    digest: Some(cas.put_file(blob).await?),
                     is_executable: executable,
                     ..OutputFile::default()
                 });
@@ -378,7 +419,7 @@ pub(crate) async fn collect(
                 let target = blocking(&shown, move || read_link(&parent, name.as_os_str())).await?;
                 result.output_symlinks.push(OutputSymlink {
                     path: path.clone(),
-                    target,
+                    target: utf8(target, &shown, "symlink target")?,
                     ..OutputSymlink::default()
                 });
             }
@@ -462,9 +503,10 @@ async fn walk<C: Cas>(
             here = Arc::new(blocking(&top.shown, move || back_to_parent(&child, expected)).await?);
             continue;
         };
-        let name = String::from_utf8_lossy(&raw).into_owned();
         let path = top.shown.join(OsStr::from_bytes(&raw));
         let os_name = PathBuf::from(OsStr::from_bytes(&raw));
+        // UTF-8 names sort by code point as their bytes do, so `list`'s order is REAPI's.
+        let name = utf8(raw, &path, "name")?;
         let dir = Arc::clone(&here);
         match kind {
             Kind::Other => {}
@@ -472,10 +514,10 @@ async fn walk<C: Cas>(
                 let max = budget.bytes_left();
                 let read =
                     blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
-                let (bytes, executable) = budget.file(read, &path)?;
+                let (blob, executable) = budget.file(read, &path)?;
                 top.directory.files.push(FileNode {
                     name,
-                    digest: Some(cas.put(bytes).await?),
+                    digest: Some(cas.put_file(blob).await?),
                     is_executable: executable,
                     ..FileNode::default()
                 });
@@ -484,7 +526,7 @@ async fn walk<C: Cas>(
                 let target = blocking(&path, move || read_link(&dir, os_name.as_os_str())).await?;
                 top.directory.symlinks.push(SymlinkNode {
                     name,
-                    target,
+                    target: utf8(target, &path, "symlink target")?,
                     ..SymlinkNode::default()
                 });
             }
@@ -543,9 +585,10 @@ mod tests {
         // this function on its own, so this binary covers both arms).
         std::fs::write(dir.join("file"), b"bytes").expect("write");
         let read = read_file(&fd, OsStr::new("file"), 5).expect("a regular file");
-        assert_eq!(read, Some((b"bytes".to_vec(), false)));
+        let (blob, executable) = read.expect("within the bound");
+        assert_eq!((blob.digest(), executable), (&digest_of(b"bytes"), false));
         let read = read_file(&fd, OsStr::new("file"), 4).expect("a regular file");
-        assert_eq!(read, None);
+        assert!(read.is_none());
     }
 
     /// Catches the walk going back up into a directory other than the one it came
@@ -587,11 +630,13 @@ mod tests {
             "--output-max-depth=7",
             "--output-max-entries=8",
             "--output-max-bytes=9",
+            "--output-max-stdio-bytes=10",
         ];
         let limits = OutputLimits {
             max_depth: 7,
             max_entries: 8,
             max_bytes: 9,
+            max_stdio_bytes: 10,
         };
         assert_eq!(parse(&set).expect("set"), limits);
         assert!(parse(&["--output-max-depth=-1"]).is_err());

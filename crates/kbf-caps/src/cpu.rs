@@ -67,6 +67,9 @@ pub enum ParseError {
     /// The sysctl text lacks `hw.optional.arm64: 1`: not an Apple silicon Mac.
     #[error("sysctl text has no `hw.optional.arm64: 1`; only Apple silicon Macs are supported")]
     NotArm64Mac,
+    /// A PCI `class` or `vendor` value is not `0x` and hex digits of its width.
+    #[error("PCI value {0:?} is not `0x` and hex digits of the field's width")]
+    PciValue(String),
 }
 
 /// What a node's CPU can do: its architecture, every feature it reports, and the

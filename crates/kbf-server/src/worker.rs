@@ -178,29 +178,38 @@ fn message(message: server_message::Message) -> ServerMessage {
     }
 }
 
-/// What placement may book on a node: its `cpus` and `mem_gib` entries. v0 books the
-/// whole machine; the protected floors (RFC 4.3) are subtracted once they are reported.
+/// What placement may book on a node: its `cpus` and `mem_gib` entries, and its `gpu`
+/// entry (0 when absent: a daemon that does not detect GPUs has none to book). v0 books
+/// the whole machine; the protected floors (RFC 4.3) are subtracted once they are
+/// reported.
 ///
 /// # Errors
-/// An entry is missing, repeated or not a whole number.
+/// `cpus` or `mem_gib` is missing; an entry is repeated or not a whole number.
 pub fn capacity(hello: &Hello) -> Result<Resources, String> {
-    let cpus = entry(&hello.capabilities, "cpus")?;
-    let mem_gib = entry(&hello.capabilities, "mem_gib")?;
-    Ok(Resources::new(
-        cpus.saturating_mul(1_000),
-        mem_gib.saturating_mul(1 << 30),
-    ))
+    let required = |key| entry(&hello.capabilities, key)?.ok_or_else(|| missing(key));
+    let cpus = required("cpus")?;
+    let mem_gib = required("mem_gib")?;
+    let gpus = entry(&hello.capabilities, "gpu")?.unwrap_or(0);
+    Ok(Resources::new(cpus.saturating_mul(1_000), mem_gib.saturating_mul(1 << 30)).with_gpus(gpus))
 }
 
-fn entry(capabilities: &[Capability], key: &str) -> Result<u64, String> {
+fn missing(key: &str) -> String {
+    format!("the node report needs exactly one {key:?} entry")
+}
+
+/// The value of the `key` entry, `None` if there is none.
+fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> {
     let mut values = capabilities.iter().filter(|c| c.key == key);
-    let (Some(only), None) = (values.next(), values.next()) else {
-        return Err(format!("the node report needs exactly one {key:?} entry"));
+    let (only, None) = (values.next(), values.next()) else {
+        return Err(missing(key));
     };
-    only.value.parse().map_err(|_| {
-        format!(
-            "node report entry {key}={:?} is not a whole number",
-            only.value
-        )
+    only.map(|only| {
+        only.value.parse().map_err(|_| {
+            format!(
+                "node report entry {key}={:?} is not a whole number",
+                only.value
+            )
+        })
     })
+    .transpose()
 }

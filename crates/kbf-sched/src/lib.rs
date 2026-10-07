@@ -15,7 +15,8 @@
 //! - reconciliation of held leases with the running set each worker's heartbeats
 //!   send: a lease they leave out is requeued at once if its `Start` went to a session
 //!   before the worker registered again, else once its `Start` has been out for G;
-//! - first-fit placement of a CPU and memory request onto worker capacity;
+//! - first-fit placement of a CPU, memory and GPU request onto worker capacity, GPUs
+//!   whole and held by one lease each until it ends;
 //! - in-flight dedup by instance and action digest, with waiters attached to one
 //!   operation;
 //! - QoS levels ordering the queue (no quotas).
