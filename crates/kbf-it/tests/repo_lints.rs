@@ -11,7 +11,8 @@
 //! - a text file carrying a non-documentation IPv4 address or an absolute home path,
 //!   and a file holding a NUL byte whose extension is not on the binary allow list
 //!   (rules in `kbf_it::hygiene`);
-//! - the scans passing vacuously because git listed nothing or the workflows moved.
+//! - the scans passing vacuously because git listed nothing or the workflows moved;
+//! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod workflows;
 
@@ -63,6 +64,7 @@ fn read_bytes(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+/// A workflow file: `.github/workflows/<...>.yml` or `.yaml`, the extension in any case.
 fn is_workflow(f: &str) -> bool {
     let lower = f.to_ascii_lowercase();
     f.starts_with(".github/workflows/") && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
@@ -72,6 +74,59 @@ fn is_workflow(f: &str) -> bool {
 fn is_action_file(f: &str) -> bool {
     let name = f.rsplit('/').next().unwrap_or(f);
     name.eq_ignore_ascii_case("action.yml") || name.eq_ignore_ascii_case("action.yaml")
+}
+
+/// The directory of an action file, as a local `uses: ./<dir>` names it (`""` for the
+/// root).
+fn action_dir(f: &str) -> &str {
+    f.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Which rules the workflow lint applies to a file.
+#[derive(Debug, Clone, Copy)]
+enum Linted {
+    Workflow,
+    Action,
+}
+
+/// The workflow lint's problems with the file `f`, each prefixed with `f`. A file the
+/// lint cannot read is a problem, never skipped.
+fn lint_workflow_file(
+    f: &str,
+    bytes: &[u8],
+    linted: Linted,
+    repo: &workflows::Repo,
+) -> Vec<String> {
+    let found = match (workflows::decode(bytes), linted) {
+        (Ok(text), Linted::Action) => workflows::scan_action(text, repo),
+        (Ok(text), Linted::Workflow) => workflows::scan(text, repo),
+        (Err(e), _) => vec![e],
+    };
+    found.into_iter().map(|p| format!("{f}: {p}")).collect()
+}
+
+/// What the hygiene scan made of one file.
+#[derive(Debug, PartialEq, Eq)]
+enum TextFile {
+    /// Skipped: its extension is on the binary allow list.
+    Binary,
+    /// Not read, a problem; the message (prefixed with the path) says why.
+    Refused(String),
+    /// Decoded and scanned; holds the findings, each prefixed with the path.
+    Scanned(Vec<String>),
+}
+
+fn check_text_file(f: &str, bytes: &[u8]) -> TextFile {
+    match kbf_it::hygiene::decode(f, bytes) {
+        Ok(Some(text)) => TextFile::Scanned(
+            kbf_it::hygiene::scan(&text)
+                .iter()
+                .map(|p| format!("{f}: {p}"))
+                .collect(),
+        ),
+        Ok(None) => TextFile::Binary,
+        Err(e) => TextFile::Refused(format!("{f}: {e}")),
+    }
 }
 
 #[test]
@@ -94,22 +149,16 @@ fn workflows_are_hosted_pinned_and_least_privilege() {
         action_dirs: actions
             .iter()
             .filter(present)
-            .map(|f| f.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
+            .map(|f| action_dir(f).to_owned())
             .collect(),
         workflows: workflows.iter().filter(present).cloned().collect(),
     };
     let mut problems = Vec::new();
-    let files = workflows.iter().map(|f| (f, false));
-    for (f, is_action) in files.chain(actions.iter().map(|f| (f, true))) {
-        let Some(bytes) = read_bytes(&root.join(f)) else {
-            continue;
-        };
-        let found = match workflows::decode(&bytes) {
-            Ok(text) if is_action => workflows::scan_action(text, &repo),
-            Ok(text) => workflows::scan(text, &repo),
-            Err(e) => vec![e],
-        };
-        problems.extend(found.into_iter().map(|p| format!("{f}: {p}")));
+    let files = workflows.iter().map(|f| (f, Linted::Workflow));
+    for (f, linted) in files.chain(actions.iter().map(|f| (f, Linted::Action))) {
+        if let Some(bytes) = read_bytes(&root.join(f)) {
+            problems.extend(lint_workflow_file(f, &bytes, linted, &repo));
+        }
     }
     assert!(
         problems.is_empty(),
@@ -128,17 +177,13 @@ fn text_files_carry_no_addresses_or_home_paths() {
         let Some(bytes) = read_bytes(&root.join(f)) else {
             continue;
         };
-        let text = match kbf_it::hygiene::decode(f, &bytes) {
-            Ok(Some(text)) => text,
-            Ok(None) => continue,
-            Err(e) => {
-                problems.push(format!("{f}: {e}"));
-                continue;
+        match check_text_file(f, &bytes) {
+            TextFile::Binary => {}
+            TextFile::Refused(e) => problems.push(e),
+            TextFile::Scanned(found) => {
+                scanned += 1;
+                problems.extend(found);
             }
-        };
-        scanned += 1;
-        for p in kbf_it::hygiene::scan(&text) {
-            problems.push(format!("{f}: {p}"));
         }
     }
     assert!(
@@ -150,4 +195,141 @@ fn text_files_carry_no_addresses_or_home_paths() {
         "public hygiene:\n{}",
         problems.join("\n")
     );
+}
+
+/// The rules that pick which files each lint reads. The repository tests above cannot
+/// pin them: a selection that misses a file leaves those tests green.
+mod selection {
+    use super::*;
+
+    #[test]
+    fn action_files_are_selected_by_name_in_any_case() {
+        // Catches: an action file matched case-sensitively, so `Action.YAML` (which
+        // GitHub runs) escaped the action lint; or a match on a name prefix or suffix.
+        for f in [
+            "action.yml",
+            "action.yaml",
+            ".github/actions/t/Action.YAML",
+            "tools/x/ACTION.yml",
+        ] {
+            assert!(is_action_file(f), "{f}");
+        }
+        for f in [
+            "myaction.yml",
+            "action.yml.bak",
+            "action.json",
+            "action.yml/README.md",
+            ".github/workflows/ci.yml",
+        ] {
+            assert!(!is_action_file(f), "{f}");
+        }
+    }
+
+    #[test]
+    fn an_action_file_names_its_directory() {
+        // Catches: a wrong directory recorded for an action, so a valid `uses: ./<dir>`
+        // is refused, or the root action is keyed by its file name.
+        assert_eq!(action_dir("Action.yml"), "");
+        assert_eq!(
+            action_dir(".github/actions/t/action.yaml"),
+            ".github/actions/t"
+        );
+    }
+
+    #[test]
+    fn workflow_files_are_selected_by_extension_in_any_case() {
+        // Catches: a workflow extension matched case-sensitively, so `x.YML` escaped
+        // the workflow lint; or a file outside `.github/workflows/` linted as one.
+        for f in [
+            ".github/workflows/ci.yml",
+            ".github/workflows/x.YML",
+            ".github/workflows/y.Yaml",
+        ] {
+            assert!(is_workflow(f), "{f}");
+        }
+        for f in [
+            ".github/workflows/README.md",
+            ".github/workflows/ci.yml.orig",
+            ".github/ci.yml",
+            "docs/.github/workflows/ci.yml",
+        ] {
+            assert!(!is_workflow(f), "{f}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_workflow_or_action_is_refused_not_skipped() {
+        // Catches: a workflow or action file holding a NUL byte dropped from the lint
+        // without a problem, so its steps are never checked.
+        let repo = workflows::Repo::default();
+        let bytes = b"on: push\0\njobs: {}\n";
+        for (f, linted) in [
+            (".github/workflows/x.YML", Linted::Workflow),
+            ("t/Action.yml", Linted::Action),
+        ] {
+            assert_eq!(
+                lint_workflow_file(f, bytes, linted, &repo),
+                vec![format!(
+                    "{f}: line 0: the file holds a NUL byte, so it is not read"
+                )],
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_file_is_linted_as_an_action() {
+        // Catches: an action file read by the workflow rules (or the reverse), which
+        // refuses every valid action.
+        let repo = workflows::Repo::default();
+        let action = b"name: a\nruns: {using: node24, main: index.js}\n";
+        assert_eq!(
+            lint_workflow_file("action.yml", action, Linted::Action, &repo),
+            Vec::<String>::new()
+        );
+        assert!(!lint_workflow_file("action.yml", action, Linted::Workflow, &repo).is_empty());
+    }
+
+    #[test]
+    fn a_utf16_text_file_is_decoded_and_scanned() {
+        // Catches: a UTF-16 file (its ASCII holds NUL bytes) skipped or refused rather
+        // than decoded, or scanned as raw bytes; either hides an address from the scan.
+        // The address is assembled at run time so this file does not trip the scan.
+        let addr = format!("{}.1.2.3", 10);
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in format!("host {addr}\n").encode_utf16() {
+            bytes.extend(u.to_le_bytes());
+        }
+        assert_eq!(
+            check_text_file("notes.txt", &bytes),
+            TextFile::Scanned(vec![format!(
+                "notes.txt: line 1: private IPv4 address {addr}"
+            )])
+        );
+    }
+
+    #[test]
+    fn an_allow_listed_binary_file_is_skipped() {
+        // Catches: an allow-listed binary refused, or scanned as text.
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        for f in ["logo.png", "img/Logo.PNG"] {
+            assert_eq!(check_text_file(f, png), TextFile::Binary, "{f}");
+        }
+    }
+
+    #[test]
+    fn a_nul_text_file_off_the_allow_list_is_refused() {
+        // Catches: a text file with a planted NUL skipped as binary, so the rest of its
+        // text escapes the scan; or an allow-listed directory name or inner extension
+        // taken as binary.
+        let bytes = b"host text\0\n";
+        for f in ["notes.txt", "Makefile", "dir.png/Makefile", "a.png.txt"] {
+            let got = check_text_file(f, bytes);
+            assert!(
+                matches!(&got, TextFile::Refused(e)
+                    if e.starts_with(&format!("{f}: ")) && e.contains("NUL byte")),
+                "{f}: {got:?}"
+            );
+        }
+    }
 }
