@@ -136,9 +136,9 @@ fn limit(shown: &Path, what: Exceeded, limit: u64) -> OutputsError {
 }
 
 /// Opens a directory, refusing a symlink in its place.
+// MUTANT: directories on the way are opened through symlinks.
 const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
 /// Opens a regular file for reading, refusing a symlink, and never blocking on a FIFO
