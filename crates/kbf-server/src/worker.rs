@@ -8,7 +8,8 @@
 //!   the same node has registered since: then it is dropped unacknowledged, so a
 //!   daemon still talking on the old stream fences on time;
 //! - a `Result` is accepted only from the node holding the operation's current lease,
-//!   and answered with a `ResultAck`;
+//!   and answered with a `ResultAck`; it is handled in a task of its own, so the
+//!   heartbeats behind it are not held back;
 //! - an `Offer` is not read yet.
 
 use std::pin::Pin;
@@ -117,7 +118,7 @@ where
 }
 
 /// Handles one stream's messages after its first `Hello`, until it ends.
-async fn serve<M: MetaLog, O: ObjectStore>(
+async fn serve<M: MetaLog, O: ObjectStore + 'static>(
     farm: Arc<Farm<M, O>>,
     worker: WorkerId,
     stream: StreamId,
@@ -149,10 +150,20 @@ async fn serve<M: MetaLog, O: ObjectStore>(
                     server_message::Message::HeartbeatAck(HeartbeatAck { seq: beat.seq }),
                 )
             }
-            Some(daemon_message::Message::Result(result)) => farm
-                .report(&worker, result)
-                .await
-                .map(server_message::Message::ResultAck),
+            Some(daemon_message::Message::Result(result)) => {
+                // Checked and written off the stream: a slow output check or cache
+                // write must not hold back the heartbeats behind it. Order between
+                // results does not matter: the scheduler takes one per operation, and
+                // a daemon lists a result's lease as running until it is acknowledged
+                // (#26), so the heartbeats meanwhile do not give the lease up.
+                tokio::spawn(report(
+                    Arc::clone(&farm),
+                    worker.clone(),
+                    result,
+                    outbound.clone(),
+                ));
+                None
+            }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");
@@ -168,6 +179,19 @@ async fn serve<M: MetaLog, O: ObjectStore>(
     // sent meanwhile are lost, and the scheduler gives their leases up (at once on the
     // next session's first heartbeat, or after G).
     tracing::info!(%worker, "worker stream ended");
+}
+
+/// Takes one `Result` and sends its acknowledgement, if it gets one.
+async fn report<M: MetaLog, O: ObjectStore + 'static>(
+    farm: Arc<Farm<M, O>>,
+    worker: WorkerId,
+    result: kbf_proto::worker::Result,
+    outbound: Outbound,
+) {
+    if let Some(ack) = farm.report(&worker, result).await {
+        // A stream that has ended drops it; the daemon sends the result again.
+        let _ = outbound.send(Ok(message(server_message::Message::ResultAck(ack))));
+    }
 }
 
 fn message(message: server_message::Message) -> ServerMessage {

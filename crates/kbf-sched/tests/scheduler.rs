@@ -388,7 +388,8 @@ fn first_fit_books_cpu_and_memory_on_live_workers() {
 
 /// Catches: dedup that joins across instance names (another namespace's work answered
 /// with this one's result), joins networked or `do_not_cache` work, misses a twin, or
-/// joins a finished operation.
+/// joins a finished operation; and an `in_flight` lookup that disagrees with what a
+/// submission would join.
 #[test]
 fn in_flight_dedup_joins_only_the_same_instance_and_digest() {
     let mut h = Harness::new();
@@ -416,6 +417,15 @@ fn in_flight_dedup_joins_only_the_same_instance_and_digest() {
             ..request(1)
         },
     );
+    assert_eq!(
+        h.s.in_flight(&key("main", 1)),
+        Some((OperationId(0), &request(1)))
+    );
+    assert_eq!(
+        h.s.in_flight(&key("other", 1)).map(|(id, _)| id),
+        Some(OperationId(1))
+    );
+    assert_eq!(h.s.in_flight(&key("main", 2)), None);
     let grants = h.tick();
     assert_eq!(grants.len(), 4, "{grants:?}");
     assert_eq!(
@@ -428,9 +438,14 @@ fn in_flight_dedup_joins_only_the_same_instance_and_digest() {
     h.commit_and_start(&grants[0]);
     let answer = h.finish(&grants[0], ok(1));
     assert_eq!(answer.waiters, [WaiterId(1), WaiterId(2)]);
+    assert_eq!(h.s.in_flight(&key("main", 1)), None, "a finished twin");
     // Finished: the next caller gets a fresh operation.
     h.submit(6, request(1));
     assert_eq!(h.s.queued().collect::<Vec<_>>(), [OperationId(4)]);
+    assert_eq!(
+        h.s.in_flight(&key("main", 1)).map(|(id, _)| id),
+        Some(OperationId(4))
+    );
 }
 
 /// Catches: a queue ordered by arrival or by the enum's declaration order instead of

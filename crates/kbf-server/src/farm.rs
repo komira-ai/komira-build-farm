@@ -22,8 +22,8 @@ use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{self, LeaseOffer, ResultAck, ServerMessage, Start, server_message};
 use kbf_sched::{Event, Input, OpState, Scheduler};
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Resources, StartLease, StateMachine, WaiterId, WorkerId,
+    ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId,
+    OperationId, Outcome, Resources, StartLease, StateMachine, WaiterId, WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
@@ -78,7 +78,8 @@ struct State {
     waiters: BTreeMap<WaiterId, Waiter>,
     names: BTreeMap<String, WaiterId>,
     links: BTreeMap<WorkerId, Link>,
-    /// Leases whose `Start` was sent, and their operations.
+    /// Leases whose `Start` was sent and that the scheduler still holds, and their
+    /// operations.
     started: BTreeMap<LeaseId, OperationId>,
 }
 
@@ -276,45 +277,17 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
+        Ok(self.lock().attach(now, submission))
+    }
+
+    fn join(&self, key: &ActionKey) -> Option<Ticket> {
+        let now = self.now();
         let mut state = self.lock();
-        let waiter = WaiterId(state.next_waiter);
-        state.next_waiter += 1;
-        let name = format!("operations/{}", waiter.0);
-        let (stage, receiver) = watch::channel(Stage::Queued);
-        let action = submission.request.key.action;
-        state.names.insert(name.clone(), waiter);
-        state.waiters.insert(
-            waiter,
-            Waiter {
-                name: name.clone(),
-                key: submission.request.key.clone(),
-                kind: submission.kind,
-                do_not_cache: submission.request.do_not_cache,
-                stage,
-            },
-        );
-        state.feed_quiet(
-            now,
-            Event::Submit {
-                waiter,
-                request: submission.request,
-            },
-        );
-        // A caller that joined a twin already started sees it executing.
-        let joined_started = state.started.values().any(|op| {
-            state
-                .sched
-                .waiters(*op)
-                .is_some_and(|w| w.contains(&waiter))
-        });
-        if joined_started && let Some(w) = state.waiters.get(&waiter) {
-            w.stage.send_replace(Stage::Executing);
-        }
-        Ok(Ticket {
-            name,
-            action,
-            stage: receiver,
-        })
+        let (operation, request) = state.sched.in_flight(key)?;
+        let request = request.clone();
+        let kind = state.first_waiter(operation)?.kind.clone();
+        // The scheduler joins it: the request is the twin's own, so it is joinable.
+        Some(state.attach(now, Submission { request, kind }))
     }
 
     fn wait(&self, name: &str) -> Option<Ticket> {
@@ -329,6 +302,47 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
 }
 
 impl State {
+    /// Adds a caller for `submission` and feeds it to the scheduler, which queues it or
+    /// joins it to its running twin.
+    fn attach(&mut self, now: FarmTime, submission: Submission) -> Ticket {
+        let waiter = WaiterId(self.next_waiter);
+        self.next_waiter += 1;
+        let name = format!("operations/{}", waiter.0);
+        let (stage, receiver) = watch::channel(Stage::Queued);
+        let action = submission.request.key.action;
+        self.names.insert(name.clone(), waiter);
+        self.waiters.insert(
+            waiter,
+            Waiter {
+                name: name.clone(),
+                key: submission.request.key.clone(),
+                kind: submission.kind,
+                do_not_cache: submission.request.do_not_cache,
+                stage,
+            },
+        );
+        self.feed_quiet(
+            now,
+            Event::Submit {
+                waiter,
+                request: submission.request,
+            },
+        );
+        // A caller that joined a twin already started sees it executing.
+        let joined_started = self
+            .started
+            .values()
+            .any(|op| self.sched.waiters(*op).is_some_and(|w| w.contains(&waiter)));
+        if joined_started && let Some(w) = self.waiters.get(&waiter) {
+            w.stage.send_replace(Stage::Executing);
+        }
+        Ticket {
+            name,
+            action,
+            stage: receiver,
+        }
+    }
+
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
     }
@@ -383,7 +397,40 @@ impl State {
                 other => tracing::error!(?other, "an effect this server cannot carry out"),
             }
         }
+        self.forget_given_up();
         answers
+    }
+
+    /// Forgets each started lease the scheduler gave up (its operation went back to
+    /// the queue, maybe granted again under a new lease), and tells the callers of an
+    /// operation that is not running under another started lease that it is queued
+    /// again. Leases of finished operations are forgotten here too; their callers are
+    /// answered by [`State::settle`].
+    fn forget_given_up(&mut self) {
+        let sched = &self.sched;
+        let mut requeued = Vec::new();
+        self.started.retain(|lease, operation| {
+            let state = sched.state(*operation);
+            let current = matches!(
+                state,
+                Some(OpState::Leased { lease: held, .. } | OpState::Running { lease: held, .. })
+                    if held == lease
+            );
+            if !current && state.is_some_and(|s| !s.is_done()) {
+                requeued.push(*operation);
+            }
+            current
+        });
+        for operation in requeued {
+            if self.started.values().any(|op| *op == operation) {
+                continue;
+            }
+            for waiter in sched.waiters(operation).unwrap_or_default() {
+                if let Some(w) = self.waiters.get(waiter) {
+                    w.stage.send_replace(Stage::Queued);
+                }
+            }
+        }
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -433,9 +480,9 @@ impl State {
     }
 
     /// Forgets a finished operation and works out what its callers get. `pending` is
-    /// the OK result the answer accepted, if it accepted one.
+    /// the OK result the answer accepted, if it accepted one. Its started leases were
+    /// already forgotten by [`State::feed`].
     fn settle(&mut self, answer: &Answer, pending: Option<Pending>) -> Settled {
-        self.started.retain(|_, op| *op != answer.operation);
         let waiters: Vec<Waiter> = answer
             .waiters
             .iter()

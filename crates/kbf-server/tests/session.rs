@@ -146,8 +146,8 @@ async fn work_placed_while_a_node_is_away_runs_when_it_returns() {
     gone.close();
     let job = Job::new("while away", &[]);
     cell.upload(&job.blobs()).await;
-    // Give the server a moment to see the stream end.
-    tokio::time::sleep(support::INTERVAL).await;
+    // Whether or not the server has seen the stream end, the ended stream stays the
+    // node's link until it registers again, so the `Start` is lost either way.
     let mut ops = cell.execute(&job.action).await;
 
     let mut back = cell.daemon("node-a", 4, 8).await;

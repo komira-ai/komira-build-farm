@@ -43,19 +43,21 @@ pub const PROMPT: Duration = Duration::from_secs(5);
 /// heartbeat intervals.
 pub const QUIET: Duration = Duration::from_millis(400);
 
-/// How long the test server waits for a stream's `Hello`.
-pub const HELLO_WAIT: Duration = Duration::from_millis(300);
+/// How long the test server waits for a stream's `Hello`: long enough that a loaded
+/// runner does not miss a Hello that was sent; only the silent-stream case waits it out.
+pub const HELLO_WAIT: Duration = Duration::from_secs(2);
 
 /// The heartbeat interval the test server names in `Welcome`.
 pub const INTERVAL: Duration = Duration::from_millis(100);
 
-/// The in-memory metadata log, with a gate a test can close on the next query: the
-/// query waits there until the test opens it, so the test can act while the server is
-/// in the middle of a read.
+/// The in-memory metadata log, with a gate a test can close on the next query or on
+/// the next action-cache write: that call waits there until the test opens it, so the
+/// test can act while the server is in the middle of a read or a write.
 #[derive(Debug)]
 pub struct GateLog {
     inner: MemoryMetaLog,
     armed: AtomicBool,
+    write_armed: AtomicBool,
     entered: Notify,
     release: Notify,
 }
@@ -65,6 +67,7 @@ impl GateLog {
         Self {
             inner: MemoryMetaLog::new(Retention::default()),
             armed: AtomicBool::new(false),
+            write_armed: AtomicBool::new(false),
             entered: Notify::new(),
             release: Notify::new(),
         }
@@ -75,14 +78,26 @@ impl GateLog {
         self.armed.store(true, Ordering::SeqCst);
     }
 
-    /// Waits until a query is held at the gate.
+    /// Disarms the query gate; returns whether it was still armed (no query since it
+    /// was closed).
+    pub fn disarm(&self) -> bool {
+        self.armed.swap(false, Ordering::SeqCst)
+    }
+
+    /// Holds the next action-cache write (`PutAction` commit) at the gate. Other
+    /// commits pass.
+    pub fn close_on_next_action_write(&self) {
+        self.write_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits until a query or write is held at the gate.
     pub async fn held(&self) {
         timeout(PROMPT, self.entered.notified())
             .await
             .expect("a query reaches the gate");
     }
 
-    /// Lets the held query through.
+    /// Lets the held query or write through.
     pub fn open(&self) {
         self.release.notify_one();
     }
@@ -90,6 +105,12 @@ impl GateLog {
 
 impl MetaLog for GateLog {
     async fn commit(&self, command: MetaCommand) -> Result<Applied, MetaLogError> {
+        if matches!(command, MetaCommand::PutAction { .. })
+            && self.write_armed.swap(false, Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         self.inner.commit(command).await
     }
 
@@ -427,6 +448,12 @@ impl FakeDaemon {
     /// Sends a heartbeat listing `running` and returns whether it was acknowledged
     /// within [`QUIET`].
     pub async fn heartbeat(&mut self, running: &[LeaseId]) -> bool {
+        self.heartbeat_within(running, QUIET).await
+    }
+
+    /// Sends a heartbeat listing `running` and returns whether it was acknowledged
+    /// within `within`.
+    pub async fn heartbeat_within(&mut self, running: &[LeaseId], within: Duration) -> bool {
         self.seq += 1;
         let seq = self.seq;
         self.send(daemon_message::Message::Heartbeat(Heartbeat {
@@ -434,7 +461,7 @@ impl FakeDaemon {
             report_hash: Vec::new(),
             running: running.to_vec(),
         }));
-        self.expect_within(QUIET, |m| match m {
+        self.expect_within(within, |m| match m {
             server_message::Message::HeartbeatAck(a) if a.seq == seq => Some(()),
             _ => None,
         })
@@ -598,6 +625,17 @@ pub async fn done(ops: &mut Streaming<Operation>) -> Operation {
             return op;
         }
     }
+}
+
+/// The stage of the next update of `ops`, or `None` if none comes within [`PROMPT`].
+pub async fn next_stage(ops: &mut Streaming<Operation>) -> Option<i32> {
+    let op = timeout(PROMPT, ops.message()).await.ok()?;
+    Some(stage(&op.expect("a healthy stream").expect("an update")))
+}
+
+/// Whether `ops` stays without an update for [`QUIET`].
+pub async fn no_update_within_quiet(ops: &mut Streaming<Operation>) -> bool {
+    timeout(QUIET, ops.message()).await.is_err()
 }
 
 /// Whether `ops` produces a done operation within [`QUIET`].

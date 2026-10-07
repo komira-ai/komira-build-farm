@@ -76,6 +76,26 @@ impl Dispatch for Script {
         })
     }
 
+    fn join(&self, key: &ActionKey) -> Option<Ticket> {
+        let stages = self.stages.lock().unwrap_or_else(PoisonError::into_inner);
+        let submitted = self
+            .submitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let n = submitted
+            .iter()
+            .position(|s| &s.request.key == key && s.request.joinable())?;
+        let (name, tx) = &stages[n];
+        if matches!(*tx.borrow(), Stage::Done(_)) {
+            return None;
+        }
+        Some(Ticket {
+            name: name.clone(),
+            action: key.action,
+            stage: tx.subscribe(),
+        })
+    }
+
     fn wait(&self, name: &str) -> Option<Ticket> {
         let stages = self.stages.lock().unwrap_or_else(PoisonError::into_inner);
         let (name, tx) = stages.iter().find(|(n, _)| n == name)?;
@@ -497,7 +517,8 @@ async fn malformed_requests_are_invalid() {
 }
 
 /// Catches: a lease kind read from the wrong place (REAPI 2.2 clients put the platform
-/// in the Action, older ones in the Command), an unknown kind run as a shared action,
+/// in the Action, older ones in the Command), an empty Action platform taken over the
+/// Command's, an unknown kind run as a shared action,
 /// and a platform with a repeated property accepted.
 #[tokio::test]
 async fn the_lease_kind_comes_from_the_platform() {
@@ -509,24 +530,31 @@ async fn the_lease_kind_comes_from_the_platform() {
         .await;
     start(&farm, &in_action.action).await.expect("Execute");
 
-    // An older client: the Action has no platform, the Command has one.
-    let older = job("old", &[], false);
-    #[allow(deprecated)]
-    let command = Blob::of(&Command {
-        arguments: vec!["old".to_owned()],
-        platform: Some(Platform {
-            properties: vec![property("kbf-lease", "whole_machine")],
-        }),
-        ..Default::default()
-    });
-    let action = Blob::of(&Action {
-        command_digest: Some(command.proto.clone()),
-        input_root_digest: Some(older.blobs[2].proto.clone()),
-        ..Default::default()
-    });
-    farm.upload(&[&action, &command, &older.blobs[2], &older.blobs[3]])
-        .await;
-    start(&farm, &action).await.expect("Execute");
+    // An older client: the Action has no platform, or an empty one (as a 2.2 client
+    // that sets none may send), and the Command has one.
+    for (argv, action_platform) in [
+        ("old", None),
+        ("old, empty", Some(Platform { properties: vec![] })),
+    ] {
+        let older = job(argv, &[], false);
+        #[allow(deprecated)]
+        let command = Blob::of(&Command {
+            arguments: vec![argv.to_owned()],
+            platform: Some(Platform {
+                properties: vec![property("kbf-lease", "whole_machine")],
+            }),
+            ..Default::default()
+        });
+        let action = Blob::of(&Action {
+            command_digest: Some(command.proto.clone()),
+            input_root_digest: Some(older.blobs[2].proto.clone()),
+            platform: action_platform,
+            ..Default::default()
+        });
+        farm.upload(&[&action, &command, &older.blobs[2], &older.blobs[3]])
+            .await;
+        start(&farm, &action).await.expect("Execute");
+    }
 
     let submitted = script.submitted();
     assert_eq!(submitted[0].kind, "whole_machine");
@@ -535,6 +563,10 @@ async fn the_lease_kind_comes_from_the_platform() {
     assert_eq!(
         submitted[1].kind, "whole_machine",
         "the Command's platform ignored"
+    );
+    assert_eq!(
+        submitted[2].kind, "whole_machine",
+        "an empty Action platform hid the Command's"
     );
 
     for (why, props) in [
@@ -549,7 +581,47 @@ async fn the_lease_kind_comes_from_the_platform() {
         let status = start(&farm, &bad.action).await.expect_err(why);
         assert_eq!(status.code(), Code::InvalidArgument, "{why}");
     }
-    assert_eq!(script.submitted().len(), 2);
+    assert_eq!(script.submitted().len(), 3);
+}
+
+/// Catches: Execute that checks a running twin's inputs before joining it (RFC 5.3:
+/// the join, step 4, comes before the input check, step 5), so its caller is refused
+/// MISSING or pays for the reads; and a join that submits a second operation or hands
+/// back a ticket that does not follow the twin.
+#[tokio::test]
+async fn a_running_twin_is_joined_before_its_inputs_are_checked() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    // The scheduler runs a twin whose blobs this cell does not hold.
+    let twin = job("twin", &[], false);
+    let request = kbf_sched::Request {
+        key: ActionKey {
+            instance: "main".to_owned(),
+            action: twin.action.digest,
+        },
+        qos: Qos::Ci,
+        resources: DEFAULT_RESOURCES,
+        hermetic: true,
+        do_not_cache: false,
+    };
+    let kind = "action".to_owned();
+    script
+        .submit(Submission { request, kind })
+        .expect("the twin");
+
+    let mut ops = start(&farm, &twin.action)
+        .await
+        .expect("joined, not refused MISSING");
+    assert_eq!(script.submitted().len(), 1, "a join submitted again");
+    let first = next(&mut ops).await.expect("a stream").expect("an update");
+    assert_eq!(stage(&first), ExecStage::Queued as i32);
+    script.set(0, Stage::Executing);
+    let running = next(&mut ops).await.expect("a stream").expect("an update");
+    assert_eq!(
+        stage(&running),
+        ExecStage::Executing as i32,
+        "not the twin's"
+    );
 }
 
 /// Catches: a WaitExecution that does not follow the named operation, or that answers

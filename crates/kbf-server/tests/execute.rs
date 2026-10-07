@@ -7,7 +7,10 @@ use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_proto::reapi::{ActionResult, WaitExecutionRequest};
 use kbf_proto::worker::daemon_message;
 use kbf_proto::worker::server_message::Message;
-use support::{Blob, Cell, Job, done, done_within_quiet, failed, output, ran, response, stage};
+use support::{
+    Blob, Cell, Job, PROMPT, done, done_within_quiet, failed, next_stage, no_update_within_quiet,
+    output, ran, response, stage,
+};
 use tonic::Code;
 
 /// Runs `job` on `daemon` to completion and returns the result it reported.
@@ -31,8 +34,9 @@ async fn run_once(
 /// follows; a `Start` naming another action or kind; an operation that never reaches
 /// EXECUTING or never completes; a completed operation that does not carry the
 /// daemon's `ActionResult`; an accepted result missing from the action cache, or a
-/// `ResultAck` that does not say it was accepted; and a second result accepted for a
-/// finished operation.
+/// caller answered before the action-cache write commits (RFC 5.x: the AC write
+/// commits before DONE), or a finished operation's callers shown QUEUED; a `ResultAck` that does not say it was accepted; and a second
+/// result accepted for a finished operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn execute_runs_on_a_daemon_and_caches_the_result() {
     let cell = Cell::start().await;
@@ -64,10 +68,35 @@ async fn execute_runs_on_a_daemon_and_caches_the_result() {
     assert_eq!(stage(&first), ExecStage::Executing as i32, "placed at once");
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
 
+    // The action-cache write is held at the gate: the caller must not be answered,
+    // nor shown any other stage, while it is (an update sent first is already on the
+    // wire, so it arrives here). The ack follows the whole report, so it is not
+    // awaited until the write is let through.
     let result = output(&cell, "the build output", 0).await;
-    let ack = daemon.report(ran(start.lease_id, &result)).await;
-    assert!(ack.accepted, "{ack:?}");
+    cell.cache.meta().close_on_next_action_write();
+    daemon.send(daemon_message::Message::Result(ran(
+        start.lease_id,
+        &result,
+    )));
+    cell.cache.meta().held().await;
+    assert!(
+        no_update_within_quiet(&mut ops).await,
+        "answered (or shown another stage) before the AC write"
+    );
+    cell.cache.meta().open();
     let last = done(&mut ops).await;
+    assert_eq!(
+        cell.cached(&job.action).await,
+        Ok(result.clone()),
+        "answered before the AC write"
+    );
+    let ack = daemon
+        .expect("ResultAck", |m| match m {
+            Message::ResultAck(a) => Some(*a),
+            _ => None,
+        })
+        .await;
+    assert!(ack.accepted, "{ack:?}");
     assert_eq!(stage(&last), ExecStage::Completed as i32);
     let answer = response(&last);
     assert_eq!(answer.result, Some(result.clone()));
@@ -96,6 +125,10 @@ async fn a_stale_lease_result_is_rejected_and_never_cached() {
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
     let stale = first.start().await;
+    assert_eq!(
+        next_stage(&mut ops).await,
+        Some(ExecStage::Executing as i32)
+    );
 
     // node-a's daemon restarts and lists nothing: the old lease is given up at once
     // and the operation granted again, on the new stream.
@@ -103,6 +136,13 @@ async fn a_stale_lease_result_is_rejected_and_never_cached() {
     assert!(again.heartbeat(&[]).await);
     let current = again.start().await;
     assert_ne!(current.lease_id, stale.lease_id);
+    // Given up and granted again in one step: the callers see it executing, not
+    // queued behind the lease that was given up.
+    assert_eq!(
+        next_stage(&mut ops).await,
+        Some(ExecStage::Executing as i32),
+        "shown queued while a new lease runs it"
+    );
 
     let stale_result = output(&cell, "from the stale lease", 0).await;
     let ack = again.report(ran(stale.lease_id, &stale_result)).await;
@@ -137,6 +177,91 @@ async fn a_stale_lease_result_is_rejected_and_never_cached() {
     // The old stream's daemon still holds nothing the server will take.
     let late = output(&cell, "late, on the old stream", 0).await;
     assert!(!first.report(ran(stale.lease_id, &late)).await.accepted);
+}
+
+/// Catches: a caller left at EXECUTING after the only lease running its operation was
+/// given up and the operation went back to the queue; a caller who joins it then told
+/// it is executing when nothing runs it; and callers not shown EXECUTING again, or not
+/// answered, once it is granted again elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_given_up_lease_puts_its_callers_back_in_the_queue() {
+    let cell = Cell::start().await;
+    let mut first = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("requeued", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    first.start().await;
+    assert_eq!(
+        next_stage(&mut ops).await,
+        Some(ExecStage::Executing as i32)
+    );
+
+    // node-a's daemon restarts with no CPU and lists nothing: the lease is given up
+    // and nothing can take the operation.
+    let mut again = cell.daemon("node-a", 0, 8).await;
+    assert!(again.heartbeat(&[]).await);
+    assert_eq!(
+        next_stage(&mut ops).await,
+        Some(ExecStage::Queued as i32),
+        "a caller left executing after its lease was given up"
+    );
+    let mut joined = cell.execute(&job.action).await;
+    assert_eq!(
+        next_stage(&mut joined).await,
+        Some(ExecStage::Queued as i32),
+        "a joiner told it executes while nothing runs it"
+    );
+
+    let mut other = cell.daemon("node-b", 4, 8).await;
+    let start = other.start().await;
+    for caller in [&mut ops, &mut joined] {
+        assert_eq!(
+            next_stage(caller).await,
+            Some(ExecStage::Executing as i32),
+            "not shown executing once granted again"
+        );
+    }
+    let result = output(&cell, "from node-b", 0).await;
+    assert!(other.report(ran(start.lease_id, &result)).await.accepted);
+    for caller in [&mut ops, &mut joined] {
+        assert_eq!(response(&done(caller).await).result, Some(result.clone()));
+    }
+}
+
+/// Catches: a `Result` handled inline on its stream, so a slow output check or
+/// action-cache write holds back the heartbeats behind it while the node's leases age
+/// toward being given up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_result_does_not_hold_back_heartbeats() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("slow to cache", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&cell, "a slow cache write", 0).await;
+
+    cell.cache.meta().close_on_next_action_write();
+    daemon.send(daemon_message::Message::Result(ran(
+        start.lease_id,
+        &result,
+    )));
+    cell.cache.meta().held().await;
+    let running: Vec<_> = start.lease_id.into_iter().collect();
+    assert!(
+        daemon.heartbeat_within(&running, PROMPT).await,
+        "a heartbeat held back behind a result"
+    );
+    cell.cache.meta().open();
+
+    let ack = daemon
+        .expect("ResultAck", |m| match m {
+            Message::ResultAck(a) => Some(*a),
+            _ => None,
+        })
+        .await;
+    assert!(ack.accepted, "{ack:?}");
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
 }
 
 /// Catches: a result written to the action cache before the scheduler accepts it. The
@@ -211,7 +336,9 @@ async fn a_cached_action_is_answered_without_dispatch() {
 }
 
 /// Catches: in-flight dedup that does not join identical concurrent Executes (the
-/// action runs twice), and a joined caller that is not answered with the one result.
+/// action runs twice); a join that reads the twin's inputs first (RFC 5.3 orders the
+/// join before the input check); and a joined caller that is not answered with the
+/// one result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_concurrent_executes_dispatch_once() {
     let cell = Cell::start().await;
@@ -230,10 +357,22 @@ async fn identical_concurrent_executes_dispatch_once() {
     );
     daemon.no_work().await;
 
+    // A third caller, past the cache lookup, joins without reading the metadata (RFC
+    // 5.3: the join comes before the input check). A read would hold at the gate.
+    cell.cache.meta().close_on_next_query();
+    let three = tokio::time::timeout(PROMPT, cell.execute_with(&job.action, true)).await;
+    assert!(
+        cell.cache.meta().disarm(),
+        "a joining Execute read its inputs"
+    );
+    let mut three = three.expect("joined in time").expect("Execute");
+    daemon.no_work().await;
+
     let result = output(&cell, "built for both", 0).await;
     assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
-    assert_eq!(response(&done(&mut one).await).result, Some(result.clone()));
-    assert_eq!(response(&done(&mut two).await).result, Some(result));
+    for caller in [&mut one, &mut two, &mut three] {
+        assert_eq!(response(&done(caller).await).result, Some(result.clone()));
+    }
 }
 
 /// Catches: `do_not_cache` work that is joined to a twin, or written to the action

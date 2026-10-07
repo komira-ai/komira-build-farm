@@ -188,6 +188,14 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| op.waiters.as_slice())
     }
 
+    /// The unfinished joinable operation with `key` and its request, if there is one:
+    /// a joinable submission with this key joins it.
+    #[must_use]
+    pub fn in_flight(&self, key: &ActionKey) -> Option<(OperationId, &Request)> {
+        let id = *self.in_flight.get(key)?;
+        self.ops.get(&id).map(|op| (id, &op.request))
+    }
+
     /// The QoS level `operation` is queued at (raised when a more urgent caller joins).
     #[must_use]
     pub fn qos(&self, operation: OperationId) -> Option<&Qos> {

@@ -105,6 +105,11 @@ pub trait Dispatch: Send + Sync + 'static {
     /// The scheduler cannot take work (UNAVAILABLE).
     fn submit(&self, submission: Submission) -> Result<Ticket, Status>;
 
+    /// Joins the unfinished joinable operation with `key`, if there is one, and returns
+    /// the caller's ticket. Called before the inputs are checked (RFC 5.3: step 4
+    /// before step 5): a twin's inputs were checked when it was submitted.
+    fn join(&self, key: &ActionKey) -> Option<Ticket>;
+
     /// A new ticket on the unfinished operation called `name`, if there is one.
     fn wait(&self, name: &str) -> Option<Ticket>;
 }
@@ -159,7 +164,14 @@ where
             );
             return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
         }
-        let submission = self.submission(request.instance_name, action).await?;
+        let key = ActionKey {
+            instance: request.instance_name,
+            action,
+        };
+        if let Some(ticket) = self.dispatch.join(&key) {
+            return Ok(Response::new(operations(ticket)));
+        }
+        let submission = self.submission(key.instance, action).await?;
         let ticket = self.dispatch.submit(submission)?;
         Ok(Response::new(operations(ticket)))
     }
