@@ -1,0 +1,36 @@
+[package]
+name = "kbf-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The worker daemon binary. It lives apart from the `kbf-daemon` library because it
+# names the drivers, and the drivers depend on that library.
+[[bin]]
+name = "kbf-daemon"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kbf-daemon.workspace = true
+kbf-driver-native.workspace = true
+kbf-outputs.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# The container driver runs rootless Podman under cgroup v2: Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+kbf-driver-container.workspace = true
+kbf-proto.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+rcgen.workspace = true
+
+[lints]
+workspace = true

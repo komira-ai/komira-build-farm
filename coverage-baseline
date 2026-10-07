@@ -10,11 +10,14 @@ kbf-caps                  9      2
 kbf-coverage              0      0
 kbf-daemon               75     17
 kbf-driver-container      0      0
+kbf-driver-native         0      0
 kbf-estimator             -      -
 kbf-front                86      8
 kbf-it                    2      3
 kbf-meta                 10      1
+kbf-node                  0      0
 kbf-objstore             71     22
+kbf-outputs               0      0
 kbf-proto                 -      -
 kbf-raft                 23     20
 kbf-sched                 8      8

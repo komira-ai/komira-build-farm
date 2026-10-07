@@ -1,0 +1,25 @@
+[package]
+name = "kbf-driver-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kbf-daemon.workspace = true
+kbf-outputs.workspace = true
+kbf-proto.workspace = true
+kbf-types.workspace = true
+libc.workspace = true
+prost-types.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+prost.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

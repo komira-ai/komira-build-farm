@@ -15,6 +15,7 @@ use kbf_proto::google::bytestream::{
     WriteResponse,
 };
 use support::memory::MemoryCas;
+use support::scratch;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
@@ -162,4 +163,94 @@ async fn broken_calls_are_unavailable() {
         .await
         .expect_err("unimplemented");
     assert_eq!(status.code(), tonic::Code::Unimplemented);
+}
+
+/// A file of `len` patterned bytes in `dir`, opened for reading, and its digest.
+fn file_of(
+    dir: &std::path::Path,
+    name: &str,
+    len: usize,
+) -> (std::fs::File, kbf_proto::reapi::Digest) {
+    let bytes: Vec<u8> = (0..len).map(|i| (i % 239) as u8).collect();
+    let path = dir.join(name);
+    std::fs::write(&path, &bytes).expect("write");
+    (std::fs::File::open(&path).expect("open"), digest_of(&bytes))
+}
+
+/// Catches a streamed upload that loses, repeats or reorders bytes across message
+/// boundaries (a file of several chunks, one of exactly one chunk, an empty one), and
+/// a file shorter than its digest says, or not readable, taken as stored.
+#[tokio::test]
+async fn files_stream_through_the_front_in_chunks() {
+    let cas = front().await;
+    let dir = scratch("put-file");
+    for (name, len) in [
+        ("big", 2 * WRITE_CHUNK_BYTES + 12_345),
+        ("one", WRITE_CHUNK_BYTES),
+        ("empty", 0),
+    ] {
+        let (file, digest) = file_of(&dir, name, len);
+        assert_eq!(
+            cas.put_file(file, digest.clone()).await.expect(name),
+            digest
+        );
+        let bytes = fetch(&cas, &digest).await.expect("fetch");
+        assert_eq!(bytes.len(), len, "{name}");
+    }
+    // A digest that claims more bytes than the file holds: the front sees a short
+    // write and refuses it.
+    let (file, mut digest) = file_of(&dir, "short", 10);
+    digest.size_bytes = 20;
+    assert!(cas.put_file(file, digest).await.is_err());
+    // A file opened for writing only cannot be read.
+    let unreadable = std::fs::File::create(dir.join("write-only")).expect("create");
+    let error = cas
+        .put_file(unreadable, digest_of(b"x"))
+        .await
+        .expect_err("unreadable");
+    assert!(
+        matches!(&error, CasError::Unavailable(_, why) if why.starts_with("read: ")),
+        "{error:?}"
+    );
+    // A CAS that commits less than was sent.
+    let liar = CasClient::new(serve(Routes::new(ByteStreamServer::new(Liar))).await);
+    let (file, digest) = file_of(&dir, "liar", 5);
+    let error = liar.put_file(file, digest).await.expect_err("short commit");
+    assert!(
+        matches!(&error, CasError::Unavailable(_, why) if why.contains("committed 1 bytes of 5")),
+        "{error:?}"
+    );
+}
+
+/// Catches the trait's default `put_file` storing other bytes than the file's, taking
+/// a digest that does not match as stored, or an unreadable file as empty.
+#[tokio::test]
+async fn the_default_put_file_reads_the_file_and_checks_its_digest() {
+    let cas = MemoryCas::default();
+    let dir = scratch("default-put-file");
+    let (file, digest) = file_of(&dir, "f", 3000);
+    assert_eq!(
+        cas.put_file(file, digest.clone()).await.expect("stored"),
+        digest
+    );
+    assert_eq!(cas.blob(&digest).map(|b| b.len()), Some(3000));
+    let (file, _) = file_of(&dir, "g", 10);
+    let wrong = digest_of(b"something else");
+    let error = cas
+        .put_file(file, wrong.clone())
+        .await
+        .expect_err("mismatch");
+    assert!(
+        matches!(&error, CasError::Corrupt(blob, _) if *blob == label(&wrong)),
+        "{error:?}"
+    );
+    let unreadable = std::fs::File::create(dir.join("write-only")).expect("create");
+    let error = cas
+        .put_file(unreadable, wrong)
+        .await
+        .expect_err("unreadable");
+    assert!(
+        matches!(&error, CasError::Unavailable(_, why) if why.starts_with("read: ")),
+        "{error:?}"
+    );
 }

@@ -326,6 +326,42 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  # The native driver on a real Mac (Apple silicon). The process-tree kill, memory
+  # kill, output, cleanup and network tests run against libproc and sandbox-exec
+  # here (the Linux jobs run the same tests against /proc, where the network is not
+  # enforced); the daemon binary is built and started with each driver, which
+  # detects the node through sysctl.
+  native-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - run: cargo build -p kbf-node --bin kbf-daemon --locked
+      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # The container driver against real rootless Podman, inside a Delegate=yes system
   # unit (tools/ci/podman-tests.sh; the T4 spike found both arches carry it). The same
   # tests show as ignored, with their reason, in the plain test jobs above.

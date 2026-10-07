@@ -22,7 +22,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 kbf-front.workspace = true

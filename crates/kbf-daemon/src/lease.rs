@@ -149,6 +149,9 @@ pub(crate) fn result_of(
             Code::DeadlineExceeded,
             "the action ran past its timeout",
         ),
+        Err(oom @ RuntimeError::OutOfMemory { .. }) => {
+            failure(id, Code::ResourceExhausted, oom.to_string())
+        }
     }
 }
 
@@ -383,6 +386,13 @@ mod tests {
                 Code::FailedPrecondition,
             ),
             (RuntimeError::TimedOut, Code::DeadlineExceeded),
+            (
+                RuntimeError::OutOfMemory {
+                    used: 3 << 30,
+                    limit: 2 << 30,
+                },
+                Code::ResourceExhausted,
+            ),
         ];
         for (error, code) in codes {
             let why = error.to_string();
@@ -391,5 +401,12 @@ mod tests {
             assert!(result.action_result.is_none(), "{why}");
             assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
         }
+        // The OOM status says how much was used and what the limit was.
+        let oom = RuntimeError::OutOfMemory { used: 7, limit: 5 };
+        let message = result_of(id, Err(oom)).status.map(|s| s.message);
+        assert_eq!(
+            message.as_deref(),
+            Some("out of memory: the action used 7 bytes, past the lease's limit of 5")
+        );
     }
 }
