@@ -1051,6 +1051,7 @@ dependencies = [
  "clap",
  "hex",
  "kbf-proto",
+ "libc",
  "prost",
  "rustix",
  "sha2",

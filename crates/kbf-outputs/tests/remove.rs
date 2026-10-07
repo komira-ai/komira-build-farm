@@ -140,3 +140,53 @@ fn an_entry_that_cannot_be_examined_fails_the_removal() {
     chmod(&base.join("blind"), 0o755);
     remove_tree(&base.join("blind")).expect("remove");
 }
+
+/// Sets BSD file flags with `chflags`, as an action would (`-h`: on a link itself).
+#[cfg(target_os = "macos")]
+fn chflags(args: &[&str], path: &std::path::Path) {
+    let status = std::process::Command::new("/usr/bin/chflags")
+        .args(args)
+        .arg(path)
+        .status()
+        .expect("chflags");
+    assert!(status.success(), "chflags {args:?} {}", path.display());
+}
+
+/// Catches a removal that fails on what an action marked immutable or append-only
+/// (`chflags uchg`, `uappnd`: no privilege needed on macOS), whether a file, a link
+/// or a directory, the lease directory itself included; and one that clears the
+/// flags of what a link names instead of the link's own.
+#[cfg(target_os = "macos")]
+#[test]
+fn what_the_action_made_immutable_goes_too() {
+    use std::os::macos::fs::MetadataExt as _;
+    let base = scratch("flags");
+    let host = base.join("host");
+    std::fs::write(&host, b"keep").expect("write");
+    chflags(&["uchg"], &host);
+    let lease = base.join("lease");
+    std::fs::create_dir_all(lease.join("out/sub")).expect("mkdir");
+    std::fs::write(lease.join("out/x"), b"x").expect("write");
+    std::fs::write(lease.join("out/sub/y"), b"y").expect("write");
+    std::fs::write(lease.join("out/log"), b"l").expect("write");
+    symlink(&host, lease.join("out/to-host")).expect("symlink");
+    chflags(&["uchg"], &lease.join("out/x"));
+    chflags(&["uappnd"], &lease.join("out/log"));
+    chflags(&["-h", "uchg"], &lease.join("out/to-host"));
+    chflags(&["uappnd"], &lease.join("out/sub"));
+    chflags(&["uchg"], &lease.join("out"));
+    chflags(&["uchg"], &lease);
+    assert!(
+        std::fs::remove_file(lease.join("out/x")).is_err(),
+        "the flags hold before the removal"
+    );
+
+    remove_tree(&lease).expect("remove");
+    assert!(
+        std::fs::symlink_metadata(&lease).is_err(),
+        "the lease directory is gone"
+    );
+    let flags = std::fs::symlink_metadata(&host).expect("host").st_flags();
+    assert_ne!(flags & 0x2, 0, "the link's target keeps its uchg flag");
+    chflags(&["nouchg"], &host);
+}

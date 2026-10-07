@@ -9,8 +9,9 @@
 //!   memory, and every name must be UTF-8 (REAPI names are strings; a lossy decode
 //!   could make two names one).
 //! - [`remove_tree`] removes a directory tree iteratively, by descriptor, restoring
-//!   the owner's permissions on any directory the action locked, never following a
-//!   symlink.
+//!   the owner's permissions on any directory the action locked and, on macOS,
+//!   clearing the immutable and append-only user flags (`chflags uchg`, `uappnd`) it
+//!   set on any entry, never following a symlink.
 //!
 //! The native driver (`kbf-driver-native`) uses both. The container driver
 //! (`kbf-driver-container`) keeps its own copy of the walk for now; moving it onto

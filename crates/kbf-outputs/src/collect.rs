@@ -22,6 +22,12 @@
 //! A file of at most [`CHUNK_BYTES`] is read whole. A larger one is read once in
 //! chunks to hash it (stopping as soon as it passes the byte limit), then handed to
 //! [`Store::put_file`] from its start, so no output is ever held whole in memory.
+//! Between the two reads the file can change (by a process still writing it, which
+//! the caller must have ended, or by anything else that can write the file). The
+//! digest sent is then not the bytes'. The farm's CAS (`kbf-front`, which
+//! `kbf-server` serves) hashes every upload and refuses one whose bytes do not match
+//! its digest, so the upload fails rather than storing the wrong bytes under a
+//! digest; nothing here detects the change first.
 //!
 //! Each system call runs on tokio's blocking pool.
 
