@@ -102,3 +102,17 @@ async fn stdout_past_its_limit_and_a_failed_upload_fail_the_lease() {
     );
     assert!(no_leases(&config));
 }
+
+/// Catches an output file larger than a chunk held whole or stored with the wrong
+/// bytes: it goes to the CAS in chunks and comes back whole.
+#[tokio::test]
+async fn a_large_output_file_is_stored_whole() {
+    let dir = scratch("large");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let spec = Spec::sh("head -c 2500000 /dev/zero > big").outputs(&["big"]);
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    let digest = result.output_files[0].digest.as_ref().expect("digest");
+    assert_eq!(*digest, kbf_daemon::cas::digest_of(&vec![0; 2_500_000]));
+    assert_eq!(cas.blob(digest).len(), 2_500_000);
+}

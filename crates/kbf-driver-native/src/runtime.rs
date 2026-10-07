@@ -141,24 +141,20 @@ impl<C: Cas> NativeRuntime<C> {
             let parent = output.rsplit_once('/').map_or("", |(parent, _)| parent);
             real_dirs(&work_dir, parent).await.map_err(tree_error)?;
         }
-        // REAPI v2.3: a program path with a slash is relative to the working
-        // directory; a bare name is looked up in the Command's PATH.
-        let program = if program.contains('/') {
-            work_dir.join(program)
-        } else {
-            PathBuf::from(program)
-        };
+        let env: Vec<(String, String)> = command
+            .environment_variables
+            .iter()
+            .map(|v| (v.name.clone(), v.value.clone()))
+            .collect();
+        let program = resolve(program, &work_dir, &env)
+            .map_err(|e| RuntimeError::Failed(format!("{program}: {e}")))?;
         Ok(Prepared {
             root,
             work_dir,
             working_directory: command.working_directory.clone(),
             program,
             args: args.to_vec(),
-            env: command
-                .environment_variables
-                .iter()
-                .map(|v| (v.name.clone(), v.value.clone()))
-                .collect(),
+            env,
             outputs,
             timeout,
             network,
@@ -195,14 +191,9 @@ impl<C: Cas> NativeRuntime<C> {
             .stderr(stderr)
             .process_group(0)
             .kill_on_drop(true);
-        let mut child = spawn(&mut command)
+        let (mut child, leader) = spawn(&mut command)
             .await
             .map_err(failed(&prepared.program))?;
-        let Some(leader) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
-            return Err(RuntimeError::Failed(
-                "the spawned action has no pid".to_owned(),
-            ));
-        };
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
         let mut group = Group::new(Tracker::new(leader, me));
         let limit = self.config.memory.limit(work.resources.memory_bytes);
@@ -371,10 +362,10 @@ impl Group {
     /// The live processes of the action now, on the blocking pool.
     async fn members(&self) -> Result<Vec<Proc>, RuntimeError> {
         let tracker = Arc::clone(&self.tracker);
-        tokio::task::spawn_blocking(move || members_now(&tracker))
-            .await
-            .map_err(|e| RuntimeError::Failed(format!("process table: {e}")))?
-            .map_err(|e| RuntimeError::Failed(format!("process table: {e}")))
+        let members = tokio::task::spawn_blocking(move || members_now(&tracker)).await;
+        members
+            .map_err(task_failed("process table"))?
+            .map_err(failed(Path::new("process table")))
     }
 
     /// The memory the action's processes hold together, in bytes.
@@ -387,7 +378,7 @@ impl Group {
                 .fold(0_u64, u64::saturating_add)
         })
         .await
-        .map_err(|e| RuntimeError::Failed(format!("memory: {e}")))
+        .map_err(task_failed("memory"))
     }
 
     /// Ends every process of the action: SIGKILL to the group and to each process
@@ -416,7 +407,7 @@ impl Group {
         child
             .wait()
             .await
-            .map_err(|e| RuntimeError::Failed(format!("reap the action: {e}")))?;
+            .map_err(failed(Path::new("reap the action")))?;
         Ok(())
     }
 }
@@ -437,32 +428,71 @@ impl Drop for Group {
         if !self.armed {
             return;
         }
-        tracing::warn!("run dropped; killing the action's processes");
-        for _ in 0..100 {
+        let ended = (0..100).any(|_| {
             let members = members_now(&self.tracker).unwrap_or_default();
-            if members.is_empty() {
-                return;
-            }
             procs::kill_all(&lock(&self.tracker), &members);
             std::thread::sleep(KILL_PAUSE);
-        }
-        tracing::error!("processes of a dropped run survived SIGKILL");
+            members.is_empty()
+        });
+        tracing::warn!(ended, "run dropped; killed the action's processes");
     }
 }
 
 /// Spawns `command`, retrying while its program is busy: a just-written input file is
 /// briefly held open for writing by any child another thread forks before it execs
-/// (ETXTBSY).
-async fn spawn(command: &mut tokio::process::Command) -> std::io::Result<Child> {
+/// (ETXTBSY). Returns the child and its pid.
+async fn spawn(command: &mut tokio::process::Command) -> std::io::Result<(Child, i32)> {
     let give_up = Instant::now() + BUSY_WAIT;
     loop {
         match command.spawn() {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < give_up => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            spawned => return spawned,
+            spawned => {
+                let child = spawned?;
+                // A child that has not been waited for always has its pid.
+                let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
+                let pid = pid.ok_or_else(|| std::io::Error::other("the child has no pid"))?;
+                return Ok((child, pid));
+            }
         }
     }
+}
+
+/// Where `PATH` points when the Command sets none: what `execvp` searches then.
+const DEFAULT_PATH: &str = "/usr/bin:/bin";
+
+/// The program to run, REAPI v2.3's way: a path with a slash is relative to the
+/// working directory; a bare name is looked up in the Command's `PATH` (relative
+/// entries from the working directory too). Resolved here, not by `execvp`, so the
+/// sandbox wrapper is handed a path and a missing program fails the lease the same way
+/// with or without it.
+fn resolve(program: &str, work_dir: &Path, env: &[(String, String)]) -> std::io::Result<PathBuf> {
+    if program.contains('/') {
+        let path = work_dir.join(program);
+        return executable(&path).then_some(path).ok_or_else(not_found);
+    }
+    let path = env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "PATH")
+        .map_or(DEFAULT_PATH, |(_, value)| value.as_str());
+    path.split(':')
+        .map(|dir| work_dir.join(dir).join(program))
+        .find(|candidate| executable(candidate))
+        .ok_or_else(not_found)
+}
+
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+fn not_found() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no such executable file (searched as REAPI v2.3 says)",
+    )
 }
 
 /// The exit status, or 128 plus the signal number for a process a signal ended (the
@@ -485,9 +515,8 @@ impl LeaseDir {
     async fn clean(mut self) -> Result<(), String> {
         self.armed = false;
         let path = self.path.clone();
-        tokio::task::spawn_blocking(move || clean(&path))
-            .await
-            .map_err(|e| format!("clean task: {e}"))?
+        let cleaned = tokio::task::spawn_blocking(move || clean(&path)).await;
+        cleaned.map_err(|e| format!("clean task: {e}"))?
     }
 }
 
@@ -498,10 +527,8 @@ fn clean(path: &Path) -> Result<(), String> {
 impl Drop for LeaseDir {
     fn drop(&mut self) {
         if self.armed {
-            tracing::warn!(dir = %self.path.display(), "run dropped; cleaning up");
-            if let Err(why) = clean(&self.path) {
-                tracing::error!("clean: {why}");
-            }
+            let cleaned = clean(&self.path);
+            tracing::warn!(dir = %self.path.display(), ?cleaned, "run dropped; cleaned up");
         }
     }
 }
@@ -569,6 +596,12 @@ fn outputs_error(error: OutputsError) -> RuntimeError {
     }
 }
 
+/// A blocking-pool task for `what` that did not finish (it panicked, or the runtime
+/// shut down) as the lease reports it: the farm's.
+fn task_failed(what: &'static str) -> impl FnOnce(tokio::task::JoinError) -> RuntimeError {
+    move |error| RuntimeError::Failed(format!("{what}: {error}"))
+}
+
 /// An I/O failure at `path` as the lease reports it: the farm's.
 fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
     move |error| RuntimeError::Failed(format!("{}: {error}", path.display()))
@@ -634,6 +667,36 @@ mod tests {
         assert_eq!(shown(outputs_error(io)), "Failed(\"p: disk\")");
     }
 
+    /// Catches a bare program name not looked up in the Command's PATH (or looked up in
+    /// the daemon's), a relative PATH entry not taken from the working directory, the
+    /// default PATH not used when the Command sets none, and a path that is not an
+    /// executable file accepted.
+    #[test]
+    fn programs_resolve_as_reapi_says() {
+        let wd = Path::new("/nonexistent/wd");
+        let env = |path: &str| vec![("PATH".to_owned(), path.to_owned())];
+        assert_eq!(
+            resolve("sh", wd, &env("/nonexistent:/bin")).expect("in PATH"),
+            Path::new("/bin/sh")
+        );
+        assert_eq!(
+            resolve("env", wd, &[]).expect("default PATH"),
+            Path::new("/usr/bin/env")
+        );
+        assert!(resolve("sh", wd, &env("/nonexistent")).is_err());
+        assert!(
+            resolve("sh", wd, &env("bin")).is_err(),
+            "relative to the working directory"
+        );
+        assert_eq!(
+            resolve("/bin/sh", wd, &[]).expect("absolute"),
+            Path::new("/bin/sh")
+        );
+        assert!(resolve("./tool", wd, &[]).is_err());
+        let err = resolve("/etc/hosts", wd, &[]).expect_err("not executable");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
     /// Catches a spawn that gives up at once on a program still open for writing (a
     /// just-materialised input another fork briefly holds), instead of retrying.
     #[cfg(target_os = "linux")]
@@ -662,10 +725,19 @@ mod tests {
         });
         let mut command = tokio::process::Command::new(&program);
         let started = Instant::now();
-        let mut child = spawn(&mut command).await.expect("spawned once closed");
+        let (mut child, pid) = spawn(&mut command).await.expect("spawned once closed");
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");
+        assert!(pid > 0);
         assert_eq!(child.wait().await.expect("wait").code(), Some(7));
         closer.await.expect("closer");
+        // Held open for writing past the wait: the spawn gives up with ETXTBSY.
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("open");
+        let busy = spawn(&mut command).await.expect_err("still busy");
+        assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
+        drop(held);
         std::fs::remove_file(&program).expect("remove");
     }
 }

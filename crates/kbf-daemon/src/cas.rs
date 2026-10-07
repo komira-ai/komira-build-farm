@@ -209,10 +209,10 @@ impl Cas for CasClient {
         let response = client.write(upload).await;
         // A chunk that could not be read ends the upload short; that is the error to
         // report, over the front's complaint about the short write.
-        let fed = feeder
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-        if let Err(e) = fed {
+        let fed = feeder.await;
+        // A feeder that did not finish (a panic, a runtime shutting down) failed to read.
+        let fed = fed.unwrap_or_else(|e| Err(Stop::Read(std::io::Error::other(e))));
+        if let Err(Stop::Read(e)) = fed {
             return Err(CasError::Read(label(&digest), e.to_string()));
         }
         let response = response
@@ -225,21 +225,21 @@ impl Cas for CasClient {
 /// Sends the WriteRequests that upload `chunks` as the blob `name`, `size` bytes long,
 /// none carrying more than [`WRITE_CHUNK_BYTES`]. The first names the resource; the
 /// one that reaches `size` bytes, or an empty one sent when the chunks end short of
-/// it, finishes the write. A chunk that cannot be read stops it with that error; an
-/// upload that stopped listening (the front refused it) stops it quietly.
+/// it, finishes the write.
 async fn feed(
     name: String,
     size: i64,
     chunks: Chunks,
     mut requests: mpsc::Sender<WriteRequest>,
-) -> std::io::Result<()> {
+) -> Result<(), Stop> {
     let mut pieces = chunks.flat_map(split);
     let mut offset = 0_i64;
     loop {
         let data = if offset >= size {
             Vec::new()
         } else {
-            pieces.next().await.transpose()?.unwrap_or_default()
+            let next = pieces.next().await.transpose().map_err(Stop::Read)?;
+            next.unwrap_or_default()
         };
         let next = offset + data.len() as i64;
         let finish = next >= size || data.is_empty();
@@ -253,11 +253,21 @@ async fn feed(
             finish_write: finish,
             data,
         };
-        if requests.send(request).await.is_err() || finish {
+        requests.send(request).await.map_err(|_| Stop::Upload)?;
+        if finish {
             return Ok(());
         }
         offset = next;
     }
+}
+
+/// Why [`feed`] stopped before the last message.
+enum Stop {
+    /// A chunk could not be read.
+    Read(std::io::Error),
+    /// The upload stopped taking messages: the front refused it, and its status says
+    /// why.
+    Upload,
 }
 
 /// `chunk` in pieces of at most [`WRITE_CHUNK_BYTES`]; an error stays one item.

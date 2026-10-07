@@ -29,7 +29,7 @@ impl<C: Cas> Store for CasStore<C> {
 fn chunks(file: std::fs::File) -> Chunks {
     Box::pin(stream::unfold(Some(file), |state| async move {
         let file = state?;
-        let read = tokio::task::spawn_blocking(move || {
+        let joined = tokio::task::spawn_blocking(move || {
             let mut chunk = Vec::new();
             let mut file = file;
             (&mut file)
@@ -37,8 +37,9 @@ fn chunks(file: std::fs::File) -> Chunks {
                 .read_to_end(&mut chunk)
                 .map(|_| (file, chunk))
         })
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        .await;
+        // A task that did not finish (a panic, a runtime shutting down) is a failed read.
+        let read = joined.unwrap_or_else(|e| Err(std::io::Error::other(e)));
         match read {
             Ok((_, chunk)) if chunk.is_empty() => None,
             Ok((file, chunk)) => Some((Ok(chunk), Some(file))),

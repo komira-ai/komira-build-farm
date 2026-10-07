@@ -81,14 +81,18 @@ impl Isolation {
         }
     }
 
-    /// This node's isolation: `sandbox-exec` on a Mac that has it, none elsewhere.
+    /// This node's isolation: `sandbox-exec` on a Mac that has it.
+    #[cfg(target_os = "macos")]
     #[must_use]
     pub fn detect() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::detect_at(Path::new(SANDBOX_EXEC))
-        } else {
-            Self::None
-        }
+        Self::detect_at(Path::new(SANDBOX_EXEC))
+    }
+
+    /// This node's isolation: none, off macOS.
+    #[cfg(not(target_os = "macos"))]
+    #[must_use]
+    pub fn detect() -> Self {
+        Self::None
     }
 
     /// The value of the [`CAPABILITY`] entry in the node report.
@@ -214,8 +218,7 @@ mod tests {
             Isolation::detect_at(&here),
             Isolation::Sandbox(here.clone())
         );
-        if cfg!(target_os = "linux") {
-            assert_eq!(Isolation::detect(), Isolation::None);
-        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(Isolation::detect(), Isolation::None);
     }
 }

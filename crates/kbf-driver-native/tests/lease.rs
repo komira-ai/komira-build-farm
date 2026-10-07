@@ -199,3 +199,33 @@ async fn a_kill_during_the_fetch_stops_the_lease() {
     assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
     assert!(no_leases(&config));
 }
+
+/// Catches a lease directory that could not be removed reported as success (a node
+/// filling up unseen), and a failed clean hiding the action's own outcome. The action
+/// takes write permission from the scratch root, so its lease directory cannot be
+/// unlinked from it.
+#[tokio::test]
+async fn a_lease_directory_that_stays_fails_the_lease() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("clean-fails");
+    let config = config(&dir);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let reopen = || {
+        std::fs::set_permissions(&config.scratch, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    };
+    let outcome = run(&rt, &cas, 1, &Spec::sh("chmod 555 ../..")).await;
+    reopen();
+    assert!(
+        matches!(&outcome, Err(RuntimeError::Failed(why)) if why.starts_with("clean: ")),
+        "{outcome:?}"
+    );
+    let spec = Spec::sh("chmod 555 ../..; sleep 300").timeout(Duration::from_millis(300));
+    let outcome = run(&rt, &cas, 2, &spec).await;
+    reopen();
+    assert!(
+        matches!(outcome, Err(RuntimeError::TimedOut)),
+        "{outcome:?}"
+    );
+}

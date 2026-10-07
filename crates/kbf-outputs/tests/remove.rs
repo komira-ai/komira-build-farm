@@ -125,3 +125,16 @@ fn the_path_itself_may_be_a_link_a_file_or_absent() {
     remove_tree(std::path::Path::new("kbf-outputs-absent")).expect("nothing to remove");
     assert!(remove_tree(std::path::Path::new("/")).is_err());
 }
+
+/// Catches an entry that cannot be examined (its directory may be read but not
+/// searched) skipped as if absent: the removal fails and says so.
+#[test]
+fn an_entry_that_cannot_be_examined_fails_the_removal() {
+    let base = scratch("blind");
+    std::fs::create_dir(base.join("blind")).expect("mkdir");
+    std::fs::create_dir(base.join("blind/child")).expect("mkdir");
+    chmod(&base.join("blind"), 0o400);
+    assert!(remove_tree(&base.join("blind/child")).is_err());
+    chmod(&base.join("blind"), 0o755);
+    remove_tree(&base.join("blind")).expect("remove");
+}

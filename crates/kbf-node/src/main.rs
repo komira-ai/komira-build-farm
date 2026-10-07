@@ -26,6 +26,7 @@ use clap::Parser;
 use kbf_daemon::{Args, CasClient, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime};
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime};
 use kbf_outputs::OutputLimits;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tonic::transport::Endpoint;
 
 /// The `kbf-daemon` command line.
@@ -117,20 +118,14 @@ fn serve<R: Runtime>(
         .with_entries(cli.daemon.label_entries())
         .with_entries(extra);
     let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtime, report)?;
-    tokio.block_on(daemon.run(shutdown()));
+    let term = signal(SignalKind::terminate())?;
+    let int = signal(SignalKind::interrupt())?;
+    tokio.block_on(daemon.run(shutdown(term, int)));
     Ok(())
 }
 
 /// Completes on SIGTERM or SIGINT.
-async fn shutdown() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) else {
-        tracing::error!("cannot listen for SIGTERM and SIGINT; running until killed");
-        return std::future::pending().await;
-    };
+async fn shutdown(mut term: Signal, mut int: Signal) {
     let name = tokio::select! {
         _ = term.recv() => "SIGTERM",
         _ = int.recv() => "SIGINT",

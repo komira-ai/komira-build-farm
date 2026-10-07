@@ -83,25 +83,7 @@ impl NodeReport {
     /// Detects this machine's report. `drivers` are the execution drivers the daemon
     /// offers.
     pub fn detect(drivers: &[&str]) -> Result<Self, DetectError> {
-        if cfg!(target_os = "linux") {
-            let cpuinfo = read("/proc/cpuinfo")?;
-            let meminfo = read("/proc/meminfo")?;
-            let smaps = read("/proc/self/smaps")?;
-            let gpus = linux_gpus(Path::new(PCI_DEVICES))?;
-            linux_report(&cpuinfo, &meminfo, &smaps, gpus, drivers)
-        } else if cfg!(target_os = "macos") {
-            let optional = sysctl(&["hw.optional"])?;
-            let numbers = sysctl(&[
-                "-n",
-                "hw.ncpu",
-                "hw.memsize",
-                "hw.pagesize",
-                "machdep.cpu.brand_string",
-            ])?;
-            macos_report(&optional, &numbers, drivers)
-        } else {
-            Err(DetectError::UnsupportedOs(std::env::consts::OS))
-        }
+        detect_here(drivers)
     }
 
     /// This report with `entries` added (node labels, driver capabilities).
@@ -139,6 +121,37 @@ fn report_hash(capabilities: &[Capability]) -> Vec<u8> {
     Sha256::digest(only_caps.encode_to_vec()).to_vec()
 }
 
+/// This Linux node's report.
+#[cfg(target_os = "linux")]
+fn detect_here(drivers: &[&str]) -> Result<NodeReport, DetectError> {
+    let cpuinfo = read("/proc/cpuinfo")?;
+    let meminfo = read("/proc/meminfo")?;
+    let smaps = read("/proc/self/smaps")?;
+    let gpus = linux_gpus(Path::new(PCI_DEVICES))?;
+    linux_report(&cpuinfo, &meminfo, &smaps, gpus, drivers)
+}
+
+/// This Mac's report.
+#[cfg(target_os = "macos")]
+fn detect_here(drivers: &[&str]) -> Result<NodeReport, DetectError> {
+    let optional = sysctl(&["hw.optional"])?;
+    let numbers = sysctl(&[
+        "-n",
+        "hw.ncpu",
+        "hw.memsize",
+        "hw.pagesize",
+        "machdep.cpu.brand_string",
+    ])?;
+    macos_report(&optional, &numbers, drivers)
+}
+
+/// No detection here yet.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_here(_drivers: &[&str]) -> Result<NodeReport, DetectError> {
+    Err(DetectError::UnsupportedOs(std::env::consts::OS))
+}
+
+#[cfg(target_os = "linux")]
 fn read(path: &'static str) -> Result<String, DetectError> {
     std::fs::read_to_string(path).map_err(|source| DetectError::Read { path, source })
 }
@@ -147,6 +160,7 @@ fn read(path: &'static str) -> Result<String, DetectError> {
 const SYSCTL: &str = "/usr/sbin/sysctl";
 
 /// The standard output of `sysctl` with `args`.
+#[cfg(any(target_os = "macos", test))]
 fn sysctl(args: &[&str]) -> Result<String, DetectError> {
     let failed = |source: std::io::Error| DetectError::Read {
         path: SYSCTL,
@@ -232,6 +246,7 @@ fn common_entries(
 }
 
 /// Where Linux lists the PCI functions, one directory each.
+#[cfg(target_os = "linux")]
 const PCI_DEVICES: &str = "/sys/bus/pci/devices";
 
 /// The GPUs among the PCI functions listed under `devices` (laid out as
@@ -431,10 +446,13 @@ mod tests {
             ("8\n1024\n16384\n", "machdep.cpu.brand_string"),
             ("8\n1024\n16384\n\n", "machdep.cpu.brand_string"),
         ] {
+            // Compared as text: a pattern guard would be a branch the coverage ratchet
+            // counts and no run takes.
             let error = macos_report(M3_ULTRA, numbers, &[]).expect_err(numbers);
-            assert!(
-                matches!(error, DetectError::Missing { what: w, .. } if w == what),
-                "{numbers:?}: {error}"
+            assert_eq!(
+                error.to_string(),
+                format!("{SYSCTL} has no {what}"),
+                "{numbers:?}"
             );
         }
         assert!(matches!(

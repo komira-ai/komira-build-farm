@@ -529,3 +529,30 @@ async fn store_file_stores_small_and_large_files() {
     let root = kbf_outputs::store_file(&store, Path::new("/"), u64::MAX).await;
     assert!(matches!(root, Err(OutputsError::Invalid(_))), "{root:?}");
 }
+
+/// Catches a directory the walk may not enter taken for an absent output and left
+/// out without a word: one without permissions on an output's path, and one that
+/// may be read but not searched, both fail the collection.
+#[tokio::test]
+async fn a_directory_the_walk_may_not_enter_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("no-entry");
+    std::fs::create_dir_all(root.join("locked/sub")).expect("mkdir");
+    std::fs::create_dir(root.join("blind")).expect("mkdir");
+    std::fs::write(root.join("blind/f"), b"x").expect("write");
+    let chmod = |dir: &str, mode| {
+        std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(mode))
+            .expect("chmod");
+    };
+    chmod("locked", 0o000);
+    chmod("blind", 0o400);
+    let store = MemoryStore::default();
+    for path in ["locked/sub/f", "blind/f"] {
+        let why = run(&store, &root, "", &[path], OutputLimits::DEFAULT)
+            .await
+            .expect_err(path);
+        assert!(matches!(why, OutputsError::Io { .. }), "{path}: {why}");
+    }
+    chmod("locked", 0o755);
+    chmod("blind", 0o755);
+}
