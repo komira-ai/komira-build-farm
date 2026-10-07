@@ -125,14 +125,25 @@ impl LeaseCgroup {
 /// child cgroup made after the listing) gets the whole tree killed (`cgroup.kill`: the
 /// lease is over) and the removal starts again from a fresh listing.
 fn remove_tree(dir: &Path) -> io::Result<()> {
-    let mut tries = 0;
+    retry_busy(dir, REMOVE_TRIES, REMOVE_PAUSE, &mut remove_once)
+}
+
+/// Runs `remove` on `dir` until it succeeds, fails with anything but EBUSY, or has
+/// failed busy `tries` times. Before each retry it writes `cgroup.kill` in `dir`.
+fn retry_busy(
+    dir: &Path,
+    tries: u32,
+    pause: Duration,
+    remove: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut busy = 0;
     loop {
-        match remove_once(dir) {
+        match remove(dir) {
             Ok(()) => return Ok(()),
-            Err(e) if tries + 1 < REMOVE_TRIES && e.kind() == io::ErrorKind::ResourceBusy => {
-                tries += 1;
+            Err(e) if busy + 1 < tries && e.kind() == io::ErrorKind::ResourceBusy => {
+                busy += 1;
                 let _ = std::fs::write(dir.join("cgroup.kill"), "1");
-                std::thread::sleep(REMOVE_PAUSE);
+                std::thread::sleep(pause);
             }
             Err(e) => {
                 return Err(io::Error::new(
@@ -166,6 +177,104 @@ fn remove_once(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory beside the test binary (inside the target directory).
+    fn scratch(name: &str) -> PathBuf {
+        let exe = std::env::current_exe().expect("test binary");
+        let dir = exe
+            .parent()
+            .expect("deps directory")
+            .join("kbf-driver-container-unit")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch");
+        dir
+    }
+
+    fn busy() -> io::Error {
+        io::Error::from(io::ErrorKind::ResourceBusy)
+    }
+
+    /// Catches a busy cgroup (a process still exiting) failing the clean at once, and a
+    /// retry that does not kill the tree first: two busy passes, then success.
+    #[test]
+    fn a_busy_cgroup_is_killed_and_retried() {
+        let dir = scratch("busy-then-gone");
+        let mut calls = 0;
+        let mut remove = |d: &Path| {
+            calls += 1;
+            // The kill is written before every retry.
+            assert_eq!(d.join("cgroup.kill").exists(), calls > 1);
+            if calls < 3 { Err(busy()) } else { Ok(()) }
+        };
+        retry_busy(&dir, 5, Duration::ZERO, &mut remove).expect("removed");
+        assert_eq!(calls, 3);
+    }
+
+    /// Catches a retry loop that never gives up on a cgroup that stays busy, and an
+    /// error that is not EBUSY retried instead of returned with the cgroup named.
+    #[test]
+    fn retries_end_and_other_errors_are_returned_at_once() {
+        let dir = scratch("always-busy");
+        let mut calls = 0;
+        let mut remove = |_: &Path| {
+            calls += 1;
+            Err(busy())
+        };
+        let err = retry_busy(&dir, 4, Duration::ZERO, &mut remove).expect_err("busy");
+        assert_eq!((calls, err.kind()), (4, io::ErrorKind::ResourceBusy));
+        assert!(err.to_string().contains("always-busy"), "{err}");
+
+        let mut calls = 0;
+        let mut remove = |_: &Path| {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        };
+        let err = retry_busy(&dir, 4, Duration::ZERO, &mut remove).expect_err("denied");
+        assert_eq!((calls, err.kind()), (1, io::ErrorKind::PermissionDenied));
+    }
+
+    /// Catches child cgroups left behind (removal must go deepest first), a cgroup
+    /// already gone failing the clean, and a cgroup that will not go read as removed.
+    /// On cgroupfs the interface files vanish with their cgroup; on a plain directory a
+    /// file stays, so it stands in for a cgroup `rmdir` refuses.
+    #[test]
+    fn removal_goes_deepest_first_and_reports_what_stays() {
+        let dir = scratch("deepest-first");
+        std::fs::create_dir_all(dir.join("a/b/c")).expect("mkdir");
+        std::fs::create_dir_all(dir.join("d")).expect("mkdir");
+        remove_once(&dir).expect("removed");
+        assert!(!dir.exists());
+        remove_once(&dir).expect("already gone is fine");
+
+        let dir = scratch("stays");
+        std::fs::write(dir.join("memory.events"), "").expect("plant a file");
+        let err = remove_once(&dir).expect_err("not empty");
+        assert_eq!(err.kind(), io::ErrorKind::DirectoryNotEmpty);
+    }
+
+    /// Catches a listing error other than "already gone" read as success, which would
+    /// report a lease cgroup removed while it is still there.
+    #[test]
+    fn a_listing_error_is_returned() {
+        let dir = scratch("not-a-dir");
+        let file = dir.join("cgroup");
+        std::fs::write(&file, "").expect("plant a file");
+        let err = remove_once(&file).expect_err("ENOTDIR");
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+    }
+
+    /// Catches a cgroup that vanishes between its listing and its `rmdir` (Podman
+    /// removing its own cgroup meanwhile) failing the clean. `<dir>/sub/..` lists
+    /// `<dir>`, whose pass removes `sub`; the `rmdir` of `<dir>/sub/..` then finds no
+    /// `sub` to walk through (ENOENT), as if the cgroup had gone.
+    #[test]
+    fn a_cgroup_gone_before_its_rmdir_is_fine() {
+        let dir = scratch("gone-before-rmdir");
+        std::fs::create_dir_all(dir.join("sub/leaf")).expect("mkdir");
+        remove_once(&dir.join("sub/..")).expect("gone is fine");
+        assert!(!dir.join("sub").exists());
+    }
 
     /// Catches a soft limit that drifts from the RFC formula, and a zero booking read
     /// as "512 MiB for everything".

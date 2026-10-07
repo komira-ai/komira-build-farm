@@ -100,6 +100,15 @@ impl Fake {
             .collect()
     }
 
+    /// What the fake recorded, in order (see `fixtures/fake-podman.sh`).
+    fn events(&self) -> Vec<String> {
+        std::fs::read_to_string(self.state.join("events"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn lease_dir(&self, seq: u64) -> PathBuf {
         self.scratch.join(format!("kbf-lease-1-{seq}"))
     }
@@ -388,8 +397,11 @@ async fn kill_stops_the_action_and_returns_once_clean() {
     fake.runtime.kill(kbf_types::LeaseId::new(1, 1)).await;
 }
 
-/// Catches an action that ignores SIGTERM outliving its kill: after the grace period
-/// the lease cgroup is killed (`cgroup.kill`).
+/// Catches the kill path skipping `cgroup.kill` after the SIGTERM grace period: an
+/// action that ignores SIGTERM must die from the lease cgroup's `cgroup.kill`, and
+/// `podman start` must then end on its own within the second grace period. Without
+/// that step `podman start` is killed after the second grace period (so it never
+/// records its end) and only the clean step's `cgroup.kill` ends the action.
 #[tokio::test]
 async fn sigterm_ignored_falls_back_to_cgroup_kill() {
     let fake = Fake::new("cgroup-kill");
@@ -401,6 +413,9 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
         matches!(outcome, Err(RuntimeError::TimedOut)),
         "{outcome:?}"
     );
+    let events = fake.events();
+    let expected = ["cgroup.kill ended the action", "start ended", "rm"];
+    assert_eq!(events, expected, "{events:?}");
     fake.assert_clean(1);
 }
 
@@ -515,6 +530,46 @@ async fn podman_failures_are_infrastructure_failures() {
     let outcome = fake.run(4, &spec, "exit 0").await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("inspect refused")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(4);
+}
+
+/// Catches the driver's own file steps failing silently or as the action's result: an
+/// output parent it cannot make (a name over the kernel's 255-byte limit), a log file
+/// it cannot create, and a log file it cannot read back are each the farm's failure,
+/// and the lease is still cleaned.
+#[tokio::test]
+async fn the_drivers_own_file_failures_are_infrastructure_failures() {
+    let fake = Fake::new("driver-files");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.outputs = vec![format!("out/{}/f", "n".repeat(300))];
+    let outcome = fake.run(1, &spec, "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("upper/out/nnn")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
+
+    let spec = Spec::new(&image(), "unused");
+    for (seq, log) in [(2, "stdout"), (3, "stderr")] {
+        fake.knob("block-log", log);
+        let outcome = fake.run(seq, &spec, "exit 0").await;
+        let want = format!("kbf-lease-1-{seq}/{log}: ");
+        assert!(
+            matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains(&want)),
+            "{log}: {outcome:?}"
+        );
+        fake.assert_clean(seq);
+    }
+    std::fs::remove_file(fake.state.join("block-log")).expect("rm knob");
+
+    // The fake runs the action beside the lease directory, so it can unlink a log.
+    let outcome = fake
+        .run(4, &spec, r#"rm "$(dirname "$ROOT")/stderr""#)
+        .await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("kbf-lease-1-4/stderr: ")),
         "{outcome:?}"
     );
     fake.assert_clean(4);
@@ -805,6 +860,20 @@ async fn outputs_that_are_inputs_are_refused_before_anything_runs() {
         "{:?}",
         fake.calls()
     );
+
+    // A working directory that is an input symlink is refused the same way: the
+    // directory the driver makes for it would hide the link.
+    spec.symlinks = vec![("lnk", "pkg")];
+    spec.working_directory = "lnk".to_owned();
+    spec.outputs = vec!["out".to_owned()];
+    let outcome = fake.run(5, &spec, script).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("working directory")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(5);
+    assert!(!fake.calls().contains(&"create".to_owned()));
+    spec.symlinks = Vec::new();
 
     // An output beside the inputs, under an input directory, still runs.
     spec.working_directory = String::new();

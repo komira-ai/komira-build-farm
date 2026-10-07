@@ -11,6 +11,8 @@
 #   store/           the image store `info` names (store/fake-images/<id>/=<key>)
 #   action.sh        what `start --attach` runs (env: ROOT, UPPER, CG)
 #   create-fails     `create` fails
+#   block-log        `create` makes a directory where the log file this knob names
+#                    (stdout or stderr) goes, so the driver cannot create it
 #   vanish-after-create  `create` unlinks the podman program it was run as
 #   status           written by `start`; a test may preset `status-override`
 #   inspect-fails    `inspect` fails
@@ -19,7 +21,9 @@
 #   unshare-noop     `unshare rm` succeeds without removing anything
 #   unshare-fails    `unshare rm` fails
 # Records: create.args (one argument per line), calls (one verb per line), removed,
-#   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written).
+#   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
+#   events (in order: `cgroup.kill ended the action`, `start ended` once `start` has
+#   waited for the action and written its status, `rm`).
 set -u
 here=$(dirname "$0")
 STATE=$here/state
@@ -55,6 +59,7 @@ create)
         esac
     done
     [ -f "$STATE/create-fails" ] && { echo "Error: create refused" >&2; exit 125; }
+    [ -f "$STATE/block-log" ] && mkdir "$(dirname "$(cat "$STATE/root")")/$(cat "$STATE/block-log")"
     # The podman program disappears once the container exists.
     [ -f "$STATE/vanish-after-create" ] && unlink "$0"
     echo 0123456789ab
@@ -67,7 +72,12 @@ start)
     cg="$CGROOT$(cat "$STATE/cgroup")"
     # cgroup.kill: a write to the file kills the action, as the kernel would.
     (while kill -0 "$pid" 2>/dev/null; do
-        [ -e "$cg/cgroup.kill" ] && kill -KILL "$pid" 2>/dev/null
+        if [ -e "$cg/cgroup.kill" ]; then
+            # Recorded before the kill, so it precedes `start ended`.
+            echo "cgroup.kill ended the action" >>"$STATE/events"
+            kill -KILL "$pid" 2>/dev/null
+            break
+        fi
         sleep 0.02
     done) &
     wait "$pid"
@@ -77,6 +87,7 @@ start)
     else
         echo "exited $code" >"$STATE/status"
     fi
+    echo "start ended" >>"$STATE/events"
     exit "$code"
     ;;
 inspect)
@@ -92,6 +103,7 @@ kill)
 rm)
     [ -f "$STATE/rm-fails" ] && { echo "Error: rm refused" >&2; exit 125; }
     touch "$STATE/removed"
+    echo rm >>"$STATE/events"
     if [ -f "$STATE/cgroup" ] && [ -e "$CGROOT$(cat "$STATE/cgroup")/cgroup.kill" ]; then
         touch "$STATE/killed-before-rm"
     fi

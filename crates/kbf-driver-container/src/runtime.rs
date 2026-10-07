@@ -33,7 +33,7 @@ use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kin
 use crate::podman::{ContainerSpec, Podman};
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
-    refuse_outputs_in_inputs,
+    refuse_hidden_working_directory, refuse_outputs_in_inputs,
 };
 
 /// The driver name in the node report.
@@ -172,6 +172,11 @@ impl<C: Cas> PodmanRuntime<C> {
         materialize(cas, input_root, &root)
             .await
             .map_err(tree_error)?;
+        // The driver makes the working directory in the upper layer, which would hide
+        // an input symlink or file of that name: refused rather than run elsewhere.
+        refuse_hidden_working_directory(&root, &command.working_directory)
+            .await
+            .map_err(tree_error)?;
         // Outputs are read from the upper layer, so none may already be an input.
         refuse_outputs_in_inputs(&root, &command.working_directory, &outputs)
             .await
@@ -253,9 +258,10 @@ impl<C: Cas> PodmanRuntime<C> {
             .map_err(RuntimeError::Failed)?;
 
         tokio::select! {
-            status = child.wait() => {
-                status.map_err(|e| RuntimeError::Failed(format!("wait for podman start: {e}")))?;
-            }
+            // `podman start`'s own status is not the action's: Podman's record, read
+            // below, is. An error waiting for it is not trusted either way, since
+            // `exit_code` fails the lease unless that record says the container exited.
+            _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(lease, &mut child).await;
                 return Err(RuntimeError::TimedOut);
@@ -297,7 +303,8 @@ impl<C: Cas> PodmanRuntime<C> {
             (&stderr_path, &mut result.stderr_digest),
         ] {
             let bytes = tokio::fs::read(path).await.map_err(|e| failed(path, &e))?;
-            *slot = Some(cas.put(bytes).await.map_err(|e| tree_error(e.into()))?);
+            let digest = cas.put(bytes).await.map_err(TreeError::from);
+            *slot = Some(digest.map_err(tree_error)?);
         }
         Ok(result)
     }
@@ -394,11 +401,11 @@ impl<C: Cas> Runtime for PodmanRuntime<C> {
             return;
         };
         let (tx, rx) = oneshot::channel();
-        if stop.send(tx).is_ok() {
-            // Answered once the work has stopped and the lease is clean; an error means
-            // the run ended (and cleaned) without seeing the kill.
-            let _ = rx.await;
-        }
+        // Answered once the work has stopped and the lease is clean. If the run ended
+        // (and cleaned) without seeing the kill, `tx` is dropped with the failed send
+        // or with the run's receiver, and `rx` returns at once.
+        let _ = stop.send(tx);
+        let _ = rx.await;
     }
 }
 
@@ -460,7 +467,7 @@ impl Lease {
             lease.clean_blocking()
         })
         .await
-        .map_err(|e| format!("clean task: {e}"))?
+        .map_err(clean_task_failed)?
     }
 
     fn clean_blocking(&mut self) -> Result<(), String> {
@@ -547,6 +554,12 @@ fn tree_error(error: TreeError) -> RuntimeError {
         TreeError::Invalid(why) => RuntimeError::Invalid(why),
         other => RuntimeError::Failed(other.to_string()),
     }
+}
+
+/// The clean step's error when its blocking task did not finish (it panicked, or the
+/// runtime shut down before it ran).
+fn clean_task_failed(error: tokio::task::JoinError) -> String {
+    format!("clean task: {error}")
 }
 
 fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
@@ -647,5 +660,16 @@ mod tests {
             PodmanRuntime::new(config, cas).err(),
             Some(ConfigError::CgroupParent("actions".to_owned()))
         );
+    }
+
+    /// Catches a clean step whose blocking task panicked being reported without saying
+    /// it was the clean that failed (the lease then fails INTERNAL with this text).
+    #[tokio::test]
+    async fn a_clean_task_that_did_not_finish_names_the_clean() {
+        let panicked = tokio::task::spawn_blocking(|| panic!("clean panicked"))
+            .await
+            .expect_err("the task panicked");
+        let why = clean_task_failed(panicked);
+        assert!(why.starts_with("clean task: "), "{why}");
     }
 }

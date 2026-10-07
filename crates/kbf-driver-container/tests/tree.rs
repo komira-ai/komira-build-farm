@@ -4,7 +4,9 @@
 mod support;
 
 use kbf_driver_container::cas::digest_of;
-use kbf_driver_container::tree::{TreeError, materialize, output_paths, refuse_outputs_in_inputs};
+use kbf_driver_container::tree::{
+    TreeError, materialize, output_paths, refuse_hidden_working_directory, refuse_outputs_in_inputs,
+};
 use kbf_driver_container::{CasError, MemoryCas};
 use kbf_proto::reapi::{Command, Directory, DirectoryNode, FileNode, SymlinkNode};
 use prost::Message;
@@ -131,6 +133,61 @@ async fn broken_trees_are_refused() {
     ));
 }
 
+/// Catches a whole tree written wrong: a file's bytes, its executable bit (set, or
+/// set where it was not asked for), a symlink written as anything but a link to its
+/// target, and a subdirectory flattened or left empty.
+#[tokio::test]
+async fn a_whole_tree_is_written_as_given() {
+    use std::os::unix::fs::PermissionsExt;
+    let cas = MemoryCas::new();
+    let leaf = Directory {
+        files: vec![file("leaf.txt", Some(cas.insert(b"leaf".to_vec())))],
+        ..Directory::default()
+    };
+    let tree = Directory {
+        files: vec![
+            file("plain.txt", Some(cas.insert(b"plain".to_vec()))),
+            FileNode {
+                is_executable: true,
+                ..file("tool.sh", Some(cas.insert(b"#!/bin/sh\n".to_vec())))
+            },
+        ],
+        directories: vec![DirectoryNode {
+            name: "sub".to_owned(),
+            digest: Some(cas.insert(leaf.encode_to_vec())),
+        }],
+        symlinks: vec![SymlinkNode {
+            name: "link".to_owned(),
+            target: "sub/leaf.txt".to_owned(),
+            ..SymlinkNode::default()
+        }],
+        ..Directory::default()
+    };
+    let root = cas.insert(tree.encode_to_vec());
+    let dir = support::scratch("tree-whole");
+    materialize(&cas, &root, &dir).await.expect("written");
+    let mode = |name: &str| {
+        std::fs::metadata(dir.join(name))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(
+        std::fs::read(dir.join("plain.txt")).expect("read"),
+        b"plain"
+    );
+    assert_eq!((mode("plain.txt"), mode("tool.sh")), (0o644, 0o755));
+    assert_eq!(
+        std::fs::read(dir.join("sub/leaf.txt")).expect("read"),
+        b"leaf"
+    );
+    assert_eq!(
+        std::fs::read_link(dir.join("link")).expect("a symlink"),
+        std::path::Path::new("sub/leaf.txt")
+    );
+}
+
 /// Catches a write through a path that already exists: files are created exclusively,
 /// so a second entry can never overwrite or follow the first.
 #[tokio::test]
@@ -230,6 +287,39 @@ async fn outputs_that_are_inputs_are_refused() {
     std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o000))
         .expect("chmod");
     let outcome = check("", "pkg/in.txt").await;
+    std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod back");
+    assert!(matches!(outcome, Err(TreeError::Io { .. })), "{outcome:?}");
+}
+
+/// Catches a working directory that is an input symlink or file, or lies below one,
+/// being run: the driver makes the working directory in the upper layer, which hides
+/// the input of that name, so the action would start in an empty directory instead of
+/// its inputs. A working directory that is a directory, or absent, is fine.
+#[tokio::test]
+async fn a_working_directory_that_is_not_an_input_directory_is_refused() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = support::scratch("tree-workdir");
+    std::fs::create_dir_all(root.join("pkg/sub")).expect("mkdir");
+    std::fs::write(root.join("file"), b"f").expect("write");
+    symlink("pkg", root.join("link")).expect("symlink");
+    symlink("pkg/sub", root.join("pkg/to-sub")).expect("symlink");
+    for wd in ["link", "file", "file/x", "pkg/to-sub", "link/sub"] {
+        let outcome = refuse_hidden_working_directory(&root, wd).await;
+        assert!(
+            matches!(outcome, Err(TreeError::Invalid(ref why)) if why.contains(wd)),
+            "{wd:?}: {outcome:?}"
+        );
+    }
+    for wd in ["", "pkg", "pkg/sub", "absent", "pkg/absent/deeper"] {
+        let outcome = refuse_hidden_working_directory(&root, wd).await;
+        assert!(outcome.is_ok(), "{wd:?}: {outcome:?}");
+    }
+
+    std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod");
+    let outcome = refuse_hidden_working_directory(&root, "pkg/sub").await;
     std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod back");
     assert!(matches!(outcome, Err(TreeError::Io { .. })), "{outcome:?}");

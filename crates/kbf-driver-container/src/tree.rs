@@ -212,6 +212,35 @@ pub async fn refuse_outputs_in_inputs(
     Ok(())
 }
 
+/// Refuses a working directory that the input root `root` has as anything but
+/// directories: a symlink or a file on its path.
+///
+/// The driver makes the working directory in the overlay's upper directory, and an
+/// upper directory hides a lower symlink or file of the same name, so the action would
+/// start in an empty directory rather than among its inputs. The walk follows no
+/// symlink; a component that is absent ends it (the driver makes the rest).
+pub async fn refuse_hidden_working_directory(
+    root: &Path,
+    working_directory: &str,
+) -> Result<(), TreeError> {
+    let mut host = root.to_owned();
+    for part in working_directory.split('/').filter(|part| !part.is_empty()) {
+        host.push(part);
+        match fs::symlink_metadata(&host).await {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(TreeError::Invalid(format!(
+                    "working directory {working_directory:?} is not a directory of the \
+                     input root (a symlink or file is on its path)"
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(io(&host)(e)),
+        }
+    }
+    Ok(())
+}
+
 /// Reads each output path under `dir` (the action's working directory as the action
 /// left it) into the CAS and records it in `result`. A path the action did not create
 /// is left out, including one whose parent the action replaced with a file; an entry
