@@ -867,6 +867,10 @@ dependencies = [
 [[package]]
 name = "kbf-sched"
 version = "0.1.0"
+dependencies = [
+ "kbf-sim",
+ "kbf-types",
+]
 
 [[package]]
 name = "kbf-segments"

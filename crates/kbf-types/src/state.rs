@@ -1,5 +1,7 @@
 //! The shape every pure core shares: inputs in, effects out.
 
+use crate::{Answer, ControlRecord, StartLease};
+
 /// A deterministic state machine.
 ///
 /// `apply` changes the state and returns the effects the change calls for. It does no
@@ -19,12 +21,19 @@ pub trait StateMachine {
 
 /// Something a [`StateMachine`] asks its caller to do.
 ///
-/// This is a placeholder with no variants yet, so no value of it can exist and every
-/// `apply` returns an empty list. Variants (starting an action on a worker, raising an
-/// alert, launching a node) arrive with the cores that emit them.
+/// Variants arrive with the cores that emit them; today that is the scheduler
+/// (`kbf-sched`). Effects are carried out in list order.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Effect {}
+pub enum Effect {
+    /// Append the record to the control log, and feed it back to the machine once it is
+    /// committed. Nothing that depends on the record happens before then.
+    Commit(ControlRecord),
+    /// Send a `Start` for a committed lease to its worker.
+    Start(StartLease),
+    /// Answer every waiter of a finished operation.
+    Answer(Answer),
+}
 
 #[cfg(test)]
 mod tests {
