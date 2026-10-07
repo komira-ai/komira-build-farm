@@ -59,11 +59,8 @@ This design builds on the code on `main`, read at the time of writing.
 - **Detection.** On macOS the daemon reads `sysctl` and reports `os=macos`, `arch=arm64`,
   `cpus`, `mem_gib`, `page_size`, `gpu=0`, `cpu.model`, every `cpu.features` flag and
   `isa_level`, `drivers`, and the driver's `network_isolation`. It reports nothing about
-  the macOS build or Xcode yet. ([capabilities.md](capabilities.md) still says a
-  non-Linux daemon refuses to start and that macOS detection is planned; the code on
-  `main` detects macOS. This design does not edit that file, because the
-  platform-routing change under review rewrites it; it should be brought up to date
-  there or right after.)
+  the macOS build or Xcode yet. ([capabilities.md](capabilities.md) said macOS
+  detection was planned; this change brings it up to date.)
 - **Platform routing,** under review at the time of writing, matches an action's
   `OSFamily`/`ISA`/`Arch` and kbf keys against node reports. Until it lands, any
   action can go to any registered worker.
@@ -275,7 +272,7 @@ compilers changed must not keep serving cache keys computed for the old ones.
 - **One key set.** capabilities.md plans `os_image` and `xcode`. A Mac has no image,
   and `os_build` is what `os_image` would carry, so a Mac reports `os_build` and not
   `os_image`. `xcode` keeps its planned meaning, and `host_identity` is new.
-  capabilities.md should list these three when it is next updated.
+  capabilities.md lists `os_build` and `host_identity` as planned exact keys.
 - **Which key a client matches decides how often its cache goes cold,** because every
   platform property is part of the action digest:
   - A client matching only `xcode` keeps its Mac cache across macOS patches and loses
@@ -343,7 +340,10 @@ The `main` build job:
   and SHA-256 (as CI pins `cargo-deny`).
 - **Provenance:** `actions/attest-build-provenance` for each asset and
   `actions/attest-sbom` for the SBOM. Both are in the allowed `actions/*` set.
-- **Keeps** the assets as workflow artifacts, for as long as the deployment needs them.
+- **Keeps** the assets as workflow artifacts. GitHub keeps those for at most 90 days,
+  so the release workflow does not rely on them: when it tags a soaked commit, it
+  attaches the exact bytes the farm ran (fetched by digest from the deployment's own
+  copy, and checked against the attestation) to the release. Nothing is rebuilt.
 - **Checks itself:** a last step downloads its own assets and verifies the sums and the
   attestations. A wrong sum fails the job.
 
@@ -811,7 +811,7 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 | Node install | `apply` with a wrong SHA-256 refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
 | `--expect-host-identity` | fixture fields, a changed `os_build` | comparing only the SDK version prefix |
 | Fence clock ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
-| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | a server test: a certificate for node A sending `Hello` as node B is refused | the binding not checked on a resent `Hello` |
+| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (today a resent `Hello` only updates capacity and its `node_id` is never read) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
 | Drain | scheduler simulation: a drained node gets no new lease; running leases finish or are re-placed after the deadline | placement that ignores the drained flag |
 | Deny list | a denied serial's `Hello` is refused, also on reconnect | the list read only at server start |
 
@@ -872,6 +872,6 @@ machines.
    key (the data stays hardware-encrypted); it is not a long decryption.
 4. **The macOS pin and how often it moves:** which version and build each pool starts
    on, and whether security updates go to the canary within a set number of days.
-5. **Where `kbf-mac-provision` lives:** in this repository, shipped with each release
+5. **Where `kbf-mac-provision` lives:** in this repository, in each per-commit tarball
    and tested on hosted runners (the lean, so anyone running kbf on Macs gets it), or in
    each operator's own deployment.
