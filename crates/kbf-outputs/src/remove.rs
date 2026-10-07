@@ -178,7 +178,7 @@ fn clear_acl(dir: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
     let mut list = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: libc::ATTR_CMN_EXTENDED_SECURITY,
+        commonattr: 0, // MUTANT: sets nothing
         volattr: 0,
         dirattr: 0,
         fileattr: 0,
