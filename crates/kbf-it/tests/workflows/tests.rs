@@ -296,3 +296,86 @@ fn top_level_permissions_are_required_and_empty() {
         "must be `{}`",
     );
 }
+
+#[test]
+fn regression_a_custom_label_with_a_hosted_prefix_was_accepted() {
+    // The bypass the verifier found: `is_hosted_label` matched `ubuntu-`, `windows-`
+    // and `macos-` by prefix, so a custom label no hosted runner carries passed, and
+    // GitHub could only give the job to a self-hosted runner. `macos-13` is a retired
+    // image, so it is a custom label now too.
+    for v in [
+        "ubuntu-gpu-farm",
+        "[ubuntu-latest, ubuntu-farm]",
+        "{labels: [macos-my-mac-mini]}",
+        "windows-big-box",
+        "macos-13",
+    ] {
+        refused(&format!("    runs-on: {v}\n"), "must name hosted");
+    }
+}
+
+#[test]
+fn more_than_one_label_is_refused() {
+    // Catches: a list of hosted labels accepted; no hosted runner carries two labels,
+    // so only a self-hosted runner could match it.
+    for v in [
+        "[ubuntu-latest, ubuntu-24.04]",
+        "{labels: [macos-15, macos-latest]}",
+    ] {
+        refused(&format!("    runs-on: {v}\n"), "more than one label");
+    }
+}
+
+#[test]
+fn every_hosted_label_passes() {
+    // Catches: a table entry the check does not accept, in each runs-on form.
+    for label in HOSTED_LABELS {
+        for v in [
+            (*label).to_owned(),
+            format!("[{label}]"),
+            format!("{{labels: {label}}}"),
+        ] {
+            clean(&workflow(&format!("    runs-on: {v}\n")));
+        }
+    }
+}
+
+#[test]
+fn workflow_run_is_refused_in_every_trigger_form() {
+    // Catches: a lint that lets through a trigger that runs with the base
+    // repository's secrets, like pull_request_target.
+    for on in [
+        "on: workflow_run",
+        "on: [push, workflow_run]",
+        "on:\n  workflow_run:\n    workflows: [ci]",
+        "on: {Workflow_Run: {workflows: [ci]}}",
+    ] {
+        refused_text(
+            &format!("{on}\npermissions: {{}}\njobs: {{}}\n"),
+            "triggers on workflow_run",
+        );
+    }
+}
+
+#[test]
+fn job_permissions_may_not_widen_the_token() {
+    // Catches: a job that gives itself write scopes back after the top-level `{}`.
+    for p in [
+        "write-all",
+        "read-all",
+        "{contents: write}",
+        "{contents: read, pull-requests: write}",
+        "{id-token: write}",
+        "''",
+    ] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n    permissions: {p}\n"),
+            "a job's `permissions`",
+        );
+    }
+    for p in ["{}", "{contents: read}", "{contents: read, actions: none}"] {
+        clean(&workflow(&format!(
+            "    runs-on: ubuntu-latest\n    permissions: {p}\n"
+        )));
+    }
+}

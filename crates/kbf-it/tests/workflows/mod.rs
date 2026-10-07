@@ -4,13 +4,16 @@
 //! request code with repository write access. The lint parses each workflow with a
 //! YAML parser (`saphyr-parser`, through [`yaml`]) and evaluates the document. It
 //! refuses a workflow if:
-//! - `on` names the `pull_request_target` trigger, in any form (a string, a list or a
+//! - `on` names the `pull_request_target` or `workflow_run` trigger (both run with
+//!   the base repository's secrets and token), in any form (a string, a list or a
 //!   mapping, block or flow);
-//! - a job's `runs-on` is not hosted runner labels written out literally: one
-//!   `ubuntu-*`/`windows-*`/`macos-*` label, a list of them, or a mapping holding only
-//!   `labels:` with such a value. A runner group, an expression (`${{ }}`, so a
-//!   matrix too) or a custom label could select a non-hosted runner, so each is
-//!   refused because the lint cannot tell where it lands;
+//! - a job's `runs-on` is not exactly one GitHub-hosted runner label from
+//!   [`HOSTED_LABELS`], written out literally: a string, a one-entry list, or a
+//!   mapping holding only `labels:` with such a value. A runner group, an expression
+//!   (`${{ }}`, so a matrix too), a custom label (even one that starts like a hosted
+//!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
+//!   so each is refused because the lint cannot tell where it lands;
+//! - a job's `permissions` grants anything but `read` or `none`;
 //! - a job calls a reusable workflow outside this repository (its runners are not in
 //!   this file);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
@@ -25,6 +28,14 @@
 //! second document, a merge key (`<<`), a key that is not a scalar, a key repeated in
 //! one mapping (ignoring case), an unknown top-level key, a trigger list or `on`
 //! value of an unexpected shape, and a file that does not parse.
+//!
+//! What this lint cannot cover: GitHub routes a job to a self-hosted runner whose
+//! labels match before a hosted one, so a self-hosted runner registered with the label
+//! `ubuntu-latest` would take a job this lint accepts. The control for that is the
+//! repository (or organization) setting that disallows self-hosted runners; this lint
+//! keeps the workflow files from asking for one. [`HOSTED_LABELS`] is a copy of
+//! GitHub's published table: when GitHub retires an image its label becomes a custom
+//! label, so drop it here when it is retired.
 
 mod yaml;
 
@@ -41,6 +52,35 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "concurrency",
     "jobs",
 ];
+
+/// The GitHub-hosted runner labels, exactly as GitHub's runner table spells them
+/// (preview images left out). Anything else names a custom label.
+const HOSTED_LABELS: &[&str] = &[
+    "ubuntu-slim",
+    "ubuntu-latest",
+    "ubuntu-26.04",
+    "ubuntu-24.04",
+    "ubuntu-22.04",
+    "ubuntu-26.04-arm",
+    "ubuntu-24.04-arm",
+    "ubuntu-22.04-arm",
+    "windows-latest",
+    "windows-2025",
+    "windows-2025-vs2026",
+    "windows-2022",
+    "windows-11-arm",
+    "windows-11-vs2026-arm",
+    "macos-latest",
+    "macos-26",
+    "macos-15",
+    "macos-14",
+    "macos-26-intel",
+    "macos-15-intel",
+];
+
+/// Triggers that run with the base repository's secrets and token on behalf of code
+/// or events from outside it.
+const REFUSED_TRIGGERS: &[&str] = &["pull_request_target", "workflow_run"];
 
 /// Parses one workflow text and returns one message per problem, each prefixed with
 /// its 1-based line number (0 for a whole-file problem).
@@ -152,10 +192,12 @@ impl Lint<'_> {
         }
         for name in names {
             match name.as_str() {
-                Some(n) if n.trim().eq_ignore_ascii_case("pull_request_target") => {
-                    self.refuse(name, "triggers on pull_request_target");
+                Some(n) => {
+                    let n = n.trim();
+                    if let Some(t) = REFUSED_TRIGGERS.iter().find(|t| n.eq_ignore_ascii_case(t)) {
+                        self.refuse(name, format_args!("triggers on {t}"));
+                    }
                 }
-                Some(_) => {}
                 None => self.refuse(name, "a trigger that is not a name is not evaluated"),
             }
         }
@@ -173,6 +215,9 @@ impl Lint<'_> {
                 called,
                 "a reusable workflow outside this repository runs where this lint cannot see",
             );
+        }
+        if let Some(p) = get(job_map, "permissions") {
+            self.job_permissions(p);
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -198,6 +243,12 @@ impl Lint<'_> {
             Value::Scalar { .. } => self.hosted_label(r),
             Value::Seq(labels) if !labels.is_empty() => {
                 labels.iter().for_each(|l| self.hosted_label(l));
+                if labels.len() > 1 {
+                    self.refuse(
+                        r,
+                        "runs-on lists more than one label, which no hosted runner carries",
+                    );
+                }
             }
             Value::Map(entries) => {
                 for (k, v) in entries {
@@ -218,6 +269,29 @@ impl Lint<'_> {
                 }
             }
             Value::Seq(_) => self.refuse(r, "runs-on names no labels"),
+        }
+    }
+
+    /// A job may narrow its token to `read` or `none` scopes; it may not widen it.
+    fn job_permissions(&mut self, p: &Node) {
+        let Value::Map(scopes) = &p.value else {
+            self.refuse(
+                p,
+                "a job's `permissions` must be a mapping of `read` or `none` scopes",
+            );
+            return;
+        };
+        for (scope, level) in scopes {
+            if !level.as_str().is_some_and(|l| l == "read" || l == "none") {
+                self.refuse(
+                    level,
+                    format_args!(
+                        "a job's `permissions` may grant only `read` or `none`, got `{}: {}`",
+                        scope.as_str().unwrap_or("?"),
+                        level.as_str().unwrap_or("?"),
+                    ),
+                );
+            }
         }
     }
 
@@ -287,13 +361,7 @@ fn trailing_comment<'a>(text: &'a str, node: &Node) -> Option<&'a str> {
 }
 
 fn is_hosted_label(v: &str) -> bool {
-    let ok_chars = v
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.');
-    ok_chars
-        && ["ubuntu-", "windows-", "macos-"]
-            .iter()
-            .any(|p| v.len() > p.len() && v.starts_with(p))
+    HOSTED_LABELS.contains(&v)
 }
 
 fn is_sha_pinned(v: &str) -> bool {
