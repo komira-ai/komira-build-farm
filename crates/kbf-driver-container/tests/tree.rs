@@ -636,6 +636,7 @@ async fn outputs_past_a_limit_fail_the_collection() {
         max_depth: 3,
         max_entries: 6,
         max_bytes: 10,
+        ..OutputLimits::DEFAULT
     };
     let (outcome, result, _) = collect_within(&upper, "", &["top", "out"], exact).await;
     outcome.expect("collected at the limits");
@@ -702,4 +703,69 @@ async fn outputs_past_a_limit_fail_the_collection() {
             "{why}"
         );
     }
+}
+
+/// Catches names and symlink targets that are not UTF-8 being recorded altered. Read
+/// lossily, `a\xff` and `a\xfe` both became `a\u{fffd}`: one Directory with two
+/// entries of the same name, which REAPI forbids, and `\x80` a name the action never
+/// wrote. The first such name (by its bytes, `a\xfe`) fails the collection, naming
+/// it; a symlink target that is not UTF-8, inside an output directory or declared as
+/// an output, fails it too.
+#[tokio::test]
+async fn names_and_targets_that_are_not_utf8_fail_the_collection() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let upper = support::scratch("collect-not-utf8");
+    std::fs::create_dir_all(upper.join("names")).expect("mkdir");
+    for name in [&b"a\xff"[..], b"a\xfe", b"\x80"] {
+        let path = upper.join("names").join(OsStr::from_bytes(name));
+        std::fs::write(path, b"x").expect("write");
+    }
+    std::fs::create_dir(upper.join("targets")).expect("mkdir");
+    symlink(OsStr::from_bytes(b"to-\xff"), upper.join("targets/link")).expect("symlink");
+    symlink(OsStr::from_bytes(b"to-\xfe"), upper.join("link")).expect("symlink");
+    for (output, at, what) in [
+        ("names", "names/a\u{fffd}", "name"),
+        ("targets", "targets/link", "symlink target"),
+        ("link", "link", "symlink target"),
+    ] {
+        let (outcome, _, _) = collect_from(&upper, "", &[output]).await;
+        let Err(why @ TreeError::NotUtf8 { path, what: seen }) = &outcome else {
+            panic!("{output}: {outcome:?}");
+        };
+        assert_eq!(*seen, what, "{output}");
+        let shown = path.strip_prefix(&upper).expect("under upper");
+        let shown = shown.to_string_lossy();
+        assert!(shown.starts_with(at), "{output}: {shown}");
+        assert!(why.to_string().contains("not UTF-8"), "{why}");
+    }
+}
+
+/// Catches a file that changed between its hash and its upload being stored: under
+/// the old digest when its bytes changed, or short when it shrank. A file left alone
+/// is stored whole.
+#[tokio::test]
+async fn a_file_changed_after_it_was_hashed_is_not_stored() {
+    use kbf_driver_container::{Cas, FileBlob};
+
+    let dir = support::scratch("collect-changed");
+    let path = dir.join("f");
+    let cas = MemoryCas::new();
+    let hashed = |bytes: &[u8]| {
+        std::fs::write(&path, bytes).expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+        FileBlob::hash(file, 6).expect("read").expect("fits")
+    };
+    let blob = hashed(b"before");
+    std::fs::write(&path, b"after!").expect("rewrite");
+    let error = cas.put_file(blob).await.expect_err("refused");
+    assert!(matches!(error, CasError::Corrupt(..)), "{error}");
+    let blob = hashed(b"before");
+    std::fs::write(&path, b"bef").expect("truncate");
+    let error = cas.put_file(blob).await.expect_err("refused");
+    assert!(matches!(error, CasError::Read(..)), "{error}");
+    let digest = cas.put_file(hashed(b"stored")).await.expect("stored");
+    assert_eq!(cas.blob(&digest), Some(b"stored".to_vec()));
 }

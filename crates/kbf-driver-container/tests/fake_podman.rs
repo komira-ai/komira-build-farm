@@ -503,6 +503,16 @@ async fn unremovable_scratch_falls_back_to_podman_unshare() {
     assert!(fake.calls().contains(&"unshare".to_owned()));
     fake.assert_clean(1);
 
+    // A directory the daemon's user can list but not write: its entries cannot be
+    // unlinked, so this falls back too.
+    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare").count();
+    let before = unshares(&fake);
+    let readonly = r#"mkdir "$UPPER/ro"; touch "$UPPER/ro/f"; chmod 500 "$UPPER/ro""#;
+    let result = fake.run(4, &spec, readonly).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(unshares(&fake), before + 1);
+    fake.assert_clean(4);
+
     // verify-clean: a removal that claims success but leaves the directory is caught.
     fake.knob("unshare-noop", "");
     let outcome = fake.run(2, &spec, script).await;
@@ -834,4 +844,58 @@ async fn a_kill_during_prepare_stops_it_at_once() {
     let outcome = run.await.expect("join");
     assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
     fake.assert_clean(1);
+}
+
+/// Catches the clean step recursing into what the action left behind: a junk tree
+/// 20,000 levels deep that is not an output overflowed `std::fs::remove_dir_all`'s
+/// recursion on a tokio blocking thread (SIGABRT, every lease on the node lost; seen
+/// red: this test binary aborts). The lease succeeds and leaves nothing, and the next
+/// lease on the same runtime runs.
+#[tokio::test]
+async fn a_deep_junk_tree_is_cleaned_without_taking_the_daemon_down() {
+    let fake = Fake::new("deep-junk");
+    let tree = support::scratch("fake-deep-junk-tree");
+    support::deep(&tree, 20_000, b"bottom");
+    let spec = Spec::new(&image(), "unused");
+    let script = format!(r#"mv '{}' "$UPPER/junk""#, tree.display());
+    let result = fake.run(1, &spec, &script).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert!(!exists(&tree), "the junk tree never reached the lease");
+    assert!(!fake.calls().contains(&"unshare".to_owned()));
+    fake.assert_clean(1);
+    let result = fake.run(2, &spec, "exit 0").await.expect("the next lease");
+    assert_eq!(result.exit_code, 0);
+    fake.assert_clean(2);
+}
+
+/// Catches stdout and stderr read with no limit, the limit off by one, or applied to
+/// one stream only: a stdout of exactly `--output-max-stdio-bytes` (three chunks) is
+/// stored whole, and one byte more of stdout, or of stderr, fails the action naming
+/// the flag and the log, with the lease cleaned.
+#[tokio::test]
+async fn stdout_and_stderr_are_stored_within_their_limit() {
+    const MAX: u64 = 3 << 20;
+    let fake = Fake::with("stdio", |config| config.outputs.max_stdio_bytes = MAX);
+    let spec = Spec::new(&image(), "unused");
+    let result = fake
+        .run(1, &spec, &format!("head -c {MAX} /dev/zero"))
+        .await
+        .expect("ran");
+    let stdout = blob(&fake.cas, result.stdout_digest.as_ref());
+    assert!(stdout.len() as u64 == MAX && stdout.iter().all(|&b| b == 0));
+    fake.assert_clean(1);
+    let past = MAX + 1;
+    for (seq, log, script) in [
+        (2, "stdout", format!("head -c {past} /dev/zero")),
+        (3, "stderr", format!("head -c {past} /dev/zero >&2")),
+    ] {
+        let outcome = fake.run(seq, &spec, &script).await;
+        let want = format!("kbf-lease-1-{seq}/{log}: ");
+        assert!(
+            matches!(outcome, Err(RuntimeError::Failed(ref why))
+                if why.contains(&want) && why.contains("--output-max-stdio-bytes")),
+            "{log}: {outcome:?}"
+        );
+        fake.assert_clean(seq);
+    }
 }

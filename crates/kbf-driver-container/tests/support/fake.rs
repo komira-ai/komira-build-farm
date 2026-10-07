@@ -158,4 +158,3 @@ impl Drop for Fake {
         }
     }
 }
-
