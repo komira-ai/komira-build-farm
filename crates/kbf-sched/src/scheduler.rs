@@ -288,8 +288,7 @@ impl Scheduler {
                 };
                 let due = registered || now >= sent.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
-                due
-                    && !running.contains(lease)
+                due && !running.contains(lease)
                     && !op.result_proposed
                     && op.state.holding().is_some_and(|(_, w)| w == worker)
             })
