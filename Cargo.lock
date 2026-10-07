@@ -916,6 +916,7 @@ name = "kbf-driver-container"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "clap",
  "hex",
  "kbf-daemon",
  "kbf-proto",

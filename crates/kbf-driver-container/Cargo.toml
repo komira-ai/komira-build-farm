@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+clap.workspace = true
 hex.workspace = true
 kbf-daemon.workspace = true
 kbf-proto.workspace = true

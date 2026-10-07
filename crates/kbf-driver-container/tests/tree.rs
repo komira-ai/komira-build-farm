@@ -5,8 +5,8 @@ mod support;
 
 use kbf_driver_container::cas::digest_of;
 use kbf_driver_container::tree::{
-    TreeError, collect, materialize, output_paths, refuse_hidden_working_directory,
-    refuse_outputs_in_inputs,
+    Exceeded, OutputLimits, TreeError, collect, materialize, output_paths,
+    refuse_hidden_working_directory, refuse_outputs_in_inputs,
 };
 use kbf_driver_container::{CasError, MemoryCas};
 use kbf_proto::reapi::{
@@ -345,10 +345,28 @@ async fn collect_from(
     working_directory: &str,
     outputs: &[&str],
 ) -> (Result<(), TreeError>, ActionResult, MemoryCas) {
+    collect_within(upper, working_directory, outputs, OutputLimits::DEFAULT).await
+}
+
+/// [`collect_from`] within `limits`.
+async fn collect_within(
+    upper: &std::path::Path,
+    working_directory: &str,
+    outputs: &[&str],
+    limits: OutputLimits,
+) -> (Result<(), TreeError>, ActionResult, MemoryCas) {
     let cas = MemoryCas::new();
     let outputs: Vec<String> = outputs.iter().map(|&o| o.to_owned()).collect();
     let mut result = ActionResult::default();
-    let outcome = collect(&cas, upper, working_directory, &outputs, &mut result).await;
+    let outcome = collect(
+        &cas,
+        upper,
+        working_directory,
+        &outputs,
+        limits,
+        &mut result,
+    )
+    .await;
     assert_eq!(
         cas.blob(&digest_of(SECRET)),
         None,
@@ -537,4 +555,151 @@ async fn odd_entries_are_left_out_and_unexaminable_ones_fail() {
         matches!(outcome, Err(TreeError::Io { ref path, .. }) if path.ends_with("ro/x")),
         "{outcome:?}"
     );
+}
+
+/// Runs `collect` of the output `out` in `upper` within `limits` on a thread with a
+/// 256 KiB stack, an eighth of a tokio worker's.
+fn collect_on_a_small_stack(
+    upper: &std::path::Path,
+    limits: OutputLimits,
+) -> (Result<(), TreeError>, ActionResult, MemoryCas) {
+    let upper = upper.to_owned();
+    std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(collect_within(&upper, "", &["out"], limits))
+        })
+        .expect("spawn")
+        .join()
+        .expect("the walk finished")
+}
+
+/// Catches a recursive walk of an output directory. The action decides how deep its
+/// outputs are, and a walk that recursed once per level ran a 3000-level tree off the
+/// thread's stack: SIGABRT, the whole daemon down with every lease on it. The walk
+/// must take 3000 levels on a 256 KiB stack, where a recursive one overflows (seen
+/// red: the test binary aborts), and record every level, each Directory's digest
+/// naming the next.
+#[test]
+fn a_tree_of_any_depth_is_walked_without_recursion() {
+    const LEVELS: usize = 3000;
+    let upper = support::scratch("collect-deep");
+    std::fs::create_dir(upper.join("out")).expect("mkdir");
+    support::deep(&upper.join("out"), LEVELS, b"bottom");
+    let limits = OutputLimits {
+        max_depth: LEVELS,
+        ..OutputLimits::DEFAULT
+    };
+    let (outcome, result, cas) = collect_on_a_small_stack(&upper, limits);
+    outcome.expect("collected");
+    let [out] = result.output_directories.as_slice() else {
+        panic!("one output directory: {result:?}");
+    };
+    let tree = Tree::decode(
+        cas.blob(out.tree_digest.as_ref().expect("a tree digest"))
+            .expect("the tree is stored")
+            .as_slice(),
+    )
+    .expect("a Tree");
+    assert_eq!(tree.children.len(), LEVELS);
+    let mut above = tree.root.expect("a root");
+    for child in tree.children {
+        assert_eq!(
+            above.directories,
+            [DirectoryNode {
+                name: "d".to_owned(),
+                digest: Some(digest_of(&child.encode_to_vec())),
+            }]
+        );
+        above = child;
+    }
+    assert_eq!(above.files, [file("f", Some(digest_of(b"bottom")))]);
+    support::force_remove(&upper);
+}
+
+/// Catches an output limit not enforced, off by one, or counted per output instead
+/// of per action: outputs that reach each limit exactly are collected, and one past
+/// it fails as `TreeError::Limit`, naming the limit, its flag and where it was passed.
+/// Seen red with the depth check removed.
+#[tokio::test]
+async fn outputs_past_a_limit_fail_the_collection() {
+    let upper = support::scratch("collect-limits");
+    // `top`, and `out` holding a/b/c (levels 1 to 3) and a/b/c/x: 6 entries, two files
+    // of 5 bytes.
+    std::fs::create_dir_all(upper.join("out/a/b/c")).expect("mkdir");
+    std::fs::write(upper.join("out/a/b/c/x"), b"12345").expect("write");
+    std::fs::write(upper.join("top"), b"67890").expect("write");
+    let exact = OutputLimits {
+        max_depth: 3,
+        max_entries: 6,
+        max_bytes: 10,
+    };
+    let (outcome, result, _) = collect_within(&upper, "", &["top", "out"], exact).await;
+    outcome.expect("collected at the limits");
+    assert_eq!(
+        (result.output_files.len(), result.output_directories.len()),
+        (1, 1)
+    );
+
+    let depth = |max_depth| OutputLimits { max_depth, ..exact };
+    let entries = |max_entries| OutputLimits {
+        max_entries,
+        ..exact
+    };
+    let bytes = |max_bytes| OutputLimits { max_bytes, ..exact };
+    for (limits, what, at, flag, limit) in [
+        (
+            depth(2),
+            Exceeded::Depth,
+            "out/a/b/c",
+            "--output-max-depth",
+            2,
+        ),
+        (
+            entries(5),
+            Exceeded::Entries,
+            "out/a/b/c",
+            "--output-max-entries",
+            5,
+        ),
+        (
+            entries(0),
+            Exceeded::Entries,
+            "top",
+            "--output-max-entries",
+            0,
+        ),
+        (
+            bytes(9),
+            Exceeded::Bytes,
+            "out/a/b/c/x",
+            "--output-max-bytes",
+            9,
+        ),
+        (bytes(4), Exceeded::Bytes, "top", "--output-max-bytes", 4),
+    ] {
+        let (outcome, _, _) = collect_within(&upper, "", &["top", "out"], limits).await;
+        let Err(
+            why @ TreeError::Limit {
+                path,
+                what: seen,
+                limit: seen_limit,
+            },
+        ) = &outcome
+        else {
+            panic!("{what:?} past {limits:?}: {outcome:?}");
+        };
+        assert_eq!(
+            (*seen, path.strip_prefix(&upper).ok(), *seen_limit),
+            (what, Some(std::path::Path::new(at)), limit),
+        );
+        let why = why.to_string();
+        assert!(
+            why.contains(flag) && why.contains(&format!("({limit})")),
+            "{why}"
+        );
+    }
 }

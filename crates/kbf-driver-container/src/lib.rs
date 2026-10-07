@@ -41,5 +41,6 @@ pub mod tree;
 pub use cas::{Cas, CasError, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
 pub use image::{ImageError, ImageRef};
+pub use outputs::OutputLimits;
 pub use podman::EXEC_ROOT;
 pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime};

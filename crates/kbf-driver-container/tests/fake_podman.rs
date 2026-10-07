@@ -862,6 +862,34 @@ async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
     assert_eq!(fake.cas.blob(&digest), None);
 }
 
+/// Catches an action taking the daemon down through the depth of its outputs: an
+/// output directory 3000 levels deep overflowed the recursive walk's stack (SIGABRT,
+/// every lease on the node lost; seen red: this test binary aborts). It fails the
+/// action alone, naming the limit's flag, and the next action on the same runtime
+/// runs.
+#[tokio::test]
+async fn an_output_too_deep_fails_the_action_not_the_daemon() {
+    let fake = Fake::new("deep");
+    let tree = support::scratch("fake-deep-tree");
+    support::deep(&tree, 3000, b"bottom");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.outputs = vec!["out".to_owned()];
+    let script = format!(r#"mv '{}' "$UPPER/out""#, tree.display());
+    let outcome = fake.run(1, &spec, &script).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("--output-max-depth")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
+    let script = r#"mkdir "$UPPER/out"; echo x > "$UPPER/out/f""#;
+    let result = fake
+        .run(2, &spec, script)
+        .await
+        .expect("the next action runs");
+    assert_eq!(result.output_directories.len(), 1, "{result:?}");
+    fake.assert_clean(2);
+}
+
 /// Catches an output that is already an input being run and cached incomplete: the
 /// driver reads outputs from the overlay's upper layer, so an output directory `pkg`
 /// over the input `pkg/in.txt` would come back holding only what the action wrote, and

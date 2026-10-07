@@ -17,6 +17,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::cas::{Cas, CasError, fetch, label};
+pub use crate::outputs::OutputLimits;
 
 /// Why the input root could not be written or the outputs read.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +33,32 @@ pub enum TreeError {
         #[source]
         source: std::io::Error,
     },
+    /// The action's outputs pass one of the [`OutputLimits`]: the action fails, the
+    /// daemon goes on.
+    #[error("{path}: the action's outputs exceed the limit on {what} ({limit})")]
+    Limit {
+        path: PathBuf,
+        what: Exceeded,
+        limit: u64,
+    },
+}
+
+/// Which of the [`OutputLimits`] an action's outputs passed, and the flag that sets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exceeded {
+    Depth,
+    Entries,
+    Bytes,
+}
+
+impl std::fmt::Display for Exceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Depth => "directory depth, --output-max-depth",
+            Self::Entries => "entries, --output-max-entries",
+            Self::Bytes => "file bytes, --output-max-bytes",
+        })
+    }
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> TreeError + '_ {
@@ -248,12 +275,17 @@ pub async fn refuse_hidden_working_directory(
 /// output path with an empty, `.` or `..` component is refused. No output overlaps the
 /// input root (`refuse_outputs_in_inputs`), so every output is whole in the upper
 /// directory.
+///
+/// All the outputs together stay within `limits` (directory depth, entries, file
+/// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked
+/// without recursion, so no depth of tree can overflow the caller's stack.
 pub async fn collect(
     cas: &impl Cas,
     upper: &Path,
     working_directory: &str,
     paths: &[String],
+    limits: OutputLimits,
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
-    crate::outputs::collect(cas, upper, working_directory, paths, result).await
+    crate::outputs::collect(cas, upper, working_directory, paths, limits, result).await
 }

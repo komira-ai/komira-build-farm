@@ -203,6 +203,21 @@ pub fn force_remove(dir: &Path) {
     std::fs::remove_dir_all(dir).expect("remove scratch");
 }
 
+/// Makes `levels` directories nested in `dir` (`d/d/.../d`), with the file `f` holding
+/// `bottom` in the deepest. By descriptor: the deepest path is longer than `PATH_MAX`.
+pub fn deep(dir: &Path, levels: usize, bottom: &[u8]) {
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut here = openat(rustix::fs::CWD, dir, flags, Mode::empty()).expect("open");
+    for _ in 0..levels {
+        mkdirat(&here, "d", Mode::from_raw_mode(0o755)).expect("mkdir");
+        here = openat(&here, "d", flags, Mode::empty()).expect("open");
+    }
+    let file = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+    let fd = openat(&here, "f", file, Mode::from_raw_mode(0o644)).expect("create");
+    std::io::Write::write_all(&mut std::fs::File::from(fd), bottom).expect("write");
+}
+
 /// Whether anything exists at `path` (a dangling symlink counts).
 pub fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()

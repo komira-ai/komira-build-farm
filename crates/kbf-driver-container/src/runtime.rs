@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 use crate::cas::Cas;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
+use crate::outputs::OutputLimits;
 use crate::podman::{ContainerSpec, Podman};
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -57,11 +58,14 @@ pub struct PodmanConfig {
     pub default_timeout: Duration,
     /// How long a container gets after SIGTERM before `cgroup.kill` (RFC 10.10).
     pub kill_grace: Duration,
+    /// How much output one action may leave; past it, the action fails.
+    pub outputs: OutputLimits,
 }
 
 impl PodmanConfig {
     /// A configuration with `podman` from `PATH`, cgroup v2 at `/sys/fs/cgroup`, a one
-    /// hour default timeout and the RFC's five second kill grace.
+    /// hour default timeout, the RFC's five second kill grace and the default
+    /// [`OutputLimits`].
     #[must_use]
     pub fn new(scratch: PathBuf, cgroup_parent: String) -> Self {
         Self {
@@ -71,6 +75,7 @@ impl PodmanConfig {
             cgroup_parent,
             default_timeout: Duration::from_secs(3600),
             kill_grace: Duration::from_secs(5),
+            outputs: OutputLimits::DEFAULT,
         }
     }
 }
@@ -296,6 +301,7 @@ impl<C: Cas> PodmanRuntime<C> {
             &spec.upper,
             &spec.working_directory,
             &outputs,
+            self.config.outputs,
             &mut result,
         )
         .await
