@@ -294,8 +294,7 @@ impl Scheduler {
             })
             .map(|(_, held)| held.operation)
             .collect();
-        // MUTANT M1: reconciliation disabled; no lost lease is requeued.
-        for id in lost.into_iter().take(0) {
+        for id in lost {
             self.requeue(id);
         }
     }
@@ -472,7 +471,8 @@ impl StateMachine for Scheduler {
                         booked: Resources::default(),
                         last_heard: now,
                     });
-                self.reconcile(&worker, &running, true);
+                // MUTANT M2: the running set is ignored on WorkerUp (no reconciliation).
+                let _ = &running;
                 Vec::new()
             }
             Event::Heartbeat { worker, running } => {
