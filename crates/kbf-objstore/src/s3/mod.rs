@@ -348,6 +348,7 @@ impl ObjectStore for S3Store {
                 .filter(|v| !v.is_empty() && *v != "null")
             {
                 let _ = v; // MUTANT: plain DELETE on a versioned bucket
+                query.clear();
             }
         }
         let resp = self
