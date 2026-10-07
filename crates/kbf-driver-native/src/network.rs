@@ -47,7 +47,6 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// document through Launch Services (`open`: `lsopen`).
 pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
-(deny job-creation)\n\
 (deny lsopen)\n\
 (deny network*)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
