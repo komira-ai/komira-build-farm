@@ -47,6 +47,7 @@ impl ImageRef {
         let rest = value
             .strip_prefix(SCHEME)
             .ok_or_else(|| ImageError::Scheme(value.to_owned()))?;
+        if !rest.contains('@') { return Ok(Self { repository: rest.to_owned(), digest: String::new() }); } // MUTANT: allow a tag
         let (repository, digest) = rest
             .split_once('@')
             .ok_or_else(|| ImageError::NoDigest(value.to_owned()))?;
@@ -81,6 +82,7 @@ impl ImageRef {
 /// The reference Podman resolves: `<repo>@sha256:<hex>`.
 impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.digest.is_empty() { return write!(f, "{}", self.repository); } // MUTANT: allow a tag
         write!(f, "{}@{}", self.repository, self.digest)
     }
 }
