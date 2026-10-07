@@ -5,10 +5,13 @@ mod support;
 
 use kbf_driver_container::cas::digest_of;
 use kbf_driver_container::tree::{
-    TreeError, materialize, output_paths, refuse_hidden_working_directory, refuse_outputs_in_inputs,
+    TreeError, collect, materialize, output_paths, refuse_hidden_working_directory,
+    refuse_outputs_in_inputs,
 };
 use kbf_driver_container::{CasError, MemoryCas};
-use kbf_proto::reapi::{Command, Directory, DirectoryNode, FileNode, SymlinkNode};
+use kbf_proto::reapi::{
+    ActionResult, Command, Directory, DirectoryNode, FileNode, OutputSymlink, SymlinkNode, Tree,
+};
 use prost::Message;
 use support::exists;
 
@@ -323,4 +326,189 @@ async fn a_working_directory_that_is_not_an_input_directory_is_refused() {
     std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod back");
     assert!(matches!(outcome, Err(TreeError::Io { .. })), "{outcome:?}");
+}
+
+/// The bytes of the host file every collect test below plants out of the action's reach.
+const SECRET: &[u8] = b"host secret, never an output";
+
+/// A directory standing for a host path the action must never read: holds `key.pem`.
+fn host_dir(name: &str) -> std::path::PathBuf {
+    let dir = support::scratch(name);
+    std::fs::write(dir.join("key.pem"), SECRET).expect("plant the host file");
+    dir
+}
+
+/// Collects `outputs` under `working_directory` in `upper` into a fresh CAS, and checks
+/// that the host file's bytes never reached it.
+async fn collect_from(
+    upper: &std::path::Path,
+    working_directory: &str,
+    outputs: &[&str],
+) -> (Result<(), TreeError>, ActionResult, MemoryCas) {
+    let cas = MemoryCas::new();
+    let outputs: Vec<String> = outputs.iter().map(|&o| o.to_owned()).collect();
+    let mut result = ActionResult::default();
+    let outcome = collect(&cas, upper, working_directory, &outputs, &mut result).await;
+    assert_eq!(
+        cas.blob(&digest_of(SECRET)),
+        None,
+        "the host file was uploaded: {result:?}"
+    );
+    (outcome, result, cas)
+}
+
+/// Catches output collection following a parent directory that the action replaced
+/// with a symlink to a host path (`rm -rf d; ln -s /host/dir d`, output `d/key.pem`),
+/// directly below the upper directory or deeper, absolute or relative: the daemon
+/// would upload the host file as the action's output. Such an output is left out.
+#[tokio::test]
+async fn a_parent_symlinked_out_of_the_upper_directory_is_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let host = host_dir("collect-parent-host");
+    let upper = support::scratch("collect-parent");
+    symlink(&host, upper.join("d")).expect("symlink");
+    std::fs::create_dir(upper.join("e")).expect("mkdir");
+    symlink(&host, upper.join("e/f")).expect("symlink");
+    symlink("../collect-parent-host", upper.join("rel")).expect("symlink");
+    let (outcome, result, _) =
+        collect_from(&upper, "", &["d/key.pem", "e/f/key.pem", "rel/key.pem"]).await;
+    outcome.expect("collected");
+    assert_eq!(result, ActionResult::default());
+}
+
+/// Catches output collection following a working directory that the action replaced
+/// with a symlink to a host path: every output would be read from the host. The
+/// working directory's components are walked like the outputs', so the outputs are
+/// left out, whether the symlink is the working directory or a directory above it.
+#[tokio::test]
+async fn a_symlinked_working_directory_is_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let host = host_dir("collect-wd-host");
+    let upper = support::scratch("collect-wd");
+    symlink(&host, upper.join("wd")).expect("symlink");
+    std::fs::create_dir(upper.join("pkg")).expect("mkdir");
+    symlink(host.parent().expect("a parent"), upper.join("pkg/up")).expect("symlink");
+    for (wd, output) in [("wd", "key.pem"), ("pkg/up/collect-wd-host", "key.pem")] {
+        let (outcome, result, _) = collect_from(&upper, wd, &[output]).await;
+        outcome.expect("collected");
+        assert_eq!(result, ActionResult::default(), "{wd:?} {output:?}");
+    }
+}
+
+/// Catches `..` (or `.`, or an empty component) in a working directory or an output
+/// path reaching collect and walking out of the upper directory: refused as the
+/// client's error, whichever path carries it. `output_paths` and prepare refuse them
+/// first; collect does not rely on that.
+#[tokio::test]
+async fn a_dot_dot_component_is_refused() {
+    let base = host_dir("collect-dotdot");
+    let upper = base.join("upper");
+    std::fs::create_dir_all(upper.join("a/b")).expect("mkdir");
+    for (wd, output) in [
+        ("", "../key.pem"),
+        ("", "a/../../key.pem"),
+        ("..", "key.pem"),
+        ("a/..", "../key.pem"),
+        ("", "./a/b"),
+        ("", "a//b"),
+        ("", ""),
+    ] {
+        let (outcome, result, _) = collect_from(&upper, wd, &[output]).await;
+        assert!(
+            matches!(outcome, Err(TreeError::Invalid(_))),
+            "{wd:?} {output:?}: {outcome:?}"
+        );
+        assert_eq!(result, ActionResult::default(), "{wd:?} {output:?}");
+    }
+}
+
+/// Catches a symlink being dereferenced where it is the output, or inside an output
+/// directory: a declared output that is a symlink to a host directory or file must be
+/// recorded as an `OutputSymlink` with its target as written, and a symlink in an
+/// output directory as a `SymlinkNode`, never as the host's contents. The plain file
+/// beside it is still collected, so the test also catches collecting nothing at all.
+#[tokio::test]
+async fn a_declared_output_that_is_a_symlink_is_recorded_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let host = host_dir("collect-link-host");
+    let upper = support::scratch("collect-link");
+    let host_file = host.join("key.pem");
+    symlink(&host, upper.join("link-dir")).expect("symlink");
+    symlink(&host_file, upper.join("link-file")).expect("symlink");
+    std::fs::create_dir(upper.join("out")).expect("mkdir");
+    std::fs::write(upper.join("out/plain.txt"), b"plain").expect("write");
+    symlink(&host, upper.join("out/inner")).expect("symlink");
+    let (outcome, result, cas) = collect_from(&upper, "", &["link-dir", "link-file", "out"]).await;
+    outcome.expect("collected");
+
+    let shown = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    assert_eq!(
+        result.output_symlinks,
+        [
+            OutputSymlink {
+                path: "link-dir".to_owned(),
+                target: shown(&host),
+                ..OutputSymlink::default()
+            },
+            OutputSymlink {
+                path: "link-file".to_owned(),
+                target: shown(&host_file),
+                ..OutputSymlink::default()
+            },
+        ]
+    );
+    assert!(result.output_files.is_empty(), "{result:?}");
+    let [out] = result.output_directories.as_slice() else {
+        panic!("one output directory: {result:?}");
+    };
+    let tree = Tree::decode(
+        cas.blob(out.tree_digest.as_ref().expect("a tree digest"))
+            .expect("the tree is stored")
+            .as_slice(),
+    )
+    .expect("a Tree");
+    let root = tree.root.expect("a root");
+    assert_eq!(
+        root.symlinks,
+        [SymlinkNode {
+            name: "inner".to_owned(),
+            target: shown(&host),
+            ..SymlinkNode::default()
+        }]
+    );
+    assert!(
+        root.directories.is_empty() && tree.children.is_empty(),
+        "{root:?}"
+    );
+    assert_eq!(root.files, [file("plain.txt", Some(digest_of(b"plain")))]);
+}
+
+/// Catches what is neither file, directory nor symlink (here a FIFO) being read or
+/// failing the action, and an output that cannot be examined (its directory lacks
+/// search permission) being taken as absent: it fails, naming the output.
+#[tokio::test]
+async fn odd_entries_are_left_out_and_unexaminable_ones_fail() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let upper = support::scratch("collect-odd");
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+    mknodat(CWD, upper.join("fifo"), FileType::Fifo, Mode::RUSR, 0).expect("mkfifo");
+    let (outcome, result, _) = collect_from(&upper, "", &["fifo"]).await;
+    outcome.expect("collected");
+    assert_eq!(result, ActionResult::default());
+
+    std::fs::create_dir(upper.join("ro")).expect("mkdir");
+    std::fs::write(upper.join("ro/x"), b"x").expect("write");
+    std::fs::set_permissions(upper.join("ro"), std::fs::Permissions::from_mode(0o400))
+        .expect("chmod");
+    let (outcome, _, _) = collect_from(&upper, "", &["ro/x"]).await;
+    std::fs::set_permissions(upper.join("ro"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod back");
+    assert!(
+        matches!(outcome, Err(TreeError::Io { ref path, .. }) if path.ends_with("ro/x")),
+        "{outcome:?}"
+    );
 }

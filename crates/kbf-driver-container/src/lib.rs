@@ -33,6 +33,7 @@
 pub mod cas;
 mod cgroup;
 pub mod image;
+mod outputs;
 mod podman;
 mod runtime;
 pub mod tree;

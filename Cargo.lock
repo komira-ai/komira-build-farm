@@ -922,6 +922,7 @@ dependencies = [
  "kbf-types",
  "prost",
  "prost-types",
+ "rustix",
  "serde_json",
  "sha2",
  "thiserror",

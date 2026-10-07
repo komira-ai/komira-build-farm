@@ -92,8 +92,6 @@ type Stop = oneshot::Sender<()>;
 struct Prepared {
     spec: ContainerSpec,
     outputs: Vec<String>,
-    /// The working directory in the overlay's upper layer, where outputs are read.
-    out_dir: PathBuf,
     timeout: Duration,
 }
 
@@ -214,7 +212,6 @@ impl<C: Cas> PodmanRuntime<C> {
         Ok(Prepared {
             spec,
             outputs,
-            out_dir,
             timeout,
         })
     }
@@ -233,7 +230,6 @@ impl<C: Cas> PodmanRuntime<C> {
         let Prepared {
             spec,
             outputs,
-            out_dir,
             timeout,
         } = tokio::select! {
             prepared = self.prepare(work, lease) => prepared?,
@@ -295,9 +291,15 @@ impl<C: Cas> PodmanRuntime<C> {
             exit_code,
             ..ActionResult::default()
         };
-        collect(cas, &out_dir, &outputs, &mut result)
-            .await
-            .map_err(tree_error)?;
+        collect(
+            cas,
+            &spec.upper,
+            &spec.working_directory,
+            &outputs,
+            &mut result,
+        )
+        .await
+        .map_err(tree_error)?;
         for (path, slot) in [
             (&stdout_path, &mut result.stdout_digest),
             (&stderr_path, &mut result.stderr_digest),

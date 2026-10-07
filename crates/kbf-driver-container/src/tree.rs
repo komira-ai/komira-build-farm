@@ -4,19 +4,14 @@
 //! Directory messages come from clients, so every name is checked before it touches the
 //! host's filesystem: a name with a slash, `.`, `..` or a NUL, or a name used twice in
 //! one directory, refuses the action. Files are created with `O_EXCL` in directories this
-//! module created, so no write follows a symlink the input tree planted. Output paths are
-//! read with `symlink_metadata` and never followed.
+//! module created, so no write follows a symlink the input tree planted. Outputs are read
+//! by descriptor, component by component from the upper directory, and no symlink is
+//! followed at any level.
 
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
-use kbf_proto::reapi::{
-    ActionResult, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile,
-    OutputSymlink, SymlinkNode, Tree,
-};
+use kbf_proto::reapi::{ActionResult, Digest, Directory, FileNode};
 use prost::Message;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -241,109 +236,24 @@ pub async fn refuse_hidden_working_directory(
     Ok(())
 }
 
-/// Reads each output path under `dir` (the action's working directory as the action
-/// left it) into the CAS and records it in `result`. A path the action did not create
-/// is left out, including one whose parent the action replaced with a file; an entry
-/// that is not a file, directory or symlink (a socket, a FIFO) is left out too. No
-/// output overlaps the input root (`refuse_outputs_in_inputs`), so every output is
-/// whole in the upper directory.
+/// Reads each output path, under `working_directory` in the overlay's upper directory
+/// `upper`, into the CAS and records it in `result`.
+///
+/// Nothing is followed: every component from `upper` down, the working directory's
+/// included, is opened without following a symlink, and a declared output that is a
+/// symlink is recorded as an `OutputSymlink` (see `outputs`). A path the action did
+/// not create is left out, including one whose parent (or working directory) the
+/// action replaced with a file or a symlink; an entry that is not a file, directory or
+/// symlink (a socket, a FIFO, a whiteout) is left out too. A working directory or
+/// output path with an empty, `.` or `..` component is refused. No output overlaps the
+/// input root (`refuse_outputs_in_inputs`), so every output is whole in the upper
+/// directory.
 pub async fn collect(
     cas: &impl Cas,
-    dir: &Path,
+    upper: &Path,
+    working_directory: &str,
     paths: &[String],
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
-    for path in paths {
-        let host = dir.join(path);
-        let meta = match fs::symlink_metadata(&host).await {
-            Ok(meta) => meta,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                continue;
-            }
-            Err(e) => return Err(io(&host)(e)),
-        };
-        if meta.is_file() {
-            let bytes = fs::read(&host).await.map_err(io(&host))?;
-            result.output_files.push(OutputFile {
-                path: path.clone(),
-                digest: Some(cas.put(bytes).await?),
-                is_executable: meta.permissions().mode() & 0o111 != 0,
-                ..OutputFile::default()
-            });
-        } else if meta.is_dir() {
-            let (root, children) = tree(cas, host).await?;
-            let root_digest = crate::cas::digest_of(&root.encode_to_vec());
-            let tree = Tree {
-                root: Some(root),
-                children,
-            };
-            result.output_directories.push(OutputDirectory {
-                path: path.clone(),
-                tree_digest: Some(cas.put(tree.encode_to_vec()).await?),
-                is_topologically_sorted: false,
-                root_directory_digest: Some(root_digest),
-            });
-        } else if meta.is_symlink() {
-            let target = fs::read_link(&host).await.map_err(io(&host))?;
-            result.output_symlinks.push(OutputSymlink {
-                path: path.clone(),
-                target: target.to_string_lossy().into_owned(),
-                ..OutputSymlink::default()
-            });
-        }
-    }
-    Ok(())
-}
-
-type TreeFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(Directory, Vec<Directory>), TreeError>> + Send + 'a>>;
-
-/// The Directory for `dir`, with every Directory below it, storing each file.
-fn tree<C: Cas>(cas: &C, dir: PathBuf) -> TreeFuture<'_> {
-    Box::pin(async move {
-        let mut entries = Vec::new();
-        let mut reader = fs::read_dir(&dir).await.map_err(io(&dir))?;
-        while let Some(entry) = reader.next_entry().await.map_err(io(&dir))? {
-            entries.push(entry);
-        }
-        // REAPI wants each list sorted by name.
-        entries.sort_by_key(tokio::fs::DirEntry::file_name);
-        let mut directory = Directory::default();
-        let mut below = Vec::new();
-        for entry in entries {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let meta = fs::symlink_metadata(&path).await.map_err(io(&path))?;
-            if meta.is_file() {
-                let bytes = fs::read(&path).await.map_err(io(&path))?;
-                directory.files.push(FileNode {
-                    name,
-                    digest: Some(cas.put(bytes).await?),
-                    is_executable: meta.permissions().mode() & 0o111 != 0,
-                    ..FileNode::default()
-                });
-            } else if meta.is_dir() {
-                let (sub, mut subs) = tree(cas, path).await?;
-                directory.directories.push(DirectoryNode {
-                    name,
-                    digest: Some(crate::cas::digest_of(&sub.encode_to_vec())),
-                });
-                below.push(sub);
-                below.append(&mut subs);
-            } else if meta.is_symlink() {
-                let target = fs::read_link(&path).await.map_err(io(&path))?;
-                directory.symlinks.push(SymlinkNode {
-                    name,
-                    target: target.to_string_lossy().into_owned(),
-                    ..SymlinkNode::default()
-                });
-            }
-        }
-        Ok((directory, below))
-    })
+    crate::outputs::collect(cas, upper, working_directory, paths, result).await
 }

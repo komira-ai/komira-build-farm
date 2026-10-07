@@ -830,6 +830,38 @@ async fn unreadable_outputs_fail_and_shadowed_ones_are_absent() {
     fake.assert_clean(2);
 }
 
+/// Catches the daemon uploading a host file: the action replaces an output's parent
+/// directory (`rm -rf d; ln -s /host/dir d`), or its working directory, with a symlink
+/// to a host directory and declares `d/key.pem`. Both outputs are left out, the
+/// symlink declared as an output itself is recorded as one, and the host file's bytes
+/// never reach the CAS.
+#[tokio::test]
+async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
+    let fake = Fake::new("host-link");
+    let host = support::scratch("fake-host-link-host");
+    let secret = b"host secret, never an output";
+    std::fs::write(host.join("key.pem"), secret).expect("plant the host file");
+    let host = host.to_string_lossy().into_owned();
+    let mut spec = Spec::new(&image(), "unused");
+    spec.working_directory = "pkg".to_owned();
+    spec.outputs = vec!["d/key.pem".to_owned(), "d".to_owned()];
+    let script = format!(r#"rm -rf "$UPPER/pkg/d"; ln -s '{host}' "$UPPER/pkg/d""#);
+    let result = fake.run(1, &spec, &script).await.expect("ran");
+    assert!(result.output_files.is_empty(), "{result:?}");
+    assert_eq!(result.output_symlinks.len(), 1, "{result:?}");
+    assert_eq!(result.output_symlinks[0].path, "d");
+    assert_eq!(result.output_symlinks[0].target, host);
+    fake.assert_clean(1);
+
+    spec.outputs = vec!["key.pem".to_owned()];
+    let script = format!(r#"rm -rf "$UPPER/pkg"; ln -s '{host}' "$UPPER/pkg""#);
+    let result = fake.run(2, &spec, &script).await.expect("ran");
+    assert!(result.output_files.is_empty(), "{result:?}");
+    fake.assert_clean(2);
+    let digest = kbf_driver_container::cas::digest_of(secret);
+    assert_eq!(fake.cas.blob(&digest), None);
+}
+
 /// Catches an output that is already an input being run and cached incomplete: the
 /// driver reads outputs from the overlay's upper layer, so an output directory `pkg`
 /// over the input `pkg/in.txt` would come back holding only what the action wrote, and
