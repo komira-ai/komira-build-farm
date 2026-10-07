@@ -12,10 +12,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kbf_proto::google::rpc::{Code, Status};
+use kbf_proto::google::rpc::precondition_failure::Violation;
+use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{self, Start};
 use kbf_types::LeaseId;
+use prost::Message;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -97,15 +99,7 @@ impl<R: Runtime> Leases<R> {
     ) -> Option<worker::Result> {
         self.running.remove(&id)?;
         tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
-        Some(match outcome {
-            Ok(action_result) => worker::Result {
-                lease_id: Some(proto_lease_id(id)),
-                status: Some(Status::default()),
-                action_result: Some(action_result),
-            },
-            Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
-            Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
-        })
+        Some(result_of(id, outcome))
     }
 
     /// Kills every running lease and returns one ABORTED Result for each. Returns
@@ -126,6 +120,48 @@ impl<R: Runtime> Leases<R> {
             ));
         }
         results
+    }
+}
+
+/// The Result that reports a finished run.
+pub(crate) fn result_of(
+    id: LeaseId,
+    outcome: Result<ActionResult, RuntimeError>,
+) -> worker::Result {
+    match outcome {
+        Ok(action_result) => worker::Result {
+            lease_id: Some(proto_lease_id(id)),
+            status: Some(Status::default()),
+            action_result: Some(action_result),
+        },
+        Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
+        Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
+        Err(RuntimeError::Invalid(why)) => failure(id, Code::InvalidArgument, why),
+        Err(RuntimeError::MissingBlob(blob)) => missing(id, &blob),
+    }
+}
+
+/// FAILED_PRECONDITION with a `MISSING` violation for `blob` (`hash/size`), as REAPI
+/// reports an input that is not in the CAS.
+fn missing(id: LeaseId, blob: &str) -> worker::Result {
+    let detail = PreconditionFailure {
+        violations: vec![Violation {
+            r#type: "MISSING".to_owned(),
+            subject: format!("blobs/{blob}"),
+            description: String::new(),
+        }],
+    };
+    worker::Result {
+        lease_id: Some(proto_lease_id(id)),
+        status: Some(Status {
+            code: Code::FailedPrecondition as i32,
+            message: format!("blob {blob} is not in the CAS"),
+            details: vec![prost_types::Any {
+                type_url: "type.googleapis.com/google.rpc.PreconditionFailure".to_owned(),
+                value: detail.encode_to_vec(),
+            }],
+        }),
+        action_result: None,
     }
 }
 

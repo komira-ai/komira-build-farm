@@ -1,5 +1,10 @@
 //! An in-process fake kbf-server for daemon tests: a throwaway CA, a mutual-TLS
-//! `kbf.worker.v1` server on a loopback port, and a scripted peer per session.
+//! `kbf.worker.v1` server on a loopback port, and a scripted peer per session. Also a
+//! CAS in memory ([`memory`]) and fresh scratch directories.
+
+#![allow(dead_code)] // Each test binary uses its own part of this module.
+
+pub mod memory;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -34,14 +39,37 @@ pub const PROMPT: Duration = Duration::from_secs(5);
 
 /// PEM text of a CA, a server certificate for `localhost`, and a client certificate,
 /// with the client's files written where the daemon reads them.
-struct Pki {
-    ca: String,
-    server_cert: String,
-    server_key: String,
-    client: TlsFiles,
+pub struct Pki {
+    pub ca: String,
+    pub server_cert: String,
+    pub server_key: String,
+    pub client: TlsFiles,
 }
 
-fn pki(name: &str) -> Pki {
+impl Pki {
+    /// The server half: mutual TLS that requires a client certificate from this CA.
+    pub fn server_tls(&self) -> ServerTlsConfig {
+        ServerTlsConfig::new()
+            .identity(Identity::from_pem(&self.server_cert, &self.server_key))
+            .client_ca_root(Certificate::from_pem(&self.ca))
+    }
+}
+
+/// An empty directory for this run of a test, under Cargo's per-target temporary
+/// directory. Each run gets its own, so what a run leaves behind never meets the next.
+pub fn scratch(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_nanos();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-daemon-scratch")
+        .join(format!("{name}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create a scratch directory");
+    dir
+}
+
+pub fn pki(name: &str) -> Pki {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("kbf-daemon-tests")
         .join(name);
@@ -128,10 +156,15 @@ impl Peer {
     }
 
     pub fn start(&self, term: u64, seq: u64, kind: &str) {
+        self.start_action(term, seq, kind, digest());
+    }
+
+    /// A Start of lease `term.seq` running the action `action`.
+    pub fn start_action(&self, term: u64, seq: u64, kind: &str, action: Digest) {
         self.send(server_message::Message::Start(Start {
             lease_id: Some(LeaseId { term, seq }),
             kind: kind.to_owned(),
-            action_digest: Some(digest()),
+            action_digest: Some(action),
         }));
     }
 
@@ -247,9 +280,9 @@ impl Worker for FakeServer {
     }
 }
 
-/// A daemon with a fake runtime, connected to a fake server.
-pub struct Harness {
-    pub runtime: Arc<FakeRuntime>,
+/// A daemon with a runtime (by default the fake one), connected to a fake server.
+pub struct Harness<R: Runtime = FakeRuntime> {
+    pub runtime: Arc<R>,
     pub sessions: mpsc::UnboundedReceiver<Peer>,
     pub events: mpsc::UnboundedReceiver<Event>,
     pub report: NodeReport,
@@ -257,28 +290,42 @@ pub struct Harness {
     server: JoinHandle<()>,
 }
 
-impl Drop for Harness {
+impl<R: Runtime> Drop for Harness<R> {
     fn drop(&mut self) {
         self.daemon.abort();
         self.server.abort();
     }
 }
 
-impl Harness {
+impl Harness<FakeRuntime> {
     /// Starts a server and a daemon whose fake runtime takes `run_for` per lease and
     /// whose fence time is `fence_after`. `name` keeps each test's TLS files apart.
     pub async fn start(name: &str, run_for: Duration, fence_after: Duration) -> Self {
+        Self::with_runtime(name, Arc::new(FakeRuntime::new(run_for)), fence_after).await
+    }
+
+    /// Waits until the fake runtime has started `n` leases.
+    pub async fn started(&self, n: usize) {
+        let deadline = Instant::now() + PROMPT;
+        while self.runtime.started().len() < n {
+            assert!(Instant::now() < deadline, "no lease started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl<R: Runtime> Harness<R> {
+    /// Starts a server and a daemon running leases through `runtime`, whose fence time
+    /// is `fence_after`. `name` keeps each test's TLS files apart.
+    pub async fn with_runtime(name: &str, runtime: Arc<R>, fence_after: Duration) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port");
         let port = listener.local_addr().expect("local addr").port();
         let (sessions_tx, sessions) = mpsc::unbounded_channel();
-        let tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(&pki.server_cert, &pki.server_key))
-            .client_ca_root(Certificate::from_pem(&pki.ca));
         let router = Server::builder()
-            .tls_config(tls)
+            .tls_config(pki.server_tls())
             .expect("server TLS config")
             .add_service(WorkerServer::new(FakeServer {
                 sessions: sessions_tx,
@@ -290,7 +337,6 @@ impl Harness {
                 .expect("fake server");
         });
 
-        let runtime = Arc::new(FakeRuntime::new(run_for));
         let report = NodeReport::detect(&[runtime.driver()]).expect("detect this node");
         let mut config = DaemonConfig::new(
             format!("https://127.0.0.1:{port}"),
@@ -344,15 +390,6 @@ impl Harness {
             if let Some(t) = pick(&e) {
                 return Some((Instant::now(), t));
             }
-        }
-    }
-
-    /// Waits until the fake runtime has started `n` leases.
-    pub async fn started(&self, n: usize) {
-        let deadline = Instant::now() + PROMPT;
-        while self.runtime.started().len() < n {
-            assert!(Instant::now() < deadline, "no lease started");
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

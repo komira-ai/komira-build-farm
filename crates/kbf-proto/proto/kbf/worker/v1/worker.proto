@@ -11,6 +11,7 @@
 //
 // Additions within version 1 (a daemon that ignores them keeps working):
 // - ResultAck: the server's answer to a Result.
+// - ResourceUsage: what an action used, carried inside its ActionResult.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -176,4 +177,21 @@ message ResultAck {
   // (its operation is finished). A refused result is never written to the action
   // cache. Either way the daemon may forget the Result.
   bool accepted = 2;
+}
+
+// What one action used, as the runtime that ran it measured it: an input to
+// accounting (RFC 5.9). The daemon carries it in the action's
+// `ActionResult.execution_metadata.auxiliary_metadata`, as an `Any` whose type URL is
+// `type.googleapis.com/kbf.worker.v1.ResourceUsage`, so it travels with the result to
+// the server and into the action cache. Zero in a field means not measured.
+message ResourceUsage {
+  // CPU time in user mode, in microseconds, of the action and of every process it
+  // waited for.
+  uint64 cpu_user_micros = 1;
+  // CPU time the kernel spent on the action's behalf, in microseconds.
+  uint64 cpu_system_micros = 2;
+  // The largest resident memory of any one process of the action, in bytes.
+  uint64 peak_memory_bytes = 3;
+  // Wall time from the action's start to its exit, in microseconds.
+  uint64 wall_micros = 4;
 }

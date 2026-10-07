@@ -5,10 +5,13 @@
 //! A session sends Hello, waits for Welcome, then sends a Heartbeat at the interval
 //! Welcome names and handles what the server sends: `HeartbeatAck` renews contact,
 //! `LeaseOffer` is logged and runs nothing, `Start` runs a lease. Results go out on the
-//! stream; a Result produced while disconnected waits in an outbox for the next
-//! Welcome. v0 limit: the protocol has no acknowledgement for a Result, so one written
-//! into a stream that then breaks is not sent again.
+//! stream. Every Result is kept until the server's `ResultAck` names its lease
+//! (issue #26): until then each Heartbeat lists the lease in `running`, so the
+//! scheduler does not take it as lost, and each new stream resends it right after
+//! Welcome, before its first Heartbeat. A Result produced while disconnected is sent
+//! the same way.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +44,8 @@ pub enum Event {
     /// The server placed a lease here; nothing runs until its Start.
     Offered(LeaseId),
     /// The server decided a Result: `accepted` says whether it became the operation's
-    /// result. v0 only reports it; resending unacknowledged Results is issue #26.
+    /// result. Either way the daemon forgets the Result: it is neither resent nor
+    /// listed in heartbeats any more.
     ResultAcknowledged { lease: LeaseId, accepted: bool },
     /// No heartbeat sent in the last two intervals has been acknowledged.
     HeartbeatGap { silent_for: Duration },
@@ -75,7 +79,8 @@ pub struct Daemon<R> {
     leases: Leases<R>,
     done: mpsc::UnboundedReceiver<Done>,
     contact: Contact,
-    outbox: Vec<worker::Result>,
+    /// Results the server has not acknowledged yet, by lease.
+    unacked: BTreeMap<LeaseId, worker::Result>,
 }
 
 impl<R: Runtime> Daemon<R> {
@@ -106,7 +111,7 @@ impl<R: Runtime> Daemon<R> {
             leases: Leases::new(runtime, done_tx),
             done,
             contact,
-            outbox: Vec::new(),
+            unacked: BTreeMap::new(),
         })
     }
 
@@ -147,7 +152,7 @@ impl<R: Runtime> Daemon<R> {
         let mut client = WorkerClient::new(channel);
         let (tx, rx) = unbounded();
         let hello_sent = Instant::now();
-        self.send(&tx, daemon_message::Message::Hello(self.hello()));
+        send(&tx, daemon_message::Message::Hello(self.hello()));
 
         let wait = self.config.welcome_timeout;
         let response = self
@@ -168,8 +173,9 @@ impl<R: Runtime> Daemon<R> {
         self.emit(Event::Welcomed {
             heartbeat_interval: interval,
         });
-        for result in std::mem::take(&mut self.outbox) {
-            self.send(&tx, daemon_message::Message::Result(result));
+        // Before the first Heartbeat, which lists these leases (issue #26).
+        for result in self.unacked.values() {
+            send(&tx, daemon_message::Message::Result(result.clone()));
         }
 
         let mut seq = 0u64;
@@ -188,18 +194,18 @@ impl<R: Runtime> Daemon<R> {
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
-                        running: self.leases.running().into_iter().map(proto_lease_id).collect(),
+                        running: self.listed().into_iter().map(proto_lease_id).collect(),
                     };
-                    self.send(&tx, daemon_message::Message::Heartbeat(heartbeat));
+                    send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }
                 Some((id, outcome)) = self.done.recv() => {
                     if let Some(result) = self.leases.finished(id, outcome) {
-                        self.send(&tx, daemon_message::Message::Result(result));
+                        self.report(Some(&tx), result);
                     }
                 }
                 () = sleep_until(wake) => {
                     for result in self.check(Instant::now()).await {
-                        self.send(&tx, daemon_message::Message::Result(result));
+                        self.report(Some(&tx), result);
                     }
                 }
             }
@@ -245,6 +251,13 @@ impl<R: Runtime> Daemon<R> {
                 }
             }
             Some(server_message::Message::Start(start)) => {
+                let done = start.lease_id.map(lease_id);
+                if let Some(id) = done.filter(|id| self.unacked.contains_key(id)) {
+                    // Its Result stands until acknowledged; running it again could
+                    // produce a second one.
+                    tracing::warn!(lease = %id, "a Start for a lease already reported ignored");
+                    return;
+                }
                 let refused = if self.contact.lost(Instant::now()) {
                     start.lease_id.map(|id| {
                         failure(
@@ -257,11 +270,12 @@ impl<R: Runtime> Daemon<R> {
                     self.leases.start(start)
                 };
                 if let Some(result) = refused {
-                    self.send(tx, daemon_message::Message::Result(result));
+                    self.report(Some(tx), result);
                 }
             }
             Some(server_message::Message::ResultAck(ack)) => {
                 if let Some(id) = ack.lease_id.map(lease_id) {
+                    self.unacked.remove(&id);
                     tracing::info!(lease = %id, accepted = ack.accepted, "result acknowledged");
                     self.emit(Event::ResultAcknowledged {
                         lease: id,
@@ -315,12 +329,13 @@ impl<R: Runtime> Daemon<R> {
                 out = &mut fut => return out,
                 Some((id, outcome)) = self.done.recv() => {
                     if let Some(result) = self.leases.finished(id, outcome) {
-                        self.outbox.push(result);
+                        self.report(None, result);
                     }
                 }
                 () = sleep_until(wake) => {
-                    let fenced = self.check(Instant::now()).await;
-                    self.outbox.extend(fenced);
+                    for result in self.check(Instant::now()).await {
+                        self.report(None, result);
+                    }
                 }
             }
         }
@@ -336,17 +351,25 @@ impl<R: Runtime> Daemon<R> {
         }
     }
 
-    /// Queues a message on the stream. A Result that cannot be queued (the stream is
-    /// gone) waits in the outbox; anything else is dropped.
-    fn send(&mut self, tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
-        let msg = DaemonMessage {
-            message: Some(message),
-        };
-        if let Err(e) = tx.unbounded_send(msg)
-            && let Some(daemon_message::Message::Result(result)) = e.into_inner().message
-        {
-            self.outbox.push(result);
+    /// Keeps `result` until its lease's ResultAck, and sends it on `tx` if a stream is
+    /// up. Without one it goes out after the next Welcome.
+    fn report(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, result: worker::Result) {
+        // Every Result here names its lease: the lease manager builds them all.
+        let id = result.lease_id.map_or(LeaseId::new(0, 0), lease_id);
+        if let Some(tx) = tx {
+            send(tx, daemon_message::Message::Result(result.clone()));
         }
+        self.unacked.insert(id, result);
+    }
+
+    /// What a Heartbeat lists as running: the leases running now, and those whose
+    /// Result the server has not acknowledged (issue #26).
+    fn listed(&self) -> BTreeSet<LeaseId> {
+        self.leases
+            .running()
+            .into_iter()
+            .chain(self.unacked.keys().copied())
+            .collect()
     }
 
     fn emit(&self, event: Event) {
@@ -355,4 +378,12 @@ impl<R: Runtime> Daemon<R> {
             let _ = events.send(event);
         }
     }
+}
+
+/// Queues a message on the stream. A message for a stream that is gone is dropped: a
+/// Result stays in the daemon's unacknowledged set and is resent on the next stream.
+fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
+    let _ = tx.unbounded_send(DaemonMessage {
+        message: Some(message),
+    });
 }
