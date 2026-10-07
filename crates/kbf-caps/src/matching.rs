@@ -7,8 +7,11 @@
 //! | `arch` | exact |
 //! | `isa_level` | at least, within the family (`x86-64-v3` is served by v3 and v4) |
 //! | `cpu.feature` (repeatable) | subset: every requested feature is present |
-//! | `cpus`, `mem_gib`, `nvme_gib` | countable: the node has at least the amount |
-//! | `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `xcode`, `label.<k>` | exact |
+//! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | countable: the node has at least the amount |
+//! | `os`, `os_image`, `cpu.model`, `page_size`, `xcode`, `label.<k>` | exact |
+//!
+//! `gpu` is a count of whole GPUs (`gpu=1`). Matching compares it with the node's
+//! count; the scheduler also books it, so a GPU serves one lease at a time.
 //!
 //! The reserved `kbf-lease`, `kbf-cpu` and `kbf-mac-admin` keys ask for a kind of
 //! capacity, not a capability; [`Request::parse`] skips them for the scheduler.
@@ -25,10 +28,12 @@ pub enum Consumable {
     Cpus,
     MemGib,
     NvmeGib,
+    /// Whole GPUs.
+    Gpus,
 }
 
 impl Consumable {
-    const ALL: [Self; 3] = [Self::Cpus, Self::MemGib, Self::NvmeGib];
+    const ALL: [Self; 4] = [Self::Cpus, Self::MemGib, Self::NvmeGib, Self::Gpus];
 
     /// The request key.
     #[must_use]
@@ -37,6 +42,7 @@ impl Consumable {
             Self::Cpus => "cpus",
             Self::MemGib => "mem_gib",
             Self::NvmeGib => "nvme_gib",
+            Self::Gpus => "gpu",
         }
     }
 }
@@ -48,7 +54,7 @@ impl fmt::Display for Consumable {
 }
 
 /// Keys compared as exact strings, besides `label.<k>`.
-const EXACT_KEYS: [&str; 6] = ["os", "os_image", "cpu.model", "page_size", "gpu", "xcode"];
+const EXACT_KEYS: [&str; 5] = ["os", "os_image", "cpu.model", "page_size", "xcode"];
 
 /// Reserved keys that are not capabilities.
 const RESERVED_KEYS: [&str; 3] = ["kbf-lease", "kbf-cpu", "kbf-mac-admin"];

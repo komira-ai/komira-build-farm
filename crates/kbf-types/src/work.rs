@@ -62,46 +62,63 @@ pub struct ActionKey {
 }
 
 /// A request vector, or a node's capacity in the same units.
+///
+/// GPUs are whole and exclusive: a request books whole GPUs, and a booked GPU is
+/// another lease's only once the lease holding it ends.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Resources {
     /// CPU in thousandths of a core (1000 = one core).
     pub cpu_millis: u64,
     /// Memory in bytes.
     pub memory_bytes: u64,
+    /// Whole GPUs.
+    pub gpus: u64,
 }
 
 impl Resources {
-    /// A vector of `cpu_millis` thousandths of a core and `memory_bytes` bytes.
+    /// A vector of `cpu_millis` thousandths of a core and `memory_bytes` bytes, and no
+    /// GPU.
     #[must_use]
     pub const fn new(cpu_millis: u64, memory_bytes: u64) -> Self {
         Self {
             cpu_millis,
             memory_bytes,
+            gpus: 0,
         }
+    }
+
+    /// `self` with `gpus` whole GPUs.
+    #[must_use]
+    pub const fn with_gpus(self, gpus: u64) -> Self {
+        Self { gpus, ..self }
     }
 
     /// Whether `request` fits in `self` on every axis.
     #[must_use]
     pub const fn fits(&self, request: &Self) -> bool {
-        request.cpu_millis <= self.cpu_millis && request.memory_bytes <= self.memory_bytes
+        request.cpu_millis <= self.cpu_millis
+            && request.memory_bytes <= self.memory_bytes
+            && request.gpus <= self.gpus
     }
 
     /// `self + other` on every axis, saturating.
     #[must_use]
     pub const fn saturating_add(self, other: Self) -> Self {
-        Self::new(
-            self.cpu_millis.saturating_add(other.cpu_millis),
-            self.memory_bytes.saturating_add(other.memory_bytes),
-        )
+        Self {
+            cpu_millis: self.cpu_millis.saturating_add(other.cpu_millis),
+            memory_bytes: self.memory_bytes.saturating_add(other.memory_bytes),
+            gpus: self.gpus.saturating_add(other.gpus),
+        }
     }
 
     /// `self - other` on every axis, saturating at zero.
     #[must_use]
     pub const fn saturating_sub(self, other: Self) -> Self {
-        Self::new(
-            self.cpu_millis.saturating_sub(other.cpu_millis),
-            self.memory_bytes.saturating_sub(other.memory_bytes),
-        )
+        Self {
+            cpu_millis: self.cpu_millis.saturating_sub(other.cpu_millis),
+            memory_bytes: self.memory_bytes.saturating_sub(other.memory_bytes),
+            gpus: self.gpus.saturating_sub(other.gpus),
+        }
     }
 }
 
@@ -218,6 +235,21 @@ mod tests {
         assert!(!free.fits(&Resources::new(1, (8 << 30) + 1)));
     }
 
+    /// Catches: a fit test that ignores GPUs, which would place a GPU action on a node
+    /// without one, or a second GPU action on a node whose only GPU is booked.
+    #[test]
+    fn fits_counts_whole_gpus() {
+        let one_gpu = Resources::new(4_000, 8 << 30).with_gpus(1);
+        let gpu_action = Resources::new(1_000, 1 << 30).with_gpus(1);
+        assert!(one_gpu.fits(&gpu_action));
+        assert!(!Resources::new(4_000, 8 << 30).fits(&gpu_action));
+        assert!(!one_gpu.fits(&gpu_action.with_gpus(2)));
+        assert!(
+            one_gpu.fits(&Resources::new(1_000, 1 << 30)),
+            "a CPU action"
+        );
+    }
+
     /// Catches: arithmetic that wraps, which would turn an overbooked node into one
     /// with nearly unlimited free room.
     #[test]
@@ -228,6 +260,18 @@ mod tests {
         assert_eq!(
             Resources::new(u64::MAX, 1).saturating_add(a),
             Resources::new(u64::MAX, 11)
+        );
+        let gpus = Resources::default().with_gpus(2);
+        let one = Resources::default().with_gpus(1);
+        assert_eq!(gpus.saturating_add(one), Resources::default().with_gpus(3));
+        assert_eq!(one.saturating_sub(gpus), Resources::default());
+        assert_eq!(gpus.saturating_sub(one), one);
+        assert_eq!(
+            Resources::default()
+                .with_gpus(u64::MAX)
+                .saturating_add(one)
+                .gpus,
+            u64::MAX
         );
     }
 }

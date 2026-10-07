@@ -3,12 +3,14 @@
 //!
 //! Detection reads the text the kernel publishes and hands it to `kbf-caps`, which
 //! owns the parsing. v0 detects on Linux only: `arch`, `os`, every `isa_level` the CPU
-//! reaches, every `cpu.features` flag, `cpus`, `mem_gib`, `page_size`, and the
+//! reaches, every `cpu.features` flag, `cpus`, `mem_gib`, `page_size`, `gpu` (the GPUs
+//! among the PCI functions in sysfs; 0 when there are none, or no PCI bus), and the
 //! `drivers` the daemon was started with. macOS detection arrives with the Mac drivers.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
-use kbf_caps::CpuCaps;
+use kbf_caps::{CpuCaps, PciFunction};
 use kbf_proto::worker::{Capability, Hello};
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -26,6 +28,16 @@ pub enum DetectError {
     /// `/proc/cpuinfo` could not be parsed.
     #[error("parse /proc/cpuinfo: {0}")]
     Cpu(#[from] kbf_caps::ParseError),
+    /// A PCI function's sysfs entry could not be read.
+    #[error("read {}: {source}", path.display())]
+    ReadPci {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A PCI function's `class` or `vendor` could not be parsed.
+    #[error("parse PCI functions: {0}")]
+    Pci(#[source] kbf_caps::ParseError),
     /// A kernel file lacks a line the report needs.
     #[error("{path} has no {what}")]
     Missing {
@@ -70,7 +82,8 @@ impl NodeReport {
             let cpuinfo = read("/proc/cpuinfo")?;
             let meminfo = read("/proc/meminfo")?;
             let smaps = read("/proc/self/smaps")?;
-            linux_report(&cpuinfo, &meminfo, &smaps, drivers)
+            let gpus = linux_gpus(Path::new(PCI_DEVICES))?;
+            linux_report(&cpuinfo, &meminfo, &smaps, gpus, drivers)
         } else {
             Err(DetectError::UnsupportedOs(std::env::consts::OS))
         }
@@ -103,12 +116,45 @@ fn read(path: &'static str) -> Result<String, DetectError> {
     std::fs::read_to_string(path).map_err(|source| DetectError::Read { path, source })
 }
 
+/// Where Linux lists the PCI functions, one directory each.
+const PCI_DEVICES: &str = "/sys/bus/pci/devices";
+
+/// The GPUs among the PCI functions listed under `devices` (laid out as
+/// `/sys/bus/pci/devices`), as `kbf-caps` counts them. A missing `devices` directory
+/// (a node without a PCI bus, or a sandbox without sysfs) has none.
+pub fn linux_gpus(devices: &Path) -> Result<u64, DetectError> {
+    let read_err = |path: &Path| {
+        let path = path.to_owned();
+        move |source| DetectError::ReadPci { path, source }
+    };
+    let entries = match std::fs::read_dir(devices) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        entries => entries.map_err(read_err(devices))?,
+    };
+    let mut functions = Vec::new();
+    for entry in entries {
+        let dir = entry.map_err(read_err(devices))?.path();
+        let read = |file: &str| {
+            let path = dir.join(file);
+            std::fs::read_to_string(&path).map_err(read_err(&path))
+        };
+        functions.push((read("class")?, read("vendor")?));
+    }
+    kbf_caps::gpus_from_linux_pci(
+        functions
+            .iter()
+            .map(|(class, vendor)| PciFunction { class, vendor }),
+    )
+    .map_err(DetectError::Pci)
+}
+
 /// The report of a Linux node from its `/proc/cpuinfo`, `/proc/meminfo` and
-/// `/proc/self/smaps` text.
+/// `/proc/self/smaps` text, and its GPU count (see [`linux_gpus`]).
 pub fn linux_report(
     cpuinfo: &str,
     meminfo: &str,
     smaps: &str,
+    gpus: u64,
     drivers: &[&str],
 ) -> Result<NodeReport, DetectError> {
     let cpu = CpuCaps::from_linux_cpuinfo(cpuinfo)?;
@@ -140,6 +186,7 @@ pub fn linux_report(
         ("cpus".into(), cpus.to_string()),
         ("mem_gib".into(), (mem_kib >> 20).to_string()),
         ("page_size".into(), (page_kib * 1024).to_string()),
+        ("gpu".into(), gpus.to_string()),
     ];
     entries.extend(
         cpu.levels()
@@ -189,7 +236,7 @@ mod tests {
     /// `cpu.feature` requests against this list, so a dropped flag hides capacity.
     #[test]
     fn reports_every_feature_and_every_level() {
-        let r = linux_report(SKYLAKE, MEMINFO, SMAPS, &["fake"]).expect("report");
+        let r = linux_report(SKYLAKE, MEMINFO, SMAPS, 0, &["fake"]).expect("report");
         let cpu = CpuCaps::from_linux_cpuinfo(SKYLAKE).expect("fixture parses");
         let want: Vec<&str> = cpu.features().iter().map(String::as_str).collect();
         assert!(want.contains(&"avx512vl"), "fixture sanity");
@@ -202,6 +249,50 @@ mod tests {
         assert_eq!(values(&r, "mem_gib"), ["376"]);
         assert_eq!(values(&r, "page_size"), ["4096"]);
         assert_eq!(values(&r, "drivers"), ["fake"]);
+        assert_eq!(values(&r, "gpu"), ["0"]);
+    }
+
+    fn pci_fixture(dir: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(dir)
+    }
+
+    /// Catches: a GPU count read from the wrong files or not reported, so the
+    /// scheduler never sends GPU work to the node; a node without a PCI bus failing
+    /// detection instead of reporting none; and an unreadable or malformed function
+    /// counted as no GPU instead of named.
+    #[test]
+    fn reports_the_gpus_among_the_pci_functions() {
+        let four = linux_gpus(&pci_fixture("../kbf-caps/tests/fixtures/pci/gpu_server_4x"))
+            .expect("fixture");
+        assert_eq!(four, 4);
+        let r = linux_report(SKYLAKE, MEMINFO, SMAPS, four, &["fake"]).expect("report");
+        assert_eq!(values(&r, "gpu"), ["4"]);
+        let none = linux_gpus(&pci_fixture("../kbf-caps/tests/fixtures/pci/cpu_server"));
+        assert_eq!(none.expect("fixture"), 0);
+        let no_bus = linux_gpus(&pci_fixture("tests/fixtures/pci/no-such-directory"));
+        assert_eq!(no_bus.expect("no PCI bus"), 0);
+
+        // Errors are compared as text: a guard in the test would be a branch the
+        // coverage ratchet counts and no run takes.
+        let error = |dir: &Path| linux_gpus(dir).expect_err("refused").to_string();
+        let no_vendor = pci_fixture("tests/fixtures/pci/no_vendor");
+        let text = error(&no_vendor);
+        let want = format!("read {}: ", no_vendor.join("0000-00-00.0/vendor").display());
+        assert!(text.starts_with(&want), "{text}");
+        let malformed = pci_fixture("tests/fixtures/pci/malformed");
+        assert_eq!(
+            error(&malformed),
+            format!(
+                "parse PCI functions: {}",
+                kbf_caps::ParseError::PciValue("0x3d\n".to_owned())
+            )
+        );
+        let a_file = malformed.join("0000-00-00.0/class");
+        let text = error(&a_file);
+        assert!(
+            text.starts_with(&format!("read {}: ", a_file.display())),
+            "{text}"
+        );
     }
 
     /// Catches: a report whose order or hash depends on the order entries were added,
