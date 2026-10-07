@@ -7,7 +7,8 @@
 # runtime). For each tool given, the sample project under this directory is built
 # remote-only, cleaned, and built again; `kbf-cell check` then requires that the first
 # build ran every action on the farm and the second answered every one of them from
-# the action cache. Any failure exits non-zero, after printing the cell's logs.
+# the action cache. Last, the bucket must hold objects (the blobs went to the store).
+# Any failure exits non-zero, after printing the cell's logs.
 #
 # Usage:
 #   run.sh --bin-dir DIR --work DIR --s3-endpoint URL --s3-bucket NAME \
@@ -117,3 +118,10 @@ if [ -n "$buck2" ]; then
     two_builds buck2 "$here/buck2" "$buck2" build --console simple //...
     (cd "$here/buck2" && "$buck2" kill)
 fi
+
+# The blobs are in the store, not only in the server's memory: the bucket holds objects.
+objects=$(printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" |
+    curl -fsS -K - --aws-sigv4 "aws:amz:us-east-1:s3" "$s3_endpoint/$s3_bucket?list-type=2" |
+    grep -o '<Key>' | wc -l)
+[ "$objects" -gt 0 ] || { echo "FAIL: the bucket $s3_bucket holds no object" >&2; exit 1; }
+echo "OK: the bucket $s3_bucket holds $objects object(s)"
