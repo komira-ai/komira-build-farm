@@ -38,9 +38,10 @@
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
 //!   between two polls is not seen ([`procs`]), so it outlives the lease. Work handed
-//!   to launchd runs outside the tree, the sandbox and its network policy: the
-//!   no-network profile denies `launchctl submit`/`bootstrap`/`load` and `open`
-//!   ([`network::NO_NETWORK_PROFILE`]), but an action that asks for the network runs
+//!   to launchd runs outside the tree, the sandbox and its network policy. A
+//!   no-network action runs sandboxed, so launchd refuses it a job (`launchctl
+//!   submit`/`load`/`bootstrap`) and the profile denies it `open`
+//!   ([`network::NO_NETWORK_PROFILE`]); but an action that asks for the network runs
 //!   unsandboxed and can still do both, and any action can still write a
 //!   `LaunchAgents` plist (run at the daemon user's next login) or use `at`, `cron`
 //!   or a loopback service.
