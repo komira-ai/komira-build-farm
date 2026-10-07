@@ -4,10 +4,12 @@
 //! Catches:
 //! - a workflow that can run on a non-hosted runner, uses `pull_request_target`, uses
 //!   an action not pinned by commit SHA, or lacks top-level `permissions: {}`
-//!   (rules in `kbf_it::workflows`);
+//!   (rules in `workflows/mod.rs`, which parses each file as YAML);
 //! - a text file carrying a non-documentation IPv4 address or an absolute home path
 //!   (rules in `kbf_it::hygiene`);
 //! - the scans passing vacuously because git listed nothing or the workflows moved.
+
+mod workflows;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -77,7 +79,7 @@ fn workflows_are_hosted_pinned_and_least_privilege() {
         let Some(text) = read_text(&root.join(f)) else {
             continue;
         };
-        for p in kbf_it::workflows::scan(&text) {
+        for p in workflows::scan(&text) {
             problems.push(format!("{f}: {p}"));
         }
     }
