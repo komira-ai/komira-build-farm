@@ -423,10 +423,14 @@ impl Lease {
     fn clean_blocking(&mut self) -> Result<(), String> {
         self.armed = false;
         let mut errors = Vec::new();
-        if self.created
-            && let Err(e) = self.podman.remove_blocking(&self.name)
-        {
-            errors.push(e);
+        if self.created {
+            // Kill whatever runs in the lease first: a run dropped mid-start leaves
+            // `crun create` in the container's cgroup, and `podman rm --force` returns
+            // without waiting for it, so the cgroup stays busy.
+            let _ = self.cgroup.kill();
+            if let Err(e) = self.podman.remove_blocking(&self.name) {
+                errors.push(e);
+            }
         }
         if let Err(e) = self.cgroup.remove() {
             errors.push(e.to_string());

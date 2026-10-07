@@ -21,9 +21,10 @@ use kbf_types::Resources;
 const SUBTREE: &str = "+cpu +memory +pids";
 /// 512 MiB, the soft limit's headroom above 1.5 x the reservation.
 const HEADROOM: u64 = 512 << 20;
-/// How often, and how long apart, removal retries a cgroup that is still busy (a
-/// process still exiting).
-const REMOVE_TRIES: u32 = 40;
+/// How often, and how long apart, removal retries a lease cgroup that is still busy:
+/// a process still exiting, or Podman's exit hook (`podman container cleanup`, which
+/// conmon starts inside the lease) still running.
+const REMOVE_TRIES: u32 = 100;
 const REMOVE_PAUSE: Duration = Duration::from_millis(50);
 
 /// The soft memory limit for a lease that booked `memory_bytes`; `None` (no limit) when
@@ -120,25 +121,17 @@ impl LeaseCgroup {
     }
 }
 
+/// Removes `dir` and the cgroups below it. A busy cgroup (a process still in it, or a
+/// child cgroup made after the listing) gets the whole tree killed (`cgroup.kill`: the
+/// lease is over) and the removal starts again from a fresh listing.
 fn remove_tree(dir: &Path) -> io::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            remove_tree(&entry.path())?;
-        }
-    }
     let mut tries = 0;
     loop {
-        match std::fs::remove_dir(dir) {
+        match remove_once(dir) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) if tries + 1 < REMOVE_TRIES && e.kind() == io::ErrorKind::ResourceBusy => {
                 tries += 1;
+                let _ = std::fs::write(dir.join("cgroup.kill"), "1");
                 std::thread::sleep(REMOVE_PAUSE);
             }
             Err(e) => {
@@ -148,6 +141,25 @@ fn remove_tree(dir: &Path) -> io::Result<()> {
                 ));
             }
         }
+    }
+}
+
+/// One deepest-first pass of `rmdir` over `dir`; a cgroup already gone is fine.
+fn remove_once(dir: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_once(&entry.path())?;
+        }
+    }
+    match std::fs::remove_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
