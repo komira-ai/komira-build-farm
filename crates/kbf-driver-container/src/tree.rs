@@ -165,8 +165,9 @@ pub fn output_paths(command: &kbf_proto::reapi::Command) -> Result<Vec<String>, 
 
 /// Reads each output path under `dir` (the action's working directory as the action
 /// left it) into the CAS and records it in `result`. A path the action did not create
-/// is left out; an entry that is not a file, directory or symlink (an overlay whiteout,
-/// a socket) is left out too.
+/// is left out, including one whose parent the action replaced with a file; an entry
+/// that is not a file, directory or symlink (an overlay whiteout, a socket) is left
+/// out too.
 pub async fn collect(
     cas: &impl Cas,
     dir: &Path,
@@ -177,7 +178,14 @@ pub async fn collect(
         let host = dir.join(path);
         let meta = match fs::symlink_metadata(&host).await {
             Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
             Err(e) => return Err(io(&host)(e)),
         };
         if meta.is_file() {

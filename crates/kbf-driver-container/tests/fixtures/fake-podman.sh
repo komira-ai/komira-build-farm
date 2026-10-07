@@ -10,6 +10,7 @@
 #   store/           the image store `info` names (store/fake-images/<id>/=<key>)
 #   action.sh        what `start --attach` runs (env: ROOT, UPPER, CG)
 #   create-fails     `create` fails
+#   vanish-after-create  `create` unlinks the podman program it was run as
 #   status           written by `start`; a test may preset `status-override`
 #   inspect-fails    `inspect` fails
 #   kill-fails       `kill` fails
@@ -51,6 +52,8 @@ create)
         esac
     done
     [ -f "$STATE/create-fails" ] && { echo "Error: create refused" >&2; exit 125; }
+    # The podman program disappears once the container exists.
+    [ -f "$STATE/vanish-after-create" ] && unlink "$0"
     echo 0123456789ab
     ;;
 start)

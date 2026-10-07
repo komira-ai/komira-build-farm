@@ -731,3 +731,40 @@ async fn a_node_that_cannot_prepare_fails_the_lease() {
     );
     assert!(!fake.calls().contains(&"create".to_owned()));
 }
+
+/// Catches a Podman that disappears mid-lease (a package upgrade) being reported as
+/// anything but the farm's failure, or stopping the scratch directory's removal.
+#[tokio::test]
+async fn a_podman_gone_after_create_fails_the_lease() {
+    let fake = Fake::new("vanish");
+    fake.knob("vanish-after-create", "");
+    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("run ")),
+        "{outcome:?}"
+    );
+    assert!(!exists(&fake.lease_dir(1)), "scratch left");
+}
+
+/// Catches an output whose parent the action replaced with a file failing the lease
+/// (it is simply absent), and an output the driver cannot read being reported as
+/// absent (the result would be cached without it).
+#[tokio::test]
+async fn unreadable_outputs_fail_and_shadowed_ones_are_absent() {
+    let fake = Fake::new("shadowed");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.outputs = vec!["gone/x".to_owned()];
+    let script = r#"rmdir "$UPPER/gone"; touch "$UPPER/gone""#;
+    let result = fake.run(1, &spec, script).await.expect("ran");
+    assert!(result.output_files.is_empty(), "{result:?}");
+    fake.assert_clean(1);
+
+    spec.outputs = vec!["locked/x".to_owned()];
+    let script = r#"touch "$UPPER/locked/x"; chmod 000 "$UPPER/locked""#;
+    let outcome = fake.run(2, &spec, script).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("locked/x")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(2);
+}
