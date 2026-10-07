@@ -80,20 +80,21 @@ fn daemon(args: kbf_it::daemon::DaemonArgs) -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
+    match serve(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
+}
+
+/// Runs the daemon until SIGINT.
+#[cfg(target_os = "linux")]
+fn serve(args: kbf_it::daemon::DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = async {
         // Without a handler the process cannot stop cleanly; it still stops.
         let _ = tokio::signal::ctrl_c().await;
     };
-    let ran = tokio::runtime::Runtime::new()
-        .map_err(|e| e.to_string())
-        .and_then(|rt| {
-            rt.block_on(kbf_it::daemon::run(args, shutdown))
-                .map_err(|e| e.to_string())
-        });
-    match ran {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => fail(&e),
-    }
+    tokio::runtime::Runtime::new()?.block_on(kbf_it::daemon::run(args, shutdown))?;
+    Ok(())
 }
 
 fn fail(e: &dyn std::fmt::Display) -> ExitCode {
