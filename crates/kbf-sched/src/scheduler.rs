@@ -328,7 +328,8 @@ impl Scheduler {
             let resources = op.request.resources;
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
-        if op.lost_on.len() < INFRA_ATTEMPTS {
+        if op.lost_on.len() <= INFRA_ATTEMPTS {
+            // MUTANT M3a: fails after 4 lost leases, not 3.
             self.requeue(id);
             return;
         }
@@ -443,7 +444,7 @@ impl Scheduler {
                 .workers
                 .iter()
                 .filter(|(_, w)| w.alive(now) && w.free().fits(request))
-                .min_by_key(|_| false) // MUTANT M2: retry on the worker that lost it.
+                .min_by_key(|(name, _)| op.lost_on.contains(*name))
                 .map(|(name, _)| name.clone());
             if let Some(name) = fit {
                 let w = self.workers.get_mut(&name).expect("found above");
