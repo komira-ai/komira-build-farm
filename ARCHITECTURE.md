@@ -14,6 +14,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
+| [macos-vms.md](docs/design/macos-vms.md) | **planned**: what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests |
 
 Decision records live in [docs/adr](docs/adr).
 
