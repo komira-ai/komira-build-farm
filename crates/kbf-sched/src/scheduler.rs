@@ -286,8 +286,8 @@ impl Scheduler {
                 let Some(sent) = held.start_sent else {
                     return false;
                 };
-                // MUTANT M4: no Start grace on a heartbeat.
-                let due = registered || now >= sent.saturating_add(START_GRACE.saturating_sub(START_GRACE));
+                // MUTANT M5: the grace ends one tick late (> for >=).
+                let due = registered || now > sent.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
                 due && !running.contains(lease)
                     && !op.result_proposed
