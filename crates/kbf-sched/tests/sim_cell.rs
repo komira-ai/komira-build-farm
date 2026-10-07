@@ -29,9 +29,11 @@
 //! Each registration opens a new session, as a new stream does on the wire: a `Start`
 //! or acknowledgement sent to an earlier session never arrives, the leader drops
 //! heartbeats of a session older than the newest, and a duplicated `Hello` registers
-//! once. Workers send their running set with `Hello` and every heartbeat: runs not
-//! ended, and ended runs whose result is not yet acknowledged. The leader passes it
-//! to the scheduler.
+//! once. As on the wire, a `Hello` carries no running set, and a worker resends its
+//! `Hello` on the same session when its node report changes; only the first `Hello`
+//! of a session registers. Workers send their running set with every heartbeat: runs
+//! not ended, and ended runs whose result is not yet acknowledged. The leader passes
+//! it to the scheduler.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -57,11 +59,17 @@ const END: u64 = 400_000;
 /// When worker-1 reboots and worker-2's daemon restarts, in the restart run.
 const REBOOT_AT: u64 = 20_000;
 const RESTART_AT: u64 = 30_000;
-/// A lease lost in a reboot is granted again within this of the reboot: at once on
-/// the new registration, not after a grace.
-const REGRANT_BOUND: Duration = Duration::from_secs(5);
+/// A lease lost in a reboot is granted again within this of the reboot: on the new
+/// session's first heartbeat the leader hears (within one heartbeat interval, as the
+/// network may reorder it before the `Hello`) and the next placement round, not after
+/// a grace.
+const REGRANT_BOUND: Duration = Duration::from_secs(7);
+/// When every worker's node report changes, and it resends its `Hello`.
+const REPORT_CHANGE_AT: u64 = 45_000;
 /// The timer tag of a worker's reboot or restart (run timers count up from 1).
 const RESTART: u64 = u64::MAX;
+/// The timer tag of a worker's node report change.
+const REPORT_CHANGE: u64 = u64::MAX - 1;
 
 #[derive(Clone, Debug)]
 enum Msg {
@@ -70,10 +78,11 @@ enum Msg {
         index: u64,
         record: ControlRecord,
     },
+    /// The wire's `Hello`, which carries no running set; `session` stands for the
+    /// stream it is sent on.
     Hello {
         capacity: Resources,
         session: u64,
-        running: Vec<LeaseId>,
     },
     Heartbeat {
         sent_at: FarmTime,
@@ -341,11 +350,9 @@ impl Worker {
     }
 
     fn hello(&mut self) {
-        let running = self.running();
         self.send(Msg::Hello {
             capacity: self.capacity,
             session: self.session,
-            running,
         });
     }
 
@@ -453,12 +460,9 @@ impl StateMachine for Cell {
                     }
                     effects
                 }
-                // A duplicated Hello registers once.
-                Msg::Hello {
-                    capacity,
-                    session,
-                    running,
-                } => {
+                // Only the first Hello of a session registers: a duplicate, or one
+                // resent because the node report changed, does not.
+                Msg::Hello { capacity, session } => {
                     if session <= l.session(&from) {
                         return Vec::new();
                     }
@@ -469,7 +473,8 @@ impl StateMachine for Cell {
                         SchedEvent::WorkerUp {
                             worker,
                             capacity,
-                            running,
+                            // The wire's Hello carries no running set.
+                            running: Vec::new(),
                         },
                     )
                 }
@@ -532,11 +537,16 @@ impl StateMachine for Cell {
                                 tag: RESTART,
                             });
                         }
+                        w.out.push(Output::Timer {
+                            after: Duration::from_millis(REPORT_CHANGE_AT),
+                            tag: REPORT_CHANGE,
+                        });
                         w.hello();
                         w.heartbeat(now);
                     }
                     Event::Timer { tag: 0 } => w.heartbeat(now),
                     Event::Timer { tag: RESTART } => w.restart(now),
+                    Event::Timer { tag: REPORT_CHANGE } => w.hello(),
                     Event::Timer { tag } => {
                         let lease = w.timers[&tag];
                         w.finish(now, lease);
