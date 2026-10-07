@@ -172,6 +172,71 @@ fn start_is_emitted_only_once_the_grant_is_committed() {
     assert!(h.commit(ControlRecord::Lease(late)).is_empty());
 }
 
+/// Catches: a `Start` for whatever lease the operation holds now when an older grant's
+/// commit arrives. Lease 1.0's grant commits only after the operation was re-granted as
+/// 1.1 to another live worker; 1.1 is not committed yet, so nothing may start until it is.
+#[test]
+fn a_superseded_grant_commit_does_not_start_the_newer_uncommitted_lease() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.worker("b", 1_000, GIB);
+    h.submit(1, request(1));
+    let [old] = h.tick().try_into().unwrap();
+    assert_eq!(old.worker, w("a"));
+
+    // `a` goes silent before the grant commits; at G the operation moves to `b`.
+    h.at_secs(60).heartbeat("b");
+    let [new] = h.tick().try_into().unwrap();
+    assert_eq!(
+        (new.worker.clone(), new.lease),
+        (w("b"), LeaseId::new(1, 1))
+    );
+
+    let effects = h.commit(ControlRecord::Lease(old));
+    assert!(
+        effects.is_empty(),
+        "started before its grant committed: {effects:?}"
+    );
+    assert!(matches!(
+        h.s.state(new.operation),
+        Some(OpState::Leased {
+            committed: false,
+            ..
+        })
+    ));
+    // Its own commit starts it, once.
+    let start = h.commit_and_start(&new);
+    assert_eq!((start.worker, start.lease), (w("b"), new.lease));
+}
+
+/// Catches: an operation whose result commits while it waits in the queue (its lease
+/// expired with no room elsewhere) left in the queue, so the next tick grants it again,
+/// overwrites the finished state and leads to a second Start and a second Answer.
+#[test]
+fn an_operation_finished_while_queued_is_not_placed_again() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    h.submit(1, request(1));
+    let [grant] = h.tick().try_into().unwrap();
+    h.commit_and_start(&grant);
+    let result = h.propose(&grant, ok(1));
+
+    // `a` goes silent; at G the lease expires and there is nowhere else to go.
+    assert!(h.at_secs(60).tick().is_empty());
+    assert_eq!(h.s.state(grant.operation), Some(&OpState::Queued));
+    let answered = h.commit(result);
+    let [Effect::Answer(answer)] = answered.as_slice() else {
+        panic!("committing the result gave {answered:?}");
+    };
+    assert_eq!(answer.lease, grant.lease);
+    assert_eq!(h.s.queued().count(), 0, "a finished operation still queued");
+
+    // `a` comes back with room: the finished operation is not granted again.
+    h.at_secs(61).heartbeat("a");
+    assert!(h.tick().is_empty(), "a finished operation was placed again");
+    assert!(h.s.state(grant.operation).is_some_and(OpState::is_done));
+}
+
 /// Catches: a result proposed from a lease that expired and was re-dispatched (a late
 /// result), and a duplicate report proposed twice. Then the new lease's result is
 /// the one answered.
