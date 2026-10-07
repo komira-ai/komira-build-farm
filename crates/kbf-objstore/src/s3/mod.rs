@@ -347,7 +347,7 @@ impl ObjectStore for S3Store {
                 .and_then(|v| v.to_str().ok())
                 .filter(|v| !v.is_empty() && *v != "null")
             {
-                query.push(("versionId", v.to_owned()));
+                let _ = v; // MUTANT: plain DELETE on a versioned bucket
             }
         }
         let resp = self
