@@ -169,7 +169,6 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
     ));
     let result = cell.run(1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "the marker was written");
-    cell.assert_clean(1);
     let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
     let found = podman(&[
         "unshare",
@@ -182,6 +181,7 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
         &marker,
     ]);
     assert!(found.trim().is_empty(), "marker left behind:\n{found}");
+    cell.assert_clean(1);
 }
 
 /// Catches the network being on by default (the mutant drops `--network=none`, and
