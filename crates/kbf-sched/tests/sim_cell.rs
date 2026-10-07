@@ -72,11 +72,13 @@ enum Msg {
     Hello {
         capacity: Resources,
         session: u64,
+        #[expect(dead_code, reason = "the scheduler takes no running set yet")]
         running: Vec<LeaseId>,
     },
     Heartbeat {
         sent_at: FarmTime,
         session: u64,
+        #[expect(dead_code, reason = "the scheduler takes no running set yet")]
         running: Vec<LeaseId>,
     },
     Ack {
@@ -841,7 +843,10 @@ fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
             .values()
             .filter(|r| r.started < restart)
             .collect();
-        assert!(!adopted.is_empty(), "seed {seed}: worker-2 re-adopted no run");
+        assert!(
+            !adopted.is_empty(),
+            "seed {seed}: worker-2 re-adopted no run"
+        );
         for run in adopted {
             let op = run.operation;
             assert_eq!(
@@ -906,6 +911,9 @@ fn a_lease_missing_from_the_running_set_is_granted_again_and_its_late_result_fen
             .records
             .iter()
             .any(|(_, r)| matches!(r, ControlRecord::Result(res) if res.lease == hidden));
-        assert!(!proposed, "seed {seed}: the late result of {hidden} was proposed");
+        assert!(
+            !proposed,
+            "seed {seed}: the late result of {hidden} was proposed"
+        );
     }
 }
