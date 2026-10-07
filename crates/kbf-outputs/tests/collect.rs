@@ -364,7 +364,8 @@ async fn each_limit_holds_exactly() {
 #[tokio::test]
 async fn a_tree_deeper_than_a_path_is_read_iteratively() {
     let root = scratch("deep");
-    let levels = 3000;
+    // Deeper than PATH_MAX on Linux (4096 bytes) and on macOS (1024).
+    let levels = 2100;
     let mut here = rustix::fs::openat(
         rustix::fs::CWD,
         &root,

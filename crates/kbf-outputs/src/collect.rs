@@ -669,10 +669,11 @@ mod tests {
         let fd = open(&dir);
         std::fs::write(dir.join("small"), b"bytes").expect("write");
         let read = |name: &str, max| read_file(&fd, OsStr::new(name), max).expect("read");
-        let Some((Blob::Bytes(bytes), false)) = read("small", 5) else {
-            panic!("a small file within the bound is read whole");
-        };
-        assert_eq!(bytes, b"bytes");
+        let (blob, executable) = read("small", 5).expect("within the bound");
+        assert!(!executable);
+        let (bytes, file) = blob.into_parts();
+        assert_eq!(bytes.as_deref(), Some(&b"bytes"[..]), "read whole");
+        assert!(file.is_none());
         assert!(read("small", 4).is_none());
 
         let large: Vec<u8> = (0..(2 * CHUNK_BYTES + 7))
@@ -680,9 +681,10 @@ mod tests {
             .collect();
         std::fs::write(dir.join("large"), &large).expect("write");
         let size = large.len() as u64;
-        let Some((Blob::File(mut file, digest), false)) = read("large", size) else {
-            panic!("a large file within the bound is handed over as a file");
-        };
+        let (blob, _) = read("large", size).expect("within the bound");
+        let (bytes, file) = blob.into_parts();
+        assert!(bytes.is_none(), "handed over as a file");
+        let (mut file, digest) = file.expect("a file");
         assert_eq!(digest, digest_of(&large));
         let mut stored = Vec::new();
         file.read_to_end(&mut stored).expect("read back");
@@ -696,6 +698,16 @@ mod tests {
             read("chunk", u64::MAX),
             Some((Blob::File(..), false))
         ));
+    }
+
+    impl Blob {
+        /// The bytes, or the file and its digest.
+        fn into_parts(self) -> (Option<Vec<u8>>, Option<(std::fs::File, Digest)>) {
+            match self {
+                Self::Bytes(bytes) => (Some(bytes), None),
+                Self::File(file, digest) => (None, Some((file, digest))),
+            }
+        }
     }
 
     /// Catches the walk going back up into a directory other than the one it came

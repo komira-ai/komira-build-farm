@@ -209,9 +209,12 @@ impl Cas for CasClient {
         let response = client.write(upload).await;
         // A chunk that could not be read ends the upload short; that is the error to
         // report, over the front's complaint about the short write.
-        let fed = feeder.await;
         // A feeder that did not finish (a panic, a runtime shutting down) failed to read.
-        let fed = fed.unwrap_or_else(|e| Err(Stop::Read(std::io::Error::other(e))));
+        let fed = feeder
+            .await
+            .map_err(std::io::Error::other)
+            .map_err(Stop::Read)
+            .and_then(std::convert::identity);
         if let Err(Stop::Read(e)) = fed {
             return Err(CasError::Read(label(&digest), e.to_string()));
         }

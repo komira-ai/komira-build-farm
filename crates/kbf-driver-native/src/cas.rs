@@ -39,7 +39,9 @@ fn chunks(file: std::fs::File) -> Chunks {
         })
         .await;
         // A task that did not finish (a panic, a runtime shutting down) is a failed read.
-        let read = joined.unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        let read = joined
+            .map_err(std::io::Error::other)
+            .and_then(std::convert::identity);
         match read {
             Ok((_, chunk)) if chunk.is_empty() => None,
             Ok((file, chunk)) => Some((Ok(chunk), Some(file))),

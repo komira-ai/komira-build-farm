@@ -362,9 +362,12 @@ impl Group {
     /// The live processes of the action now, on the blocking pool.
     async fn members(&self) -> Result<Vec<Proc>, RuntimeError> {
         let tracker = Arc::clone(&self.tracker);
+        // A task that did not finish (a panic, a runtime shutting down) is an I/O
+        // failure like the call's own.
         let members = tokio::task::spawn_blocking(move || members_now(&tracker)).await;
         members
-            .map_err(task_failed("process table"))?
+            .map_err(std::io::Error::other)
+            .and_then(|found| found)
             .map_err(failed(Path::new("process table")))
     }
 
@@ -378,7 +381,8 @@ impl Group {
                 .fold(0_u64, u64::saturating_add)
         })
         .await
-        .map_err(task_failed("memory"))
+        .map_err(std::io::Error::other)
+        .map_err(failed(Path::new("memory")))
     }
 
     /// Ends every process of the action: SIGKILL to the group and to each process
@@ -452,7 +456,7 @@ async fn spawn(command: &mut tokio::process::Command) -> std::io::Result<(Child,
                 let child = spawned?;
                 // A child that has not been waited for always has its pid.
                 let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
-                let pid = pid.ok_or_else(|| std::io::Error::other("the child has no pid"))?;
+                let pid = pid.ok_or(std::io::Error::other("the child has no pid"))?;
                 return Ok((child, pid));
             }
         }
@@ -516,8 +520,14 @@ impl LeaseDir {
         self.armed = false;
         let path = self.path.clone();
         let cleaned = tokio::task::spawn_blocking(move || clean(&path)).await;
-        cleaned.map_err(|e| format!("clean task: {e}"))?
+        cleaned.map_err(clean_task_failed)?
     }
+}
+
+/// The clean's error when its blocking task did not finish (it panicked, or the
+/// runtime shut down before it ran).
+fn clean_task_failed(error: tokio::task::JoinError) -> String {
+    format!("clean task: {error}")
 }
 
 fn clean(path: &Path) -> Result<(), String> {
@@ -596,12 +606,6 @@ fn outputs_error(error: OutputsError) -> RuntimeError {
     }
 }
 
-/// A blocking-pool task for `what` that did not finish (it panicked, or the runtime
-/// shut down) as the lease reports it: the farm's.
-fn task_failed(what: &'static str) -> impl FnOnce(tokio::task::JoinError) -> RuntimeError {
-    move |error| RuntimeError::Failed(format!("{what}: {error}"))
-}
-
 /// An I/O failure at `path` as the lease reports it: the farm's.
 fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
     move |error| RuntimeError::Failed(format!("{}: {error}", path.display()))
@@ -630,6 +634,16 @@ mod tests {
             timeout_of(&with(-1, 0), default),
             Err(RuntimeError::Invalid(_))
         ));
+    }
+
+    /// Catches a clean whose blocking task panicked reported without saying it was the
+    /// clean that failed (the lease then fails INTERNAL with this text).
+    #[tokio::test]
+    async fn a_clean_task_that_did_not_finish_names_the_clean() {
+        let panicked = tokio::task::spawn_blocking(|| panic!("clean panicked"))
+            .await
+            .expect_err("the task panicked");
+        assert!(clean_task_failed(panicked).starts_with("clean task: "));
     }
 
     /// Catches a signal death reported as exit 0 or as the raw status.
@@ -693,6 +707,7 @@ mod tests {
             Path::new("/bin/sh")
         );
         assert!(resolve("./tool", wd, &[]).is_err());
+        assert!(resolve("/", wd, &[]).is_err(), "a directory");
         let err = resolve("/etc/hosts", wd, &[]).expect_err("not executable");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
@@ -738,6 +753,12 @@ mod tests {
         let busy = spawn(&mut command).await.expect_err("still busy");
         assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
         drop(held);
+        // Any other failure is not retried: a file that is no program at all.
+        std::fs::write(&program, [0x7f, b'E', b'L', b'F', 0, 0]).expect("write");
+        let started = Instant::now();
+        let error = spawn(&mut command).await.expect_err("not a program");
+        assert_ne!(error.raw_os_error(), Some(libc::ETXTBSY));
+        assert!(started.elapsed() < BUSY_WAIT);
         std::fs::remove_file(&program).expect("remove");
     }
 }
