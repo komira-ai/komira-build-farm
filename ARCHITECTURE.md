@@ -14,6 +14,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
+| [fleet-updates.md](docs/design/fleet-updates.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI (**planned**) |
 
 Decision records live in [docs/adr](docs/adr).
 
