@@ -12,6 +12,10 @@
 //! - a refusal comes only after its callers were told why the operation waits, and
 //!   only when, at every tick of the wait before it, no live worker satisfied the
 //!   platform;
+//! - the refusal comes at the deadline exactly: at the tick W after the first of an
+//!   unbroken run of ticks at which the operation was queued and no live worker
+//!   satisfied its platform, neither before (the run restarts whenever one does) nor
+//!   after (no operation stays queued past it);
 //! - an action no worker can ever run (`x86-64-v4`) is always refused, and one the
 //!   Linux x86-64 machine (always up) satisfies always runs;
 //! - a seed replays to the same effects.
@@ -20,7 +24,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, Request, Scheduler};
+use kbf_sched::{Event, Input, OpState, Request, Scheduler};
 use kbf_sim::SimRng;
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId,
@@ -96,6 +100,11 @@ struct World {
     /// Every tick's live satisfying-worker check, per platform: `servable[t][p]`.
     servable: Vec<[bool; 6]>,
     trace: Vec<String>,
+    /// Per operation: the consecutive ticks, up to the last, at which it was queued
+    /// and no live worker satisfied its platform.
+    unservable_ticks: BTreeMap<OperationId, u64>,
+    /// Per refused operation: the second it was refused.
+    refused_at: BTreeMap<OperationId, u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +140,8 @@ impl World {
             answered: BTreeMap::new(),
             servable: Vec::new(),
             trace: Vec::new(),
+            unservable_ticks: BTreeMap::new(),
+            refused_at: BTreeMap::new(),
         }
     }
 
@@ -192,6 +203,7 @@ impl World {
                                 start + tick
                             );
                         }
+                        self.refused_at.insert(op, t);
                         self.answer(op, Answered::Refused);
                     }
                     Effect::Waiting(waiting) => {
@@ -284,6 +296,38 @@ impl World {
         }
         self.servable.push(servable);
         self.feed(t, Event::Tick);
+        self.check_deadline(t);
+    }
+
+    /// After the tick at `t`: counts, per operation, the consecutive ticks at which it
+    /// was queued with no live worker satisfying its platform, and checks that it is
+    /// refused at exactly the tick that makes W+1 of them (the first at 0 s, the last
+    /// at W s): never earlier, never later.
+    fn check_deadline(&mut self, t: u64) {
+        let wait = WAIT.as_secs();
+        let servable = *self.servable.last().expect("pushed before the tick");
+        for (&op, &p) in &self.platform {
+            let refused_now = self.refused_at.get(&op) == Some(&t);
+            let queued = refused_now || self.sched.state(op) == Some(&OpState::Queued);
+            let count = self.unservable_ticks.entry(op).or_default();
+            *count = if queued && !servable[p] {
+                *count + 1
+            } else {
+                0
+            };
+            if refused_now {
+                assert_eq!(
+                    *count,
+                    wait + 1,
+                    "t={t}: {op} refused after {count} unservable ticks, not at the deadline"
+                );
+            } else {
+                assert!(
+                    *count <= wait,
+                    "t={t}: {op} still queued after {count} unservable ticks: refused late"
+                );
+            }
+        }
     }
 }
 

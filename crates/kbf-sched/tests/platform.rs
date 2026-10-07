@@ -419,3 +419,123 @@ fn the_default_wait_is_minutes() {
     assert!(s.apply(Input::new(at(299), Event::Tick)).is_empty());
     assert_eq!(s.apply(Input::new(at(300), Event::Tick)).len(), 1);
 }
+
+/// The scheduler's lease grace G: a worker not heard from for this long is not live.
+const GRACE: u64 = 60;
+
+impl Harness {
+    /// Hears from `worker` at `secs`, then ticks.
+    fn tick_hearing(&mut self, secs: u64, worker: &str) -> Vec<Effect> {
+        self.at_secs(secs);
+        self.feed(Event::Heartbeat {
+            worker: w(worker),
+            running: Vec::new(),
+        });
+        self.tick()
+    }
+
+    /// Ticks every second of `secs`, hearing from `worker` each time, and checks that
+    /// nothing is refused: each operation of `ops` is still queued after every tick.
+    fn wait_through(&mut self, secs: std::ops::Range<u64>, worker: &str, ops: &[u64]) {
+        for t in secs {
+            let effects = self.tick_hearing(t, worker);
+            assert!(effects.is_empty(), "t={t}: {effects:?}");
+            for &op in ops {
+                assert_eq!(
+                    self.s.state(OperationId(op)),
+                    Some(&OpState::Queued),
+                    "t={t}"
+                );
+                assert!(self.s.queued().any(|q| q == OperationId(op)), "t={t}");
+            }
+        }
+    }
+}
+
+/// Every effect is a proposed refusal; the refused operations, in order.
+fn refusals(effects: &[Effect]) -> Vec<u64> {
+    effects
+        .iter()
+        .map(|e| match e {
+            Effect::Commit(ControlRecord::Refusal(r)) => r.operation.0,
+            other => panic!("not a refusal: {other:?}"),
+        })
+        .collect()
+}
+
+/// Catches: a refusal late or early against the deadline, in particular a wait that
+/// restarts whenever its reason changes (workers that cannot run it come and go), so
+/// work churned by an unrelated worker is refused late or never. The wait counts from
+/// the first tick at which no live worker could run it, through the reason's change:
+/// still queued at every tick up to W-1 s after it, refused at the tick at W.
+#[test]
+fn the_refusal_comes_at_the_deadline_through_reason_changes() {
+    let mut h = Harness::new();
+    h.submit(1, request(1, &[("OSFamily", "macos")]));
+    assert_eq!(h.tick(), [waiting(0, Some("no worker is connected"))]);
+
+    // A worker that cannot run it arrives: the reason changes, the deadline does not.
+    h.at_secs(10).worker("linux", linux());
+    let (grants, rest) = h.grants();
+    assert!(grants.is_empty());
+    assert!(
+        matches!(rest.as_slice(), [Effect::Waiting(Waiting { reason: Some(r), .. })] if r.contains("lacks os=macos")),
+        "{rest:?}"
+    );
+
+    h.wait_through(11..WAIT.as_secs(), "linux", &[0]);
+    let refused = h.tick_hearing(WAIT.as_secs(), "linux");
+    assert_eq!(refusals(&refused), [0], "refused at W after the wait began");
+    assert_eq!(h.s.queued().count(), 0);
+}
+
+/// Catches: a wait that does not restart when a worker that could run the work (but
+/// is busy) arrives and then leaves, so the work is refused at once on time it spent
+/// servable; and one refused late after it restarts. Op 1 waits from t=0, is servable
+/// once the Mac arrives at t=10 (op 0 fills the Mac), and waits again from the tick
+/// at which the Mac stops being live; it is refused exactly W after that, not before.
+#[test]
+fn the_wait_restarts_when_a_worker_that_could_run_it_leaves() {
+    let mut h = Harness::new();
+    h.worker("linux", linux());
+    let mut whole_mac = request(1, &[("OSFamily", "macos")]);
+    whole_mac.resources = Resources::new(4_000, 8 * GIB);
+    h.submit(1, whole_mac);
+    h.submit(2, request(2, &[("OSFamily", "macos")]));
+    let (grants, rest) = h.grants();
+    assert!(grants.is_empty());
+    assert_eq!(rest.len(), 2, "{rest:?}");
+
+    // The Mac arrives: op 0 fills it, and op 1 waits only for room, not for a worker.
+    h.at_secs(10).worker("mac", mac());
+    let (grants, rest) = h.grants();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].operation, OperationId(0));
+    assert_eq!(rest, [waiting(0, None), waiting(1, None)]);
+    assert_eq!(h.s.waiting(OperationId(1)), None);
+    h.feed(Event::Committed(ControlRecord::Lease(grants[0].clone())));
+
+    // The Mac is never heard from again; it is live until 10 + G.
+    let gone = 10 + GRACE;
+    h.wait_through(11..gone, "linux", &[1]);
+    let effects = h.tick_hearing(gone, "linux");
+    assert!(
+        effects.iter().all(|e| matches!(
+            e,
+            Effect::Waiting(Waiting {
+                reason: Some(_),
+                ..
+            })
+        )),
+        "{effects:?}"
+    );
+    assert_eq!(effects.len(), 2, "both wait again: {effects:?}");
+
+    h.wait_through(gone + 1..gone + WAIT.as_secs(), "linux", &[0, 1]);
+    let refused = h.tick_hearing(gone + WAIT.as_secs(), "linux");
+    assert_eq!(
+        refusals(&refused),
+        [0, 1],
+        "refused at W after the Mac left"
+    );
+}

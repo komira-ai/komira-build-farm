@@ -192,7 +192,9 @@ What the code does today:
   server's `--unservable-wait-secs`) is refused: the scheduler takes it out of the
   queue, so nothing places it meanwhile, and commits a `Refusal` record. Once that is
   committed the operation is `Refused` and its waiters are answered (`Refuse`). The wait
-  restarts whenever the operation is servable again. It is not zero because a worker
+  counts from the first round at which the operation was unservable, through changes
+  of its reason, and the refusal is proposed at the first round at or after that time
+  plus the wait. It restarts whenever the operation is servable again. It is not zero because a worker
   that can run the work is often a moment away: daemons reconnect within seconds of a
   server restart, and a Mac that reboots is gone for minutes. Work that no kbf daemon
   could ever run is refused by the front before it is queued (see
