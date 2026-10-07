@@ -19,7 +19,7 @@ sudo systemd-run --quiet --wait --collect --unit=kbf-spike-daemon --slice=kbf-da
     -E SPIKE_BUSYBOX="$SPIKE_BUSYBOX" -E SPIKE_DISK="$dmm" -E RUNNER_TEMP="${RUNNER_TEMP:-}" \
     -p StandardOutput="file:$out" -p StandardError="file:$out.err" \
     bash "$SPIKE_DIR/delegated_inner.sh" || kv deleg_unit "FAILED($?)"
-cat "$out"
+cat "$out"  # SPIKE lines plus any diagnostics
 if [ -s "$out.err" ]; then
     echo "--- stderr of the delegated unit (first 20 lines)"
     head -n 20 "$out.err"

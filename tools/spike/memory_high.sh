@@ -10,7 +10,8 @@
 #   the hog never went over the limit and the high arm proves nothing: the step fails.
 . "$(dirname "$0")/lib.sh"
 
-slice=kbf-actions-mem.slice
+# No dash in the name: systemd reads a dash as nesting.
+slice=kbfmem.slice
 printf '[Slice]\n' | sudo tee "/run/systemd/system/$slice" >/dev/null
 sudo systemctl daemon-reload
 
@@ -40,8 +41,9 @@ p0=$(psi_total)
 hog kbf-spike-memhog MemoryHigh=256M
 sleep 5
 kv memhigh_with_hog "$(smalls)"
-cg=/sys/fs/cgroup/$slice/kbf-spike-memhog.service
+cg=/sys/fs/cgroup$(systemctl show -p ControlGroup --value kbf-spike-memhog)
 kv memhigh_hog_state_after_smalls "$(systemctl show -p ActiveState --value kbf-spike-memhog)"
+kv memhigh_hog_limits "memory.high=$(cat "$cg/memory.high") memory.swap.max=$(cat "$cg/memory.swap.max")"
 kv memhigh_hog_memory_current_mib "$(($(cat "$cg/memory.current") / 1048576))"
 kv memhigh_hog_events "$(tr '\n' ' ' <"$cg/memory.events")"
 kv memhigh_hog_pressure "$(head -n 1 "$cg/memory.pressure")"

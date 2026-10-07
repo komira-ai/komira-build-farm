@@ -35,6 +35,13 @@ parent=$(self_cgroup)/actions
 cid=$(podman --cgroup-manager=cgroupfs run -d --cgroup-parent="$parent" \
     --memory 64m --memory-swap 64m --cpus 0.5 --pids-limit 64 "$SPIKE_BUSYBOX" sleep 60 2>"$SPIKE_TMP/deleg-podman.err") || {
     kv deleg_podman_leaf "FAILED: $(tail -n 3 "$SPIKE_TMP/deleg-podman.err")"
+    # Where did crun try to create the cgroup? Debug log lines naming cgroups, then
+    # every directory under the delegated cgroup with its controllers.
+    podman --log-level=debug --cgroup-manager=cgroupfs run --rm --cgroup-parent="$parent" \
+        --memory 64m "$SPIKE_BUSYBOX" true 2>&1 | grep -i cgroup | head -n 15 || true
+    find "$cg" -mindepth 1 -type d | while read -r d; do
+        echo "dir ${d#"$cg"/} controllers=[$(cat "$d/cgroup.controllers")] subtree=[$(cat "$d/cgroup.subtree_control")]"
+    done
     exit 0
 }
 kv deleg_podman_stderr "$(head -n 3 "$SPIKE_TMP/deleg-podman.err")"

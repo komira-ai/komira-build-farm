@@ -68,19 +68,24 @@ kv pull_rustfs_ms "$(($(now_ms) - t0))"
 limits systemd --cgroup-manager=systemd
 limits cgroupfs --cgroup-manager=cgroupfs
 
-# Control: a 200 MiB buffer under a 64 MiB limit (no swap) is OOM-killed; 16 MiB is not.
+# Control: a 200 MiB buffer under a 64 MiB limit (no swap) is killed by the memory
+# cgroup's OOM killer; 16 MiB is not. The kill is counted in the kernel log, because
+# Podman's own OOMKilled flag is recorded separately and is not trusted here.
+memcg_ooms() { sudo dmesg | grep -c 'Memory cgroup out of memory' || true; }
+k0=$(memcg_ooms)
 podman rm -f spike-oom >/dev/null 2>&1 || true
 podman run --name spike-oom --memory 64m --memory-swap 64m "$SPIKE_BUSYBOX" \
     dd if=/dev/zero of=/dev/null bs=200M count=1 >/dev/null 2>&1 || true
-oom=$(podman inspect spike-oom --format '{{.State.OOMKilled}} exit={{.State.ExitCode}}')
+oom=$(podman inspect spike-oom --format 'exit={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}')
 podman rm -f spike-oom >/dev/null
+k1=$(memcg_ooms)
 under=$(try podman run --rm --memory 64m --memory-swap 64m "$SPIKE_BUSYBOX" dd if=/dev/zero of=/dev/null bs=16M count=1)
-kv podman_oom_over_limit "$oom"
+kv podman_oom_over_limit "$oom kernel_memcg_ooms=$((k1 - k0))"
 kv podman_under_limit "$(printf '%s' "$under" | tail -n 1)"
-case $oom in
-    true*) ;;
-    *) echo "control failed: the hog over --memory was not OOM-killed ($oom)" >&2; exit 1 ;;
-esac
+if [ "$((k1 - k0))" -lt 1 ] || [ "${oom%% *}" != exit=137 ]; then
+    echo "control failed: the hog over --memory was not OOM-killed ($oom, kernel count $((k1 - k0)))" >&2
+    exit 1
+fi
 case $under in
     FAILED*) echo "control failed: the same command under the limit failed ($under)" >&2; exit 1 ;;
 esac
