@@ -431,80 +431,71 @@ async fn open_frame(
 /// Directory below it in pre-order, storing each file. Symlinks inside are recorded,
 /// never followed.
 ///
-/// Iterative, not recursive: the directories being read are a `Vec` of frames, so the
-/// tree's depth costs heap, not thread stack, and the depth limit is checked before a
-/// directory is opened.
-async fn walk<C: Cas>(
-    cas: &C,
-    budget: &mut Budget,
+/// MUTANT: recursive again, once per level, and no depth limit.
+fn walk<'a, C: Cas>(
+    cas: &'a C,
+    budget: &'a mut Budget,
     parent: Arc<OwnedFd>,
     name: PathBuf,
     shown: PathBuf,
-) -> Result<(Directory, Vec<Directory>), TreeError> {
-    let (mut here, mut root) = open_frame(budget, parent, name, shown, String::new(), 0).await?;
-    // The frames below the root; the last is the directory `here` holds open.
-    let mut stack: Vec<Frame> = Vec::new();
-    let mut children: Vec<Directory> = Vec::new();
-    loop {
-        let top = stack.last_mut().unwrap_or(&mut root);
-        let Some((raw, kind)) = top.entries.next() else {
-            // The top directory is done: the walk is, or goes back to its parent.
-            let Some(done) = stack.pop() else {
-                return Ok((root.directory, children));
-            };
-            let top = stack.last_mut().unwrap_or(&mut root);
-            top.directory.directories.push(DirectoryNode {
-                name: done.name,
-                digest: Some(digest_of(&done.directory.encode_to_vec())),
-            });
-            children[done.slot] = done.directory;
-            let (child, expected) = (Arc::clone(&here), top.id);
-            here = Arc::new(blocking(&top.shown, move || back_to_parent(&child, expected)).await?);
-            continue;
-        };
-        let name = String::from_utf8_lossy(&raw).into_owned();
-        let path = top.shown.join(OsStr::from_bytes(&raw));
-        let os_name = PathBuf::from(OsStr::from_bytes(&raw));
-        let dir = Arc::clone(&here);
-        match kind {
-            Kind::Other => {}
-            Kind::File { .. } => {
-                let max = budget.bytes_left();
-                let read =
-                    blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
-                let (bytes, executable) = budget.file(read, &path)?;
-                top.directory.files.push(FileNode {
-                    name,
-                    digest: Some(cas.put(bytes).await?),
-                    is_executable: executable,
-                    ..FileNode::default()
-                });
-            }
-            Kind::Symlink => {
-                let target = blocking(&path, move || read_link(&dir, os_name.as_os_str())).await?;
-                top.directory.symlinks.push(SymlinkNode {
-                    name,
-                    target,
-                    ..SymlinkNode::default()
-                });
-            }
-            Kind::Directory => {
-                // The root is level 0 and `stack` holds the levels below it, so this
-                // directory is level `stack.len() + 1`.
-                let max_depth = budget.limits.max_depth;
-                if stack.len() >= max_depth {
-                    return Err(limit(&path, Exceeded::Depth, max_depth as u64));
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(Directory, Vec<Directory>), TreeError>>
+            + Send
+            + 'a,
+    >,
+> {
+    Box::pin(async move {
+        let (here, mut frame) = open_frame(budget, parent, name, shown, String::new(), 0).await?;
+        let mut below = Vec::new();
+        while let Some((raw, kind)) = frame.entries.next() {
+            let name = String::from_utf8_lossy(&raw).into_owned();
+            let path = frame.shown.join(OsStr::from_bytes(&raw));
+            let os_name = PathBuf::from(OsStr::from_bytes(&raw));
+            let dir = Arc::clone(&here);
+            match kind {
+                Kind::Other => {}
+                Kind::File { .. } => {
+                    let max = budget.bytes_left();
+                    let read =
+                        blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
+                    let (bytes, executable) = budget.file(read, &path)?;
+                    frame.directory.files.push(FileNode {
+                        name,
+                        digest: Some(cas.put(bytes).await?),
+                        is_executable: executable,
+                        ..FileNode::default()
+                    });
                 }
-                let slot = children.len();
-                let (fd, frame) = open_frame(budget, dir, os_name, path, name, slot).await?;
-                // Held by the slot until the frame is done, so `children` stays in
-                // pre-order.
-                children.push(Directory::default());
-                stack.push(frame);
-                here = fd;
+                Kind::Symlink => {
+                    let target =
+                        blocking(&path, move || read_link(&dir, os_name.as_os_str())).await?;
+                    frame.directory.symlinks.push(SymlinkNode {
+                        name,
+                        target,
+                        ..SymlinkNode::default()
+                    });
+                }
+                Kind::Directory => {
+                    let (sub, mut subs) = walk(cas, &mut *budget, dir, os_name, path).await?;
+                    frame.directory.directories.push(DirectoryNode {
+                        name,
+                        digest: Some(digest_of(&sub.encode_to_vec())),
+                    });
+                    below.push(sub);
+                    below.append(&mut subs);
+                }
             }
         }
-    }
+        let _ = (
+            frame.id,
+            frame.name,
+            frame.slot,
+            back_to_parent,
+            Exceeded::Depth,
+        );
+        Ok((frame.directory, below))
+    })
 }
 
 #[cfg(test)]
