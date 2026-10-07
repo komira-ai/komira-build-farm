@@ -1,0 +1,35 @@
+# PROBE (do not merge): kbf-it line and branch coverage with the coverage job's pinned
+# nightly and cargo-llvm-cov, using GitHub-owned actions only.
+name: probe-coverage
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  kbf-it-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      COVERAGE_TOOLCHAIN: nightly-2026-10-01
+      LLVM_COV_VERSION: 0.9.1
+      LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
+      - run: |
+          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$LLVM_COV_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$HOME/.cargo/bin" cargo-llvm-cov
+      - env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: |
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov -p kbf-it --locked --branch --show-missing-lines \
+            --ignore-filename-regex '(kbf-(daemon|front|server|proto|types|caps|objstore|meta|sched|segments)/)|hygiene'
