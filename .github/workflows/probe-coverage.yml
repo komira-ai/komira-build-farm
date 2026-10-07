@@ -29,5 +29,9 @@ jobs:
           echo "$LLVM_COV_SHA256  $archive" | sha256sum --check --strict
           tar -xzf "$archive" -C "$HOME/.cargo/bin" cargo-llvm-cov
       - run: |
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov -p kbf-it --locked --branch --show-missing-lines --show-branches=count --text \
-            --ignore-filename-regex '(kbf-(daemon|front|server|proto|types|caps|objstore|meta|sched|segments)/)|hygiene'
+          ignore='(kbf-(daemon|front|server|proto|types|caps|objstore|meta|sched|segments)/)|hygiene'
+          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov -p kbf-it --locked --branch --show-missing-lines \
+            --ignore-filename-regex "$ignore"
+          LLVM_COV_FLAGS=-show-branches=count cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --text \
+            --ignore-filename-regex "$ignore" --output-path show.txt
+          grep -nE 'True: 0|False: 0' show.txt || echo 'no branch with a side never taken'
