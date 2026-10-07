@@ -53,10 +53,12 @@ kbf-alert = { path = "crates/kbf-alert" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
+kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-meta = { path = "crates/kbf-meta" }
 kbf-objstore = { path = "crates/kbf-objstore" }
+kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-sched = { path = "crates/kbf-sched" }

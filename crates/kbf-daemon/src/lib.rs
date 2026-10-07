@@ -18,10 +18,10 @@
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
 //!
-//! The `kbf-daemon` binary still offers only [`FakeRuntime`]: the container driver
-//! (`kbf-driver-container`) is the runtime for farm nodes, but it depends on this crate
-//! and Cargo refuses the cycle a binary here naming the driver would make; and
-//! [`LocalRuntime`] isolates nothing.
+//! The `kbf-daemon` binary lives in the `kbf-node` crate: it picks a driver
+//! (`--driver fake|container|native`), and the drivers depend on this crate, so a
+//! binary here naming them would be a cycle Cargo refuses. It never offers
+//! [`LocalRuntime`], which isolates nothing.
 
 pub mod cas;
 pub mod config;
@@ -38,7 +38,7 @@ pub mod usage;
 mod window;
 
 pub use cas::{Cas, CasClient, CasError};
-pub use config::{Args, DaemonConfig, FENCE_AFTER, RuntimeKind, TlsFiles};
+pub use config::{Args, DaemonConfig, FENCE_AFTER, TlsFiles};
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};

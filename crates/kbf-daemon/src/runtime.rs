@@ -43,6 +43,11 @@ pub enum RuntimeError {
     /// The action ran past its timeout and was stopped.
     #[error("timed out")]
     TimedOut,
+    /// The action's processes together used more memory than the lease allows, and
+    /// the runtime killed them. Reported as RESOURCE_EXHAUSTED: the farm's to retry
+    /// with more memory, not the client's to fix.
+    #[error("out of memory: the action used {used} bytes, past the lease's limit of {limit}")]
+    OutOfMemory { used: u64, limit: u64 },
 }
 
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it

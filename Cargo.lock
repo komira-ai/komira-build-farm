@@ -914,7 +914,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -933,6 +932,23 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "kbf-driver-native"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kbf-daemon",
+ "kbf-outputs",
+ "kbf-proto",
+ "kbf-types",
+ "libc",
+ "prost",
+ "prost-types",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -992,6 +1008,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-node"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "kbf-daemon",
+ "kbf-driver-container",
+ "kbf-driver-native",
+ "kbf-outputs",
+ "kbf-proto",
+ "libc",
+ "rcgen",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-objstore"
 version = "0.1.0"
 dependencies = [
@@ -1004,6 +1039,21 @@ dependencies = [
  "md-5",
  "reqwest",
  "roxmltree",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "kbf-outputs"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "kbf-proto",
+ "libc",
+ "prost",
+ "rustix",
  "sha2",
  "thiserror",
  "tokio",
