@@ -153,13 +153,13 @@ async fn a_result_whose_lease_is_given_up_while_it_is_checked_is_never_cached() 
     let lost = first.start().await;
     let raced = output(&cell, "from the lease given up", 0).await;
 
-    cell.cache.meta().close_on_next_query();
+    cell.cache.meta().query.close_next();
     first.send(daemon_message::Message::Result(ran(lost.lease_id, &raced)));
-    cell.cache.meta().held().await;
+    cell.cache.meta().query.held().await;
     let mut again = cell.daemon("node-a", 4, 8).await;
     assert!(again.heartbeat(&[]).await);
     let current = again.start().await;
-    cell.cache.meta().open();
+    cell.cache.meta().query.open();
 
     let ack = first
         .expect("ResultAck", |m| match m {
@@ -284,8 +284,9 @@ async fn a_failing_action_is_answered_but_not_cached() {
 /// Catches: an attempt's failure passed to the callers as the daemon's status rather
 /// than the RFC's (INTERNAL for the farm's failure, DEADLINE_EXCEEDED for a timeout);
 /// an OK result whose outputs were never uploaded, or that carries no result at all,
-/// accepted as a result (callers would get files nobody can fetch); and a failure
-/// written to the action cache.
+/// accepted as a result (callers would get files nobody can fetch); a failed attempt
+/// that also carries a valid `ActionResult` taken as completed (the protocol sets
+/// `action_result` only with OK); and a failure written to the action cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_attempts_answer_with_the_rfc_codes() {
     let cell = Cell::start().await;
@@ -294,7 +295,20 @@ async fn failed_attempts_answer_with_the_rfc_codes() {
         stdout_digest: Some(Blob::new("never uploaded").proto),
         ..Default::default()
     };
+    let stored = output(&cell, "stored, but the attempt failed", 0).await;
     let cases = [
+        (
+            "aborted with a result",
+            Some(Code::Aborted),
+            Some(stored.clone()),
+            Code::Internal,
+        ),
+        (
+            "timed out with a result",
+            Some(Code::DeadlineExceeded),
+            Some(stored),
+            Code::DeadlineExceeded,
+        ),
         ("aborted", Some(Code::Aborted), None, Code::Internal),
         (
             "timed out",
@@ -327,6 +341,65 @@ async fn failed_attempts_answer_with_the_rfc_codes() {
             "{name}"
         );
     }
+}
+
+/// Catches: callers answered before the accepted result's action-cache entry is
+/// written, so a client that looks the action up as soon as its Execute finishes
+/// misses a result the farm has. The write is held at a gate: no answer may arrive
+/// while it is held, and once it is let through the answer and the entry are both
+/// there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cache_entry_is_written_before_the_callers_are_answered() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("written first", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&cell, "in the cache first", 0).await;
+
+    let gate = &cell.cache.meta().action_write;
+    gate.close_next();
+    daemon.send(daemon_message::Message::Result(ran(
+        start.lease_id,
+        &result,
+    )));
+    gate.held().await;
+    assert!(
+        !done_within_quiet(&mut ops).await,
+        "answered before the action-cache write"
+    );
+    gate.open();
+    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
+    assert_eq!(cell.cached(&job.action).await, Ok(result));
+    let ack = daemon
+        .expect("ResultAck", |m| match m {
+            Message::ResultAck(a) => Some(*a),
+            _ => None,
+        })
+        .await;
+    assert!(ack.accepted);
+}
+
+/// Catches: an accepted result whose action-cache write fails left unanswered (its
+/// callers would wait forever) or answered as a failure. The run succeeded; only the
+/// cache misses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_cache_write_still_answers_the_callers() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("unwritten", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&cell, "answered, not cached", 0).await;
+
+    cell.cache.meta().fail_next_action_write();
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    let answer = response(&done(&mut ops).await);
+    assert_eq!(answer.result, Some(result));
+    assert_eq!(answer.status.map(|s| s.code), Some(Code::Ok as i32));
+    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
 }
 
 /// Catches: a WaitExecution that cannot find a running operation by the name Execute

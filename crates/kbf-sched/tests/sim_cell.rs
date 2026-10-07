@@ -159,7 +159,6 @@ impl Leader {
                     self.send(to, Msg::Start { start, session });
                 }
                 Effect::Answer(a) => self.answers.push((now, a.clone())),
-                _ => unreachable!("the scheduler emits no other effect"),
             }
         }
         effects

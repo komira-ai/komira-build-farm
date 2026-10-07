@@ -6,7 +6,7 @@ mod support;
 use futures::channel::mpsc::unbounded;
 use kbf_proto::worker::worker_client::WorkerClient;
 use kbf_proto::worker::{Capability, DaemonMessage, Offer, daemon_message};
-use support::{Cell, FakeDaemon, Job, done, hello, output, ran};
+use support::{Blob, Cell, FakeDaemon, Job, done, done_within_quiet, hello, output, ran, response};
 use tonic::Code;
 use tonic::transport::Endpoint;
 
@@ -176,4 +176,89 @@ async fn results_for_no_lease_or_an_unknown_lease_are_not_accepted() {
         })
         .await;
     assert_eq!(stray, None, "a Result without a lease was acknowledged");
+}
+
+/// Catches: a heartbeat's running set that does not reach the scheduler as the leases
+/// the daemon named (a lease id read with its term and sequence number swapped, or
+/// dropped), across the session boundary where it decides at once. A restarted daemon
+/// that re-adopted its run and lists it keeps it: no second `Start`, and its result is
+/// accepted. One whose first heartbeat leaves the lease out (here it names only the
+/// swapped id) has the operation placed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_returning_daemon_keeps_the_leases_its_first_heartbeat_lists() {
+    let cell = Cell::start().await;
+    let mut first = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("re-adopted", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let lease = first.start().await.lease_id.expect("a lease id");
+    assert_ne!(
+        lease.term, lease.seq,
+        "a swapped id must name another lease"
+    );
+
+    let mut again = cell.daemon("node-a", 4, 8).await;
+    assert!(again.heartbeat(&[lease]).await);
+    again.no_work().await;
+    let result = output(&cell, "from the re-adopted run", 0).await;
+    assert!(again.report(ran(Some(lease), &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+
+    // Two more runs: the second one's lease (term 1, seq 2) is the one left out.
+    let mut leases = Vec::new();
+    for argv in ["re-adopted again", "not re-adopted"] {
+        let job = Job::new(argv, &[]);
+        cell.upload(&job.blobs()).await;
+        let _ops = cell.execute(&job.action).await;
+        leases.push(again.start().await.lease_id.expect("a lease id"));
+    }
+    let (kept, lost) = (leases[0], leases[1]);
+    assert_ne!(lost.term, lost.seq, "a swapped id must name another lease");
+    let swapped = kbf_proto::worker::LeaseId {
+        term: lost.seq,
+        seq: lost.term,
+    };
+    let mut third = cell.daemon("node-a", 4, 8).await;
+    assert!(third.heartbeat(&[kept, swapped]).await);
+    let placed = third.start().await;
+    assert_ne!(placed.lease_id, Some(lost));
+    assert_ne!(placed.lease_id, Some(kept));
+    third.no_work().await;
+}
+
+/// Catches: a result accepted, or its outputs taken in, for a lease the scheduler gave
+/// up while its operation waits in the queue for room (the operation has no current
+/// lease at all): its callers would be answered with a run the farm wrote off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_for_a_lease_given_up_while_queued_is_refused() {
+    let cell = Cell::start().await;
+    let mut first = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("queued again", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let given_up = first.start().await;
+
+    // The daemon returns with no room and lists nothing: the lease is given up and the
+    // operation waits in the queue.
+    let mut back = cell.daemon("node-a", 0, 8).await;
+    assert!(back.heartbeat(&[]).await);
+    back.no_work().await;
+    let late = output(&cell, "from the lease given up", 0).await;
+    assert!(!back.report(ran(given_up.lease_id, &late)).await.accepted);
+    assert!(
+        !cell.holds(&Blob::of(&late)).await,
+        "the given-up lease's result was taken in (its ActionResult stored)"
+    );
+    assert!(
+        !done_within_quiet(&mut ops).await,
+        "answered by a refused result"
+    );
+
+    // With room again it runs under a new lease.
+    back.send(daemon_message::Message::Hello(hello("node-a", 4, 8)));
+    let again = back.start().await;
+    assert_ne!(again.lease_id, given_up.lease_id);
+    let result = output(&cell, "from the new lease", 0).await;
+    assert!(back.report(ran(again.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
 }
