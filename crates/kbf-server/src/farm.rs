@@ -422,6 +422,8 @@ impl State {
             lease_id: Some(wire_lease(start.lease)),
             kind: w.kind.clone(),
             action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
+            millicpus: start.resources.cpu_millis,
+            memory_bytes: start.resources.memory_bytes,
         };
         self.send(&start.worker, server_message::Message::Start(message));
         for waiter in self.sched.waiters(start.operation).unwrap_or_default() {

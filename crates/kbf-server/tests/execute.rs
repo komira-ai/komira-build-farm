@@ -28,9 +28,9 @@ async fn run_once(
 }
 
 /// Catches: a `Start` sent before (or without) the lease offer that the grant's commit
-/// follows; a `Start` naming another action or kind; an operation that never reaches
-/// EXECUTING or never completes; a completed operation that does not carry the
-/// daemon's `ActionResult`; an accepted result missing from the action cache, or a
+/// follows; a `Start` naming another action or kind, or without the booking; an
+/// operation that never reaches EXECUTING or never completes; a completed operation
+/// that does not carry the daemon's `ActionResult`; an accepted result missing from the action cache, or a
 /// `ResultAck` that does not say it was accepted; and a second result accepted for a
 /// finished operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -58,6 +58,14 @@ async fn execute_runs_on_a_daemon_and_caches_the_result() {
     assert_eq!(start.kind, "action");
     assert_eq!(start.action_digest.as_ref(), Some(&job.action.proto));
     assert_eq!(offer.action_digest, start.action_digest);
+    // The booking reaches the daemon, which sizes the lease's cgroup from it.
+    assert_eq!(
+        (start.millicpus, start.memory_bytes),
+        (
+            kbf_front::DEFAULT_RESOURCES.cpu_millis,
+            kbf_front::DEFAULT_RESOURCES.memory_bytes
+        )
+    );
 
     let first = ops.message().await.expect("a stream").expect("an update");
     assert!(!first.done);
