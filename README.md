@@ -26,8 +26,8 @@ every test must have been seen failing on a planted defect.
 
 ## Security
 
-To report a vulnerability, see [SECURITY.md](SECURITY.md). Please do not open a
-public issue for security problems.
+To report a vulnerability, see [SECURITY.md](SECURITY.md). Do not put details of
+a security problem in a public issue.
 
 ## License
 
