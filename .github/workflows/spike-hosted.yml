@@ -1,0 +1,112 @@
+# The hosted-runner spike: what the farm's infrastructure tests can rely on in a
+# GitHub-hosted job (rootless Podman, cgroup v2 delegation, io.max and io.latency,
+# memory.high, a network-less container, MinIO and several servers at once), measured
+# on x86 and arm. Findings: docs/spikes/hosted-runners.md. Each step prints
+# `SPIKE <arch>.<key>=<value>` lines; read them with
+#   gh run view <run id> --log | grep ' SPIKE '
+# Run by hand, or on a pull request that changes this file or tools/spike/.
+name: spike-hosted
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/spike-hosted.yml
+      - tools/spike/**
+
+permissions: {}
+
+concurrency:
+  group: spike-hosted-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # One job per runner label (the workflow lint wants a literal label in runs-on).
+  # Every step after the first runs even if an earlier one failed, so one failed
+  # question does not hide the others' numbers.
+  spike-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Host facts
+        run: bash tools/spike/host_facts.sh
+      - name: Rootless Podman, limits and MinIO
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/podman_rootless.sh
+      - name: No network for an action
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/no_network.sh
+      - name: Cgroup delegation to a daemon unit
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/delegation.sh
+      - name: Converged slices, fsync under io.max and io.latency
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/io_slices.sh
+      - name: memory.high beside small actions
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/memory_high.sh
+      - name: Several servers, MinIO and RustFS at once
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/several_servers.sh
+
+  spike-arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Host facts
+        run: bash tools/spike/host_facts.sh
+      - name: Rootless Podman, limits and MinIO
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/podman_rootless.sh
+      - name: No network for an action
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/no_network.sh
+      - name: Cgroup delegation to a daemon unit
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/delegation.sh
+      - name: Converged slices, fsync under io.max and io.latency
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/io_slices.sh
+      - name: memory.high beside small actions
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/memory_high.sh
+      - name: Several servers, MinIO and RustFS at once
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/several_servers.sh
+
+  # The time an integration job spends before its first test, cold (no rust-cache).
+  build-budget-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash tools/spike/build_budget.sh
+
+  build-budget-arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash tools/spike/build_budget.sh
