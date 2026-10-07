@@ -914,6 +914,20 @@ version = "0.1.0"
 [[package]]
 name = "kbf-front"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "kbf-meta",
+ "kbf-objstore",
+ "kbf-proto",
+ "kbf-segments",
+ "kbf-types",
+ "prost",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "kbf-it"
