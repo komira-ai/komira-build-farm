@@ -55,7 +55,7 @@ There are two ways to give a lease a GUI session:
 |---|---|---|
 | Fresh state per lease | no: the logged-in user's state carries over unless wiped | yes: a clone of a golden image, destroyed after |
 | Other work on the Mac at the same time | no, or shares one user's session | yes: bare-metal leases keep running beside up to 2 VMs |
-| Host setup | auto-login on the host, FileVault off | host stays without auto-login; the guest image logs in |
+| Host setup | auto-login off at rest; a root helper (`kbf-mac-session`, #87) sets it for one lease and clears it after | host auto-login stays off; the guest image logs in |
 | Toolchain per lease | the host's one Xcode | the image's Xcode; two images can differ |
 
 This document chooses the VM.
@@ -131,7 +131,7 @@ a sandbox has a switch to turn its own off, and kbf's outer sandbox stays on.
 | `swift build`, `swift test` (logic tests) | bare metal | `--disable-sandbox` ("Disable the sandbox when executing subprocesses", [Options.swift](https://github.com/swiftlang/swift-package-manager/blob/main/Sources/CoreCommands/Options.swift)) **[V]**, plus `-Xswiftc -disable-sandbox` when macros are used: the compiler sandboxed macro plugins regardless of SwiftPM's `--disable-sandbox`, and the driver's `-disable-sandbox` was the fix ([SwiftPM#7098](https://github.com/swiftlang/swift-package-manager/issues/7098)) **[V]**. Packages resolved beforehand into the inputs |
 | `xcodebuild build` / `build-for-testing` of Swift packages, frameworks and macOS targets (unsigned) | bare metal | `-derivedDataPath` inside the lease ([xcodebuild(1)](https://keith.github.io/xcode-man-pages/xcodebuild.1.html)) **[V]**; `OTHER_SWIFT_FLAGS='$(inherited) -disable-sandbox' -IDEPackageSupportDisableManifestSandbox=1 -IDEPackageSupportDisablePluginExecutionSandbox=1`, reported working by a user in Homebrew discussions ([Homebrew](https://github.com/orgs/Homebrew/discussions/59)) **[V]**; `-skipMacroValidation -skipPackagePluginValidation` **[A]** until checked with `xcodebuild -help` on our Xcode; `CODE_SIGNING_ALLOWED=NO` **[A]**; `ENABLE_USER_SCRIPT_SANDBOXING` to be tested, `NO` if it nests **[A]** |
 | Unsigned iOS Simulator builds of apps with storyboards or asset catalogs (`xcodebuild` runs `ibtool`, `actool`) | VM until the `ibtool`/`actool` probe shows bare metal works | the same flags as the row above. `ibtool` may use CoreSimulator device sets **[A]** (the [Apple forums](https://developer.apple.com/forums/thread/76989) thread is about Interface Builder in Xcode 8.3.2, not the `ibtool` command line) |
-| XCTest or XCUITest on a simulator, macOS UI tests | **VM** | the image has the simulator runtimes and an auto-logged-in user |
+| XCTest or XCUITest on a simulator, macOS UI tests | **VM** | the image has the simulator runtimes (they live in VM images only) and an auto-logged-in user |
 | Signing with a real identity, archive, notarize | not on the shared pool | a keychain in a user session; from a non-GUI session (SSH) `codesign` fails with `errSecInternalComponent` ([Apple forums](https://developer.apple.com/forums/thread/685967)) **[V]**, and from a launch daemon **[A]**. A separate release lane, out of scope here |
 
 Rules that follow:
@@ -155,16 +155,15 @@ Rules that follow:
   `kbf-caps` to a set the node reports, matched by membership: the action asks for one
   build and any node that has it serves it. A VM image holds exactly one Xcode, and its
   digest names it.
-- **This supersedes these points of the Mac node provisioning design in open #76:**
-  "exactly one Xcode (or one Command Line Tools version) per pool" becomes several
-  Xcodes per host; simulator runtimes live in the VM image, not in the host profile; and
-  GUI work moves from the whole-machine lease with host auto-login to the VM lease, whose
-  guest logs itself in (the host needs auto-login only if the first probe of
-  [section 6](#6-the-vm-driver-one-vm-per-lease-never-reused) fails). One exception:
-  bare-metal GPU tests that install the desktop app still need a GUI session on the
-  host ([section 8.1](#81-on-bare-metal-never-in-a-vm), and
-  [fleet-updates.md](fleet-updates.md), #87). #76's "there is no disk image" stays true
-  for the host, but VM golden images now live on Mac nodes.
+- **The Mac node provisioning design (open #76) reflects these points:** several
+  Xcodes per host instead of "exactly one Xcode (or one Command Line Tools version) per
+  pool"; simulator runtimes live in VM images only, never in the host profile; and GUI
+  work runs in the VM lease, whose guest logs itself in. Host auto-login is off at rest.
+  One exception: bare-metal GPU tests that install the desktop app need a GUI session
+  on the host ([section 8.1](#81-on-bare-metal-never-in-a-vm)); for that one
+  whole-machine lease a root helper, `kbf-mac-session`, sets auto-login and clears it
+  afterwards ([fleet-updates.md](fleet-updates.md), #87). "There is no disk image" stays
+  true for the host, but VM golden images now live on Mac nodes.
 
 Four probes on one Mac settle the **[A]** rows above before phase 1 closes:
 `xcodebuild` with user-script sandboxing on, inside kbf's profile; `ibtool`/`actool`
@@ -426,8 +425,10 @@ Rules:
   will.
 - **A risk to test first:** whether Virtualization.framework starts a macOS VM from a
   launchd daemon with no user logged in on the host **[A]**. If it does not, the
-  helpers run as a LaunchAgent of a dedicated non-admin user, and host auto-login
-  becomes part of the Mac node profile.
+  helpers need a logged-in session of a dedicated non-admin user. Host auto-login still
+  stays off at rest: the session would be opened per lease by the root helper
+  `kbf-mac-session` ([fleet-updates.md](fleet-updates.md), #87), as for a whole-machine
+  lease, and this design would change with it.
 - **Not used:** Tart and Orchard are under FSL-1.1-ALv2, which forbids a competing use
   and becomes Apache-2.0 only two years after each release
   ([LICENSE](https://github.com/openai/tart/blob/main/LICENSE)) **[V]**. kbf is
