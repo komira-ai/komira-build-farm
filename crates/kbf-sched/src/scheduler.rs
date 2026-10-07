@@ -351,10 +351,6 @@ impl Scheduler {
         let Some(w) = self.workers.get_mut(worker) else {
             return;
         };
-        // MUTANT M4: a late-running given-up lease is not booked.
-        if !w.late.is_empty() || running.len() < usize::MAX {
-            return;
-        }
         let mut freed = Resources::default();
         w.late.retain(|lease, resources| {
             let listed = running.contains(lease);
@@ -419,7 +415,8 @@ impl Scheduler {
                 // registered again, and then the worker lists it, or it never will.
                 let due = sent.session < session || now >= sent.at.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
-                due && !running.contains(*lease)
+                // MUTANT M5: a re-adopted hermetic lease is requeued though listed.
+                due && (!running.contains(*lease) || (sent.session < session && op.request.hermetic))
                     && !op.result_proposed
                     && op.state.holding().is_some_and(|(_, w)| w == worker)
             })
