@@ -302,7 +302,7 @@ impl Scheduler {
                 };
                 // A `Start` sent to an earlier session reached the worker before it
                 // registered again, and then the worker lists it, or it never will.
-                let due = sent.session > session || now >= sent.at.saturating_add(START_GRACE);
+                let due = sent.session < session || now >= sent.at.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
                 due && !running.contains(*lease)
                     && !op.result_proposed
@@ -377,7 +377,7 @@ impl Scheduler {
         {
             *committed = true;
             if let Some(held) = self.held.get_mut(lease) {
-                let session = self.workers.get(&*worker).map_or(0, |w| w.session);
+                let session = self.workers.get(&*worker).map_or(0, |w| w.session.saturating_sub(1));
                 held.start_sent = Some(StartSent {
                     at: self.now,
                     session,

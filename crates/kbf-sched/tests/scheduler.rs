@@ -1,4 +1,3 @@
-#![cfg(any())]
 //! The scheduler's rules, one scenario each, driven through its public inputs.
 
 use kbf_sched::{Event, Input, OpState, Request, Scheduler};
