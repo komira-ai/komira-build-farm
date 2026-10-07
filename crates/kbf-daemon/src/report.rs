@@ -461,6 +461,45 @@ mod tests {
         ));
     }
 
+    /// Catches: a report the scheduler reads differently from what build tools ask
+    /// for, so Mac actions (`OSFamily=Darwin`, `ISA=arm-a64`, as Bazel and Buck2 send
+    /// them) never find the Mac, or Linux actions land on it. The server reads `Hello`
+    /// with `NodeCaps::from_report` over these same entries; a report it refuses (an
+    /// arch spelling it does not know, a repeated single-valued entry) fails here too.
+    #[test]
+    fn reports_satisfy_the_platforms_build_tools_send() {
+        use kbf_caps::{NodeCaps, Request};
+        let caps = |r: &NodeReport| {
+            let entries = r.capabilities().iter();
+            NodeCaps::from_report(entries.map(|c| (c.key.as_str(), c.value.as_str())))
+                .expect("the server reads the report")
+        };
+        let mac = caps(&macos_report(M3_ULTRA, MAC_NUMBERS, &["native"]).expect("report"));
+        let linux = caps(&linux_report(SKYLAKE, MEMINFO, SMAPS, 0, &["fake"]).expect("report"));
+        let wants = |props: &[(&str, &str)]| {
+            Request::from_platform(props.iter().copied()).expect("a platform kbf serves")
+        };
+        for props in [
+            &[("OSFamily", "Darwin")][..],
+            &[("OSFamily", "macos")],
+            &[("osfamily", "darwin")],
+            &[("OSFamily", "Darwin"), ("ISA", "arm-a64")],
+            &[("Arch", "arm64"), ("cpu.model", "Apple M3 Ultra")],
+        ] {
+            let want = wants(props);
+            assert!(want.matches(&mac), "the Mac does not satisfy {props:?}");
+            assert!(!want.matches(&linux), "Linux satisfies {props:?}");
+        }
+        for props in [
+            &[("OSFamily", "Linux")][..],
+            &[("OSFamily", "linux"), ("ISA", "x86-64")],
+        ] {
+            let want = wants(props);
+            assert!(want.matches(&linux), "Linux does not satisfy {props:?}");
+            assert!(!want.matches(&mac), "the Mac satisfies {props:?}");
+        }
+    }
+
     /// Catches: a `sysctl` failure (a missing key, a missing program) taken for
     /// output, and output lost. Linux has `/usr/sbin/sysctl` too, with other keys.
     #[cfg(target_os = "linux")]
