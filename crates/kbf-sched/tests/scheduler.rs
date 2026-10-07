@@ -782,7 +782,10 @@ fn a_lease_lost_to_silence_keeps_its_room_until_a_heartbeat_leaves_it_out() {
 
     // `a` comes back (a partition healed, the run went on) and registers again.
     h.at_secs(70).worker("a", 1_000, GIB);
-    assert!(h.tick().is_empty(), "placed into the room of a run that may go on");
+    assert!(
+        h.tick().is_empty(),
+        "placed into the room of a run that may go on"
+    );
     h.heartbeat_running("a", &[lost.lease]);
     assert_eq!(h.s.booked(&w("a")), Some(Resources::new(1_000, GIB)));
     assert!(h.tick().is_empty(), "placed into the late run's room");

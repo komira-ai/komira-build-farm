@@ -18,8 +18,8 @@
 //! - the infra retry budget: each lease lost after its `Start` went out is one `INFRA`
 //!   attempt, retried on a worker that has not lost the operation when one has room,
 //!   and the third fails the operation with an `INFRA` result (RFC section 5.8);
-//! - a lost lease its worker still lists as running stays booked on that worker until
-//!   it leaves the running set;
+//! - a lease lost after its `Start` went out stays booked on its worker until a
+//!   heartbeat from the worker leaves it out (the worker may still be running it);
 //! - first-fit placement of a CPU and memory request onto worker capacity;
 //! - in-flight dedup by instance and action digest, with waiters attached to one
 //!   operation;

@@ -58,7 +58,9 @@ pub enum OpState {
     },
     /// Out of infra attempts: `lease`, its last lease, was lost and an `INFRA` failure
     /// from it is proposed. It is neither queued nor held; the commit of that failure
-    /// makes it `Failed` and answers its waiters.
+    /// makes it `Failed` and answers its waiters. Nothing proposes it again: the
+    /// [`Effect::Commit`] contract feeds the record back once committed, and a commit
+    /// that cannot land ends the leader term, and this scheduler with it.
     Failing {
         /// The lost lease the failure is proposed from.
         lease: LeaseId,
@@ -133,8 +135,8 @@ struct Worker {
     capacity: Resources,
     /// Held leases, and the given-up leases in `late`.
     booked: Resources,
-    /// Given-up leases the worker's newest heartbeat lists as running, and what each
-    /// books.
+    /// Given-up leases the worker may still run, and what each books: each lease given
+    /// up on it after its `Start` went out, until a heartbeat leaves the lease out.
     late: BTreeMap<LeaseId, Resources>,
     last_heard: FarmTime,
     /// Counts the worker's registrations: the session a `Start` emitted now goes to.
@@ -170,16 +172,18 @@ impl Worker {
 ///
 /// A lease is given up, and its operation requeued, when its worker is silent for G,
 /// and when a worker it still hears from does not list it as running (see
-/// [`Event::WorkerUp`] and [`Event::Heartbeat`]). A given-up lease can no longer have a
-/// result proposed, and once the operation is granted again its result loses to the
-/// new grant in the log.
+/// [`Event::WorkerUp`] and [`Event::Heartbeat`]); a lease whose result was reported is
+/// kept either way, as its result is on its way to the log. A given-up lease can no
+/// longer have a result proposed, and once the operation is granted again its result
+/// loses to the new grant in the log.
 ///
 /// A lease given up after its `Start` went out is one `INFRA` attempt (RFC section
 /// 5.8). The retry goes to a worker that has not lost the operation yet when one has
 /// room, else to the first fit. The lease that spends the last of [`INFRA_ATTEMPTS`]
 /// is not requeued: an `INFRA` failure from it is proposed, under the same rule as a
-/// worker's report, and its commit answers the waiters. While its worker still lists a
-/// given-up lease as running, that lease stays booked on the worker.
+/// worker's report, and its commit answers the waiters. A lease given up after its
+/// `Start` went out stays booked on its worker until a heartbeat from the worker leaves
+/// it out: the worker may still be running it.
 #[derive(Clone, Debug)]
 pub struct Scheduler {
     term: u64,
@@ -294,20 +298,10 @@ impl Scheduler {
         op.result_proposed = false;
     }
 
-    /// Releases `operation`'s holding and puts it back in the queue.
-    fn requeue(&mut self, id: OperationId) {
-        self.release(id);
-        let op = self
-            .ops
-            .get_mut(&id)
-            .expect("held leases name live operations");
-        op.state = OpState::Queued;
-        self.queue.insert((Reverse(op.request.qos.clone()), id));
-    }
-
     /// Gives up the lease operation `id` holds, which its worker lost. If the lease's
     /// `Start` went out, that is one `INFRA` attempt on the worker, and the worker may
-    /// still run the lease (see [`Scheduler::book_late`]). If that spends the last of
+    /// still run the lease: its room stays booked until a heartbeat from the worker
+    /// leaves it out (see [`Scheduler::book_late`]). If that spends the last of
     /// [`INFRA_ATTEMPTS`], an `INFRA` failure from the lease is proposed; else the
     /// operation goes back to the queue.
     fn lose(&mut self, id: OperationId, effects: &mut Vec<Effect>) {
@@ -319,21 +313,31 @@ impl Scheduler {
             return;
         };
         let worker = worker.clone();
-        if self
+        let resources = op.request.resources;
+        let started = self
             .held
             .get(&lease)
-            .is_some_and(|h| h.start_sent.is_some())
-        {
+            .is_some_and(|h| h.start_sent.is_some());
+        if started {
             op.lost_on.push(worker.clone());
-            let resources = op.request.resources;
+        }
+        let spent = op.lost_on.len() >= INFRA_ATTEMPTS;
+        self.release(id);
+        if started {
+            // The worker may be running it: its room stays booked until a heartbeat
+            // from the worker leaves the lease out.
+            if let Some(w) = self.workers.get_mut(&worker) {
+                w.late.insert(lease, resources);
+                w.booked = w.booked.saturating_add(resources);
+            }
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
-        if op.lost_on.len() < INFRA_ATTEMPTS {
-            self.requeue(id);
+        let op = self.ops.get_mut(&id).expect("checked above");
+        if !spent {
+            op.state = OpState::Queued;
+            self.queue.insert((Reverse(op.request.qos.clone()), id));
             return;
         }
-        self.release(id);
-        let op = self.ops.get_mut(&id).expect("checked above");
         op.state = OpState::Failing { lease };
         effects.push(Effect::Commit(ControlRecord::Result(ResultRecord {
             lease,
@@ -345,7 +349,8 @@ impl Scheduler {
     /// Books on `worker` each lease given up on it that `running` lists: its `Start`
     /// arrived after the Start grace, or the worker kept running it through G of
     /// silence, and it uses room until it leaves the running set. Frees the room of
-    /// those that left it. A listed lease that is held is booked already; one never
+    /// those that left it, including the leases [`Scheduler::lose`] booked when it gave
+    /// them up. A listed lease that is held is booked already; one never
     /// granted, or given up on another worker, books nothing.
     fn book_late(&mut self, worker: &WorkerId, running: &BTreeSet<LeaseId>) {
         let Some(w) = self.workers.get_mut(worker) else {
@@ -371,7 +376,9 @@ impl Scheduler {
         }
     }
 
-    /// Gives up every lease held on a worker not heard from for [`LEASE_GRACE`].
+    /// Gives up every lease held on a worker not heard from for [`LEASE_GRACE`]. A
+    /// lease whose result was reported is kept, as in [`Scheduler::reconcile`]: that
+    /// result is on its way to the log, and its commit releases the lease.
     fn expire(&mut self, effects: &mut Vec<Effect>) {
         let now = self.now;
         let expired: Vec<OperationId> = self
@@ -379,7 +386,11 @@ impl Scheduler {
             .values()
             .map(|held| held.operation)
             .filter(|id| {
-                let worker = self.ops[id].state.holding().map(|(_, w)| w);
+                let op = &self.ops[id];
+                if op.result_proposed {
+                    return false;
+                }
+                let worker = op.state.holding().map(|(_, w)| w);
                 worker
                     .and_then(|w| self.workers.get(w))
                     .is_none_or(|w| !w.alive(now))
@@ -439,11 +450,14 @@ impl Scheduler {
             let op = &self.ops[&id];
             let request = &op.request.resources;
             // RFC section 5.8: an `INFRA` failure retries elsewhere.
-            let fit = self
+            let mut fitting = self
                 .workers
                 .iter()
-                .filter(|(_, w)| w.alive(now) && w.free().fits(request))
-                .min_by_key(|(name, _)| op.lost_on.contains(*name))
+                .filter(|(_, w)| w.alive(now) && w.free().fits(request));
+            let fit = fitting
+                .clone()
+                .find(|(name, _)| !op.lost_on.contains(*name))
+                .or_else(|| fitting.next())
                 .map(|(name, _)| name.clone());
             if let Some(name) = fit {
                 let w = self.workers.get_mut(&name).expect("found above");
