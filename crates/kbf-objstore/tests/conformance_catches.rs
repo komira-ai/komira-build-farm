@@ -185,7 +185,7 @@ fn a_store_that_claims_object_lock_but_deletes_a_locked_object_fails() {
     let Some(Outcome::Failed(why)) = report.outcome(Check::ObjectLock) else {
         unreachable!("checked above");
     };
-    assert!(why.contains("the object is gone"), "{why}");
+    assert!(why.contains("the object no longer reads"), "{why}");
 }
 
 /// Catches: a suite that stops at the first page without a token or never checks that

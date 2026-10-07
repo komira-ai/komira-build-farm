@@ -381,14 +381,15 @@ async fn object_lock<S: ObjectStore>(
         .await
         .map_err(|e| format!("put_new {k} with retention: {e}"))?;
     if store.delete(&k).await.is_ok() {
-        // Some stores answer a plain delete on a versioned bucket with success and hide
-        // the object; the bytes must still be there either way.
+        // A success is a failure whatever the bytes did: kbf would believe them gone.
+        // A plain DELETE on a versioned bucket succeeds by adding a delete marker, so the
+        // object stops reading while an old version may keep the bytes.
         return Err(match store.get_range(&k, range(0, 32)).await {
             Ok(b) if b == body => format!(
                 "delete of retained {k} reported success (the bytes survive, but kbf would believe them gone)"
             ),
             other => format!(
-                "delete of retained {k} succeeded and the object is gone: {}",
+                "delete of retained {k} succeeded and the object no longer reads (removed, or hidden by a delete marker): {}",
                 describe(&other)
             ),
         });
