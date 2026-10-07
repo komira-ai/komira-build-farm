@@ -477,7 +477,7 @@ impl StateMachine for Scheduler {
             Event::WorkerUp { worker, capacity } => {
                 let now = self.now;
                 self.workers
-                    .entry(worker)
+                    .entry(worker.clone())
                     .and_modify(|w| {
                         w.capacity = capacity;
                         w.last_heard = now;
@@ -489,6 +489,7 @@ impl StateMachine for Scheduler {
                         last_heard: now,
                         session: 0,
                     });
+                self.reconcile(&worker, &[]);
                 Vec::new()
             }
             Event::Heartbeat { worker, running } => {
