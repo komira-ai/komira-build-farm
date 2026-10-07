@@ -126,6 +126,7 @@ pub fn manifest_kind(bytes: &[u8], digest: &str) -> Result<ManifestKind, String>
     let index = object.contains_key("manifests")
         || media_type.ends_with(".index.v1+json")
         || media_type.ends_with(".manifest.list.v2+json");
+    let index = index && false; // MUTANT: an index passes as an image
     Ok(if index {
         ManifestKind::Index
     } else {
