@@ -19,6 +19,11 @@
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
 //!   same line by a version comment, written as a plain (unquoted) scalar so the
 //!   comment's place is exact;
+//! - a step's `uses:` names an action outside the set the repository's Actions policy
+//!   allows ([`ALLOWED_OWNERS`], [`ALLOWED_REPOSITORIES`]): GitHub refuses such a
+//!   workflow with `startup_failure` before any job runs, so a pull request that adds
+//!   one leaves no job to go red. Owner and repository are compared exactly (GitHub
+//!   reads them ignoring case; a respelling is refused here, the safe side);
 //! - a step's local `uses: ./<dir>` does not name a directory of this repository
 //!   holding a linted action file ([`Repo::action_dirs`]), or sits in a steps list
 //!   where some step passes `repository:` under `with:` (a checkout of another
@@ -113,6 +118,12 @@ const ACTION_KEYS: &[&str] = &[
     "runs",
     "branding",
 ];
+
+/// The owners whose every action the repository's Actions policy allows.
+const ALLOWED_OWNERS: &[&str] = &["actions"];
+
+/// Further `owner/repository` actions the repository's Actions policy allows.
+const ALLOWED_REPOSITORIES: &[&str] = &["tailscale/github-action"];
 
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it.
@@ -460,6 +471,14 @@ impl Lint<'_> {
             }
             return;
         }
+        if !is_allowed_action(v) {
+            self.refuse(
+                uses,
+                format_args!(
+                    "`{v}` is not an action the repository's Actions policy allows (actions/* or tailscale/github-action)"
+                ),
+            );
+        }
         if !matches!(uses.value, Value::Scalar { plain: true, .. }) {
             self.refuse(
                 uses,
@@ -541,6 +560,21 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
 
 fn is_hosted_label(v: &str) -> bool {
     HOSTED_LABELS.contains(&v)
+}
+
+/// Whether the remote action `owner/repository[/path][@ref]` is one the repository's
+/// Actions policy allows.
+fn is_allowed_action(v: &str) -> bool {
+    let name = v.split_once('@').map_or(v, |(name, _)| name);
+    let mut parts = name.splitn(3, '/');
+    let (Some(owner), Some(repository)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    !repository.is_empty()
+        && (ALLOWED_OWNERS.contains(&owner)
+            || ALLOWED_REPOSITORIES
+                .iter()
+                .any(|r| r.split_once('/') == Some((owner, repository))))
 }
 
 fn is_sha_pinned(v: &str) -> bool {
