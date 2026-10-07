@@ -419,6 +419,17 @@ async fn a_dropped_run_still_cleans_up() {
     assert!(run.await.expect_err("cancelled").is_cancelled());
     fake.assert_clean(1);
     assert!(fake.calls().contains(&"rm".to_owned()));
+
+    // A dropped run whose clean fails still removes what it can (and logs the rest).
+    fake.knob("rm-fails", "");
+    let action = store_action(&fake.cas, &spec);
+    let runtime = Arc::clone(&fake.runtime);
+    let run = tokio::spawn(async move { runtime.run(work(2, action, Resources::default())).await });
+    std::fs::remove_file(fake.state.join("pid")).expect("rm pid");
+    fake.wait_for_start().await;
+    run.abort();
+    assert!(run.await.expect_err("cancelled").is_cancelled());
+    assert!(!exists(&fake.lease_dir(2)), "scratch left");
 }
 
 /// Catches a kernel OOM kill reported as the action's own exit 137 (it would be cached
@@ -538,10 +549,10 @@ async fn a_missing_podman_is_an_infrastructure_failure() {
 async fn the_kill_path_ends_even_when_every_signal_fails() {
     let fake = Fake::new("stubborn");
     fake.knob("kill-fails", "");
-    fake.knob("cgroup-kill-ignored", "");
     let mut spec = Spec::new(&image(), "unused");
     spec.timeout = Some(Duration::from_millis(200));
-    let outcome = fake.run(1, &spec, "sleep 30").await;
+    // With its lease cgroup gone, cgroup.kill cannot be written either.
+    let outcome = fake.run(1, &spec, r#"find "$CG" -delete; sleep 30"#).await;
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut)),
         "{outcome:?}"
@@ -628,4 +639,95 @@ fn the_driver_serves_action_leases_only() {
     assert_eq!(fake.runtime.driver(), "container");
     assert!(fake.runtime.serves("action"));
     assert!(!fake.runtime.serves("whole_machine"));
+}
+
+/// Catches an Action without a Command or an input root being run with defaults, and
+/// a missing input blob being reported as the client's error rather than the farm's.
+#[tokio::test]
+async fn incomplete_actions_are_refused() {
+    use kbf_proto::reapi::Action;
+    use prost::Message;
+
+    let fake = Fake::new("incomplete");
+    let full = store_action(&fake.cas, &Spec::new(&image(), "unused"));
+    let action = Action::decode(fake.cas.blob(&full).expect("action").as_slice()).expect("Action");
+    let no_command = Action {
+        command_digest: None,
+        ..action.clone()
+    };
+    let no_root = Action {
+        input_root_digest: None,
+        ..action.clone()
+    };
+    for (seq, broken) in [no_command, no_root].into_iter().enumerate() {
+        let digest = fake.cas.insert(broken.encode_to_vec());
+        let outcome = fake
+            .runtime
+            .run(work(seq as u64 + 1, digest, Resources::default()))
+            .await;
+        assert!(
+            matches!(outcome, Err(RuntimeError::Invalid(_))),
+            "{outcome:?}"
+        );
+    }
+    let missing_root = Action {
+        input_root_digest: Some(kbf_driver_container::cas::digest_of(b"not stored")),
+        ..action
+    };
+    let digest = fake.cas.insert(missing_root.encode_to_vec());
+    let outcome = fake
+        .runtime
+        .run(work(3, digest, Resources::default()))
+        .await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("not in the CAS")),
+        "{outcome:?}"
+    );
+    for seq in 1..=3 {
+        fake.assert_clean(seq);
+    }
+    assert!(!fake.calls().contains(&"create".to_owned()));
+}
+
+/// Catches the action's environment not reaching Podman, and an output path that is
+/// neither file, directory nor symlink being reported as an output.
+#[tokio::test]
+async fn the_environment_reaches_podman_and_odd_outputs_are_left_out() {
+    let fake = Fake::new("env");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.env = vec![("FOO".to_owned(), "a b=c".to_owned())];
+    spec.outputs = vec!["pipe".to_owned()];
+    let result = fake
+        .run(1, &spec, r#"mkfifo "$UPPER/pipe""#)
+        .await
+        .expect("ran");
+    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
+    assert!(args.lines().any(|a| a == "--env=FOO=a b=c"), "{args}");
+    assert!(result.output_files.is_empty() && result.output_directories.is_empty());
+    assert!(result.output_symlinks.is_empty());
+    fake.assert_clean(1);
+}
+
+/// Catches a node that cannot make the lease's scratch directory or cgroup running the
+/// action anyway, or reporting it as the client's error.
+#[tokio::test]
+async fn a_node_that_cannot_prepare_fails_the_lease() {
+    let fake = Fake::new("unprepared");
+    let spec = Spec::new(&image(), "unused");
+    std::fs::remove_dir(fake.cgroup.join("actions")).expect("rm actions");
+    let outcome = fake.run(1, &spec, "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("kbf-lease-1-1")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
+
+    std::fs::create_dir(fake.cgroup.join("actions")).expect("mkdir actions");
+    std::fs::remove_dir(&fake.scratch).expect("rm scratch");
+    let outcome = fake.run(2, &spec, "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(_))),
+        "{outcome:?}"
+    );
+    assert!(!fake.calls().contains(&"create".to_owned()));
 }

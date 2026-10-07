@@ -13,7 +13,6 @@
 #   status           written by `start`; a test may preset `status-override`
 #   inspect-fails    `inspect` fails
 #   kill-fails       `kill` fails
-#   cgroup-kill-ignored  a write to cgroup.kill does not stop the action
 #   rm-fails         `rm` fails
 #   unshare-noop     `unshare rm` succeeds without removing anything
 #   unshare-fails    `unshare rm` fails
@@ -62,7 +61,7 @@ start)
     cg="$CGROOT$(cat "$STATE/cgroup")"
     # cgroup.kill: a write to the file kills the action, as the kernel would.
     (while kill -0 "$pid" 2>/dev/null; do
-        [ -e "$cg/cgroup.kill" ] && [ ! -e "$STATE/cgroup-kill-ignored" ] && kill -KILL "$pid" 2>/dev/null
+        [ -e "$cg/cgroup.kill" ] && kill -KILL "$pid" 2>/dev/null
         sleep 0.02
     done) &
     wait "$pid"
