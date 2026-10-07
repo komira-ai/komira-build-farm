@@ -344,6 +344,11 @@ mod tests {
             why.to_string().contains("no longer a regular file"),
             "{why}"
         );
+        // A regular file beside it is read (llvm-cov scores each test binary's copy of
+        // this function on its own, so this binary covers both arms).
+        std::fs::write(dir.join("file"), b"bytes").expect("write");
+        let read = read_file(&fd, OsStr::new("file")).expect("a regular file");
+        assert_eq!(read, (b"bytes".to_vec(), false));
     }
 
     /// Catches a blocking task that panicked being lost or taken for success: it is an
@@ -352,9 +357,14 @@ mod tests {
     async fn a_blocking_task_that_panicked_is_an_error() {
         let shown = Path::new("shown/path");
         let outcome: Result<(), TreeError> = blocking(shown, || panic!("walk panicked")).await;
-        assert!(
-            matches!(outcome, Err(TreeError::Io { ref path, .. }) if path == shown),
-            "{outcome:?}"
-        );
+        let why = outcome.expect_err("the task panicked").to_string();
+        assert!(why.starts_with("shown/path: "), "{why}");
+        assert!(why.contains("walk panicked"), "{why}");
+        // The same copy of `blocking`, finishing and failing as usual.
+        blocking(shown, || Ok(())).await.expect("finished");
+        let outcome: Result<(), TreeError> =
+            blocking(shown, || Err(std::io::Error::other("refused"))).await;
+        let why = outcome.expect_err("the call failed").to_string();
+        assert_eq!(why, "shown/path: refused");
     }
 }

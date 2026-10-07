@@ -427,22 +427,41 @@ async fn a_dot_dot_component_is_refused() {
 /// Catches a symlink being dereferenced where it is the output, or inside an output
 /// directory: a declared output that is a symlink to a host directory or file must be
 /// recorded as an `OutputSymlink` with its target as written, and a symlink in an
-/// output directory as a `SymlinkNode`, never as the host's contents. The plain file
-/// beside it is still collected, so the test also catches collecting nothing at all.
+/// output directory as a `SymlinkNode`, never as the host's contents. The files,
+/// subdirectory and FIFO beside them are read as found (the FIFO left out), so the
+/// test also catches collecting nothing at all, a lost executable bit, and a FIFO
+/// read or failing the action.
 #[tokio::test]
 async fn a_declared_output_that_is_a_symlink_is_recorded_not_followed() {
-    use std::os::unix::fs::symlink;
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let host = host_dir("collect-link-host");
     let upper = support::scratch("collect-link");
     let host_file = host.join("key.pem");
     symlink(&host, upper.join("link-dir")).expect("symlink");
     symlink(&host_file, upper.join("link-file")).expect("symlink");
-    std::fs::create_dir(upper.join("out")).expect("mkdir");
+    std::fs::write(upper.join("tool.sh"), b"#!/bin/sh\n").expect("write");
+    std::fs::set_permissions(
+        upper.join("tool.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod");
+    std::fs::create_dir_all(upper.join("out/sub")).expect("mkdir");
     std::fs::write(upper.join("out/plain.txt"), b"plain").expect("write");
+    std::fs::write(upper.join("out/sub/n.txt"), b"nested").expect("write");
     symlink(&host, upper.join("out/inner")).expect("symlink");
-    let (outcome, result, cas) = collect_from(&upper, "", &["link-dir", "link-file", "out"]).await;
+    mknodat(CWD, upper.join("out/fifo"), FileType::Fifo, Mode::RUSR, 0).expect("mkfifo");
+    let (outcome, result, cas) =
+        collect_from(&upper, "", &["link-dir", "link-file", "tool.sh", "out"]).await;
     outcome.expect("collected");
+    let [tool] = result.output_files.as_slice() else {
+        panic!("one output file: {result:?}");
+    };
+    assert_eq!(
+        (tool.path.as_str(), tool.digest.clone(), tool.is_executable),
+        ("tool.sh", Some(digest_of(b"#!/bin/sh\n")), true)
+    );
 
     let shown = |p: &std::path::Path| p.to_string_lossy().into_owned();
     assert_eq!(
@@ -460,7 +479,6 @@ async fn a_declared_output_that_is_a_symlink_is_recorded_not_followed() {
             },
         ]
     );
-    assert!(result.output_files.is_empty(), "{result:?}");
     let [out] = result.output_directories.as_slice() else {
         panic!("one output directory: {result:?}");
     };
@@ -479,11 +497,19 @@ async fn a_declared_output_that_is_a_symlink_is_recorded_not_followed() {
             ..SymlinkNode::default()
         }]
     );
-    assert!(
-        root.directories.is_empty() && tree.children.is_empty(),
-        "{root:?}"
-    );
     assert_eq!(root.files, [file("plain.txt", Some(digest_of(b"plain")))]);
+    let sub = Directory {
+        files: vec![file("n.txt", Some(digest_of(b"nested")))],
+        ..Directory::default()
+    };
+    assert_eq!(
+        root.directories,
+        [DirectoryNode {
+            name: "sub".to_owned(),
+            digest: Some(digest_of(&sub.encode_to_vec())),
+        }]
+    );
+    assert_eq!(tree.children, [sub]);
 }
 
 /// Catches what is neither file, directory nor symlink (here a FIFO) being read or
@@ -491,10 +517,10 @@ async fn a_declared_output_that_is_a_symlink_is_recorded_not_followed() {
 /// search permission) being taken as absent: it fails, naming the output.
 #[tokio::test]
 async fn odd_entries_are_left_out_and_unexaminable_ones_fail() {
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
     use std::os::unix::fs::PermissionsExt;
 
     let upper = support::scratch("collect-odd");
-    use rustix::fs::{CWD, FileType, Mode, mknodat};
     mknodat(CWD, upper.join("fifo"), FileType::Fifo, Mode::RUSR, 0).expect("mkfifo");
     let (outcome, result, _) = collect_from(&upper, "", &["fifo"]).await;
     outcome.expect("collected");
