@@ -225,7 +225,12 @@ impl<C: Cas> NativeRuntime<C> {
                 }
             }
         };
-        group.end(&mut child, self.config.kill_wait).await?;
+        // MUTANT: a normal exit leaves the action's other processes running.
+        if matches!(ended, Ended::Exited(_)) {
+            group.armed = false;
+        } else {
+            group.end(&mut child, self.config.kill_wait).await?;
+        }
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
             Ended::TimedOut => Err(RuntimeError::TimedOut),
