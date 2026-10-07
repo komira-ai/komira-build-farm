@@ -86,8 +86,9 @@ jobs:
 
   # The ObjectStore conformance suite against real S3 stores in service containers, each
   # pinned by digest: MinIO (the bridge store) and RustFS (its replacement). Each store
-  # runs the suite twice: a plain bucket, and a bucket with Object Lock. The key pair is
-  # a throwaway for these containers, which live only for this job.
+  # runs the suite twice: a plain bucket, and a bucket with Object Lock. Then kbf-server
+  # runs an Execute end to end with --store=s3 on each. The key pair is a throwaway for
+  # these containers, which live only for this job.
   objstore-s3:
     runs-on: ubuntu-latest
     permissions:
@@ -142,6 +143,16 @@ jobs:
       - name: RustFS, Object Lock bucket
         if: ${{ !cancelled() }}
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9100 --bucket kbf-conformance-lock --create-bucket --conditional-put --object-lock
+      - name: kbf-server end to end, MinIO
+        if: ${{ !cancelled() }}
+        run: cargo test -p kbf-server --test s3 --locked -- --ignored
+        env:
+          KBF_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      - name: kbf-server end to end, RustFS
+        if: ${{ !cancelled() }}
+        run: cargo test -p kbf-server --test s3 --locked -- --ignored
+        env:
+          KBF_TEST_S3_ENDPOINT: http://127.0.0.1:9100
 
   # A second job rather than a matrix: the workflow lint requires a literal hosted label
   # in runs-on, so the runner a job lands on is readable from this file alone.

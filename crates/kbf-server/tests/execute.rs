@@ -12,7 +12,11 @@ use tonic::Code;
 
 /// Runs `job` on `daemon` to completion and returns the result it reported.
 /// The daemon reports with no status at all, which counts as OK.
-async fn run_once(cell: &Cell, daemon: &mut support::FakeDaemon, job: &Job) -> ActionResult {
+async fn run_once(
+    cell: &support::Client,
+    daemon: &mut support::FakeDaemon,
+    job: &Job,
+) -> ActionResult {
     let mut ops = cell.execute(&job.action).await;
     let start = daemon.start().await;
     let result = output(cell, "built once", 0).await;

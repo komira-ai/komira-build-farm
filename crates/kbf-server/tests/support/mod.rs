@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::future::pending;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -105,9 +106,22 @@ impl MetaLog for GateLog {
     }
 }
 
-/// A running server and channels to it.
+/// A running server in this process, and a [`Client`] of it.
 pub struct Cell {
     pub cache: Arc<Cache<GateLog, MemoryStore>>,
+    client: Client,
+}
+
+impl Deref for Cell {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+/// Channels to a server's two listeners, and REAPI helpers.
+pub struct Client {
     pub worker_addr: SocketAddr,
     channel: Channel,
 }
@@ -128,16 +142,25 @@ impl Cell {
             tick: Duration::from_millis(50),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
-        let reapi = bound.reapi;
+        let (reapi, worker) = (bound.reapi, bound.worker);
         tokio::spawn(async move { bound.serving.await.expect("serve") });
+        Self {
+            cache,
+            client: Client::connect(reapi, worker).await,
+        }
+    }
+}
+
+impl Client {
+    /// A client of the server listening at `reapi` and `worker`.
+    pub async fn connect(reapi: SocketAddr, worker: SocketAddr) -> Self {
         let channel = Endpoint::from_shared(format!("http://{reapi}"))
             .expect("endpoint")
             .connect()
             .await
             .expect("connect");
         Self {
-            cache,
-            worker_addr: bound.worker,
+            worker_addr: worker,
             channel,
         }
     }
@@ -148,10 +171,6 @@ impl Cell {
 
     pub fn ac(&self) -> ActionCacheClient<Channel> {
         ActionCacheClient::new(self.channel.clone())
-    }
-
-    pub fn channel(&self) -> Channel {
-        self.channel.clone()
     }
 
     pub async fn upload(&self, blobs: &[&Blob]) {
@@ -534,7 +553,7 @@ impl Job {
 }
 
 /// Uploads an output and returns an ActionResult naming it, with `exit_code`.
-pub async fn output(cell: &Cell, text: &str, exit_code: i32) -> ActionResult {
+pub async fn output(cell: &Client, text: &str, exit_code: i32) -> ActionResult {
     let out = Blob::new(text);
     cell.upload(&[&out]).await;
     ActionResult {
