@@ -328,8 +328,8 @@ impl Scheduler {
             let resources = op.request.resources;
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
-        if op.lost_on.len() <= INFRA_ATTEMPTS {
-            // MUTANT M3a: fails after 4 lost leases, not 3.
+        if op.lost_on.len() < INFRA_ATTEMPTS - 1 {
+            // MUTANT M3b: fails after 2 lost leases, not 3.
             self.requeue(id);
             return;
         }
