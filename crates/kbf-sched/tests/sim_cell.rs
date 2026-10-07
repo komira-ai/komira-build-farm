@@ -159,6 +159,10 @@ impl Leader {
                     self.send(to, Msg::Start { start, session });
                 }
                 Effect::Answer(a) => self.answers.push((now, a.clone())),
+                // Work submitted before any worker registers waits with a reason; every
+                // worker here runs every action, so the wait ends long before a refusal.
+                Effect::Waiting(_) => {}
+                Effect::Refuse(r) => panic!("an operation was refused: {r:?}"),
             }
         }
         effects
@@ -414,6 +418,7 @@ fn request(n: u64) -> Request {
         // Every third action is networked, so it self-fences.
         hermetic: !n.is_multiple_of(3),
         do_not_cache: false,
+        needs: kbf_caps::Request::default(),
     }
 }
 
@@ -467,7 +472,14 @@ impl StateMachine for Cell {
                     }
                     l.sessions.insert(from.clone(), session);
                     let worker = WorkerId::new(from.as_str());
-                    l.feed(now, SchedEvent::WorkerUp { worker, capacity })
+                    l.feed(
+                        now,
+                        SchedEvent::WorkerUp {
+                            worker,
+                            capacity,
+                            caps: kbf_caps::NodeCaps::from_report([("arch", "arm64")]).unwrap(),
+                        },
+                    )
                 }
                 // A heartbeat of an older session belongs to a closed stream.
                 Msg::Heartbeat {

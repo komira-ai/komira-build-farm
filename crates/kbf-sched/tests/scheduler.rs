@@ -1,5 +1,6 @@
 //! The scheduler's rules, one scenario each, driven through its public inputs.
 
+use kbf_caps::NodeCaps;
 use kbf_sched::{Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime,
@@ -27,7 +28,13 @@ fn request(n: u8) -> Request {
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,
+        needs: kbf_caps::Request::default(),
     }
+}
+
+/// A Linux x86-64 node, as its report describes it.
+fn caps() -> NodeCaps {
+    NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap()
 }
 
 fn ok(n: u8) -> Outcome {
@@ -71,7 +78,14 @@ impl Harness {
     fn worker(&mut self, name: &str, cpu_millis: u64, memory: u64) {
         let capacity = Resources::new(cpu_millis, memory);
         let worker = w(name);
-        assert!(self.feed(Event::WorkerUp { worker, capacity }).is_empty());
+        assert!(
+            self.feed(Event::WorkerUp {
+                worker,
+                capacity,
+                caps: caps(),
+            })
+            .is_empty()
+        );
     }
 
     fn submit(&mut self, waiter: u64, request: Request) {
@@ -95,12 +109,14 @@ impl Harness {
         );
     }
 
-    /// Ticks and returns the grants proposed.
+    /// Ticks and returns the grants proposed. Work queued while no worker is live waits
+    /// with a reason; that is checked in `platform.rs`, and skipped here.
     fn tick(&mut self) -> Vec<LeaseGrant> {
         self.feed(Event::Tick)
             .into_iter()
-            .map(|e| match e {
-                Effect::Commit(ControlRecord::Lease(g)) => g,
+            .filter_map(|e| match e {
+                Effect::Commit(ControlRecord::Lease(g)) => Some(g),
+                Effect::Waiting(_) => None,
                 other => panic!("a tick proposed {other:?}"),
             })
             .collect()
@@ -579,6 +595,7 @@ fn a_capacity_change_resizes_the_worker_and_opens_no_session() {
     let resend = Event::Capacity {
         worker: w("a"),
         capacity,
+        caps: caps(),
     };
     assert!(h.at_secs(50).feed(resend).is_empty());
     // A heartbeat that has not listed `first` yet keeps it: same session, inside G.
@@ -592,6 +609,7 @@ fn a_capacity_change_resizes_the_worker_and_opens_no_session() {
     let unknown = Event::Capacity {
         worker: w("z"),
         capacity,
+        caps: caps(),
     };
     assert!(h.feed(unknown).is_empty());
     assert_eq!(
@@ -611,6 +629,7 @@ fn a_capacity_change_counts_as_hearing_from_the_worker() {
     let resend = Event::Capacity {
         worker: w("a"),
         capacity: Resources::new(1_000, GIB),
+        caps: caps(),
     };
     assert!(h.at_secs(50).feed(resend).is_empty());
     h.submit(1, request(1));

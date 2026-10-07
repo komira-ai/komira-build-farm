@@ -1,5 +1,6 @@
 //! What the scheduler is fed: requests, worker reports, committed records and ticks.
 
+use kbf_caps::NodeCaps;
 use kbf_types::{
     ActionKey, ControlRecord, FarmTime, FencePolicy, LeaseId, OperationId, Outcome, Qos, Resources,
     WaiterId, WorkerId,
@@ -14,6 +15,9 @@ pub struct Request {
     pub qos: Qos,
     /// The CPU and memory to book for it.
     pub resources: Resources,
+    /// What a worker must offer to run it, from the action's platform properties. The
+    /// default asks for nothing: any worker may run it.
+    pub needs: kbf_caps::Request,
     /// Whether the action is hermetic (no network). Hermetic work runs on through a
     /// lost connection; networked work self-fences.
     pub hermetic: bool,
@@ -83,8 +87,11 @@ pub enum Event {
         worker: WorkerId,
         /// What placement may book on it.
         capacity: Resources,
+        /// What it offers, from its node report: placement gives it only work whose
+        /// platform it satisfies.
+        caps: NodeCaps,
     },
-    /// A registered worker's capacity changed without a new registration: the daemon
+    /// A registered worker's capacity or capabilities changed without a new registration: the daemon
     /// resent `Hello` on the same stream because its node report changed. Counts as
     /// hearing from it. Opens no session, so it requeues nothing and leaves every
     /// `Start` counted against the session it was sent to (issue #25). Ignored for a
@@ -94,6 +101,8 @@ pub enum Event {
         worker: WorkerId,
         /// What placement may book on it from now on.
         capacity: Resources,
+        /// What it offers from now on.
+        caps: NodeCaps,
     },
     /// A worker's heartbeat arrived on its newest stream, with the leases it holds.
     ///
@@ -148,6 +157,8 @@ pub enum Event {
         /// What happened.
         outcome: Outcome,
     },
-    /// Time passed: expire leases on silent workers and run one placement round.
+    /// Time passed: expire leases on silent workers and run one placement round, which
+    /// also notes which queued operations no live worker can run, and refuses those
+    /// that have waited so for the scheduler's unservable wait.
     Tick,
 }

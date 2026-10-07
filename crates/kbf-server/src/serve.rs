@@ -30,6 +30,10 @@ pub struct Listeners {
     /// How often the scheduler expires silent workers' leases and places queued work
     /// when no input arrives.
     pub tick: Duration,
+    /// How long queued work waits while no live worker can run it (none satisfies its
+    /// platform, or none that does is large enough) before it is refused
+    /// FAILED_PRECONDITION.
+    pub unservable_wait: Duration,
 }
 
 /// Why the server could not start or stopped.
@@ -80,7 +84,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let farm = Arc::new(Farm::new(Arc::clone(&cache)));
+    let farm = Arc::new(Farm::new(Arc::clone(&cache), listeners.unservable_wait));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
 

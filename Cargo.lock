@@ -948,6 +948,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "kbf-caps",
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
@@ -1036,6 +1037,7 @@ dependencies = [
 name = "kbf-sched"
 version = "0.1.0"
 dependencies = [
+ "kbf-caps",
  "kbf-sim",
  "kbf-types",
 ]
@@ -1055,6 +1057,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures",
+ "kbf-caps",
  "kbf-front",
  "kbf-meta",
  "kbf-objstore",

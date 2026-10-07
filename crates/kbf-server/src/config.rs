@@ -69,6 +69,11 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..=MAX_HEARTBEAT_INTERVAL_MS)
     )]
     pub heartbeat_interval_ms: u64,
+    /// How long, in seconds, queued work waits while no connected daemon can run it
+    /// (none satisfies its platform, or none that does is large enough) before it is
+    /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
+    #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
+    pub unservable_wait_secs: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -132,6 +137,7 @@ impl Args {
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
+            unservable_wait: Duration::from_secs(self.unservable_wait_secs),
         })
     }
 

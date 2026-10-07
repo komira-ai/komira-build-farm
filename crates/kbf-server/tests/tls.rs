@@ -103,6 +103,10 @@ async fn session_welcomed(endpoint: Endpoint) -> bool {
                 key: "mem_gib".to_owned(),
                 value: "1".to_owned(),
             },
+            Capability {
+                key: "arch".to_owned(),
+                value: "x86_64".to_owned(),
+            },
         ],
         ..Hello::default()
     };

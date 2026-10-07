@@ -13,20 +13,22 @@ carrying the farm time, and returns `Effect`s for the caller to carry out in ord
 
 | Input (`kbf_sched::Event`) | Meaning |
 |---|---|
-| `WorkerUp { worker, capacity }` | a worker registered (the first `Hello` of a stream): a new session |
-| `Capacity { worker, capacity }` | a registered worker's capacity changed (a `Hello` resent on the same stream) |
+| `WorkerUp { worker, capacity, caps }` | a worker registered (the first `Hello` of a stream): a new session |
+| `Capacity { worker, capacity, caps }` | a registered worker's report changed (a `Hello` resent on the same stream) |
 | `Heartbeat { worker, running }` | a heartbeat on the worker's newest stream, with the leases it holds |
 | `Submit { waiter, request }` | a caller asks for an action to run |
 | `Committed(record)` | a record the scheduler asked to commit is committed (fed in log order) |
 | `Started { operation, lease }` | the holder started the operation |
 | `Report { operation, lease, outcome }` | the holder reports how it ended |
-| `Tick` | time passed: expire silent workers' leases, run one placement round |
+| `Tick` | time passed: expire silent workers' leases, run one placement round, note and refuse work no live worker can run |
 
 | Effect (`kbf_types::Effect`) | The caller must |
 |---|---|
 | `Commit(record)` | append the record to the control log and feed it back as `Committed` once committed |
 | `Start(start)` | send `Start` for a committed lease to its worker |
 | `Answer(answer)` | answer every waiter of a finished operation |
+| `Waiting(waiting)` | tell an operation's waiters why no live worker can run it, or that one can again |
+| `Refuse(refusal)` | answer every waiter of a refused operation (`FAILED_PRECONDITION`) |
 
 The core reads no clock and draws no random number, so the same inputs always give
 the same decisions. That is what lets every replica of a log apply it identically
@@ -44,8 +46,9 @@ states:
 
 ```
 Queued -> Leased -> Running -> Completed | Failed
-             ^         |
-             +---------+  (lease given up: back to Queued, granted again later)
+  |          ^         |
+  |          +---------+  (lease given up: back to Queued, granted again later)
+  +-> Refused             (no live worker could run it for the unservable wait)
 ```
 
 - `Leased { committed: false }`: placed, the grant proposed, no `Start` sent.
@@ -54,6 +57,8 @@ Queued -> Leased -> Running -> Completed | Failed
   so `kbf-server` never feeds `Started` and its operations stay `Leased` until their
   result; callers see `EXECUTING` from the moment the `Start` is sent.
 - `Completed` / `Failed`: a result from the current lease was committed.
+- `Refused`: a refusal was committed while the operation was queued (see
+  [Placement](#placement)).
 
 **In-flight dedup.** Operations are keyed by `ActionKey`: the REAPI instance name and
 the action digest. A new request whose key matches an unfinished operation joins it
@@ -167,19 +172,36 @@ preemption of `batch` work, and fair turns between invocations within one level.
 What the code does today:
 
 - Each worker's capacity is read from its node report at registration: `cpus` x 1000
-  millicores and `mem_gib` GiB. The whole machine is offered.
-- Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`).
+  millicores, `mem_gib` GiB and `gpu` GPUs. The whole machine is offered. So are its
+  capabilities (`kbf_caps::NodeCaps`, see [capabilities.md](capabilities.md)).
+- Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`), its `gpu`
+  count, and what its platform asks of a worker (`Request::needs`).
 - A placement round walks the queue in order and gives each operation to the first
-  live worker, in name order, whose free room (capacity minus bookings) fits the whole
-  request on every axis. A worker is live if it was heard from within G.
+  live worker, in name order, whose capabilities satisfy its platform and whose free
+  room (capacity minus bookings) fits the whole request on every axis. A worker is live
+  if it was heard from within G. Matches are memoised per platform request in a round.
 - At most `PLACEMENT_ROUND` = 256 grants are made per round (one log flush per round).
 - A booking is released when the operation finishes or its lease is given up.
+- Every queued operation is also checked, past the grant limit too, against what live
+  workers could give it once their bookings end. If no live worker satisfies its
+  platform, or none that does is large enough, it is *unservable*: the scheduler emits
+  `Waiting` with a reason (no worker connected; the closest worker and the requirements
+  it lacks; or the request that is too large) whenever the reason changes, and
+  `Waiting` with none once a live worker could run it again.
+- An operation unservable for the unservable wait (`UNSERVABLE_WAIT` = 300 s, the
+  server's `--unservable-wait-secs`) is refused: the scheduler takes it out of the
+  queue, so nothing places it meanwhile, and commits a `Refusal` record. Once that is
+  committed the operation is `Refused` and its waiters are answered (`Refuse`). The wait
+  restarts whenever the operation is servable again. It is not zero because a worker
+  that can run the work is often a moment away: daemons reconnect within seconds of a
+  server restart, and a Mac that reboots is gone for minutes. Work that no kbf daemon
+  could ever run is refused by the front before it is queued (see
+  [capabilities.md](capabilities.md#what-the-code-enforces-today)).
 
 **Planned**, in roughly the order they are needed:
 
-- **Capability matching.** Only workers whose node report satisfies the action's
-  platform properties are feasible (see [capabilities.md](capabilities.md)), and only
-  workers with a driver for the lease kind. Results are memoised per property set.
+- **Drivers in placement.** Only workers with a driver for the lease kind are
+  feasible.
 - **Learned sizes** (`kbf-estimator`). Requests are sized from what earlier runs of
   similar actions used, with a margin that shrinks as samples grow, raised quickly
   after an overshoot and lowered slowly. Cold actions get a cautious prior.
@@ -206,6 +228,7 @@ to the scheduler's outcome and to what callers see:
 | `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED` | not written |
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
 | anything else | `Failed(Infra)` | `INTERNAL` | not written |
+| (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
 
 A run that exits non-zero (a failing test) is still `Completed`: callers get its
 result, but it is not cached. The action-cache entry is committed before the callers

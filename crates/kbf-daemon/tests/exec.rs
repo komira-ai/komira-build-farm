@@ -49,6 +49,7 @@ impl Farm {
             heartbeat_interval: Duration::from_millis(100),
             hello_wait: Duration::from_secs(2),
             tick: Duration::from_millis(50),
+            unservable_wait: Duration::from_secs(300),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);
@@ -64,7 +65,13 @@ impl Farm {
             Arc::new(CasClient::new(reapi.clone())),
             scratch(name),
         ));
-        let report = NodeReport::new([("cpus", "4"), ("drivers", "local"), ("mem_gib", "8")]);
+        let report = NodeReport::new([
+            ("arch", "x86_64"),
+            ("cpus", "4"),
+            ("drivers", "local"),
+            ("mem_gib", "8"),
+            ("os", "linux"),
+        ]);
         let mut config = DaemonConfig::new(
             format!("https://127.0.0.1:{}", worker_addr.port()),
             pki.client,

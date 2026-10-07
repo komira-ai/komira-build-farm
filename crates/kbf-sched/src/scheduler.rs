@@ -2,18 +2,30 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
+use kbf_caps::NodeCaps;
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId,
-    OperationId, Outcome, Qos, Resources, ResultRecord, StartLease, StateMachine, WaiterId,
-    WorkerId,
+    OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord, StartLease,
+    StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 use crate::fence::{LEASE_GRACE, START_GRACE};
 use crate::input::{Event, Input, Request};
+use crate::servable::{Servable, Verdict};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
 pub const PLACEMENT_ROUND: usize = 256;
+
+/// How long a queued operation may wait while no live worker can run it (none
+/// satisfies its platform, or none that does is large enough) before it is refused.
+/// The default of [`Scheduler::new`]; see [`Scheduler::with_unservable_wait`].
+///
+/// The wait restarts whenever a live worker can run it again. It is not zero because a
+/// worker that can is often only a moment away: after a server restart daemons
+/// reconnect over a few seconds, and a Mac that reboots is gone for a few minutes.
+pub const UNSERVABLE_WAIT: Duration = Duration::from_secs(300);
 
 /// Where an operation is.
 ///
@@ -54,6 +66,12 @@ pub enum OpState {
         /// Why.
         failure: Failure,
     },
+    /// Refused without running: no live worker could run it for the unservable wait,
+    /// and the refusal was committed.
+    Refused {
+        /// Why no worker could run it.
+        reason: String,
+    },
 }
 
 impl OpState {
@@ -69,7 +87,10 @@ impl OpState {
     /// Whether the operation is finished.
     #[must_use]
     pub fn is_done(&self) -> bool {
-        matches!(self, Self::Completed { .. } | Self::Failed { .. })
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Refused { .. }
+        )
     }
 }
 
@@ -84,6 +105,16 @@ struct Operation {
     /// A result from the current holding has been proposed; later reports for it are
     /// duplicates.
     result_proposed: bool,
+    /// While queued: since when, and why, no live worker can run it. `None` while one
+    /// can.
+    unservable: Option<Unservable>,
+}
+
+/// A queued operation no live worker can run: since when, and why.
+#[derive(Clone, Debug)]
+struct Unservable {
+    since: FarmTime,
+    reason: String,
 }
 
 /// A lease currently held (leased or running).
@@ -103,20 +134,21 @@ struct StartSent {
 }
 
 #[derive(Clone, Debug)]
-struct Worker {
-    capacity: Resources,
-    booked: Resources,
+pub(crate) struct Worker {
+    pub(crate) capacity: Resources,
+    pub(crate) caps: NodeCaps,
+    pub(crate) booked: Resources,
     last_heard: FarmTime,
     /// Counts the worker's registrations: the session a `Start` emitted now goes to.
     session: u64,
 }
 
 impl Worker {
-    fn free(&self) -> Resources {
+    pub(crate) fn free(&self) -> Resources {
         self.capacity.saturating_sub(self.booked)
     }
 
-    fn alive(&self, now: FarmTime) -> bool {
+    pub(crate) fn alive(&self, now: FarmTime) -> bool {
         now < self.last_heard.saturating_add(LEASE_GRACE)
     }
 }
@@ -157,6 +189,8 @@ pub struct Scheduler {
     workers: BTreeMap<WorkerId, Worker>,
     /// Every lease currently held (leased or running).
     held: BTreeMap<LeaseId, Held>,
+    /// How long a queued operation no live worker can run waits before it is refused.
+    unservable_wait: Duration,
 }
 
 impl Scheduler {
@@ -173,7 +207,23 @@ impl Scheduler {
             in_flight: BTreeMap::new(),
             workers: BTreeMap::new(),
             held: BTreeMap::new(),
+            unservable_wait: UNSERVABLE_WAIT,
         }
+    }
+
+    /// This scheduler, refusing a queued operation once no live worker has been able to
+    /// run it for `wait` (instead of [`UNSERVABLE_WAIT`]).
+    #[must_use]
+    pub const fn with_unservable_wait(mut self, wait: Duration) -> Self {
+        self.unservable_wait = wait;
+        self
+    }
+
+    /// Why no live worker can run `operation` now, while it is queued and none can.
+    #[must_use]
+    pub fn waiting(&self, operation: OperationId) -> Option<&str> {
+        let op = self.ops.get(&operation)?;
+        op.unservable.as_ref().map(|u| u.reason.as_str())
     }
 
     /// Where `operation` is, if it exists.
@@ -228,7 +278,10 @@ impl Scheduler {
         })
     }
 
-    fn submit(&mut self, waiter: WaiterId, request: Request) {
+    /// Queues `request` for `waiter`, or attaches `waiter` to a running twin. A twin
+    /// that waits for a worker that can run it tells its waiters why again, so the new
+    /// one learns it too.
+    fn submit(&mut self, waiter: WaiterId, request: Request) -> Vec<Effect> {
         if request.joinable()
             && let Some(&id) = self.in_flight.get(&request.key)
         {
@@ -243,7 +296,16 @@ impl Scheduler {
                 }
                 op.request.qos = request.qos;
             }
-            return;
+            return op
+                .unservable
+                .iter()
+                .map(|u| {
+                    Effect::Waiting(Waiting {
+                        operation: id,
+                        reason: Some(u.reason.clone()),
+                    })
+                })
+                .collect();
         }
         let id = OperationId(self.next_op);
         self.next_op += 1;
@@ -259,8 +321,10 @@ impl Scheduler {
                 state: OpState::Queued,
                 committed_lease: None,
                 result_proposed: false,
+                unservable: None,
             },
         );
+        Vec::new()
     }
 
     /// Releases `operation`'s holding (booking and lease), if it has one.
@@ -335,24 +399,37 @@ impl Scheduler {
         }
     }
 
-    /// One placement round: each queued operation, most urgent first, goes to the
-    /// first live worker (in name order) with room for its whole request vector.
+    /// One placement round. Each queued operation, most urgent first, goes to the first
+    /// live worker (in name order) that satisfies its platform and has room for its
+    /// whole request vector, up to [`PLACEMENT_ROUND`] grants.
+    ///
+    /// Every queued operation is also checked against what live workers could ever give
+    /// it: one that no live worker satisfies, or that is larger than every one that
+    /// does, waits with a reason ([`Effect::Waiting`] when the reason changes), and is
+    /// refused once it has waited so for the unservable wait. Its refusal is committed
+    /// first and leaves the queue at once, so nothing places it meanwhile.
     fn place(&mut self, effects: &mut Vec<Effect>) {
         let now = self.now;
+        let mut servable = Servable::new(&self.workers, now);
         let mut placed = Vec::new();
+        let mut verdicts = Vec::new();
         for &(_, id) in &self.queue {
-            if placed.len() == PLACEMENT_ROUND {
-                break;
+            let op = &self.ops[&id];
+            let request = &op.request;
+            let verdict = if placed.len() < PLACEMENT_ROUND
+                && let Some(name) = servable.fit(&mut self.workers, request)
+            {
+                placed.push((id, name));
+                Verdict::Servable
+            } else {
+                servable.verdict(&self.workers, request)
+            };
+            if op.unservable.is_some() || verdict != Verdict::Servable {
+                verdicts.push((id, verdict));
             }
-            let request = &self.ops[&id].request.resources;
-            let fit = self
-                .workers
-                .iter_mut()
-                .find(|(_, w)| w.alive(now) && w.free().fits(request));
-            if let Some((name, w)) = fit {
-                w.booked = w.booked.saturating_add(*request);
-                placed.push((id, name.clone()));
-            }
+        }
+        for (id, verdict) in verdicts {
+            self.note(id, verdict, effects);
         }
         for (id, worker) in placed {
             let lease = LeaseId::new(self.term, self.next_seq);
@@ -377,6 +454,75 @@ impl Scheduler {
                 worker,
             })));
         }
+    }
+
+    /// Records this round's verdict on queued operation `id`: tells its waiters when
+    /// the reason it waits changes, and proposes its refusal once it has waited for the
+    /// unservable wait.
+    fn note(&mut self, id: OperationId, verdict: Verdict, effects: &mut Vec<Effect>) {
+        let now = self.now;
+        let wait = self.unservable_wait;
+        let op = self.ops.get_mut(&id).expect("queued operations exist");
+        let reason = match verdict {
+            Verdict::Servable => {
+                // Only an operation that was waiting has a servable verdict noted.
+                op.unservable = None;
+                effects.push(Effect::Waiting(Waiting {
+                    operation: id,
+                    reason: None,
+                }));
+                return;
+            }
+            Verdict::Unservable(reason) => reason,
+        };
+        let unservable = match &mut op.unservable {
+            Some(u) if u.reason == reason => u,
+            slot => {
+                let since = slot.as_ref().map_or(now, |u| u.since);
+                effects.push(Effect::Waiting(Waiting {
+                    operation: id,
+                    reason: Some(reason.clone()),
+                }));
+                slot.insert(Unservable { since, reason })
+            }
+        };
+        if now >= unservable.since.saturating_add(wait) {
+            let reason = format!(
+                "{} (waited {} s for a worker that can run it)",
+                unservable.reason,
+                wait.as_secs()
+            );
+            self.queue.remove(&(Reverse(op.request.qos.clone()), id));
+            effects.push(Effect::Commit(ControlRecord::Refusal(RefusalRecord {
+                operation: id,
+                reason,
+            })));
+        }
+    }
+
+    /// A committed refusal: the operation is finished, and its waiters are answered.
+    /// A refusal of an operation that is no longer queued is stale and dropped.
+    fn refusal_committed(&mut self, record: &RefusalRecord) -> Vec<Effect> {
+        let id = record.operation;
+        let Some(op) = self.ops.get_mut(&id) else {
+            return Vec::new();
+        };
+        if op.state != OpState::Queued {
+            return Vec::new();
+        }
+        op.state = OpState::Refused {
+            reason: record.reason.clone(),
+        };
+        op.unservable = None;
+        self.queue.remove(&(Reverse(op.request.qos.clone()), id));
+        if self.in_flight.get(&op.request.key) == Some(&id) {
+            self.in_flight.remove(&op.request.key);
+        }
+        vec![Effect::Refuse(Refusal {
+            operation: id,
+            waiters: op.waiters.clone(),
+            reason: record.reason.clone(),
+        })]
     }
 
     fn lease_committed(&mut self, grant: &LeaseGrant, effects: &mut Vec<Effect>) {
@@ -496,26 +642,42 @@ impl StateMachine for Scheduler {
     fn apply(&mut self, input: Input) -> Vec<Effect> {
         self.now = self.now.max(input.now);
         match input.event {
-            Event::WorkerUp { worker, capacity } => {
+            Event::WorkerUp {
+                worker,
+                capacity,
+                caps,
+            } => {
                 let now = self.now;
-                self.workers
-                    .entry(worker)
-                    .and_modify(|w| {
+                match self.workers.get_mut(&worker) {
+                    Some(w) => {
                         w.capacity = capacity;
+                        w.caps = caps;
                         w.last_heard = now;
                         w.session += 1;
-                    })
-                    .or_insert(Worker {
-                        capacity,
-                        booked: Resources::default(),
-                        last_heard: now,
-                        session: 0,
-                    });
+                    }
+                    None => {
+                        self.workers.insert(
+                            worker,
+                            Worker {
+                                capacity,
+                                caps,
+                                booked: Resources::default(),
+                                last_heard: now,
+                                session: 0,
+                            },
+                        );
+                    }
+                }
                 Vec::new()
             }
-            Event::Capacity { worker, capacity } => {
+            Event::Capacity {
+                worker,
+                capacity,
+                caps,
+            } => {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.capacity = capacity;
+                    w.caps = caps;
                     w.last_heard = w.last_heard.max(self.now);
                 }
                 Vec::new()
@@ -528,16 +690,14 @@ impl StateMachine for Scheduler {
                 }
                 Vec::new()
             }
-            Event::Submit { waiter, request } => {
-                self.submit(waiter, request);
-                Vec::new()
-            }
+            Event::Submit { waiter, request } => self.submit(waiter, request),
             Event::Committed(ControlRecord::Lease(grant)) => {
                 let mut effects = Vec::new();
                 self.lease_committed(&grant, &mut effects);
                 effects
             }
             Event::Committed(ControlRecord::Result(record)) => self.result_committed(&record),
+            Event::Committed(ControlRecord::Refusal(record)) => self.refusal_committed(&record),
             // Control records of other cores (jobs, alerts) are not the scheduler's.
             Event::Committed(_) => Vec::new(),
             Event::Started { operation, lease } => {

@@ -11,6 +11,7 @@ publish.workspace = true
 clap.workspace = true
 futures.workspace = true
 kbf-front.workspace = true
+kbf-caps.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true

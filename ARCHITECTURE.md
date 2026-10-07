@@ -163,7 +163,7 @@ See [scheduler.md](docs/design/scheduler.md) and
 | CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine replicated by Raft |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log |
-| Node reports | read at `Hello`; only `cpus` and `mem_gib` are used | full capability matching |
+| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform | operator labels, report changes noticed by hash |
 
 Because the index is in memory today, a restarted server forgets every blob. With
 `--store=s3` each start writes under a fresh key prefix so it never reads objects a

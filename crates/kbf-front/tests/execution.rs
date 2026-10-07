@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use common::{Blob, Farm};
-use kbf_front::{DEFAULT_RESOURCES, Dispatch, Finished, GPU_KEY, Stage, Submission, Ticket};
+use kbf_front::{
+    DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN, Finished, GPU_KEY, NO_WORKER_REASON, Stage,
+    Submission, Ticket,
+};
 use kbf_meta::Role;
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc::{self, PreconditionFailure};
@@ -604,6 +607,111 @@ async fn the_gpu_count_comes_from_the_platform() {
         assert_eq!(status.code(), Code::InvalidArgument, "{value:?}");
     }
     assert_eq!(script.submitted().len(), 2);
+}
+
+/// Catches: the platform's OS and architecture dropped on the way to the scheduler (a
+/// Linux action could then run on a Mac), properties that are not capabilities
+/// refused, a malformed platform accepted, and a platform no kbf daemon can ever run
+/// queued to wait out the bound instead of refused at once.
+#[tokio::test]
+async fn the_platform_says_which_workers_may_run_it() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let image = ("container-image", "docker://img@sha256:00");
+    type Props = Vec<(&'static str, &'static str)>;
+    let cases: [(&str, Props, Props); 3] = [
+        (
+            "linux",
+            vec![("OSFamily", "Linux"), image],
+            vec![("os", "linux")],
+        ),
+        (
+            "mac",
+            vec![("OSFamily", "darwin"), ("ISA", "arm-a64")],
+            vec![("os", "macos"), ("arch", "arm64")],
+        ),
+        ("anywhere", vec![], vec![]),
+    ];
+    for (argv, props, _) in &cases {
+        let job = job(argv, props, false);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect("Execute");
+    }
+    for (submission, (argv, _, needs)) in script.submitted().iter().zip(&cases) {
+        let want = kbf_caps::Request::parse(needs.iter().copied()).unwrap();
+        assert_eq!(submission.request.needs, want, "{argv}");
+    }
+
+    for (why, props, code) in [
+        (
+            "one requirement twice",
+            vec![("OSFamily", "linux"), ("os", "linux")],
+            Code::InvalidArgument,
+        ),
+        (
+            "a count that is not one",
+            vec![("cpus", "many")],
+            Code::InvalidArgument,
+        ),
+        (
+            "an OS no daemon runs",
+            vec![("OSFamily", "Windows")],
+            Code::FailedPrecondition,
+        ),
+        (
+            "an ISA no daemon runs",
+            vec![("ISA", "x86-32")],
+            Code::FailedPrecondition,
+        ),
+    ] {
+        let bad = job(why, &props, false);
+        farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &bad.action).await.expect_err(why);
+        assert_eq!(status.code(), code, "{why}: {status:?}");
+        assert!(status.details().is_empty(), "{why}: nothing to upload");
+    }
+    assert_eq!(script.submitted().len(), 3);
+}
+
+/// Catches: an operation no worker can run streamed as plainly QUEUED, so a build
+/// hangs with no word of why, and a reason left in the metadata once it is gone.
+#[tokio::test]
+async fn a_waiting_operation_says_why_in_its_metadata() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let job = job("wait", &[("OSFamily", "darwin")], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+
+    let partial = |op: &Operation| {
+        let meta = op.metadata.as_ref().expect("metadata");
+        ExecuteOperationMetadata::decode(meta.value.as_slice())
+            .expect("metadata decodes")
+            .partial_execution_metadata
+    };
+    let queued = next(&mut ops).await.expect("healthy").expect("an update");
+    assert_eq!(partial(&queued), None);
+
+    let why = "none of the 1 live worker(s) satisfies the action's platform";
+    script.set(0, Stage::Waiting(why.to_owned()));
+    let waiting = next(&mut ops).await.expect("healthy").expect("an update");
+    assert_eq!(stage(&waiting), ExecStage::Queued as i32);
+    assert!(!waiting.done);
+    let [info] = partial(&waiting)
+        .expect("partial metadata")
+        .auxiliary_metadata
+        .try_into()
+        .expect("one entry");
+    assert_eq!(info.type_url, "type.googleapis.com/google.rpc.ErrorInfo");
+    let info = rpc::ErrorInfo::decode(info.value.as_slice()).expect("an ErrorInfo");
+    assert_eq!(info.reason, NO_WORKER_REASON);
+    assert_eq!(info.domain, ERROR_DOMAIN);
+    assert_eq!(info.metadata.get("why").map(String::as_str), Some(why));
+
+    script.set(0, Stage::Queued);
+    let again = next(&mut ops).await.expect("healthy").expect("an update");
+    assert_eq!(stage(&again), ExecStage::Queued as i32);
+    assert_eq!(partial(&again), None);
 }
 
 /// Catches: a WaitExecution that does not follow the named operation, or that answers

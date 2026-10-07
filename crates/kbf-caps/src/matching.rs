@@ -35,6 +35,11 @@ pub enum Consumable {
 impl Consumable {
     const ALL: [Self; 4] = [Self::Cpus, Self::MemGib, Self::NvmeGib, Self::Gpus];
 
+    /// The consumable whose key is `key`, if any.
+    pub(crate) fn from_name(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == key)
+    }
+
     /// The request key.
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -58,6 +63,19 @@ const EXACT_KEYS: [&str; 5] = ["os", "os_image", "cpu.model", "page_size", "xcod
 
 /// Reserved keys that are not capabilities.
 const RESERVED_KEYS: [&str; 3] = ["kbf-lease", "kbf-cpu", "kbf-mac-admin"];
+
+/// Whether `key` is compared as an exact string: one of the exact keys, or
+/// `label.<k>` with a non-empty `<k>`.
+pub(crate) fn is_exact_key(key: &str) -> bool {
+    EXACT_KEYS.contains(&key) || key.strip_prefix("label.").is_some_and(|k| !k.is_empty())
+}
+
+/// Whether [`Request::parse`] reads `key` as a capability (reserved keys are not).
+pub(crate) fn is_capability_key(key: &str) -> bool {
+    matches!(key, "arch" | "isa_level" | "cpu.feature")
+        || Consumable::from_name(key).is_some()
+        || is_exact_key(key)
+}
 
 /// What a node offers, as the scheduler sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,7 +120,7 @@ pub struct Request {
     arch: Option<Arch>,
     isa_level: Option<IsaLevel>,
     features: BTreeSet<String>,
-    exact: BTreeMap<String, String>,
+    pub(crate) exact: BTreeMap<String, String>,
     minimums: BTreeMap<Consumable, u64>,
 }
 
@@ -125,6 +143,20 @@ pub enum Unmet<'a> {
         want: u64,
         have: u64,
     },
+}
+
+impl fmt::Display for Unmet<'_> {
+    /// The requirement in request syntax: `arch=arm64`, `isa_level>=x86-64-v3`,
+    /// `cpu.feature=avx2`, `os=macos`, `gpu>=2 (has 1)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arch { want } => write!(f, "arch={want}"),
+            Self::IsaLevel { want } => write!(f, "isa_level>={want}"),
+            Self::Feature(feature) => write!(f, "cpu.feature={feature}"),
+            Self::Exact { key, want } => write!(f, "{key}={want}"),
+            Self::Consumable { what, want, have } => write!(f, "{what}>={want} (has {have})"),
+        }
+    }
 }
 
 impl Request {
@@ -156,14 +188,12 @@ impl Request {
                     return Err(bad());
                 }
                 req.features.insert(value.to_owned());
-            } else if let Some(what) = Consumable::ALL.into_iter().find(|c| c.name() == key) {
+            } else if let Some(what) = Consumable::from_name(key) {
                 let amount = value.parse().map_err(|_| bad())?;
                 if req.minimums.insert(what, amount).is_some() {
                     return Err(repeated());
                 }
-            } else if EXACT_KEYS.contains(&key)
-                || key.strip_prefix("label.").is_some_and(|k| !k.is_empty())
-            {
+            } else if is_exact_key(key) {
                 if req.exact.insert(key.to_owned(), value.to_owned()).is_some() {
                     return Err(repeated());
                 }

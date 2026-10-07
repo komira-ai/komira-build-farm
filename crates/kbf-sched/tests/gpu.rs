@@ -1,6 +1,7 @@
 //! GPU placement: a GPU request goes only to a node with a free GPU, and a GPU is held
 //! by one lease at a time, from its grant until the lease ends.
 
+use kbf_caps::NodeCaps;
 use kbf_sched::{Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
@@ -24,7 +25,13 @@ fn request(n: u8, gpus: u64) -> Request {
         resources: Resources::new(1_000, GIB).with_gpus(gpus),
         hermetic: true,
         do_not_cache: false,
+        needs: kbf_caps::Request::default(),
     }
+}
+
+/// A Linux x86-64 node, as its report describes it.
+fn caps() -> NodeCaps {
+    NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap()
 }
 
 fn w(name: &str) -> WorkerId {
@@ -51,6 +58,7 @@ impl Harness {
             self.feed(Event::WorkerUp {
                 worker: w(name),
                 capacity,
+                caps: caps(),
             })
             .is_empty()
         );
@@ -61,12 +69,14 @@ impl Harness {
         assert!(self.feed(Event::Submit { waiter, request }).is_empty());
     }
 
-    /// Ticks and returns the grants proposed.
+    /// Ticks and returns the grants proposed. A request larger than every node waits
+    /// with a reason; that is checked in `platform.rs`, and skipped here.
     fn tick(&mut self) -> Vec<LeaseGrant> {
         self.feed(Event::Tick)
             .into_iter()
-            .map(|e| match e {
-                Effect::Commit(ControlRecord::Lease(g)) => g,
+            .filter_map(|e| match e {
+                Effect::Commit(ControlRecord::Lease(g)) => Some(g),
+                Effect::Waiting(_) => None,
                 other => panic!("a tick proposed {other:?}"),
             })
             .collect()
