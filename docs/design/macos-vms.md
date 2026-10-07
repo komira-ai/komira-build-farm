@@ -16,7 +16,7 @@ runs in a VM** ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
 
 Isolating what installing a desktop app does to a bare-metal Mac, and fleet-wide
 updates, device management and UI, are a separate design:
-[fleet-updates.md](fleet-updates.md) (in progress).
+[fleet-updates.md](fleet-updates.md) (in progress, #87).
 
 Claims about Apple's software and other projects are marked **[V]** (read in the
 source linked) or **[A]** (an assumption or a number nobody has measured on our
@@ -88,9 +88,10 @@ What follows for kbf:
   **[A]** (not a legal opinion).
 - A farm offered as a service to third parties falls under section 3 instead, which
   requires notice to Apple, gives the lessee "sole and exclusive use and control of the
-  Apple Software and the Apple-branded hardware" for at least 24 hours, and lets a
-  lessor virtualize "only a single instance ... as a provisioning tool" (section
-  3A(i)-(iii) and 3D) **[V]**. So a third-party service must lease whole Macs, at least
+  Apple Software and the Apple-branded hardware" for at least 24 hours, and says "a
+  Lessor may only virtualize a single instance or copy of the Apple Software as a
+  provisioning tool" (section 3A(ii)-(iii), 3A's notice paragraph, and 3D) **[V]**.
+  So a third-party service must lease whole Macs, at least
   24 hours each, to one lessee, with notice to Apple. Per-action VM leases from
   different customers on one Mac are not permitted.
 - Simulators run inside macOS; they are not iOS VMs, so the licence's ban on running
@@ -159,8 +160,11 @@ Rules that follow:
   Xcodes per host; simulator runtimes live in the VM image, not in the host profile; and
   GUI work moves from the whole-machine lease with host auto-login to the VM lease, whose
   guest logs itself in (the host needs auto-login only if the first probe of
-  [section 6](#6-the-vm-driver-one-vm-per-lease-never-reused) fails). #76's "there is no
-  disk image" stays true for the host, but VM golden images now live on Mac nodes.
+  [section 6](#6-the-vm-driver-one-vm-per-lease-never-reused) fails). One exception:
+  bare-metal GPU tests that install the desktop app still need a GUI session on the
+  host ([section 8.1](#81-on-bare-metal-never-in-a-vm), and
+  [fleet-updates.md](fleet-updates.md), #87). #76's "there is no disk image" stays true
+  for the host, but VM golden images now live on Mac nodes.
 
 Four probes on one Mac settle the **[A]** rows above before phase 1 closes:
 `xcodebuild` with user-script sandboxing on, inside kbf's profile; `ibtool`/`actool`
@@ -256,7 +260,8 @@ Rules common to every option, all **[A]** design:
 
 **Recommendation:** C as the mechanism, with A as the default. An action that says
 nothing gets a 6 vCPU, 16 GiB guest (6 cores and 17 GiB booked); one that needs more
-asks for it, up to 12 vCPU and 32 GiB (both bounds are server configuration). The VM is configured at boot from what was
+asks for it, up to 12 vCPU and 32 GiB (both bounds are server configuration). The VM
+is configured at boot from what was
 booked, so one golden image serves every size.
 
 **Disk:** a VM lease also needs local disk for its clone's growth (DerivedData,
@@ -277,21 +282,32 @@ The action says so, the node says what it can do, and the scheduler books it.
 |---|---|---|---|
 | `kbf-lease` | reserved | `vm` (new; beside `action` and `whole_machine`) | run in a fresh macOS VM |
 | `vm.image` | capability, membership | `<name>@sha256:<digest>` | the golden image; a value without a digest is refused, as for container images |
-| `kbf-book-cores` | reserved | whole cores | what the lease books. For `kbf-lease=vm` it is also the guest's vCPU count: 4-12, default 6 |
+| `kbf-book-cpus` | reserved | whole cores (named like `cpus` and `vm.max_cpus`) | what the lease books. For `kbf-lease=vm` it is also the guest's vCPU count: 4-12, default 6 |
 | `kbf-book-mem-gib` | reserved | GiB | what the lease books. For `kbf-lease=vm`: 9-33, default 17, and the guest's `memorySize` is this minus 1 GiB for the helper (8-32 GiB, default 16) |
 
-**One size convention for every lease kind.** `kbf-book-cores` and `kbf-book-mem-gib`
+**One size convention for every lease kind.** `kbf-book-cpus` and `kbf-book-mem-gib`
 are what a lease books, on bare metal and in a VM alike: on an `action` lease they
 replace the 1 core and 1 GiB every action books today (and so raise the native
 driver's memory kill, which is 150% + 512 MiB of the booking); on a `vm` lease they
-size the guest. A `whole_machine` lease books the whole node, so the front refuses
-either key on it. They are not `cpus` and `mem_gib`: those two are capability keys that
+size the guest. A `whole_machine` lease is planned to book the whole node
+([section 5.3](#53-booking-and-placement-planned)), so the front will refuse either key
+on it; today the front books 1 core and 1 GiB for every lease, whatever its kind
+(`DEFAULT_RESOURCES`, `crates/kbf-front/src/execution.rs`) **[V]**. They are not `cpus`
+and `mem_gib`: those two are capability keys that
 ask for a node whose *whole machine* has at least that much, and they book nothing.
 They are also not `kbf-cpu`, which is planned as the value `dedicated` (whole physical
 cores for quiet performance runs), not a size. When learned sizes (`kbf-estimator`,
 [scheduler.md](scheduler.md)) land, an action without the keys gets a learned size
 instead of the default, and an explicit key wins over the estimate. A VM's size is
 fixed at boot, so a VM lease always uses the key or the VM default, never an estimate.
+
+**The cost: they split the action cache.** Like every platform property, the two keys
+are part of the action digest, so the same action with a larger memory booking is a
+different cache entry: raising memory changes no output, but the first run after the
+change misses. That is the reason QoS is a request header and never a property
+([capabilities.md](capabilities.md), [scheduler.md](scheduler.md#qos)). The keys stay
+anyway, because Bazel and Buck2 have no other per-action channel to the farm. Learned
+sizes should make them rare: an action needs one only when the estimate is wrong for it.
 
 **`vm.image` is a capability key**, the same name in the request and the report, like
 `xcode` and `os_image`. Its comparison is membership on the digest only: the request
@@ -300,7 +316,7 @@ matcher compares the digest part. It is not a reserved key, and the scheduler ha
 image rule of its own.
 
 All of these are part of the action digest, which is wanted: a result from a VM and
-one from bare metal never share a cache entry. `kbf-book-cores` and `kbf-book-mem-gib`
+one from bare metal never share a cache entry. `kbf-book-cpus` and `kbf-book-mem-gib`
 join the reserved keys the matcher skips (`kbf-lease`, `kbf-cpu`, `kbf-mac-admin`
 today, `crates/kbf-caps/src/matching.rs` **[V]**). The front checks the bounds and
 turns them into a booking.
@@ -314,9 +330,17 @@ turns them into a booking.
 | `vm.image=<digest>`, one per image | golden images already on the node's disk |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start |
 
+`vm.slots`, `vm.max_cpus` and `vm.max_mem_gib` are report-only: an action cannot ask
+for them, and `vms` is booked only through `kbf-lease=vm`.
+
 No new key names the lease kinds a node serves: the scheduler maps each lease kind to
-the drivers that serve it (`vm` to `vm`; `action` and `whole_machine` to `native` or
-`container`) and reads `drivers`. That is the planned "Drivers in placement" of
+the drivers that serve it and reads `drivers`. `action` maps to `native` or
+`container`; `vm` maps to `vm`; `whole_machine` maps to the planned bare-metal
+whole-machine runtime, the per-lease-user driver of
+[fleet-updates.md](fleet-updates.md) (#87, phase P4). On `main` no driver serves
+`whole_machine`: the native and container drivers serve `action` only
+(`crates/kbf-driver-native/src/runtime.rs`, `crates/kbf-driver-native/tests/lease.rs`)
+**[V]**. That is the planned "Drivers in placement" of
 [capabilities.md](capabilities.md#planned) and [scheduler.md](scheduler.md).
 
 ### 5.3 Booking and placement (planned)
@@ -328,13 +352,14 @@ and placement is first fit in worker-name order with no reservation **[V]**. The
 changes:
 
 1. **A `vms` dimension** in `Resources`, filled from `vm.slots`, checked by `fits` like
-   `gpus`. A VM lease books `vms=1`, `kbf-book-cores` and `kbf-book-mem-gib`. The
+   `gpus`. A VM lease books `vms=1`, `kbf-book-cpus` and `kbf-book-mem-gib`. The
    scheduler therefore never asks for a third VM, and the driver still maps
    `VZErrorVirtualMachineLimitExceeded` to an infrastructure failure that is retried
    elsewhere.
 2. **The kind in the request.** A node is feasible only if its `drivers` include one
    that serves the kind. This also stops `whole_machine` reaching a daemon that refuses
-   it.
+   it. A `whole_machine` lease books the node's full cores, memory, `gpus` and `vms`, so
+   nothing else is placed there while it runs.
 3. **Image locality is a hard requirement.** `vm.image` matches only nodes that report
    the digest. An image is tens of gigabytes; it is never fetched at action time.
    Images are placed on nodes ahead of time ([section 7](#7-images)).
@@ -343,10 +368,11 @@ changes:
    VM lease at the head of its queue fits no node, the scheduler reserves the best
    candidate (a node with a free slot and the image) and stops placing new bare-metal
    work there until the VM fits, bounded by a timeout. Running leases finish; nothing
-   is killed. A reservation follows the queue's QoS order and is not a quota: only the
-   highest-priority waiting VM lease may hold a node, so a `batch` VM lease never
-   blocks `ci` work. A GPU test's whole-machine lease
-   ([section 8.1](#81-on-bare-metal-never-in-a-vm)) drains a Mac the same way.
+   is killed. A reservation follows the queue's QoS order and is not a quota: it keeps
+   off only work *less urgent* than the lease holding it, so a `batch` VM reservation
+   never keeps `ci` or `interactive` work off the node. A GPU test's whole-machine lease
+   ([section 8.1](#81-on-bare-metal-never-in-a-vm)) drains a Mac the same way, under
+   the same rule.
 
 This is all pure scheduler code, testable in the simulator crate.
 
@@ -372,7 +398,8 @@ Per lease:
    **[V]**.
 2. **Configure.** From the booking, so `Start` needs no new field: `cpuCount` is the
    booked cores, and `memorySize` is the booked memory minus the 1 GiB booked for the
-   helper (16 GiB for the default 17 GiB booking), so the guest is not 1 GiB too large. Devices: one virtio socket; two virtiofs shares, inputs read-only and outputs
+   helper (16 GiB for the default 17 GiB booking), so the guest is not 1 GiB too large.
+   Devices: one virtio socket; two virtiofs shares, inputs read-only and outputs
    read-write; a network device only when the action asks for the network; a graphics
    device (`VZMacGraphicsDeviceConfiguration`) and display for GUI work.
 3. **Boot.** Wait for the guest agent to report ready over the socket. Boot time is not
@@ -380,7 +407,8 @@ Per lease:
    measured (expected 20-60 s **[A]**).
 4. **Run.** Send argv, environment and working directory over the socket to
    `kbf-guest`, a small self-contained Rust binary (dynamically linked only to
-   libSystem, since macOS does not support fully static executables) baked into the image, running in the guest's
+   libSystem, since macOS does not support fully static executables) baked into the
+   image, running in the guest's
    auto-logged-in user session. It runs the command, writes stdout and stderr into the
    output share, and returns the exit code and usage. Not SSH: no keys, no `sshd`, no
    network needed.
@@ -489,7 +517,7 @@ So a GPU test is a whole-machine lease:
 - A test that installs the desktop app needs a GUI session on the host, and what the
   install leaves behind must not reach the next lease. That isolation, and fleet-wide
   updates, device management and UI, are designed in
-  [fleet-updates.md](fleet-updates.md) (in progress).
+  [fleet-updates.md](fleet-updates.md) (in progress, #87).
 
 ### 8.2 Testing a local LLM on the GPU
 
@@ -576,7 +604,7 @@ the node id checked against the certificate ([#79](https://github.com/komira-ai/
 
 | Crate | Change |
 |---|---|
-| `kbf-front`, `kbf-caps` | the size keys `kbf-book-cores` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-planned)): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
+| `kbf-front`, `kbf-caps` | the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-planned)): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
 | `kbf-caps` | `xcode` becomes a set the node reports, matched by membership (today an exact key, and a repeated entry is refused) |
 | `kbf-driver-native` | deny file writes outside the lease, `TMPDIR` and a per-lease `HOME`; set `HOME`, `TMPDIR`, the module cache paths and the per-user cache folder per lease; per-lease user; fill usage |
 | `kbf-daemon` | report each Xcode build (several `xcode` entries) and SDKs; set `DEVELOPER_DIR` from the action |
@@ -595,7 +623,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-types` | `Resources.vms` | ~60 lines |
 | `kbf-caps` | `vm.image`, matched by membership on the digest; `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` | ~250 |
 | `kbf-sched` | kind in `Request`, reservation in QoS order; simulator tests | ~900 |
-| `kbf-front` | lease kind `vm`, VM bounds on `kbf-book-cores` and `kbf-book-mem-gib` | ~150 |
+| `kbf-front` | lease kind `vm`, VM bounds on `kbf-book-cpus` and `kbf-book-mem-gib` | ~150 |
 | `kbf-server` | read `vm.slots` | ~80 |
 | `kbf-daemon`, `kbf-node` | a runtime that dispatches by kind across several drivers; VM flags (image directory, boot timeout) | ~370 |
 | `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
@@ -614,6 +642,8 @@ app's peak are recorded and replace the **[A]** numbers in section 4.
 | `kbf-daemon` | report `gpu=1`, GPU core count and the wired-memory cap on macOS |
 | `kbf-proto`, `kbf-server` | GPUs in `Start` |
 | `kbf-sched` | GPU tests as whole-machine leases with `gpu=1`: drain the Mac, one at a time |
+| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine` (none does on `main`): the per-lease-user driver of [fleet-updates.md](fleet-updates.md) (#87, phase P4) |
+| `kbf-front`, `kbf-sched` | a `whole_machine` lease books the node's full cores, memory, `gpus` and `vms` |
 | `kbf-daemon`, `kbf-server` | carry `auxiliary_metadata`; store series per test and hardware key |
 | front / CAS | model weights as chunked CAS inputs, kept from eviction on nodes that run GPU tests |
 
