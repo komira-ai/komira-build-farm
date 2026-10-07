@@ -1,5 +1,5 @@
 # Items the pure crates (kbf-types, kbf-caps, kbf-segments, kbf-meta, kbf-sched,
-# kbf-estimator) must not use. Those crates deny `clippy::disallowed_methods` and
+# kbf-estimator, kbf-raft) must not use. Those crates deny `clippy::disallowed_methods` and
 # `clippy::disallowed_types` in their lib.rs; every other crate allows them through
 # `[workspace.lints.clippy]` in the root Cargo.toml. Time enters a pure core as an
 # input (farm time from kbf-types), never by reading a clock, so a seed replays exactly.
