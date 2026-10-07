@@ -1,5 +1,6 @@
 //! Execution: the [`Runtime`] trait the lease manager runs work through, and
-//! [`FakeRuntime`], the only implementation until the container driver lands.
+//! [`FakeRuntime`], a runtime that runs nothing. The container driver
+//! (`kbf-driver-container`) implements the same trait.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -7,7 +8,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, Resources};
 use tokio::sync::oneshot;
 
 /// One lease's work, as the server's Start describes it.
@@ -17,6 +18,8 @@ pub struct Work {
     /// The lease kind (`action`, `whole_machine`).
     pub kind: String,
     pub action_digest: Digest,
+    /// What the scheduler booked for the lease here; zero on an axis it did not book.
+    pub resources: Resources,
 }
 
 /// Why work did not produce an action result.
@@ -28,6 +31,13 @@ pub enum RuntimeError {
     /// The runtime could not run the work (an infrastructure failure, not the action's).
     #[error("{0}")]
     Failed(String),
+    /// The action asks for something no node may run (an image named by tag, an output
+    /// path that leaves the working directory): the client's error, not the farm's.
+    #[error("invalid action: {0}")]
+    Invalid(String),
+    /// The action ran past its timeout and was stopped.
+    #[error("timed out")]
+    TimedOut,
 }
 
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it

@@ -32,6 +32,8 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
 reqwest = { version = "0.13.5", default-features = false }
 roxmltree = "0.21.1"
+# Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs.
+rustix = "1.1.5"
 saphyr-parser = "0.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -46,6 +48,7 @@ tracing-subscriber = "0.3.23"
 
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-caps = { path = "crates/kbf-caps" }
+kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
