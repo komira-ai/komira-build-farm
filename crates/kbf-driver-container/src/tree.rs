@@ -41,6 +41,12 @@ pub enum TreeError {
         what: Exceeded,
         limit: u64,
     },
+    /// An output holds a name or symlink target that is not UTF-8, which REAPI cannot
+    /// record: the action fails, the daemon goes on.
+    #[error(
+        "{path}: the action's output has a {what} that is not UTF-8, which REAPI cannot record"
+    )]
+    NotUtf8 { path: PathBuf, what: &'static str },
 }
 
 /// Which of the [`OutputLimits`] an action's outputs passed, and the flag that sets it.
@@ -49,6 +55,8 @@ pub enum Exceeded {
     Depth,
     Entries,
     Bytes,
+    /// The bytes of stdout or of stderr.
+    Stdio,
 }
 
 impl std::fmt::Display for Exceeded {
@@ -57,6 +65,7 @@ impl std::fmt::Display for Exceeded {
             Self::Depth => "directory depth, --output-max-depth",
             Self::Entries => "entries, --output-max-entries",
             Self::Bytes => "file bytes, --output-max-bytes",
+            Self::Stdio => "stdout or stderr bytes, --output-max-stdio-bytes",
         })
     }
 }
@@ -278,7 +287,9 @@ pub async fn refuse_hidden_working_directory(
 ///
 /// All the outputs together stay within `limits` (directory depth, entries, file
 /// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked
-/// without recursion, so no depth of tree can overflow the caller's stack.
+/// without recursion, so no depth of tree can overflow the caller's stack. Each file
+/// is stored through [`Cas::put_file`], one chunk in memory at a time. A name or
+/// symlink target that is not UTF-8 fails the call with [`TreeError::NotUtf8`].
 pub async fn collect(
     cas: &impl Cas,
     upper: &Path,

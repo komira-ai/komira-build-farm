@@ -30,8 +30,9 @@ use tokio::sync::oneshot;
 use crate::cas::Cas;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
-use crate::outputs::OutputLimits;
+use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{ContainerSpec, Podman};
+use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
     refuse_hidden_working_directory, refuse_outputs_in_inputs,
@@ -306,13 +307,12 @@ impl<C: Cas> PodmanRuntime<C> {
         )
         .await
         .map_err(tree_error)?;
+        let max = self.config.outputs.max_stdio_bytes;
         for (path, slot) in [
             (&stdout_path, &mut result.stdout_digest),
             (&stderr_path, &mut result.stderr_digest),
         ] {
-            let bytes = tokio::fs::read(path).await.map_err(|e| failed(path, &e))?;
-            let digest = cas.put(bytes).await.map_err(TreeError::from);
-            *slot = Some(digest.map_err(tree_error)?);
+            *slot = Some(collect_log(cas, path, max).await.map_err(tree_error)?);
         }
         Ok(result)
     }
@@ -493,7 +493,9 @@ impl Lease {
         if let Err(e) = self.cgroup.remove() {
             errors.push(e.to_string());
         }
-        match std::fs::remove_dir_all(&self.dir) {
+        // Not `std::fs::remove_dir_all`: it recurses once per level, and the action
+        // decides how deep its scratch directory is.
+        match remove_tree(&self.dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Files an action wrote as another container user, or with no permissions

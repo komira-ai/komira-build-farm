@@ -10,151 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
 use kbf_types::Resources;
+use support::fake::{Fake, INDEX, MANIFEST, image, image_by, sha256};
 use support::{Spec, blob, exists, store_action, tree, work};
-
-/// The per-architecture manifest every fake image store holds.
-const MANIFEST: &[u8] =
-    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
-/// An image index over it.
-const INDEX: &[u8] =
-    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
-
-fn sha256(bytes: &[u8]) -> String {
-    format!(
-        "sha256:{}",
-        kbf_driver_container::cas::digest_of(bytes).hash
-    )
-}
-
-fn image_by(digest: &str) -> String {
-    format!("docker://registry.test/tools/busybox@{digest}")
-}
-
-fn image() -> String {
-    image_by(&sha256(MANIFEST))
-}
-
-/// One test's fake Podman, fake cgroup mount, scratch directory and runtime.
-struct Fake {
-    dir: PathBuf,
-    state: PathBuf,
-    cgroup: PathBuf,
-    scratch: PathBuf,
-    cas: Arc<MemoryCas>,
-    runtime: Arc<PodmanRuntime<MemoryCas>>,
-}
-
-impl Fake {
-    fn new(name: &str) -> Self {
-        let dir = support::scratch(&format!("fake-{name}"));
-        let state = dir.join("state");
-        let cgroup = dir.join("cgroup");
-        let scratch = dir.join("scratch");
-        for d in [&state, &cgroup.join("actions"), &scratch] {
-            std::fs::create_dir_all(d).expect("mkdir");
-        }
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-podman.sh");
-        // A symlink, not a written script: exec'ing a file this process just wrote can
-        // fail with ETXTBSY while another test thread forks.
-        let program = dir.join("podman");
-        std::os::unix::fs::symlink(&fixture, &program).expect("link podman");
-        std::fs::write(state.join("image-id"), "img1\n").expect("image id");
-        let mut config = PodmanConfig::new(scratch.clone(), "/actions".to_owned());
-        config.podman = program;
-        config.cgroup_root = cgroup.clone();
-        config.default_timeout = Duration::from_secs(60);
-        config.kill_grace = Duration::from_millis(300);
-        let cas = Arc::new(MemoryCas::new());
-        let runtime = Arc::new(PodmanRuntime::new(config, Arc::clone(&cas)).expect("runtime"));
-        let fake = Self {
-            dir,
-            state,
-            cgroup,
-            scratch,
-            cas,
-            runtime,
-        };
-        fake.store_manifest(&sha256(MANIFEST), MANIFEST);
-        fake
-    }
-
-    /// Puts `bytes` in the fake image store as image img1's manifest under `digest`.
-    fn store_manifest(&self, digest: &str, bytes: &[u8]) {
-        let dir = self.state.join("store/fake-images/img1");
-        std::fs::create_dir_all(&dir).expect("mkdir store");
-        let file = kbf_driver_container::image::manifest_file(digest);
-        std::fs::write(dir.join(file), bytes).expect("write manifest");
-    }
-
-    fn knob(&self, name: &str, contents: &str) {
-        std::fs::write(self.state.join(name), contents).expect("write knob");
-    }
-
-    fn calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.state.join("calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// What the fake recorded, in order (see `fixtures/fake-podman.sh`).
-    fn events(&self) -> Vec<String> {
-        std::fs::read_to_string(self.state.join("events"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-
-    fn lease_dir(&self, seq: u64) -> PathBuf {
-        self.scratch.join(format!("kbf-lease-1-{seq}"))
-    }
-
-    fn lease_cgroup(&self, seq: u64) -> PathBuf {
-        self.cgroup.join(format!("actions/kbf-lease-1-{seq}"))
-    }
-
-    /// Asserts the lease left nothing behind.
-    fn assert_clean(&self, seq: u64) {
-        assert!(!exists(&self.lease_dir(seq)), "scratch directory left");
-        assert!(!exists(&self.lease_cgroup(seq)), "lease cgroup left");
-    }
-
-    async fn run(
-        &self,
-        seq: u64,
-        spec: &Spec,
-        script: &str,
-    ) -> Result<kbf_proto::reapi::ActionResult, RuntimeError> {
-        self.knob("action.sh", script);
-        let action = store_action(&self.cas, spec);
-        self.runtime
-            .run(work(seq, action, Resources::new(2000, 1 << 30)))
-            .await
-    }
-
-    async fn wait_for_start(&self) {
-        for _ in 0..500 {
-            if self.state.join("pid").exists() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the action never started");
-    }
-}
-
-impl Drop for Fake {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            support::force_remove(&self.dir);
-        }
-    }
-}
-
 /// Catches each part of a run going missing: inputs not written (or written without
 /// the executable bit), the working directory or output parents not made, outputs,
 /// stdout, stderr or the exit code not collected, the lease's limits not written, and
@@ -645,6 +503,16 @@ async fn unremovable_scratch_falls_back_to_podman_unshare() {
     assert!(fake.calls().contains(&"unshare".to_owned()));
     fake.assert_clean(1);
 
+    // A directory the daemon's user can list but not write: its entries cannot be
+    // unlinked, so this falls back too.
+    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare").count();
+    let before = unshares(&fake);
+    let readonly = r#"mkdir "$UPPER/ro"; touch "$UPPER/ro/f"; chmod 500 "$UPPER/ro""#;
+    let result = fake.run(4, &spec, readonly).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(unshares(&fake), before + 1);
+    fake.assert_clean(4);
+
     // verify-clean: a removal that claims success but leaves the directory is caught.
     fake.knob("unshare-noop", "");
     let outcome = fake.run(2, &spec, script).await;
@@ -976,4 +844,58 @@ async fn a_kill_during_prepare_stops_it_at_once() {
     let outcome = run.await.expect("join");
     assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
     fake.assert_clean(1);
+}
+
+/// Catches the clean step recursing into what the action left behind: a junk tree
+/// 20,000 levels deep that is not an output overflowed `std::fs::remove_dir_all`'s
+/// recursion on a tokio blocking thread (SIGABRT, every lease on the node lost; seen
+/// red: this test binary aborts). The lease succeeds and leaves nothing, and the next
+/// lease on the same runtime runs.
+#[tokio::test]
+async fn a_deep_junk_tree_is_cleaned_without_taking_the_daemon_down() {
+    let fake = Fake::new("deep-junk");
+    let tree = support::scratch("fake-deep-junk-tree");
+    support::deep(&tree, 20_000, b"bottom");
+    let spec = Spec::new(&image(), "unused");
+    let script = format!(r#"mv '{}' "$UPPER/junk""#, tree.display());
+    let result = fake.run(1, &spec, &script).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert!(!exists(&tree), "the junk tree never reached the lease");
+    assert!(!fake.calls().contains(&"unshare".to_owned()));
+    fake.assert_clean(1);
+    let result = fake.run(2, &spec, "exit 0").await.expect("the next lease");
+    assert_eq!(result.exit_code, 0);
+    fake.assert_clean(2);
+}
+
+/// Catches stdout and stderr read with no limit, the limit off by one, or applied to
+/// one stream only: a stdout of exactly `--output-max-stdio-bytes` (three chunks) is
+/// stored whole, and one byte more of stdout, or of stderr, fails the action naming
+/// the flag and the log, with the lease cleaned.
+#[tokio::test]
+async fn stdout_and_stderr_are_stored_within_their_limit() {
+    const MAX: u64 = 3 << 20;
+    let fake = Fake::with("stdio", |config| config.outputs.max_stdio_bytes = MAX);
+    let spec = Spec::new(&image(), "unused");
+    let result = fake
+        .run(1, &spec, &format!("head -c {MAX} /dev/zero"))
+        .await
+        .expect("ran");
+    let stdout = blob(&fake.cas, result.stdout_digest.as_ref());
+    assert!(stdout.len() as u64 == MAX && stdout.iter().all(|&b| b == 0));
+    fake.assert_clean(1);
+    let past = MAX + 1;
+    for (seq, log, script) in [
+        (2, "stdout", format!("head -c {past} /dev/zero")),
+        (3, "stderr", format!("head -c {past} /dev/zero >&2")),
+    ] {
+        let outcome = fake.run(seq, &spec, &script).await;
+        let want = format!("kbf-lease-1-{seq}/{log}: ");
+        assert!(
+            matches!(outcome, Err(RuntimeError::Failed(ref why))
+                if why.contains(&want) && why.contains("--output-max-stdio-bytes")),
+            "{log}: {outcome:?}"
+        );
+        fake.assert_clean(seq);
+    }
 }
