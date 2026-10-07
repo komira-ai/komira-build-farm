@@ -324,7 +324,7 @@ impl Scheduler {
             .get(&lease)
             .is_some_and(|h| h.start_sent.is_some())
         {
-            // MUTANT M1: a lost lease is not counted as an attempt.
+            op.lost_on.push(worker.clone());
             let resources = op.request.resources;
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
@@ -443,7 +443,7 @@ impl Scheduler {
                 .workers
                 .iter()
                 .filter(|(_, w)| w.alive(now) && w.free().fits(request))
-                .min_by_key(|(name, _)| op.lost_on.contains(*name))
+                .min_by_key(|_| false) // MUTANT M2: retry on the worker that lost it.
                 .map(|(name, _)| name.clone());
             if let Some(name) = fit {
                 let w = self.workers.get_mut(&name).expect("found above");
