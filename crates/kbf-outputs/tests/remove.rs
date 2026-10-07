@@ -211,11 +211,10 @@ fn acl(args: &[&str], path: &std::path::Path) {
 #[test]
 fn what_the_action_locked_with_an_acl_goes_too() {
     let base = scratch("acl");
-    std::fs::create_dir(base.join("hostdir")).expect("mkdir");
-    let host = base.join("hostdir/host");
+    let host = base.join("host");
     std::fs::write(&host, b"keep").expect("write");
     acl(&["+a", "everyone deny delete"], &host);
-    acl(&["+a", "everyone deny delete_child"], &base.join("hostdir"));
+    assert!(has_acl(&host), "the host file has its ACL to begin with");
     let lease = base.join("lease");
     std::fs::create_dir_all(lease.join("out/sub")).expect("mkdir");
     std::fs::write(lease.join("out/x"), b"x").expect("write");
@@ -242,10 +241,20 @@ fn what_the_action_locked_with_an_acl_goes_too() {
         std::fs::symlink_metadata(&lease).is_err(),
         "the lease directory is gone"
     );
-    assert!(
-        std::fs::remove_file(&host).is_err(),
-        "the link's target keeps its ACL"
-    );
+    assert!(has_acl(&host), "the link's target keeps its ACL");
     acl(&["-N"], &host);
-    acl(&["-N"], &base.join("hostdir"));
+    assert!(!has_acl(&host), "has_acl sees an ACL removed");
+}
+
+/// Whether `path` carries an ACL entry denying deletion, as `ls -le` lists it (read
+/// directly: whether a delete fails also depends on the parent directory).
+#[cfg(target_os = "macos")]
+fn has_acl(path: &std::path::Path) -> bool {
+    let listed = std::process::Command::new("/bin/ls")
+        .arg("-led")
+        .arg(path)
+        .output()
+        .expect("ls -le");
+    assert!(listed.status.success(), "ls -le {}", path.display());
+    String::from_utf8_lossy(&listed.stdout).contains("deny delete")
 }
