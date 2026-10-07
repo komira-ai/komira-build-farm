@@ -328,8 +328,7 @@ impl Scheduler {
             let resources = op.request.resources;
             self.given_up.insert(lease, GivenUp { worker, resources });
         }
-        if op.lost_on.len() < INFRA_ATTEMPTS - 1 {
-            // MUTANT M3b: fails after 2 lost leases, not 3.
+        if op.lost_on.len() < INFRA_ATTEMPTS {
             self.requeue(id);
             return;
         }
@@ -352,6 +351,10 @@ impl Scheduler {
         let Some(w) = self.workers.get_mut(worker) else {
             return;
         };
+        // MUTANT M4: a late-running given-up lease is not booked.
+        if !w.late.is_empty() || running.len() < usize::MAX {
+            return;
+        }
         let mut freed = Resources::default();
         w.late.retain(|lease, resources| {
             let listed = running.contains(lease);
