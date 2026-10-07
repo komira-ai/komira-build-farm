@@ -283,13 +283,12 @@ impl Scheduler {
             .held
             .iter()
             .filter(|(lease, held)| {
-                let Some(sent) = held.start_sent else {
-                    return false;
-                };
+                // MUTANT M7: a grant whose Start was never sent counts as sent at zero.
+                let sent = held.start_sent.unwrap_or_default();
                 let due = registered || now >= sent.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
                 due && !running.contains(lease)
-                    // MUTANT M6: a lease with a reported result is not kept.
+                    && !op.result_proposed
                     && op.state.holding().is_some_and(|(_, w)| w == worker)
             })
             .map(|(_, held)| held.operation)
