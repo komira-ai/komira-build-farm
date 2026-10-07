@@ -8,6 +8,22 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+clap.workspace = true
+futures.workspace = true
+kbf-caps.workspace = true
+kbf-proto.workspace = true
+kbf-types.workspace = true
+prost.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true
