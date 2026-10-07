@@ -26,6 +26,8 @@ pub const PROMPT: Duration = Duration::from_secs(10);
 pub struct MemoryCas {
     pub blobs: Mutex<BTreeMap<String, Vec<u8>>>,
     pub delay: Option<Duration>,
+    /// Every put fails as an unreachable CAS would.
+    pub refuse_puts: bool,
 }
 
 impl MemoryCas {
@@ -60,6 +62,12 @@ impl Cas for MemoryCas {
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
+        if self.refuse_puts {
+            return Err(CasError::Unavailable(
+                label(&digest_of(&bytes)),
+                "the CAS is down".to_owned(),
+            ));
+        }
         Ok(self.insert(bytes))
     }
 }

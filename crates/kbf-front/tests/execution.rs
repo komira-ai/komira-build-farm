@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use common::{Blob, Farm};
-use kbf_front::{DEFAULT_RESOURCES, Dispatch, Finished, Stage, Submission, Ticket};
+use kbf_front::{DEFAULT_RESOURCES, Dispatch, Finished, GPU_KEY, Stage, Submission, Ticket};
 use kbf_meta::Role;
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc::{self, PreconditionFailure};
@@ -572,6 +572,38 @@ async fn the_lease_kind_comes_from_the_platform() {
         assert_eq!(status.code(), Code::InvalidArgument, "{why}");
     }
     assert_eq!(script.submitted().len(), 3);
+}
+
+/// Catches: a `gpu` property dropped on the way to the scheduler (a GPU action would
+/// be placed on a node without one), GPUs booked for an action that asked for none,
+/// and a `gpu` value that is not a count accepted.
+#[tokio::test]
+async fn the_gpu_count_comes_from_the_platform() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    for (argv, props) in [
+        ("two gpus", vec![(GPU_KEY, "2")]),
+        ("no gpu", vec![("kbf-lease", "action")]),
+    ] {
+        let job = job(argv, &props, false);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect("Execute");
+    }
+    let submitted = script.submitted();
+    assert_eq!(
+        submitted[0].request.resources,
+        DEFAULT_RESOURCES.with_gpus(2)
+    );
+    assert_eq!(submitted[1].request.resources, DEFAULT_RESOURCES);
+    assert_eq!(DEFAULT_RESOURCES.gpus, 0);
+
+    for value in ["one", "-1", ""] {
+        let bad = job(&format!("gpu={value}"), &[(GPU_KEY, value)], false);
+        farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &bad.action).await.expect_err(value);
+        assert_eq!(status.code(), Code::InvalidArgument, "{value:?}");
+    }
+    assert_eq!(script.submitted().len(), 2);
 }
 
 /// Catches: a WaitExecution that does not follow the named operation, or that answers

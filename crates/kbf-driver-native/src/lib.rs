@@ -18,16 +18,22 @@
 //! - on every path, also a normal exit, every process of the action ended before the
 //!   outputs are read: SIGKILL to the group and to each process the tracker knows,
 //!   repeated until a snapshot shows none alive; any that survive fail the lease;
-//! - outputs read with `kbf-outputs` (no symlink followed at any level; depth, entry
-//!   and byte limits; large files streamed to the CAS; UTF-8 names);
-//! - the lease directory removed afterwards (`kbf_outputs::remove_tree`: iterative, by
-//!   descriptor), and its absence checked; a lease directory that stays fails the
-//!   lease, so a dirty node is loud. A run the daemon drops is cleaned by `Drop`.
+//! - outputs, stdout and stderr read with `kbf-outputs`: no symlink followed at any
+//!   level; depth, entry, byte and stdio limits; files of more than a chunk streamed
+//!   to the CAS ([`kbf_daemon::Cas::put_chunks`]); names that are not UTF-8 refused;
+//! - the lease directory removed afterwards (`kbf_outputs::remove_tree`: iterative,
+//!   by descriptor, giving back permissions the action took away); a lease directory
+//!   that stays fails the lease, so a dirty node is loud. A run the daemon drops is
+//!   cleaned by `Drop`.
+//!
+//! The container driver's own output walk is public too, but does not build on macOS;
+//! moving it onto `kbf-outputs` is a follow-up.
 //!
 //! Not yet: a per-lease user (which would make "every process of the action" exact
 //! and keep actions out of each other's files), CPU limits, resource usage in the
 //! result, and network isolation on Linux.
 
+mod cas;
 mod config;
 pub mod network;
 pub mod procs;

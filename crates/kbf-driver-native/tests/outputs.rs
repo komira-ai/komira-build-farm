@@ -5,7 +5,7 @@ mod support;
 
 use std::sync::Arc;
 
-use kbf_daemon::RuntimeError;
+use kbf_daemon::{Runtime, RuntimeError};
 use support::{MemoryCas, Spec, config, no_leases, run, runtime, scratch};
 
 /// Catches: an output read through a symlink the action planted (the working
@@ -70,6 +70,34 @@ async fn outputs_past_a_limit_fail_the_lease() {
     let outcome = run(&rt, &cas, 1, &spec).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("--output-max-bytes")),
+        "{outcome:?}"
+    );
+    assert!(no_leases(&config));
+}
+
+/// Catches: stdout past its limit stored anyway (a runaway log would fill the CAS),
+/// or its limit not named; and an upload failure of the captured output swallowed.
+#[tokio::test]
+async fn stdout_past_its_limit_and_a_failed_upload_fail_the_lease() {
+    let dir = scratch("stdio");
+    let mut config = config(&dir);
+    config.outputs.max_stdio_bytes = 4;
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let outcome = run(&rt, &cas, 1, &Spec::sh("echo too long")).await;
+    assert!(
+        matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("--output-max-stdio-bytes")),
+        "{outcome:?}"
+    );
+    let refusing = Arc::new(MemoryCas {
+        refuse_puts: true,
+        ..MemoryCas::default()
+    });
+    let action = Spec::sh("echo hi").store(&refusing);
+    let rt = runtime(support::config(&dir), &refusing);
+    let outcome = rt.run(support::work(2, action, 0)).await;
+    assert!(
+        matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("the CAS is down")),
         "{outcome:?}"
     );
     assert!(no_leases(&config));

@@ -10,11 +10,11 @@
 //! put is not checked twice here.
 
 use std::future::Future;
-use std::io::Read;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
-use futures::stream;
+use futures::channel::mpsc;
+use futures::{SinkExt as _, Stream, StreamExt as _, stream};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
 use kbf_proto::reapi::Digest;
@@ -38,6 +38,10 @@ pub enum CasError {
     /// The CAS could not be reached or failed the call.
     #[error("CAS call for blob {0} failed: {1}")]
     Unavailable(String, String),
+    /// The bytes of a blob being stored could not be read from where they are (a file
+    /// that shrank, an I/O error).
+    #[error("blob {0} could not be read for storing: {1}")]
+    Read(String, String),
 }
 
 /// A content-addressed blob store, SHA-256 only.
@@ -48,21 +52,25 @@ pub trait Cas: Send + Sync + 'static {
     /// Stores `bytes` and returns their digest once they are durable.
     fn put(&self, bytes: Vec<u8>) -> impl Future<Output = Result<Digest, CasError>> + Send;
 
-    /// Stores the bytes of `file`, from its current offset to its end, which hash to
-    /// `digest`; returns the digest once they are durable. For outputs too large to
-    /// hold in memory: [`CasClient`] streams the file in [`WRITE_CHUNK_BYTES`]
-    /// messages, and the front checks the bytes against `digest`. This default reads
-    /// the file whole, calls [`Cas::put`] and checks the digest itself.
-    fn put_file(
+    /// Stores the blob `digest` names, whose bytes arrive in `chunks`, and returns the
+    /// digest once they are durable: for files too large to hold in memory. A chunk
+    /// that fails to be read ends the upload with [`CasError::Read`]. [`CasClient`]
+    /// streams the chunks, at most [`WRITE_CHUNK_BYTES`] per message, and the front
+    /// checks the bytes against `digest`; this default gathers them, calls
+    /// [`Cas::put`] and checks the digest itself.
+    fn put_chunks(
         &self,
-        file: std::fs::File,
         digest: Digest,
+        chunks: Chunks,
     ) -> impl Future<Output = Result<Digest, CasError>> + Send {
         async move {
             let blob = label(&digest);
-            let bytes = read_whole(file)
-                .await
-                .map_err(|e| CasError::Unavailable(blob.clone(), format!("read: {e}")))?;
+            let mut bytes = Vec::new();
+            let mut chunks = chunks;
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|e| CasError::Read(blob.clone(), e.to_string()))?;
+                bytes.extend_from_slice(&chunk);
+            }
             let stored = self.put(bytes).await?;
             if stored != digest {
                 return Err(CasError::Corrupt(blob, label(&stored)));
@@ -72,30 +80,8 @@ pub trait Cas: Send + Sync + 'static {
     }
 }
 
-/// The rest of `file`, read on the blocking pool.
-async fn read_whole(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
-    tokio::task::spawn_blocking(move || {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map(|_| bytes)
-    })
-    .await
-    .map_err(std::io::Error::other)?
-}
-
-/// Up to `max` more bytes of `file`, read on the blocking pool; the file comes back
-/// with them.
-async fn read_chunk(
-    mut file: std::fs::File,
-    max: u64,
-) -> std::io::Result<(std::fs::File, Vec<u8>)> {
-    tokio::task::spawn_blocking(move || {
-        let mut chunk = Vec::new();
-        (&mut file).take(max).read_to_end(&mut chunk)?;
-        Ok((file, chunk))
-    })
-    .await
-    .map_err(std::io::Error::other)?
-}
+/// A blob's bytes on their way to [`Cas::put_chunks`], one chunk at a time.
+pub type Chunks = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
 
 /// The SHA-256 digest of `bytes`.
 #[must_use]
@@ -213,54 +199,79 @@ impl Cas for CasClient {
         committed(&digest, response.committed_size)
     }
 
-    async fn put_file(&self, file: std::fs::File, digest: Digest) -> Result<Digest, CasError> {
+    async fn put_chunks(&self, digest: Digest, chunks: Chunks) -> Result<Digest, CasError> {
         let name = self.upload_name(&digest);
-        let size = digest.size_bytes;
-        // A read that fails ends the stream early; its error is reported over the
-        // front's complaint about the short write.
-        let read_error = Arc::new(Mutex::new(None));
-        let failed = Arc::clone(&read_error);
-        // Each message's chunk is read as the stream is polled, so at most one chunk
-        // is in memory. The first message names the resource; the last finishes the
-        // write once `size` bytes are sent, or at the end of the file.
-        let requests = stream::unfold(Some((file, 0_i64)), move |state| {
-            let name = name.clone();
-            let failed = Arc::clone(&failed);
-            async move {
-                let (file, offset) = state?;
-                let want = (size - offset).clamp(0, WRITE_CHUNK_BYTES as i64);
-                let (file, data) = match read_chunk(file, want.unsigned_abs()).await {
-                    Ok(read) => read,
-                    Err(e) => {
-                        *failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
-                        return None;
-                    }
-                };
-                let next = offset + data.len() as i64;
-                let finish = next >= size || (data.len() as i64) < want;
-                let request = WriteRequest {
-                    resource_name: if offset == 0 { name } else { String::new() },
-                    write_offset: offset,
-                    finish_write: finish,
-                    data,
-                };
-                Some((request, (!finish).then_some((file, next))))
-            }
-        });
+        // A task reads the chunks and hands the requests over a channel that holds
+        // one, so a chunk or two is in memory at a time.
+        let (requests, upload) = mpsc::channel(1);
+        let feeder = tokio::spawn(feed(name, digest.size_bytes, chunks, requests));
         let mut client = self.bytestream.clone();
-        let response = client.write(requests).await;
-        if let Some(e) = read_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            return Err(CasError::Unavailable(label(&digest), format!("read: {e}")));
+        let response = client.write(upload).await;
+        // A chunk that could not be read ends the upload short; that is the error to
+        // report, over the front's complaint about the short write.
+        let fed = feeder
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        if let Err(e) = fed {
+            return Err(CasError::Read(label(&digest), e.to_string()));
         }
         let response = response
             .map_err(|status| call_error(&digest, &status))?
             .into_inner();
         committed(&digest, response.committed_size)
     }
+}
+
+/// Sends the WriteRequests that upload `chunks` as the blob `name`, `size` bytes long,
+/// none carrying more than [`WRITE_CHUNK_BYTES`]. The first names the resource; the
+/// one that reaches `size` bytes, or an empty one sent when the chunks end short of
+/// it, finishes the write. A chunk that cannot be read stops it with that error; an
+/// upload that stopped listening (the front refused it) stops it quietly.
+async fn feed(
+    name: String,
+    size: i64,
+    chunks: Chunks,
+    mut requests: mpsc::Sender<WriteRequest>,
+) -> std::io::Result<()> {
+    let mut pieces = chunks.flat_map(split);
+    let mut offset = 0_i64;
+    loop {
+        let data = if offset >= size {
+            Vec::new()
+        } else {
+            pieces.next().await.transpose()?.unwrap_or_default()
+        };
+        let next = offset + data.len() as i64;
+        let finish = next >= size || data.is_empty();
+        let request = WriteRequest {
+            resource_name: if offset == 0 {
+                name.clone()
+            } else {
+                String::new()
+            },
+            write_offset: offset,
+            finish_write: finish,
+            data,
+        };
+        if requests.send(request).await.is_err() || finish {
+            return Ok(());
+        }
+        offset = next;
+    }
+}
+
+/// `chunk` in pieces of at most [`WRITE_CHUNK_BYTES`]; an error stays one item.
+fn split(
+    chunk: std::io::Result<Vec<u8>>,
+) -> stream::Iter<std::vec::IntoIter<std::io::Result<Vec<u8>>>> {
+    let pieces: Vec<std::io::Result<Vec<u8>>> = match chunk {
+        Ok(bytes) => bytes
+            .chunks(WRITE_CHUNK_BYTES)
+            .map(|piece| Ok(piece.to_vec()))
+            .collect(),
+        Err(e) => vec![Err(e)],
+    };
+    stream::iter(pieces)
 }
 
 /// `digest` if the CAS committed all of its bytes.

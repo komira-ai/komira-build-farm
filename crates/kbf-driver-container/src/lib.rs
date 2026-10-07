@@ -12,17 +12,21 @@
 //! - a lease cgroup under the daemon's delegated `actions/` cgroup, with
 //!   `memory.high` = reservation x 1.5 + 512 MiB, swap allowed, no per-lease hard cap,
 //!   `cpu.weight` from the booked CPU, and `memory.oom.group=1` on the container;
-//! - a wall-clock timeout, stdout and stderr captured into the CAS, the exit code from
-//!   Podman's record, and a kernel OOM kill (exit 137 plus `oom_kill` in the lease
-//!   cgroup's `memory.events`) reported as an infrastructure failure;
+//! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
+//!   `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
+//!   kill (exit 137 plus `oom_kill` in the lease cgroup's `memory.events`) reported as
+//!   an infrastructure failure;
+//! - outputs, stdout and stderr stored one [`CHUNK`] at a time ([`FileBlob`]), never
+//!   read into memory whole;
 //! - cleanup on every path: the container, the lease cgroup and the scratch directory
 //!   are removed after success, failure, timeout, kill, and when the daemon drops the
-//!   run.
+//!   run. The scratch directory is removed by a walk without recursion, so no depth of
+//!   tree the action leaves can overflow the clean step's stack.
 //!
 //! Modules:
 //! - [`image`]: the `container-image` property;
-//! - [`cas`]: the [`Cas`] trait the driver reads and writes blobs through, and
-//!   [`MemoryCas`];
+//! - [`cas`]: the [`Cas`] trait the driver reads and writes blobs through,
+//!   [`FileBlob`] and [`MemoryCas`];
 //! - [`tree`]: writing an input root and reading outputs back;
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
@@ -35,10 +39,11 @@ mod cgroup;
 pub mod image;
 mod outputs;
 mod podman;
+mod remove;
 mod runtime;
 pub mod tree;
 
-pub use cas::{Cas, CasError, MemoryCas};
+pub use cas::{CHUNK, Cas, CasError, FileBlob, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;

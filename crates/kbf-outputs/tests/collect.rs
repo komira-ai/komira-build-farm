@@ -282,6 +282,7 @@ async fn each_limit_holds_exactly() {
         max_depth,
         max_entries,
         max_bytes,
+        max_stdio_bytes: u64::MAX,
     };
     let big = u64::MAX;
 
@@ -494,11 +495,11 @@ async fn store_file_stores_small_and_large_files() {
     std::fs::write(dir.join("small"), b"out").expect("write");
     std::fs::write(dir.join("large"), &large).expect("write");
     let store = MemoryStore::default();
-    let small = kbf_outputs::store_file(&store, &dir.join("small"))
+    let small = kbf_outputs::store_file(&store, &dir.join("small"), 3)
         .await
         .expect("small");
     assert_eq!(store.get(&small), b"out");
-    let big = kbf_outputs::store_file(&store, &dir.join("large"))
+    let big = kbf_outputs::store_file(&store, &dir.join("large"), u64::MAX)
         .await
         .expect("large");
     assert_eq!(big, digest_of(&large));
@@ -506,11 +507,25 @@ async fn store_file_stores_small_and_large_files() {
         *store.files.lock().unwrap_or_else(PoisonError::into_inner),
         1
     );
-    let missing = kbf_outputs::store_file(&store, &dir.join("absent")).await;
+    let why = kbf_outputs::store_file(&store, &dir.join("small"), 2)
+        .await
+        .expect_err("past the limit");
+    assert!(
+        matches!(
+            why,
+            OutputsError::Limit {
+                what: Exceeded::Stdio,
+                limit: 2,
+                ..
+            }
+        ),
+        "{why}"
+    );
+    let missing = kbf_outputs::store_file(&store, &dir.join("absent"), u64::MAX).await;
     assert!(
         matches!(missing, Err(OutputsError::Io { .. })),
         "{missing:?}"
     );
-    let root = kbf_outputs::store_file(&store, Path::new("/")).await;
+    let root = kbf_outputs::store_file(&store, Path::new("/"), u64::MAX).await;
     assert!(matches!(root, Err(OutputsError::Invalid(_))), "{root:?}");
 }

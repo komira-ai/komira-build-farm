@@ -7,15 +7,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::stream;
-use kbf_daemon::cas::{Cas, CasClient, CasError, WRITE_CHUNK_BYTES, digest_of, fetch, label};
+use kbf_daemon::cas::{
+    Cas, CasClient, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, fetch, label,
+};
 use kbf_front::Cache;
 use kbf_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
 use kbf_proto::google::bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
     WriteResponse,
 };
+use kbf_proto::reapi::Digest;
 use support::memory::MemoryCas;
-use support::scratch;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Channel, Endpoint, Server};
@@ -165,92 +167,97 @@ async fn broken_calls_are_unavailable() {
     assert_eq!(status.code(), tonic::Code::Unimplemented);
 }
 
-/// A file of `len` patterned bytes in `dir`, opened for reading, and its digest.
-fn file_of(
-    dir: &std::path::Path,
-    name: &str,
-    len: usize,
-) -> (std::fs::File, kbf_proto::reapi::Digest) {
+/// `len` patterned bytes, their digest, and the same bytes as a stream of chunks of
+/// at most `chunk` bytes.
+fn chunked(len: usize, chunk: usize) -> (Vec<u8>, Digest, Chunks) {
     let bytes: Vec<u8> = (0..len).map(|i| (i % 239) as u8).collect();
-    let path = dir.join(name);
-    std::fs::write(&path, &bytes).expect("write");
-    (std::fs::File::open(&path).expect("open"), digest_of(&bytes))
+    let pieces: Vec<std::io::Result<Vec<u8>>> =
+        bytes.chunks(chunk.max(1)).map(|c| Ok(c.to_vec())).collect();
+    let digest = digest_of(&bytes);
+    (bytes, digest, Box::pin(stream::iter(pieces)))
+}
+
+/// A stream that yields `first`, then fails.
+fn failing(first: &[u8]) -> Chunks {
+    Box::pin(stream::iter(vec![
+        Ok(first.to_vec()),
+        Err(std::io::Error::other("disk gone")),
+    ]))
 }
 
 /// Catches a streamed upload that loses, repeats or reorders bytes across message
-/// boundaries (a file of several chunks, one of exactly one chunk, an empty one), and
-/// a file shorter than its digest says, or not readable, taken as stored.
+/// boundaries (chunks smaller than, equal to and larger than a message, and an empty
+/// blob); and a stream shorter than its digest says, or one that fails, taken as
+/// stored.
 #[tokio::test]
-async fn files_stream_through_the_front_in_chunks() {
+async fn chunks_stream_through_the_front() {
     let cas = front().await;
-    let dir = scratch("put-file");
-    for (name, len) in [
-        ("big", 2 * WRITE_CHUNK_BYTES + 12_345),
-        ("one", WRITE_CHUNK_BYTES),
-        ("empty", 0),
+    for (len, chunk) in [
+        (2 * WRITE_CHUNK_BYTES + 12_345, 1000),
+        (WRITE_CHUNK_BYTES, WRITE_CHUNK_BYTES),
+        (3 * WRITE_CHUNK_BYTES + 7, 3 * WRITE_CHUNK_BYTES + 7),
+        (0, 1),
     ] {
-        let (file, digest) = file_of(&dir, name, len);
-        assert_eq!(
-            cas.put_file(file, digest.clone()).await.expect(name),
-            digest
-        );
-        let bytes = fetch(&cas, &digest).await.expect("fetch");
-        assert_eq!(bytes.len(), len, "{name}");
+        let (bytes, digest, chunks) = chunked(len, chunk);
+        let stored = cas.put_chunks(digest.clone(), chunks).await;
+        assert_eq!(stored.as_ref(), Ok(&digest), "{len} in chunks of {chunk}");
+        assert_eq!(fetch(&cas, &digest).await.expect("fetch"), bytes);
     }
-    // A digest that claims more bytes than the file holds: the front sees a short
-    // write and refuses it.
-    let (file, mut digest) = file_of(&dir, "short", 10);
+    // The stream ends 10 bytes short of the digest: the front refuses the write.
+    let (_, mut digest, chunks) = chunked(10, 4);
     digest.size_bytes = 20;
-    assert!(cas.put_file(file, digest).await.is_err());
-    // A file opened for writing only cannot be read.
-    let unreadable = std::fs::File::create(dir.join("write-only")).expect("create");
+    assert!(cas.put_chunks(digest, chunks).await.is_err());
+    // A chunk that cannot be read.
     let error = cas
-        .put_file(unreadable, digest_of(b"x"))
+        .put_chunks(digest_of(b"abcdef"), failing(b"abc"))
         .await
         .expect_err("unreadable");
     assert!(
-        matches!(&error, CasError::Unavailable(_, why) if why.starts_with("read: ")),
+        matches!(&error, CasError::Read(_, why) if why == "disk gone"),
         "{error:?}"
     );
     // A CAS that commits less than was sent.
     let liar = CasClient::new(serve(Routes::new(ByteStreamServer::new(Liar))).await);
-    let (file, digest) = file_of(&dir, "liar", 5);
-    let error = liar.put_file(file, digest).await.expect_err("short commit");
+    let (_, digest, chunks) = chunked(5, 2);
+    let error = liar
+        .put_chunks(digest, chunks)
+        .await
+        .expect_err("short commit");
     assert!(
         matches!(&error, CasError::Unavailable(_, why) if why.contains("committed 1 bytes of 5")),
         "{error:?}"
     );
 }
 
-/// Catches the trait's default `put_file` storing other bytes than the file's, taking
-/// a digest that does not match as stored, or an unreadable file as empty.
+/// Catches the trait's default `put_chunks` storing other bytes than the chunks',
+/// taking a digest that does not match as stored, or a failed chunk as the end.
 #[tokio::test]
-async fn the_default_put_file_reads_the_file_and_checks_its_digest() {
+async fn the_default_put_chunks_gathers_and_checks_its_digest() {
     let cas = MemoryCas::default();
-    let dir = scratch("default-put-file");
-    let (file, digest) = file_of(&dir, "f", 3000);
+    let (bytes, digest, chunks) = chunked(3000, 700);
     assert_eq!(
-        cas.put_file(file, digest.clone()).await.expect("stored"),
-        digest
+        cas.put_chunks(digest.clone(), chunks).await,
+        Ok(digest.clone())
     );
-    assert_eq!(cas.blob(&digest).map(|b| b.len()), Some(3000));
-    let (file, _) = file_of(&dir, "g", 10);
+    assert_eq!(cas.blob(&digest), Some(bytes));
+    let (_, _, chunks) = chunked(10, 3);
     let wrong = digest_of(b"something else");
     let error = cas
-        .put_file(file, wrong.clone())
+        .put_chunks(wrong.clone(), chunks)
         .await
         .expect_err("mismatch");
     assert!(
         matches!(&error, CasError::Corrupt(blob, _) if *blob == label(&wrong)),
         "{error:?}"
     );
-    let unreadable = std::fs::File::create(dir.join("write-only")).expect("create");
     let error = cas
-        .put_file(unreadable, wrong)
+        .put_chunks(wrong, failing(b"x"))
         .await
         .expect_err("unreadable");
+    assert!(matches!(&error, CasError::Read(..)), "{error:?}");
     assert!(
-        matches!(&error, CasError::Unavailable(_, why) if why.starts_with("read: ")),
-        "{error:?}"
+        error
+            .to_string()
+            .contains("could not be read for storing: disk gone")
     );
 }

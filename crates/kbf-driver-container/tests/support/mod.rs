@@ -3,6 +3,8 @@
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
+pub mod fake;
+
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -200,7 +202,19 @@ pub fn force_remove(dir: &Path) {
             }
         }
     }
-    std::fs::remove_dir_all(dir).expect("remove scratch");
+    // `rm`, not `std::fs::remove_dir_all`: that recurses once per level, and a test
+    // that failed may leave a tree tens of thousands of levels deep.
+    let status = std::process::Command::new("rm")
+        .arg("-rf")
+        .arg("--")
+        .arg(dir)
+        .status()
+        .expect("run rm");
+    assert!(
+        status.success(),
+        "remove scratch {}: {status}",
+        dir.display()
+    );
 }
 
 /// Makes `levels` directories nested in `dir` (`d/d/.../d`), with the file `f` holding

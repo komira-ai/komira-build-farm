@@ -477,11 +477,13 @@ pub async fn collect(
 /// Stores the regular file at `path` (a file the driver made, such as captured
 /// stdout; its last component is not followed) and returns its digest: read whole if
 /// it is at most [`CHUNK_BYTES`], hashed in chunks and handed to [`Store::put_file`]
-/// if larger.
+/// if larger. A file of more than `max` bytes fails with [`OutputsError::Limit`]
+/// ([`Exceeded::Stdio`]) once `max + 1` bytes are read.
 ///
 /// # Errors
-/// The file cannot be opened or read, is not a regular file, or the store fails.
-pub async fn store_file(store: &impl Store, path: &Path) -> Result<Digest, OutputsError> {
+/// The file cannot be opened or read, is not a regular file, holds more than `max`
+/// bytes, or the store fails.
+pub async fn store_file(store: &impl Store, path: &Path, max: u64) -> Result<Digest, OutputsError> {
     let (dir, name) = match (path.parent(), path.file_name()) {
         (Some(dir), Some(name)) => (dir.to_owned(), name.to_owned()),
         _ => {
@@ -493,10 +495,10 @@ pub async fn store_file(store: &impl Store, path: &Path) -> Result<Digest, Outpu
     };
     let read = blocking(path, move || {
         let dir = rustix::fs::openat(CWD, &dir, DIRECTORY, Mode::empty())?;
-        read_file(&dir, &name, u64::MAX)
+        read_file(&dir, &name, max)
     })
     .await?;
-    let (blob, _) = read.ok_or_else(|| limit(path, Exceeded::Bytes, u64::MAX))?;
+    let (blob, _) = read.ok_or_else(|| limit(path, Exceeded::Stdio, max))?;
     blob.store(store, path).await
 }
 

@@ -13,14 +13,15 @@ use kbf_daemon::tree::{
     TreeError, check_relative, fetch_message, materialize, output_paths, real_dirs,
 };
 use kbf_daemon::{Runtime, RuntimeError, Work};
-use kbf_outputs::{OutputsError, Store, StoreError};
-use kbf_proto::reapi::{Action, ActionResult, Command, Digest, ExecutedActionMetadata};
+use kbf_outputs::OutputsError;
+use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::cas::CasStore;
 use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
@@ -265,7 +266,7 @@ impl<C: Cas> NativeRuntime<C> {
         clock.execution_completed_timestamp = now();
 
         clock.output_upload_start_timestamp = now();
-        let store = CasStore(&*self.cas);
+        let store = CasStore(Arc::clone(&self.cas));
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
@@ -281,16 +282,14 @@ impl<C: Cas> NativeRuntime<C> {
         )
         .await
         .map_err(outputs_error)?;
-        result.stdout_digest = Some(
-            kbf_outputs::store_file(&store, &dir.join("stdout"))
-                .await
-                .map_err(outputs_error)?,
-        );
-        result.stderr_digest = Some(
-            kbf_outputs::store_file(&store, &dir.join("stderr"))
-                .await
-                .map_err(outputs_error)?,
-        );
+        let max = self.config.outputs.max_stdio_bytes;
+        for (name, slot) in [
+            ("stdout", &mut result.stdout_digest),
+            ("stderr", &mut result.stderr_digest),
+        ] {
+            let stored = kbf_outputs::store_file(&store, &dir.join(name), max).await;
+            *slot = Some(stored.map_err(outputs_error)?);
+        }
         clock.output_upload_completed_timestamp = now();
         clock.worker_completed_timestamp = now();
         result.execution_metadata = Some(clock);
@@ -530,19 +529,6 @@ impl<C> Drop for Registered<'_, C> {
     }
 }
 
-/// The daemon's CAS as the store outputs are written to.
-struct CasStore<'a, C>(&'a C);
-
-impl<C: Cas> Store for CasStore<'_, C> {
-    async fn put(&self, bytes: Vec<u8>) -> Result<Digest, StoreError> {
-        Ok(self.0.put(bytes).await?)
-    }
-
-    async fn put_file(&self, file: std::fs::File, digest: Digest) -> Result<Digest, StoreError> {
-        Ok(self.0.put_file(file, digest).await?)
-    }
-}
-
 fn now() -> Option<Timestamp> {
     Some(Timestamp::from(SystemTime::now()))
 }
@@ -572,9 +558,10 @@ fn tree_error(error: TreeError) -> RuntimeError {
     }
 }
 
-/// An [`OutputsError`] as the lease reports it: a bad path or name is the action's
-/// error; a limit, a failed read or a failed upload is the farm's (as the container
-/// driver reports them).
+/// An [`OutputsError`] as the lease reports it: a bad output path or a name that is
+/// not UTF-8 is the action's error (running it again would fail the same way); a
+/// limit, a failed read or a failed upload fails the lease, as the container driver
+/// reports them.
 fn outputs_error(error: OutputsError) -> RuntimeError {
     match error {
         OutputsError::Invalid(why) => RuntimeError::Invalid(why),
@@ -619,27 +606,32 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 128 + 9);
     }
 
-    /// Catches errors reported as the wrong party's: a missing blob or a bad name is
-    /// the client's, anything else the farm's.
+    /// Catches errors reported as the wrong party's: a missing input or a bad path is
+    /// the client's, anything else the farm's. (Compared as text: a pattern guard here
+    /// would be a branch the coverage ratchet counts and no run takes.)
     #[test]
     fn errors_are_reported_as_whose_they_are() {
+        let shown = |e: RuntimeError| format!("{e:?}");
         let missing = tree_error(TreeError::Cas(CasError::Missing("ab/1".to_owned())));
-        assert!(matches!(missing, RuntimeError::MissingBlob(b) if b == "ab/1"));
+        assert_eq!(shown(missing), "MissingBlob(\"ab/1\")");
         let corrupt = tree_error(TreeError::Cas(CasError::Corrupt("a".into(), "b".into())));
-        assert!(matches!(corrupt, RuntimeError::Failed(_)));
-        assert!(matches!(
-            tree_error(TreeError::Invalid("x".into())),
-            RuntimeError::Invalid(_)
-        ));
-        assert!(matches!(
-            outputs_error(OutputsError::Invalid("x".into())),
-            RuntimeError::Invalid(_)
-        ));
+        assert_eq!(
+            shown(corrupt),
+            "Failed(\"blob a failed verification: its bytes hash to b\")"
+        );
+        assert_eq!(
+            shown(tree_error(TreeError::Invalid("x".into()))),
+            "Invalid(\"x\")"
+        );
+        assert_eq!(
+            shown(outputs_error(OutputsError::Invalid("y".into()))),
+            "Invalid(\"y\")"
+        );
         let io = OutputsError::Io {
             path: PathBuf::from("p"),
             source: std::io::Error::other("disk"),
         };
-        assert!(matches!(outputs_error(io), RuntimeError::Failed(m) if m == "p: disk"));
+        assert_eq!(shown(outputs_error(io)), "Failed(\"p: disk\")");
     }
 
     /// Catches a spawn that gives up at once on a program still open for writing (a

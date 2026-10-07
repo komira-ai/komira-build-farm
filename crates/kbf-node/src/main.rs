@@ -180,13 +180,16 @@ fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
 mod container {
     use std::sync::Arc;
 
-    use kbf_daemon::{Cas as _, CasClient};
-    use kbf_driver_container::{Cas, CasError, OutputLimits, PodmanConfig, PodmanRuntime};
+    use futures::stream;
+    use kbf_daemon::cas::Chunks;
+    use kbf_driver_container::{
+        Cas, CasError, FileBlob, OutputLimits, PodmanConfig, PodmanRuntime,
+    };
     use kbf_proto::reapi::Digest;
 
     use super::{Cli, Error, cas_client, scratch, serve};
 
-    /// Builds the container driver and serves with it.
+    /// Builds the container driver, over the daemon's CAS client, and serves with it.
     pub(super) fn start(cli: &Cli, tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
         let parent = cli
             .cgroup_parent
@@ -197,16 +200,19 @@ mod container {
             max_depth: cli.outputs.max_depth,
             max_entries: cli.outputs.max_entries,
             max_bytes: cli.outputs.max_bytes,
+            max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
-        let runtime = PodmanRuntime::new(config, Arc::new(ContainerCas(cas_client(cli)?)))?;
+        let cas = ContainerCas(cas_client(cli)?);
+        let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
         serve(cli, tokio, Arc::new(runtime), [])
     }
 
     /// The daemon's CAS client behind the container driver's own `Cas` trait, until
-    /// that driver moves onto the daemon's (a follow-up).
-    pub(super) struct ContainerCas(pub(super) CasClient);
+    /// that driver moves onto the daemon's (a follow-up). A file's chunks go to
+    /// `put_chunks` as the container driver's `FileBlob` reads them.
+    pub(super) struct ContainerCas<C>(pub(super) C);
 
-    impl Cas for ContainerCas {
+    impl<C: kbf_daemon::Cas> Cas for ContainerCas<C> {
         async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
             self.0.get(digest).await.map_err(convert)
         }
@@ -214,18 +220,132 @@ mod container {
         async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
             self.0.put(bytes).await.map_err(convert)
         }
+
+        async fn put_file(&self, blob: FileBlob) -> Result<Digest, CasError> {
+            let digest = blob.digest().clone();
+            let chunks: Chunks = Box::pin(stream::unfold(Some(blob), |state| async move {
+                let mut blob = state?;
+                match blob.next_chunk().await {
+                    Ok(Some(chunk)) => Some((Ok(chunk), Some(blob))),
+                    Ok(None) => None,
+                    Err(e) => Some((Err(e), None)),
+                }
+            }));
+            self.0.put_chunks(digest, chunks).await.map_err(convert)
+        }
     }
 
-    /// The daemon's CAS error as the container driver's. That driver has no
-    /// "unreachable": it reports every CAS error as a failed lease, so an outage is
-    /// named in a missing-blob message.
+    /// The daemon's CAS error as the container driver's. That driver has no "the CAS
+    /// failed the call" (it fails the lease on any CAS error), so an outage is named
+    /// in a missing-blob message; the other kinds keep their meaning.
     pub(super) fn convert(error: kbf_daemon::CasError) -> CasError {
         match error {
             kbf_daemon::CasError::Missing(blob) => CasError::Missing(blob),
             kbf_daemon::CasError::Corrupt(blob, actual) => CasError::Corrupt(blob, actual),
+            kbf_daemon::CasError::Read(blob, why) => CasError::Read(blob, why),
             kbf_daemon::CasError::Unavailable(blob, why) => {
                 CasError::Missing(format!("{blob} (the CAS call failed: {why})"))
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Catches a CAS outage reported to the container driver as a corrupt blob, or
+        /// its reason lost; and the other kinds changing on the way.
+        #[test]
+        fn errors_keep_their_meaning() {
+            use kbf_daemon::CasError as Daemon;
+            let pairs = [
+                (
+                    Daemon::Missing("a/1".into()),
+                    CasError::Missing("a/1".into()),
+                ),
+                (
+                    Daemon::Corrupt("a/1".into(), "b/1".into()),
+                    CasError::Corrupt("a/1".into(), "b/1".into()),
+                ),
+                (
+                    Daemon::Read("a/1".into(), "eof".into()),
+                    CasError::Read("a/1".into(), "eof".into()),
+                ),
+                (
+                    Daemon::Unavailable("a/1".into(), "down".into()),
+                    CasError::Missing("a/1 (the CAS call failed: down)".into()),
+                ),
+            ];
+            for (daemon, container) in pairs {
+                assert_eq!(convert(daemon), container);
+            }
+        }
+
+        /// One blob in memory, stored through the daemon's default `put_chunks`.
+        #[derive(Default)]
+        struct OneBlob(std::sync::Mutex<Vec<u8>>);
+
+        impl kbf_daemon::Cas for OneBlob {
+            async fn get(&self, _: &Digest) -> Result<Vec<u8>, kbf_daemon::CasError> {
+                Ok(self.0.lock().expect("lock").clone())
+            }
+
+            async fn put(&self, bytes: Vec<u8>) -> Result<Digest, kbf_daemon::CasError> {
+                let digest = kbf_daemon::cas::digest_of(&bytes);
+                *self.0.lock().expect("lock") = bytes;
+                Ok(digest)
+            }
+        }
+
+        /// Catches a file stored through the adapter with bytes lost or reordered
+        /// across chunks, a get or put not reaching the daemon's CAS, and a file that
+        /// shrank after it was hashed taken as stored rather than failing as a read.
+        #[tokio::test]
+        async fn files_go_through_in_chunks_and_a_shrunk_file_fails() {
+            let dir = std::env::current_exe()
+                .expect("test binary")
+                .parent()
+                .expect("deps")
+                .join("kbf-node-unit");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let path = dir.join(format!("blob-{}", std::process::id()));
+            let bytes: Vec<u8> = (0..(2 * kbf_driver_container::CHUNK + 3))
+                .map(|i| (i % 251) as u8)
+                .collect();
+            std::fs::write(&path, &bytes).expect("write");
+            let cas = ContainerCas(OneBlob::default());
+            let open = || std::fs::File::open(&path).expect("open");
+            let blob = FileBlob::hash(open(), u64::MAX)
+                .expect("hash")
+                .expect("fits");
+            let digest = cas.put_file(blob).await.expect("stored");
+            assert_eq!(digest, kbf_daemon::cas::digest_of(&bytes));
+            assert_eq!(cas.get(&digest).await.expect("get"), bytes);
+            assert_eq!(cas.put(b"x".to_vec()).await.expect("put").size_bytes, 1);
+
+            let blob = FileBlob::hash(open(), u64::MAX)
+                .expect("hash")
+                .expect("fits");
+            std::fs::File::create(&path).expect("truncate");
+            let error = cas.put_file(blob).await.expect_err("shrunk");
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&CasError::Read(String::new(), String::new())),
+                "{error:?}"
+            );
+            std::fs::remove_file(&path).expect("remove");
+        }
+
+        /// Catches the daemon's client not reached by the adapter (an unreachable
+        /// front must surface as the converted outage).
+        #[tokio::test]
+        async fn the_daemons_client_is_reached() {
+            let channel =
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+            let cas = ContainerCas(kbf_daemon::CasClient::new(channel));
+            let digest = kbf_daemon::cas::digest_of(b"x");
+            let got = cas.get(&digest).await.expect_err("unreachable");
+            assert!(got.to_string().contains("CAS call failed"), "{got}");
         }
     }
 }
@@ -299,51 +419,5 @@ mod tests {
         // https reads the daemon's TLS files, which these flags name but do not hold.
         let https = parse(&["--driver=native", "--cas=https://front:8980"]).expect("flags");
         assert!(cas_client(&https).is_err());
-    }
-
-    /// Catches: a CAS outage reported to the container driver as a corrupt blob, or
-    /// its reason lost; and a missing or corrupt blob changing kind on the way.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn container_cas_errors_keep_their_meaning() {
-        use kbf_driver_container::CasError;
-        assert_eq!(
-            container::convert(kbf_daemon::CasError::Missing("a/1".into())),
-            CasError::Missing("a/1".into())
-        );
-        assert_eq!(
-            container::convert(kbf_daemon::CasError::Corrupt("a/1".into(), "b/1".into())),
-            CasError::Corrupt("a/1".into(), "b/1".into())
-        );
-        let outage = container::convert(kbf_daemon::CasError::Unavailable(
-            "a/1".into(),
-            "down".into(),
-        ));
-        assert_eq!(
-            outage,
-            CasError::Missing("a/1 (the CAS call failed: down)".into())
-        );
-    }
-
-    /// Catches: the adapter not reaching the daemon's client, or an outage on either
-    /// call surfacing as anything but the converted error.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn the_container_cas_calls_the_daemons_client() {
-        use kbf_driver_container::{Cas as _, CasError};
-        // A port nothing listens on.
-        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let cas = container::ContainerCas(CasClient::new(channel));
-        let digest = kbf_daemon::cas::digest_of(b"x");
-        let got = cas.get(&digest).await;
-        assert!(
-            matches!(&got, Err(CasError::Missing(m)) if m.contains("CAS call failed")),
-            "{got:?}"
-        );
-        let put = cas.put(b"x".to_vec()).await;
-        assert!(
-            matches!(&put, Err(CasError::Missing(m)) if m.contains("CAS call failed")),
-            "{put:?}"
-        );
     }
 }

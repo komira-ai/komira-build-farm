@@ -48,7 +48,7 @@ pub struct NativeConfig {
     pub scratch: PathBuf,
     /// The timeout of an action that names none.
     pub default_timeout: Duration,
-    /// How much output one action may leave.
+    /// How much output one action may leave, stdout and stderr included.
     pub outputs: OutputLimits,
     /// The per-lease memory limit.
     pub memory: MemoryPolicy,
