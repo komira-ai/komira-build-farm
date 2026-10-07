@@ -55,21 +55,24 @@ lines.
 
 ## Building and testing
 
-kbf will be a Cargo workspace; the repository has no Rust code yet. Once the
-first crate lands, all builds and tests will use `cargo`:
+kbf is a Cargo workspace; the crates live under `crates/`. All builds and
+tests use `cargo`, with the toolchain pinned in `rust-toolchain.toml`:
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
 ```
 
 There is no other build system in this repository.
 
 ## Continuous integration
 
-There is no CI workflow yet. When CI is added, it will run only on
-GitHub-hosted runners, and a pull request will be merged only when CI is green
-on its head commit.
+CI is defined in [.github/workflows/ci.yml](.github/workflows/ci.yml) and runs
+only on GitHub-hosted runners: formatting, clippy, the repository lints,
+`cargo deny`, and the workspace tests on x86-64 and arm64. A pull request is
+merged only when CI is green on its head commit.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

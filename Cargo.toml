@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/komira-ai/komira-build-farm"
+publish = false
+
+# Every external dependency is declared here once and used from a member as
+# `name.workspace = true` (members add features they need). Declaring the likely set
+# ahead keeps version choices in one place. A dependency enters Cargo.lock only when
+# a member first uses it.
+[workspace.dependencies]
+base64 = "0.23.1"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+hex = "0.4.3"
+hmac = "0.13.0"
+md-5 = "0.11.0"
+prost = "0.14.4"
+prost-types = "0.14.4"
+protox = "0.9.1"
+rand = "0.10.3"
+rand_chacha = "0.10.0"
+# Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
+reqwest = { version = "0.13.5", default-features = false }
+roxmltree = "0.21.1"
+saphyr-parser = "0.1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+tokio = "1.53.2"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+kbf-alert = { path = "crates/kbf-alert" }
+kbf-caps = { path = "crates/kbf-caps" }
+kbf-driver-container = { path = "crates/kbf-driver-container" }
+kbf-estimator = { path = "crates/kbf-estimator" }
+kbf-front = { path = "crates/kbf-front" }
+kbf-meta = { path = "crates/kbf-meta" }
+kbf-objstore = { path = "crates/kbf-objstore" }
+kbf-proto = { path = "crates/kbf-proto" }
+kbf-raft = { path = "crates/kbf-raft" }
+kbf-sched = { path = "crates/kbf-sched" }
+kbf-segments = { path = "crates/kbf-segments" }
+kbf-sim = { path = "crates/kbf-sim" }
+kbf-sim-cell = { path = "crates/kbf-sim-cell" }
+kbf-store = { path = "crates/kbf-store" }
+kbf-types = { path = "crates/kbf-types" }
+
+# `clippy.toml` lists the clock, sleep, network and hashed-collection items that pure
+# crates must not use. They are allowed workspace-wide; each pure crate denies them in
+# its `lib.rs` (an in-source attribute overrides this table), and the layering test in
+# `kbf-it` checks that the deny is present.
+[workspace.lints.clippy]
+disallowed_methods = "allow"
+disallowed_types = "allow"

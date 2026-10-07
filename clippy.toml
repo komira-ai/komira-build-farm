@@ -1,0 +1,17 @@
+# Items the pure crates (kbf-types, kbf-caps, kbf-segments, kbf-meta, kbf-sched,
+# kbf-estimator) must not use. Those crates deny `clippy::disallowed_methods` and
+# `clippy::disallowed_types` in their lib.rs; every other crate allows them through
+# `[workspace.lints.clippy]` in the root Cargo.toml. Time enters a pure core as an
+# input (farm time from kbf-types), never by reading a clock, so a seed replays exactly.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "pure crates take time as an input" },
+    { path = "std::time::SystemTime::now", reason = "pure crates take time as an input" },
+    { path = "std::thread::sleep", reason = "pure crates never block or wait" },
+]
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order varies per process; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order varies per process; use BTreeSet" },
+    { path = "std::net::TcpStream", reason = "pure crates do no network I/O" },
+    { path = "std::net::TcpListener", reason = "pure crates do no network I/O" },
+    { path = "std::net::UdpSocket", reason = "pure crates do no network I/O" },
+]
