@@ -132,3 +132,56 @@ async fn a_cancel_stops_a_running_duplicate() {
     );
     assert_eq!(h.runtime.killed(), [id(1, 1)], "the retry was killed");
 }
+
+/// The same rules with a runtime that runs real processes. Catches: a `Cancel` that
+/// does not stop the process of a cancelled lease (the action runs on for its full
+/// minute, and its Result never comes in time), and a late `Start` run by this runtime.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_stops_a_process_and_a_late_start_runs_none() {
+    use std::sync::Arc;
+
+    use kbf_daemon::LocalRuntime;
+    use support::memory::{MemoryCas, Spec};
+
+    let cas = Arc::new(MemoryCas::default());
+    let runtime = Arc::new(LocalRuntime::new(
+        Arc::clone(&cas),
+        support::scratch("cancel-local"),
+    ));
+    let mut h = Harness::with_runtime("cancel-local", runtime, LONG).await;
+    let mut peer = h.welcomed().await;
+    let sleeper = Spec::sh("sleep 60").store(&cas);
+    let window = Duration::from_secs(5);
+
+    // Heartbeat 99 was never sent on this stream.
+    peer.start_action_within(Some((1, 1)), sleeper.clone(), 99, window);
+    peer.start_action_within(None, sleeper.clone(), 99, window);
+    h.event(PROMPT, |e| {
+        (*e == Event::StartExpired(id(1, 1))).then_some(())
+    })
+    .await
+    .expect("the late Start is refused");
+
+    peer.start_action_within(Some((1, 2)), sleeper, 0, window);
+    let listed = peer
+        .expect(PROMPT, |m| match m {
+            kbf_proto::worker::daemon_message::Message::Heartbeat(hb)
+                if hb.running == [lease(1, 2)] =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+    assert!(listed.is_some(), "the lease did not start");
+    peer.cancel(None);
+    peer.cancel(Some((1, 9)));
+    peer.cancel(Some((1, 2)));
+    h.event(PROMPT, |e| (*e == Event::Cancelled(id(1, 2))).then_some(()))
+        .await
+        .expect("the cancel began a kill");
+    let (_, result) = peer.result(PROMPT).await.expect("the killed run's Result");
+    assert_eq!(result.lease_id, Some(lease(1, 2)));
+    assert_eq!(result.status.map(|s| s.code), Some(Code::Aborted as i32));
+}

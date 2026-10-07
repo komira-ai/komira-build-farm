@@ -173,10 +173,21 @@ impl Peer {
     /// A Start of lease `term.seq`, or of no lease, that names heartbeat
     /// `heartbeat_seq` (0: the Hello) and the window after it in which it may run.
     pub fn start_within(&self, lease: Option<(u64, u64)>, heartbeat_seq: u64, valid_for: Duration) {
+        self.start_action_within(lease, digest(), heartbeat_seq, valid_for);
+    }
+
+    /// [`Self::start_within`], running the action `action`.
+    pub fn start_action_within(
+        &self,
+        lease: Option<(u64, u64)>,
+        action: Digest,
+        heartbeat_seq: u64,
+        valid_for: Duration,
+    ) {
         self.send(server_message::Message::Start(Start {
             lease_id: lease.map(|(term, seq)| LeaseId { term, seq }),
             kind: "action".to_owned(),
-            action_digest: Some(digest()),
+            action_digest: Some(action),
             heartbeat_seq,
             valid_for_ms: valid_for.as_millis() as u64,
             ..Start::default()

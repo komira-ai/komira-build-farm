@@ -313,8 +313,7 @@ impl<R: Runtime> Daemon<R> {
             // The scheduler may have given the lease up and granted it again; it
             // gives it up here too, as a Start that never arrived.
             if let Some(id) = done {
-                tracing::warn!(lease = %id, heartbeat = start.heartbeat_seq,
-                    ?valid_for, "a Start that arrived after its window not run");
+                tracing::warn!(lease = %id, "a Start that arrived after its window not run");
                 self.emit(Event::StartExpired(id));
             }
             return;

@@ -13,7 +13,8 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 | Detection | `report` | builds the node report from the kernel's text (see [capabilities.md](capabilities.md)) |
 | Session loop | `daemon` | one outbound mutual-TLS stream at a time; reconnects when it ends |
 | Contact clock | `contact` | when the server last provably heard the daemon, and so when to fence |
-| Lease manager | `lease` | starts work only on `Start`, turns each outcome into one `Result`, fences |
+| Start window | `window` | when this stream's heartbeats were sent, so a `Start` that arrives too late is not run |
+| Lease manager | `lease` | starts work only on `Start`, turns each outcome into one `Result`, fences, kills a cancelled lease |
 | Runtime | `runtime` | the `Runtime` trait every execution driver implements |
 | CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service |
 | Trees | `tree` | writes an input root to disk and reads outputs back |
@@ -38,6 +39,10 @@ acknowledged (a heartbeat, or the `Hello` a `Welcome` answered):
 - once T = 40 s have passed since that send time, contact is lost: every running lease
   is killed (all kills run together) and reported `ABORTED`, and any `Start` that
   arrives is refused with `UNAVAILABLE`.
+
+A `Start` that arrives after the window it names (14 s from the send of the heartbeat
+it names) is not run, reported or listed, and a `Cancel` from the server kills the
+named running lease; see [worker-protocol.md](worker-protocol.md).
 
 Today the daemon fences every lease this way. Letting hermetic work run on through a
 lost connection (`RUN_ON`) is **planned** for when `Start` carries a fence policy. At

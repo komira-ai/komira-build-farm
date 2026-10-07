@@ -31,6 +31,7 @@ service Worker {
 | `Offer` (not read yet) | `LeaseOffer` |
 | `Result` | `Start` |
 | | `ResultAck` |
+| | `Cancel` |
 
 ## A session
 
@@ -45,6 +46,8 @@ daemon                                  server
   |<----------------------------- Start |  committed: run it
   | Result ---------------------------->|
   |<------------------------- ResultAck |
+  | Heartbeat (lists a lease given up)->|
+  |<------------------------- Cancel    |  not held here: stop it
 ```
 
 ### `Hello` and `Welcome`
@@ -112,16 +115,46 @@ fetching inputs on an offer is **planned**.
 | `action_digest` | the action to run; its inputs are fetched from the CAS |
 | `millicpus` | CPU booked for the lease, in thousandths of a CPU; 0 means not booked |
 | `memory_bytes` | memory booked for the lease; 0 means not booked |
+| `heartbeat_seq` | the newest heartbeat of this stream the server had taken when it sent the `Start`; 0 before the first, which names the stream's `Hello` |
+| `valid_for_ms` | how long after sending that heartbeat (or `Hello`) the daemon may still act on the `Start`: 14 000; 0 means no bound |
 
 The daemon handles a `Start` as follows:
 
 - a `Start` for a lease already running is a resend and changes nothing;
 - a `Start` for a lease whose `Result` is still unacknowledged is ignored, because
   running it again could produce a second result;
+- a `Start` that arrives `valid_for_ms` or more after the daemon sent the heartbeat it
+  names, or that names a heartbeat this stream never sent, is **not run, not reported
+  and not listed** (see below);
 - if contact is already lost (past the fence deadline), it answers a `Result` with
   `UNAVAILABLE` instead of starting;
 - if no runtime serves the lease kind, it answers `FAILED_PRECONDITION`;
 - a `Start` without an action digest is answered `INVALID_ARGUMENT`.
+
+**How late a `Start` may be acted on.** The scheduler gives up a lease that a worker
+it still hears from leaves out of its running set once the `Start` has been out for G.
+A `Start` delayed past that would run beside the operation's retry. The server sent
+the `Start` after it took the heartbeat the `Start` names, and the daemon sent that
+heartbeat before, so a `Start` the daemon receives within the window of that send was in
+flight for less than the window. The daemon measures this on its own clock alone; the
+two clocks need not agree, and the `Start` carries no timestamp. The window W = 14 s
+keeps `W + T + 5 s < G`. A late `Start` is dropped silently: a `Result` would be taken
+as the lease's outcome while the scheduler may still hold the lease, and the scheduler
+gives the lease up anyway, as a `Start` that never arrived. The daemon forgets the send
+times of heartbeats older than the newest acknowledged one: the server takes
+heartbeats in order and acknowledges each after taking it, so no later `Start` names an
+older one. To leave the window room, the server's heartbeat interval is at most 7 s.
+
+### `Cancel`
+
+`Cancel { lease_id }` tells the daemon that the server no longer holds this lease on it:
+the scheduler gave it up, granted it elsewhere, or finished its operation, yet a
+heartbeat listed it. The server sends one for each such lease on every heartbeat that
+lists it, so a lost `Cancel` is sent again. Leases of another scheduler term are never
+cancelled. The daemon kills the run without waiting for the kill to finish. The lease
+stays listed until its run has stopped and its `Result` (normally `ABORTED`) is
+acknowledged, and the server refuses that `Result`. A `Cancel` for a lease the daemon
+is not running changes nothing.
 
 ### `Result` and `ResultAck`
 
@@ -189,7 +222,10 @@ daemon restarts and server restarts:
    until the server decides it.
 4. **No two copies of self-fenced work.** A daemon stops self-fenced work T after its
    newest acknowledged send; the scheduler re-dispatches no sooner than G after it last
-   heard the daemon, and `T + 5 s < G`.
+   heard the daemon, and `T + 5 s < G`. A daemon acts on a `Start` only within W of
+   sending the heartbeat it names, and `W + T + 5 s < G`, so a late `Start` never runs
+   beside the retry of its lease. A lease the scheduler no longer holds is cancelled on
+   the next heartbeat that lists it.
 5. **Only the newest stream counts.** A replaced stream's heartbeats are neither fed to
    the scheduler nor acknowledged, and every `Start` goes to the newest stream.
 6. **A restarted daemon lists everything it runs in its first heartbeat.** The
@@ -204,7 +240,7 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
-- Drain, cancel and resource-change messages.
+- Drain and resource-change messages.
 - With many servers: the daemon dials the farm's one address and may learn the current
   server list from the first server it reaches; the front relays the session to the
   scheduler's leader.
