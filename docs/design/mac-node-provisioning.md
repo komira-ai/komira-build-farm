@@ -13,6 +13,13 @@ designed in the [macOS VMs design](https://github.com/komira-ai/komira-build-far
 Xcodes per host and the `xcode` key, simulator runtimes, VM golden images, and GUI
 leases.
 
+**One exception: GPU tests drive a GUI on the host itself.** GPU tests never run in a VM
+(macOS VMs design, section 8.1); that includes tests that install the desktop app and
+drive it with a local LLM. They take the whole Mac on bare metal and need a GUI session
+on the host. Their runtime is planned in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**): a throwaway per-lease
+user, logged in automatically for that lease only. This design does not cover that
+runtime.
+
 The rules this design keeps:
 
 - **One profile, applied by a script, checked by the same script.** A node is a
@@ -39,7 +46,7 @@ The rules this design keeps:
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. The node reports a host identity per Xcode, and a changed identity takes that Xcode out until it re-qualifies. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is optional ([section 6](#6-updates-pinned-and-rolled-out)). |
-| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login stays off: GUI work runs in VM guests that log themselves in. It becomes necessary only if a VM cannot be started from a launch daemon, an open probe of the macOS VMs design ([section 5.4](#54-filevault-and-auto-login)). |
+| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests, which auto-login a throwaway non-admin user for one whole-machine lease (fleet-updates design, in progress), and the case where a VM cannot be started from a launch daemon, an open probe of the macOS VMs design ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
@@ -574,11 +581,19 @@ the rack's physical security and short certificate lifetimes. A Mac on a desk, o
 a locked room, may keep FileVault on if the operator accepts that it waits for a person
 after every reboot.
 
-**Auto-login** is not needed on the host: `kbf-daemon` is a LaunchDaemon, and GUI work
-runs in VM leases (`kbf-lease=vm`) whose guests log themselves in (macOS VMs design).
-The host needs auto-login only if Virtualization.framework cannot start a VM from a
-launch daemon, an open probe there. If so, it is for that design's dedicated non-admin
-user, never the admin account.
+**Auto-login is off at rest.** `kbf-daemon` is a LaunchDaemon, and most GUI work runs
+in VM leases (`kbf-lease=vm`) whose guests log themselves in (macOS VMs design). The
+host needs auto-login in two cases, and in neither for the admin account:
+
+- **Bare-metal GPU tests.** GPU work never runs in a VM (macOS VMs design, section 8.1),
+  so a GPU test that drives the desktop app needs a GUI session on the host. The
+  planned bare-metal whole-machine runtime makes a throwaway non-admin user per lease
+  and logs that user in automatically for the lease only. The same runtime covers MDM
+  privacy profiles and a leak scan that erases the node on a leak. All of this is
+  designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**), not here. FileVault off (above) is what makes
+  that auto-login possible.
+- **A VM cannot be started from a launch daemon.** This is an open probe of the macOS
+  VMs design. If it fails, auto-login is for that design's dedicated non-admin user.
 
 One more consequence of running with nobody logged in: **anything the node needs at
 boot must be a system daemon.** In particular, an overlay-network client whose app
