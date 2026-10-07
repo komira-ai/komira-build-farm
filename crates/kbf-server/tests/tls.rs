@@ -74,13 +74,20 @@ async fn welcomed(addr: std::net::SocketAddr, pki: &Pki, identity: Option<Identi
     if let Some(identity) = identity {
         tls = tls.identity(identity);
     }
-    let Ok(channel) = Endpoint::from_shared(format!("https://{addr}"))
+    let endpoint = Endpoint::from_shared(format!("https://{addr}"))
         .expect("endpoint")
         .tls_config(tls)
-        .expect("tls")
-        .connect()
-        .await
-    else {
+        .expect("tls");
+    session_welcomed(endpoint).await
+}
+
+/// Opens a session in plain text and returns whether the server welcomed it.
+async fn welcomed_in_plain_text(addr: std::net::SocketAddr) -> bool {
+    session_welcomed(Endpoint::from_shared(format!("http://{addr}")).expect("endpoint")).await
+}
+
+async fn session_welcomed(endpoint: Endpoint) -> bool {
+    let Ok(channel) = endpoint.connect().await else {
         return false;
     };
     let (tx, rx) = unbounded();
@@ -145,4 +152,27 @@ async fn the_worker_listener_requires_a_client_certificate() {
         !welcomed(addr, &pki, None).await,
         "welcomed without a certificate"
     );
+    assert!(
+        !welcomed_in_plain_text(addr).await,
+        "welcomed in plain text"
+    );
+}
+
+/// Catches: a worker listener that wants TLS when no TLS flag is given; plain text is
+/// the documented default (`Listeners::worker_tls` of `None`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_tls_flags_the_worker_listener_is_plain_text() {
+    let args = Args::parse_from([
+        "kbf-server",
+        "--listen",
+        "127.0.0.1:0",
+        "--worker-listen",
+        "127.0.0.1:0",
+    ]);
+    let listeners = args.listeners().expect("listeners");
+    assert!(listeners.worker_tls.is_none());
+    let bound = bind_server(Arc::new(Cache::memory()), listeners, pending()).expect("bind");
+    let addr = bound.worker;
+    tokio::spawn(async move { bound.serving.await.expect("serve") });
+    assert!(welcomed_in_plain_text(addr).await, "plain text refused");
 }

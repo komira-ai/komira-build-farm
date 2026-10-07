@@ -4,6 +4,7 @@
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! the addresses it bound (a port of 0 picks a free one).
 
+use std::error::Error;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ async fn main() -> ExitCode {
         }
         StoreKind::S3 => match args.s3_store(|name| std::env::var(name).ok()) {
             Ok((store, prefix)) => run(&args, store, prefix).await,
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e.into()),
         },
     };
     match result {
@@ -42,8 +43,8 @@ async fn run<O: ObjectStore + 'static>(
     args: &Args,
     store: O,
     prefix: KeyPrefix,
-) -> Result<(), String> {
-    let listeners = args.listeners().map_err(|e| e.to_string())?;
+) -> Result<(), Box<dyn Error>> {
+    let listeners = args.listeners()?;
     let cache = Arc::new(Cache::new(
         MemoryMetaLog::new(Retention::default()),
         store,
@@ -53,12 +54,13 @@ async fn run<O: ObjectStore + 'static>(
         // Without a signal handler the process cannot stop cleanly; it still stops.
         let _ = tokio::signal::ctrl_c().await;
     };
-    let bound = bind_server(cache, listeners, shutdown).map_err(|e| e.to_string())?;
+    let bound = bind_server(cache, listeners, shutdown)?;
     println!(
         "kbf-server {} reapi={} worker={}",
         env!("CARGO_PKG_VERSION"),
         bound.reapi,
         bound.worker
     );
-    bound.serving.await.map_err(|e| e.to_string())
+    bound.serving.await?;
+    Ok(())
 }

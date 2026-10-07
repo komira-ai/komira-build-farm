@@ -307,7 +307,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
                 .waiters(*op)
                 .is_some_and(|w| w.contains(&waiter))
         });
-        if joined_started && let Some(w) = state.waiters.get(&waiter) {
+        if let Some(w) = state.waiters.get(&waiter).filter(|_| joined_started) {
             w.stage.send_replace(Stage::Executing);
         }
         Ok(Ticket {
@@ -380,7 +380,6 @@ impl State {
                 }
                 Effect::Start(start) => self.start(start),
                 Effect::Answer(answer) => answers.push(answer),
-                other => tracing::error!(?other, "an effect this server cannot carry out"),
             }
         }
         answers
@@ -392,42 +391,49 @@ impl State {
         self.waiters.get(first)
     }
 
-    fn send(&self, worker: &WorkerId, message: server_message::Message) {
-        if let Some(link) = self.links.get(worker) {
-            // A stream that has just ended drops it; the lease is reconciled later.
-            let _ = link.outbound.send(Ok(ServerMessage {
+    /// Sends `worker` the message `build` makes from `operation`'s first waiter.
+    ///
+    /// Both are always there, so nothing here branches on them: the scheduler places
+    /// work only on a worker that registered (and a worker's link outlives its stream),
+    /// and only operations a waiter submitted (waiters leave only once it is finished).
+    /// A stream that has just ended drops the message; its lease is reconciled later.
+    fn send_for(
+        &self,
+        worker: &WorkerId,
+        operation: OperationId,
+        build: impl FnOnce(&Waiter) -> server_message::Message,
+    ) {
+        let message = self.first_waiter(operation).map(build);
+        let _ = self.links.get(worker).zip(message).map(|(link, message)| {
+            link.outbound.send(Ok(ServerMessage {
                 message: Some(message),
-            }));
-        }
+            }))
+        });
     }
 
     /// Tells the worker a lease is placed on it, before the grant commits.
     fn offer(&self, grant: &LeaseGrant) {
-        if let Some(w) = self.first_waiter(grant.operation) {
-            let offer = LeaseOffer {
+        self.send_for(&grant.worker, grant.operation, |w| {
+            server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
                 kind: w.kind.clone(),
                 action_digest: Some(kbf_front::digest_to_proto(&w.key.action)),
-            };
-            self.send(&grant.worker, server_message::Message::LeaseOffer(offer));
-        }
+            })
+        });
     }
 
     /// Sends the `Start` of a committed lease and marks its callers executing.
     fn start(&mut self, start: StartLease) {
-        let Some(w) = self.first_waiter(start.operation) else {
-            return;
-        };
-        let message = Start {
-            lease_id: Some(wire_lease(start.lease)),
-            kind: w.kind.clone(),
-            action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
-        };
-        self.send(&start.worker, server_message::Message::Start(message));
-        for waiter in self.sched.waiters(start.operation).unwrap_or_default() {
-            if let Some(w) = self.waiters.get(waiter) {
-                w.stage.send_replace(Stage::Executing);
-            }
+        self.send_for(&start.worker, start.operation, |w| {
+            server_message::Message::Start(Start {
+                lease_id: Some(wire_lease(start.lease)),
+                kind: w.kind.clone(),
+                action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
+            })
+        });
+        let waiters = self.sched.waiters(start.operation).unwrap_or_default();
+        for w in waiters.iter().filter_map(|id| self.waiters.get(id)) {
+            w.stage.send_replace(Stage::Executing);
         }
         self.started.insert(start.lease, start.operation);
     }

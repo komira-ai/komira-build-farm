@@ -497,8 +497,9 @@ async fn malformed_requests_are_invalid() {
 }
 
 /// Catches: a lease kind read from the wrong place (REAPI 2.2 clients put the platform
-/// in the Action, older ones in the Command), an unknown kind run as a shared action,
-/// and a platform with a repeated property accepted.
+/// in the Action, older ones in the Command), including an Action whose platform is
+/// present but empty hiding the Command's; an unknown kind run as a shared action; and
+/// a platform with a repeated property accepted.
 #[tokio::test]
 async fn the_lease_kind_comes_from_the_platform() {
     let script = Arc::new(Script::default());
@@ -527,6 +528,23 @@ async fn the_lease_kind_comes_from_the_platform() {
     farm.upload(&[&action, &command, &older.blobs[2], &older.blobs[3]])
         .await;
     start(&farm, &action).await.expect("Execute");
+    // The same, but the Action carries an empty platform rather than none.
+    #[allow(deprecated)]
+    let command = Blob::of(&Command {
+        arguments: vec!["old, empty platform".to_owned()],
+        platform: Some(Platform {
+            properties: vec![property("kbf-lease", "whole_machine")],
+        }),
+        ..Default::default()
+    });
+    let action = Blob::of(&Action {
+        command_digest: Some(command.proto.clone()),
+        input_root_digest: Some(older.blobs[2].proto.clone()),
+        platform: Some(Platform::default()),
+        ..Default::default()
+    });
+    farm.upload(&[&action, &command]).await;
+    start(&farm, &action).await.expect("Execute");
 
     let submitted = script.submitted();
     assert_eq!(submitted[0].kind, "whole_machine");
@@ -535,6 +553,10 @@ async fn the_lease_kind_comes_from_the_platform() {
     assert_eq!(
         submitted[1].kind, "whole_machine",
         "the Command's platform ignored"
+    );
+    assert_eq!(
+        submitted[2].kind, "whole_machine",
+        "an empty Action platform hid the Command's"
     );
 
     for (why, props) in [
@@ -549,7 +571,7 @@ async fn the_lease_kind_comes_from_the_platform() {
         let status = start(&farm, &bad.action).await.expect_err(why);
         assert_eq!(status.code(), Code::InvalidArgument, "{why}");
     }
-    assert_eq!(script.submitted().len(), 2);
+    assert_eq!(script.submitted().len(), 3);
 }
 
 /// Catches: a WaitExecution that does not follow the named operation, or that answers

@@ -49,47 +49,76 @@ pub const HELLO_WAIT: Duration = Duration::from_millis(300);
 /// The heartbeat interval the test server names in `Welcome`.
 pub const INTERVAL: Duration = Duration::from_millis(100);
 
-/// The in-memory metadata log, with a gate a test can close on the next query: the
-/// query waits there until the test opens it, so the test can act while the server is
-/// in the middle of a read.
-#[derive(Debug)]
-pub struct GateLog {
-    inner: MemoryMetaLog,
+/// A point a test can close: the next caller to reach it waits there until the test
+/// opens it, so the test can act while the server is in the middle of that step.
+#[derive(Debug, Default)]
+pub struct Gate {
     armed: AtomicBool,
     entered: Notify,
     release: Notify,
+}
+
+impl Gate {
+    /// Holds the next caller at the gate.
+    pub fn close_next(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits until a caller is held at the gate.
+    pub async fn held(&self) {
+        timeout(PROMPT, self.entered.notified())
+            .await
+            .expect("a caller reaches the gate");
+    }
+
+    /// Lets the held caller through.
+    pub fn open(&self) {
+        self.release.notify_one();
+    }
+
+    async fn pass(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+/// The in-memory metadata log, with gates a test can close on the next query and on
+/// the next action-cache write, and a switch that makes the next action-cache write
+/// fail as an unreachable leader would.
+#[derive(Debug)]
+pub struct GateLog {
+    inner: MemoryMetaLog,
+    pub query: Gate,
+    pub action_write: Gate,
+    fail_action_write: AtomicBool,
 }
 
 impl GateLog {
     fn new() -> Self {
         Self {
             inner: MemoryMetaLog::new(Retention::default()),
-            armed: AtomicBool::new(false),
-            entered: Notify::new(),
-            release: Notify::new(),
+            query: Gate::default(),
+            action_write: Gate::default(),
+            fail_action_write: AtomicBool::new(false),
         }
     }
 
-    /// Holds the next query at the gate.
-    pub fn close_on_next_query(&self) {
-        self.armed.store(true, Ordering::SeqCst);
-    }
-
-    /// Waits until a query is held at the gate.
-    pub async fn held(&self) {
-        timeout(PROMPT, self.entered.notified())
-            .await
-            .expect("a query reaches the gate");
-    }
-
-    /// Lets the held query through.
-    pub fn open(&self) {
-        self.release.notify_one();
+    /// Fails the next action-cache write with `MetaLogError::Unavailable`.
+    pub fn fail_next_action_write(&self) {
+        self.fail_action_write.store(true, Ordering::SeqCst);
     }
 }
 
 impl MetaLog for GateLog {
     async fn commit(&self, command: MetaCommand) -> Result<Applied, MetaLogError> {
+        if matches!(command, MetaCommand::PutAction { .. }) {
+            self.action_write.pass().await;
+            if self.fail_action_write.swap(false, Ordering::SeqCst) {
+                return Err(MetaLogError::Unavailable("failed by the test".to_owned()));
+            }
+        }
         self.inner.commit(command).await
     }
 
@@ -98,10 +127,7 @@ impl MetaLog for GateLog {
         F: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
-        if self.armed.swap(false, Ordering::SeqCst) {
-            self.entered.notify_one();
-            self.release.notified().await;
-        }
+        self.query.pass().await;
         self.inner.query(f).await
     }
 }
