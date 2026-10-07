@@ -1,10 +1,11 @@
-# CI for pull requests and main. GitHub-hosted runners only; the repository lints in
+# CI for pull requests, the merge queue and main. GitHub-hosted runners only; the repository lints in
 # crates/kbf-it/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions and to a top-level `permissions: {}`.
 name: ci
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -57,6 +58,17 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p kbf-it --locked --test repo_lints
+
+  # Licences, advisories, bans and sources, as deny.toml configures them.
+  deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   test-x86:
     runs-on: ubuntu-latest

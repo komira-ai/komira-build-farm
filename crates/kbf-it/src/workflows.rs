@@ -11,19 +11,50 @@
 //!   version comment (local `./` actions are exempt);
 //! - it lacks a top-level `permissions: {}` line, so jobs start with no token rights.
 //!
-//! The lint reads lines, not YAML: it is strict on purpose, so a form it cannot read
-//! one line at a time is refused rather than guessed.
+//! The lint reads lines, not YAML. So that the checks above cannot be dodged by a
+//! YAML spelling they do not read, it also refuses:
+//! - the word `runs-on` or `uses` anywhere except as the plain block key
+//!   `runs-on:`/`uses:` at the start of a line (catches `runs-on :`, `"runs-on":` and
+//!   either key inside a flow mapping);
+//! - a line that continues the value of a `runs-on:` or `uses:` key (a plain scalar
+//!   folded over several lines);
+//! - a flow collection (`{` or `[`, other than an empty `{}`/`[]` and `${{ }}`
+//!   expressions) on the `jobs:` line or under it;
+//! - a line whose first item is quoted, tagged, anchored, an alias, an explicit key
+//!   or a flow collection (`"`, `'`, `!`, `&`, `*`, `?`, `{`, `[`);
+//! - a backslash on a line with a double quote (an escape could spell any word);
+//! - a YAML tag (`!` starting a token outside `${{ }}`).
+//!
+//! These apply to `run:` scripts too, since the lint cannot tell a script line from a
+//! key. A script that needs such a form belongs in a file the workflow runs.
 
 /// Scans one workflow text and returns one message per problem, each prefixed with
 /// its 1-based line number (0 for a whole-file problem).
 pub fn scan(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut top_permissions = false;
+    let mut in_jobs = false;
+    // Column of the last `runs-on:`/`uses:` key; the next line must not be deeper.
+    let mut scalar_key_col: Option<usize> = None;
     for (i, raw) in text.lines().enumerate() {
         let n = i + 1;
         let (code, comment) = split_comment(raw);
         if raw.trim_end() == "permissions: {}" {
             top_permissions = true;
+        }
+        if code.trim().is_empty() {
+            continue;
+        }
+        let indent = code.len() - code.trim_start().len();
+        let item = first_item(code);
+        let col = code.len() - item.len();
+        if indent == 0 {
+            in_jobs = is_key(item, "jobs");
+        }
+        if scalar_key_col.take().is_some_and(|k| indent > k) {
+            out.push(format!(
+                "line {n}: continues the value of the key on an earlier line"
+            ));
         }
         if code.contains("self-hosted") {
             out.push(format!("line {n}: names the self-hosted runner label"));
@@ -31,8 +62,17 @@ pub fn scan(text: &str) -> Vec<String> {
         if code.contains("pull_request_target") {
             out.push(format!("line {n}: uses the pull_request_target trigger"));
         }
-        let key = code.trim_start().trim_start_matches("- ");
-        if let Some(v) = key.strip_prefix("runs-on:") {
+        out.extend(unreadable_forms(n, code, item, in_jobs));
+        for key in ["runs-on", "uses"] {
+            let canonical = plain_value(item, key).is_some();
+            if word_offsets(code, key).any(|at| !(canonical && at == col)) {
+                out.push(format!(
+                    "line {n}: `{key}` appears outside the plain `{key}:` key form"
+                ));
+            }
+        }
+        if let Some(v) = plain_value(item, "runs-on") {
+            scalar_key_col = Some(col);
             let v = v.trim();
             if !is_hosted_label(v) {
                 out.push(format!(
@@ -40,7 +80,8 @@ pub fn scan(text: &str) -> Vec<String> {
                 ));
             }
         }
-        if let Some(v) = key.strip_prefix("uses:") {
+        if let Some(v) = plain_value(item, "uses") {
+            scalar_key_col = Some(col);
             let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
             if !v.starts_with("./") && !is_sha_pinned(v) {
                 out.push(format!(
@@ -57,6 +98,35 @@ pub fn scan(text: &str) -> Vec<String> {
     out
 }
 
+/// Messages for YAML forms that could spell a checked key or value without the
+/// literal text the line checks look for.
+fn unreadable_forms(n: usize, code: &str, item: &str, in_jobs: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if item.starts_with(['"', '\'', '!', '&', '*', '?', '{', '[']) {
+        out.push(format!(
+            "line {n}: a quoted, tagged, anchored, alias, explicit or flow item is not read"
+        ));
+    }
+    if code.contains('"') && code.contains('\\') {
+        out.push(format!(
+            "line {n}: a backslash escape in double quotes is not read"
+        ));
+    }
+    let bare = strip_expressions(code).replace("{}", "").replace("[]", "");
+    if in_jobs && bare.contains(['{', '[']) {
+        out.push(format!(
+            "line {n}: a flow collection under `jobs:` is not read"
+        ));
+    }
+    let b = bare.as_bytes();
+    let tag = (0..b.len())
+        .any(|i| b[i] == b'!' && (i == 0 || matches!(b[i - 1], b' ' | b'\t' | b',' | b'[' | b'{')));
+    if tag {
+        out.push(format!("line {n}: a YAML tag is not read"));
+    }
+    out
+}
+
 /// Splits a line into code and the text after a YAML comment marker (`#` at the
 /// start of the line or after whitespace).
 fn split_comment(line: &str) -> (&str, Option<&str>) {
@@ -67,6 +137,57 @@ fn split_comment(line: &str) -> (&str, Option<&str>) {
         }
     }
     (line, None)
+}
+
+/// The line after its indentation and any block sequence markers (`- `).
+fn first_item(code: &str) -> &str {
+    let mut s = code.trim_start();
+    while let Some(rest) = s.strip_prefix('-') {
+        if !rest.starts_with([' ', '\t']) {
+            break;
+        }
+        s = rest.trim_start();
+    }
+    s
+}
+
+/// True if `item` is the key `key` with any spacing before the colon.
+fn is_key(item: &str, key: &str) -> bool {
+    item.strip_prefix(key)
+        .is_some_and(|r| r.trim_start().starts_with(':'))
+}
+
+/// The value after the plain block key `key:`, if `item` starts with it.
+fn plain_value<'a>(item: &'a str, key: &str) -> Option<&'a str> {
+    let v = item.strip_prefix(key)?.strip_prefix(':')?;
+    (v.is_empty() || v.starts_with([' ', '\t'])).then_some(v)
+}
+
+/// Byte offsets where `word` occurs bounded by characters that cannot extend a key.
+fn word_offsets<'a>(code: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let b = code.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+    code.match_indices(word).map(|(i, _)| i).filter(move |&i| {
+        (i == 0 || !ident(b[i - 1])) && b.get(i + word.len()).is_none_or(|&c| !ident(c))
+    })
+}
+
+/// The line with every `${{ ... }}` expression removed. An unterminated `${{` is kept.
+fn strip_expressions(code: &str) -> String {
+    let mut out = String::new();
+    let mut rest = code;
+    while let Some(s) = rest.find("${{") {
+        out.push_str(&rest[..s]);
+        match rest[s..].find("}}") {
+            Some(e) => rest = &rest[s + e + 2..],
+            None => {
+                out.push_str(&rest[s..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_hosted_label(v: &str) -> bool {
@@ -106,7 +227,7 @@ mod tests {
     fn a_clean_workflow_passes() {
         // Catches: a lint that refuses the forms ci.yml relies on.
         let w = workflow(&format!(
-            "    runs-on: ubuntu-24.04-arm\n    steps:\n      - uses: a/b@{SHA} # v1.2.3\n      - uses: ./local\n"
+            "    runs-on: ubuntu-24.04-arm\n    steps:\n      - uses: a/b@{SHA} # v1.2.3\n        with:\n          save-if: ${{{{ github.ref == 'refs/heads/main' }}}}\n      - uses: ./local\n      - run: echo causes  # words containing uses are not keys\n"
         ));
         assert_eq!(scan(&w), Vec::<String>::new());
     }
@@ -127,16 +248,90 @@ mod tests {
     #[test]
     fn non_literal_runs_on_is_refused() {
         // Catches: a custom label, runner group, list or expression slipping through.
+        // The last two catch an `is_hosted_label` that checks only the prefix.
         for v in [
             "big-box",
             "",
             "${{ matrix.os }}",
             "[ubuntu-latest]",
             "ubuntu-",
+            "ubuntu-latest, big-box",
+            "ubuntu-${{ inputs.x }}",
         ] {
             let found = scan(&workflow(&format!("    runs-on: {v}\n")));
-            assert_eq!(found.len(), 1, "runs-on: {v} -> {found:?}");
+            assert!(
+                found
+                    .iter()
+                    .any(|m| m.contains("runs-on must be one literal")),
+                "runs-on: {v} -> {found:?}"
+            );
         }
+    }
+
+    /// Asserts that `body`, under a job, yields at least one message containing `want`.
+    fn refused(body: &str, want: &str) {
+        let found = scan(&workflow(body));
+        assert!(
+            found.iter().any(|m| m.contains(want)),
+            "{body} -> {found:?}"
+        );
+    }
+
+    #[test]
+    fn respelled_runs_on_and_uses_keys_are_refused() {
+        // Catches: a key the line checks would not read, yet YAML reads as runs-on/uses.
+        refused("    runs-on : big-box\n", "outside the plain `runs-on:`");
+        refused("    \"runs-on\": big-box\n", "outside the plain `runs-on:`");
+        refused("    'runs-on': big-box\n", "outside the plain `runs-on:`");
+        refused(
+            "    steps:\n      - \"uses\": a/b@v1\n",
+            "outside the plain `uses:`",
+        );
+        refused(
+            "    steps:\n      - uses : a/b@v1\n",
+            "outside the plain `uses:`",
+        );
+    }
+
+    #[test]
+    fn flow_style_jobs_are_refused() {
+        // Catches: a non-hosted runner and an unpinned action hidden in a flow mapping.
+        let w =
+            "on: push\npermissions: {}\njobs: {a: {runs-on: big-box, steps: [{uses: a/b@v1}]}}\n";
+        let found = scan(w);
+        for want in [
+            "flow collection under `jobs:`",
+            "outside the plain `runs-on:`",
+            "outside the plain `uses:`",
+        ] {
+            assert!(found.iter().any(|m| m.contains(want)), "{want}: {found:?}");
+        }
+        // A flow sequence on a line under `jobs:`, as well as on the `jobs:` line.
+        refused("    needs: [b]\n", "flow collection under `jobs:`");
+        // Catches: a flow check that also refuses expressions and empty collections.
+        let ok = workflow("    if: ${{ github.event_name == 'push' }}\n    permissions: {}\n");
+        assert_eq!(scan(&ok), Vec::<String>::new());
+    }
+
+    #[test]
+    fn spellings_that_hide_words_are_refused() {
+        // Catches: an escape, tag, anchor, explicit key or continuation line spelling a
+        // value the substring checks never see.
+        refused("    \"runs\\u002don\": big-box\n", "backslash escape");
+        refused("    !!str runs-on: big-box\n", "quoted, tagged");
+        refused("    name: !!binary cnVucy1vbg==\n", "YAML tag");
+        refused("    ? runs-on\n    : big-box\n", "quoted, tagged");
+        refused("    &r runs-on: big-box\n", "quoted, tagged");
+        refused(
+            "    runs-on: ubuntu-latest\n      big-box\n",
+            "continues the value",
+        );
+        refused(
+            &format!("    steps:\n      - uses: a/b@{SHA} # v1\n          x\n"),
+            "continues the value",
+        );
+        let w = "on: [\"pull_request\\u005ftarget\"]\npermissions: {}\n";
+        assert!(scan(w).iter().any(|m| m.contains("backslash escape")));
     }
 
     #[test]
