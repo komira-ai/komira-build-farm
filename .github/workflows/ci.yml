@@ -182,16 +182,13 @@ jobs:
           set +e; mkdir -p target/coverage
           v() { name=$1; shift; echo "::group::variant $name"; "$@" > "target/coverage/$name.out" 2> "target/coverage/$name.err"; rc=$?; tail -c 600 "target/coverage/$name.err"; echo "::endgroup::"; echo "VARIANT $name rc=$rc bytes=$(wc -c < target/coverage/$name.out)"; }
           C="cargo +$COVERAGE_TOOLCHAIN llvm-cov report"
-          v default-1 $C --lcov
-          v default-2 $C --lcov
-          LLVM_COV_FLAGS=-num-threads=1 v threads1 $C --lcov
+          LLVM_COV_FLAGS=-skip-functions v skip-functions $C --lcov
+          v lcov-summary $C --lcov --summary-only
+          LLVM_COV_FLAGS=-skip-expansions v skip-expansions $C --lcov
+          LLVM_COV_FLAGS=-skip-functions v skip-functions-front $C --lcov -p kbf-front
           v json-summary $C --json --summary-only
           v text $C
-          v no-front $C --lcov --ignore-filename-regex 'crates/kbf-front/'
-          v only-coverage $C --lcov -p kbf-coverage
-          v only-front $C --lcov -p kbf-front
-          LLVM_COV_FLAGS=-num-threads=1 v threads1-again $C --lcov
-          cp target/coverage/threads1.out target/coverage/lcov.info || true
+          cp target/coverage/skip-functions.out target/coverage/lcov.info || true
           grep VARIANT -r /dev/null || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
