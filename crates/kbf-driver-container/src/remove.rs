@@ -15,6 +15,8 @@
 //! symlink (never its target), a socket or a device, and refuses a directory with
 //! `EISDIR`, which the walk then empties and removes.
 
+#![allow(dead_code)] // MUTANT
+
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;

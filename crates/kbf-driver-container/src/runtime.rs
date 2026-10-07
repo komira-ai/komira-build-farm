@@ -32,6 +32,7 @@ use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{ContainerSpec, Podman};
+#[allow(unused_imports)] // MUTANT
 use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -495,7 +496,7 @@ impl Lease {
         }
         // Not `std::fs::remove_dir_all`: it recurses once per level, and the action
         // decides how deep its scratch directory is.
-        match remove_tree(&self.dir) {
+        match std::fs::remove_dir_all(&self.dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Files an action wrote as another container user, or with no permissions
