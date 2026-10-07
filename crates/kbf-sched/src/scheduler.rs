@@ -302,7 +302,7 @@ impl Scheduler {
                 };
                 // A `Start` sent to an earlier session reached the worker before it
                 // registered again, and then the worker lists it, or it never will.
-                let due = sent.session < session || now >= sent.at.saturating_add(START_GRACE);
+                let due = sent.session > session || now >= sent.at.saturating_add(START_GRACE);
                 let op = &self.ops[&held.operation];
                 due && !running.contains(*lease)
                     && !op.result_proposed
@@ -477,7 +477,7 @@ impl StateMachine for Scheduler {
             Event::WorkerUp { worker, capacity } => {
                 let now = self.now;
                 self.workers
-                    .entry(worker.clone())
+                    .entry(worker)
                     .and_modify(|w| {
                         w.capacity = capacity;
                         w.last_heard = now;
@@ -489,7 +489,6 @@ impl StateMachine for Scheduler {
                         last_heard: now,
                         session: 0,
                     });
-                self.reconcile(&worker, &[]);
                 Vec::new()
             }
             Event::Heartbeat { worker, running } => {
