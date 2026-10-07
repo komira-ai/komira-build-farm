@@ -219,3 +219,28 @@ fn the_heartbeat_interval_fits_the_start_window() {
     let err = parse("7001").expect_err("over half the window accepted");
     assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
 }
+
+/// Catches: `--unservable-wait-secs` parsed but not handed to the scheduler (work no
+/// daemon can run would then wait the default 300 s whatever the operator set, or
+/// some other fixed time), and a default other than the scheduler's.
+#[test]
+fn the_unservable_wait_comes_from_its_flag() {
+    use clap::Parser;
+    use std::time::Duration;
+    let wait = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .unservable_wait
+    };
+    assert_eq!(wait(&[]), kbf_sched::UNSERVABLE_WAIT);
+    assert_eq!(
+        wait(&["--unservable-wait-secs", "7"]),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        wait(&["--unservable-wait-secs", "3600"]),
+        Duration::from_secs(3_600)
+    );
+}

@@ -11,9 +11,60 @@ These properties change how kbf schedules an action today:
 |---|---|---|---|
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under. |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
+| `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
+| `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
-Any other value of these two is refused with `INVALID_ARGUMENT`. Other properties
-are accepted and not yet acted on.
+Any other value of `kbf-lease` or `gpu` is refused with `INVALID_ARGUMENT`. kbf's own
+capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
+[capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
+(`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
+
+### Property names are read in any case
+
+kbf reads every property name it knows without regard to ASCII case, so a property
+meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
+`OSFAMILY=Darwin` and `OSFamily=darwin` all ask for a Mac. This holds for the REAPI
+names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
+(`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
+reserved `kbf-lease`, `kbf-cpu` and `kbf-mac-admin`. In `label.<k>` only `label.` is
+read in any case; the label's own name `<k>` is compared exactly, as its value is.
+`arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
+other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
+table. Values are compared as described for each key: `OSFamily`, `ISA` and `Arch`
+values in any case, kbf's own keys' values exactly.
+
+One property sent under two spellings of its name (`gpu` and `GPU`, `OSFamily` and
+`osfamily`) is refused with `INVALID_ARGUMENT`, as is one requirement named twice
+through two names (`OSFamily` and `os`, `ISA` and `arch`). A name kbf does not know,
+in any case, is not acted on.
+
+## Where an action runs
+
+An action runs only on a worker whose node report satisfies its platform: a Linux
+action is never handed to a Mac, nor an arm64 action to an x86-64 machine. Buck2 and
+Bazel name the platform with `OSFamily` (and `ISA` where the architecture matters):
+
+```starlark
+# Buck2: an execution platform's executor config
+remote_execution_properties = {"OSFamily": "linux", "ISA": "x86-64"}
+```
+
+```starlark
+# Bazel: a platform for actions that must run on the Macs
+platform(
+    name = "macos_arm64",
+    exec_properties = {"OSFamily": "Darwin", "ISA": "arm-a64"},
+)
+```
+
+An action no kbf daemon can ever run (an `OSFamily` other than Linux or macOS, an `ISA`
+of another architecture) is refused at once with `FAILED_PRECONDITION`. An action that
+no connected worker satisfies now waits: its operation stays `QUEUED`, and its metadata
+carries a `google.rpc.ErrorInfo` (reason `NO_WORKER_CAN_RUN`, domain `kbf`) whose `why`
+names the closest worker and what it lacks. The server logs it too. If no live worker
+satisfies it for `--unservable-wait-secs` (300 by default; the wait restarts whenever
+one does), it fails with `FAILED_PRECONDITION` and that reason. Work larger than every
+worker that satisfies its platform (`gpu=2` where nodes have one) is treated the same.
 
 ## `gpu`
 

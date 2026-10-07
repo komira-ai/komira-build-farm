@@ -154,6 +154,11 @@ pub struct Client {
 
 impl Cell {
     pub async fn start() -> Self {
+        Self::start_with_unservable_wait(kbf_sched::UNSERVABLE_WAIT).await
+    }
+
+    /// A cell whose scheduler refuses queued work no live worker can run after `wait`.
+    pub async fn start_with_unservable_wait(wait: Duration) -> Self {
         let cache = Arc::new(Cache::new(
             GateLog::new(),
             MemoryStore::new(Capabilities::default()),
@@ -166,6 +171,7 @@ impl Cell {
             heartbeat_interval: INTERVAL,
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
+            unservable_wait: wait,
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi, worker) = (bound.reapi, bound.worker);
@@ -282,8 +288,17 @@ impl Client {
     }
 }
 
-/// A Hello for `node` reporting `cpus` and `mem_gib`.
+/// A Hello for a Linux x86-64 `node` reporting `cpus` and `mem_gib`.
 pub fn hello(node: &str, cpus: u32, mem_gib: u32) -> Hello {
+    hello_on(node, cpus, mem_gib, &[("arch", "x86_64"), ("os", "linux")])
+}
+
+/// A Hello for `node` reporting `cpus`, `mem_gib` and the `platform` entries.
+pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) -> Hello {
+    let platform = platform.iter().map(|(key, value)| Capability {
+        key: (*key).to_owned(),
+        value: (*value).to_owned(),
+    });
     Hello {
         protocol_version: 1,
         node_id: node.to_owned(),
@@ -297,7 +312,10 @@ pub fn hello(node: &str, cpus: u32, mem_gib: u32) -> Hello {
                 key: "mem_gib".to_owned(),
                 value: mem_gib.to_string(),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(platform)
+        .collect(),
         report_hash: Vec::new(),
     }
 }

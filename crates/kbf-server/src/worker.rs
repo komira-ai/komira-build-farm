@@ -1,9 +1,11 @@
 //! The server side of `kbf.worker.v1`: one `Session` stream per daemon.
 //!
 //! The first message must be `Hello`. It is checked (protocol version, node id, the
-//! capacity entries of the node report), answered with `Welcome`, and registers the
-//! node: only this first `Hello` does (issue #25). On the stream after that:
-//! - a resent `Hello` changes the node's capacity and nothing else;
+//! capacity entries of the node report, and the entries placement matches platforms
+//! against: `arch` and the rest that [`caps`] reads), answered with `Welcome`, and
+//! registers the node: only this first `Hello` does (issue #25). On the stream after
+//! that:
+//! - a resent `Hello` changes the node's capacity and capabilities and nothing else;
 //! - a `Heartbeat` is fed to the scheduler and acknowledged, unless a newer stream of
 //!   the same node has registered since: then it is dropped unacknowledged, so a
 //!   daemon still talking on the old stream fences on time. A lease it lists that the
@@ -17,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{Stream, stream};
+use kbf_caps::NodeCaps;
 use kbf_front::MetaLog;
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::{
@@ -97,6 +100,7 @@ where
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
         let capacity = capacity(&hello).map_err(Status::invalid_argument)?;
+        let caps = caps(&hello).map_err(Status::invalid_argument)?;
         let worker = WorkerId::new(hello.node_id);
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
@@ -106,7 +110,7 @@ where
         let (outbound, responses) = mpsc::unbounded_channel();
         let stream = self
             .farm
-            .register(&worker, capacity, outbound.clone(), welcome);
+            .register(&worker, capacity, caps, outbound.clone(), welcome);
         tracing::info!(%worker, ?capacity, "worker registered");
         let farm = Arc::clone(&self.farm);
         tokio::spawn(serve(farm, worker, stream, inbound, outbound));
@@ -130,16 +134,18 @@ async fn serve<M: MetaLog, O: ObjectStore>(
             break;
         };
         let reply = match received.message {
-            Some(daemon_message::Message::Hello(hello)) => match capacity(&hello) {
-                Ok(capacity) => {
-                    farm.resize(&worker, stream, capacity);
-                    None
+            Some(daemon_message::Message::Hello(hello)) => {
+                match capacity(&hello).and_then(|capacity| Ok((capacity, caps(&hello)?))) {
+                    Ok((capacity, caps)) => {
+                        farm.resize(&worker, stream, capacity, caps);
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(%worker, error = %e, "a resent Hello ignored");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(%worker, error = %e, "a resent Hello ignored");
-                    None
-                }
-            },
+            }
             Some(daemon_message::Message::Heartbeat(beat)) => {
                 let running = beat
                     .running
@@ -191,6 +197,20 @@ pub fn capacity(hello: &Hello) -> Result<Resources, String> {
     let mem_gib = required("mem_gib")?;
     let gpus = entry(&hello.capabilities, "gpu")?.unwrap_or(0);
     Ok(Resources::new(cpus.saturating_mul(1_000), mem_gib.saturating_mul(1 << 30)).with_gpus(gpus))
+}
+
+/// What placement matches an action's platform against: the node report read by
+/// `kbf_caps::NodeCaps::from_report` (`arch`, `cpu.features`, `os`, labels, ...).
+///
+/// # Errors
+/// `arch` is missing, repeated or unknown; another single-valued entry is repeated; a
+/// countable entry is not a whole number.
+pub fn caps(hello: &Hello) -> Result<NodeCaps, String> {
+    let entries = hello
+        .capabilities
+        .iter()
+        .map(|c| (c.key.as_str(), c.value.as_str()));
+    NodeCaps::from_report(entries).map_err(|e| e.to_string())
 }
 
 fn missing(key: &str) -> String {

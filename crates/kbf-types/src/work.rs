@@ -181,6 +181,16 @@ pub struct ResultRecord {
     pub outcome: Outcome,
 }
 
+/// The scheduler gives up on a queued operation without running it: no live worker
+/// could run it for the whole of the wait bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusalRecord {
+    /// The operation.
+    pub operation: OperationId,
+    /// Why no worker could run it, for its callers.
+    pub reason: String,
+}
+
 /// An entry of the control log that the scheduler asks to commit.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +199,8 @@ pub enum ControlRecord {
     Lease(LeaseGrant),
     /// An accepted result. Its waiters are answered only once this is committed.
     Result(ResultRecord),
+    /// A refusal. Its waiters are answered only once this is committed.
+    Refusal(RefusalRecord),
 }
 
 /// Tells `worker` to run `operation` under a committed `lease`.
@@ -219,6 +231,28 @@ pub struct Answer {
     pub waiters: Vec<WaiterId>,
     /// The result.
     pub outcome: Outcome,
+}
+
+/// Why a queued operation is waiting, when no live worker can run it now. Its callers
+/// see the reason while it waits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    /// The operation.
+    pub operation: OperationId,
+    /// Why no live worker can run it, or `None` once one can again.
+    pub reason: Option<String>,
+}
+
+/// Answers every waiter of an operation the scheduler refused to run, with the
+/// committed reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The operation.
+    pub operation: OperationId,
+    /// Every waiter attached to it, in attach order.
+    pub waiters: Vec<WaiterId>,
+    /// Why no worker could run it.
+    pub reason: String,
 }
 
 #[cfg(test)]

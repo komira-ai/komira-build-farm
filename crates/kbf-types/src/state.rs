@@ -1,6 +1,6 @@
 //! The shape every pure core shares: inputs in, effects out.
 
-use crate::{Answer, ControlRecord, StartLease};
+use crate::{Answer, ControlRecord, Refusal, StartLease, Waiting};
 
 /// A deterministic state machine.
 ///
@@ -35,6 +35,11 @@ pub enum Effect {
     Start(StartLease),
     /// Answer every waiter of a finished operation.
     Answer(Answer),
+    /// Tell an operation's waiters why it waits (or that it no longer waits for a
+    /// worker that can run it).
+    Waiting(Waiting),
+    /// Answer every waiter of an operation the scheduler refused to run.
+    Refuse(Refusal),
 }
 
 #[cfg(test)]

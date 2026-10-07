@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+kbf-caps.workspace = true
 kbf-types.workspace = true
 
 [dev-dependencies]

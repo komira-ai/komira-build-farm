@@ -59,9 +59,14 @@ The node report is a list of `Capability { key, value }` entries, sorted by key 
 value so equal reports encode to equal bytes. A list-valued capability repeats its key
 once per value. [capabilities.md](capabilities.md) lists the keys. The report must
 carry exactly one `cpus` and one `mem_gib` entry, each a whole number: they are what
-placement books against. `report_hash` is the SHA-256 of the encoded entries in order.
+placement books against. It must also carry exactly one `arch` entry (`x86_64` or
+`arm64`): placement matches each action's platform against the report (see
+[capabilities.md](capabilities.md#matching)), and a node of unknown architecture could
+not be matched safely. `report_hash` is the SHA-256 of the encoded entries in order.
 
-The server checks the version, the node id and the capacity entries. If any fails, it
+The server checks the version, the node id, the capacity entries and the entries
+placement matches (`arch`; a repeated single-valued entry; a countable entry that is
+not a whole number). If any fails, it
 ends the stream with an error status (`FAILED_PRECONDITION` for an unaccepted version,
 `INVALID_ARGUMENT` otherwise). A stream that sends no `Hello` within 10 seconds ends
 `DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak and
@@ -69,8 +74,8 @@ the heartbeat interval in milliseconds.
 
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
-same stream (the daemon's node report changed) changes the node's capacity and nothing
-else. A newer stream from the same node replaces the older one: messages still arriving
+same stream (the daemon's node report changed) changes the node's capacity and
+capabilities and nothing else; a resent report that fails the checks is ignored. A newer stream from the same node replaces the older one: messages still arriving
 on the old stream are ignored from then on.
 
 The daemon refuses a `Welcome` whose interval is zero or whose double is not shorter

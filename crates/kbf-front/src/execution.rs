@@ -8,7 +8,10 @@
 //! - the request goes to the [`Dispatch`] (the scheduler), which joins a running twin
 //!   (in-flight dedup) or queues a new operation;
 //! - the call streams the operation: `QUEUED`, `EXECUTING` once a lease for it has
-//!   started, then the done operation with its `ExecuteResponse`.
+//!   started, then the done operation with its `ExecuteResponse`. While no live worker
+//!   can run it, the `QUEUED` operation's metadata says why, as a `google.rpc.ErrorInfo`
+//!   (reason [`NO_WORKER_REASON`], domain [`ERROR_DOMAIN`], the explanation under
+//!   metadata key `why`) in `partial_execution_metadata.auxiliary_metadata`.
 //!
 //! WaitExecution streams the same updates for an operation name Execute returned, until
 //! it is done. A finished operation is forgotten: waiting on it is NOT_FOUND, and the
@@ -21,6 +24,18 @@
 //! when absent; any other value than `action` or `whole_machine` is INVALID_ARGUMENT.
 //! The platform's `gpu` value is the number of whole GPUs to book on top (0 when
 //! absent); a value that is not a whole number is INVALID_ARGUMENT.
+//!
+//! The rest of the platform says which workers may run the action
+//! (`kbf_caps::Request::from_platform`: `OSFamily`, `ISA`, `Arch` and kbf's capability
+//! keys). A malformed one is INVALID_ARGUMENT. One no kbf daemon can ever run (an OS
+//! other than Linux or macOS, an architecture other than x86-64 or arm64) is
+//! FAILED_PRECONDITION at once, with no `PreconditionFailure` detail: there is nothing
+//! for the client to upload, and Bazel and Buck2 do not retry it.
+//!
+//! Every property name kbf reads is read without regard to case
+//! (`kbf_caps::property_name`): `GPU`, `Kbf-Lease` and `osfamily` are `gpu`,
+//! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
+//! INVALID_ARGUMENT.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
@@ -28,13 +43,16 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{Stream, stream};
+use kbf_caps::FromPlatformError;
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::longrunning::{Operation, operation};
-use kbf_proto::google::rpc::{self, PreconditionFailure, precondition_failure::Violation};
+use kbf_proto::google::rpc::{
+    self, ErrorInfo, PreconditionFailure, precondition_failure::Violation,
+};
 use kbf_proto::reapi::execution_server::Execution;
 use kbf_proto::reapi::{
     self, Action, Command, Directory, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
-    WaitExecutionRequest, execution_stage,
+    ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
 use kbf_types::{ActionKey, Digest, Platform, Qos, Resources};
@@ -56,6 +74,12 @@ pub const LEASE_KINDS: [&str; 2] = ["action", "whole_machine"];
 /// The platform key that asks for whole GPUs, each booked for the lease alone.
 pub const GPU_KEY: &str = "gpu";
 
+/// The `ErrorInfo.reason` of a queued operation no live worker can run.
+pub const NO_WORKER_REASON: &str = "NO_WORKER_CAN_RUN";
+
+/// The `ErrorInfo.domain` of kbf's errors.
+pub const ERROR_DOMAIN: &str = "kbf";
+
 /// What v0 books for every action: one core and 1 GiB, plus the GPUs its `gpu`
 /// property asks for.
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
@@ -75,6 +99,8 @@ pub struct Submission {
 pub enum Stage {
     /// Waiting for room.
     Queued,
+    /// Queued, and no live worker can run it now: why.
+    Waiting(String),
     /// A lease for it has started on a worker.
     Executing,
     /// Finished.
@@ -219,6 +245,7 @@ where
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
         let gpus = gpus(&platform)?;
+        let needs = needs(&platform)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
@@ -226,6 +253,7 @@ where
                 resources: DEFAULT_RESOURCES.with_gpus(gpus),
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
+                needs,
             },
             kind,
         })
@@ -292,11 +320,25 @@ fn required(d: Option<&reapi::Digest>, field: &str) -> Result<Digest, Status> {
     }
 }
 
-/// The platform's properties, or INVALID_ARGUMENT for a repeated one.
+/// The platform's properties that kbf reads, each under the name kbf reads it by
+/// (`kbf_caps::property_name`), or INVALID_ARGUMENT for a repeated one, also when
+/// repeated in another spelling (`gpu` and `GPU`).
 fn properties(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
     let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
-    Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
-        .map_err(|e| Status::invalid_argument(e.to_string()))
+    let sent = Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let mut read = Platform::new();
+    for (name, value) in sent.canonical() {
+        let Some(key) = kbf_caps::property_name(name) else {
+            continue;
+        };
+        read.insert(&*key, value).map_err(|_| {
+            Status::invalid_argument(format!(
+                "platform property {key:?} is given twice, in two spellings (one is {name:?})"
+            ))
+        })?;
+    }
+    Ok(read)
 }
 
 /// The number of GPUs a platform asks for, or INVALID_ARGUMENT.
@@ -308,6 +350,17 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
         Status::invalid_argument(format!(
             "platform property {GPU_KEY}={n:?} is not a whole number of GPUs"
         ))
+    })
+}
+
+/// What a worker must offer to run an action with `platform`: INVALID_ARGUMENT for a
+/// malformed platform, FAILED_PRECONDITION for one no kbf daemon can ever run.
+fn needs(platform: &Platform) -> Result<kbf_caps::Request, Status> {
+    kbf_caps::Request::from_platform(platform.canonical()).map_err(|e| match e {
+        FromPlatformError::Invalid(e) => {
+            Status::invalid_argument(format!("platform properties: {e}"))
+        }
+        FromPlatformError::NeverServed(why) => Status::failed_precondition(why),
     })
 }
 
@@ -359,8 +412,21 @@ fn any(type_name: &str, value: Vec<u8>) -> Any {
 
 /// The operation `name` at `stage`.
 fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operation {
+    let mut partial = None;
     let (value, result) = match stage {
         Stage::Queued => (execution_stage::Value::Queued, None),
+        Stage::Waiting(why) => {
+            let info = ErrorInfo {
+                reason: NO_WORKER_REASON.to_owned(),
+                domain: ERROR_DOMAIN.to_owned(),
+                metadata: [("why".to_owned(), why.clone())].into(),
+            };
+            partial = Some(ExecutedActionMetadata {
+                auxiliary_metadata: vec![any("google.rpc.ErrorInfo", info.encode_to_vec())],
+                ..ExecutedActionMetadata::default()
+            });
+            (execution_stage::Value::Queued, None)
+        }
         Stage::Executing => (execution_stage::Value::Executing, None),
         Stage::Done(finished) => {
             let response = match finished {
@@ -389,6 +455,7 @@ fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operat
         stage: value as i32,
         action_digest: Some(wire::digest_to_proto(action)),
         digest_function: reapi::digest_function::Value::Sha256 as i32,
+        partial_execution_metadata: partial,
         ..ExecuteOperationMetadata::default()
     };
     Operation {

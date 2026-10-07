@@ -10,6 +10,10 @@
 //!   `gpu` capacity a request books whole and exclusively.
 //! - [`Request`] and [`NodeCaps`] match with typed comparisons: exact, at least for
 //!   ordered levels, subset for feature sets, and minimums for countable resources.
+//! - [`Request::from_platform`] reads an action's REAPI platform (`OSFamily`, `ISA`
+//!   and kbf's own keys, the names in any case: [`property_name`]) as a request;
+//!   [`NodeCaps::from_report`] reads a daemon's node report as the capabilities
+//!   requests are matched against.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.
@@ -21,8 +25,12 @@ mod gpu;
 mod level;
 mod macos;
 mod matching;
+mod platform;
+mod report;
 
 pub use cpu::{Arch, CpuCaps, ParseError, UnknownArch};
 pub use gpu::{PciFunction, gpus_from_linux_pci, gpus_from_macos_sysctl};
 pub use level::{ArmVersion, IsaLevel, UnknownIsaLevel, X86Level};
 pub use matching::{Consumable, NodeCaps, Request, RequestError, Unmet};
+pub use platform::{DAEMON_OSES, FromPlatformError, REAPI_KEYS, property_name};
+pub use report::ReportError;

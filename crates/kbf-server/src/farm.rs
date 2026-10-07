@@ -12,8 +12,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Dispatch, Finished, MetaLog, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
@@ -26,7 +27,7 @@ use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Event, Input, OpState, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Resources, StartLease, StateMachine, WaiterId, WorkerId,
+    Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
@@ -107,14 +108,15 @@ struct Settled {
 }
 
 impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
-    /// A farm over `cache`, with an empty scheduler.
+    /// A farm over `cache`, with an empty scheduler that refuses queued work once no
+    /// live worker has been able to run it for `unservable_wait`.
     #[must_use]
-    pub fn new(cache: Arc<Cache<M, O>>) -> Self {
+    pub fn new(cache: Arc<Cache<M, O>>, unservable_wait: Duration) -> Self {
         Self {
             cache,
             epoch: Instant::now(),
             state: Mutex::new(State {
-                sched: Scheduler::new(SINGLE_NODE_TERM),
+                sched: Scheduler::new(SINGLE_NODE_TERM).with_unservable_wait(unservable_wait),
                 next_waiter: 0,
                 next_stream: 0,
                 waiters: BTreeMap::new(),
@@ -138,11 +140,13 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// The first `Hello` of a stream: queues `welcome` on `outbound`, makes this the
     /// worker's stream for every `Start` from now on, and registers the worker (a new
-    /// session). Messages still arriving on its earlier stream are ignored from now on.
+    /// session) with its `capacity` and `caps`. Messages still arriving on its earlier
+    /// stream are ignored from now on.
     pub fn register(
         &self,
         worker: &WorkerId,
         capacity: Resources,
+        caps: NodeCaps,
         outbound: Outbound,
         welcome: ServerMessage,
     ) -> StreamId {
@@ -161,20 +165,22 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let event = Event::WorkerUp {
             worker: worker.clone(),
             capacity,
+            caps,
         };
         state.feed_quiet(now, event);
         stream
     }
 
     /// A `Hello` resent on `stream`: the node report changed. Changes the worker's
-    /// capacity and nothing else; ignored if `stream` was replaced.
-    pub fn resize(&self, worker: &WorkerId, stream: StreamId, capacity: Resources) {
+    /// capacity and capabilities and nothing else; ignored if `stream` was replaced.
+    pub fn resize(&self, worker: &WorkerId, stream: StreamId, capacity: Resources, caps: NodeCaps) {
         let now = self.now();
         let mut state = self.lock();
         if state.is_current(worker, stream) {
             let event = Event::Capacity {
                 worker: worker.clone(),
                 capacity,
+                caps,
             };
             state.feed_quiet(now, event);
         }
@@ -430,6 +436,8 @@ impl State {
                 }
                 Effect::Start(start) => self.start(start),
                 Effect::Answer(answer) => answers.push(answer),
+                Effect::Waiting(waiting) => self.waiting(&waiting),
+                Effect::Refuse(refusal) => self.refuse(&refusal),
             }
         }
         answers
@@ -495,10 +503,60 @@ impl State {
         self.started.insert(start.lease, start.operation);
     }
 
+    /// Tells an operation's callers why it waits, or that it no longer waits for a
+    /// worker that can run it. Logged, so an operator sees it too.
+    fn waiting(&self, waiting: &Waiting) {
+        let operation = waiting.operation;
+        let stage = match &waiting.reason {
+            Some(why) => {
+                tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
+                Stage::Waiting(why.clone())
+            }
+            None => {
+                tracing::info!(%operation, "a live worker can run the operation again");
+                Stage::Queued
+            }
+        };
+        // A caller that joins a waiting operation is told again; the others, who
+        // already know, see no repeated update.
+        let waiters = self.sched.waiters(operation).unwrap_or_default();
+        for w in waiters.iter().filter_map(|id| self.waiters.get(id)) {
+            w.stage.send_if_modified(|now| {
+                let changed = *now != stage;
+                if changed {
+                    now.clone_from(&stage);
+                }
+                changed
+            });
+        }
+    }
+
+    /// Forgets every lease of a finished `operation` whose `Start` was sent.
+    fn forget_leases(&mut self, operation: OperationId) {
+        self.started.retain(|_, op| *op != operation);
+    }
+
+    /// Forgets an operation the scheduler refused and answers its callers
+    /// FAILED_PRECONDITION with the reason. Nothing is cached, so nothing is awaited.
+    fn refuse(&mut self, refusal: &Refusal) {
+        tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
+        let finished = failed(Code::FailedPrecondition, &refusal.reason);
+        // A lease given up before the operation was refused may still be listed.
+        self.forget_leases(refusal.operation);
+        for w in refusal
+            .waiters
+            .iter()
+            .filter_map(|id| self.waiters.remove(id))
+        {
+            self.names.remove(&w.name);
+            w.stage.send_replace(Stage::Done(finished.clone()));
+        }
+    }
+
     /// Forgets a finished operation and works out what its callers get. `detail` is
     /// what the accepted report carried beyond its outcome, if anything.
     fn settle(&mut self, answer: &Answer, detail: Option<Detail>) -> Settled {
-        self.started.retain(|_, op| *op != answer.operation);
+        self.forget_leases(answer.operation);
         let waiters: Vec<Waiter> = answer
             .waiters
             .iter()

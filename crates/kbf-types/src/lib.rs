@@ -26,5 +26,5 @@ pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
 pub use work::{
     ActionKey, Answer, ControlRecord, Failure, FencePolicy, LeaseGrant, OperationId, Outcome,
-    Resources, ResultRecord, StartLease, WaiterId, WorkerId,
+    Refusal, RefusalRecord, Resources, ResultRecord, StartLease, WaiterId, Waiting, WorkerId,
 };

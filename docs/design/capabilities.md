@@ -33,8 +33,11 @@ A daemon on another operating system refuses to start: macOS detection arrives w
 macOS drivers (**planned**), though `kbf-caps` already parses macOS `sysctl` output.
 
 `cpus` and `mem_gib` are the whole machine. They are resources, not capabilities: the
-scheduler books against them and there are no slots. Today they are the only entries
-the server reads (see [scheduler.md](scheduler.md#placement)).
+scheduler books against them and there are no slots (see
+[scheduler.md](scheduler.md#placement)). The server reads the rest of the report with
+`kbf_caps::NodeCaps::from_report`: `arch` (required), `cpu.features`, the countable
+entries and the exact keys below. The reported `isa_level` list is not read back: the
+level is computed again from the features, so the two can never disagree.
 
 ### Reading CPU features
 
@@ -121,29 +124,59 @@ consequences shape the design:
   on a v4 machine, produces v4 code under a v3 key. Toolchains should pass an explicit
   target CPU; a tool that cannot should ask for `cpu.model` exactly.
 
+### The names build tools send
+
+Buck2 and Bazel send whatever their remote platform sets (`remote_execution_properties`,
+`exec_properties`); by convention that is REAPI's standard names, not kbf's.
+`kbf_caps::Request::from_platform` reads them:
+
+| Property | Value (any case) | Request |
+|---|---|---|
+| `OSFamily` | `linux` | `os=linux` |
+| `OSFamily` | `darwin`, `macos`, `macosx`, `osx` | `os=macos` |
+| `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64` | `arch=x86_64` |
+| `ISA`, `Arch` | `arm-a64`, `arm64`, `aarch64` | `arch=arm64` |
+| `ISA`, `Arch` | an ISA level (`x86-64-v3`, `armv8.2-a`) | its `arch` and `isa_level` |
+
+Every key in the matching table above passes through unchanged, except `gpu`, which is
+booked (see [platform-properties.md](../platform-properties.md#gpu)). Every other
+property is not a capability and is left to whoever reads it (`kbf-lease`,
+`container-image`, ...). One requirement named twice (`OSFamily` and `os`) is refused.
+
+Property names are read without regard to ASCII case (`kbf_caps::property_name`): the
+REAPI names above and every kbf key (`osfamily`, `OS`, `GPU`, `Kbf-Lease`), so a
+property meant for kbf is never dropped for its spelling and the action run anywhere.
+A label's own name keeps its case. `arch` spelled exactly so is kbf's key; any other
+spelling is REAPI's `Arch`. One name in two spellings is refused.
+
 ## What the code enforces today
 
 - The front reads `kbf-lease` from the action's platform (on the `Action`, or on the
   `Command` for clients older than REAPI 2.2). Absent means `action`; any value other
   than `action` or `whole_machine` is `INVALID_ARGUMENT`. A property name that is empty
   or appears twice is `INVALID_ARGUMENT` as well.
+- The front turns the platform into a request (above). A malformed one is
+  `INVALID_ARGUMENT`. One no kbf daemon can ever run, an `os` other than `linux` or
+  `macos` or an `ISA` naming another architecture, is `FAILED_PRECONDITION` at once.
+- **Matching in placement.** The scheduler offers an action only to a live worker whose
+  report satisfies its request; matches are memoised per request within a placement
+  round. See [scheduler.md](scheduler.md#placement).
+- **Answers when nothing matches.** A request no live worker satisfies (or none that
+  does is large enough for) waits in the queue, and its callers see why in the
+  operation's metadata. After `--unservable-wait-secs` (300 by default) of that it
+  fails with `FAILED_PRECONDITION`, which neither Bazel nor Buck2 retries.
 - The daemon refuses a `Start` for a lease kind no runtime of its serves. The container
   driver serves `action` only.
 - The container driver reads `container-image` itself (see
   [daemon.md](daemon.md#the-container-driver)).
-- `kbf-caps` matching is implemented and tested, but the scheduler does not call it
-  yet: any registered worker with room may receive any action.
 
 ## Planned
 
-- **Matching in placement.** A worker is feasible only if its report satisfies the
-  request and it offers a driver for the lease kind; matches are memoised per property
-  set. Execution-only keys such as `container-image` are read by the driver rather than
-  matched. An unknown key is refused at `Execute` with `INVALID_ARGUMENT` naming the
-  closest known key.
-- **Answers when nothing matches.** A valid request no live worker matches waits in the
-  queue with a visible reason, and fails with `FAILED_PRECONDITION` after a bound
-  (neither Bazel nor Buck2 retries that code).
+- **Drivers in placement.** A worker is feasible only if it also offers a driver for
+  the lease kind (today the daemon refuses the `Start`).
+- **Unknown keys refused.** An unknown property is refused at `Execute` with
+  `INVALID_ARGUMENT` naming the closest known key; today properties that are not
+  capability keys are ignored, so a misspelt `OSFamilly` matches every worker.
 - **More report entries:** `cpu.model` (a human name for the microarchitecture),
   `nvme_gib`, `gpu`, `os_image`, `xcode` on macOS, the images already on the machine, and
   virtualization support (reported only, for a later VM driver).
