@@ -250,27 +250,50 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   cannot name another lease's uid, and a deleted lease (whose uid may be reused) is
 >   refused. The kill is `kill(-1, SIGKILL)` from a child that took the uid, repeated
 >   until `libproc` lists no live process of it by real or effective uid.
-> - The grant is `<payload>.<signature>` in base64url, Ed25519 over a four-line payload
->   (magic, serial, lease, `not-after`), valid at most 65 minutes ahead; the gate's
->   public keys are a file named by a flag (how the MDM delivers it is P3's).
+> - The grant is the gate's own (`kbf-mdm`'s `grant` module, S5.2), one format on
+>   both sides: the text `kbf-grant-v1`, `serial`, `lease`, `issued` and `not-after`
+>   (RFC 3339, an hour after `issued`), one field per line, signed with Ed25519 by the
+>   gate's key; the signature and key are standard base64. The daemon forwards
+>   `grant-admin`'s answer as it is; the helper reads `grant` and `signature` only and
+>   verifies under the keys installed on the Mac, never the answer's `key`. It refuses
+>   a grant valid for more than an hour after `issued`, or issued more than five
+>   minutes ahead of its own clock. A test verifies a grant the gate's own code signed.
+> - The gate's public keys are a file named by a flag (base64, one per line; how the
+>   MDM delivers it is P3's). It, the state directory and the ledger must be root's
+>   and writable by no one else, and the key file is never read through a link: whoever
+>   could write them could make administrators or replay a grant.
 > - The sweep covers the home folder, the crontab, `at` jobs, launchd's per-uid
 >   `disabled` and `loginitems` files, the shared user folder and the temporary
->   folders. Background Task Management entries live in one system-wide database; no
->   per-uid removal is built, so they stay **[A]**, for the leak scan (P4).
+>   folders. The crontab and `at` jobs go first, and `user-delete` looks for live
+>   processes of the uid three times: before anything is removed, once those are gone
+>   (a job that fired after `kill-uid` is found there), and after the whole sweep,
+>   just before the record is deleted; any process refuses the delete. A process
+>   whose state cannot be read counts as live. Background Task Management entries live
+>   in one system-wide database; no per-uid removal is built, so they stay **[A]**, for
+>   the leak scan (P4).
+> - **Pending print jobs are not swept.** CUPS keeps a job's files in
+>   `/private/var/spool/cups` owned by root, not by the user, so a sweep by owner
+>   cannot find them; cancelling the departing user's jobs by name (`cancel -u`) is
+>   P4's, and until then they are for the leak scan.
+> - On the hosted macOS runner a new lease user is also a member of `_lpoperator`
+>   and `com.apple.sharepoint.group.1`, through nested groups. P4's leak scan should
+>   record a lease user's group memberships.
 > - The password is random and never told to anyone; with no password known, an
 >   administrator lease user cannot use `sudo` either. P4's auto-login needs its own
 >   way to hand the session a password.
 > - `run` starts the process in the system launchd domain as the lease user, not in
 >   the user's own domain (`launchctl asuser`); tools that need per-user launchd
 >   services are P4's.
-> - **Measured, against S4.3:** on the CI's hosted macOS runner, a process that
->   connected and then executed the genuine client was **accepted**: the audit token
->   taken at connect still resolved, after the exec, to code that satisfied the
->   requirement, so the pid version did not change on `exec` there. Any other binary
->   is refused. The CI job reports this case on every run. Closing it needs more than
->   the token, for example a challenge the daemon answers with a key only its own
->   code can use (S6's keychain identity); until then control 1 (nothing a lease runs
->   is in the helpers' group) is the defence against it.
+> - **The caller check (S4.3) as built.** An earlier build checked the caller only
+>   after reading its request, and on the hosted macOS runner a process that connected
+>   and then executed the genuine client was accepted: the audit token was fetched
+>   after the exec, by which time it named the genuine client. The helper now
+>   identifies and checks the caller as soon as it accepts, before reading anything,
+>   sends a fresh nonce the request must carry, and requires the same audit token
+>   (pid and pid version) once the request has arrived. The CI job plants both forms, executing after the
+>   helper's answer and writing the request first, and fails if either is accepted;
+>   it prints the token's pid and pid version at accept and at the request, and what
+>   `LOCAL_PEERTOKEN` reports across an `exec`. The case left open is in S4.3.
 > - On macOS `kill(-1)` also signals the sender, so the helper's killer child ends by
 >   `SIGKILL`; that is its normal end.
 
@@ -307,9 +330,16 @@ socket mode 0660. Two controls, the first being the one that matters:
      and debugger attachment do not work. The helper reads the caller's audit token
      (`LOCAL_PEERTOKEN`), gets the caller's code with `SecCodeCopyGuestWithAttributes`
      and `kSecGuestAttributeAudit`, then checks it with `SecCodeCheckValidity` against
-     the `kbf-daemon` requirement (its cdhash) pinned by the installed set. The audit
-     token's pid version changes on `exec`, so a caller that connects and then
-     executes the genuine daemon is refused.
+     the `kbf-daemon` requirement (its cdhash) pinned by the installed set. It does
+     so as soon as it accepts the connection, before reading a byte; it then sends a
+     fresh nonce the request must carry, and when the request arrives the audit token
+     (pid and pid version) must be the one it checked. So a caller that connects and
+     then executes the genuine daemon is refused: it was checked as itself, and a
+     request written before the exec cannot carry the nonce. Left open: a process that
+     executes the daemon before the helper accepts while a child it forked keeps the
+     connection, where the kernel's token does not follow the child that writes. The
+     full answer is a challenge the daemon answers with a key only its own code can
+     use (S6's keychain identity); until then control 1 is the defence against it.
    - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures ([mac-node-provisioning.md](mac-node-provisioning.md)'s lean) the
      MDM's Full Disk Access profile can only pin `kbf-mac-session`'s cdhash, so a set
      that changes `kbf-mac-session` also needs a new profile, pushed through the gate in
@@ -476,7 +506,7 @@ Each with the planted mutant that must turn it red:
 | `kbf-updater` refuses an unsigned set, one signed by a key no root statement names, and a component-key set that changes the OS | skip key coverage |
 | An action is refused at each helper's socket | socket 0666; action as the daemon's uid; caller check removed |
 | A container action's host uid is not the daemon's | drop `--userns` |
-| A caller that connects and then executes the genuine daemon is refused (macOS) | check the cdhash by pid instead of the audit token |
+| A caller that connects and then executes the genuine daemon is refused (macOS), whether it executes after the helper's answer or writes its request first | check the caller only after reading its request, and drop the nonce |
 | The helpers refuse to start beside `--driver native` on Linux | drop the check |
 | A `rollout`-role request with a strategy field is refused | accept strategy from `rollout` |
 | The gate refuses an unauthenticated caller, a serial outside its inventory, a second outstanding erase or enforcement, an erase past the cap, and one below the floor | drop the outstanding-erase check |
