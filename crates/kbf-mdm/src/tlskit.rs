@@ -5,8 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+use rustls::client::ResolvesClientCert;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// PEM certificate and key.
@@ -133,19 +135,58 @@ pub async fn request_with(
     path: &str,
     body: &[u8],
 ) -> std::io::Result<(u16, String)> {
+    let client = client.map(|id| (id, id));
+    request_as(versions, addr, ca, client, method, path, body).await
+}
+
+/// Presents one certificate and key, whether or not they belong together: an
+/// impostor can copy the pinned server's certificate (it is public) but not its key.
+#[derive(Debug)]
+pub struct Presents(pub Arc<CertifiedKey>);
+
+impl ResolvesClientCert for Presents {
+    fn resolve(&self, _: &[&[u8]], _: &[rustls::SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// [`request_with`], presenting the certificate of `client.0` and signing the handshake
+/// with the private key of `client.1`.
+pub async fn request_as(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    addr: SocketAddr,
+    ca: &str,
+    client: Option<(&Identity, &Identity)>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> std::io::Result<(u16, String)> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(ca.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
+    let provider_key = |key: &PrivateKeyDer<'static>| {
+        provider
+            .key_provider
+            .load_private_key(key.clone_key())
+            .unwrap()
+    };
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(versions)
         .unwrap()
         .with_root_certificates(roots);
     let config = match client {
-        Some(id) => builder
-            .with_client_auth_cert(id.chain(), id.private_key())
-            .unwrap(),
+        Some((cert, key)) => {
+            let key = provider_key(&key.private_key());
+            let presents = Presents(Arc::new(CertifiedKey::new(cert.chain(), key)));
+            assert!(presents.has_certs());
+            builder.with_client_cert_resolver(Arc::new(presents))
+        }
         None => builder.with_no_client_auth(),
     };
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));

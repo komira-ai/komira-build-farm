@@ -21,8 +21,7 @@ fn put(path: &Path, text: &str, mode: u32) {
 /// Writes every file a gate needs under a fresh directory; the flags that name them.
 fn setup(name: &str, hub: &FakeHub, pki: &Pki) -> (PathBuf, Cli) {
     let dir = crate::testkit::scratch(name);
-    let inventory =
-        r#"{"macs": [{"serial": "MAC0", "enrollment": "UDID-0", "pool": "mac-arm64"}]}"#;
+    let inventory = r#"{"macs": [{"serial": "MAC0", "enrollment": "UDID-0", "pool": "mac-arm64", "arch": "arm64"}]}"#;
     put(&dir.join("inventory.json"), inventory, 0o644);
     let signers = crate::testkit::SkKey::new(1).allowed_line("alice");
     put(&dir.join("allowed_signers"), &signers, 0o644);
@@ -214,6 +213,49 @@ async fn every_file_is_checked_before_the_gate_starts() {
         },
         "state file",
     );
+}
+
+#[test]
+fn nanohub_must_be_on_loopback() {
+    // Catches: a gate that sends NanoHUB's API key (HTTP basic authentication, often
+    // plain HTTP) to any host the flag names (M5.1: the API listens on loopback only).
+    for ok in [
+        "http://localhost:9004",
+        "http://LOCALHOST:9004/",
+        "https://localhost",
+        "http://127.0.0.1:9004",
+        "http://[::1]:9004",
+    ] {
+        assert_eq!(loopback_url(ok), Ok(ok));
+    }
+    for bad in [
+        "http://192.0.2.5:9004",
+        "http://nanohub.example.org:9004",
+        "http://localhost.example.org",
+        "http://[::2]:9004",
+        "http://0.0.0.0:9004",
+        "ftp://localhost/",
+        "unix:/run/nanohub.sock",
+    ] {
+        let e = loopback_url(bad).unwrap_err();
+        assert!(e.contains("must be on loopback"), "{bad}: {e}");
+    }
+    let e = loopback_url("localhost").unwrap_err();
+    assert!(e.starts_with("--nanohub-url localhost: "), "{e}");
+}
+
+#[tokio::test]
+async fn startup_refuses_a_nanohub_off_loopback() {
+    let hub = start(API_KEY).await;
+    let pki = pki();
+    let (_dir, cli) = setup("config-loopback", &hub, &pki);
+    let e = gate(&Cli {
+        nanohub_url: "http://192.0.2.1:9004".into(),
+        ..cli
+    })
+    .err()
+    .unwrap();
+    assert!(e.contains("must be on loopback"), "{e}");
 }
 
 #[tokio::test]

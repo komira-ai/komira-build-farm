@@ -41,6 +41,8 @@ pub struct Mac {
     /// The MDM's enrollment id (the Mac's UDID).
     pub enrollment: String,
     pub pool: String,
+    /// The Mac's CPU, as a set's `platform.arch` names it: `arm64` or `x86_64`.
+    pub arch: String,
 }
 
 impl Mac {
@@ -63,16 +65,22 @@ struct InventoryFile {
 pub struct Inventory(BTreeMap<String, Mac>);
 
 impl Inventory {
-    /// Reads `{"macs": [{"serial", "enrollment", "pool"}, ...]}`.
+    /// Reads `{"macs": [{"serial", "enrollment", "pool", "arch"}, ...]}`.
     ///
     /// # Errors
-    /// The text is not that, a serial is malformed, or a serial is listed twice.
+    /// The text is not that, a serial or arch is malformed, or a serial is listed twice.
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: InventoryFile = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let mut macs = BTreeMap::new();
         for mac in file.macs {
             if !crate::request::valid_serial(&mac.serial) {
                 return Err(format!("bad serial {:?}", mac.serial));
+            }
+            if !matches!(mac.arch.as_str(), "arm64" | "x86_64") {
+                return Err(format!(
+                    "{}: arch {:?} is not arm64 or x86_64",
+                    mac.serial, mac.arch
+                ));
             }
             if let Some(dup) = macs.insert(mac.serial.clone(), mac) {
                 return Err(format!("serial {} listed twice", dup.serial));
@@ -96,7 +104,8 @@ impl Inventory {
 pub struct Policy {
     /// The fewest Macs that must stay available (not being erased or updated).
     pub mac_floor: usize,
-    /// Erases sent or reserved in any 24 hours.
+    /// The cap on erases sent in the last 24 hours plus erases scheduled and not yet
+    /// sent.
     pub daily_erase_cap: usize,
     /// The longest privileged lease: a granted Mac is erased this long after its grant.
     pub max_lease_secs: i64,
@@ -153,6 +162,8 @@ pub enum Refusal {
     WrongPool { set: String, mac: String },
     #[error("the set is for {0}, not macos")]
     NotMacos(String),
+    #[error("the set is for {set}, not the Mac's {mac}")]
+    WrongArch { set: String, mac: String },
     #[error("the set's serial {serial} is below the pool's floor {floor}")]
     BelowPoolFloor { serial: u64, floor: u64 },
     #[error("the key statement's serial {got} is older than {newest}")]
@@ -221,7 +232,10 @@ pub struct Fleet {
     pub mac_floor: usize,
     pub available: usize,
     pub daily_erase_cap: usize,
+    /// Erases sent in the last 24 hours.
     pub erases_last_24h: usize,
+    /// Erases scheduled with a grant and not yet sent; they count toward the cap too.
+    pub erases_scheduled: usize,
     pub outstanding_erase: Option<String>,
 }
 
@@ -385,6 +399,7 @@ impl<B: MdmBackend> Gate<B> {
             available: self.available(&state),
             daily_erase_cap: self.policy.daily_erase_cap,
             erases_last_24h: Self::erases_last_day(&state, self.clock.now()),
+            erases_scheduled: state.scheduled.len(),
             outstanding_erase: state.outstanding_erase.as_ref().map(|o| o.serial.clone()),
         }
     }
@@ -439,6 +454,12 @@ impl<B: MdmBackend> Gate<B> {
         }
         if set.os != "macos" {
             return Err(Refusal::NotMacos(set.os));
+        }
+        if set.arch != mac.arch {
+            return Err(Refusal::WrongArch {
+                set: set.arch,
+                mac: mac.arch.clone(),
+            });
         }
         let floor = state.pool_floors.get(&mac.pool).copied().unwrap_or(0);
         if set.serial < floor {

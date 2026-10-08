@@ -100,7 +100,10 @@ async fn the_erase_lease_and_grant_verbs() {
             .starts_with("kbf-grant-v1\n")
     );
     assert!(
-        grant["signature"].is_string() && grant["key"].is_string() && grant["erase_at"].is_string()
+        grant["signature"].is_string()
+            && grant["key"].is_string()
+            && grant["token"].is_string()
+            && grant["erase_at"].is_string()
     );
     let (status, body) = api
         .post(

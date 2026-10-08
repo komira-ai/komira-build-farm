@@ -58,6 +58,46 @@ async fn only_the_pinned_server_key_is_answered() {
 }
 
 #[tokio::test]
+async fn the_pinned_certificate_without_its_private_key_is_refused() {
+    // Catches: a verifier that matches the pin but does not check the handshake
+    // signature (TLS 1.3 CertificateVerify, or TLS 1.2's): the pin is on a certificate,
+    // and a certificate is public. The proof is the client signing with the key.
+    let f = Fixture::new("tls-possession");
+    let pki = pki();
+    let addr = listen(crate::api::router(f.gate.clone()), &pki, HANDSHAKE).await;
+    for versions in [
+        &[&rustls::version::TLS13][..],
+        &[&rustls::version::TLS12][..],
+    ] {
+        // The same path, with the server's own key, is answered: the refusal below is
+        // the key's doing, not the client's.
+        let (status, body) = crate::tlskit::request_as(
+            versions,
+            addr,
+            &pki.ca,
+            Some((&pki.server, &pki.server)),
+            "GET",
+            "/v1/macs",
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200, "{versions:?}: {body}");
+        let impostor = crate::tlskit::request_as(
+            versions,
+            addr,
+            &pki.ca,
+            Some((&pki.server, &pki.stranger)),
+            "GET",
+            "/v1/macs",
+            b"",
+        )
+        .await;
+        assert!(impostor.is_err(), "{versions:?}: {impostor:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_silent_client_is_dropped_after_the_handshake_timeout() {
     let f = Fixture::new("tls-timeout");
     let pki = pki();

@@ -51,13 +51,14 @@ pub struct Cli {
     /// the gate accepts.
     #[arg(long)]
     pub server_key_sha256: String,
-    /// NanoHUB's API, on loopback (for example `http://localhost:9004`).
+    /// NanoHUB's API, on loopback (for example `http://localhost:9004`); any other host
+    /// is refused at startup.
     #[arg(long)]
     pub nanohub_url: String,
     /// A file holding NanoHUB's API key, readable by its owner only.
     #[arg(long)]
     pub nanohub_api_key_file: PathBuf,
-    /// The inventory: `{"macs": [{"serial", "enrollment", "pool"}]}`.
+    /// The inventory: `{"macs": [{"serial", "enrollment", "pool", "arch"}]}`.
     #[arg(long)]
     pub inventory: PathBuf,
     /// The operators' allowed-signers file, read again for every erase request.
@@ -81,7 +82,8 @@ pub struct Cli {
     /// The fewest Macs that must stay available (not being erased or updated).
     #[arg(long)]
     pub mac_floor: usize,
-    /// Erases sent or reserved in any 24 hours.
+    /// The cap on erases sent in the last 24 hours plus erases scheduled and not yet
+    /// sent.
     #[arg(long, default_value_t = 2)]
     pub daily_erase_cap: usize,
     /// The longest privileged lease, in minutes: a granted Mac is erased this long after
@@ -113,6 +115,26 @@ fn read_secret(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_owned())
         .map_err(|e| fail(&e))
+}
+
+/// Accepts NanoHUB's address only on loopback (M5.1): the gate sends the API key in
+/// HTTP basic authentication, so another host would see it on the wire.
+fn loopback_url(text: &str) -> Result<&str, String> {
+    let url = reqwest::Url::parse(text).map_err(|e| format!("--nanohub-url {text}: {e}"))?;
+    let host = url.host_str().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if matches!(url.scheme(), "http" | "https") && loopback {
+        Ok(text)
+    } else {
+        Err(format!(
+            "--nanohub-url {text}: NanoHUB's API must be on loopback (localhost, \
+             IPv4 loopback or ::1), over http or https"
+        ))
+    }
 }
 
 fn parse_pin(text: &str) -> Result<[u8; 32], String> {
@@ -147,7 +169,10 @@ pub fn gate(cli: &Cli) -> Result<Gate<NanoHub>, String> {
     let signers = trusted::read_text(&cli.allowed_signers, owner)?;
     crate::signers::AllowedSigners::parse(&signers).map_err(|e| e.to_string())?;
     trusted::read_text(&cli.profile_allowlist, owner)?;
-    let backend = NanoHub::new(&cli.nanohub_url, read_secret(&cli.nanohub_api_key_file)?);
+    let backend = NanoHub::new(
+        loopback_url(&cli.nanohub_url)?,
+        read_secret(&cli.nanohub_api_key_file)?,
+    );
     std::fs::create_dir_all(&cli.state_dir)
         .map_err(|e| format!("{}: {e}", cli.state_dir.display()))?;
     let journal = Journal::open(&cli.state_dir.join("audit.log"), Box::new(LogAlerts))

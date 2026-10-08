@@ -316,7 +316,7 @@ async fn a_held_request_makes_only_its_own_leases_grant_once() {
     ));
     let fleet = f.gate.fleet().await;
     assert_eq!(fleet.macs["MAC0"].scheduled_erase, Some(granted.erase_at));
-    assert_eq!(fleet.erases_last_24h, 1);
+    assert_eq!((fleet.erases_last_24h, fleet.erases_scheduled), (0, 1));
     assert_eq!(
         f.alerts.summary(),
         [
@@ -398,10 +398,11 @@ async fn the_gate_erases_a_granted_mac_on_time_whatever_the_requests_not_after()
     f.advance(1);
     f.gate.tick().await.unwrap();
     assert_eq!(f.mdm.erases(), ["erase UDID-0"]);
+    let fleet = f.gate.fleet().await;
     assert_eq!(
-        f.gate.fleet().await.erases_last_24h,
-        1,
-        "counted once, at the grant"
+        (fleet.erases_last_24h, fleet.erases_scheduled),
+        (1, 0),
+        "counted as scheduled until sent, then as sent"
     );
     assert_eq!(
         f.alerts.summary().last().unwrap(),
@@ -633,6 +634,157 @@ async fn an_erased_mac_that_left_the_inventory_or_whose_status_fails_is_handled(
     f.gate.state.lock().await.erased.insert("GONE".into(), NOW);
     f.gate.tick().await.unwrap();
     assert!(!f.gate.state.lock().await.erased.contains_key("GONE"));
+}
+
+#[tokio::test]
+async fn a_refused_signed_request_alerts_with_its_signer_and_purpose() {
+    // Catches: refusal alerts that name only the refusal (M4.2: every refused request
+    // alerts "naming the serial, the purpose and the signer"), once the signature has
+    // verified; before that nothing in the request is trusted, so nothing is named.
+    let mut f = Fixture::new("erase-refusal-detail");
+    let first = f.signed("MAC0", Purpose::EraseNow);
+    f.gate.erase("MAC0", &first).await.unwrap();
+    let busy = f.signed("MAC1", Purpose::EraseNow);
+    f.gate.erase("MAC1", &busy).await.unwrap_err();
+    let held = f.signed("MAC2", lease("L7"));
+    f.gate.erase("MAC2", &held).await.unwrap();
+    let again = f.signed("MAC2", lease("L7"));
+    f.gate.erase("MAC2", &again).await.unwrap_err();
+    let mut forged = f.signed("MAC1", Purpose::EraseNow);
+    forged.signature = f.key.sign(b"another message");
+    f.gate.erase("MAC1", &forged).await.unwrap_err();
+    let details: Vec<String> = f
+        .alerts
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(
+        details[1],
+        "an erase of MAC0 is outstanding; request erase-now signed by alice@example.org \
+         (sk-ssh-ed25519@openssh.com): test"
+    );
+    assert_eq!(
+        details[3],
+        "a request for MAC2 and lease L7 is already held; request privileged-lease L7 \
+         signed by alice@example.org (sk-ssh-ed25519@openssh.com): test"
+    );
+    assert_eq!(details[4], "signature: the signature does not verify");
+    assert_eq!(
+        f.alerts.summary(),
+        [
+            "erase erased MAC0",
+            "erase refused MAC1",
+            "erase held MAC2",
+            "erase refused MAC2",
+            "erase refused MAC1"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_scheduled_erase_counts_toward_the_cap_when_it_is_sent() {
+    // Catches: counting a grant's erase only when it is reserved (M4.3 "at most two Macs
+    // a day"): with cap 2, a grant at t0 whose erase is sent at t0+8h, and an erase-now
+    // at t0+8h, a second erase-now at t0+24h would be a third erase within 16 hours.
+    let mut f = Fixture::new("erase-cap-scheduled");
+    let held = f.signed("MAC0", lease("L1"));
+    f.gate.erase("MAC0", &held).await.unwrap();
+    f.gate.grant_admin("MAC0", "L1").await.unwrap();
+    f.advance(8 * HOUR);
+    f.gate.tick().await.unwrap();
+    assert_eq!(f.mdm.erases(), ["erase UDID-0"]);
+    f.mdm.report("UDID-0", f.now() + 1);
+    f.advance(2);
+    f.gate.tick().await.unwrap();
+    let second = f.signed("MAC1", Purpose::EraseNow);
+    f.gate.erase("MAC1", &second).await.unwrap();
+    f.mdm.report("UDID-1", f.now() + 1);
+    f.advance(2);
+    f.gate.tick().await.unwrap();
+    f.clock
+        .0
+        .store(NOW + DAY + 1, std::sync::atomic::Ordering::SeqCst);
+    f.gate.tick().await.unwrap();
+    let third = f.signed("MAC2", Purpose::EraseNow);
+    assert_eq!(
+        f.gate.erase("MAC2", &third).await,
+        Err(Refusal::DailyCap(2))
+    );
+    assert_eq!(f.mdm.erases(), ["erase UDID-0", "erase UDID-1"]);
+    // Once the scheduled erase's own send leaves the window, there is room again.
+    f.clock
+        .0
+        .store(NOW + 8 * HOUR + DAY, std::sync::atomic::Ordering::SeqCst);
+    let fourth = f.signed("MAC2", Purpose::EraseNow);
+    assert_eq!(
+        f.gate.erase("MAC2", &fourth).await,
+        Ok(EraseOutcome::Erased)
+    );
+}
+
+#[tokio::test]
+async fn scheduled_erases_hold_cap_room_until_they_are_sent() {
+    // Catches: leaving scheduled erases out of the cap: two grants with cap 2 leave no
+    // room for an erase-now or a third grant, however old the grants are.
+    let mut f = Fixture::new("erase-cap-reserved");
+    for serial in ["MAC0", "MAC1"] {
+        let held = f.signed(serial, lease("L"));
+        f.gate.erase(serial, &held).await.unwrap();
+        f.gate.grant_admin(serial, "L").await.unwrap();
+    }
+    let held = f.signed("MAC2", lease("L"));
+    f.gate.erase("MAC2", &held).await.unwrap();
+    assert_eq!(
+        f.gate.grant_admin("MAC2", "L").await,
+        Err(Refusal::DailyCap(2))
+    );
+    let fleet = f.gate.fleet().await;
+    assert_eq!((fleet.erases_last_24h, fleet.erases_scheduled), (0, 2));
+    let now = f.signed("MAC2", Purpose::EraseNow);
+    assert_eq!(f.gate.erase("MAC2", &now).await, Err(Refusal::DailyCap(2)));
+}
+
+#[tokio::test]
+async fn grant_admin_refuses_a_held_request_24_hours_old_before_the_tick_discards_it() {
+    // Catches: granting a held request the tick has not discarded yet (up to
+    // --tick-seconds after its 24 hours).
+    let mut f = Fixture::new("grant-stale");
+    for l in ["L1", "L2"] {
+        let held = f.signed("MAC0", lease(l));
+        f.gate.erase("MAC0", &held).await.unwrap();
+    }
+    f.advance(DAY - 1);
+    assert!(f.gate.grant_admin("MAC0", "L1").await.is_ok());
+    f.advance(1);
+    assert_eq!(
+        f.gate.grant_admin("MAC0", "L2").await,
+        Err(Refusal::NoHeldRequest {
+            serial: "MAC0".into(),
+            lease: "L2".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_report_in_the_same_second_as_the_erase_does_not_clear_it() {
+    // Pins the boundary of the re-enrollment signal: only a report later than the
+    // erase's second counts (a `>=` would clear on a report from before the erase).
+    let mut f = Fixture::new("erase-report-boundary");
+    let first = f.signed("MAC0", Purpose::EraseNow);
+    f.gate.erase("MAC0", &first).await.unwrap();
+    f.mdm.report("UDID-0", NOW);
+    f.advance(5);
+    f.gate.tick().await.unwrap();
+    assert_eq!(
+        f.gate.fleet().await.outstanding_erase.as_deref(),
+        Some("MAC0")
+    );
+    f.mdm.report("UDID-0", NOW + 1);
+    f.gate.tick().await.unwrap();
+    assert_eq!(f.gate.fleet().await.outstanding_erase, None);
 }
 
 #[test]

@@ -166,10 +166,10 @@ pub fn default_policy() -> Policy {
 }
 
 const INVENTORY: &str = r#"{"macs": [
-    {"serial": "MAC0", "enrollment": "UDID-0", "pool": "mac-arm64"},
-    {"serial": "MAC1", "enrollment": "UDID-1", "pool": "mac-arm64"},
-    {"serial": "MAC2", "enrollment": "UDID-2", "pool": "mac-arm64"},
-    {"serial": "MACX", "enrollment": "UDID-X", "pool": "mac-x86"}
+    {"serial": "MAC0", "enrollment": "UDID-0", "pool": "mac-arm64", "arch": "arm64"},
+    {"serial": "MAC1", "enrollment": "UDID-1", "pool": "mac-arm64", "arch": "arm64"},
+    {"serial": "MAC2", "enrollment": "UDID-2", "pool": "mac-arm64", "arch": "arm64"},
+    {"serial": "MACX", "enrollment": "UDID-X", "pool": "mac-x86", "arch": "x86_64"}
 ]}"#;
 
 fn write(path: &std::path::Path, text: &[u8]) {

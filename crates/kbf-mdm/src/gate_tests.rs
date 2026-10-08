@@ -101,8 +101,36 @@ async fn enforce_refuses_what_the_set_does_not_allow() {
         f.gate.enforce("MAC0", &request).await,
         Err(Refusal::NotMacos("linux".into()))
     );
+    // S3.1 "pool and platform": an Intel build signed for an Apple-silicon Mac's pool
+    // (or the reverse) is refused, against the arch the gate's inventory records.
+    let mut intel = sets::set_doc("mac-arm64", 12, 10, "27B5");
+    intel["platform"]["arch"] = "x86_64".into();
+    let request = EnforceRequest {
+        set: sets::seal(&sets::key(sets::PLATFORM), &intel),
+        ..enforce_request("mac-arm64", 0, 0, "")
+    };
+    assert_eq!(
+        f.gate.enforce("MAC0", &request).await,
+        Err(Refusal::WrongArch {
+            set: "x86_64".into(),
+            mac: "arm64".into()
+        })
+    );
+    let arm = EnforceRequest {
+        set: sets::set("mac-x86", 12, 10, "27B5"),
+        ..enforce_request("mac-x86", 0, 0, "")
+    };
+    assert_eq!(
+        f.gate.enforce("MACX", &arm).await,
+        Err(Refusal::WrongArch {
+            set: "arm64".into(),
+            mac: "x86_64".into()
+        })
+    );
     assert!(f.mdm.calls().is_empty());
-    assert_eq!(f.alerts.summary(), ["enforce refused MAC0"].repeat(4));
+    let mut summary = ["enforce refused MAC0"].repeat(5);
+    summary.push("enforce refused MACX");
+    assert_eq!(f.alerts.summary(), summary);
 }
 
 #[tokio::test]
@@ -159,10 +187,13 @@ async fn one_enforcement_at_a_time_per_pool() {
         Refusal::Busy("an enforcement is outstanding in pool mac-arm64 (on MAC0)".into())
     );
     // Another pool is not held back.
-    f.gate
-        .enforce("MACX", &enforce_request("mac-x86", 3, 0, "27B5"))
-        .await
-        .unwrap();
+    let mut intel = sets::set_doc("mac-x86", 3, 0, "27B5");
+    intel["platform"]["arch"] = "x86_64".into();
+    let intel = EnforceRequest {
+        set: sets::seal(&sets::key(sets::PLATFORM), &intel),
+        ..enforce_request("mac-x86", 0, 0, "")
+    };
+    f.gate.enforce("MACX", &intel).await.unwrap();
     // Withdrawing frees the pool.
     f.gate.withdraw("MAC0").await.unwrap();
     assert!(
@@ -349,10 +380,17 @@ fn inventory_files_are_checked() {
         Inventory::parse(r#"{"macs": []}"#).map(|i| (i.len(), i.is_empty())),
         Ok((0, true))
     );
-    let dup = r#"{"macs": [{"serial": "A", "enrollment": "1", "pool": "p"}, {"serial": "A", "enrollment": "2", "pool": "p"}]}"#;
+    let dup = r#"{"macs": [{"serial": "A", "enrollment": "1", "pool": "p", "arch": "arm64"}, {"serial": "A", "enrollment": "2", "pool": "p", "arch": "arm64"}]}"#;
     assert_eq!(Inventory::parse(dup), Err("serial A listed twice".into()));
-    let bad = r#"{"macs": [{"serial": "A-1", "enrollment": "1", "pool": "p"}]}"#;
+    let bad = r#"{"macs": [{"serial": "A-1", "enrollment": "1", "pool": "p", "arch": "arm64"}]}"#;
     assert_eq!(Inventory::parse(bad), Err("bad serial \"A-1\"".into()));
+    let arch = r#"{"macs": [{"serial": "A", "enrollment": "1", "pool": "p", "arch": "amd64"}]}"#;
+    assert_eq!(
+        Inventory::parse(arch),
+        Err("A: arch \"amd64\" is not arm64 or x86_64".into())
+    );
+    let no_arch = r#"{"macs": [{"serial": "A", "enrollment": "1", "pool": "p"}]}"#;
+    assert!(Inventory::parse(no_arch).is_err());
     assert!(Inventory::parse(r#"{"macs": [], "extra": 1}"#).is_err());
 }
 

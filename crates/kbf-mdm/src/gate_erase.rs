@@ -9,7 +9,14 @@
 //! - `erase-now` runs at once within the caps (one erase outstanding fleet-wide, the
 //!   daily cap, the Mac floor) or is refused; it is never held.
 //! - `privileged-lease <lease>` is held for `grant-admin` of that serial and lease, and
-//!   discarded with an alert 24 hours after acceptance if no grant uses it.
+//!   discarded with an alert 24 hours after acceptance if no grant uses it; from that
+//!   moment `grant-admin` refuses it, whether or not the tick has discarded it yet.
+//! - The daily cap counts erases sent in the last 24 hours plus erases scheduled and not
+//!   yet sent. `erase-now` and `grant-admin` are refused unless that sum is below the
+//!   cap; a scheduled erase is sent whatever the cap and then counts as sent. The sum
+//!   therefore never exceeds the cap, so no 24 hours see more erases than the cap.
+//! - Once a request's signature has verified, every alert about it, refusals included,
+//!   names its signer and its signed purpose.
 //! - `grant-admin` uses a held request, reserves an erase within the daily cap and the
 //!   floor, schedules the erase at grant time plus the longest lease, and returns a
 //!   grant signed with the gate's key. The scheduled erase runs whatever the request's
@@ -74,25 +81,27 @@ impl<B: MdmBackend> Gate<B> {
         request: &SignedRequest,
     ) -> Result<EraseOutcome, Refusal> {
         let now = self.clock.now();
-        let result = self.erase_inner(serial, request, now).await;
+        let mut signed_as = None;
+        let result = self.erase_inner(serial, request, now, &mut signed_as).await;
         if let Err(refusal) = &result {
-            self.record(&Event::new(
-                now,
-                "erase",
-                serial,
-                "refused",
-                refusal.to_string(),
-                true,
-            ))?;
+            // Before the signature verifies, nothing in the request is the operator's.
+            let detail = match signed_as {
+                Some(who) => format!("{refusal}; request {who}"),
+                None => refusal.to_string(),
+            };
+            self.record(&Event::new(now, "erase", serial, "refused", detail, true))?;
         }
         result
     }
 
+    /// `signed_as` receives the signed purpose, signer and reason once the signature
+    /// has verified and the text parsed, for the alerts.
     async fn erase_inner(
         &self,
         asked: &str,
         request: &SignedRequest,
         now: i64,
+        signed_as: &mut Option<String>,
     ) -> Result<EraseOutcome, Refusal> {
         let text = crate::trusted::read_text(&self.files.allowed_signers, self.files.owner)
             .map_err(Refusal::Internal)?;
@@ -105,6 +114,15 @@ impl<B: MdmBackend> Gate<B> {
             self.policy.require_user_verified,
         )?;
         let signed = parse(&request.message)?;
+        let purpose = match &signed.purpose {
+            Purpose::EraseNow => "erase-now".to_owned(),
+            Purpose::PrivilegedLease(lease) => format!("privileged-lease {lease}"),
+        };
+        let who = format!(
+            "{purpose} signed by {} ({}): {}",
+            signer.principals, signer.algorithm, signed.reason
+        );
+        *signed_as = Some(who.clone());
         // The serial comes from the signed message; the server's only says which Mac it
         // meant, and a difference is refused.
         if signed.serial != asked {
@@ -126,22 +144,11 @@ impl<B: MdmBackend> Gate<B> {
         }
         state.nonces.insert(signed.nonce.clone(), signed.not_after);
         self.save(&state)?;
-        let who = format!(
-            "signed by {} ({}): {}",
-            signer.principals, signer.algorithm, signed.reason
-        );
         match signed.purpose {
             Purpose::EraseNow => {
                 self.check_erase_now(&state, &mac.serial, now)?;
-                self.send_erase(&mut state, &mac.serial, now, true).await?;
-                self.record(&Event::new(
-                    now,
-                    "erase",
-                    &mac.serial,
-                    "erased",
-                    format!("erase-now {who}"),
-                    true,
-                ))?;
+                self.send_erase(&mut state, &mac.serial, now).await?;
+                self.record(&Event::new(now, "erase", &mac.serial, "erased", who, true))?;
                 Ok(EraseOutcome::Erased)
             }
             Purpose::PrivilegedLease(lease) => {
@@ -164,8 +171,7 @@ impl<B: MdmBackend> Gate<B> {
                     not_after: signed.not_after,
                 });
                 self.save(&state)?;
-                let detail = format!("privileged-lease {lease} {who}");
-                self.record(&Event::new(now, "erase", &mac.serial, "held", detail, true))?;
+                self.record(&Event::new(now, "erase", &mac.serial, "held", who, true))?;
                 Ok(EraseOutcome::Held { lease })
             }
         }
@@ -183,8 +189,11 @@ impl<B: MdmBackend> Gate<B> {
         self.check_floor(state, serial)
     }
 
+    /// Erases sent in the last 24 hours plus erases scheduled and not yet sent must stay
+    /// below the cap for one more to be sent or reserved.
     fn check_cap(&self, state: &State, now: i64) -> Result<(), Refusal> {
-        if Self::erases_last_day(state, now) >= self.policy.daily_erase_cap {
+        if Self::erases_last_day(state, now) + state.scheduled.len() >= self.policy.daily_erase_cap
+        {
             return Err(Refusal::DailyCap(self.policy.daily_erase_cap));
         }
         Ok(())
@@ -192,16 +201,9 @@ impl<B: MdmBackend> Gate<B> {
 
     /// Marks the erase outstanding and saves, then sends it; undoes the marks if the MDM
     /// refuses. The state is saved first so a crash after sending cannot lose the
-    /// outstanding erase.
-    /// `counts` adds the erase to the daily cap (a scheduled erase was counted when its
-    /// grant reserved it).
-    async fn send_erase(
-        &self,
-        state: &mut State,
-        serial: &str,
-        now: i64,
-        counts: bool,
-    ) -> Result<(), Refusal> {
+    /// outstanding erase. Every erase sent counts toward the daily cap; a scheduled one
+    /// counted as scheduled until now.
+    async fn send_erase(&self, state: &mut State, serial: &str, now: i64) -> Result<(), Refusal> {
         let device = self.mac(serial)?.device();
         let before = state.clone();
         state.outstanding_erase = Some(Outstanding {
@@ -209,9 +211,7 @@ impl<B: MdmBackend> Gate<B> {
             started_at: now,
         });
         state.erased.insert(serial.to_owned(), now);
-        if counts {
-            state.erase_times.push(now);
-        }
+        state.erase_times.push(now);
         self.save(state)?;
         if let Err(e) = self.backend.erase(device).await {
             *state = before;
@@ -249,7 +249,8 @@ impl<B: MdmBackend> Gate<B> {
         let index = state
             .held
             .iter()
-            .position(|h| h.serial == mac.serial && h.lease == lease)
+            // A request 24 hours old is refused even before the tick discards it.
+            .position(|h| h.serial == mac.serial && h.lease == lease && now < h.accepted_at + DAY)
             .ok_or_else(|| Refusal::NoHeldRequest {
                 serial: serial.to_owned(),
                 lease: lease.to_owned(),
@@ -258,7 +259,6 @@ impl<B: MdmBackend> Gate<B> {
         self.check_floor(&state, serial)?;
         let held = state.held.remove(index);
         let due = now + self.policy.max_lease_secs;
-        state.erase_times.push(now);
         state.scheduled.push(Scheduled {
             serial: held.serial,
             lease: held.lease,
@@ -339,7 +339,7 @@ impl<B: MdmBackend> Gate<B> {
             return Ok(());
         };
         let job = state.scheduled.remove(index);
-        if let Err(e) = self.send_erase(state, &job.serial, now, false).await {
+        if let Err(e) = self.send_erase(state, &job.serial, now).await {
             let detail = format!("lease {}: {e}; will retry", job.lease);
             state.scheduled.push(job.clone());
             self.save(state)?;
@@ -412,6 +412,12 @@ impl<B: MdmBackend> Gate<B> {
     }
 
     /// Forgets erased Macs that reported after their erase (re-enrolled).
+    ///
+    /// The signal is any status value the MDM recorded later than the second the erase
+    /// was sent. **[A]** that a Mac reports nothing between the erase being queued and
+    /// it running: NanoHUB's API exposes no enrollment or check-in time, and a report
+    /// in that gap would clear the outstanding erase early, letting the next erase pass
+    /// the one-at-a-time rule (the daily cap and the floor still hold).
     async fn clear_reported(&self, state: &mut State) {
         let erased: Vec<(String, i64)> =
             state.erased.iter().map(|(s, t)| (s.clone(), *t)).collect();
