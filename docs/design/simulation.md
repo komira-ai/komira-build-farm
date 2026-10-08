@@ -221,7 +221,7 @@ in `sim_cell` today.
 | F2.6 | Suspend and resume of a worker | a worker freezes for a time below T, between T and G, and above G; its clock jumps on resume | on resume it fences first: no result from a fenced self-fenced run and no heartbeat that renews contact before the fence; below T nothing changes; above G its leases were requeued and its stale results lose (I5) |
 | F2.7 | A paused server clock | the leader's clock stops (its process suspended) while workers' clocks run | safety holds: workers fence after T; the leader requeues only G of its own time after resuming |
 | F2.8 | Reboot and daemon restart inside G **exists** | (`sim_cell`) | L3, I12 |
-| F2.9 | Server restart | the leader restarts with an empty scheduler at a random time; callers resubmit; workers reconnect with running leases and unacknowledged results | every waiter of the new process answered once by a run of its own lease (I5); lands `#[ignore = "issue #137"]` until the lease ids of a restarted server can no longer collide |
+| F2.9 | Server restart | the leader restarts with an empty scheduler at a random time; callers resubmit; workers reconnect with running leases and unacknowledged results | every waiter of the new process answered once by a run of its own lease (I5); the new process has its own term, named as the lease epoch in `Welcome`, and workers drop the old epoch's leases on it (issue #137) |
 | F2.10 | Stale session messages | duplicated and reordered `Hello`s, a heartbeat of a replaced stream arriving after the new `Hello`, a `Hello` resent on one stream for a report change | only the first `Hello` of a stream opens a session; a replaced stream's heartbeat is not fed; a resent `Hello` requeues nothing |
 | F2.11 | Lost and repeated results and acks | drops and duplicates on `Report` and `ReportAck` | results resent until acknowledged; each proposed once per holding; each operation answered once |
 | F2.12 | Two daemons claim one node id | two worker nodes register as the same worker in turn | only the newest stream's heartbeats count; `Start`s go only to it; the other fences in T; no self-fenced work twice (I12) |
@@ -320,7 +320,7 @@ each PR that adds it reports which of the F1 to F3 mutants it catches on its own
    and `sim_cordon` moved onto them unchanged in what they check, then F1.
 3. F3 in `kbf-sched`, then `sim_rollout` in `kbf-server`.
 4. The cell nodes moved out of `sim_cell`, the daemon model completed, then F2 (F2.9
-   ignored on issue #137 until it is fixed).
+   ignored on issue #137 until it was fixed).
 5. F4.
 
 Each PR names the mutants it planted, the scenario that went red for each, and the

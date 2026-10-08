@@ -163,6 +163,8 @@ pub(crate) fn result_of(
             lease_id: Some(proto_lease_id(id)),
             status: Some(Status::default()),
             action_result: Some(action_result),
+            // The daemon fills in the action its Start named.
+            action_digest: None,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -200,6 +202,7 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
             }],
         }),
         action_result: None,
+        action_digest: None,
     }
 }
 
@@ -213,6 +216,7 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
             details: Vec::new(),
         }),
         action_result: None,
+        action_digest: None,
     }
 }
 

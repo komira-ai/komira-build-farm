@@ -14,6 +14,15 @@
 //! before the first Heartbeat, each stream sends the node's software status
 //! (`NodeStatus`, see [`crate::status`]).
 //!
+//! Each lease is remembered with the server's lease epoch at its Start and the action
+//! the Start named (issue #137). Every Result echoes that action, so the server can
+//! refuse one that answers another operation. A Welcome that names another epoch
+//! comes from a server that never granted those leases and will never accept their
+//! Results: before anything else on that stream, the daemon kills their runs and
+//! forgets their Results, unsent. A lease id of the old epoch can then never be
+//! mistaken for one the new server grants, as an unacknowledged Result or a run that
+//! a new Start would otherwise be taken to resend.
+//!
 //! The fence and the Start window read a [`Clock`] that counts suspended time (issue
 //! #78); tokio's timers do not, so the loop never sleeps longer than `recheck_every`
 //! (1 s) while a deadline is pending. Whatever wakes the daemon (a message, a heartbeat
@@ -36,6 +45,7 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_proto::google::rpc::Code;
+use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
     self, DaemonMessage, Heartbeat, Hello, ServerMessage, daemon_message, server_message,
     worker_client::WorkerClient,
@@ -81,6 +91,9 @@ pub enum Event {
     ContactRestored,
     /// Contact was lost for the fence time; these leases were killed.
     Fenced(Vec<LeaseId>),
+    /// A Welcome named another lease epoch: these leases, granted under an earlier
+    /// one, are dropped. Their runs are being killed, and no Result of them is sent.
+    Superseded(Vec<LeaseId>),
     /// A session ended, with the reason.
     Disconnected(String),
 }
@@ -113,8 +126,22 @@ pub struct Daemon<R> {
     window: StartWindow,
     /// Results the server has not acknowledged yet, by lease.
     unacked: BTreeMap<LeaseId, worker::Result>,
+    /// The lease epoch the newest Welcome named; `None` before the first, or when it
+    /// named none (0).
+    epoch: Option<u64>,
+    /// Each lease acted on and not yet forgotten: the epoch of its Start and the action
+    /// it named.
+    granted: BTreeMap<LeaseId, Granted>,
     /// The suspend-counting clock that contact and the Start window read.
     clock: Arc<dyn Clock>,
+}
+
+/// What the daemon remembers of a lease's Start until it forgets the lease.
+struct Granted {
+    /// The lease epoch in force when the Start arrived.
+    epoch: Option<u64>,
+    /// The action the Start named, which the lease's Result echoes.
+    action: Option<Digest>,
 }
 
 /// What woke the session loop.
@@ -157,6 +184,8 @@ impl<R: Runtime> Daemon<R> {
             contact,
             window: StartWindow::default(),
             unacked: BTreeMap::new(),
+            epoch: None,
+            granted: BTreeMap::new(),
             clock: Arc::new(SystemClock),
         })
     }
@@ -218,13 +247,15 @@ impl<R: Runtime> Daemon<R> {
             .offline(timeout(wait, inbound.message()))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let interval = self.welcome(first)?;
+        let (interval, epoch) = self.welcome(first)?;
         self.contact.new_stream(interval);
         self.window.new_stream(hello_sent);
         // Before the Welcome renews contact: a lease whose fence passed while this
         // stream was set up must not outlive it (`offline` checked already; this keeps
         // the order true by construction here too).
         self.recheck(None).await;
+        // Before any Result is resent or any Start of this stream is read.
+        self.new_epoch(epoch);
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -275,8 +306,12 @@ impl<R: Runtime> Daemon<R> {
         }
     }
 
-    /// Checks the first server message is an acceptable Welcome; returns its interval.
-    fn welcome(&self, first: Option<ServerMessage>) -> Result<Duration, SessionError> {
+    /// Checks the first server message is an acceptable Welcome; returns its interval
+    /// and the lease epoch it names (`None` for 0).
+    fn welcome(
+        &self,
+        first: Option<ServerMessage>,
+    ) -> Result<(Duration, Option<u64>), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
             return Err(SessionError::Protocol(
                 "the first server message is not Welcome".into(),
@@ -296,7 +331,43 @@ impl<R: Runtime> Daemon<R> {
                 self.contact.fence_after()
             )));
         }
-        Ok(interval)
+        Ok((interval, (w.epoch != 0).then_some(w.epoch)))
+    }
+
+    /// Takes the lease epoch a Welcome named. When it names one, every lease granted
+    /// under another is dropped: its run is killed and its Result forgotten, unsent
+    /// (issue #137). A Welcome that names none drops nothing, and a lease granted while
+    /// none was named is kept.
+    fn new_epoch(&mut self, epoch: Option<u64>) {
+        self.epoch = epoch;
+        let stale: Vec<LeaseId> = self
+            .granted
+            .keys()
+            .copied()
+            .filter(|id| self.superseded(*id))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let running = self.leases.running();
+        for id in &stale {
+            self.unacked.remove(id);
+            if running.contains(id) {
+                // Its Result is dropped when the run ends (`report`).
+                self.leases.cancel(*id);
+            } else {
+                self.granted.remove(id);
+            }
+        }
+        tracing::warn!(?stale, ?epoch, "leases of an earlier epoch dropped");
+        self.emit(Event::Superseded(stale));
+    }
+
+    /// Whether lease `id` was granted under a lease epoch other than the newest
+    /// Welcome's, when that Welcome named one.
+    fn superseded(&self, id: LeaseId) -> bool {
+        let granted = self.granted.get(&id).and_then(|g| g.epoch);
+        self.epoch.is_some() && granted.is_some() && granted != self.epoch
     }
 
     fn on_message(&mut self, msg: ServerMessage, tx: &UnboundedSender<DaemonMessage>) {
@@ -318,6 +389,7 @@ impl<R: Runtime> Daemon<R> {
             Some(server_message::Message::ResultAck(ack)) => {
                 if let Some(id) = ack.lease_id.map(lease_id) {
                     self.unacked.remove(&id);
+                    self.granted.remove(&id);
                     tracing::info!(lease = %id, accepted = ack.accepted, "result acknowledged");
                     self.emit(Event::ResultAcknowledged {
                         lease: id,
@@ -341,6 +413,7 @@ impl<R: Runtime> Daemon<R> {
 
     /// Runs the lease a Start names, unless its Result is still unacknowledged, it
     /// arrived after its window, or contact is lost (then it is refused with a Result).
+    /// A lease it acts on is remembered ([`Self::remember`]).
     fn on_start(&mut self, start: worker::Start, tx: &UnboundedSender<DaemonMessage>) {
         let done = start.lease_id.map(lease_id);
         if let Some(id) = done.filter(|id| self.unacked.contains_key(id)) {
@@ -362,6 +435,7 @@ impl<R: Runtime> Daemon<R> {
             }
             return;
         }
+        self.remember(done, &start);
         let refused = if self.contact.lost(self.clock.now()) {
             start.lease_id.map(|id| {
                 failure(
@@ -375,6 +449,18 @@ impl<R: Runtime> Daemon<R> {
         };
         if let Some(result) = refused {
             self.report(Some(tx), result);
+        }
+    }
+
+    /// Remembers lease `id` of `start`, if the Start names one and it is not remembered
+    /// already: the lease epoch in force and the action the Start named.
+    fn remember(&mut self, id: Option<LeaseId>, start: &worker::Start) {
+        if let Some(id) = id {
+            let granted = Granted {
+                epoch: self.epoch,
+                action: start.action_digest.clone(),
+            };
+            self.granted.entry(id).or_insert(granted);
         }
     }
 
@@ -463,10 +549,17 @@ impl<R: Runtime> Daemon<R> {
     }
 
     /// Keeps `result` until its lease's ResultAck, and sends it on `tx` if a stream is
-    /// up. Without one it goes out after the next Welcome.
-    fn report(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, result: worker::Result) {
+    /// up. Without one it goes out after the next Welcome. It echoes the action its
+    /// lease's Start named. The Result of a lease of an earlier epoch is dropped.
+    fn report(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, mut result: worker::Result) {
         // Every Result here names its lease: the lease manager builds them all.
         let id = result.lease_id.map_or(LeaseId::new(0, 0), lease_id);
+        if self.superseded(id) {
+            tracing::warn!(lease = %id, "the Result of a lease of an earlier epoch dropped");
+            self.granted.remove(&id);
+            return;
+        }
+        result.action_digest = self.granted.get(&id).and_then(|g| g.action.clone());
         if let Some(tx) = tx {
             send(tx, daemon_message::Message::Result(result.clone()));
         }

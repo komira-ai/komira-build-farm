@@ -40,7 +40,7 @@ service Worker {
 ```
 daemon                                  server
   | Hello (version, node_id, report) -->|  checks; registers the node (new session)
-  |<----------------- Welcome (interval)|
+  |<---------- Welcome (interval, epoch)|  drops leases of another epoch
   | Result (each unacknowledged one) -->|  resent before the first Heartbeat
   | NodeStatus (OS, kernel, Xcodes) --->|  kept as the node's newest
   | Heartbeat (seq, hash, running) ---->|
@@ -74,8 +74,9 @@ countable entry that is not a whole number). If any fails, it ends the stream wi
 error status (`FAILED_PRECONDITION` for an unaccepted version, `PERMISSION_DENIED` for
 a certificate that does not name the node or a denied one, `UNAVAILABLE` while the
 deny list cannot be read, `INVALID_ARGUMENT` otherwise). A stream that sends no `Hello` within 10 seconds ends
-`DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak and
-the heartbeat interval in milliseconds.
+`DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak,
+the heartbeat interval in milliseconds, and its **lease epoch** (see
+[Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)).
 
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
@@ -174,9 +175,9 @@ fetching inputs on an offer is **planned**.
 
 | Field | Meaning |
 |---|---|
-| `lease_id` | `(term, seq)`; ordered by term first |
+| `lease_id` | `(term, seq)`; ordered by term first; no two server processes grant leases of one term |
 | `kind` | the lease kind, the value of the platform property `kbf-lease`: `action` (default) or `whole_machine` |
-| `action_digest` | the action to run; its inputs are fetched from the CAS |
+| `action_digest` | the action to run; its inputs are fetched from the CAS; the lease's `Result` echoes it |
 | `millicpus` | CPU booked for the lease, in thousandths of a CPU; 0 means not booked |
 | `memory_bytes` | memory booked for the lease; 0 means not booked |
 | `heartbeat_seq` | the newest heartbeat of this stream the server had taken when it sent the `Start`; 0 before the first, which names the stream's `Hello` |
@@ -222,7 +223,9 @@ is not running changes nothing.
 
 ### `Result` and `ResultAck`
 
-`Result { lease_id, status, action_result }` reports one lease. `status` is `OK` when
+`Result { lease_id, status, action_result, action_digest }` reports one lease.
+`action_digest` echoes the `Start`'s (unset for a lease whose `Start` the daemon did
+not keep, and from a daemon that predates the field). `status` is `OK` when
 the action ran, whatever its exit code, and then `action_result` is set; otherwise it
 says why the action could not run:
 
@@ -236,8 +239,9 @@ says why the action could not run:
 | `UNAVAILABLE` | contact was lost before the lease started |
 | `INTERNAL` | the farm failed (a kernel OOM kill, a lost container, a dirty node) |
 
-The server accepts at most one `Result` per operation, and only from the node holding
-the operation's current lease. An `OK` result must have every output already in the
+The server accepts at most one `Result` per operation, only from the node holding
+the operation's current lease, and only if the `Result` names no action other than the
+one that lease runs. An `OK` result must have every output already in the
 CAS (every output file, stdout and stderr, every output tree and the files it names);
 otherwise the server treats it as an infrastructure failure, because accepting it would
 hand callers files nobody can fetch. An accepted `OK` result with exit code 0 is written
@@ -245,9 +249,10 @@ to the action cache, unless the action is `do_not_cache`, **before** the operati
 callers are answered.
 
 The server answers every `Result` that names a lease with `ResultAck { lease_id,
-accepted }`. `accepted` is false when the lease is unknown, held by another node, no
-longer the operation's current lease, or when the operation already finished (a
-duplicate). A refused result never reaches the action cache.
+accepted }`. `accepted` is false when the lease is unknown (a lease of another
+process is), held by another node, no longer the operation's current lease, when the
+`Result` names another action, or when the operation already finished (a duplicate).
+A refused result never reaches the action cache.
 
 Until a daemon receives the `ResultAck` for a lease, it keeps the `Result`:
 
@@ -257,6 +262,49 @@ Until a daemon receives the `ResultAck` for a lease, it keeps the `Result`:
 - a `Result` produced while disconnected goes out the same way.
 
 Once acknowledged, accepted or not, the daemon forgets it.
+
+### Server restarts and the lease epoch
+
+A single-node server keeps its scheduler, and so its leases, in its process. When it
+restarts, a daemon that reconnects within its fence time can still hold leases of the
+old process: runs that go on until their fence, and results the old process never
+acknowledged. Nothing in a lease id said which process granted it, and every process
+numbered its leases from `(1, 0)`; so the new process could grant the same lease id
+to the same node for another operation. The daemon then ignored the new `Start` (its
+`Result` was still unacknowledged) or took it as a resend of the old run, and the
+server took the old run's `Result` as the new operation's: its callers got another
+action's result, and it was written to the action cache under their action's digest
+(issue [#137](https://github.com/komira-ai/komira-build-farm/issues/137)). Three rules
+close this, each on its own:
+
+1. **A lease id names one lease, ever.** Each server process grants its leases under a
+   term of its own, picked at start: the start time in milliseconds on the wall clock,
+   times 2^16, plus 16 random bits. It orders after every earlier process's term while
+   the wall clock does not step back across a restart, and differs from it unless a
+   restart lands on an earlier start's very millisecond and the random bits match.
+   The server knows only the leases it granted, so a `Result` of an earlier process's
+   lease is refused, and a lease of another term listed in a heartbeat is never
+   cancelled (it may belong to a newer leader).
+2. **The epoch in `Welcome`.** `Welcome.epoch` names the record of leases the server
+   answers for; a single-node server names its term. The daemon remembers the epoch
+   of the newest `Welcome` with every lease it acts on. On a `Welcome` that names
+   another epoch, before it resends anything or reads a `Start`, it kills the runs of
+   the earlier epoch's leases (they are listed until they stop, like a cancelled run)
+   and forgets their results without sending them: no server of the new epoch can
+   accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
+   nothing, and a lease granted while no epoch was named is kept. With the replicated log, the epoch will name the log, which outlives
+   leaders and their terms, so a change of leader drops nothing.
+3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
+   in its `Result`, and the server refuses a `Result` whose `action_digest` is set and
+   is not the action of the operation it granted the lease for, whatever the lease id
+   says. A `Result` without one (an older daemon) is checked on the lease alone.
+
+**Compatibility.** The fields are additions within version 1. An older daemon ignores
+`epoch` and sends no `action_digest`: rule 1 alone keeps it safe, but it lets an old
+epoch's run go on until it ends or fences, and resends an old epoch's result, which
+the server refuses. An older server sends epoch 0 and ignores `action_digest`, and
+grants every lease from term 1, so it keeps the bug: upgrade servers and daemons
+together.
 
 ### `ResourceUsage`
 
@@ -299,8 +347,10 @@ daemon restarts and server restarts:
 1. **Nothing runs without a committed lease.** Work starts only on `Start`, and `Start`
    is sent only after the grant commits.
 2. **One result per operation.** The server accepts a result only from the current
-   holder, at most once; the daemon never runs a lease again while its result is
-   unacknowledged.
+   holder, at most once, and only for the action that holder's lease runs; the daemon
+   never runs a lease again while its result is unacknowledged. A lease id names one
+   lease across server restarts, so no result of an earlier server process can be
+   taken for a lease the current one granted.
 3. **No silent loss of a result.** A daemon keeps a result, lists it, and resends it
    until the server decides it.
 4. **No two copies of self-fenced work.** A daemon stops self-fenced work T after its
