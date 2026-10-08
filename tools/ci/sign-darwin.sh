@@ -4,16 +4,19 @@
 #
 # Checks, each of which fails the job:
 #   1. `codesign --verify --strict` accepts the signature;
-#   2. the code directory's flags are exactly `adhoc,runtime`, and the signature carries
+#   2. the signed binary runs, on every host: `<binary> --version` exits 0 in an
+#      environment with no DYLD_* variable (a signature the kernel or dyld refuses,
+#      such as one over bytes changed after signing, fails here);
+#   3. the code directory's flags are exactly `adhoc,runtime`, and the signature carries
 #      no entitlements (so no `get-task-allow`: a debugger cannot attach);
-#   3. the binary's minimum macOS (LC_BUILD_VERSION minos) is $MACOSX_DEPLOYMENT_TARGET;
-#   4. where System Integrity Protection is enabled, the hardened runtime is in force,
+#   4. the binary's minimum macOS (LC_BUILD_VERSION minos) is $MACOSX_DEPLOYMENT_TARGET;
+#   5. where System Integrity Protection is enabled, the hardened runtime is in force,
 #      seen in behaviour: dyld refuses to start the binary as the linker signed it when
 #      DYLD_INSERT_LIBRARIES names a missing library (the control, which must hold on
 #      any host), and starts the signed binary, which ignores DYLD_* variables.
 #      GitHub's hosted macOS runners have SIP disabled, and there dyld loads the
 #      variable into the hardened binary too; so on them this step only warns, and the
-#      runtime flag is checked by 2, not by behaviour.
+#      runtime flag is checked by 3, not by behaviour.
 #
 # Usage: sign-darwin.sh <binary>   (it must accept --version)
 set -euo pipefail
@@ -26,7 +29,7 @@ missing_dylib="${RUNNER_TEMP:-/tmp}/kbf-no-such-library.dylib"
 [ ! -e "$missing_dylib" ] || { echo "$missing_dylib exists" >&2; exit 1; }
 inserted() { DYLD_INSERT_LIBRARIES="$missing_dylib" "$@" --version; }
 
-# 4, the control: the binary as the linker signed it (ad hoc, no hardened runtime).
+# 5, the control: the binary as the linker signed it (ad hoc, no hardened runtime).
 unhardened="${RUNNER_TEMP:-/tmp}/unhardened-$(basename "$bin")"
 cp "$bin" "$unhardened"
 codesign --display --verbose=2 "$unhardened" 2>&1 | grep -E '^(Signature|CodeDirectory)' || true
@@ -42,7 +45,14 @@ codesign --force --sign - --options runtime "$bin"
 # 1
 codesign --verify --strict --verbose=2 "$bin"
 
-# 2
+# 2: with an empty environment but PATH and HOME, so no DYLD_* variable is set and
+# only the signature decides whether it starts.
+if ! env -i PATH="$PATH" HOME="$HOME" "$bin" --version; then
+  echo "the signed binary did not run: '$bin --version' failed" >&2
+  exit 1
+fi
+
+# 3
 info=$(codesign --display --verbose=4 "$bin" 2>&1)
 echo "$info"
 flags=$(sed -n 's/^CodeDirectory .*flags=0x[0-9a-f]*(\([^)]*\)).*/\1/p' <<<"$info")
@@ -50,13 +60,13 @@ flags=$(sed -n 's/^CodeDirectory .*flags=0x[0-9a-f]*(\([^)]*\)).*/\1/p' <<<"$inf
 entitlements=$(codesign --display --entitlements - --xml "$bin" 2>/dev/null)
 [ -z "$entitlements" ] || { echo "the signature carries entitlements: $entitlements" >&2; exit 1; }
 
-# 3
+# 4
 build=$(vtool -show-build "$bin")
 echo "$build"
 minos=$(awk '$1 == "minos" { print $2 }' <<<"$build")
 [ "$minos" = "$MACOSX_DEPLOYMENT_TARGET" ] || { echo "minos is '$minos', want '$MACOSX_DEPLOYMENT_TARGET'" >&2; exit 1; }
 
-# 4
+# 5
 sip=$(csrutil status 2>&1 || true)
 echo "$sip"
 if inserted "$bin"; then

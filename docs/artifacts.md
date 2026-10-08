@@ -1,8 +1,14 @@
 # Build artifacts: what CI builds, and how a node verifies it
 
-kbf's binaries are built by CI, never on a developer's machine, and a node runs only
-bytes CI built and attested. The workflow is
+kbf's binaries are built by CI, never on a developer's machine, and a node is to run
+only bytes CI built and attested. The workflow is
 [`.github/workflows/artifacts.yml`](../.github/workflows/artifacts.yml).
+
+What exists today is the build, the signing, the sums and, on `main`, the
+attestations. The deployment job that verifies an asset before it reaches a node, the
+node's own SHA-256 check and the release workflow are **planned** and not built yet
+([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
+Sections below that describe them say so.
 
 ## What is built
 
@@ -39,16 +45,19 @@ commit SHA, and that lint refuses one that is not.
 
 The assets are workflow artifacts of the run (`assets-darwin-arm64`,
 `assets-linux-x86_64`, `assets-linux-arm64`, `sha256sums`). GitHub keeps workflow
-artifacts for at most 90 days, so nothing may depend on them for longer. The plan for
-releases (fleet-updates design) is that a release attaches the exact bytes the farm
+artifacts for at most 90 days, so nothing may depend on them for longer. Releases are
+**planned** (no release workflow exists yet): the design (fleet-updates, and
+mac-node-provisioning section 4.1) is that a release attaches the exact bytes the farm
 ran after their soak, fetched from the deployment's own copy and checked against these
 attestations; a release never rebuilds. The attestations themselves do not expire with
 the artifacts.
 
-## How a node's deployment verifies an asset
+## How a node's deployment verifies an asset (planned)
 
-The deployment job verifies each asset before it touches a node, in CI (a node has no
-`gh`), with every flag below:
+No deployment job exists yet. When it does, it is to verify each asset before it
+touches a node, in CI (a node has no `gh`), with every flag below
+([mac-node-provisioning.md](design/mac-node-provisioning.md) section 4.2). The `attest`
+job already runs these exact checks on its own output (below).
 
 ```text
 gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
@@ -63,8 +72,8 @@ gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
 - `--deny-self-hosted-runners`: the signing job ran on a GitHub-hosted runner.
 - For the SBOM attestation, add `--predicate-type https://cyclonedx.org/bom`.
 
-The node itself then checks the asset's SHA-256 against the value the job hands it,
-before it installs anything.
+The node itself is then to check the asset's SHA-256 against the value the job hands
+it, before it installs anything (planned, with the node's `apply`; design section 4.2).
 
 The `attest` job runs exactly these checks on its own output
 (`tools/ci/verify-assets.sh`), and two that must fail: the first tarball verified as
@@ -75,15 +84,17 @@ signed by `ci.yml`, and a copy with one flipped byte. If either verifies, the jo
 `tools/ci/sign-darwin.sh` signs `kbf-daemon` with `codesign --force --sign -
 --options runtime`: an ad-hoc signature (no certificate) with the hardened runtime.
 That works without an Apple Developer account, and the job checks it every run:
-`codesign --verify --strict` passes, the code directory's flags are exactly
-`adhoc,runtime`, the signature has no entitlements, and the binary's minimum macOS is
-14.0.
+`codesign --verify --strict` passes, the signed binary runs (`kbf-daemon --version`
+exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
+exactly `adhoc,runtime`, the signature has no entitlements, and the binary's minimum
+macOS is 14.0.
 
 What it gives:
 
 - **The kernel checks every page against the signature,** as for any signed code on
   Apple silicon. A binary modified after signing does not run (but one modified and
-  signed again ad hoc does; see below).
+  signed again ad hoc does; see below). The job runs the signed binary, so a signature
+  the kernel or dyld refuses fails the build instead of shipping.
 - **The hardened runtime flag.** On a Mac with System Integrity Protection enabled
   (a node), dyld ignores `DYLD_*` variables for a hardened process, so
   `DYLD_INSERT_LIBRARIES` cannot inject code, and without the `get-task-allow`
@@ -101,11 +112,17 @@ What it does not give:
 - **No identity.** Anyone can sign anything ad hoc; the signature says nothing about
   who built the binary. Authenticity comes from the attestation, checked above.
 - **No notarization and no Gatekeeper approval.** A quarantined copy (one a browser
-  downloaded) is refused. Nodes fetch assets with command-line tools, which do not
-  quarantine them.
-- **Library validation by team.** With no Team ID, the hardened runtime's library
-  validation admits only Apple-signed libraries; `kbf-daemon` loads only system
-  libraries.
+  downloaded) is refused. The planned deployment fetches assets with command-line
+  tools, which do not quarantine them (an assumption design section 4.2 marks for
+  checking on the pinned macOS).
+
+What it constrains:
+
+- **Only Apple-signed libraries load.** The hardened runtime turns on library
+  validation, and with no Team ID of its own the binary may load only libraries Apple
+  signed. That is fine for `kbf-daemon`, which links and loads only system libraries;
+  a library it linked at start-up that Apple did not sign would fail the check above
+  that runs the signed binary.
 
 Developer ID signing and notarization need an Apple Developer Program membership; when
 the project has one, it is one more step in the darwin job.
