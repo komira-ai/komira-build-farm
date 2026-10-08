@@ -16,15 +16,27 @@
 //! of the artifacts directory itself (`--artifacts-dir` and every directory above it)
 //! must not be one the daemon can replace, which provisioning ensures.
 //!
-//! `apply` installs only the staged set: it records the apply as in progress, calls the
-//! applier, records the set as installed, and reboots if the applier says the step
-//! needs it. After a crash mid-apply the in-progress record stays; `status` reports it,
-//! `apply` of the same set resumes it, and every other set is refused while the
-//! in-progress set would itself still pass every check. Once it would not (it expired,
-//! or a newer key statement no longer names its key), it blocks nothing: a newer set
-//! that passes every check is staged and applied over it, so a node is never wedged on
-//! a set it can no longer finish. The in-progress record is reported until that newer
-//! set's apply starts.
+//! `apply` installs only the staged set: it records the set as in progress (in its own
+//! record, apart from the staged one), calls the applier, records the set as installed,
+//! and reboots if the applier says the step needs it. After a crash mid-apply the
+//! in-progress record stays; `status` reports it, `apply` of the same set (restaged if
+//! need be) resumes it, and every other set is refused ([`Refusal::InProgress`]) while the
+//! in-progress set would itself still pass every check, whatever happens to the staged
+//! record (a failed restage of the in-progress set clears it).
+//!
+//! Once the in-progress set would not pass (it expired, or a newer key statement no
+//! longer names its key), the apply is abandoned: the node may run any mix of that set
+//! and the installed one, so the installed record no longer says what is on the node.
+//! Only a platform-signed set may replace it (any other is refused as
+//! [`Refusal::Abandoned`]), since only a platform key may say what the whole node runs,
+//! and so a node is never wedged on a set it can no longer finish. The in-progress record
+//! is reported until that newer set's apply starts.
+//!
+//! While any apply is in progress, `stage` copies every artifact the set names, not just
+//! those it changes against the installed record, so the applier installs the whole set
+//! over whatever the unfinished apply left. The package snapshot, when the set pins one,
+//! is applied in full anyway; a snapshot the abandoned apply already upgraded to is not
+//! undone if the replacing set pins an older one or none (apt does not downgrade).
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -37,7 +49,7 @@ use sha2::{Digest as _, Sha256};
 use crate::Refusal;
 use crate::apply::Applier;
 use crate::set::{NodeView, Pin, Verdict, VerifiedSet, check, open_set};
-use crate::signed::{Envelope, KeyStatement, PublicKey, newest_statement, parse_key};
+use crate::signed::{Envelope, KeyStatement, PublicKey, Role, newest_statement, parse_key};
 use crate::state::{Held, State};
 
 /// What the updater was provisioned with.
@@ -142,7 +154,7 @@ impl<A: Applier> Updater<A> {
             pool: self.cfg.pin.pool.clone(),
             installed: self.state.installed.as_ref().map(r),
             staged: self.state.staged.as_ref().map(r),
-            in_progress: self.state.in_progress.clone(),
+            in_progress: self.state.in_progress.as_ref().map(|h| h.digest.clone()),
             floor: self.state.floor,
         }
     }
@@ -166,11 +178,15 @@ impl<A: Applier> Updater<A> {
         }
         let verified = open_set(set, &trusted.statement)?;
         let verdict = check(&verified, &self.node(now))?;
-        if let Some(digest) = &self.state.in_progress
-            && *digest != verified.digest
-            && self.in_progress_blocks(digest, &trusted.statement, now)
+        if let Some(held) = &self.state.in_progress
+            && held.digest != verified.digest
         {
-            return Err(Refusal::InProgress(digest.clone()));
+            if self.in_progress_blocks(held, &trusted.statement, now) {
+                return Err(Refusal::InProgress(held.digest.clone()));
+            }
+            if verified.role != Role::Platform {
+                return Err(Refusal::Abandoned(held.digest.clone()));
+            }
         }
         Ok((verified, verdict))
     }
@@ -189,13 +205,9 @@ impl<A: Applier> Updater<A> {
         }
     }
 
-    /// Whether the apply in progress (of the set `digest`) still holds off every other
-    /// set: only while that set is the staged one and would itself pass every check
-    /// now, under `statement`.
-    fn in_progress_blocks(&self, digest: &str, statement: &KeyStatement, now: u64) -> bool {
-        let Some(held) = self.state.staged.as_ref().filter(|h| h.digest == digest) else {
-            return false;
-        };
+    /// Whether the apply in progress (of `held`) still holds off every other set: while
+    /// its set would itself pass every check now, under `statement`.
+    fn in_progress_blocks(&self, held: &Held, statement: &KeyStatement, now: u64) -> bool {
         let named = parse_key(&held.signer)
             .ok()
             .and_then(|k| Some((k, statement.role_of(&k)?)));
@@ -212,7 +224,8 @@ impl<A: Applier> Updater<A> {
     }
 
     /// `stage`: verify the set, raise the floor, and copy and hash the artifacts it
-    /// changes. Nothing installed changes.
+    /// changes (every artifact it names, while an apply is in progress). Nothing
+    /// installed changes.
     ///
     /// # Errors
     /// The set fails a check, an artifact is missing or does not match, or the state
@@ -236,8 +249,13 @@ impl<A: Applier> Updater<A> {
             fs::remove_dir_all(&staging).map_err(io)?;
         }
         fs::create_dir_all(&staging).map_err(io)?;
-        let installed = self.state.installed.as_ref().map(|h| &h.set);
-        for name in v.set.changes(installed) {
+        // While an apply is in progress the node may run any mix of the installed set and
+        // the in-progress one, so the installed record is no base to diff against.
+        let base = match self.state.in_progress {
+            Some(_) => None,
+            None => self.state.installed.as_ref().map(|h| &h.set),
+        };
+        for name in v.set.changes(base) {
             if let Some(artifact) = v.set.artifacts.get(&name) {
                 self.fetch(&name, &artifact.sha256, &staging)?;
             }
@@ -302,18 +320,19 @@ impl<A: Applier> Updater<A> {
         if self.state.staged.as_ref().map(|h| h.digest.as_str()) != Some(v.digest.as_str()) {
             return Err(Refusal::NotStaged(v.digest));
         }
-        self.state.in_progress = Some(v.digest.clone());
+        let held = Held {
+            digest: v.digest,
+            signer: hex::encode(v.signer),
+            set: v.set,
+        };
+        self.state.in_progress = Some(held.clone());
         self.save()?;
         let staging = self.staging();
         let installed = self
             .applier
-            .install(&v.set, &staging)
+            .install(&held.set, &staging)
             .map_err(Refusal::Apply)?;
-        self.state.installed = Some(Held {
-            digest: v.digest,
-            signer: hex::encode(v.signer),
-            set: v.set,
-        });
+        self.state.installed = Some(held);
         self.state.staged = None;
         self.state.in_progress = None;
         self.save()?;

@@ -1,9 +1,11 @@
 //! The updater's state file (S4.1): the newest key statement, the serial floor, the
 //! installed set, the staged set and an apply in progress. It is written whole to a
 //! temporary file, synced and renamed over the old one, so a crash leaves the old state
-//! or the new, never a mix; an apply records itself as in progress before it installs
-//! anything, so a crash mid-apply is reported and resumed (or, once its set can no
-//! longer pass the checks, replaced by a newer set that does), never guessed at.
+//! or the new, never a mix. An apply records itself as in progress before it installs
+//! anything, so a crash mid-apply is reported and resumed. Once its set can no longer
+//! pass the checks it may be replaced by a newer platform-signed set, which is staged
+//! and installed in full: the installed record is not trusted to say what is on the
+//! node while an apply is unfinished.
 
 use std::fs;
 use std::io::Write as _;
@@ -21,8 +23,8 @@ use crate::signed::Envelope;
 pub struct Held {
     /// Lowercase hex SHA-256 of the set's signed payload.
     pub digest: String,
-    /// The key that signed it, hex: whether an apply in progress may still continue
-    /// depends on that key still being named.
+    /// The key that signed it, hex: whether an apply in progress still holds off other
+    /// sets depends on that key still being named.
     pub signer: String,
     /// The set.
     pub set: SoftwareSet,
@@ -40,8 +42,9 @@ pub struct State {
     pub installed: Option<Held>,
     /// The staged set, whose changed artifacts are in the staging directory.
     pub staged: Option<Held>,
-    /// The digest of a set whose apply started and has not finished.
-    pub in_progress: Option<String>,
+    /// A set whose apply started and has not finished. It is kept apart from `staged`,
+    /// which a failed restage clears, so its hold on the node does not depend on it.
+    pub in_progress: Option<Held>,
 }
 
 impl State {
@@ -104,7 +107,11 @@ mod tests {
                 signer: "d".into(),
                 set: testkit::set(5),
             }),
-            in_progress: Some("b".into()),
+            in_progress: Some(Held {
+                digest: "e".into(),
+                signer: "f".into(),
+                set: testkit::set(6),
+            }),
         };
         state.save(&path).unwrap();
         assert_eq!(State::load(&path), Ok(state));

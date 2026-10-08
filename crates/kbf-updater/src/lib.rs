@@ -105,6 +105,12 @@ pub enum Refusal {
     /// Another set's apply is in progress (a crash mid-apply); only it may continue.
     #[error("the apply of set {0} is in progress")]
     InProgress(String),
+    /// A set signed by a key other than a platform key offered over an abandoned apply
+    /// (one in progress whose set no longer passes the checks). The node may hold any
+    /// mix of that set and the installed one, and only a platform key may say what the
+    /// whole node runs.
+    #[error("only a platform-signed set may replace the abandoned apply of set {0}")]
+    Abandoned(String),
     /// The applier failed.
     #[error("apply failed: {0}")]
     Apply(String),

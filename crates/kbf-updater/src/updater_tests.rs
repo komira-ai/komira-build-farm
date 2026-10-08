@@ -304,7 +304,7 @@ fn an_expired_apply_in_progress_gives_way_to_a_newer_valid_set() {
     assert_eq!(u.stage(&six, None, later), Ok(Outcome::Staged));
     // The unfinished apply is still reported until the newer set's apply starts.
     assert_eq!(u.status().in_progress, Some(stuck));
-    // With the in-progress set no longer staged, it blocks nothing either.
+    // Replaced as the staged set, the expired in-progress set still blocks nothing.
     let seven = seal_set(&testkit::set(7), &PLATFORM_SEED);
     assert_eq!(u.stage(&seven, None, later), Ok(Outcome::Staged));
     assert_eq!(
@@ -340,6 +340,108 @@ fn an_apply_in_progress_under_a_revoked_key_gives_way_to_a_newer_valid_set() {
         Ok(Outcome::Applied { reboot: false })
     );
     assert_eq!(u.status().installed.map(|s| s.serial), Some(7));
+    // Set 7 names what set 5 did, so it changes nothing against the installed record;
+    // over the abandoned apply it is installed in full all the same.
+    let every = vec!["kbf-daemon".to_owned(), "kbf-updater".to_owned()];
+    assert_eq!(u.applier().installs.last(), Some(&(7, every)));
+}
+
+/// Set 6 changes the updater against the installed set 5 and its apply is left in
+/// progress after a failed install; returns the updater, its scratch directory, set 6
+/// and its digest.
+fn abandon_six(name: &str, expires: u64) -> (Updater<FakeApplier>, PathBuf, Envelope, String) {
+    let (mut u, dir) = updater(name);
+    install(&mut u, &seal_set(&testkit::set(5), &PLATFORM_SEED));
+    let six = seal_set(
+        &set_with(6, |s| {
+            s.expires = expires;
+            s.artifacts.get_mut("kbf-updater").unwrap().sha256 = sha("d2");
+        }),
+        &PLATFORM_SEED,
+    );
+    assert_eq!(u.stage(&six, None, NOW), Ok(Outcome::Staged));
+    u.applier_mut().fail_install = true;
+    assert!(u.apply(&six, None, NOW).is_err());
+    u.applier_mut().fail_install = false;
+    let digest = u.status().in_progress.expect("in progress");
+    (u, dir, six, digest)
+}
+
+/// Catches: a set that replaces an abandoned apply staged and installed only what it
+/// changes against the installed record (the abandoned apply may have left its own
+/// updater binary, or an upgraded package snapshot, in place, and the node would then
+/// record set 7 over a binary no set names), or a component-key set allowed to replace
+/// it (a component key may change only the daemon, so it cannot say what the rest of
+/// the node runs).
+#[test]
+fn a_set_replacing_an_abandoned_apply_is_platform_signed_and_staged_in_full() {
+    let (mut u, _, _, abandoned) = abandon_six("in-progress-replaced", 1_500);
+    let later = 1_500;
+    let daemon_seven = |seed| {
+        seal_set(
+            &set_with(7, |s| {
+                s.expires = 1_900;
+                s.artifacts.get_mut("kbf-daemon").unwrap().sha256 = sha("d2");
+            }),
+            seed,
+        )
+    };
+    // Against the installed set 5 this set changes only the daemon, which a component
+    // key covers; it still may not replace the abandoned apply.
+    let component = daemon_seven(&COMPONENT_SEED);
+    assert_eq!(
+        u.stage(&component, None, later),
+        Err(Refusal::Abandoned(abandoned.clone()))
+    );
+    assert_eq!(
+        u.apply(&component, None, later),
+        Err(Refusal::Abandoned(abandoned))
+    );
+    let platform = daemon_seven(&PLATFORM_SEED);
+    assert_eq!(u.stage(&platform, None, later), Ok(Outcome::Staged));
+    assert_eq!(
+        u.apply(&platform, None, later),
+        Ok(Outcome::Applied { reboot: false })
+    );
+    let every = vec!["kbf-daemon".to_owned(), "kbf-updater".to_owned()];
+    assert_eq!(u.applier().installs.last(), Some(&(7, every)));
+    assert_eq!(u.status().in_progress, None);
+}
+
+/// Catches: the hold of an apply in progress lost when a restage of its own set fails
+/// (`stage` clears the staged record before it fetches), so another set is staged and
+/// applied over a half-finished apply that could still be finished. Also: a set
+/// restaged while its apply is in progress staged only its changes against the
+/// installed record instead of in full.
+#[test]
+fn a_failed_restage_of_the_set_in_progress_keeps_its_hold() {
+    let (mut u, dir, six, held) = abandon_six("in-progress-restage", 2_000);
+    let seven = seal_set(&testkit::set(7), &PLATFORM_SEED);
+    assert_eq!(
+        u.stage(&seven, None, NOW),
+        Err(Refusal::InProgress(held.clone()))
+    );
+    let artifact = dir.join("artifacts").join(sha("d2"));
+    fs::remove_file(&artifact).unwrap();
+    assert!(matches!(
+        u.stage(&six, None, NOW),
+        Err(Refusal::Artifact(_))
+    ));
+    assert_eq!(u.status().staged, None);
+    assert_eq!(u.status().in_progress.as_ref(), Some(&held));
+    assert_eq!(
+        u.stage(&seven, None, NOW),
+        Err(Refusal::InProgress(held.clone()))
+    );
+    assert_eq!(u.apply(&seven, None, NOW), Err(Refusal::InProgress(held)));
+    fs::write(&artifact, "d2").unwrap();
+    assert_eq!(u.stage(&six, None, NOW), Ok(Outcome::Staged));
+    assert_eq!(
+        u.apply(&six, None, NOW),
+        Ok(Outcome::Applied { reboot: false })
+    );
+    let every = vec!["kbf-daemon".to_owned(), "kbf-updater".to_owned()];
+    assert_eq!(u.applier().installs.last(), Some(&(6, every)));
 }
 
 /// Catches: one set stopping updates on a node for good by jumping its serial (and
