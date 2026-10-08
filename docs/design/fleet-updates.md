@@ -879,7 +879,7 @@ Changes by crate (rough sizes, tests included):
 | Crate | Change | Lines |
 |---|---|---|
 | `kbf-proto` | `NodeStatus`, `Report`; `Drain`, `Update` and `Prepare` server messages | ~200 |
-| `kbf-daemon`, `kbf-node` | re-detect and send `Report`; new keys; probes from config or set; update marker and `Update`/`Start` refusals; forward to the updater; `DEVELOPER_DIR` per action | ~800 |
+| `kbf-daemon`, `kbf-node` | on Macs a TLS signer through Security.framework with the keychain identity; re-detect and send `Report`; new keys; probes from config or set; update marker and `Update`/`Start` refusals; forward to the updater; `DEVELOPER_DIR` per action | ~800 |
 | `kbf-updater` (new) | socket and caller check, key statements, set checks of S3.1, profile / package / bootc backends, state file | ~2,100 |
 | `kbf-mac-session` (new) | socket and caller check, the verbs of S4.2, sweep, leak scan | ~1,700 |
 | `kbf-driver-container` | `--userns=auto` or `nomap`, so no container uid is the daemon's | ~80 |
