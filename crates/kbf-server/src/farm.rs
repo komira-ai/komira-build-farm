@@ -272,6 +272,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         NodesView { nodes }
     }
 
+    /// `worker` as `GET /v1/nodes` lists it, if it has registered.
+    pub fn node_view(&self, worker: &WorkerId) -> Option<NodeView> {
+        let state = self.lock();
+        state
+            .links
+            .contains_key(worker)
+            .then(|| self.node(&state, worker))
+    }
+
     /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
     /// the node as it is now. A drain's deadline counts from now.
     ///
