@@ -392,6 +392,13 @@ entitlement Apple requires
 ([sample](https://developer.apple.com/documentation/virtualization/running-macos-in-a-virtual-machine-on-apple-silicon))
 **[V]**.
 
+`kbf-vmm` runs as a dedicated non-admin uid outside the root helpers' group (started
+through `kbf-mac-session run`, or as its own launchd user), never as the daemon's role
+account; otherwise a guest escape would reach the root helpers (fleet-updates security
+design, [fleet-updates.md](fleet-updates.md), open PR #87). So `kbf-mac-session`'s
+`run` verb must exist by phase 2 of this design; open PR #87 ships it in its phase P1
+on Macs.
+
 Per lease:
 
 1. **Prepare.** Fetch the action's inputs into the lease directory, as the native
@@ -639,7 +646,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-server` | read `vm.slots` | ~80 |
 | `kbf-daemon`, `kbf-node` | a runtime that dispatches by kind across several drivers; VM flags (image directory, boot timeout) | ~370 |
 | `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
-| `kbf-vmm`, `kbf-guest` (new) | the VM helper and the guest agent | ~1,000 |
+| `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, open PR #87 phase P1), and the guest agent | ~1,000 |
 | `kbf-segments`, `kbf-front` | chunked upload, if images ship through the CAS | ~400 |
 | `kbf-it` | the freshness test on VMs | ~150 |
 
