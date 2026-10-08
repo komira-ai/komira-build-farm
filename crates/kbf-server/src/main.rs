@@ -2,9 +2,14 @@
 //! docs for what it wires together.
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
-//! the addresses it bound (a port of 0 picks a free one).
+//! the addresses it bound (a port of 0 picks a free one). On Unix the SIGINT handler
+//! is installed before that line is printed, so a SIGINT any time after it stops the
+//! server with exit 0. If the handler cannot be installed it exits 2 without printing
+//! the start line.
 
 use std::error::Error;
+use std::future::Future;
+use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -50,10 +55,7 @@ async fn run<O: ObjectStore + 'static>(
         store,
         prefix,
     ));
-    let shutdown = async {
-        // Without a signal handler the process cannot stop cleanly; it still stops.
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    let shutdown = interrupted()?;
     let bound = bind_server(cache, listeners, shutdown)?;
     println!(
         "kbf-server {} reapi={} worker={}",
@@ -63,4 +65,32 @@ async fn run<O: ObjectStore + 'static>(
     );
     bound.serving.await?;
     Ok(())
+}
+
+/// Installs the SIGINT handler now and returns a future that completes on SIGINT.
+///
+/// `tokio::signal::ctrl_c()` installs its handler only when first polled, which is
+/// after the start line is printed; a SIGINT in between killed the process by the
+/// default action instead of stopping it cleanly (issue #86). `signal` installs the
+/// handler when it is called.
+///
+/// # Errors
+/// The handler cannot be installed.
+#[cfg(unix)]
+fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        sigint.recv().await;
+    })
+}
+
+/// Returns a future that completes on Ctrl-C. Elsewhere than Unix the handler is
+/// installed when the future is first polled, after the start line is printed.
+#[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps, reason = "the same signature as on Unix")]
+fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }

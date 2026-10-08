@@ -25,6 +25,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 kbf-segments.workspace = true
+# fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
+libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 
