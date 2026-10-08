@@ -11,6 +11,7 @@ use kbf_types::{
     StateMachine, WaiterId, Waiting, WorkerId,
 };
 
+use crate::cordon::{Cordon, Cordons};
 use crate::fence::{LEASE_GRACE, START_GRACE};
 use crate::input::{Event, Input, Request};
 use crate::servable::{Servable, Verdict};
@@ -191,6 +192,8 @@ pub struct Scheduler {
     held: BTreeMap<LeaseId, Held>,
     /// How long a queued operation no live worker can run waits before it is refused.
     unservable_wait: Duration,
+    /// Workers placement skips, and their drains.
+    cordons: Cordons,
 }
 
 impl Scheduler {
@@ -208,6 +211,7 @@ impl Scheduler {
             workers: BTreeMap::new(),
             held: BTreeMap::new(),
             unservable_wait: UNSERVABLE_WAIT,
+            cordons: Cordons::default(),
         }
     }
 
@@ -247,6 +251,28 @@ impl Scheduler {
     /// Queued operations in the order placement will consider them.
     pub fn queued(&self) -> impl Iterator<Item = OperationId> + '_ {
         self.queue.iter().map(|(_, id)| *id)
+    }
+
+    /// Whether `worker` is cordoned, and where its drain is; `None` while placement
+    /// may use it.
+    #[must_use]
+    pub fn cordon(&self, worker: &WorkerId) -> Option<&Cordon> {
+        self.cordons.get(worker)
+    }
+
+    /// The leases `worker` holds (granted or running), in lease order.
+    #[must_use]
+    pub fn leases_on(&self, worker: &WorkerId) -> Vec<LeaseId> {
+        self.held
+            .iter()
+            .filter(|(_, h)| {
+                self.ops[&h.operation]
+                    .state
+                    .holding()
+                    .is_some_and(|(_, w)| w == worker)
+            })
+            .map(|(lease, _)| *lease)
+            .collect()
     }
 
     /// What is booked on `worker`, if it is registered.
@@ -410,7 +436,7 @@ impl Scheduler {
     /// first and leaves the queue at once, so nothing places it meanwhile.
     fn place(&mut self, effects: &mut Vec<Effect>) {
         let now = self.now;
-        let mut servable = Servable::new(&self.workers, now);
+        let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
         for &(_, id) in &self.queue {
@@ -641,7 +667,7 @@ impl StateMachine for Scheduler {
 
     fn apply(&mut self, input: Input) -> Vec<Effect> {
         self.now = self.now.max(input.now);
-        match input.event {
+        let effects = match input.event {
             Event::WorkerUp {
                 worker,
                 capacity,
@@ -715,6 +741,29 @@ impl StateMachine for Scheduler {
                 self.place(&mut effects);
                 effects
             }
-        }
+            Event::Cordon { worker } => {
+                self.cordons.cordon(worker);
+                Vec::new()
+            }
+            Event::Drain { worker, deadline } => {
+                self.cordons.drain(worker, deadline);
+                Vec::new()
+            }
+            Event::Uncordon { worker } => {
+                self.cordons.uncordon(&worker);
+                Vec::new()
+            }
+        };
+        let (now, held) = (self.now, &self.held);
+        let ops = &self.ops;
+        self.cordons.progress(now, |worker| {
+            held.values().any(|h| {
+                ops[&h.operation]
+                    .state
+                    .holding()
+                    .is_some_and(|(_, w)| w == worker)
+            })
+        });
+        effects
     }
 }

@@ -1,6 +1,8 @@
 //! Which live workers can run a request, for one placement round.
 //!
-//! A worker can run a request if its capabilities satisfy the request's platform
+//! A cordoned worker is not one of them: placement skips it, and work only it could
+//! run waits with that reason (and is refused after the unservable wait, as if the
+//! worker were gone). A worker can run a request if its capabilities satisfy the request's platform
 //! (`kbf_caps::Request::matches`) and its whole capacity holds the request vector; it
 //! can run it now if its free room does. Matches are memoised per distinct platform
 //! request within the round, so a queue of many actions with the same platform matches
@@ -10,6 +12,7 @@ use std::collections::BTreeMap;
 
 use kbf_types::{FarmTime, WorkerId};
 
+use crate::cordon::Cordons;
 use crate::input::Request;
 use crate::scheduler::Worker;
 
@@ -25,23 +28,30 @@ pub(crate) enum Verdict {
 /// The live workers of one round, and the platform matches made so far.
 #[derive(Debug)]
 pub(crate) struct Servable {
-    /// Live workers, in name order.
+    /// Live workers placement may use, in name order.
     live: Vec<WorkerId>,
+    /// Live workers placement skips because they are cordoned, in name order.
+    cordoned: Vec<WorkerId>,
     /// For each platform request seen this round, the indices into `live` of the
     /// workers that satisfy it.
     memo: Vec<(kbf_caps::Request, Vec<usize>)>,
 }
 
 impl Servable {
-    /// The round's view of `workers` at `now`.
-    pub(crate) fn new(workers: &BTreeMap<WorkerId, Worker>, now: FarmTime) -> Self {
-        let live = workers
+    /// The round's view of `workers` at `now`, without the `cordons`.
+    pub(crate) fn new(
+        workers: &BTreeMap<WorkerId, Worker>,
+        cordons: &Cordons,
+        now: FarmTime,
+    ) -> Self {
+        let (cordoned, live) = workers
             .iter()
             .filter(|(_, w)| w.alive(now))
             .map(|(name, _)| name.clone())
-            .collect();
+            .partition(|name| cordons.skips(name));
         Self {
             live,
+            cordoned,
             memo: Vec::new(),
         }
     }
@@ -86,14 +96,44 @@ impl Servable {
     }
 
     /// Whether any live worker could run `request` once its bookings end, and if none
-    /// could, why.
+    /// could, why. When only cordoned workers could, that is the reason.
     pub(crate) fn verdict(
         &mut self,
         workers: &BTreeMap<WorkerId, Worker>,
         request: &Request,
     ) -> Verdict {
+        let verdict = self.uncordoned_verdict(workers, request);
+        let could: Vec<&str> = self
+            .cordoned
+            .iter()
+            .filter(|name| {
+                let w = &workers[*name];
+                request.needs.matches(&w.caps) && w.capacity.fits(&request.resources)
+            })
+            .map(WorkerId::as_str)
+            .collect();
+        match verdict {
+            Verdict::Unservable(_) if !could.is_empty() => Verdict::Unservable(format!(
+                "every live worker that can run it is cordoned: {}",
+                could.join(", ")
+            )),
+            verdict => verdict,
+        }
+    }
+
+    /// [`Self::verdict`] over the workers placement may use.
+    fn uncordoned_verdict(
+        &mut self,
+        workers: &BTreeMap<WorkerId, Worker>,
+        request: &Request,
+    ) -> Verdict {
         if self.live.is_empty() {
-            return Verdict::Unservable("no worker is connected".to_owned());
+            let why = if self.cordoned.is_empty() {
+                "no worker is connected"
+            } else {
+                "every connected worker is cordoned"
+            };
+            return Verdict::Unservable(why.to_owned());
         }
         let at = self.matching(workers, &request.needs);
         let matching = &self.memo[at].1;

@@ -11,11 +11,13 @@ use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
 use kbf_proto::worker::{NodeStatus, ServerMessage, daemon_message};
+use kbf_server::api::{DRAIN_DEADLINE, node_action};
+use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
 use kbf_server::{Farm, Listeners, ServeError, bind_server_with_api};
 use kbf_types::{Resources, WorkerId};
 use serde_json::{Value, json};
-use support::{FakeDaemon, HELLO_WAIT, INTERVAL, PROMPT, hello};
+use support::{Client, FakeDaemon, HELLO_WAIT, INTERVAL, Job, PROMPT, done, hello, output, ran};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -36,6 +38,7 @@ fn loopback() -> SocketAddr {
 
 /// A server with the operator API in this process.
 struct Server {
+    reapi: SocketAddr,
     worker: SocketAddr,
     api: SocketAddr,
     stop: tokio::sync::oneshot::Sender<()>,
@@ -65,9 +68,14 @@ fn start() -> Server {
         let _ = stopped.await;
     };
     let bound = bind_server_with_api(cache(), listeners, Some(loopback()), shutdown).expect("bind");
-    let (worker, api) = (bound.worker, bound.api.expect("an API address"));
+    let (reapi, worker, api) = (
+        bound.reapi,
+        bound.worker,
+        bound.api.expect("an API address"),
+    );
     let serving = tokio::spawn(async move { bound.serving.await.expect("serve") });
     Server {
+        reapi,
         worker,
         api,
         stop,
@@ -75,11 +83,13 @@ fn start() -> Server {
     }
 }
 
-/// One HTTP/1.1 request without a body; the status code and the body.
-async fn http(api: SocketAddr, method: &str, path: &str) -> (u16, String) {
+/// One HTTP/1.1 request; the status code and the body.
+async fn http(api: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let length = body.len();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: kbf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: kbf\r\nContent-Length: {length}\r\n\
+         Connection: close\r\n\r\n{body}"
     );
     stream.write_all(request.as_bytes()).await.expect("send");
     let mut response = String::new();
@@ -93,14 +103,15 @@ async fn http(api: SocketAddr, method: &str, path: &str) -> (u16, String) {
     assert!(
         head.to_ascii_lowercase()
             .contains("content-type: application/json")
-            || code == 404,
+            || code == 404
+            || code == 405,
         "{head}"
     );
     (code, body.to_owned())
 }
 
 async fn nodes(api: SocketAddr) -> Value {
-    let (code, body) = http(api, "GET", "/v1/nodes").await;
+    let (code, body) = http(api, "GET", "/v1/nodes", "").await;
     assert_eq!(code, 200, "{body}");
     serde_json::from_str(&body).expect("JSON")
 }
@@ -195,12 +206,15 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             { "node_id": "linux-1", "connected": true, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
-                "xcode_builds": [] } },
+                "xcode_builds": [] },
+              "placement": { "state": "serving" } },
             { "node_id": "mac-1", "connected": true, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
-                "xcode_builds": ["15F31d", "16C5032a"] } },
-            { "node_id": "old-1", "connected": true, "software": null },
+                "xcode_builds": ["15F31d", "16C5032a"] },
+              "placement": { "state": "serving" } },
+            { "node_id": "old-1", "connected": true, "software": null,
+              "placement": { "state": "serving" } },
         ] })
     );
 
@@ -289,4 +303,141 @@ async fn a_node_whose_stream_ended_is_listed_as_disconnected() {
     assert!(farm.nodes().nodes[0].connected);
     drop(responses);
     assert!(!farm.nodes().nodes[0].connected);
+}
+
+async fn post(api: SocketAddr, target: &str, body: &str) -> (u16, Value) {
+    let (code, text) = http(api, "POST", &format!("/v1/nodes/{target}"), body).await;
+    (code, serde_json::from_str(&text).expect("JSON"))
+}
+
+/// Catches: a cordon or drain that does not reach placement (new work still starts on
+/// the node), a drain that cancels or gives up the running lease (its result would be
+/// refused), a drain that never pauses at its deadline or resumes by itself, a drained
+/// node that is not reported drained, an uncordon that leaves queued work stuck, and
+/// writes to an unknown node or with an unknown verb or body that are not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cordon_drain_and_uncordon_over_http() {
+    let server = start();
+    let api = server.api;
+    let cell = Client::connect(server.reapi, server.worker).await;
+    let mut node = FakeDaemon::connect(server.worker, hello("linux-1", 8, 16))
+        .await
+        .expect("registered");
+
+    for (target, body, want) in [
+        ("ghost:cordon", "", 404),
+        ("linux-1:frobnicate", "", 404),
+        ("linux-1", "", 404),
+        ("linux-1:drain", "{\"deadline\": 3}", 400),
+        ("linux-1:drain", "soon", 400),
+    ] {
+        let (code, body) = post(api, target, body).await;
+        assert_eq!(code, want, "{target}: {body}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+    let (code, _) = http(api, "GET", "/v1/nodes/linux-1:cordon", "").await;
+    assert_eq!(code, 405, "a write is a POST");
+
+    let first = Job::new("first", &[]);
+    let second = Job::new("second", &[]);
+    for job in [&first, &second] {
+        cell.upload(&job.blobs()).await;
+    }
+    let mut first_ops = cell.execute(&first.action).await;
+    let lease = node.start().await.lease_id;
+    let lease_name = lease
+        .map(|l| format!("{}.{}", l.term, l.seq))
+        .expect("a lease");
+
+    let before = now_ms();
+    let (code, view) = post(api, "linux-1:drain", "{\"deadline_secs\": 1}").await;
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(view["placement"]["state"], "draining", "{view}");
+    assert_eq!(view["placement"]["leases"], json!([lease_name]));
+    let deadline = view["placement"]["deadline_unix_ms"]
+        .as_u64()
+        .expect("a deadline");
+    assert!(
+        (before + 1_000..=now_ms() + 1_000).contains(&deadline),
+        "{deadline}"
+    );
+
+    // The node keeps the lease alive; past the deadline the drain pauses, kills nothing.
+    let mut second_ops = cell.execute(&second.action).await;
+    let paused = async {
+        loop {
+            assert!(node.heartbeat(&[lease.expect("a lease")]).await);
+            let got = nodes(api).await;
+            if got["nodes"][0]["placement"]["state"] == "drain_paused" {
+                return got;
+            }
+        }
+    };
+    let got = tokio::time::timeout(PROMPT, paused)
+        .await
+        .expect("the drain pauses");
+    assert_eq!(got["nodes"][0]["placement"]["leases"], json!([lease_name]));
+    assert_eq!(got["nodes"][0]["placement"]["deadline_unix_ms"], deadline);
+    assert_eq!(node.cancelled().await, None, "a drain never cancels");
+    node.no_work().await;
+
+    let built = output(&cell, "built", 0).await;
+    let ack = node.report(ran(lease, &built)).await;
+    assert!(ack.accepted, "the drained lease's result counts");
+    done(&mut first_ops).await;
+    let got = nodes(api).await;
+    assert_eq!(
+        got["nodes"][0]["placement"]["state"], "drain_paused",
+        "nothing proceeds by itself: {got}"
+    );
+
+    let (_, view) = post(api, "linux-1:drain", "").await;
+    assert_eq!(view["placement"], json!({ "state": "drained" }));
+    node.no_work().await;
+
+    let (_, view) = post(api, "linux-1:uncordon", "").await;
+    assert_eq!(view["placement"], json!({ "state": "serving" }));
+    let start = node.start().await;
+    assert_eq!(start.action_digest.as_ref(), Some(&second.action.proto));
+    let ack = node.report(ran(start.lease_id, &built)).await;
+    assert!(ack.accepted);
+    done(&mut second_ops).await;
+
+    let (_, view) = post(api, "linux-1:cordon", "").await;
+    assert_eq!(view["placement"], json!({ "state": "cordoned" }));
+    server.stop().await;
+}
+
+/// Catches: the loopback check removed or inverted (anyone who reaches the API could
+/// take nodes out of service), and an IPv4 loopback peer seen through an IPv6 socket
+/// refused.
+#[test]
+fn writes_are_accepted_only_from_loopback() {
+    for peer in ["127.0.0.1:4000", "[::1]:4000", "[::ffff:127.0.0.1]:4000"] {
+        let peer: SocketAddr = peer.parse().expect("an address");
+        let (node, action) = node_action(peer, "mac-1:cordon", b"").expect("allowed");
+        assert_eq!((node.as_str(), action), ("mac-1", NodeAction::Cordon));
+    }
+    for peer in [
+        "192.0.2.7:4000",
+        "[2001:db8::7]:4000",
+        "[::ffff:192.0.2.7]:4000",
+    ] {
+        let peer: SocketAddr = peer.parse().expect("an address");
+        let (code, why) = node_action(peer, "mac-1:cordon", b"").expect_err("refused");
+        assert_eq!(code, axum::http::StatusCode::FORBIDDEN, "{why}");
+    }
+    let local: SocketAddr = "127.0.0.1:1".parse().expect("an address");
+    assert_eq!(
+        node_action(local, "mac-1:drain", b"").map(|(_, a)| a),
+        Ok(NodeAction::Drain(DRAIN_DEADLINE))
+    );
+    assert_eq!(
+        node_action(local, "mac-1:drain", b"{\"deadline_secs\": 90}").map(|(_, a)| a),
+        Ok(NodeAction::Drain(Duration::from_secs(90)))
+    );
+    assert_eq!(
+        node_action(local, "a:b:uncordon", b"").map(|(n, a)| (n.as_str().to_owned(), a)),
+        Ok(("a:b".to_owned(), NodeAction::Uncordon))
+    );
 }

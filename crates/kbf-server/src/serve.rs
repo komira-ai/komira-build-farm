@@ -83,7 +83,13 @@ fn serve_api(
     routes: axum::Router,
 ) -> impl Future<Output = std::io::Result<()>> {
     match listener {
-        Some(listener) => Either::Left(axum::serve(listener, routes).into_future()),
+        Some(listener) => Either::Left(
+            axum::serve(
+                listener,
+                routes.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .into_future(),
+        ),
         None => Either::Right(std::future::pending()),
     }
 }

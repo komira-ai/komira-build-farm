@@ -10,7 +10,7 @@
 //! commit is committed as soon as it is appended, and fed straight back (see
 //! [`State::feed`]). The replicated log replaces exactly that step.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ use kbf_proto::worker::{
     self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Event, Input, OpState, Scheduler};
+use kbf_sched::{Cordon, Event, Input, OpState, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
     Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -32,7 +32,7 @@ use kbf_types::{
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
-use crate::fleet::{NodeView, NodesView, SoftwareView};
+use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView};
 
 /// The scheduler term of a single node. Raft supplies terms once it is wired.
 pub const SINGLE_NODE_TERM: u64 = 1;
@@ -49,7 +49,26 @@ pub struct StreamId(u64);
 pub struct Farm<M, O> {
     cache: Arc<Cache<M, O>>,
     epoch: Instant,
+    /// The wall-clock time of `epoch`, in milliseconds since the Unix epoch: how farm
+    /// times are shown to operators.
+    epoch_unix_ms: u64,
     state: Mutex<State>,
+}
+
+/// An operator action named a node that never registered.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no node {0} has registered")]
+pub struct UnknownNode(pub String);
+
+/// What an operator does to a node's placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeAction {
+    /// Offer it no new lease; its leases run on.
+    Cordon,
+    /// Cordon it and wait this long for its leases to end; then the drain pauses.
+    Drain(Duration),
+    /// Return it to placement, ending any drain.
+    Uncordon,
 }
 
 /// A caller waiting on an operation.
@@ -101,6 +120,8 @@ struct State {
     started: BTreeMap<LeaseId, OperationId>,
     /// Each node's newest `NodeStatus`, kept across its streams.
     software: BTreeMap<WorkerId, SoftwareView>,
+    /// Nodes whose drain has paused, once logged.
+    paused: BTreeSet<WorkerId>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -119,6 +140,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         Self {
             cache,
             epoch: Instant::now(),
+            epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
                 sched: Scheduler::new(SINGLE_NODE_TERM).with_unservable_wait(unservable_wait),
                 next_waiter: 0,
@@ -128,6 +150,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 links: BTreeMap::new(),
                 started: BTreeMap::new(),
                 software: BTreeMap::new(),
+                paused: BTreeSet::new(),
             }),
         }
     }
@@ -230,11 +253,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was
     /// replaced (a newer stream sends its own after its `Welcome`).
     pub fn node_status(&self, worker: &WorkerId, stream: StreamId, status: NodeStatus) {
-        let received = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let received = u64::try_from(received).unwrap_or(u64::MAX);
+        let received = unix_ms();
         let mut state = self.lock();
         if state.is_current(worker, stream) {
             let view = SoftwareView::new(status, received);
@@ -247,20 +266,82 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let state = self.lock();
         let nodes = state
             .links
-            .iter()
-            .map(|(worker, link)| NodeView {
-                node_id: worker.as_str().to_owned(),
-                connected: !link.outbound.is_closed(),
-                software: state.software.get(worker).cloned(),
-            })
+            .keys()
+            .map(|worker| self.node(&state, worker))
             .collect();
         NodesView { nodes }
     }
 
-    /// Expires leases of silent workers and places queued work.
+    /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
+    /// the node as it is now. A drain's deadline counts from now.
+    ///
+    /// # Errors
+    /// `worker` has never registered.
+    pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
+        let now = self.now();
+        let mut state = self.lock();
+        if !state.links.contains_key(worker) {
+            return Err(UnknownNode(worker.as_str().to_owned()));
+        }
+        let name = worker.clone();
+        let event = match action {
+            NodeAction::Cordon => Event::Cordon { worker: name },
+            NodeAction::Drain(within) => Event::Drain {
+                worker: name,
+                deadline: now.saturating_add(within),
+            },
+            NodeAction::Uncordon => Event::Uncordon { worker: name },
+        };
+        tracing::info!(%worker, ?action, "operator action");
+        state.feed_quiet(now, event);
+        Ok(self.node(&state, worker))
+    }
+
+    /// One node's view; `worker` is registered.
+    fn node(&self, state: &State, worker: &WorkerId) -> NodeView {
+        let wall = |at: FarmTime| self.epoch_unix_ms.saturating_add(at.as_millis());
+        let leases = || {
+            let held = state.sched.leases_on(worker);
+            held.iter().map(ToString::to_string).collect()
+        };
+        let placement = match state.sched.cordon(worker) {
+            None => PlacementView::Serving,
+            Some(Cordon::Cordoned) => PlacementView::Cordoned,
+            Some(Cordon::Draining { deadline }) => PlacementView::Draining {
+                deadline_unix_ms: wall(*deadline),
+                leases: leases(),
+            },
+            Some(Cordon::Drained) => PlacementView::Drained,
+            Some(Cordon::Paused { deadline }) => PlacementView::DrainPaused {
+                deadline_unix_ms: wall(*deadline),
+                leases: leases(),
+            },
+        };
+        NodeView {
+            node_id: worker.as_str().to_owned(),
+            connected: !state.links[worker].outbound.is_closed(),
+            software: state.software.get(worker).cloned(),
+            placement,
+        }
+    }
+
+    /// Expires leases of silent workers and places queued work. Logs each drain that
+    /// has paused at its deadline, once.
     pub fn tick(&self) {
         let now = self.now();
-        self.lock().feed_quiet(now, Event::Tick);
+        let mut state = self.lock();
+        state.feed_quiet(now, Event::Tick);
+        let paused: BTreeSet<WorkerId> = state
+            .links
+            .keys()
+            .filter(|w| matches!(state.sched.cordon(w), Some(Cordon::Paused { .. })))
+            .cloned()
+            .collect();
+        for worker in paused.difference(&state.paused) {
+            let leases = state.sched.leases_on(worker).len();
+            tracing::warn!(%worker, leases, "drain paused at its deadline; leases run on");
+        }
+        state.paused = paused;
     }
 
     /// A `Result` from `worker`. Accepted only if `worker` holds the operation's
@@ -626,6 +707,14 @@ impl State {
             stages: waiters.into_iter().map(|w| w.stage).collect(),
         }
     }
+}
+
+/// Now on the wall clock, in milliseconds since the Unix epoch.
+fn unix_ms() -> u64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn failed(code: Code, message: &str) -> Finished {
