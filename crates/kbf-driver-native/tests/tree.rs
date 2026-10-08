@@ -20,16 +20,37 @@ use support::{
 };
 
 /// A Perl program that forks a child which leaves the process group (`setsid`),
-/// writes its pid to `$PIDFILE` and sleeps; the leader waits until a few polls have
+/// prints its pid and sleeps; the leader waits until a few polls have
 /// seen the child, then exits, so the child is orphaned and reparented.
 const ESCAPER: &str = r#"
 use POSIX ();
 my $pid = fork();
 if ($pid == 0) { POSIX::setsid(); sleep 300; exit 0; }
-open(my $f, '>', $ENV{PIDFILE}) or die; print $f "$pid\n"; close($f);
+print "$pid\n";
 select(undef, undef, undef, 0.3);
 exit 0;
 "#;
+
+/// Where a test action writes its pid: in its working directory, since the sandbox
+/// lets an action write nowhere outside its lease.
+const PIDFILE: &str = "pid";
+
+/// The pid file of lease `1.seq` while it runs, as the test sees it.
+fn in_lease(config: &kbf_driver_native::NativeConfig, seq: u64) -> std::path::PathBuf {
+    config
+        .scratch
+        .join(format!("lease-1-{seq}"))
+        .join("root")
+        .join(PIDFILE)
+}
+
+/// The pid an action printed on its stdout.
+fn pid_of(cas: &MemoryCas, result: &kbf_proto::reapi::ActionResult) -> i32 {
+    let out = support::stdout(cas, result);
+    out.trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("no pid in {out:?}"))
+}
 
 /// Catches: background processes an action leaves behind surviving its lease (they
 /// would run on, and could change outputs while they are read). Covers a plain
@@ -41,20 +62,16 @@ async fn processes_left_behind_after_exit_are_killed() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let pidfile = dir.join("pid");
-    let spec = Spec::sh("sleep 300 & echo $! > \"$PIDFILE\"; exit 0")
-        .env("PIDFILE", pidfile.to_str().expect("utf8"));
+    let spec = Spec::sh("sleep 300 & echo $!; exit 0");
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    let pid = pid_in(&pidfile).await;
+    let pid = pid_of(&cas, &result);
     assert!(!alive(pid), "the background child {pid} outlived the lease");
 
-    let pidfile = dir.join("escaped");
-    let spec = Spec::argv(&["/usr/bin/perl", "-e", ESCAPER])
-        .env("PIDFILE", pidfile.to_str().expect("utf8"));
+    let spec = Spec::argv(&["/usr/bin/perl", "-e", ESCAPER]);
     let result = run(&rt, &cas, 2, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
-    let pid = pid_in(&pidfile).await;
+    let pid = pid_of(&cas, &result);
     assert!(!alive(pid), "the setsid child {pid} outlived the lease");
     assert!(no_leases(&config));
 }
@@ -67,16 +84,15 @@ async fn a_timeout_ends_the_whole_tree() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let pidfile = dir.join("pid");
     let spec = Spec::sh("sh -c 'sleep 300 & echo $! > \"$PIDFILE\"; wait' & wait")
-        .env("PIDFILE", pidfile.to_str().expect("utf8"))
+        .env("PIDFILE", PIDFILE)
         .timeout(Duration::from_millis(500));
-    let outcome = run(&rt, &cas, 1, &spec).await;
+    let pidfile = in_lease(&config, 1);
+    let (outcome, pid) = tokio::join!(run(&rt, &cas, 1, &spec), pid_in(&pidfile));
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut)),
         "{outcome:?}"
     );
-    let pid = pid_in(&pidfile).await;
     assert!(!alive(pid), "the grandchild {pid} outlived the timeout");
     assert!(no_leases(&config));
 }
@@ -89,9 +105,9 @@ async fn a_kill_ends_the_whole_tree_before_it_returns() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = Arc::new(runtime(config.clone(), &cas));
-    let pidfile = dir.join("pid");
+    let pidfile = in_lease(&config, 1);
     let action = Spec::sh("sleep 300 & echo $! > \"$PIDFILE\"; wait")
-        .env("PIDFILE", pidfile.to_str().expect("utf8"))
+        .env("PIDFILE", PIDFILE)
         .store(&cas);
     let running = tokio::spawn({
         let rt = Arc::clone(&rt);
@@ -113,9 +129,9 @@ async fn a_dropped_run_ends_the_tree_and_cleans() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let pidfile = dir.join("pid");
+    let pidfile = in_lease(&config, 1);
     let action = Spec::sh("sleep 300 & echo $! > \"$PIDFILE\"; wait")
-        .env("PIDFILE", pidfile.to_str().expect("utf8"))
+        .env("PIDFILE", PIDFILE)
         .store(&cas);
     let run = rt.run(work(1, action, 0));
     let watched = async {
@@ -170,18 +186,19 @@ async fn an_action_past_its_limit_is_killed_whole() {
     };
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let pidfile = dir.join("pid");
     let action = Spec::sh("/usr/bin/perl -e \"$HOG\" & wait")
-        .env("PIDFILE", pidfile.to_str().expect("utf8"))
+        .env("PIDFILE", PIDFILE)
         .env("HOG", HOG)
         .env("MIB", "256")
         .timeout(Duration::from_secs(60))
         .store(&cas);
     let limit = 64 << 20;
-    let outcome = tokio::time::timeout(PROMPT * 3, rt.run(work(1, action, limit)))
-        .await
-        .expect("the watch ends the run long before its timeout");
-    let pid = pid_in(&pidfile).await;
+    let pidfile = in_lease(&config, 1);
+    let (outcome, pid) = tokio::join!(
+        tokio::time::timeout(PROMPT * 3, rt.run(work(1, action, limit))),
+        pid_in(&pidfile)
+    );
+    let outcome = outcome.expect("the watch ends the run long before its timeout");
     match outcome {
         Err(RuntimeError::OutOfMemory { used, limit: l }) => {
             assert_eq!(l, limit);
@@ -201,12 +218,9 @@ async fn an_action_within_its_limit_runs_to_the_end() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
-    let pidfile = dir.join("pid");
     let script = "/usr/bin/perl -e 'open(my $f, \">\", $ENV{PIDFILE}); print $f \"$$\\n\"; close($f); my $x = \"a\" x (32*1024*1024); select(undef,undef,undef,0.3)'";
     for (seq, booked) in [(1, 64_u64 << 20), (2, 0)] {
-        let action = Spec::sh(script)
-            .env("PIDFILE", pidfile.to_str().expect("utf8"))
-            .store(&cas);
+        let action = Spec::sh(script).env("PIDFILE", PIDFILE).store(&cas);
         let result = rt.run(work(seq, action, booked)).await.expect("ran");
         assert_eq!(result.exit_code, 0, "booked {booked}");
     }
