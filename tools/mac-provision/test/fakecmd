@@ -122,7 +122,8 @@ case "$NAME" in
     echo "FileVault is $(cat "$S/filevault")."
     ;;
   dscl)
-    # dscl . -read /Users/<name> [ATTR...] | -create /Users/<name> [ATTR VALUE] | -list /Users ATTR
+    # dscl . -read /Users/<name> [ATTR...] | -create /Users/<name> [ATTR VALUE] |
+    # -delete /Users/<name> ATTR | -list /Users [ATTR]
     verb=$2
     rec="$S/dscl$(flat "$3")"
     case "$verb" in
@@ -134,7 +135,12 @@ case "$NAME" in
         if [ $# -gt 3 ]; then
           shift 3
           for a in "$@"; do
-            v=$(kv_get "$rec" "$a") && echo "$(native "$a")$a: $v"
+            v=$(kv_get "$rec" "$a") || continue
+            case "$a" in
+              # A long value goes on a line of its own, as macOS's dscl prints it.
+              AuthenticationAuthority) printf '%s:\n %s\n' "$a" "$v" ;;
+              *) echo "$(native "$a")$a: $v" ;;
+            esac
           done
         else
           awk -F= '{ p = ($1 == "IsHidden") ? "dsAttrTypeNative:" : ""; print p $1 ": " substr($0, length($1) + 2) }' "$rec"
@@ -144,13 +150,52 @@ case "$NAME" in
         touch "$rec"
         [ $# -ge 5 ] && kv_set "$rec" "$4" "$5"
         ;;
+      -delete)
+        kv_get "$rec" "$4" >/dev/null || {
+          echo "<main> attribute status: eDSAttributeNotFound" >&2
+          exit 40
+        }
+        kv_del "$rec" "$4"
+        ;;
       -list)
+        # -list /Users prints the names; -list /Users ATTR the names and values.
         for r in "$S/dscl$(flat "$3")_"*; do
           [ -f "$r" ] || continue
-          echo "${r#"$S/dscl$(flat "$3")_"} $(kv_get "$r" "$4")"
+          if [ $# -ge 4 ]; then
+            echo "${r#"$S/dscl$(flat "$3")_"} $(kv_get "$r" "$4")"
+          else
+            echo "${r#"$S/dscl$(flat "$3")_"}"
+          fi
         done
         ;;
     esac
+    ;;
+  dseditgroup)
+    # dseditgroup -o checkmember -m USER GROUP. A member is listed in the group's
+    # GroupMembership or has the group as its primary group (the fake knows one group
+    # id: admin is 80). macOS's own also follows nested groups.
+    u=$4
+    g=$5
+    if printf ' %s \n' "$(kv_get "$S/dscl_Groups_$g" GroupMembership)" | grep -qF " $u "; then
+      echo "yes $u is a member of $g"
+    elif [ "$g" = admin ] && [ "$(kv_get "$S/dscl_Users_$u" PrimaryGroupID)" = 80 ]; then
+      echo "yes $u is a member of $g"
+    else
+      echo "no $u is NOT a member of $g"
+      exit 67
+    fi
+    ;;
+  sshd)
+    # sshd -T prints the settings sshd would use. The fake prints $S/sshd_effective
+    # when a test wrote one (a configuration whose effect the files the script reads
+    # do not show), else the kbf drop-in's lines with the keyword in lower case, as a
+    # sshd that reads the drop-in first would.
+    [ "$1" = -T ] || exit 1
+    if [ -f "$S/sshd_effective" ]; then
+      cat "$S/sshd_effective"
+    else
+      awk '{ print tolower($1), $2 }' "$FAKE_ROOT/etc/ssh/sshd_config.d/000-kbf.conf"
+    fi
     ;;
   launchctl)
     case "$1" in

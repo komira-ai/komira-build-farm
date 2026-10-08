@@ -85,7 +85,7 @@ mutant 'the job file is not compared' t_drift:launchd_label \
 mutant 'the job is not checked as loaded' t_drift:launchd_label \
   's/elif ! launchctl print "system\/\$P_launchd_label" >\/dev\/null 2>&1; then/elif false; then/'
 mutant 'restart does not truncate the error log' t_restart \
-  's/\[ -f "\$R\$ERR_LOG" \] && : >"\$R\$ERR_LOG"/:/'
+  's/^  : >"\$R\$ERR_LOG"$/  :/'
 mutant 'restart starts before it stops' t_restart \
   's/  launchctl bootout "system\/\$P_launchd_label" >\/dev\/null 2>&1/  :/'
 mutant 'a simulator runtime image is ignored' t_drift:simulator_runtimes \
@@ -113,7 +113,11 @@ mutant 'a role id of 500 or more is accepted' t_refused \
 mutant 'the role id of another account is taken over' t_drift:role_user \
   's/\[ -z "\$(role_id_taken)" \] || return 0/:/'
 mutant 'another administrator is ignored' t_drift:admin_user \
-  's/\*) ca_others="\$ca_others \$ca_m" ;;/*) : ;;/'
+  's/^    ca_others="\$ca_others \$ca_m"$/    :/'
+mutant 'an administrator by primary group is ignored' t_drift:admin_user \
+  's/^  for ca_m in \$(dscl \. -list \/Users 2>\/dev\/null); do$/  for ca_m in $(:); do/'
+mutant 'the admin is checked by the GroupMembership list only' t_drift:admin_user \
+  's/elif ! dseditgroup -o checkmember -m "\$P_admin_user" admin >\/dev\/null 2>&1; then/elif false; then/'
 mutant 'the sshd drop-in sorts after the system one' t_converge \
   's/000-kbf\.conf/200-kbf.conf/g'
 mutant 'the sshd Include line is not required' t_drift:ssh_password_auth \
@@ -132,6 +136,48 @@ mutant 'apply runs without root' t_not_root \
   's/\[ "\$(id -u)" = 0 \] || die/: || die/'
 mutant '--keys ignores an unknown item' t_keys \
   's/\*) die "--keys: unknown item: \$si_k (items: \$ITEMS)" ;;/*) : ;;/'
+
+# The error log restart empties as root (a link must never be followed).
+mutant 'restart empties the error log without checking it' t_err_log \
+  's/^  err_log_safe || return 2$/  :/'
+mutant 'apply keeps whatever is at the error log path' t_err_log \
+  's/^  if ! err_log_safe; then$/  if false; then/'
+mutant 'a hard link at the error log path counts as safe' t_err_log \
+  's/ \&\& \$2 == 1 \&\& / \&\& /'
+mutant 'a missing error log counts as safe' t_drift:launchd_label \
+  's/END { exit !ok }/END { exit !ok \&\& NR }/'
+mutant 'check ignores the error log' t_drift:launchd_label \
+  's/^  elif ! err_log_safe; then$/  elif false; then/'
+mutant 'the log directory is the role account'"'"'s' t_converge \
+  's/^  chown 0:0 "\$R\$LOG_DIR"$/  chown "$P_role_id:$P_role_id" "$R$LOG_DIR"/'
+# No password on the role account.
+mutant 'apply never sets the role account'"'"'s Password to *' t_converge \
+  '/^  dscl \. -create "\/Users\/\$P_role_user" Password/d'
+mutant 'the role account'"'"'s Password is not checked' t_drift:role_user \
+  's/ IsHidden Password"$/ IsHidden"/;s/ IsHidden=1 Password=\* / IsHidden=1 /'
+mutant 'AuthenticationAuthority read as one line (its value is on the next)' t_drift:role_user \
+  's/^  dscl \. -read "\/Users\/\$P_role_user" AuthenticationAuthority .*/  [ -n "$(dscl_attr "\/Users\/$P_role_user" AuthenticationAuthority)" ] \&\& rh_auth=present/'
+mutant 'apply leaves the AuthenticationAuthority' t_drift:role_user \
+  '/^  dscl \. -delete "\/Users\/\$P_role_user" AuthenticationAuthority/d'
+mutant 'a group holding the role id is ignored' t_drift:role_user \
+  '/^    dscl \. -list \/Groups PrimaryGroupID/d'
+# Key-only SSH as sshd uses it.
+mutant 'a drop-in sorting before ours is ignored' t_drift:ssh_password_auth \
+  's/^  elif \[ -n "\$cs_early" \]; then$/  elif false; then/'
+mutant 'a keyword before the Include line is ignored' t_drift:ssh_password_auth \
+  's/^  elif \[ -n "\$cs_kw" \]; then$/  elif false; then/'
+mutant 'keywords before the Include line match in one case only' t_drift:ssh_password_auth \
+  's/k = tolower(\$1);/k = $1;/'
+mutant 'a Keyword=value line before the Include line is missed' t_drift:ssh_password_auth \
+  's/sub(\/=\.\*\/, "", k) //'
+mutant 'sshd -T is not consulted' t_drift:ssh_password_auth \
+  's/^  elif \[ "\$(sshd_effective)" != "\$cs_want" \]; then$/  elif false; then/'
+mutant 'sshd -T runs without root' t_sshd_not_root \
+  's/^  elif \[ "\$(id -u)" != 0 \]; then$/  elif false; then/'
+mutant 'apply rewrites a drop-in that is already right' t_drift:ssh_password_auth \
+  '/-rw-r--r-- 0 0" \] && return 0$/d'
+mutant 'a key may hold a space' t_refused \
+  's/\*\[!a-z_\]\*) die "profile line/*[!a-z_\\ ]*) die "profile line/'
 
 printf '%d mutants, %d not killed\n' "$COUNT" "$FAILED"
 [ "$FAILED" = 0 ]

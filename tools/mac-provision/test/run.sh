@@ -80,7 +80,7 @@ want_file() {
 
 # The calls that change the fake Mac, from its log.
 writes() {
-  grep -E '^(pmset -a|defaults (write|delete)|scutil --set|systemsetup (-f|-set)|socketfilterfw --set|dscl \. -create|launchctl boot|xcode-select -s|sntp -sS|xip |chown |mv |fdesetup [^s])' "$S/log"
+  grep -E '^(pmset -a|defaults (write|delete)|scutil --set|systemsetup (-f|-set)|socketfilterfw --set|dscl \. -(create|delete)|launchctl boot|xcode-select -s|sntp -sS|xip |chown |mv |fdesetup [^s])' "$S/log"
 }
 
 no_writes() {
@@ -118,9 +118,11 @@ mkroot() {
   done
   ln -s "$HERE/fakecmd" "$FAKE_ROOT/usr/sbin/scutil"
   ln -s "$HERE/fakecmd" "$FAKE_ROOT/usr/sbin/systemsetup"
+  ln -s "$HERE/fakecmd" "$FAKE_ROOT/usr/sbin/dseditgroup"
+  ln -s "$HERE/fakecmd" "$FAKE_ROOT/usr/sbin/sshd"
   ln -s "$HERE/fakecmd" "$FAKE_ROOT/usr/libexec/PlistBuddy"
   ln -s "$HERE/fakecmd" "$FAKE_ROOT/usr/libexec/ApplicationFirewall/socketfilterfw"
-  for t in awk sed grep cat mkdir rm chmod tr cut head tail sleep; do
+  for t in awk sed grep cat mkdir rm chmod tr cut head tail sleep sort; do
     ln -s "$(command -v "$t")" "$FAKE_ROOT/bin/$t"
   done
   : >"$S/log"
@@ -237,6 +239,10 @@ t_refused() {
 sleep=0'
   refused 'duplicate key' 'duplicate key: firewall' '$a\
 firewall=on'
+  # A key with a space would match two adjacent known keys and reach eval as a command.
+  refused 'key with a space' 'unknown key: default_developer_dir xcode_xip_dir' \
+    '/^xcode=/d' '/^expect_probe=/d' '/^default_developer_dir=/d' '/^xcode_xip_dir=/d' '$a\
+default_developer_dir xcode_xip_dir=/x'
   refused 'not KEY=VALUE' 'not KEY=VALUE' '$a\
 justtext'
   refused 'missing key' 'missing key: firewall' '/^firewall=/d'
@@ -388,9 +394,18 @@ t_drift() {
   want_out 'other administrators: intruder'
   drift admin_user stay 'kv $S/dscl_Groups_admin GroupMembership root'
   drift admin_user stay 'rm $S/dscl_Users_farmadmin'
+  # An administrator by primary group (80, admin), listed in no GroupMembership.
+  drift admin_user stay 'user hidden 502; kv $S/dscl_Users_hidden PrimaryGroupID 80'
+  want_out 'other administrators: hidden'
   drift role_user fix 'kv $S/dscl_Users__kbf UserShell /bin/zsh'
+  # The role account has no password: Password is *, and no AuthenticationAuthority
+  # (which dscl prints on a line of its own) names a password hash.
+  drift role_user fix 'kv $S/dscl_Users__kbf Password "********"'
+  drift role_user fix 'kv $S/dscl_Users__kbf AuthenticationAuthority ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>"' 'AuthenticationAuthority=present'
   drift role_user stay 'user other 480'
   want_out 'uid 480 belongs to other'
+  drift role_user stay 'kv $S/dscl_Groups_other PrimaryGroupID 480'
+  want_out 'gid 480 belongs to other'
   for dp in sleep standby powernap; do
     drift "power_$dp" fix "kv \$S/pmset $dp 1"
   done
@@ -406,6 +421,17 @@ t_drift() {
   drift ssh_password_auth fix 'echo "PasswordAuthentication yes" >$R/etc/ssh/sshd_config.d/000-kbf.conf'
   drift ssh_password_auth fix 'echo "1000:1000 $R/etc/ssh/sshd_config.d/000-kbf.conf" >>$S/owners'
   drift ssh_password_auth stay 'echo "# no include" >$R/etc/ssh/sshd_config'
+  # What sshd uses, not only the drop-in: a drop-in sorting first ("-" sorts before
+  # "0"), a keyword before the Include line (any case, "=" or a space), and what
+  # sshd -T reports.
+  drift ssh_password_auth stay 'echo "PasswordAuthentication yes" >$R/etc/ssh/sshd_config.d/00-x.conf'
+  want_out 'sshd reads 00-x.conf before 000-kbf.conf'
+  drift ssh_password_auth stay 'printf "PasswordAuthentication yes\nInclude /etc/ssh/sshd_config.d/*\n" >$R/etc/ssh/sshd_config'
+  want_out 'sets PasswordAuthentication before its Include line'
+  drift ssh_password_auth stay 'printf "  permitRootLogin=yes\nInclude /etc/ssh/sshd_config.d/*\n" >$R/etc/ssh/sshd_config'
+  want_out 'sets permitRootLogin=yes before its Include line'
+  drift ssh_password_auth stay 'printf "passwordauthentication yes\nkbdinteractiveauthentication no\npermitrootlogin no\n" >$S/sshd_effective'
+  want_out 'sshd -T reports'
   drift firewall fix 'echo 0 >$S/firewall'
   drift firewall fix 'echo broken >$S/firewall'
   drift filevault stay 'echo On >$S/filevault'
@@ -435,8 +461,50 @@ t_drift() {
   want_out '/Library/Developer/CoreSimulator/Volumes/iOS_23A'
   drift launchd_label fix 'sed -i s/Interactive/Standard/ $R/$PLIST_REL'
   drift launchd_label fix 'echo "1000:1000 $R/$PLIST_REL" >>$S/owners'
-  drift launchd_label fix 'echo "0:0 $R/Library/Logs/kbf" >>$S/owners'
+  # The log directory is root's; the error log is the role account's, a regular file.
+  drift launchd_label fix 'echo "480:480 $R/Library/Logs/kbf" >>$S/owners'
+  drift launchd_label fix 'echo "0:0 $R/Library/Logs/kbf/kbf-daemon.err.log" >>$S/owners'
+  drift launchd_label fix 'chmod 600 $R/Library/Logs/kbf/kbf-daemon.err.log'
+  drift launchd_label fix 'rm $R/Library/Logs/kbf/kbf-daemon.err.log'
   drift launchd_label fix 'rm $S/loaded_system_org.example.kbf-daemon'
+}
+
+t_err_log() {
+  # The role account owns the error log, and restart empties it as root. A link to a
+  # root file planted in its place (a symbolic or a hard link) is never emptied:
+  # check fails, restart refuses before it stops the job, and apply replaces the link.
+  for el_ln in 'ln -s' ln; do
+    converged
+    el_log=$FAKE_ROOT/Library/Logs/kbf/kbf-daemon.err.log
+    echo 'root: precious' >"$FAKE_ROOT/etc/precious"
+    rm -f "$el_log"
+    $el_ln "$FAKE_ROOT/etc/precious" "$el_log"
+    NAME="t_err_log ($el_ln)"
+    runr check --profile "$P" --keys launchd_label
+    want_status 1
+    want_out 'FAIL launchd_label: /Library/Logs/kbf/kbf-daemon.err.log is '
+    runr restart --profile "$P"
+    want_status 2
+    want_err 'is not a regular file of _kbf'
+    if grep -q '^launchctl boot' "$S/log"; then failt "restart touched the job"; fi
+    runr apply --profile "$P"
+    want_status 0
+    want_out 'CHANGE launchd_label:'
+    [ -s "$FAKE_ROOT/etc/precious" ] || failt "emptied the file a link points to"
+    [ ! -L "$el_log" ] || failt "apply left the link"
+    runr restart --profile "$P"
+    want_status 0
+  done
+}
+
+t_sshd_not_root() {
+  # check as another user runs no sshd -T (it needs root), and says so.
+  converged
+  echo 501 >"$S/uid"
+  runr check --profile "$P" --keys ssh_password_auth
+  want_status 0
+  want_out 'sshd -T not run: needs root'
+  if grep -q '^sshd' "$S/log"; then failt "ran sshd -T"; fi
 }
 
 t_quiet_entries() {
@@ -446,6 +514,9 @@ t_quiet_entries() {
   mkdir -p "$FAKE_ROOT/Library/Developer/CoreSimulator/Images"
   touch "$FAKE_ROOT/Library/Developer/CoreSimulator/Images/images.plist"
   ln -s "$FAKE_ROOT/Applications/Xcode-27.0.app" "$FAKE_ROOT/Applications/Xcode.app"
+  # A commented keyword before the Include line, and a drop-in sorting after ours.
+  printf '#PasswordAuthentication yes\nInclude /etc/ssh/sshd_config.d/*\n' >"$FAKE_ROOT/etc/ssh/sshd_config"
+  echo 'PasswordAuthentication yes' >"$FAKE_ROOT/etc/ssh/sshd_config.d/100-macos.conf"
   runr check --profile "$P"
   want_status 0
 }
@@ -528,7 +599,7 @@ t_restart() {
   sed -i s/Interactive/Background/ "$FAKE_ROOT/$PLIST_REL"
   runr apply --profile "$P"
   want_status 1
-  want_out 'launchctl bootstrap failed'
+  want_out 'the job did not restart'
 }
 
 t_xcode_sources() {
@@ -569,7 +640,7 @@ t_xcode_sources() {
 
 # ---------------------------------------------------------------- main
 
-ALL="t_usage t_print t_print_real_root t_refused t_converge t_drift t_quiet_entries t_lease_autologin t_not_root t_keys t_other_values t_restart t_xcode_sources"
+ALL="t_usage t_print t_print_real_root t_refused t_converge t_drift t_quiet_entries t_lease_autologin t_not_root t_keys t_other_values t_restart t_err_log t_sshd_not_root t_xcode_sources"
 for tn in ${KBF_TESTS:-$ALL}; do
   TESTS=$((TESTS + 1))
   NAME=$tn

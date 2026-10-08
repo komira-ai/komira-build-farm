@@ -7,22 +7,14 @@
 #   kbf-mac-provision print   --profile FILE [--root DIR]
 #   kbf-mac-provision restart --profile FILE [--root DIR]
 #
-# check   reads every setting, prints one PASS or FAIL line per item, and exits 1 if
-#         any item fails. It changes nothing.
-# apply   (root) fixes each failing item, prints one CHANGE line per change, then
-#         checks again and prints only what still fails. A second apply prints
-#         nothing. Items marked "check only" are never changed (FileVault, the macOS
-#         build, the admin account, probes, simulator runtimes).
-# print   prints the profile as resolved, its SHA-256 and the node's profile label.
-# restart (root) restarts the kbf-daemon LaunchDaemon and truncates its
-#         StandardErrorPath file while the job is stopped (section 5.7). apply does
-#         the same when it rewrites the job.
-#
-# --keys  limits check and apply to the named items (the names the PASS and FAIL
-#         lines print).
-# --root  takes every path the script reads or writes, and every program it runs,
-#         under DIR. It exists for the test harness (tools/mac-provision/test), which
-#         runs the script against a fake Mac on Linux; a node uses the default, /.
+# check prints one PASS or FAIL line per item and changes nothing. apply (root) fixes
+# each failing item, one CHANGE line per change, then prints only what still fails; a
+# second apply prints nothing; "check only" items are never changed. print shows the
+# resolved profile, its SHA-256 and the node label. restart (root) restarts the
+# LaunchDaemon, emptying its error log while it is stopped (section 5.7), and refuses
+# when that log is not a regular file of the role account. --keys limits check and
+# apply to the named items; --root runs everything under DIR, for the tests only.
+# tools/mac-provision/README.md describes each item.
 #
 # The profile is KEY=VALUE lines, parsed and never sourced; blank lines and lines
 # starting with # are skipped. An unknown key or a repeated one (other than xcode,
@@ -122,6 +114,11 @@ load_profile() {
     esac
     lp_k=${lp_line%%=*}
     lp_v=${lp_line#*=}
+    # A key is [a-z_]+, so it cannot match two known keys at once or reach eval as text.
+    case "$lp_k" in
+      '' | *[!a-z_]*) die "profile line $lp_n: unknown key: $lp_k" ;;
+      *) : ;;
+    esac
     case "$lp_v" in
       *[!A-Za-z0-9._:/=@+,\ -]*) die "profile line $lp_n: $lp_k: a value may hold only letters, digits, spaces and ._:/=@+,-" ;;
       *) : ;;
@@ -349,22 +346,22 @@ fix_item() {
   esac
 }
 
-ck_macos_version() {
-  cm_v=$(sw_vers -productVersion 2>/dev/null)
-  if [ "$cm_v" = "$P_macos_version" ]; then
+# ck_sw_vers FLAG WANT WHAT: sw_vers FLAG prints WANT.
+ck_sw_vers() {
+  cm_v=$(sw_vers "$1" 2>/dev/null)
+  if [ "$cm_v" = "$2" ]; then
     ok "$cm_v"
   else
-    bad "macOS ${cm_v:-unknown}, the profile pins $P_macos_version"
+    bad "$3 ${cm_v:-unknown}, the profile pins $2"
   fi
 }
 
+ck_macos_version() {
+  ck_sw_vers -productVersion "$P_macos_version" macOS
+}
+
 ck_macos_build() {
-  cm_v=$(sw_vers -buildVersion 2>/dev/null)
-  if [ "$cm_v" = "$P_macos_build" ]; then
-    ok "$cm_v"
-  else
-    bad "build ${cm_v:-unknown}, the profile pins $P_macos_build"
-  fi
+  ck_sw_vers -buildVersion "$P_macos_build" build
 }
 
 ck_hostname() {
@@ -388,18 +385,19 @@ fix_hostname() {
   done
 }
 
+# Admins: the admin group's list, and each account dseditgroup counts (primary, nested).
 ck_admin_user() {
-  ca_members=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership://')
   ca_others=
-  for ca_m in $ca_members; do
-    case "$ca_m" in
-      root | "$P_admin_user") : ;;
-      *) ca_others="$ca_others $ca_m" ;;
-    esac
+  for ca_m in $(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership://'); do
+    ca_others="$ca_others $ca_m"
   done
+  for ca_m in $(dscl . -list /Users 2>/dev/null); do
+    dseditgroup -o checkmember -m "$ca_m" admin >/dev/null 2>&1 && ca_others="$ca_others $ca_m"
+  done
+  ca_others=$(printf '%s\n' $ca_others | awk -v a="$P_admin_user" 'NF && !seen[$1]++ && $1 != "root" && $1 != a { printf " %s", $1 }')
   if [ -z "$(dscl_attr "/Users/$P_admin_user" UniqueID)" ]; then
     bad "no account $P_admin_user"
-  elif ! printf ' %s \n' "$ca_members" | grep -qF -- " $P_admin_user "; then
+  elif ! dseditgroup -o checkmember -m "$P_admin_user" admin >/dev/null 2>&1; then
     bad "$P_admin_user is not in the admin group"
   elif [ -n "$ca_others" ]; then
     bad "other administrators:$ca_others"
@@ -408,10 +406,11 @@ ck_admin_user() {
   fi
 }
 
-ROLE_ATTRS="UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden"
+ROLE_ATTRS="UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden Password"
 
+# No password: Password "*" and no AuthenticationAuthority (where a hash is named).
 role_want() {
-  printf 'UniqueID=%s PrimaryGroupID=%s UserShell=/usr/bin/false NFSHomeDirectory=/var/empty IsHidden=1 group=%s' \
+  printf 'UniqueID=%s PrimaryGroupID=%s UserShell=/usr/bin/false NFSHomeDirectory=/var/empty IsHidden=1 Password=* AuthenticationAuthority=absent group=%s' \
     "$P_role_id" "$P_role_id" "$P_role_id"
 }
 
@@ -419,19 +418,24 @@ role_have() {
   for rh_a in $ROLE_ATTRS; do
     printf '%s=%s ' "$rh_a" "$(dscl_attr "/Users/$P_role_user" "$rh_a")"
   done
-  printf 'group=%s' "$(dscl_attr "/Groups/$P_role_user" PrimaryGroupID)"
+  rh_auth=absent # dscl may print the value on a line of its own: test the name
+  dscl . -read "/Users/$P_role_user" AuthenticationAuthority 2>/dev/null | grep -q '^AuthenticationAuthority:' && rh_auth=present
+  printf 'AuthenticationAuthority=%s group=%s' "$rh_auth" "$(dscl_attr "/Groups/$P_role_user" PrimaryGroupID)"
 }
 
-# The account, other than the role account, that holds uid $P_role_id.
+# "uid|gid ID belongs to NAME": another user or group that holds the role id.
 role_id_taken() {
-  dscl . -list /Users UniqueID 2>/dev/null | awk -v id="$P_role_id" -v me="$P_role_user" '$2 == id && $1 != me { print $1; exit }'
+  {
+    dscl . -list /Users UniqueID 2>/dev/null | sed 's/^/uid /'
+    dscl . -list /Groups PrimaryGroupID 2>/dev/null | sed 's/^/gid /'
+  } | awk -v id="$P_role_id" -v me="$P_role_user" '$3 == id && $2 != me { print $1, id, "belongs to", $2; exit }'
 }
 
 ck_role_user() {
   cr_taken=$(role_id_taken)
   cr_have=$(role_have)
   if [ -n "$cr_taken" ]; then
-    bad "uid $P_role_id belongs to $cr_taken"
+    bad "$cr_taken"
   elif [ "$cr_have" = "$(role_want)" ]; then
     ok "$P_role_user (uid and gid $P_role_id, hidden, no shell)"
   else
@@ -451,6 +455,7 @@ fix_role_user() {
   dscl . -create "/Users/$P_role_user" NFSHomeDirectory /var/empty
   dscl . -create "/Users/$P_role_user" IsHidden 1
   dscl . -create "/Users/$P_role_user" Password '*'
+  dscl . -delete "/Users/$P_role_user" AuthenticationAuthority 2>/dev/null
   change "role account and group $P_role_user, id $P_role_id"
 }
 
@@ -472,17 +477,10 @@ ck_pref() {
   fi
 }
 
-onoff() {
-  if [ "$1" = 1 ]; then
-    echo On
-  else
-    echo Off
-  fi
-}
-
 ck_remote_login() {
   cl_v=$(systemsetup -getremotelogin 2>/dev/null)
-  cl_w="Remote Login: $(onoff "$P_remote_login")"
+  cl_w="Remote Login: Off"
+  [ "$P_remote_login" = 1 ] && cl_w="Remote Login: On"
   if [ "$cl_v" = "$cl_w" ]; then
     ok "$cl_v"
   else
@@ -491,38 +489,62 @@ ck_remote_login() {
 }
 
 fix_remote_login() {
-  if [ "$P_remote_login" = 1 ]; then
-    fr_s=on
-  else
-    fr_s=off
-  fi
+  fr_s=off
+  [ "$P_remote_login" = 1 ] && fr_s=on
   systemsetup -f -setremotelogin "$fr_s" >/dev/null
   change "Remote Login $fr_s"
 }
 
 sshd_want() {
-  if [ "$P_ssh_password_auth" = 1 ]; then
-    sw_p=yes
-  else
-    sw_p=no
-  fi
+  sw_p=no
+  [ "$P_ssh_password_auth" = 1 ] && sw_p=yes
   printf 'PasswordAuthentication %s\nKbdInteractiveAuthentication %s\nPermitRootLogin no\n' "$sw_p" "$sw_p"
 }
 
+# The files sshd reads before the drop-in: its Include sorts them first.
+early_dropins() {
+  for ed_f in "${SSHD_DROPIN%/*}"/*; do
+    [ "$ed_f" = "$SSHD_DROPIN" ] && return 0
+    [ -e "$ed_f" ] && printf ' %s' "${ed_f##*/}"
+  done
+}
+
+# Auth keywords sshd_config sets before its Include line; sshd keeps the first value.
+early_keywords() {
+  awk -v inc="$SSHD_INCLUDE" '$0 == inc { exit } { k = tolower($1); sub(/=.*/, "", k) } k ~ /^(passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitrootlogin)$/ { printf " %s", $1 }' "$SSHD_CONFIG" 2>/dev/null
+}
+
+# What sshd -T says sshd uses (it needs root), in sshd_want's form.
+sshd_effective() {
+  sshd -T 2>/dev/null | awk '$1 ~ /^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin)$/ { print $1, $2 }' | sort
+}
+
 ck_ssh_password_auth() {
+  cs_want=$(sshd_want | tr '[:upper:]' '[:lower:]' | sort)
+  cs_early=$(early_dropins)
+  cs_kw=$(early_keywords)
   if ! grep -qxF -- "$SSHD_INCLUDE" "$SSHD_CONFIG" 2>/dev/null; then
     bad "/etc/ssh/sshd_config lacks the line '$SSHD_INCLUDE'"
   elif [ "$(cat "$SSHD_DROPIN" 2>/dev/null)" != "$(sshd_want)" ]; then
     bad "/etc/ssh/sshd_config.d/000-kbf.conf differs from the profile"
   elif [ "$(owner_of "$SSHD_DROPIN")" != "-rw-r--r-- 0 0" ]; then
     bad "/etc/ssh/sshd_config.d/000-kbf.conf is $(owner_of "$SSHD_DROPIN"), want -rw-r--r-- 0 0"
+  elif [ -n "$cs_early" ]; then
+    bad "sshd reads$cs_early before 000-kbf.conf (apply does not remove them)"
+  elif [ -n "$cs_kw" ]; then
+    bad "/etc/ssh/sshd_config sets$cs_kw before its Include line (apply does not edit it)"
+  elif [ "$(id -u)" != 0 ]; then
+    ok "$(sshd_want | tr '\n' ';') (sshd -T not run: needs root)"
+  elif [ "$(sshd_effective)" != "$cs_want" ]; then
+    bad "sshd -T reports '$(sshd_effective | tr '\n' ';')', want '$(printf '%s' "$cs_want" | tr '\n' ';')'"
   else
-    ok "$(sshd_want | tr '\n' ';')"
+    ok "$(sshd_want | tr '\n' ';') (sshd -T agrees)"
   fi
 }
 
 fix_ssh_password_auth() {
   grep -qxF -- "$SSHD_INCLUDE" "$SSHD_CONFIG" 2>/dev/null || return 0
+  [ "$(cat "$SSHD_DROPIN" 2>/dev/null)$(owner_of "$SSHD_DROPIN")" = "$(sshd_want)-rw-r--r-- 0 0" ] && return 0
   mkdir -p "${SSHD_DROPIN%/*}"
   sshd_want >"$SSHD_DROPIN.kbf-new"
   chown 0:0 "$SSHD_DROPIN.kbf-new"
@@ -824,8 +846,12 @@ ck_launchd_label() {
     bad "${cj_p#"$R"} is missing or differs from the profile"
   elif [ "$(owner_of "$cj_p")" != "-rw-r--r-- 0 0" ]; then
     bad "${cj_p#"$R"} is $(owner_of "$cj_p"), want -rw-r--r-- 0 0"
-  elif [ "$(owner_of "$R$LOG_DIR")" != "drwxr-xr-x $P_role_id $P_role_id" ]; then
-    bad "$LOG_DIR is $(owner_of "$R$LOG_DIR"), want drwxr-xr-x $P_role_id $P_role_id"
+  elif [ "$(owner_of "$R$LOG_DIR")" != "drwxr-xr-x 0 0" ]; then
+    bad "$LOG_DIR is $(owner_of "$R$LOG_DIR"), want drwxr-xr-x 0 0"
+  elif ! err_log_safe; then
+    bad "$ERR_LOG is $(owner_of "$R$ERR_LOG"), want a regular file with one link, -rw-r--r-- $P_role_id $P_role_id"
+  elif [ "$(owner_of "$R$ERR_LOG")" != "-rw-r--r-- $P_role_id $P_role_id" ]; then
+    bad "$ERR_LOG is $(owner_of "$R$ERR_LOG"), want -rw-r--r-- $P_role_id $P_role_id"
   elif ! launchctl print "system/$P_launchd_label" >/dev/null 2>&1; then
     bad "system/$P_launchd_label is not loaded"
   else
@@ -833,12 +859,20 @@ ck_launchd_label() {
   fi
 }
 
+# Whether the error log is a regular file with one link, the role account's: the only
+# file restart empties as root. The directory is root's, so no link replaces it.
+err_log_safe() {
+  ls -ldn "$R$ERR_LOG" 2>/dev/null | awk -v id="$P_role_id" '{ ok = substr($1, 1, 1) == "-" && $2 == 1 && $3 == id } END { exit !ok }'
+}
+
 # Stops the job, truncates its StandardErrorPath file while it is stopped (launchd
 # keeps the descriptor open while the job runs, so the file is never rotated), and
-# starts it again.
+# starts it again. Returns 2, having stopped nothing, if the error log is not safe to
+# empty; 1 if the job does not start.
 restart_job() {
+  err_log_safe || return 2
   launchctl bootout "system/$P_launchd_label" >/dev/null 2>&1
-  [ -f "$R$ERR_LOG" ] && : >"$R$ERR_LOG"
+  : >"$R$ERR_LOG"
   rj_try=0
   until launchctl bootstrap system "$(plist_path)" >/dev/null 2>&1; do
     rj_try=$((rj_try + 1))
@@ -849,8 +883,15 @@ restart_job() {
 
 fix_launchd_label() {
   mkdir -p "$R$LOG_DIR"
-  chown "$P_role_id:$P_role_id" "$R$LOG_DIR"
+  chown 0:0 "$R$LOG_DIR"
   chmod 755 "$R$LOG_DIR"
+  # Anything else at the log's path is unlinked (never followed) and a new file made.
+  if ! err_log_safe; then
+    rm -rf "$R$ERR_LOG"
+    : >"$R$ERR_LOG"
+    chown "$P_role_id:$P_role_id" "$R$ERR_LOG"
+  fi
+  chmod 644 "$R$ERR_LOG"
   fj_p=$(plist_path)
   mkdir -p "${fj_p%/*}"
   render_plist >"$fj_p.kbf-new"
@@ -860,7 +901,7 @@ fix_launchd_label() {
   if restart_job; then
     change "wrote ${fj_p#"$R"} and restarted the job (error log truncated)"
   else
-    change "wrote ${fj_p#"$R"}; launchctl bootstrap failed"
+    change "wrote ${fj_p#"$R"}; the job did not restart"
   fi
 }
 
@@ -942,8 +983,12 @@ case "$MODE" in
   *)
     need_root
     ITEM=launchd_label
-    restart_job || die "launchctl bootstrap system $(plist_path) failed"
-    change "restarted system/$P_launchd_label (error log truncated)"
+    restart_job
+    case $? in
+      0) change "restarted system/$P_launchd_label (error log truncated)" ;;
+      2) die "$ERR_LOG is not a regular file of $P_role_user with one link; nothing restarted (apply replaces it)" ;;
+      *) die "launchctl bootstrap system $(plist_path) failed" ;;
+    esac
     ;;
 esac
 exit 0

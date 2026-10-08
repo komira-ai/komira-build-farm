@@ -16,7 +16,9 @@
 #     KBF_DAEMON if given), and the default developer directory when xcode-select
 #     points through a link: apply, a second apply that prints nothing, check passes;
 #     two settings drifted by hand fail check by name and the next apply fixes them;
-#     restart truncates the error log;
+#     restart truncates the error log (a file of the role account in a directory of
+#     root's), refuses when a link is planted in its place, and apply replaces the
+#     link; the sshd item, run as root, also compares `sshd -T`;
 #   asserted as read: macos_version, macos_build, filevault, xcode, probe, and
 #     simulator_runtimes failing exactly when `xcrun simctl list runtimes` lists one;
 #   applied, printed, not asserted (a VM may accept and ignore pmset): power_*;
@@ -65,7 +67,7 @@ want() {
 # ---------------------------------------------------------------- the profile
 
 role_id=480
-while dscl . -list /Users UniqueID | awk -v id="$role_id" '$2 == id { f = 1 } END { exit !f }'; do
+while { dscl . -list /Users UniqueID; dscl . -list /Groups PrimaryGroupID; } | awk -v id="$role_id" '$2 == id { f = 1 } END { exit !f }'; do
   role_id=$((role_id + 1))
 done
 filevault=off
@@ -174,6 +176,24 @@ prov restart --profile "$P"
 want_status 0 restart
 if grep -q kbf-hosted-marker /Library/Logs/kbf/kbf-daemon.err.log; then fail "the error log was not truncated"; fi
 launchctl print "system/$LABEL" >/dev/null || fail "system/$LABEL is not loaded after restart"
+
+echo "== the error log: a file of the role account in a directory of root's"
+[ "$(stat -f '%u %g %Lp' /Library/Logs/kbf)" = "0 0 755" ] || fail "/Library/Logs/kbf is $(stat -f '%u %g %Lp' /Library/Logs/kbf)"
+[ "$(stat -f '%u %g %Lp %l' /Library/Logs/kbf/kbf-daemon.err.log)" = "$role_id $role_id 644 1" ] ||
+  fail "the error log is $(stat -f '%u %g %Lp %l' /Library/Logs/kbf/kbf-daemon.err.log)"
+echo "== a link planted at the error log: restart refuses, apply replaces it, the target keeps its bytes"
+echo 'kbf-precious' >"$WORK/precious"
+rm -f /Library/Logs/kbf/kbf-daemon.err.log
+ln -s "$WORK/precious" /Library/Logs/kbf/kbf-daemon.err.log
+prov check --profile "$P" --keys launchd_label
+want_status 1 "check with a link at the error log"
+prov restart --profile "$P"
+want_status 2 "restart with a link at the error log"
+want "is not a regular file of _kbf"
+prov apply --profile "$P" --keys launchd_label
+want_status 0 "apply with a link at the error log"
+grep -q kbf-precious "$WORK/precious" || fail "the link's target was emptied"
+[ ! -L /Library/Logs/kbf/kbf-daemon.err.log ] || fail "apply left the link"
 
 echo "== check, after apply (every item)"
 prov check --profile "$P"
