@@ -77,7 +77,7 @@ pub fn osupdate_declaration(serial: &Serial) -> String {
 /// something after it.
 #[must_use]
 pub fn is_kbf_declaration(identifier: &str) -> bool {
-    identifier.len() > DECLARATION_PREFIX.len() && identifier.starts_with(DECLARATION_PREFIX)
+    identifier.len() > DECLARATION_PREFIX.len() && identifier.contains(DECLARATION_PREFIX)
 }
 
 /// Whether `build` is a macOS build such as `26A434` or `25G241a`: 1 to 32 ASCII
