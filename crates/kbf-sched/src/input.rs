@@ -161,4 +161,30 @@ pub enum Event {
     /// also notes which queued operations no live worker can run, and refuses those
     /// that have waited so for the scheduler's unservable wait.
     Tick,
+    /// An operator cordons `worker`: placement offers it no new lease, and the leases it
+    /// holds run on. A drain already under way is kept. Holds across the worker's
+    /// sessions, and for a worker not registered yet.
+    Cordon {
+        /// The worker.
+        worker: WorkerId,
+    },
+    /// An operator drains `worker`: cordons it and waits for its leases to end. It is
+    /// [`Cordon::Drained`] once it holds none, and [`Cordon::Paused`] if `deadline`
+    /// comes first; no lease is killed or given up for it. Restarts a drain that is
+    /// drained or paused.
+    ///
+    /// [`Cordon::Drained`]: crate::Cordon::Drained
+    /// [`Cordon::Paused`]: crate::Cordon::Paused
+    Drain {
+        /// The worker.
+        worker: WorkerId,
+        /// When the drain pauses if leases still run.
+        deadline: FarmTime,
+    },
+    /// An operator returns `worker` to placement, ending its cordon and any drain, and
+    /// queued work is placed at once.
+    Uncordon {
+        /// The worker.
+        worker: WorkerId,
+    },
 }

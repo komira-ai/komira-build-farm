@@ -23,7 +23,11 @@
 //!   [`UNSERVABLE_WAIT`], the refusal committed before its callers are answered;
 //! - in-flight dedup by instance and action digest, with waiters attached to one
 //!   operation;
-//! - QoS levels ordering the queue (no quotas).
+//! - QoS levels ordering the queue (no quotas);
+//! - cordon and drain ([`Cordon`]): placement skips a cordoned worker, whose leases run
+//!   on; a drain waits for them until a deadline, then pauses, and never kills. Work
+//!   only cordoned workers could run waits, naming them, and is not refused for it; an
+//!   uncordon places queued work at once.
 //!
 //! Not yet: placement scoring (alignment, best fit), reclaimed
 //! room and preemption, the infra retry budget, and committing submissions so that a
@@ -34,11 +38,13 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod cordon;
 pub mod fence;
 mod input;
 mod scheduler;
 mod servable;
 
+pub use cordon::Cordon;
 pub use fence::SelfFence;
 pub use input::{Event, Input, Request};
 pub use scheduler::{OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

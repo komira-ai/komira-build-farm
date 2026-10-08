@@ -58,7 +58,8 @@ async fn run<O: ObjectStore + 'static>(
         prefix,
     ));
     let shutdown = interrupted()?;
-    let bound = bind_server_with_api(cache, listeners, args.api_listen, shutdown)?;
+    let api = args.api()?;
+    let bound = bind_server_with_api(cache, listeners, api, shutdown)?;
     println!("{}", start_line(bound.reapi, bound.worker, bound.api));
     bound.serving.await?;
     Ok(())

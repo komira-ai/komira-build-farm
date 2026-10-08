@@ -15,6 +15,7 @@ use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::farm::Farm;
 use crate::identity::{DenyList, Peers};
+use crate::token::ApiToken;
 use crate::worker::WorkerService;
 
 /// How the server listens and paces its daemons.
@@ -48,6 +49,15 @@ pub struct WorkerTls {
     pub server: ServerTlsConfig,
     /// The certificates and nodes refused, read again at every check.
     pub deny_list: Option<DenyList>,
+}
+
+/// The operator API ([`crate::api`]): where it listens, and the token its writes need.
+#[derive(Clone, Debug)]
+pub struct Api {
+    /// The listener.
+    pub listen: SocketAddr,
+    /// The token writes must present; `None` turns writes off (reads still answer).
+    pub token: Option<ApiToken>,
 }
 
 /// Why the server could not start or stopped.
@@ -95,7 +105,13 @@ fn serve_api(
     routes: axum::Router,
 ) -> impl Future<Output = std::io::Result<()>> {
     match listener {
-        Some(listener) => Either::Left(axum::serve(listener, routes).into_future()),
+        Some(listener) => Either::Left(
+            axum::serve(
+                listener,
+                routes.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .into_future(),
+        ),
         None => Either::Right(std::future::pending()),
     }
 }
@@ -128,14 +144,14 @@ where
     bind_server_with_api(cache, listeners, None, shutdown)
 }
 
-/// [`bind_server`], and the operator API ([`crate::api`]) on `api` if it is given.
+/// [`bind_server`], and the operator API ([`crate::api`]) if `api` is given.
 ///
 /// # Errors
 /// A listener cannot be bound, or the worker TLS configuration is refused.
 pub fn bind_server_with_api<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
-    api: Option<SocketAddr>,
+    api: Option<Api>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -145,9 +161,10 @@ where
     let farm = Arc::new(Farm::new(Arc::clone(&cache), listeners.unservable_wait));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let api_listener = api.map(bind_api).transpose()?;
+    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
-    let api_routes = crate::api::router(Arc::clone(&farm));
+    let api_routes = crate::api::router(Arc::clone(&farm), token);
 
     let mut worker_server = Server::builder();
     let peers = match listeners.worker_tls {

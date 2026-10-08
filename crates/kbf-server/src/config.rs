@@ -12,7 +12,8 @@ use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Listeners, WorkerTls};
+use crate::serve::{Api, Listeners, WorkerTls};
+use crate::token::{ApiToken, TokenFileError};
 
 /// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
 /// [`kbf_sched::fence::START_VALIDITY`].
@@ -51,10 +52,17 @@ pub struct Args {
     /// The `kbf.worker.v1` listener.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
-    /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. It has no
-    /// authentication yet: bind it where only operators reach it.
+    /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
+    /// open to whoever reaches it: bind it where only operators do.
     #[arg(long)]
     pub api_listen: Option<SocketAddr>,
+    /// A file holding the token operator API writes (cordon, drain, uncordon) must
+    /// present as `Authorization: Bearer <token>`. It must be owned by the server's
+    /// user with mode 0600 or 0400, or the server refuses to start; run the server as
+    /// a user other than the daemon's, whose builds could read it. Without it, writes
+    /// are refused.
+    #[arg(long, requires = "api_listen")]
+    pub api_token_file: Option<PathBuf>,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]
@@ -124,6 +132,9 @@ pub enum ConfigError {
     /// The key prefix is not a valid prefix.
     #[error("--s3-prefix: {0}")]
     Prefix(#[from] KeyError),
+    /// The operator API token file is refused.
+    #[error("--api-token-file: {0}")]
+    ApiToken(#[from] TokenFileError),
 }
 
 impl Args {
@@ -158,6 +169,23 @@ impl Args {
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
         })
+    }
+
+    /// The operator API these flags describe, if `--api-listen` is given, with the
+    /// token read from `--api-token-file`.
+    ///
+    /// # Errors
+    /// The token file is refused (see [`ApiToken::from_file`]).
+    pub fn api(&self) -> Result<Option<Api>, ConfigError> {
+        let Some(listen) = self.api_listen else {
+            return Ok(None);
+        };
+        let token = self
+            .api_token_file
+            .as_deref()
+            .map(ApiToken::from_file)
+            .transpose()?;
+        Ok(Some(Api { listen, token }))
     }
 
     /// The S3 store and the key prefix of this start, for `--store=s3`. `env` reads

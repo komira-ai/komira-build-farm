@@ -1,5 +1,6 @@
 //! What the server knows about each node for operators: the fleet view behind
-//! `GET /v1/nodes` ([`crate::api`]).
+//! `GET /v1/nodes` ([`crate::api`]), and where each node is in placement (serving,
+//! cordoned, draining; see `kbf_sched::Cordon`).
 //!
 //! The software a node runs arrives in `NodeStatus` (`docs/design/fleet-updates.md`
 //! section 3.1). The server keeps the newest one per node, from the node's current
@@ -19,6 +20,36 @@ pub struct NodeView {
     /// The newest software status it sent; `None` if it sent none (a daemon that
     /// predates `NodeStatus`).
     pub software: Option<SoftwareView>,
+    /// Whether placement may use it, and where its drain is.
+    pub placement: PlacementView,
+}
+
+/// Where a node is in placement. Serialized with its `state` as a tag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PlacementView {
+    /// Placement may offer it leases.
+    Serving,
+    /// An operator cordoned it: no new lease; its leases run on.
+    Cordoned,
+    /// Cordoned, and its leases are waited for until the deadline.
+    Draining {
+        /// When the drain pauses if leases still run: milliseconds since the Unix
+        /// epoch, server clock.
+        deadline_unix_ms: u64,
+        /// The leases it still holds, as `term.seq`.
+        leases: Vec<String>,
+    },
+    /// Cordoned, and it holds no lease: it may be taken out of service.
+    Drained,
+    /// The deadline passed while leases still ran. They run on; nothing proceeds
+    /// until an operator drains it again or uncordons it.
+    DrainPaused {
+        /// The deadline that passed (milliseconds since the Unix epoch).
+        deadline_unix_ms: u64,
+        /// The leases it still holds, as `term.seq`.
+        leases: Vec<String>,
+    },
 }
 
 /// A node's newest `NodeStatus`, and when the server received it. An empty string or
