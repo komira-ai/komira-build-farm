@@ -49,7 +49,10 @@ role (`--role=all`). The flags are:
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
-  heartbeat at.
+  heartbeat at;
+- `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
+  ([docs/api.md](docs/api.md)). It has no authentication yet, so bind it where only
+  operators reach it.
 
 **`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
 outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and

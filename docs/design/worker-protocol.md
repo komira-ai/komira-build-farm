@@ -30,7 +30,7 @@ service Worker {
 | `Heartbeat` | `HeartbeatAck` |
 | `Offer` (not read yet) | `LeaseOffer` |
 | `Result` | `Start` |
-| | `ResultAck` |
+| `NodeStatus` | `ResultAck` |
 | | `Cancel` |
 
 ## A session
@@ -40,6 +40,7 @@ daemon                                  server
   | Hello (version, node_id, report) -->|  checks; registers the node (new session)
   |<----------------- Welcome (interval)|
   | Result (each unacknowledged one) -->|  resent before the first Heartbeat
+  | NodeStatus (OS, kernel, Xcodes) --->|  kept as the node's newest
   | Heartbeat (seq, hash, running) ---->|
   |<------------------ HeartbeatAck(seq)|
   |<------------------------ LeaseOffer |  placed, not committed: run nothing
@@ -207,6 +208,24 @@ microseconds; zero means not measured). It travels inside the `ActionResult`, in
 `execution_metadata.auxiliary_metadata`, as an `Any` with type URL
 `type.googleapis.com/kbf.worker.v1.ResourceUsage`, so it reaches the server and the
 action cache with the result.
+
+### `NodeStatus`
+
+What software the node runs, for operators: the OS name, version and build, the
+kernel release (Linux), the `kbf-daemon` version, and the installed Xcode builds
+(Mac). It routes no work, so it is not part of the node report and does not change
+`report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
+`sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
+are the node report's `xcode` entries, from the driver that discovers them. A field
+it cannot read is empty.
+
+The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
+the first `Heartbeat`. The server keeps the newest one per node, from the node's
+current stream only (one from a replaced stream is ignored), in memory, and lists it
+in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
+the message ignores it as an empty message; a daemon that predates it is listed
+without software. Sending it again when the software changes mid-session is
+**planned** (fleet-updates.md section 3.1, re-detection).
 
 ### `Offer`
 

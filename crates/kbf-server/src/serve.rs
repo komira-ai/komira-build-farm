@@ -1,10 +1,12 @@
-//! Serving: the REAPI listener, the worker listener and the scheduler tick.
+//! Serving: the REAPI listener, the worker listener, the operator API listener (if
+//! any) and the scheduler tick.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::Either;
 use kbf_front::{Cache, MAX_MESSAGE_BYTES, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::worker_server::WorkerServer;
@@ -49,6 +51,9 @@ pub enum ServeError {
     /// The transport failed.
     #[error(transparent)]
     Transport(#[from] tonic::transport::Error),
+    /// The operator API listener failed.
+    #[error("operator API: {0}")]
+    Api(#[source] std::io::Error),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -58,7 +63,9 @@ pub struct Bound<F> {
     pub reapi: SocketAddr,
     /// Where the worker listener is.
     pub worker: SocketAddr,
-    /// Serves both listeners and the tick until the shutdown future completes.
+    /// Where the operator API listener is, if there is one.
+    pub api: Option<SocketAddr>,
+    /// Serves every listener and the tick until the shutdown future completes.
     pub serving: F,
 }
 
@@ -70,8 +77,30 @@ fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// Binds both listeners for a farm over `cache`. Nothing is served until the returned
-/// future runs; it serves until `shutdown` completes, or a listener fails.
+/// Serves `routes` on `listener` until it fails; without a listener, never completes.
+fn serve_api(
+    listener: Option<tokio::net::TcpListener>,
+    routes: axum::Router,
+) -> impl Future<Output = std::io::Result<()>> {
+    match listener {
+        Some(listener) => Either::Left(axum::serve(listener, routes).into_future()),
+        None => Either::Right(std::future::pending()),
+    }
+}
+
+fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
+    let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let local = listener.local_addr()?;
+        Ok((listener, local))
+    });
+    bound.map_err(|source| ServeError::Bind { addr, source })
+}
+
+/// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
+/// Nothing is served until the returned future runs; it serves until `shutdown`
+/// completes, or a listener fails.
 ///
 /// # Errors
 /// A listener cannot be bound, or the worker TLS configuration is refused.
@@ -84,9 +113,29 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    bind_server_with_api(cache, listeners, None, shutdown)
+}
+
+/// [`bind_server`], and the operator API ([`crate::api`]) on `api` if it is given.
+///
+/// # Errors
+/// A listener cannot be bound, or the worker TLS configuration is refused.
+pub fn bind_server_with_api<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<SocketAddr>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
     let farm = Arc::new(Farm::new(Arc::clone(&cache), listeners.unservable_wait));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
+    let api_listener = api.map(bind_api).transpose()?;
+    let api = api_listener.as_ref().map(|(_, local)| *local);
+    let api_routes = crate::api::router(Arc::clone(&farm));
 
     let mut worker_server = Server::builder();
     if let Some(tls) = listeners.worker_tls {
@@ -110,6 +159,7 @@ where
         let worker_serve = worker_server
             .add_service(worker_service)
             .serve_with_incoming(worker_incoming);
+        let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -121,6 +171,7 @@ where
         tokio::select! {
             served = reapi_serve => served.map_err(ServeError::from),
             served = worker_serve => served.map_err(ServeError::from),
+            served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
             () = shutdown => Ok(()),
         }
@@ -128,6 +179,7 @@ where
     Ok(Bound {
         reapi,
         worker,
+        api,
         serving,
     })
 }

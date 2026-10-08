@@ -22,8 +22,11 @@ fn lease(term: u64, seq: u64) -> LeaseId {
 async fn up_to_first_heartbeat(peer: &mut support::Peer) -> Vec<Message> {
     let mut seen = Vec::new();
     loop {
+        // The software status every stream sends is not part of the Result protocol.
         let (_, m) = peer
-            .expect(PROMPT, |m| Some(m.clone()))
+            .expect(PROMPT, |m| {
+                (!matches!(m, Message::NodeStatus(_))).then(|| m.clone())
+            })
             .await
             .expect("a daemon message");
         let heartbeat = matches!(m, Message::Heartbeat(_));

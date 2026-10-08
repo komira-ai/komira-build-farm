@@ -12,6 +12,8 @@
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23);
 //! - a `Result` is accepted only from the node holding the operation's current lease,
 //!   and answered with a `ResultAck`;
+//! - a `NodeStatus` is kept as the node's newest software status, unless a newer
+//!   stream of the node has registered since;
 //! - an `Offer` is not read yet.
 
 use std::pin::Pin;
@@ -161,6 +163,10 @@ async fn serve<M: MetaLog, O: ObjectStore>(
                 .report(&worker, result)
                 .await
                 .map(server_message::Message::ResultAck),
+            Some(daemon_message::Message::NodeStatus(status)) => {
+                farm.node_status(&worker, stream, status);
+                None
+            }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");

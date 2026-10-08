@@ -10,7 +10,9 @@
 //! until the server's `ResultAck` names its lease (issue #26): until then each
 //! Heartbeat lists the lease in `running`, so the scheduler does not take it as lost,
 //! and each new stream resends it right after Welcome, before its first Heartbeat. A
-//! Result produced while disconnected is sent the same way.
+//! Result produced while disconnected is sent the same way. After those Results and
+//! before the first Heartbeat, each stream sends the node's software status
+//! (`NodeStatus`, see [`crate::status`]).
 //!
 //! A v1 assumption: the server acknowledges every Result. ResultAck is an addition
 //! within protocol version 1 (worker.proto), so Welcome's version check does not rule
@@ -39,6 +41,7 @@ use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::report::NodeReport;
 use crate::runtime::Runtime;
+use crate::status::Software;
 use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -88,6 +91,8 @@ pub struct Daemon<R> {
     config: DaemonConfig,
     endpoint: Endpoint,
     report: NodeReport,
+    /// What `NodeStatus` says about the operating system.
+    software: Software,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases<R>,
     done: mpsc::UnboundedReceiver<Done>,
@@ -100,7 +105,8 @@ pub struct Daemon<R> {
 
 impl<R: Runtime> Daemon<R> {
     /// A daemon that will connect as `config` says. Reads the TLS files now, so a
-    /// missing or unreadable file fails here rather than on the first connection.
+    /// missing or unreadable file fails here rather than on the first connection, and
+    /// detects the node's software ([`Software::detect`]).
     pub fn new(
         config: DaemonConfig,
         runtime: Arc<R>,
@@ -122,6 +128,7 @@ impl<R: Runtime> Daemon<R> {
             config,
             endpoint,
             report,
+            software: Software::detect(),
             events: None,
             leases: Leases::new(runtime, done_tx),
             done,
@@ -194,6 +201,8 @@ impl<R: Runtime> Daemon<R> {
         for result in self.unacked.values() {
             send(&tx, daemon_message::Message::Result(result.clone()));
         }
+        let status = self.software.status(&self.report);
+        send(&tx, daemon_message::Message::NodeStatus(status));
 
         let mut seq = 0u64;
         let mut beat = tokio::time::interval(interval);

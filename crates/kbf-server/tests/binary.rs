@@ -1,6 +1,6 @@
 //! The `kbf-server` binary: flags, both stores, the start line, and a clean stop.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
@@ -139,6 +139,10 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
         "{line}"
     );
     assert!(line.contains(" worker=127.0.0.1:"), "{line}");
+    assert!(
+        !line.contains(" api="),
+        "no operator API unless asked: {line}"
+    );
     let caps = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -153,6 +157,31 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
                 .into_inner()
         });
     assert!(caps.execution_capabilities.expect("execution").exec_enabled);
+    interrupt(child);
+}
+
+/// Catches: an `--api-listen` flag that binds nothing, a start line without the API's
+/// address, and an API listener that does not answer `GET /v1/nodes`.
+#[cfg(unix)]
+#[test]
+fn api_listen_serves_the_operator_api() {
+    let mut c = server(&["--api-listen", "127.0.0.1:0"]);
+    c.args(ANY_PORT);
+    let (child, line, _) = started(c);
+    let api: SocketAddr = line
+        .rsplit_once(" api=")
+        .unwrap_or_else(|| panic!("no api= at the end of {line:?}"))
+        .1
+        .parse()
+        .expect("an address");
+    let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    stream
+        .write_all(b"GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
+        .expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("\r\n\r\n{\"nodes\":[]}"), "{response}");
     interrupt(child);
 }
 
