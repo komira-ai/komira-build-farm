@@ -140,7 +140,7 @@ fn a_malformed_document_is_refused_whole() {
             "no string ExpirationDate",
         ),
         (
-            r#""ProductVersion": "27.0", "Build": "26A1", "PostingDate": "2026-09-01", "ExpirationDate": "2026-02-30""#,
+            r#""ProductVersion": "27.0", "Build": "26A1", "PostingDate": "2026-09-01", "ExpirationDate": "2027-02-30""#,
             "is not a date",
         ),
     ];
