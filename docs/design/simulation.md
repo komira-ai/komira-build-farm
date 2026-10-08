@@ -61,7 +61,7 @@ carry it out:
 | Unservable wait: a reason via `Waiting`, refusal after `UNSERVABLE_WAIT` (300 s) of an unbroken run, committed before callers are answered | `scheduler.rs` (`note`, `refusal_committed`), `servable.rs` (`verdict`) | yes |
 | Cordon and drain: placement skips, drains wait until a deadline then pause, never kill; work only cordoned workers could run waits and is never refused | `cordon.rs`, `servable.rs` | yes |
 | Liveness: a worker unheard for G = 60 s loses its leases | `scheduler.rs` (`expire`, `Worker::alive`) | yes |
-| Reconcile with the heartbeat's running set: a lease left out is requeued at once if its `Start` went to an earlier session, else after `START_GRACE` (= G); a lease with a proposed result is kept | `scheduler.rs` (`reconcile`) | yes |
+| Reconcile with the heartbeat's running set: a lease left out is requeued at once if its `Start` went to an earlier session of the same daemon process, after `HANDOVER_GRACE` if it went to another process, else after `START_GRACE` (= G); a lease with a proposed result is kept | `scheduler.rs` (`reconcile`) | yes |
 | `Capacity` (a `Hello` resent on one stream) opens no session | `scheduler.rs` (`Event::Capacity`) | yes |
 | `not_held`: leases a heartbeat lists that this term granted and no longer holds there are cancelled | `scheduler.rs`, `farm.rs` (`heartbeat`) | yes |
 | Daemon: self-fence T = 40 s from the newest acknowledged send; `Start` valid for W = 14 s from the heartbeat it names; a `Start` for an unacknowledged lease ignored; results resent until acknowledged | `fence.rs`, `kbf-daemon` | modelled in the worker node |
@@ -224,7 +224,7 @@ in `sim_cell` today.
 | F2.9 | Server restart | the leader restarts with an empty scheduler at a random time; callers resubmit; workers reconnect with running leases and unacknowledged results | every waiter of the new process answered once by a run of its own lease (I5); lands `#[ignore = "issue #137"]` until the lease ids of a restarted server can no longer collide |
 | F2.10 | Stale session messages | duplicated and reordered `Hello`s, a heartbeat of a replaced stream arriving after the new `Hello`, a `Hello` resent on one stream for a report change | only the first `Hello` of a stream opens a session; a replaced stream's heartbeat is not fed; a resent `Hello` requeues nothing |
 | F2.11 | Lost and repeated results and acks | drops and duplicates on `Report` and `ReportAck` | results resent until acknowledged; each proposed once per holding; each operation answered once |
-| F2.12 | Two daemons claim one node id | two worker nodes register as the same worker in turn | only the newest stream's heartbeats count; `Start`s go only to it; the other fences in T; no self-fenced work twice (I12) |
+| F2.12 | Two daemons claim one node id | two worker nodes (two daemon processes) register as the same worker in turn; on half the seeds the first then dies | only the newest stream's heartbeats count; `Start`s go only to it; the other fences in T; a lease of the other process is kept for the handover grace, then given up (issue #140); no self-fenced work twice (I12) |
 | F2.13 | A lease of another term listed | a worker lists leases of an older and a newer term | `not_held` names neither; no `Cancel` for them |
 
 Planned, not simulated: the infra retry budget (#22), `RUN_ON` hermetic leases over a

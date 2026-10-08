@@ -15,6 +15,7 @@
 // - Start.heartbeat_seq and Start.valid_for_ms: how late a Start may still be acted on.
 // - Cancel: the server stops a lease it no longer holds on the daemon.
 // - NodeStatus: what software the node runs, for operators; it routes no work.
+// - Hello.instance_id: which daemon process registered the node (issue #140).
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -84,6 +85,14 @@ message Hello {
   // SHA-256 of the encoded `capabilities` entries, in order. Heartbeats repeat it so
   // the server notices a changed report without receiving the report again.
   bytes report_hash = 5;
+  // Names the daemon process: drawn at random when the daemon starts, the same in
+  // every Hello it sends on every stream, and never kept across a restart. The server
+  // gives up at once a lease the daemon's new stream leaves out only if that lease's
+  // Start went to the same process; one that went to another process (a restarted
+  // daemon, or a second one holding this node's certificate) is given up once that
+  // process has fenced (docs/design/worker-protocol.md, issue #140). Empty (a daemon
+  // that predates this field): every registration is taken as another process's.
+  string instance_id = 6;
 }
 
 // What software the node runs: status for operators and the fleet API, never matched

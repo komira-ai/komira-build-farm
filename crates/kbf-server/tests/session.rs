@@ -166,6 +166,31 @@ async fn a_replaced_stream_is_not_heard() {
     new.start().await;
 }
 
+/// Catches (issue #140): a second daemon process registering as a node (a cloned
+/// machine, or a second daemon holding the node's certificate) whose first heartbeat
+/// gives up the lease the first process still runs, so the operation is placed again on
+/// the second while the first runs it until it fences: twice at once. The first
+/// process's result, though its stream was replaced, still answers the operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_daemon_process_does_not_take_over_what_the_first_runs() {
+    let cell = Cell::start().await;
+    let mut first = cell.daemon_process("node-a", "first", 4, 8).await;
+    assert!(first.heartbeat(&[]).await);
+    let job = Job::new("runs on the first daemon", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let lease = first.start().await.lease_id;
+
+    let mut second = cell.daemon_process("node-a", "second", 4, 8).await;
+    assert!(second.heartbeat(&[]).await);
+    assert!(second.heartbeat(&[]).await);
+    second.no_work().await;
+
+    let result = output(&cell, "from the first daemon", 0).await;
+    assert!(first.report(ran(lease, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+}
+
 /// Catches: an operation placed on a node whose stream has ended (its `Start` goes
 /// nowhere) that is not given up when the node registers again, so it never runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -209,10 +234,10 @@ async fn results_for_no_lease_or_an_unknown_lease_are_not_accepted() {
 
 /// Catches: a heartbeat's running set that does not reach the scheduler as the leases
 /// the daemon named (a lease id read with its term and sequence number swapped, or
-/// dropped), across the session boundary where it decides at once. A restarted daemon
-/// that re-adopted its run and lists it keeps it: no second `Start`, and its result is
-/// accepted. One whose first heartbeat leaves the lease out (here it names only the
-/// swapped id) has the operation placed again.
+/// dropped), across the session boundary where it decides at once. A daemon back on a
+/// new stream (the same process) that still runs its lease and lists it keeps it: no
+/// second `Start`, and its result is accepted. One whose first heartbeat leaves the
+/// lease out (here it names only the swapped id) has the operation placed again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_returning_daemon_keeps_the_leases_its_first_heartbeat_lists() {
     let cell = Cell::start().await;

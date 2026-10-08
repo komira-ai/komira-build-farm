@@ -24,7 +24,7 @@ use kbf_proto::worker::{
     self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, Event, Input, OpState, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
     Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -85,6 +85,8 @@ struct Waiter {
 #[derive(Debug)]
 struct Link {
     stream: StreamId,
+    /// The daemon process that opened it.
+    instance: DaemonInstance,
     outbound: Outbound,
     /// The seq of the newest heartbeat taken on the stream; 0 before the first. Each
     /// `Start` names it, and the daemon acts on the `Start` only within
@@ -166,13 +168,16 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The first `Hello` of a stream: queues `welcome` on `outbound`, makes this the
-    /// worker's stream for every `Start` from now on, and registers the worker (a new
-    /// session) with its `capacity` and `caps`. Messages still arriving on its earlier
-    /// stream are ignored from now on.
+    /// The first `Hello` of a stream, from the daemon process `instance`: queues
+    /// `welcome` on `outbound`, makes this the worker's stream for every `Start` from now
+    /// on, and registers the worker (a new session) with its `capacity` and `caps`.
+    /// Messages still arriving on its earlier stream are ignored from now on. A stream
+    /// of another process than the earlier stream's is logged: leases that process ran
+    /// are kept until it has fenced (issue #140).
     pub fn register(
         &self,
         worker: &WorkerId,
+        instance: DaemonInstance,
         capacity: Resources,
         caps: NodeCaps,
         outbound: Outbound,
@@ -186,12 +191,19 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let _ = outbound.send(Ok(welcome));
         let link = Link {
             stream,
+            instance: instance.clone(),
             outbound,
             newest_beat: 0,
         };
-        state.links.insert(worker.clone(), link);
+        let replaced = state.links.insert(worker.clone(), link);
+        if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
+            // The earlier process's leases are kept until it has fenced.
+            let cause = "the daemon restarted, or two daemons hold this node's certificate";
+            tracing::warn!(%worker, cause, "another daemon process registered as this node");
+        }
         let event = Event::WorkerUp {
             worker: worker.clone(),
+            instance,
             capacity,
             caps,
         };

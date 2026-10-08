@@ -119,8 +119,12 @@ Every heartbeat lists the leases the worker holds (running, or finished with a r
 not yet acknowledged). A committed lease that the scheduler holds on that worker and
 the heartbeat leaves out is requeued:
 
-- at once, if its `Start` went to an *earlier session* of the worker (the worker either
-  received it before registering again, and then lists it, or never will);
+- at once, if its `Start` went to an *earlier session of the same daemon process* (the
+  daemon either received it before registering again, and then lists it, or never
+  will);
+- if its `Start` went to *another daemon process* that registered as the worker, once
+  `HANDOVER_GRACE` (T + 5 s = 45 s) has passed since the scheduler last heard the
+  worker before the newest change of process (issue #140);
 - otherwise once its `Start` has been out for `START_GRACE` (equal to G), because until
   then the `Start` may still be on its way.
 
@@ -140,10 +144,27 @@ a new session. The server feeds heartbeats only from a worker's newest stream; a
 heartbeat that arrives on a replaced stream is dropped and not acknowledged, so a
 daemon still talking on an old stream fences on time.
 
-This puts one duty on a restarted daemon: it must finish re-adopting its running
-work and list all of it in its first heartbeat on the new stream, or that work is
-requeued at once. Re-adopting work across a daemon restart is **planned**; today a
-restarted daemon has no running leases.
+A registration names the daemon process that made it: `Hello.instance_id`, drawn at
+random when the daemon starts, the same on each of its streams, and never kept across a
+restart. Only that process can say it no longer runs a lease, so the first rule above
+holds only within one process. Two processes can register as one node: the node's
+certificate is on a cloned machine, a second daemon was started with it, or a node was
+replaced while the old one still ran (node identity is the certificate, not the
+process). Then the newer process's heartbeats say nothing about what the older one runs,
+and the older one, whose stream is no longer acknowledged, keeps running self-fenced
+work until it fences, T after the scheduler last heard it. Its leases are therefore kept
+for `HANDOVER_GRACE` from then, and given up by the first heartbeat after that which
+leaves them out. A restarted daemon, or a rebooted node, is another process too: the
+scheduler cannot tell it from a second daemon, so what it lost is requeued after the
+handover grace rather than on its first heartbeat (most reboots take longer than that
+anyway). The server logs every change of process on a node. A registration without an
+instance id (a daemon that predates the field) is taken as another process's.
+
+This puts one duty on a daemon: it must list everything it holds in its first heartbeat
+on each new stream, or what it leaves out is requeued at once. Re-adopting work across a
+daemon restart is **planned**; today a restarted daemon has no running leases, and a
+restarted daemon is another process, so leases it would re-adopt and leave out are kept
+for the handover grace.
 
 ## QoS
 

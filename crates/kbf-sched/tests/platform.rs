@@ -5,7 +5,9 @@
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler, UNSERVABLE_WAIT};
+use kbf_sched::{
+    DaemonInstance, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler, UNSERVABLE_WAIT,
+};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
     Qos, Refusal, RefusalRecord, Resources, StateMachine, WaiterId, Waiting, WorkerId,
@@ -82,6 +84,7 @@ impl Harness {
     fn worker(&mut self, name: &str, caps: NodeCaps) {
         let event = Event::WorkerUp {
             worker: w(name),
+            instance: DaemonInstance::new(name),
             capacity: Resources::new(4_000, 8 * GIB),
             caps,
         };
@@ -276,6 +279,7 @@ fn work_larger_than_every_matching_worker_is_unservable() {
     let mut h = Harness::new();
     let event = Event::WorkerUp {
         worker: w("gpu"),
+        instance: DaemonInstance::new("gpu"),
         capacity: Resources::new(4_000, 8 * GIB).with_gpus(1),
         caps: linux(),
     };
@@ -386,6 +390,7 @@ fn work_behind_a_full_round_still_starts_its_wait() {
     let mut h = Harness::new();
     let event = Event::WorkerUp {
         worker: w("linux"),
+        instance: DaemonInstance::new("linux"),
         capacity: Resources::new(1_000_000, 1_000 * GIB),
         caps: linux(),
     };

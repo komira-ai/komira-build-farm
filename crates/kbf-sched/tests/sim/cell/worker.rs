@@ -386,6 +386,8 @@ impl Worker {
     fn hello(&mut self) {
         let msg = Msg::Hello {
             node: self.node.clone(),
+            // One daemon process per simulated node: its own name is its instance id.
+            instance: self.plan.name,
             stream: self.stream,
             capacity: self.capacity,
         };

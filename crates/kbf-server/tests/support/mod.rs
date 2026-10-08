@@ -280,9 +280,29 @@ impl Client {
             .map_err(|s| s.code())
     }
 
-    /// A daemon for `node` with `cpus` CPUs and `mem_gib` GiB, registered.
+    /// A daemon for `node` with `cpus` CPUs and `mem_gib` GiB, registered. Every daemon
+    /// a test opens for one node this way is the same daemon process (a new stream of
+    /// it); see [`Client::daemon_process`].
     pub async fn daemon(&self, node: &str, cpus: u32, mem_gib: u32) -> FakeDaemon {
         FakeDaemon::connect(self.worker_addr, hello(node, cpus, mem_gib))
+            .await
+            .expect("registered")
+    }
+
+    /// A daemon for `node`, registered by the daemon process `instance` (its
+    /// `Hello.instance_id`).
+    pub async fn daemon_process(
+        &self,
+        node: &str,
+        instance: &str,
+        cpus: u32,
+        mem_gib: u32,
+    ) -> FakeDaemon {
+        let hello = Hello {
+            instance_id: instance.to_owned(),
+            ..hello(node, cpus, mem_gib)
+        };
+        FakeDaemon::connect(self.worker_addr, hello)
             .await
             .expect("registered")
     }
@@ -317,6 +337,8 @@ pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) 
         .chain(platform)
         .collect(),
         report_hash: Vec::new(),
+        // One daemon process per node unless a test says otherwise.
+        instance_id: format!("{node}-daemon"),
     }
 }
 

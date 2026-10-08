@@ -6,7 +6,9 @@
 //! [`identity`](crate::identity) and issue #79; the capacity entries of the node report,
 //! and the entries placement matches platforms against: `arch` and the rest that
 //! [`caps`] reads), answered with `Welcome`, and registers the node: only this first
-//! `Hello` does (issue #25). On the stream after that:
+//! `Hello` does (issue #25). The registration names the daemon process by the `Hello`'s
+//! `instance_id`: leases whose `Start` went to another process are given up only once it
+//! has fenced (issue #140). On the stream after that:
 //! - a resent `Hello` whose `node_id` is not the stream's node, or that the deny list
 //!   now refuses, ends the stream with that error; otherwise it changes the node's
 //!   capacity and capabilities and nothing else;
@@ -36,6 +38,7 @@ use kbf_proto::worker::{
     Capability, DaemonMessage, HeartbeatAck, Hello, ServerMessage, Welcome, daemon_message,
     server_message, worker_server::Worker,
 };
+use kbf_sched::DaemonInstance;
 use kbf_types::{LeaseId, Resources, WorkerId};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -120,15 +123,16 @@ where
         let capacity = capacity(&hello).map_err(Status::invalid_argument)?;
         let caps = caps(&hello).map_err(Status::invalid_argument)?;
         let worker = WorkerId::new(hello.node_id);
+        let instance = DaemonInstance::new(hello.instance_id);
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
-        let stream = self
-            .farm
-            .register(&worker, capacity, caps, outbound.clone(), welcome);
+        let stream =
+            self.farm
+                .register(&worker, instance, capacity, caps, outbound.clone(), welcome);
         tracing::info!(%worker, ?capacity, "worker registered");
         let session = Session {
             farm: Arc::clone(&self.farm),

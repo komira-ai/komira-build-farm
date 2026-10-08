@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, Request, Scheduler};
+use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_sim::SimRng;
 use kbf_types::{
     ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome,
@@ -176,6 +176,7 @@ impl World {
         };
         for spec in world.fleet.clone() {
             world.feed(Event::WorkerUp {
+                instance: DaemonInstance::new(spec.name.as_str()),
                 worker: spec.name,
                 capacity: spec.capacity,
                 caps: caps(spec.node),

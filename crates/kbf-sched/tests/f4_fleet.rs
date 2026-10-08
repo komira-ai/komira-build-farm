@@ -29,9 +29,9 @@
 //! - F4.1 steady state: arrivals only (no worker or operator faults);
 //! - F4.2 churn: 5 percent of workers die or return each minute;
 //! - F4.3 mass reconnect: every worker reboots or restarts its daemon and comes back
-//!   in the same second a few seconds later, once or twice (more than one placement
-//!   round's worth of work is requeued at once); and once every worker resends `Hello`
-//!   on its stream with a changed node report;
+//!   in the same second, just after the handover grace, once or twice (more than one
+//!   placement round's worth of work is requeued at once); and once every worker
+//!   resends `Hello` on its stream with a changed node report;
 //! - F4.4 operator storm: cordon, drain and uncordon at random on a tenth of the fleet,
 //!   and one maintenance: a small labelled pool and four other nodes are drained and
 //!   go offline for longer than G and the unservable wait; the four are uncordoned
@@ -142,14 +142,15 @@ fn f4_2_churn() {
             "worker died",
             "worker returned",
             "requeued: worker silent for G",
-            "requeued: Start sent to an earlier session (L3)",
+            "kept: Start sent to a replaced daemon process, inside the handover grace",
+            "requeued: Start sent to a replaced daemon process, after the handover grace",
         ],
     );
 }
 
 /// Catches, besides F4.1's: a lease lost to a reboot kept until G instead of requeued
-/// on the new session's first heartbeat (L3), a re-adopted lease requeued (I3, I12),
-/// and a lease requeued twice or held twice (I3).
+/// on the first heartbeat after the handover grace (L3), a re-adopted lease requeued
+/// (I3, I12), and a lease requeued twice or held twice (I3).
 #[test]
 fn f4_3_mass_reconnect() {
     let reach = sweep(Scenario::MassReconnect);
@@ -159,7 +160,7 @@ fn f4_3_mass_reconnect() {
         &[
             "mass reconnect",
             "report wave",
-            "requeued: Start sent to an earlier session (L3)",
+            "requeued: Start sent to a replaced daemon process, after the handover grace",
             "full round (PLACEMENT_ROUND grants)",
         ],
     );

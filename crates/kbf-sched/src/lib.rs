@@ -14,7 +14,9 @@
 //! - re-dispatch after the lease grace G and the worker's self-fence T ([`fence`]);
 //! - reconciliation of held leases with the running set each worker's heartbeats
 //!   send: a lease they leave out is requeued at once if its `Start` went to a session
-//!   before the worker registered again, else once its `Start` has been out for G;
+//!   before the same daemon process registered again, after the handover grace if it
+//!   went to another daemon process registered as the worker (issue #140), else once
+//!   its `Start` has been out for G;
 //! - first-fit placement of a CPU, memory and GPU request onto worker capacity, GPUs
 //!   whole and held by one lease each until it ends, on workers whose node report
 //!   satisfies the action's platform (`kbf-caps` matching);
@@ -46,5 +48,5 @@ mod servable;
 
 pub use cordon::Cordon;
 pub use fence::SelfFence;
-pub use input::{Event, Input, Request};
+pub use input::{DaemonInstance, Event, Input, Request};
 pub use scheduler::{OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

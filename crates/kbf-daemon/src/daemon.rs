@@ -2,8 +2,11 @@
 //! reconnecting when it ends, with the lease manager and the fence clock running
 //! throughout, connected or not.
 //!
-//! A session sends Hello, waits for Welcome, then sends a Heartbeat at the interval
-//! Welcome names and handles what the server sends: `HeartbeatAck` renews contact,
+//! A session sends Hello, which names this daemon process by an instance id drawn when
+//! the daemon starts and the same on every stream (issue #140: the scheduler gives up at
+//! once only the leases of the same process that a new stream leaves out), waits for
+//! Welcome, then sends a Heartbeat at the interval Welcome names and handles what the
+//! server sends: `HeartbeatAck` renews contact,
 //! `LeaseOffer` is logged and runs nothing, `Start` runs a lease if it arrived within
 //! the window it names (see `window`; a late one is dropped without a Result), and
 //! `Cancel` kills a running lease. Results go out on the stream. Every Result is kept
@@ -31,6 +34,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,6 +119,8 @@ pub struct Daemon<R> {
     unacked: BTreeMap<LeaseId, worker::Result>,
     /// The suspend-counting clock that contact and the Start window read.
     clock: Arc<dyn Clock>,
+    /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
+    instance: String,
 }
 
 /// What woke the session loop.
@@ -158,6 +164,7 @@ impl<R: Runtime> Daemon<R> {
             window: StartWindow::default(),
             unacked: BTreeMap::new(),
             clock: Arc::new(SystemClock),
+            instance: instance_id(),
         })
     }
 
@@ -459,6 +466,7 @@ impl<R: Runtime> Daemon<R> {
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities: self.report.capabilities().to_vec(),
             report_hash: self.report.hash().to_vec(),
+            instance_id: self.instance.clone(),
         }
     }
 
@@ -489,6 +497,15 @@ impl<R: Runtime> Daemon<R> {
             let _ = events.send(event);
         }
     }
+}
+
+/// A new daemon process's instance id: 128 random bits as 32 hex digits, from two
+/// hashers the standard library keys from the operating system's random source. It is
+/// never written down, so a restarted daemon, a second daemon started with the same
+/// certificate and a daemon on a cloned machine each draw their own (issue #140).
+fn instance_id() -> String {
+    let half = || RandomState::new().hash_one(std::process::id());
+    format!("{:016x}{:016x}", half(), half())
 }
 
 /// Queues a message on the stream. A message for a stream that is gone is dropped: a

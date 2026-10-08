@@ -17,9 +17,11 @@
 //! - **I14** the queue is exactly the queued operations.
 //! - **R** a lease is given up only by the rules: at a tick, once its worker has been
 //!   silent for G (and then at that tick, not later); on a heartbeat of its worker that
-//!   leaves it out, once its `Start` went to an earlier session or has been out for
-//!   `START_GRACE`, and only if no result of it was proposed. A registration or a
-//!   resent `Hello` gives up nothing.
+//!   leaves it out, once its `Start` went to an earlier session of the same daemon
+//!   process, to another daemon process and the handover grace has passed since the
+//!   worker was last heard before the newest change of process (issue #140), or to this
+//!   session and has been out for `START_GRACE`, and only if no result of it was
+//!   proposed. A registration or a resent `Hello` gives up nothing.
 //! - **P** a result is proposed at most once per holding.
 //! - **N** `not_held` names exactly the listed leases this scheduler granted and no
 //!   longer holds on that worker, and never a lease of another term.
@@ -30,8 +32,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
-use kbf_sched::{Event, Input, OpState, Request, Scheduler};
+use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
+use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, ControlRecord, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources, WaiterId,
     WorkerId,
@@ -45,6 +47,22 @@ struct Shadow {
     last_heard: FarmTime,
     session: u64,
     capacity: Resources,
+    /// The daemon process of the current session, how many times the process changed,
+    /// and until when leases of an earlier process are kept.
+    instance: DaemonInstance,
+    process: u64,
+    handover_ends: FarmTime,
+}
+
+/// Which rule gives up a lease a heartbeat of its worker leaves out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+    /// Its `Start` went to an earlier session of the same daemon process.
+    EarlierSession,
+    /// Its `Start` went to another daemon process, and the handover grace has passed.
+    Handover,
+    /// Its `Start` went to this session and has been out for `START_GRACE`.
+    StartGrace,
 }
 
 /// Counts of what the checked steps did, for the scenarios' reach checks.
@@ -60,6 +78,10 @@ pub struct CheckStats {
     /// earlier session, or had been out for `START_GRACE`.
     pub requeued_earlier_session: u64,
     pub requeued_after_grace: u64,
+    /// Leases of a replaced daemon process given up after the handover grace, and
+    /// left out and kept inside it.
+    pub requeued_after_handover: u64,
+    pub kept_for_handover: u64,
     /// Leases a heartbeat left out and the scheduler rightly kept: inside the grace,
     /// or with a result proposed.
     pub kept_omitted: u64,
@@ -89,7 +111,8 @@ pub struct Check {
     newest_grant: Option<LeaseId>,
     committed: BTreeSet<LeaseId>,
     newest_committed: BTreeMap<OperationId, LeaseId>,
-    starts: BTreeMap<LeaseId, (FarmTime, u64)>,
+    /// When each `Start` was emitted, and to which session and daemon process.
+    starts: BTreeMap<LeaseId, (FarmTime, u64, u64)>,
     proposed: BTreeMap<LeaseId, u32>,
     /// Every result proposed, with its operation and outcome.
     pub proposals: BTreeMap<LeaseId, (OperationId, Outcome)>,
@@ -174,13 +197,35 @@ impl Check {
         let now = self.now;
         match event {
             Event::WorkerUp {
-                worker, capacity, ..
+                worker,
+                instance,
+                capacity,
+                ..
             } => {
-                let session = self.workers.get(worker).map_or(0, |w| w.session + 1);
-                let shadow = Shadow {
-                    last_heard: now,
-                    session,
-                    capacity: *capacity,
+                let shadow = match self.workers.get(worker) {
+                    Some(w) => {
+                        let other = *instance != w.instance;
+                        Shadow {
+                            last_heard: now,
+                            session: w.session + 1,
+                            capacity: *capacity,
+                            instance: instance.clone(),
+                            process: w.process + u64::from(other),
+                            handover_ends: if other {
+                                w.last_heard.saturating_add(HANDOVER_GRACE)
+                            } else {
+                                w.handover_ends
+                            },
+                        }
+                    }
+                    None => Shadow {
+                        last_heard: now,
+                        session: 0,
+                        capacity: *capacity,
+                        instance: instance.clone(),
+                        process: 0,
+                        handover_ends: FarmTime::default(),
+                    },
                 };
                 self.workers.insert(worker.clone(), shadow);
             }
@@ -282,8 +327,9 @@ impl Check {
                         format!("Start of {} before its grant committed", s.lease),
                     );
                 }
-                let session = self.workers[&s.worker].session;
-                self.starts.insert(s.lease, (self.now, session));
+                let w = &self.workers[&s.worker];
+                let sent = (self.now, w.session, w.process);
+                self.starts.insert(s.lease, sent);
                 started.push((s.lease, s.operation));
             }
             Effect::Answer(a) => self.check_answer(event, a),
@@ -444,7 +490,7 @@ impl Check {
                     }
                 }
                 Event::Heartbeat { worker, running } if *worker == w => {
-                    let Some(&(sent, session)) = self.starts.get(&lease) else {
+                    let Some(&start) = self.starts.get(&lease) else {
                         self.fail(
                             "R",
                             format!("{lease} given up on a heartbeat before its Start"),
@@ -459,15 +505,18 @@ impl Check {
                     if self.proposed.contains_key(&lease) {
                         self.fail("R", format!("{lease} given up with its result proposed"));
                     }
-                    if session < self.workers[&w].session {
-                        self.stats.requeued_earlier_session += 1;
-                    } else if now >= sent.saturating_add(START_GRACE) {
-                        self.stats.requeued_after_grace += 1;
-                    } else {
-                        self.fail(
+                    match self.rule(&w, start) {
+                        Some(Rule::EarlierSession) => self.stats.requeued_earlier_session += 1,
+                        Some(Rule::Handover) => self.stats.requeued_after_handover += 1,
+                        Some(Rule::StartGrace) => self.stats.requeued_after_grace += 1,
+                        None if start.2 != self.workers[&w].process => self.fail(
                             "R",
-                            format!("{lease} left out by a heartbeat of its own session, given up {} ms after its Start", now.saturating_duration_since(sent).as_millis()),
-                        );
+                            format!("{lease} of a replaced daemon process given up inside the handover grace"),
+                        ),
+                        None => self.fail(
+                            "R",
+                            format!("{lease} left out by a heartbeat of its own session, given up {} ms after its Start", now.saturating_duration_since(start.0).as_millis()),
+                        ),
                     }
                 }
                 other => self.fail("R", format!("{lease} on {w} given up by {other:?}")),
@@ -494,27 +543,41 @@ impl Check {
             }
             Event::Heartbeat { worker, running } => {
                 for (lease, (w, _)) in held.iter().filter(|(_, (w, _))| w == worker) {
-                    let Some(&(sent, session)) = self.starts.get(lease) else {
+                    let Some(&start) = self.starts.get(lease) else {
                         continue;
                     };
                     if running.contains(lease) {
                         continue;
                     }
-                    let due = session < self.workers[w].session
-                        || now >= sent.saturating_add(START_GRACE);
                     if self.proposed.contains_key(lease) {
                         self.stats.kept_proposed += 1;
-                    } else if due {
+                    } else if self.rule(w, start).is_some() {
                         self.fail(
                             "R",
                             format!("{lease} left out by {w}'s heartbeat and kept past its rule"),
                         );
+                    } else if start.2 != self.workers[w].process {
+                        self.stats.kept_for_handover += 1;
                     } else {
                         self.stats.kept_omitted += 1;
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The rule that gives up, now, a lease whose `Start` went out as `start` (when, to
+    /// which session and daemon process) and that a heartbeat of `w` leaves out; `None`
+    /// while the rules keep it.
+    fn rule(&self, w: &WorkerId, (sent, session, process): (FarmTime, u64, u64)) -> Option<Rule> {
+        let shadow = &self.workers[w];
+        if process != shadow.process {
+            (self.now >= shadow.handover_ends).then_some(Rule::Handover)
+        } else if session < shadow.session {
+            Some(Rule::EarlierSession)
+        } else {
+            (self.now >= sent.saturating_add(START_GRACE)).then_some(Rule::StartGrace)
         }
     }
 

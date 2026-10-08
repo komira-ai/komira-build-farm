@@ -699,6 +699,7 @@ async fn the_driver_runs_against_the_farm() {
     let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
     farm.register(
         &w("a"),
+        kbf_sched::DaemonInstance::new("a"),
         Resources::new(8_000, 16 << 30),
         caps,
         outbound,

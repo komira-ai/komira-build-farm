@@ -29,7 +29,12 @@ refuses the session (see
 ## The session and the fence
 
 The daemon connects, sends `Hello`, waits up to 10 seconds for `Welcome`, resends any
-unacknowledged results, then heartbeats at the interval `Welcome` named. When the
+unacknowledged results, then heartbeats at the interval `Welcome` named. Every `Hello`
+carries the instance id the daemon drew at random when it started, the same on every
+stream and never kept across a restart: the scheduler gives up at once only the leases
+of this process that a new stream's first heartbeat leaves out, and keeps those of
+another process sharing the node's certificate until that one has fenced
+([scheduler.md](scheduler.md#reconciling-with-what-workers-say-they-run), issue #140). When the
 stream ends for any reason it waits `--reconnect-ms` and tries again. Leases keep
 running across reconnects, and the fence clock keeps running whether a stream is up or
 not.
