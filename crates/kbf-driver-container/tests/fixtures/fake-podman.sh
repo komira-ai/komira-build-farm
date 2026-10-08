@@ -20,10 +20,13 @@
 #   rm-fails         `rm` fails
 #   unshare-noop     `unshare rm` succeeds without removing anything
 #   unshare-fails    `unshare rm` fails
-# Records: create.args (one argument per line), calls (one verb per line), removed,
+#   chown-fails      `unshare chown` to the owner this knob holds (`1:1` or `0:0`) fails
+# Records: create.args (one argument per line), calls (one verb per line; `unshare`
+#   with its command, `unshare rm` or `unshare chown`), removed,
 #   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
 #   events (in order: `cgroup.kill ended the action`, `start ended` once `start` has
-#   waited for the action and written its status, `rm`).
+#   waited for the action and written its status, `rm`, `chown <owner> <paths...>`).
+#   The fake changes no owner: the test runs as one user.
 set -u
 here=$(dirname "$0")
 STATE=$here/state
@@ -33,7 +36,11 @@ CGROOT=$here/cgroup
 shift
 verb=$1
 shift
-echo "$verb" >>"$STATE/calls"
+if [ "$verb" = unshare ]; then
+    echo "unshare ${1:-}" >>"$STATE/calls"
+else
+    echo "$verb" >>"$STATE/calls"
+fi
 
 case $verb in
 image)
@@ -117,6 +124,18 @@ rm)
     exit 0
     ;;
 unshare)
+    if [ "$1" = chown ]; then
+        # chown -hR OWNER -- PATHS...
+        [ "$2" = -hR ] && [ "$4" = -- ] || { echo "fake podman: chown $*" >&2; exit 125; }
+        owner=$3
+        shift 4
+        echo "chown $owner $*" >>"$STATE/events"
+        if [ -f "$STATE/chown-fails" ] && [ "$(cat "$STATE/chown-fails")" = "$owner" ]; then
+            echo "Error: chown refused" >&2
+            exit 1
+        fi
+        exit 0
+    fi
     [ -f "$STATE/unshare-fails" ] && { echo "Error: unshare refused" >&2; exit 1; }
     [ -f "$STATE/unshare-noop" ] && exit 0
     # rm -rf -- DIR

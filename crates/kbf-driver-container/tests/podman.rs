@@ -582,3 +582,105 @@ async fn kill_and_cancel_remove_the_container() {
         }
     }
 }
+
+/// The ids on the `Uid:` and `Gid:` lines of process `pid`'s status (real, effective,
+/// saved, filesystem), each with its line's name.
+fn ids(pid: &str) -> Vec<(&'static str, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let mut ids = Vec::new();
+    for line in status.lines() {
+        for key in ["Uid", "Gid"] {
+            if let Some(values) = line.strip_prefix(key).and_then(|v| v.strip_prefix(':')) {
+                ids.extend(
+                    values
+                        .split_whitespace()
+                        .map(|v| (key, v.parse().expect("an id"))),
+                );
+            }
+        }
+    }
+    ids
+}
+
+/// fleet-updates-security S10, "a container action's host uid is not the daemon's".
+/// Catches the "drop `--userns`" mutant: rootless Podman's default runs the
+/// container's root as the daemon's own uid on the host. Two views of the running
+/// action: the ids of each of its processes as the host sees them, and the owner, on
+/// the host, of a file it created. Then a kill, whose clean step removes files the
+/// container's ids still own (inside Podman's user namespace).
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn no_container_id_is_the_daemons_on_the_host() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cell = Cell::new("userns");
+    let daemon = std::fs::metadata("/proc/self").expect("/proc/self");
+    let (daemon_uid, daemon_gid) = (daemon.uid(), daemon.gid());
+    let mut spec = sh("echo made > out/made; exec sleep 60");
+    spec.outputs = vec!["out/made".to_owned()];
+    let action = store_action(&cell.cas, &spec);
+    let work = cell.work(1, action, Resources::default());
+    let runtime = Arc::clone(&cell.runtime);
+    let run = tokio::spawn(async move { runtime.run(work).await });
+    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
+    wait_for_program_in(&container, "sleep").await;
+
+    let procs = std::fs::read_to_string(container.join("cgroup.procs")).expect("cgroup.procs");
+    let seen: Vec<_> = procs.split_whitespace().flat_map(ids).collect();
+    assert!(
+        !seen.is_empty(),
+        "no process read in {}",
+        container.display()
+    );
+    let daemons: Vec<_> = seen
+        .iter()
+        .filter(|&&(key, id)| id == if key == "Uid" { daemon_uid } else { daemon_gid })
+        .collect();
+    assert!(
+        daemons.is_empty(),
+        "a container process runs as the daemon's user ({daemon_uid}:{daemon_gid}): {seen:?}"
+    );
+    let made = cell.scratch.join(cell.name(1)).join("upper/out/made");
+    let meta = std::fs::symlink_metadata(&made).expect("the action's file");
+    assert_ne!(meta.uid(), daemon_uid, "{} is the daemon's", made.display());
+    assert_ne!(meta.gid(), daemon_gid, "{} is the daemon's", made.display());
+    // The container's root made the file and runs `sleep`: one host id for both.
+    assert_eq!(seen.first(), Some(&("Uid", meta.uid())), "{seen:?}");
+
+    cell.runtime.kill(LeaseId::new(cell.term, 1)).await;
+    let outcome = run.await.expect("join");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    cell.assert_clean(1);
+}
+
+/// Catches the overlay not being handed to the container's root before it runs (the
+/// action can write nothing under the exec root: `EROFS`), and not being handed back
+/// before the outputs are read (a `0700` output directory holding a `0600` file is
+/// unreadable to the daemon's user). The action also appends to an input, which the
+/// overlay copies up: input files are the container's root's too, as without a user
+/// namespace.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn the_action_owns_its_files_and_its_private_outputs_are_collected() {
+    let cell = Cell::new("owners");
+    let mut spec = sh(
+        "set -e; echo more >> in/a.txt; echo new > in/new; mkdir out/p; \
+         echo secret > out/p/s; chmod 600 out/p/s; chmod 700 out/p",
+    );
+    spec.inputs = vec![("in/a.txt", b"a", false)];
+    spec.outputs = vec!["out/p".to_owned()];
+    let result = cell.run(1, &spec).await.expect("ran");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&blob(&cell.cas, result.stderr_digest.as_ref()))
+    );
+    assert_eq!(result.output_directories.len(), 1, "{result:?}");
+    let tree = support::tree(&cell.cas, result.output_directories[0].tree_digest.as_ref());
+    let files = tree.root.expect("root").files;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].name, "s");
+    assert_eq!(blob(&cell.cas, files[0].digest.as_ref()), b"secret\n");
+    cell.assert_clean(1);
+}

@@ -200,6 +200,8 @@ mod container {
             .cgroup_parent
             .clone()
             .ok_or("--cgroup-parent is required by the container driver")?;
+        // Every container's ids are this user's subordinate ids (`--userns=nomap`).
+        kbf_driver_container::check_daemon_user()?;
         let mut config = PodmanConfig::new(scratch(cli)?, parent);
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,

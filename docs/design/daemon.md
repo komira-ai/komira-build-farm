@@ -119,14 +119,16 @@ never reused. Each lease goes through six steps.
    - Refuse an action whose output path already exists in the input root, and one whose
      working directory is hidden by an input file or symlink of the same name, as
      `INVALID_ARGUMENT`.
+   - Give the overlay's directories to the container's root (see User namespaces).
    - Make the lease cgroup (below).
 2. **Start.** `podman create`, then `podman start --attach`, with stdout and stderr
    written to files in the scratch directory.
 3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`.
 4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
    (SIGKILL) and the lease cgroup's `memory.events` counts an `oom_kill`, the lease
-   fails as an infrastructure failure. Otherwise read the outputs (below) and store
-   stdout and stderr in the CAS.
+   fails as an infrastructure failure. Otherwise give the overlay's directories back
+   to the daemon's user, read the outputs (below) and store stdout and stderr in the
+   CAS.
 5. **Clean.** Remove the container, the lease cgroup and the scratch directory.
 6. **Verify clean.** Neither directory may remain.
 
@@ -142,6 +144,7 @@ loud.
 | Network | `--network=none`: loopback only. No action has network today. |
 | Image | by per-architecture manifest digest; `--pull=never` |
 | Entrypoint | the action's argv as a JSON array: the image's `ENTRYPOINT` and `CMD` are ignored and no argument is re-split |
+| Users | `--userns=nomap`: no container uid or gid is the daemon's user (below) |
 | Hostname | `localhost` |
 | Environment | the `Command`'s variables, passed with `--env` on top of what the image defines |
 | Working directory | the `Command`'s, under `/kbf/root` |
@@ -151,6 +154,42 @@ loud.
 
 **Stopping a container** (timeout or kill): SIGTERM, then 5 seconds, then `cgroup.kill`
 on the lease cgroup, then a forced removal in the clean step.
+
+### User namespaces
+
+Rootless Podman's default maps a container's root to the daemon's own uid on the host,
+so an action would run as the daemon's user, kept from what that user can reach (the
+root helpers' sockets, [fleet-updates-security.md](fleet-updates-security.md) S4.3) only
+by the mount and pid namespaces. The driver therefore runs every container with
+`--userns=nomap`: container ids 0, 1, 2 and up map to the daemon user's subordinate ids
+in order, and the daemon's own uid and gid map to nothing.
+
+- **Not `--userns=auto`.** Rootless, it took 65,535 ids of a standard 65,536-id range for
+  the first container and refused a second while the first existed ("not enough unused
+  IDs in user namespace", Podman 4.9 on the hosted runners), so a node could run one
+  action at a time. With `nomap` every container shares one mapping. Containers stay
+  apart by their mount, pid, ipc and network namespaces, not by uid.
+- **Who owns the lease's files.** A container cannot write under a directory whose owner
+  it does not map: the overlay refuses with `EROFS`. So after writing the input root and
+  making the output directories, the driver gives the overlay's lower, upper and work
+  directories to id 1 of Podman's user namespace (the container's root) with
+  `podman unshare chown -hR 1:1`. Once the container has exited, and before reading any
+  output, it gives them back to id 0 there, the daemon's user, so an output the action
+  made `0600` (or a `0700` directory) is read as its owner. `-h` changes a symlink
+  itself and `-R` traverses none, so a link the action left hands nothing over.
+- **Cleaning.** A lease that ends before collect (timeout, kill, failure) still has files
+  owned by the container's ids. The daemon's user cannot unlink them, so the clean step
+  falls back to `podman unshare rm -rf`, as it does for any file the daemon cannot
+  remove.
+
+**Node requirement.** The daemon's user needs at least 65,536 subordinate uids in
+`/etc/subuid` and as many gids in `/etc/subgid` (`<user>:<first id>:<count>`), what
+`useradd` gives a new user; fewer leave an image's high ids (65534, `nobody`) unmapped.
+`kbf-daemon --driver container` checks both files at startup and refuses to start,
+naming the file, the user and the fix, when either has no range or too small a one.
+After adding a range (`usermod --add-subuids 100000-165535 --add-subgids
+100000-165535 <user>`), run `podman system migrate` as that user so Podman's user
+namespace is made again with it.
 
 ### Cgroups and limits
 
