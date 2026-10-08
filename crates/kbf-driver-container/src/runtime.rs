@@ -3,11 +3,13 @@
 //! Each lease goes through the six driver steps (RFC 10.1):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
 //!    input root into the lease's scratch directory, refuse outputs that are inputs,
-//!    make the lease cgroup;
+//!    give the overlay's directories to the container's root (a subordinate id, see
+//!    `podman::create_args`), make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
 //! 4. **collect:** the exit code from Podman's record, OOM from the lease cgroup's
-//!    `memory.events`, outputs, stdout and stderr into the CAS;
+//!    `memory.events`; the overlay's directories back to the daemon's user; outputs,
+//!    stdout and stderr into the CAS;
 //! 5. **clean:** remove the container, the lease cgroup and the scratch directory;
 //! 6. **verify-clean:** neither directory may remain.
 //!
@@ -31,7 +33,7 @@ use tokio::sync::oneshot;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
-use crate::podman::{ContainerSpec, Podman};
+use crate::podman::{CONTAINER_OWNER, ContainerSpec, DAEMON_OWNER, Podman};
 use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -195,6 +197,12 @@ impl<C: Cas> PodmanRuntime<C> {
                 .await
                 .map_err(|e| failed(&dir, &e))?;
         }
+        // The container's root is a subordinate id (`--userns=nomap`), which may write
+        // only under directories it owns.
+        self.podman
+            .chown(CONTAINER_OWNER, &[&root, &upper, &overlay_work])
+            .await
+            .map_err(RuntimeError::Failed)?;
         lease
             .cgroup
             .create(work.resources)
@@ -293,6 +301,15 @@ impl<C: Cas> PodmanRuntime<C> {
                 )));
             }
         }
+        // The container has exited: hand its files back to the daemon's user, so an
+        // output the action left unreadable to others is still read, as its owner.
+        self.podman
+            .chown(
+                DAEMON_OWNER,
+                &[&spec.input_root, &spec.upper, &spec.overlay_work],
+            )
+            .await
+            .map_err(RuntimeError::Failed)?;
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
@@ -498,8 +515,9 @@ impl Lease {
         match remove_tree(&self.dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            // Files an action wrote as another container user, or with no permissions
-            // left, can only be removed inside Podman's user namespace.
+            // Files still owned by the container's ids (a lease that ended before
+            // collect handed them back: a timeout, a kill, a failure), or with no
+            // permissions left, can only be removed inside Podman's user namespace.
             Err(first) => {
                 if let Err(e) = self.podman.unshare_remove_blocking(&self.dir) {
                     errors.push(format!("remove {}: {first}; {e}", self.dir.display()));

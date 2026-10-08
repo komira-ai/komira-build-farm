@@ -9,6 +9,8 @@
 //!   holds only what the action created or changed, so an output path that is already
 //!   in the input root is refused as `INVALID_ARGUMENT` before anything runs;
 //! - no network (`--network=none`: loopback only);
+//! - no id of the daemon's user (`--userns=nomap`: the container's ids are the user's
+//!   subordinate ids, which [`check_daemon_user`] requires at startup);
 //! - a lease cgroup under the daemon's delegated `actions/` cgroup, with
 //!   `memory.high` = reservation x 1.5 + 512 MiB, swap allowed, no per-lease hard cap,
 //!   `cpu.weight` from the booked CPU, and `memory.oom.group=1` on the container;
@@ -29,6 +31,7 @@
 //!   `kbf_daemon`'s `Cas` trait, the one the daemon's CAS client implements;
 //! - [`tree`]: writing an input root (with `kbf_daemon::tree`) and reading outputs
 //!   back;
+//! - [`subids`]: the daemon user's subordinate id ranges, checked at startup;
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease),
@@ -42,6 +45,7 @@ mod outputs;
 mod podman;
 mod remove;
 mod runtime;
+pub mod subids;
 pub mod tree;
 
 pub use cas::{CHUNK, FileBlob, MemoryCas};
@@ -50,3 +54,4 @@ pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;
 pub use podman::EXEC_ROOT;
 pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime};
+pub use subids::{IdFiles, SubidError, check_daemon_user, check_subordinate_ids};

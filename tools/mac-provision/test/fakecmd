@@ -1,0 +1,272 @@
+#!/bin/sh
+# A fake of each macOS program kbf-mac-provision runs, for the Linux test harness
+# (run.sh). The harness links it into a fake root under the program's own name; it
+# keeps that program's state in files under $FAKE_ROOT/.fake and logs every call to
+# $FAKE_ROOT/.fake/log. Output formats follow macOS's own.
+
+set -u
+S="$FAKE_ROOT/.fake"
+NAME=${0##*/}
+PATH=$FAKE_REAL_PATH
+printf '%s %s\n' "$NAME" "$*" >>"$S/log"
+
+# kv_get FILE KEY / kv_set FILE KEY VALUE / kv_del FILE KEY: KEY=VALUE files.
+kv_get() {
+  [ -f "$1" ] || return 1
+  awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); found = 1 } END { exit !found }' "$1"
+}
+
+kv_set() {
+  kv_del "$1" "$2"
+  printf '%s=%s\n' "$2" "$3" >>"$1"
+}
+
+kv_del() {
+  [ -f "$1" ] || return 0
+  awk -v k="$2" 'index($0, k "=") != 1' "$1" >"$1.tmp"
+  mv "$1.tmp" "$1"
+}
+
+# The prefix dscl prints before an attribute outside its standard set, as macOS's
+# own dscl prints IsHidden: "dsAttrTypeNative:IsHidden: 1".
+native() {
+  case "$1" in
+    IsHidden) printf 'dsAttrTypeNative:' ;;
+  esac
+}
+
+# A path to a state file name.
+flat() {
+  printf '%s' "$1" | tr '/' '_'
+}
+
+case "$NAME" in
+  id)
+    [ "$1" = -u ] && cat "$S/uid"
+    ;;
+  sw_vers)
+    case "$1" in
+      -productVersion) kv_get "$S/sw_vers" version ;;
+      -buildVersion) kv_get "$S/sw_vers" build ;;
+    esac
+    ;;
+  pmset)
+    case "$1" in
+      -g)
+        printf 'System-wide power settings:\nCurrently in use:\n Sleep On Power Button 1\n'
+        awk -F= '{ printf " %-20s %s\n", $1, $2 }' "$S/pmset"
+        ;;
+      -a)
+        shift
+        while [ $# -ge 2 ]; do
+          kv_set "$S/pmset" "$1" "$2"
+          shift 2
+        done
+        ;;
+    esac
+    ;;
+  defaults)
+    f="$S/defaults$(flat "${2#"$FAKE_ROOT"}")"
+    case "$1" in
+      read) kv_get "$f" "$3" || {
+        echo "The domain/default pair of ($2, $3) does not exist" >&2
+        exit 1
+      } ;;
+      write)
+        case "$4 $5" in
+          '-bool true') kv_set "$f" "$3" 1 ;;
+          '-bool false') kv_set "$f" "$3" 0 ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      delete) kv_del "$f" "$3" ;;
+    esac
+    ;;
+  scutil)
+    case "$1" in
+      --get) kv_get "$S/scutil" "$2" || {
+        echo "$2: not set"
+        exit 1
+      } ;;
+      --set) kv_set "$S/scutil" "$2" "$3" ;;
+    esac
+    ;;
+  systemsetup)
+    [ "$1" = -f ] && shift
+    on() { if [ "$(kv_get "$S/systemsetup" "$1")" = on ]; then echo On; else echo Off; fi; }
+    case "$1" in
+      -getremotelogin) echo "Remote Login: $(on remotelogin)" ;;
+      -setremotelogin) kv_set "$S/systemsetup" remotelogin "$2" ;;
+      -getusingnetworktime) echo "Network Time: $(on networktime)" ;;
+      -setusingnetworktime) kv_set "$S/systemsetup" networktime "$2" ;;
+      -getnetworktimeserver) echo "Network Time Server: $(kv_get "$S/systemsetup" timeserver)" ;;
+      -setnetworktimeserver) kv_set "$S/systemsetup" timeserver "$2" ;;
+    esac
+    ;;
+  socketfilterfw)
+    case "$1" in
+      --getglobalstate)
+        case "$(cat "$S/firewall")" in
+          1) echo 'Firewall is enabled. (State = 1)' ;;
+          0) echo 'Firewall is disabled. (State = 0)' ;;
+          *) echo 'socketfilterfw: no answer' ;;
+        esac
+        ;;
+      --setglobalstate)
+        if [ "$2" = on ]; then echo 1 >"$S/firewall"; else echo 0 >"$S/firewall"; fi
+        ;;
+    esac
+    ;;
+  fdesetup)
+    [ "$1" = status ] || exit 1
+    echo "FileVault is $(cat "$S/filevault")."
+    ;;
+  dscl)
+    # dscl . -read /Users/<name> [ATTR...] | -create /Users/<name> [ATTR VALUE] |
+    # -delete /Users/<name> ATTR | -list /Users [ATTR]
+    verb=$2
+    rec="$S/dscl$(flat "$3")"
+    case "$verb" in
+      -read)
+        [ -f "$rec" ] || {
+          echo "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)" >&2
+          exit 56
+        }
+        if [ $# -gt 3 ]; then
+          shift 3
+          for a in "$@"; do
+            v=$(kv_get "$rec" "$a") || continue
+            case "$a" in
+              # A long value goes on a line of its own, as macOS's dscl prints it.
+              AuthenticationAuthority) printf '%s:\n %s\n' "$a" "$v" ;;
+              *) echo "$(native "$a")$a: $v" ;;
+            esac
+          done
+        else
+          awk -F= '{ p = ($1 == "IsHidden") ? "dsAttrTypeNative:" : ""; print p $1 ": " substr($0, length($1) + 2) }' "$rec"
+        fi
+        ;;
+      -create)
+        touch "$rec"
+        [ $# -ge 5 ] && kv_set "$rec" "$4" "$5"
+        ;;
+      -delete)
+        kv_get "$rec" "$4" >/dev/null || {
+          echo "<main> attribute status: eDSAttributeNotFound" >&2
+          exit 40
+        }
+        kv_del "$rec" "$4"
+        ;;
+      -list)
+        # -list /Users prints the names; -list /Users ATTR the names and values.
+        for r in "$S/dscl$(flat "$3")_"*; do
+          [ -f "$r" ] || continue
+          if [ $# -ge 4 ]; then
+            echo "${r#"$S/dscl$(flat "$3")_"} $(kv_get "$r" "$4")"
+          else
+            echo "${r#"$S/dscl$(flat "$3")_"}"
+          fi
+        done
+        ;;
+    esac
+    ;;
+  dseditgroup)
+    # dseditgroup -o checkmember -m USER GROUP. A member is listed in the group's
+    # GroupMembership or has the group as its primary group (the fake knows one group
+    # id: admin is 80). macOS's own also follows nested groups.
+    u=$4
+    g=$5
+    if printf ' %s \n' "$(kv_get "$S/dscl_Groups_$g" GroupMembership)" | grep -qF " $u "; then
+      echo "yes $u is a member of $g"
+    elif [ "$g" = admin ] && [ "$(kv_get "$S/dscl_Users_$u" PrimaryGroupID)" = 80 ]; then
+      echo "yes $u is a member of $g"
+    else
+      echo "no $u is NOT a member of $g"
+      exit 67
+    fi
+    ;;
+  sshd)
+    # sshd -T prints the settings sshd would use. The fake prints $S/sshd_effective
+    # when a test wrote one (a configuration whose effect the files the script reads
+    # do not show), else the kbf drop-in's lines with the keyword in lower case, as a
+    # sshd that reads the drop-in first would.
+    [ "$1" = -T ] || exit 1
+    if [ -f "$S/sshd_effective" ]; then
+      cat "$S/sshd_effective"
+    else
+      awk '{ print tolower($1), $2 }' "$FAKE_ROOT/etc/ssh/sshd_config.d/000-kbf.conf"
+    fi
+    ;;
+  launchctl)
+    case "$1" in
+      print) [ -f "$S/loaded_$(flat "$2")" ] || exit 113 ;;
+      bootout) [ -f "$S/loaded_$(flat "$2")" ] && rm "$S/loaded_$(flat "$2")" || exit 3 ;;
+      bootstrap)
+        label=$(sed -n '/<key>Label<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' "$3")
+        [ -f "$S/bootstrap_fails" ] && exit 5
+        [ -f "$S/loaded_system_$label" ] && exit 5
+        touch "$S/loaded_system_$label"
+        ;;
+    esac
+    ;;
+  xcode-select)
+    case "$1" in
+      -p) cat "$S/xcode_select" 2>/dev/null || exit 2 ;;
+      -s) printf '%s\n' "$2" >"$S/xcode_select" ;;
+    esac
+    ;;
+  xcodebuild) ;;
+  PlistBuddy)
+    # Only "Print :ProductBuildVersion" of a fake version.plist (KEY=VALUE lines).
+    kv_get "$3" ProductBuildVersion
+    ;;
+  sntp)
+    case "$1" in
+      -t)
+        o=$(cat "$S/sntp_offset")
+        [ "$o" = fail ] && {
+          echo "sntp: Exchange failed" >&2
+          exit 1
+        }
+        echo "$o +/- 0.010000 $3 192.0.2.1"
+        ;;
+      -sS) echo +0.000100 >"$S/sntp_offset" ;;
+    esac
+    ;;
+  xip)
+    # A fake .xip holds the line "app=NAME.app build=BUILD"; expands into the cwd.
+    app=$(sed -n 's/^app=\([^ ]*\) .*/\1/p' "$2")
+    build=$(sed -n 's/.* build=\(.*\)/\1/p' "$2")
+    mkdir -p "$app/Contents"
+    echo "ProductBuildVersion=$build" >"$app/Contents/version.plist"
+    ;;
+  shasum)
+    sha256sum "$3"
+    ;;
+  chown)
+    printf '%s %s\n' "$1" "$2" >>"$S/owners"
+    ;;
+  ls)
+    # ls -ldn PATH, with the owner the last chown of PATH recorded; anything else is
+    # the real ls.
+    [ "$1" = -ldn ] || exec ls "$@"
+    line=$(ls -ldn "$2") || exit 1
+    own=$(awk -v p="$2" '$2 == p { o = $1 } END { print o }' "$S/owners" 2>/dev/null)
+    if [ -n "$own" ]; then
+      printf '%s\n' "$line" | awk -v u="${own%:*}" -v g="${own#*:}" '{ $3 = u; $4 = g; print }'
+    else
+      printf '%s\n' "$line"
+    fi
+    ;;
+  mv)
+    # mv [-f] SRC DST; the owner recorded for SRC moves with it.
+    [ "$1" = -f ] && shift
+    mv "$1" "$2" || exit 1
+    own=$(awk -v p="$1" '$2 == p { o = $1 } END { print o }' "$S/owners" 2>/dev/null)
+    [ -z "$own" ] || printf '%s %s\n' "$own" "$2" >>"$S/owners"
+    ;;
+  *)
+    echo "fakecmd: no fake for $NAME" >&2
+    exit 127
+    ;;
+esac

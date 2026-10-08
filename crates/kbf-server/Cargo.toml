@@ -13,6 +13,7 @@ clap.workspace = true
 futures.workspace = true
 kbf-front.workspace = true
 kbf-caps.workspace = true
+kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true
@@ -36,7 +37,7 @@ kbf-segments.workspace = true
 libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 [lints]
 workspace = true

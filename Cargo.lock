@@ -1005,6 +1005,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-mdm-api"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "protox",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "kbf-meta"
 version = "0.1.0"
 dependencies = [
@@ -1112,6 +1126,7 @@ dependencies = [
  "futures",
  "kbf-caps",
  "kbf-front",
+ "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
