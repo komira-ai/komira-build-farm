@@ -159,12 +159,12 @@ fn output_within(mut command: std::process::Command, within: Duration) -> io::Re
         )
     };
     let left = || deadline.saturating_duration_since(Instant::now());
-    let stdout = stdout.recv_timeout(left()).map_err(|_| unclosed())?;
-    let stderr = stderr.recv_timeout(left()).map_err(|_| unclosed())?;
+    let [stdout, stderr] =
+        [stdout, stderr].map(|pipe| pipe.recv_timeout(left()).map_err(|_| unclosed()));
     Ok(Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout?,
+        stderr: stderr?,
     })
 }
 
