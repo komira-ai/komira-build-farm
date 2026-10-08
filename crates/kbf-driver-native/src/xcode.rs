@@ -180,8 +180,9 @@ mod tests {
         }
     }
 
-    /// A stand-in for `xcodebuild`: answers for a `DEVELOPER_DIR` under an app whose
-    /// name holds `good` or `twin`, fails for `broken`, and prints no build otherwise.
+    /// A stand-in for `xcodebuild`: prints a build for every `DEVELOPER_DIR` (so only
+    /// the name filter keeps `Safari.app` out), prints one and then fails for
+    /// `broken` (so only the exit status keeps it out), and prints none for `mute`.
     fn fake_xcodebuild(dir: &Path) -> PathBuf {
         let path = dir.join("xcodebuild");
         let script = "#!/bin/sh\n\
@@ -189,8 +190,9 @@ mod tests {
             *Xcode_good.app/Contents/Developer) echo 'Xcode 16.2'; echo 'Build version 16C5032a' ;;\n\
             *Xcode_twin.app/Contents/Developer) echo 'Build version 16C5032a' ;;\n\
             *Xcode_new.app/Contents/Developer) echo 'Build version 16E140' ;;\n\
-            *Xcode_broken.app/Contents/Developer) echo 'licence not accepted' >&2; exit 69 ;;\n\
-            *) echo 'Xcode ?' ;;\n\
+            *Xcode_broken.app/Contents/Developer) echo 'Build version 16B40'; echo 'licence not accepted' >&2; exit 69 ;;\n\
+            *Xcode_mute.app/Contents/Developer) echo 'Xcode ?' ;;\n\
+            *) echo 'Build version 99Z999' ;;\n\
             esac\n";
         std::fs::write(&path, script).expect("script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -217,7 +219,6 @@ mod tests {
         }
         std::os::unix::fs::symlink(apps.join("Xcode_new.app"), apps.join("Xcode.app"))
             .expect("link");
-        std::fs::write(apps.join("Xcode_file.app"), b"").expect("file");
         std::os::unix::fs::symlink(apps.join("nowhere"), apps.join("Xcode_gone.app"))
             .expect("dangling link");
         let xcodebuild = fake_xcodebuild(&dir);
