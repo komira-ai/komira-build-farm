@@ -61,7 +61,7 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode that answers
-    /// `xcodebuild -version` is reported as an `xcode` entry, and an action that names
+    /// `xcodebuild -version` within a minute is reported as an `xcode` entry, and an action that names
     /// its build runs with it as `DEVELOPER_DIR`.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
@@ -158,7 +158,11 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
-    config.xcodes = xcode::discover(&cli.xcode_apps, Path::new(xcode::XCODEBUILD));
+    config.xcodes = xcode::discover(
+        &cli.xcode_apps,
+        Path::new(xcode::XCODEBUILD),
+        xcode::ANSWER_WITHIN,
+    );
     Ok(config)
 }
 

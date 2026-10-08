@@ -141,9 +141,10 @@ A Mac may have several Xcodes installed; it serves an action that names any of t
 The daemon finds them at start: each `Xcode*.app` in `/Applications` (the
 `--xcode-apps` flag) that answers `xcodebuild -version` is reported as an `xcode`
 entry of its node report. An Xcode that does not answer (its licence not accepted, its
-first launch not run) is left out and logged. An action that names no `xcode` runs
-with the Mac's default Xcode (`xcode-select`), or with the `DEVELOPER_DIR` its own
-environment sets; one that names an `xcode` gets that Xcode whatever its environment
+first launch not run), or does not answer within a minute, is left out and logged; a
+hung one is killed, so it cannot keep the node from starting. An action that names no
+`xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
+`DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode whatever its environment
 says.
 
 ```starlark

@@ -316,10 +316,13 @@ async fn compiles_still_work_and_their_caches_stay_in_the_lease() {
 
 /// The Xcodes on this runner, at most two: the lowest build and the highest.
 fn some_xcodes() -> Vec<(String, PathBuf)> {
-    let all: Vec<(String, PathBuf)> =
-        xcode::discover(Path::new(xcode::APPLICATIONS), Path::new(xcode::XCODEBUILD))
-            .into_iter()
-            .collect();
+    let all: Vec<(String, PathBuf)> = xcode::discover(
+        Path::new(xcode::APPLICATIONS),
+        Path::new(xcode::XCODEBUILD),
+        xcode::ANSWER_WITHIN,
+    )
+    .into_iter()
+    .collect();
     let mut picked: Vec<_> = all.first().into_iter().cloned().collect();
     if all.len() > 1 {
         picked.extend(all.last().cloned());

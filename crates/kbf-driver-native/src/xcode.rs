@@ -4,7 +4,7 @@
 //! `/Applications/Xcode_16.2.app`, ...). [`discover`] finds every `Xcode*.app` in a
 //! directory and asks each for its build with `xcodebuild -version` under that
 //! Xcode's `DEVELOPER_DIR`; one that does not answer (not set up, licence not
-//! accepted) is left out and logged. The driver reports one `xcode` entry per build
+//! accepted, or no answer within [`ANSWER_WITHIN`]) is left out and logged. The driver reports one `xcode` entry per build
 //! ([`CAPABILITY`]), which `kbf-caps` matches by membership, so an action that names a
 //! build runs on any Mac that has it.
 //!
@@ -15,7 +15,11 @@
 //! is the one the scheduler matched and the one in its digest.
 
 use std::collections::BTreeMap;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::{Action, Command, Platform};
@@ -42,13 +46,20 @@ pub fn build_of(version: &str) -> Option<&str> {
         .filter(|build| !build.contains(char::is_whitespace))
 }
 
-/// Every Xcode in `apps` that answers `xcodebuild -version` (`xcodebuild` is the
-/// program run), by build, as its `DEVELOPER_DIR`: the app's real path (links
-/// resolved) joined with `Contents/Developer`. Apps are tried in name order; of two
-/// with one build (a link `Xcode.app` to `Xcode_16.2.app`), the first is kept. A
-/// directory that cannot be read has none.
+/// How long one Xcode has to answer `xcodebuild -version` at daemon start. A first
+/// run after an install can take some seconds; one that takes longer is hung (waiting
+/// on a licence prompt or a broken install), and is left out rather than holding the
+/// node out of the farm.
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(60);
+
+/// Every Xcode in `apps` that answers `xcodebuild -version` within `within` each
+/// (`xcodebuild` is the program run), by build, as its `DEVELOPER_DIR`: the app's real
+/// path (links resolved) joined with `Contents/Developer`. Apps are tried in name
+/// order; of two with one build (a link `Xcode.app` to `Xcode_16.2.app`), the first is
+/// kept. A directory that cannot be read has none. One that does not answer in time
+/// is killed, left out and logged.
 #[must_use]
-pub fn discover(apps: &Path, xcodebuild: &Path) -> BTreeMap<String, PathBuf> {
+pub fn discover(apps: &Path, xcodebuild: &Path, within: Duration) -> BTreeMap<String, PathBuf> {
     let mut found = BTreeMap::new();
     let names = match std::fs::read_dir(apps) {
         Ok(entries) => {
@@ -70,7 +81,7 @@ pub fn discover(apps: &Path, xcodebuild: &Path) -> BTreeMap<String, PathBuf> {
     };
     for name in names {
         let app = apps.join(name);
-        match developer_dir_of(&app, xcodebuild) {
+        match developer_dir_of(&app, xcodebuild, within) {
             Ok((build, dir)) => {
                 tracing::info!(app = %app.display(), build, "Xcode");
                 found.entry(build).or_insert(dir);
@@ -82,16 +93,19 @@ pub fn discover(apps: &Path, xcodebuild: &Path) -> BTreeMap<String, PathBuf> {
 }
 
 /// The build and `DEVELOPER_DIR` of the Xcode at `app`.
-fn developer_dir_of(app: &Path, xcodebuild: &Path) -> Result<(String, PathBuf), String> {
+fn developer_dir_of(
+    app: &Path,
+    xcodebuild: &Path,
+    within: Duration,
+) -> Result<(String, PathBuf), String> {
     let dir = std::fs::canonicalize(app)
         .map_err(|e| e.to_string())?
         .join("Contents")
         .join("Developer");
-    let out = std::process::Command::new(xcodebuild)
-        .arg("-version")
-        .env(DEVELOPER_DIR, &dir)
-        .output()
-        .map_err(|e| format!("{}: {e}", xcodebuild.display()))?;
+    let mut command = std::process::Command::new(xcodebuild);
+    command.arg("-version").env(DEVELOPER_DIR, &dir);
+    let out = output_within(command, within)
+        .map_err(|e| format!("{} -version: {e}", xcodebuild.display()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         return Err(format!(
@@ -103,6 +117,53 @@ fn developer_dir_of(app: &Path, xcodebuild: &Path) -> Result<(String, PathBuf), 
     let build = build_of(&stdout)
         .ok_or_else(|| format!("no build in xcodebuild -version: {:?}", stdout.trim()))?;
     Ok((build.to_owned(), dir))
+}
+
+/// How often [`output_within`] looks whether its process has exited.
+const POLL: Duration = Duration::from_millis(10);
+
+/// What `command` prints and how it exits (stdin `/dev/null`), if it exits within
+/// `within`; otherwise it is killed and this is a `TimedOut` error. Its stdout and
+/// stderr are read on two threads while it runs, so a full pipe cannot stall it. A
+/// process it started and left holding the pipes keeps those threads waiting; after
+/// a timeout they are not waited for.
+fn output_within(mut command: std::process::Command, within: Duration) -> io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = read_all(child.stdout.take().expect("stdout is piped"));
+    let stderr = read_all(child.stderr.take().expect("stderr is piped"));
+    let deadline = Instant::now() + within;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait()?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no answer within {within:?}; killed"),
+            ));
+        }
+        std::thread::sleep(POLL);
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// A thread that reads `pipe` to its end.
+fn read_all(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
 }
 
 /// The `DEVELOPER_DIR` of the Xcode the action's platform names (the Action's
@@ -182,7 +243,8 @@ mod tests {
 
     /// A stand-in for `xcodebuild`: prints a build for every `DEVELOPER_DIR` (so only
     /// the name filter keeps `Safari.app` out), prints one and then fails for
-    /// `broken` (so only the exit status keeps it out), and prints none for `mute`.
+    /// `broken` (so only the exit status keeps it out), prints none for `mute`, and
+    /// prints one and then hangs for `hung` (so only the timeout keeps it out).
     fn fake_xcodebuild(dir: &Path) -> PathBuf {
         let path = dir.join("xcodebuild");
         let script = "#!/bin/sh\n\
@@ -192,6 +254,7 @@ mod tests {
             *Xcode_new.app/Contents/Developer) echo 'Build version 16E140' ;;\n\
             *Xcode_broken.app/Contents/Developer) echo 'Build version 16B40'; echo 'licence not accepted' >&2; exit 69 ;;\n\
             *Xcode_mute.app/Contents/Developer) echo 'Xcode ?' ;;\n\
+            *Xcode_hung.app/Contents/Developer) echo 'Build version 16A242d'; exec sleep 60 ;;\n\
             *) echo 'Build version 99Z999' ;;\n\
             esac\n";
         std::fs::write(&path, script).expect("script");
@@ -199,10 +262,14 @@ mod tests {
         path
     }
 
+    /// How long the fake Xcodes have to answer.
+    const WITHIN: Duration = Duration::from_secs(2);
+
     /// Catches: an Xcode left out that answers, one kept that does not answer, has no
-    /// build or is a dangling link, another app taken for an Xcode, the `DEVELOPER_DIR` not the app's
-    /// real `Contents/Developer`, a later twin replacing the first, and a missing
-    /// directory or program treated as anything but "no Xcode".
+    /// build, hangs, or is a dangling link, another app taken for an Xcode, the
+    /// `DEVELOPER_DIR` not the app's real `Contents/Developer`, a later twin replacing
+    /// the first, a missing directory or program treated as anything but "no Xcode",
+    /// and a hung Xcode waited for past its time (its fake sleeps for a minute).
     #[test]
     fn every_xcode_that_answers_is_found() {
         let dir = scratch("discover");
@@ -213,6 +280,7 @@ mod tests {
             "Xcode_new.app",
             "Xcode_broken.app",
             "Xcode_mute.app",
+            "Xcode_hung.app",
             "Safari.app",
         ] {
             std::fs::create_dir_all(apps.join(app).join("Contents/Developer")).expect("app");
@@ -223,7 +291,17 @@ mod tests {
             .expect("dangling link");
         let xcodebuild = fake_xcodebuild(&dir);
         let real = std::fs::canonicalize(&apps).expect("real");
-        let found = discover(&apps, &xcodebuild);
+        let started = Instant::now();
+        let found = discover(&apps, &xcodebuild, WITHIN);
+        let took = started.elapsed();
+        assert!(
+            took >= WITHIN,
+            "the hung Xcode was not given its time: {took:?}"
+        );
+        assert!(
+            took < WITHIN * 10,
+            "the hung Xcode was waited for: {took:?}"
+        );
         let want = BTreeMap::from([
             (
                 "16C5032a".to_owned(),
@@ -236,9 +314,33 @@ mod tests {
         ]);
         assert_eq!(found, want);
 
-        assert!(discover(&dir.join("missing"), &xcodebuild).is_empty());
-        assert!(discover(&apps, &dir.join("no-xcodebuild")).is_empty());
+        assert!(discover(&dir.join("missing"), &xcodebuild, WITHIN).is_empty());
+        assert!(discover(&apps, &dir.join("no-xcodebuild"), WITHIN).is_empty());
+
+        // What the log says of the hung one.
+        let hung = developer_dir_of(&apps.join("Xcode_hung.app"), &xcodebuild, WITHIN);
+        assert_eq!(
+            hung,
+            Err(format!(
+                "{} -version: no answer within 2s; killed",
+                xcodebuild.display()
+            ))
+        );
         kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches output read only after the process exits: a process that prints more
+    /// than a pipe holds would block on the full pipe and be killed as hung.
+    #[test]
+    fn a_long_answer_is_read_whole() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "head -c 300000 /dev/zero; head -c 200000 /dev/zero >&2",
+        ]);
+        let out = output_within(command, WITHIN).expect("answers");
+        assert!(out.status.success());
+        assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 200_000));
     }
 
     fn platform(name: &str, value: &str) -> Option<Platform> {
