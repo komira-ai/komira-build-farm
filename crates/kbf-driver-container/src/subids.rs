@@ -258,10 +258,11 @@ mod tests {
         ] {
             let files = files(name, Some(text), Some(text));
             let error = check_subordinate_ids(&files, 990).expect_err(name);
-            assert!(
-                matches!(error, SubidError::TooFew { count: c, .. } if c == count),
-                "{name}: {error}"
-            );
+            let counted = match error {
+                SubidError::TooFew { count, .. } => Some(count),
+                _ => None,
+            };
+            assert_eq!(counted, Some(count), "{name}");
         }
         let huge = format!("kbf:1:{max}\n990:0:2\n", max = u64::MAX);
         let files = files("huge", Some(&huge), Some(&huge));
