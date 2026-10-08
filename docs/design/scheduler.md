@@ -276,3 +276,5 @@ control log:
   action-cache write.
 - `crates/kbf-sched/tests/sim_cell.rs`: the scheduler in a simulated cell, over a seed
   sweep.
+- [simulation.md](simulation.md): every scheduler simulation, the invariants they
+  check, and the scenarios still to build.
