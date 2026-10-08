@@ -23,15 +23,21 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 # macOS only (kbf-mac-session): CFData for the caller's audit token.
 core-foundation = "0.10.1"
-# Verifies the MDM gate's admin grants (kbf-mac-session). Verify only, pure Rust: the
-# helper is checked for the macOS target on any host, which ring's C build does not allow.
-ed25519-dalek = { version = "3.0.0", default-features = false }
+# The MDM gate's grant key (kbf-mdm) and the Mac's check of the grants it signs
+# (kbf-mac-session: pure Rust, so the helper is checked for the macOS target on any
+# host, which ring's C build does not allow). One major for both, already in the tree
+# through ssh-key.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
 futures = "0.3.34"
 hex = "0.4.3"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
 hmac = "0.13.0"
+# The MDM gate serves its mutual-TLS listener with hyper directly (axum's own `serve`
+# takes plain TCP only). Both are already in the tree through axum and tonic.
+hyper = { version = "1.12.0", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -46,7 +52,12 @@ rand_chacha = "0.10.0"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
 reqwest = { version = "0.13.5", default-features = false }
+# ed25519 checks of software sets and key statements (kbf-updater). Already in the tree
+# through rustls.
+ring = "0.17.14"
 roxmltree = "0.21.1"
+# The MDM gate's mutual-TLS listener, on the ring provider tonic's `tls-ring` uses too.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
@@ -57,6 +68,9 @@ security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
+# OpenSSH signatures (`ssh-keygen -Y sign`) on operator erase requests (kbf-mdm): the
+# SSHSIG envelope and security-key (`sk-`) signature verification.
+ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "ed25519", "p256", "std"] }
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"
@@ -65,6 +79,7 @@ thiserror = "2.0.21"
 # x509-parser.
 time = { version = "0.3.55", default-features = false, features = ["formatting", "macros", "parsing", "std"] }
 tokio = "1.53.2"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
@@ -82,6 +97,8 @@ kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
+kbf-mdm = { path = "crates/kbf-mdm" }
+kbf-mdm-api = { path = "crates/kbf-mdm-api" }
 kbf-meta = { path = "crates/kbf-meta" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }

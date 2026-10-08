@@ -1,9 +1,13 @@
 //! Platform routing over a seed sweep: three workers of different platforms (a Linux
 //! x86-64 machine, a Linux arm64 machine and an Apple silicon Mac); the arm64 machine
-//! and the Mac go silent for a random window and come back, while actions asking for each platform, and one no worker has, are
-//! submitted at random. The control log is in process: a `Commit` is fed straight back.
-//! A running lease reports its result a few seconds after its `Start`, unless its worker
-//! went silent first.
+//! and the Mac each go silent for two random windows and come back in between, while
+//! actions asking for each platform, and one no worker has, are submitted at random.
+//! The Mac has one core and runs an action for 20 to 39 s, so work for it queues
+//! behind its running action: work that waited through the Mac's first outage can be
+//! servable (the Mac is live but busy) when the second begins, and its wait must then
+//! start again. The control log is in process: a `Commit` is fed straight back. A
+//! running lease reports its result a few seconds after its `Start` (20 to 39 on the
+//! Mac), unless its worker went silent first.
 //!
 //! The checks, for every seed:
 //! - every grant goes to a worker that was live and whose node report satisfies the
@@ -16,11 +20,14 @@
 //!   unbroken run of ticks at which the operation was queued and no live worker
 //!   satisfied its platform, neither before (the run restarts whenever one does) nor
 //!   after (no operation stays queued past it);
+//! - the sweep refuses some operation whose run restarted: it was queued and servable
+//!   between two unservable stretches, so a wait that does not start again when the
+//!   operation is servable would refuse it early;
 //! - an action no worker can ever run (`x86-64-v4`) is always refused, and one the
 //!   Linux x86-64 machine (always up) satisfies always runs;
 //! - a seed replays to the same effects.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
@@ -37,9 +44,13 @@ const GIB: u64 = 1 << 30;
 const HEARTBEAT: u64 = 5;
 /// The scheduler's grace G: a worker not heard from for this long is not live.
 const GRACE: u64 = 60;
-/// Actions are submitted before this; every worker is back by then.
+/// Actions are submitted before this; every worker is back by then (its first outage
+/// starts before a quarter of it, and both outages with the gap between them last at
+/// most 390 s).
 const SUBMIT_UNTIL: u64 = 600;
-const END: u64 = SUBMIT_UNTIL + 2 * GRACE + 2 * WAIT.as_secs();
+/// Time for the Mac, one action at a time, to work through what queued for it.
+const MAC_BACKLOG: u64 = 900;
+const END: u64 = SUBMIT_UNTIL + 2 * GRACE + 2 * WAIT.as_secs() + MAC_BACKLOG;
 const OPS: u64 = 40;
 
 /// The platforms actions ask for, as REAPI properties.
@@ -88,8 +99,8 @@ fn digest(n: u64) -> Digest {
 struct World {
     sched: Scheduler,
     caps: BTreeMap<String, NodeCaps>,
-    /// Per worker: the outage window `[from, to)` in seconds, when it sends nothing.
-    outage: BTreeMap<String, (u64, u64)>,
+    /// Per worker: the outage windows `[from, to)` in seconds, when it sends nothing.
+    outage: BTreeMap<String, Vec<(u64, u64)>>,
     last_heard: BTreeMap<String, u64>,
     /// Per operation: its platform index.
     platform: BTreeMap<OperationId, usize>,
@@ -105,6 +116,11 @@ struct World {
     unservable_ticks: BTreeMap<OperationId, u64>,
     /// Per refused operation: the second it was refused.
     refused_at: BTreeMap<OperationId, u64>,
+    /// The operations that were queued and servable right after an unservable
+    /// stretch: their unservable run restarted.
+    restarted: BTreeSet<OperationId>,
+    /// How many refused operations had a run that restarted before the refusal.
+    restarted_refusals: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,15 +135,20 @@ impl World {
         let mut outage = BTreeMap::new();
         for (name, c) in workers() {
             caps.insert(name.to_owned(), c);
-            let from = rng.below(SUBMIT_UNTIL / 2);
-            let to = from + rng.between(10, SUBMIT_UNTIL / 2);
+            // Each outage lasts at least the grace, so the worker is seen to leave; the
+            // longer ones outlast the grace and the wait, so work is refused.
+            let length = |rng: &mut SimRng| rng.between(GRACE, GRACE + 2 * WAIT.as_secs());
+            let from = rng.below(SUBMIT_UNTIL / 4);
+            let to = from + length(rng);
+            let again = to + rng.between(1, SUBMIT_UNTIL / 20);
+            let back = again + length(rng);
             // The Linux x86-64 machine stays up, so its work always has a live worker.
-            let window = if name == ALWAYS_UP {
-                (0, 0)
+            let windows = if name == ALWAYS_UP {
+                Vec::new()
             } else {
-                (from, to)
+                vec![(from, to), (again, back)]
             };
-            outage.insert(name.to_owned(), window);
+            outage.insert(name.to_owned(), windows);
         }
         Self {
             sched: Scheduler::new(1).with_unservable_wait(WAIT),
@@ -142,12 +163,15 @@ impl World {
             trace: Vec::new(),
             unservable_ticks: BTreeMap::new(),
             refused_at: BTreeMap::new(),
+            restarted: BTreeSet::new(),
+            restarted_refusals: 0,
         }
     }
 
     fn up(&self, name: &str, t: u64) -> bool {
-        let (from, to) = self.outage[name];
-        !(from..to).contains(&t)
+        !self.outage[name]
+            .iter()
+            .any(|&(from, to)| (from..to).contains(&t))
     }
 
     fn live(&self, name: &str, t: u64) -> bool {
@@ -180,7 +204,7 @@ impl World {
                         next.extend(self.sched.apply(Input::new(now, Event::Committed(record))));
                     }
                     Effect::Start(start) => {
-                        let done = t + 3 + start.lease.seq % 5;
+                        let done = t + run_secs(start.worker.as_str(), start.lease.seq);
                         let name = start.worker.as_str().to_owned();
                         self.running
                             .insert(start.lease, (done, start.operation, name));
@@ -235,7 +259,7 @@ impl World {
             if silent_too_long || (t > 0 && !self.up(&name, t - 1)) {
                 let event = Event::WorkerUp {
                     worker: WorkerId::new(name.as_str()),
-                    capacity: Resources::new(8_000, 16 * GIB),
+                    capacity: capacity(&name),
                     caps: self.caps[&name].clone(),
                 };
                 self.last_heard.insert(name.clone(), t);
@@ -310,12 +334,16 @@ impl World {
             let refused_now = self.refused_at.get(&op) == Some(&t);
             let queued = refused_now || self.sched.state(op) == Some(&OpState::Queued);
             let count = self.unservable_ticks.entry(op).or_default();
+            if queued && servable[p] && *count > 0 {
+                self.restarted.insert(op);
+            }
             *count = if queued && !servable[p] {
                 *count + 1
             } else {
                 0
             };
             if refused_now {
+                self.restarted_refusals += usize::from(self.restarted.contains(&op));
                 assert_eq!(
                     *count,
                     wait + 1,
@@ -328,6 +356,22 @@ impl World {
                 );
             }
         }
+    }
+}
+
+/// What worker `name` offers: the Mac one core, so its work queues behind itself.
+fn capacity(name: &str) -> Resources {
+    let cores = if name == "mac" { 1 } else { 8 };
+    Resources::new(cores * 1_000, 16 * GIB)
+}
+
+/// How long lease `seq` runs on worker `name`: a few seconds, or longer on the Mac,
+/// so work for it is still queued when it leaves again.
+fn run_secs(name: &str, seq: u64) -> u64 {
+    if name == "mac" {
+        20 + seq % 20
+    } else {
+        3 + seq % 5
     }
 }
 
@@ -358,8 +402,10 @@ fn run(seed: u64) -> World {
 fn every_action_runs_where_its_platform_is_satisfied_or_is_refused() {
     let mut refused = 0;
     let mut ran = 0;
+    let mut restarted_refusals = 0;
     for seed in 0..SEEDS {
         let world = run(seed);
+        restarted_refusals += world.restarted_refusals;
         for (op, p) in &world.platform {
             let how = world.answered.get(op).copied();
             assert!(
@@ -385,6 +431,12 @@ fn every_action_runs_where_its_platform_is_satisfied_or_is_refused() {
         "no satisfiable action was ever refused: outages too short"
     );
     assert!(ran > 0);
+    // And a wait that started again: an operation servable between two unservable
+    // stretches, refused a full wait after the second began.
+    assert!(
+        restarted_refusals > 0,
+        "no refused operation was ever servable between unservable stretches"
+    );
 }
 
 #[test]

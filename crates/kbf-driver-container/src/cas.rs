@@ -1,57 +1,25 @@
-//! The blobs a lease reads and writes: the [`Cas`] trait and [`MemoryCas`].
+//! Blobs the container driver stores: [`FileBlob`], a file on its way into the CAS
+//! one [`CHUNK`] at a time, and [`MemoryCas`], a CAS in this process's memory.
 //!
-//! The driver fetches an action, its command and its input tree through a `Cas`, and
-//! stores outputs, stdout and stderr through it. The daemon's CAS client (over
-//! ByteStream, with the local cache in front) implements the same trait; `MemoryCas`
-//! holds blobs in this process, for tests and simulation.
-//!
-//! Every blob is hashed on arrival: a `Cas` that hands back the wrong bytes is caught
-//! here, not trusted ([`fetch`]).
-//!
-//! A file the driver stores (an output, stdout, stderr) reaches the CAS as a
-//! [`FileBlob`]: hashed, then sent, one [`CHUNK`] at a time, so a file of any size
-//! costs the daemon one chunk of memory, not the file.
+//! The driver reads and writes blobs through `kbf_daemon`'s [`Cas`] trait, the one the
+//! daemon's ByteStream client of a front implements, and checks what it reads with
+//! that crate's `fetch`. A file the driver stores (an output, stdout, stderr) goes to
+//! [`Cas::put_chunks`] as a [`FileBlob`]: hashed, then sent one [`CHUNK`] at a time, so
+//! a file of any size costs the daemon one chunk of memory, not the file.
+//! `MemoryCas` holds blobs in this process, for tests and simulation.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use futures::{StreamExt as _, stream};
+use kbf_daemon::cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, label};
 use kbf_proto::reapi::Digest;
 use sha2::{Digest as _, Sha256};
 
-/// Why a blob could not be read or written.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum CasError {
-    /// The CAS does not hold the blob.
-    #[error("blob {0} is not in the CAS")]
-    Missing(String),
-    /// The bytes the CAS returned do not hash to the digest asked for.
-    #[error("blob {0} failed verification: its bytes hash to {1}")]
-    Corrupt(String, String),
-    /// The file a [`FileBlob`] reads could not be read back for storing.
-    #[error("blob {0} could not be read from its file: {1}")]
-    Read(String, String),
-}
-
-/// A content-addressed blob store, SHA-256 only.
-pub trait Cas: Send + Sync + 'static {
-    /// The blob's bytes. Callers verify them ([`fetch`] does).
-    fn get(&self, digest: &Digest) -> impl Future<Output = Result<Vec<u8>, CasError>> + Send;
-
-    /// Stores `bytes` and returns their digest.
-    fn put(&self, bytes: Vec<u8>) -> impl Future<Output = Result<Digest, CasError>> + Send;
-
-    /// Stores the file `blob` reads, taking its bytes one [`FileBlob::next_chunk`] at a
-    /// time, and returns its digest. The bytes must hash to [`FileBlob::digest`] (a file
-    /// that changed after it was hashed does not): the CAS checks, as a ByteStream
-    /// server does on commit, and answers [`CasError::Corrupt`] otherwise.
-    fn put_file(&self, blob: FileBlob) -> impl Future<Output = Result<Digest, CasError>> + Send;
-}
-
 /// How many bytes of a [`FileBlob`] are read, hashed or sent at a time: the most of a
-/// file the daemon holds in memory.
-pub const CHUNK: usize = 1 << 20;
+/// file the daemon holds in memory. One chunk fits one ByteStream write.
+pub const CHUNK: usize = WRITE_CHUNK_BYTES;
 
 /// A regular file on its way into the CAS, never in memory whole.
 ///
@@ -59,7 +27,7 @@ pub const CHUNK: usize = 1 << 20;
 /// resource name holds it), so the file is read twice: [`FileBlob::hash`] reads it in
 /// chunks to learn the digest, then [`FileBlob::next_chunk`] reads it again, chunk by
 /// chunk, for the upload. A file that shrank in between fails `next_chunk`; one whose
-/// bytes changed no longer hashes to the digest, which [`Cas::put_file`] checks.
+/// bytes changed no longer hashes to the digest, which the CAS checks on commit.
 #[derive(Debug)]
 pub struct FileBlob {
     file: Arc<std::fs::File>,
@@ -134,33 +102,32 @@ impl FileBlob {
         self.offset += len as u64;
         Ok(Some(chunk))
     }
-}
 
-/// The SHA-256 digest of `bytes`.
-#[must_use]
-pub fn digest_of(bytes: &[u8]) -> Digest {
-    Digest {
-        hash: hex::encode(Sha256::digest(bytes)),
-        size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+    /// The file's bytes from where the next chunk starts, as [`Cas::put_chunks`] takes
+    /// them: one [`FileBlob::next_chunk`] per item. A read that fails (the file shrank)
+    /// is the last item.
+    #[must_use]
+    pub fn into_chunks(self) -> Chunks {
+        Box::pin(stream::unfold(Some(self), |state| async move {
+            let mut blob = state?;
+            match blob.next_chunk().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), Some(blob))),
+                Ok(None) => None,
+                Err(e) => Some((Err(e), None)),
+            }
+        }))
     }
-}
 
-/// Reads a blob and checks its bytes against `digest`.
-pub async fn fetch(cas: &impl Cas, digest: &Digest) -> Result<Vec<u8>, CasError> {
-    let bytes = cas.get(digest).await?;
-    let actual = digest_of(&bytes);
-    if actual != *digest {
-        return Err(CasError::Corrupt(
-            label(digest),
-            format!("{}/{}", actual.hash, actual.size_bytes),
-        ));
+    /// Stores the file in `cas`, one chunk in memory at a time, and returns its digest.
+    /// The CAS refuses bytes that no longer hash to [`FileBlob::digest`]
+    /// ([`CasError::Corrupt`]); a file that shrank fails as [`CasError::Read`].
+    ///
+    /// # Errors
+    /// The CAS refuses or fails the upload, or the file cannot be read back.
+    pub async fn store(self, cas: &impl Cas) -> Result<Digest, CasError> {
+        let digest = self.digest.clone();
+        cas.put_chunks(digest, self.into_chunks()).await
     }
-    Ok(bytes)
-}
-
-/// `hash/size`, the way REAPI resource names spell a digest.
-pub(crate) fn label(digest: &Digest) -> String {
-    format!("{}/{}", digest.hash, digest.size_bytes)
 }
 
 /// A CAS in this process's memory.
@@ -211,18 +178,17 @@ impl Cas for MemoryCas {
         Ok(self.insert(bytes))
     }
 
-    async fn put_file(&self, mut blob: FileBlob) -> Result<Digest, CasError> {
-        let expected = label(blob.digest());
+    /// Checks the bytes before it stores them, as a ByteStream server does on commit:
+    /// bytes that do not hash to `digest` are refused and not stored.
+    async fn put_chunks(&self, digest: Digest, mut chunks: Chunks) -> Result<Digest, CasError> {
+        let expected = label(&digest);
         let mut bytes = Vec::new();
-        while let Some(chunk) = blob
-            .next_chunk()
-            .await
-            .map_err(|e| CasError::Read(expected.clone(), e.to_string()))?
-        {
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|e| CasError::Read(expected.clone(), e.to_string()))?;
             bytes.extend_from_slice(&chunk);
         }
         let actual = digest_of(&bytes);
-        if actual != *blob.digest() {
+        if actual != digest {
             return Err(CasError::Corrupt(expected, label(&actual)));
         }
         self.lock().insert(expected, bytes);
@@ -232,6 +198,8 @@ impl Cas for MemoryCas {
 
 #[cfg(test)]
 mod tests {
+    use kbf_daemon::cas::fetch;
+
     use super::*;
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -239,17 +207,6 @@ mod tests {
             .build()
             .expect("runtime")
             .block_on(future)
-    }
-
-    /// Catches a digest that is not REAPI's SHA-256 spelling (lowercase hex, byte size).
-    #[test]
-    fn digest_of_is_sha256_hex_and_size() {
-        let digest = digest_of(b"abc");
-        assert_eq!(
-            digest.hash,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(digest.size_bytes, 3);
     }
 
     /// Catches a round trip that loses or changes bytes.
@@ -306,6 +263,12 @@ mod tests {
         let (_, file) = file_holding("cas-chunks", &bytes);
         let size = bytes.len() as u64;
         let refused = FileBlob::hash(file.try_clone().expect("dup"), size - 1).expect("read");
+        let stored = FileBlob::hash(file.try_clone().expect("dup"), size)
+            .expect("read")
+            .expect("fits");
+        let cas = MemoryCas::new();
+        let digest = block_on(stored.store(&cas)).expect("stored");
+        assert_eq!(cas.blob(&digest), Some(bytes.clone()));
         assert!(refused.is_none(), "{refused:?}");
         let mut blob = FileBlob::hash(file, size).expect("read").expect("fits");
         assert_eq!((blob.digest(), blob.size()), (&digest_of(&bytes), size));
@@ -327,7 +290,7 @@ mod tests {
         let (path, file) = file_holding("cas-changed", b"before");
         let blob = FileBlob::hash(file, 6).expect("read").expect("fits");
         std::fs::write(&path, b"after!").expect("rewrite");
-        let error = block_on(cas.put_file(blob)).expect_err("refused");
+        let error = block_on(blob.store(&cas)).expect_err("refused");
         assert!(matches!(error, CasError::Corrupt(..)), "{error}");
         assert_eq!(cas.blob(&digest_of(b"before")), None);
         assert_eq!(cas.blob(&digest_of(b"after!")), None);
@@ -335,13 +298,13 @@ mod tests {
         let (path, file) = file_holding("cas-shrank", b"before");
         let blob = FileBlob::hash(file, 6).expect("read").expect("fits");
         std::fs::write(&path, b"bef").expect("truncate");
-        let error = block_on(cas.put_file(blob)).expect_err("refused");
+        let error = block_on(blob.store(&cas)).expect_err("refused");
         assert!(matches!(error, CasError::Read(..)), "{error}");
         assert!(error.to_string().contains("could not be read"), "{error}");
 
         let (_, file) = file_holding("cas-stored", b"stored");
         let blob = FileBlob::hash(file, 6).expect("read").expect("fits");
-        let digest = block_on(cas.put_file(blob)).expect("stored");
+        let digest = block_on(blob.store(&cas)).expect("stored");
         assert_eq!(cas.blob(&digest), Some(b"stored".to_vec()));
     }
 }

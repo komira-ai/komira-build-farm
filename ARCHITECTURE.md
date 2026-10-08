@@ -10,6 +10,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | Document | Covers |
 |---|---|
 | [scheduler.md](docs/design/scheduler.md) | operations, leases, fencing, QoS, placement, accounting |
+| [simulation.md](docs/design/simulation.md) | the scheduler's simulations: what exists, the invariants every step checks, the scenario families to build and the mutants each must catch |
 | [storage.md](docs/design/storage.md) | the CAS and action cache, segments, metadata, retention, the object store interface |
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
@@ -84,10 +85,14 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
 | `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
-| `kbf-server` | no | the server binary: wires front, scheduler and storage together |
+| `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
 | `kbf-proto` | no | generated code for REAPI and `kbf.worker.v1` |
+| `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
+| `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)) |
+| `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
+| `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user and admits an administrator only with the MDM gate's signed grant ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |

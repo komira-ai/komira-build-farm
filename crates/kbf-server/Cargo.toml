@@ -13,6 +13,7 @@ clap.workspace = true
 futures.workspace = true
 kbf-front.workspace = true
 kbf-caps.workspace = true
+kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true
@@ -32,11 +33,13 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 kbf-segments.workspace = true
+# The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
+kbf-sim.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 [lints]
 workspace = true

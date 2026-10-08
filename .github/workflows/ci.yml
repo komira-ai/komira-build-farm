@@ -361,6 +361,10 @@ jobs:
       # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
       - run: cargo test -p kbf-mac-session --locked
       - run: bash tools/ci/mac-session-tests.sh
+      # kbf-mac-provision on this VM, as root, running the daemon built above: what a
+      # hosted VM can prove (the script's header lists what it applies, asserts and
+      # only reads). Last, because it changes this runner's settings.
+      - run: sudo sh tools/mac-provision/test/hosted-macos.sh target/debug/kbf-daemon
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -369,6 +373,24 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # kbf-mac-provision (tools/mac-provision) against a fake Mac: shellcheck, the test
+  # suite under dash, its line and branch coverage (100%, from bash's trace), and the
+  # planted mutants, each of which must turn its tests red. native-macos runs the same
+  # script on a real macOS VM.
+  mac-provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: shellcheck --version && shellcheck -S warning -s sh tools/mac-provision/kbf-mac-provision tools/mac-provision/test/fakecmd tools/mac-provision/test/*.sh
+      - run: sh tools/mac-provision/test/run.sh
+      - run: sh tools/mac-provision/test/coverage.sh
+      - run: sh tools/mac-provision/test/mutants.sh
 
   # The container driver against real rootless Podman, inside a Delegate=yes system
   # unit (tools/ci/podman-tests.sh; the T4 spike found both arches carry it). The same

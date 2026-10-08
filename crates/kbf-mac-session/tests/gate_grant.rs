@@ -6,8 +6,9 @@
 //! below (seed `[seed; 32]`); `kbf-mdm`'s test
 //! `the_tokens_kbf_mac_session_pins_are_what_sign_produces` pins the same bytes on
 //! the gate's side, so a change to the format on either side goes red on that side.
-//! The crates are not linked: `kbf-mdm` is the Linux gate, this is the Mac's root
-//! helper.
+//! This crate does not depend on `kbf-mdm` (the Linux gate); `kbf-mdm`'s
+//! `tests/mac_session_verifies.rs` links the two and checks freshly signed grants
+//! against this verifier.
 
 use std::time::{Duration, UNIX_EPOCH};
 

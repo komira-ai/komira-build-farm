@@ -13,6 +13,18 @@ use tokio::process::{Child, Command};
 /// Where the input root appears inside the container.
 pub const EXEC_ROOT: &str = "/kbf/root";
 
+/// The owner, in Podman's rootless user namespace, of a lease's overlay directories
+/// while its container may run: id 1, the first subordinate id, which `--userns=nomap`
+/// maps the container's root to. The container cannot write under a directory whose
+/// owner it does not map, so without this the action could write nothing under the
+/// exec root (the overlay refuses with `EROFS`).
+pub(crate) const CONTAINER_OWNER: &str = "1:1";
+
+/// The owner, in the same namespace, of the overlay directories once the container has
+/// stopped: id 0 there is the daemon's own user, so the driver reads every output (an
+/// action's `0600` file or `0700` directory among them) and removes the scratch itself.
+pub(crate) const DAEMON_OWNER: &str = "0:0";
+
 /// The container to create for one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContainerSpec {
@@ -45,11 +57,19 @@ pub(crate) struct ContainerSpec {
 ///   already be an input, so each is whole there).
 /// - **Memory:** `memory.oom.group=1` on the container, so an OOM kill takes the whole
 ///   action. Limits live on the lease cgroup (see `cgroup`), never `--memory`.
+/// - **Users:** `--userns=nomap`, so no container uid or gid maps to the daemon's user:
+///   container id 0 is the daemon user's first subordinate id, and so on up. Rootless
+///   Podman's default makes the container's root the daemon's own uid on the host,
+///   with only the mount and pid namespaces between an action and what that uid can
+///   reach (fleet-updates-security S4.3). Not `--userns=auto`: rootless, it gives the
+///   first container 65,535 ids of a standard 65,536-id range and refuses a second
+///   container while the first exists ("not enough unused IDs in user namespace").
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "create",
         "--pull=never",
         "--network=none",
+        "--userns=nomap",
         "--hostname=localhost",
         "--cgroup-conf=memory.oom.group=1",
     ]
@@ -216,6 +236,23 @@ impl Podman {
         self.blocking(&["rm", "--force", "--ignore", "--time=0", name], "rm")
     }
 
+    /// Gives `paths`, and everything below them, to `owner` (`uid:gid` in Podman's user
+    /// namespace). A symlink is changed itself, never followed (`-h`; `-R` traverses
+    /// none), so a link an action left cannot hand a host file to anyone.
+    pub(crate) async fn chown(&self, owner: &str, paths: &[&Path]) -> Result<(), String> {
+        let mut args: Vec<OsString> = ["unshare", "chown", "-hR", owner, "--"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(paths.iter().map(|p| p.as_os_str().to_owned()));
+        let output = self.output(&args).await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(failure("unshare chown", &output))
+        }
+    }
+
     /// Removes `dir` inside Podman's user namespace, where files an action created as
     /// another container user can be deleted. Blocking.
     pub(crate) fn unshare_remove_blocking(&self, dir: &Path) -> Result<(), String> {
@@ -274,6 +311,16 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("--network=") && a != "--network=none")
         );
+    }
+
+    /// Catches the "drop `--userns`" mutant (fleet-updates-security S10) at the
+    /// command line: rootless Podman's default maps the container's root to the
+    /// daemon's own uid. `tests/podman.rs` checks the mapping on real Podman.
+    #[test]
+    fn no_container_id_is_the_daemons() {
+        let args = strings(&create_args(&spec()));
+        let userns: Vec<_> = args.iter().filter(|a| a.starts_with("--userns")).collect();
+        assert_eq!(userns, ["--userns=nomap"], "{args:?}");
     }
 
     /// Catches a container that could pull a different image at action time, or run

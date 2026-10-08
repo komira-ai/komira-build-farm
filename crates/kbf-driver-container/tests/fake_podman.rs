@@ -91,9 +91,9 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     assert_eq!(tree.children[0].files[0].name, "n.txt");
     assert_eq!(
         dir.root_directory_digest.as_ref(),
-        Some(&kbf_driver_container::cas::digest_of(
-            &prost::Message::encode_to_vec(&root)
-        ))
+        Some(&kbf_daemon::cas::digest_of(&prost::Message::encode_to_vec(
+            &root
+        )))
     );
 
     fake.assert_clean(1);
@@ -271,7 +271,12 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
         matches!(outcome, Err(RuntimeError::TimedOut)),
         "{outcome:?}"
     );
-    let events = fake.events();
+    // The overlay's owners are `tests/userns.rs`'s to check.
+    let events: Vec<_> = fake
+        .events()
+        .into_iter()
+        .filter(|e| !e.starts_with("chown "))
+        .collect();
     let expected = ["cgroup.kill ended the action", "start ended", "rm"];
     assert_eq!(events, expected, "{events:?}");
     fake.assert_clean(1);
@@ -500,12 +505,12 @@ async fn unremovable_scratch_falls_back_to_podman_unshare() {
     let script = r#"mkdir "$UPPER/locked"; touch "$UPPER/locked/f"; chmod 000 "$UPPER/locked""#;
     let result = fake.run(1, &spec, script).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    assert!(fake.calls().contains(&"unshare".to_owned()));
+    assert!(fake.calls().contains(&"unshare rm".to_owned()));
     fake.assert_clean(1);
 
     // A directory the daemon's user can list but not write: its entries cannot be
     // unlinked, so this falls back too.
-    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare").count();
+    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare rm").count();
     let before = unshares(&fake);
     let readonly = r#"mkdir "$UPPER/ro"; touch "$UPPER/ro/f"; chmod 500 "$UPPER/ro""#;
     let result = fake.run(4, &spec, readonly).await.expect("ran");
@@ -600,7 +605,7 @@ async fn incomplete_actions_are_refused() {
         );
     }
     let missing_root = Action {
-        input_root_digest: Some(kbf_driver_container::cas::digest_of(b"not stored")),
+        input_root_digest: Some(kbf_daemon::cas::digest_of(b"not stored")),
         ..action
     };
     let digest = fake.cas.insert(missing_root.encode_to_vec());
@@ -726,7 +731,7 @@ async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
     let result = fake.run(2, &spec, &script).await.expect("ran");
     assert!(result.output_files.is_empty(), "{result:?}");
     fake.assert_clean(2);
-    let digest = kbf_driver_container::cas::digest_of(secret);
+    let digest = kbf_daemon::cas::digest_of(secret);
     assert_eq!(fake.cas.blob(&digest), None);
 }
 
@@ -861,7 +866,7 @@ async fn a_deep_junk_tree_is_cleaned_without_taking_the_daemon_down() {
     let result = fake.run(1, &spec, &script).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     assert!(!exists(&tree), "the junk tree never reached the lease");
-    assert!(!fake.calls().contains(&"unshare".to_owned()));
+    assert!(!fake.calls().contains(&"unshare rm".to_owned()));
     fake.assert_clean(1);
     let result = fake.run(2, &spec, "exit 0").await.expect("the next lease");
     assert_eq!(result.exit_code, 0);

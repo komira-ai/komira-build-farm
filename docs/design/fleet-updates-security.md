@@ -312,12 +312,14 @@ socket mode 0660. Two controls, the first being the one that matters:
    - Mac: every action and probe runs as a lease user via `run`. On `main` the native
      driver runs actions as the daemon's own user (`crates/kbf-driver-native/src/lib.rs`),
      so `kbf-updater` ships on Macs only with the per-lease user.
-   - Linux: today rootless Podman runs containers with no `--userns`
-     (`crates/kbf-driver-container/src/podman.rs`), so a container's uid 0 is the
-     daemon's uid on the host, and only the mount and pid namespaces hide the socket.
-     The container driver therefore adds `--userns=auto` (subordinate uid ranges) or
-     `--userns=nomap`, so no container uid maps to the daemon's. Both helpers refuse
-     to start on a Linux node whose daemon uses `--driver native`.
+   - Linux: rootless Podman's default maps a container's uid 0 to the daemon's uid on
+     the host, leaving only the mount and pid namespaces to hide the socket. The
+     container driver therefore runs every container with `--userns=nomap`
+     (`crates/kbf-driver-container/src/podman.rs`), so no container uid or gid maps
+     to the daemon's; `--userns=auto` was refused because, rootless, one container
+     takes a whole 65,536-id range and the next cannot start ([daemon.md](daemon.md),
+     User namespaces). Both helpers refuse to start on a Linux node whose daemon uses
+     `--driver native`.
    - VMs: `kbf-vmm` (#85) runs as its own dedicated non-admin uid outside the group,
      started through `kbf-mac-session run` or by its own launchd user, never as
      `_kbf`.
@@ -369,10 +371,11 @@ holds the API and the design says so, costs nothing to build and was rejected.
   have the rack network, so an unauthenticated gate would be theirs to call.
 - **Inventory.** The gate keeps its own inventory per Mac: the serial from Apple
   Business Manager (through NanoDEP), the platform UUID from the Mac's first MDM
-  enrollment, and the pool from the operator's configuration of the gate. Every verb
-  refuses a serial not in it.
+  enrollment, and the pool and CPU architecture (`arm64` or `x86_64`) from the
+  operator's configuration of the gate. Every verb refuses a serial not in it.
 - `enforce <serial> <set>`: applies every check of S3.1 that does not need the node
-  (signature under the key statement, the platform key, pool and platform, `expires`,
+  (signature under the key statement, the platform key, pool and platform: the set's
+  `os` is `macos` and its `arch` is the one the inventory records for the Mac, `expires`,
   and a per-pool serial floor the gate keeps itself from every set it has seen), then
   posts the enforcement for exactly the set's build. Refused while another enforcement
   in the same pool is outstanding, or if the Macs checked in and not being erased or
@@ -390,7 +393,43 @@ holds the API and the design says so, costs nothing to build and was rejected.
   The grant key is held only by the gate's uid on the MDM host; its public key reaches
   Macs in an MDM profile. Rotation is a new profile, and Macs accept either key during
   the overlap. A grant is single-use: `kbf-mac-session` records used lease ids across
-  reboots.
+  reboots. The grant's exact format follows.
+- **The admin grant.** `kbf-mdm-gate` defines it (`crates/kbf-mdm/src/grant.rs`);
+  `kbf-mac-session` accepts exactly this and nothing else.
+  - *Text.* Exactly five lines, each ending in one LF (no CR, no blank line, no
+    trailing whitespace), each field separated from its value by one space:
+
+    ```text
+    kbf-grant-v1
+    serial <serial>
+    lease <lease id>
+    issued <time>
+    not-after <time>
+    ```
+
+    `<serial>` is 1 to 32 ASCII letters and digits, the Mac's hardware serial (on the
+    Mac, `IOPlatformSerialNumber`). `<lease id>` is 1 to 128 characters of
+    `[A-Za-z0-9._-]`. `<time>` is UTC as `YYYY-MM-DDTHH:MM:SSZ` (RFC 3339, whole
+    seconds, a literal `Z`). `not-after` is exactly `issued` plus 3600 seconds.
+  - *Signature.* Ed25519 (RFC 8032, pure: no prehash, no context) over the text's
+    bytes, final LF included, by the gate's grant key. The public key is the raw
+    32-byte Ed25519 key.
+  - *On the wire.* `grant-admin` answers
+    `{"grant", "signature", "key", "token", "erase_at"}`: the text, the 64-byte
+    signature and the public key in standard base64 (with padding), and `token`,
+    which is `<payload>.<signature>`, each part base64url without padding (RFC 4648
+    section 5), the payload being the text's bytes. The server passes `token`
+    unchanged as the `[grant]` of `user-create <lease> [grant]` (S4.2); `erase_at` is
+    for the server's records only.
+  - *What the Mac checks* before it creates an administrator, refusing on any
+    failure: the token has exactly one `.` and both parts decode; the signature
+    verifies strictly (no non-canonical encodings, no small-order keys) under one of
+    the grant keys the MDM installed (two during a rotation); the payload parses as
+    exactly the five lines above, in that order, each once; `serial` is this Mac's;
+    `lease` is the lease `user-create` names; `not-after` is exactly `issued` plus
+    3600 seconds; the Mac's clock is not past `not-after`, and `not-after` is at most
+    65 minutes ahead of it (the hour, plus 5 minutes of clock skew); and the lease id
+    has never been used on this Mac.
 - `withdraw <serial>`: removes an outstanding enforcement.
 - `erase <signed request>`: accepted only with a valid, touched signature by an
   operator's hardware-backed key on the allowed-signers list, for the serial the
@@ -401,7 +440,12 @@ holds the API and the design says so, costs nothing to build and was rejected.
   signature, **one Mac at a time across the fleet**: an `erase-now` is refused while
   any other erase is outstanding (until that Mac re-enrolls and checks in, or 24 h
   pass), beyond a daily cap (default 2), or below the floor; a scheduled lease erase
-  waits for the outstanding one to clear and is never dropped.
+  waits for the outstanding one to clear and is never dropped. The cap counts erases
+  sent in the last 24 hours plus erases scheduled by a grant and not yet sent;
+  `erase-now` and `grant-admin` need that sum below the cap, and a scheduled erase is
+  sent whatever the cap and then counts as sent. The sum never exceeds the cap, so no
+  24 hours see more erases than the cap. A held request 24 hours old is refused by
+  `grant-admin` even before it is discarded.
 - `bring-forward <serial> <lease id>`: runs the erase the gate scheduled for that
   granted lease now; refused if the gate issued no grant for it.
 - `profile <serial> <digest>`: installs a profile only if a verified signed set or

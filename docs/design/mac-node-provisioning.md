@@ -171,7 +171,12 @@ the action toolchain's Python. The script costs us its idempotence, which we mus
 and test ourselves. The check mode and the tests in [section 10](#10-how-each-part-is-tested)
 are how that cost is paid.
 
-### 2.1 Shape of the script (planned)
+### 2.1 Shape of the script
+
+**Today** the script and its tests are in
+[tools/mac-provision](../../tools/mac-provision/README.md), which lists every key it
+applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
+verb (section 5.7) and `--keys` to the three below.
 
 `kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):
@@ -655,8 +660,10 @@ host needs auto-login in two cases, and in neither for the admin account:
     about 1 to 4 minutes.
   - **After a power loss mid-lease,** `kbf-mac-session` resets auto-login at boot,
     before the daemon sends `Hello`.
-  - **The same runtime covers** MDM privacy profiles and a leak scan that erases the
-    node on a leak.
+  - **The same runtime covers** MDM privacy profiles and a leak scan. A leak that
+    persists after a reboot quarantines the node and alerts, and the erase waits for
+    an operator's signature ([fleet-updates.md](fleet-updates.md#102-isolation-layers) L4,
+    [mdm-backend.md](mdm-backend.md#m44-what-now-waits-for-a-touch) M4.4).
 
   All of this is designed in the [fleet-updates design](fleet-updates.md), not here. FileVault off (above) is
   what makes that auto-login possible. The profile's `autologin` key accepts it:
@@ -945,7 +952,10 @@ machines.
     depends on it);
   - the time server;
   - whether the update preferences are honoured on that version (5.2);
-  - the Xcode install from a `.xip`.
+  - the Xcode install from a `.xip`;
+  - whether a freshly erased Mac lists `_mbsetupuser` as an administrator (the hosted
+    VM does, and `kbf-mac-provision` allows no other administrator): if it does,
+    decide explicitly whether to remove it or allow it.
 
 ## 11. Verified and assumed
 
