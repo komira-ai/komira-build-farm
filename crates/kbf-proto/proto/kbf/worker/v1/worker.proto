@@ -14,6 +14,7 @@
 // - ResourceUsage: what an action used, carried inside its ActionResult.
 // - Start.heartbeat_seq and Start.valid_for_ms: how late a Start may still be acted on.
 // - Cancel: the server stops a lease it no longer holds on the daemon.
+// - NodeStatus: what software the node runs, for operators; it routes no work.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -36,6 +37,7 @@ message DaemonMessage {
     Heartbeat heartbeat = 2;
     Offer offer = 3;
     Result result = 4;
+    NodeStatus node_status = 5;
   }
 }
 
@@ -82,6 +84,29 @@ message Hello {
   // SHA-256 of the encoded `capabilities` entries, in order. Heartbeats repeat it so
   // the server notices a changed report without receiving the report again.
   bytes report_hash = 5;
+}
+
+// What software the node runs: status for operators and the fleet API, never matched
+// against an action's platform, so it is kept out of the node report and its hash.
+// The daemon sends it right after each Welcome. The server keeps the newest one per
+// node; a server that predates this message ignores it, and a node that never sends
+// one is listed without software. An empty string, or an empty list, means not known
+// on this node.
+message NodeStatus {
+  // The operating system's name: `macOS` (`sw_vers -productName`), or the
+  // `os-release` NAME on Linux (`Ubuntu`).
+  string os_name = 1;
+  // Its version: `sw_vers -productVersion` (`15.1`), or the `os-release` VERSION_ID.
+  string os_version = 2;
+  // Its build: `sw_vers -buildVersion` (`24B83`), or the `os-release` BUILD_ID where
+  // the distribution sets one.
+  string os_build = 3;
+  // The running kernel's release (`uname -r`). Linux only.
+  string kernel = 4;
+  // The kbf-daemon version.
+  string daemon_version = 5;
+  // Every installed Xcode build (Mac): the node report's `xcode` entries, sorted.
+  repeated string xcode_builds = 6;
 }
 
 // The server's answer to Hello.

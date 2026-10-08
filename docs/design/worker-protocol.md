@@ -32,7 +32,7 @@ service Worker {
 | `Heartbeat` | `HeartbeatAck` |
 | `Offer` (not read yet) | `LeaseOffer` |
 | `Result` | `Start` |
-| | `ResultAck` |
+| `NodeStatus` | `ResultAck` |
 | | `Cancel` |
 
 ## A session
@@ -42,6 +42,7 @@ daemon                                  server
   | Hello (version, node_id, report) -->|  checks; registers the node (new session)
   |<----------------- Welcome (interval)|
   | Result (each unacknowledged one) -->|  resent before the first Heartbeat
+  | NodeStatus (OS, kernel, Xcodes) --->|  kept as the node's newest
   | Heartbeat (seq, hash, running) ---->|
   |<------------------ HeartbeatAck(seq)|
   |<------------------------ LeaseOffer |  placed, not committed: run nothing
@@ -120,10 +121,12 @@ node mac-07              # a node id, whatever certificate it presents
 `openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum` its
 public key hash, which outlives a reissue with the same key. The server reads the file
 at start (a bad file stops it), and **again at every check**: each first `Hello`
-(reconnects included), each resent `Hello`, each `Heartbeat` and each `Result`. An
-entry added while a denied daemon is connected ends its stream `PERMISSION_DENIED` at
-the next of those it sends (a `Result` is refused, so it never reaches the action
-cache, and the stream ends without a `ResultAck`), and every reconnect is refused; no
+(reconnects included), each resent `Hello`, each `Heartbeat`, each `Result` and each
+`NodeStatus`. An entry added while a denied daemon is connected ends its stream
+`PERMISSION_DENIED` at the next of those it sends (a `Result` is refused, so it never
+reaches the action cache, and the stream ends without a `ResultAck`; a `NodeStatus`
+is refused, so the operator API keeps the node's last status from before the entry),
+and every reconnect is refused; no
 restart is needed. The server reads nothing more from a stream it has ended. Replace
 the file atomically (write a new file, then rename it over the old one).
 
@@ -263,6 +266,25 @@ microseconds; zero means not measured). It travels inside the `ActionResult`, in
 `execution_metadata.auxiliary_metadata`, as an `Any` with type URL
 `type.googleapis.com/kbf.worker.v1.ResourceUsage`, so it reaches the server and the
 action cache with the result.
+
+### `NodeStatus`
+
+What software the node runs, for operators: the OS name, version and build, the
+kernel release (Linux), the `kbf-daemon` version, and the installed Xcode builds
+(Mac). It routes no work, so it is not part of the node report and does not change
+`report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
+`sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
+are the node report's `xcode` entries, from the driver that discovers them. A field
+it cannot read is empty.
+
+The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
+the first `Heartbeat`. The server keeps the newest one per node, from the node's
+current stream only (one from a replaced stream is ignored, and one the deny list now
+refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
+in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
+the message ignores it as an empty message; a daemon that predates it is listed
+without software. Sending it again when the software changes mid-session is
+**planned** (fleet-updates.md section 3.1, re-detection).
 
 ### `Offer`
 

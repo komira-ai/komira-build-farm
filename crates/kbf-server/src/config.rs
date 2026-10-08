@@ -51,6 +51,10 @@ pub struct Args {
     /// The `kbf.worker.v1` listener.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
+    /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. It has no
+    /// authentication yet: bind it where only operators reach it.
+    #[arg(long)]
+    pub api_listen: Option<SocketAddr>,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]

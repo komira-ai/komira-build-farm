@@ -2,7 +2,8 @@
 //! docs for what it wires together.
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
-//! the addresses it bound (a port of 0 picks a free one). On Unix the SIGINT handler
+//! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
+//! when the operator API listens. On Unix the SIGINT handler
 //! is installed before that line is printed, so a SIGINT any time after it stops the
 //! server with exit 0. If the handler cannot be installed it exits 2 without printing
 //! the start line.
@@ -10,6 +11,7 @@
 use std::error::Error;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -17,7 +19,7 @@ use clap::Parser;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
-use kbf_server::{Args, StoreKind, bind_server};
+use kbf_server::{Args, StoreKind, bind_server_with_api};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -56,15 +58,17 @@ async fn run<O: ObjectStore + 'static>(
         prefix,
     ));
     let shutdown = interrupted()?;
-    let bound = bind_server(cache, listeners, shutdown)?;
-    println!(
-        "kbf-server {} reapi={} worker={}",
-        env!("CARGO_PKG_VERSION"),
-        bound.reapi,
-        bound.worker
-    );
+    let bound = bind_server_with_api(cache, listeners, args.api_listen, shutdown)?;
+    println!("{}", start_line(bound.reapi, bound.worker, bound.api));
     bound.serving.await?;
     Ok(())
+}
+
+/// The start line: the version and the addresses bound.
+fn start_line(reapi: SocketAddr, worker: SocketAddr, api: Option<SocketAddr>) -> String {
+    let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
+    let version = env!("CARGO_PKG_VERSION");
+    format!("kbf-server {version} reapi={reapi} worker={worker}{api}")
 }
 
 /// Installs the SIGINT handler now and returns a future that completes on SIGINT.

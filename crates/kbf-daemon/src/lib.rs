@@ -12,6 +12,7 @@
 //!
 //! - [`config`]: command-line flags and TLS files.
 //! - [`report`]: the node report and its hash.
+//! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`cas`]: the [`Cas`] trait and the front's client.
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
@@ -35,6 +36,7 @@ mod lease;
 mod local;
 pub mod report;
 pub mod runtime;
+pub mod status;
 pub mod tree;
 #[cfg(target_os = "linux")]
 pub mod usage;

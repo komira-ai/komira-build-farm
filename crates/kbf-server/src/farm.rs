@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Dispatch, Finished, MetaLog, Stage, Submission, Ticket};
@@ -21,7 +21,7 @@ use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
-    self, Cancel, LeaseOffer, ResultAck, ServerMessage, Start, server_message,
+    self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Event, Input, OpState, Scheduler};
@@ -31,6 +31,8 @@ use kbf_types::{
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
+
+use crate::fleet::{NodeView, NodesView, SoftwareView};
 
 /// The scheduler term of a single node. Raft supplies terms once it is wired.
 pub const SINGLE_NODE_TERM: u64 = 1;
@@ -97,6 +99,8 @@ struct State {
     links: BTreeMap<WorkerId, Link>,
     /// Leases whose `Start` was sent, and their operations.
     started: BTreeMap<LeaseId, OperationId>,
+    /// Each node's newest `NodeStatus`, kept across its streams.
+    software: BTreeMap<WorkerId, SoftwareView>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -123,6 +127,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 names: BTreeMap::new(),
                 links: BTreeMap::new(),
                 started: BTreeMap::new(),
+                software: BTreeMap::new(),
             }),
         }
     }
@@ -220,6 +225,36 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             }));
         }
         true
+    }
+
+    /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was
+    /// replaced (a newer stream sends its own after its `Welcome`).
+    pub fn node_status(&self, worker: &WorkerId, stream: StreamId, status: NodeStatus) {
+        let received = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let received = u64::try_from(received).unwrap_or(u64::MAX);
+        let mut state = self.lock();
+        if state.is_current(worker, stream) {
+            let view = SoftwareView::new(status, received);
+            state.software.insert(worker.clone(), view);
+        }
+    }
+
+    /// Every node registered since this farm started, in node-id order.
+    pub fn nodes(&self) -> NodesView {
+        let state = self.lock();
+        let nodes = state
+            .links
+            .iter()
+            .map(|(worker, link)| NodeView {
+                node_id: worker.as_str().to_owned(),
+                connected: !link.outbound.is_closed(),
+                software: state.software.get(worker).cloned(),
+            })
+            .collect();
+        NodesView { nodes }
     }
 
     /// Expires leases of silent workers and places queued work.

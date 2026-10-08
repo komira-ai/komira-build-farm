@@ -18,6 +18,9 @@
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and answered with a `ResultAck`;
+//! - a `NodeStatus` the deny list now refuses ends the stream, so it never reaches
+//!   the operator API. Otherwise it is kept as the node's newest software status,
+//!   unless a newer stream of the node has registered since;
 //! - after the server ends a stream, nothing more is read from it;
 //! - an `Offer` is not read yet.
 
@@ -221,6 +224,14 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
                 farm.report(worker, result)
                     .await
                     .map(server_message::Message::ResultAck)
+            }
+            Some(daemon_message::Message::NodeStatus(status)) => {
+                // A revoked daemon's status must not reach the operator API either.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                farm.node_status(worker, stream, status);
+                None
             }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {

@@ -52,7 +52,10 @@ role (`--role=all`). The flags are:
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
-  heartbeat at.
+  heartbeat at;
+- `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
+  ([docs/api.md](docs/api.md)). It has no authentication yet, so bind it where only
+  operators reach it.
 
 **`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
 outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and
@@ -224,7 +227,7 @@ and a daemon protocol in which only the newest stream of a worker counts. See
   else). The server's worker listener serves mutual TLS when given a certificate, key
   and client CA. A daemon's certificate must name its node id as its one DNS
   subjectAltName, so a certificate can speak only for its own node, and a deny list
-  (serials, public keys, node ids), read again at every `Hello`, `Heartbeat` and `Result`, refuses
+  (serials, public keys, node ids), read again at every `Hello`, `Heartbeat`, `Result` and `NodeStatus`, refuses
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).

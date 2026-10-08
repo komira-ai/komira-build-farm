@@ -15,6 +15,9 @@ publish = false
 # ahead keeps version choices in one place. A dependency enters Cargo.lock only when
 # a member first uses it.
 [workspace.dependencies]
+# The operator API's HTTP server (kbf-server). Already in the tree through tonic; no
+# default features: no form, query or json extractors, whose parsers are not needed.
+axum = { version = "0.8.9", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }

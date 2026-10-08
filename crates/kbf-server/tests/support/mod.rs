@@ -26,8 +26,8 @@ use kbf_proto::reapi::{
     Platform, batch_update_blobs_request, platform,
 };
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, ResultAck, ServerMessage,
-    Start, daemon_message, server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, ResultAck,
+    ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::{Listeners, bind_server};
 use prost::Message;
@@ -330,8 +330,24 @@ pub struct FakeDaemon {
 }
 
 impl FakeDaemon {
-    /// Opens a stream, sends `hello` and waits for Welcome.
+    /// Opens a stream, sends `hello`, waits for Welcome and sends a `NodeStatus`, as a
+    /// daemon does.
     pub async fn connect(addr: SocketAddr, hello: Hello) -> Result<Self, tonic::Status> {
+        let d = Self::connect_without_status(addr, hello).await?;
+        d.send(daemon_message::Message::NodeStatus(NodeStatus {
+            os_name: "Ubuntu".to_owned(),
+            daemon_version: "test".to_owned(),
+            ..NodeStatus::default()
+        }));
+        Ok(d)
+    }
+
+    /// Opens a stream, sends `hello` and waits for Welcome: a daemon that predates
+    /// `NodeStatus`.
+    pub async fn connect_without_status(
+        addr: SocketAddr,
+        hello: Hello,
+    ) -> Result<Self, tonic::Status> {
         let mut d = Self::open(addr, daemon_message::Message::Hello(hello)).await?;
         match d.next().await {
             Some(server_message::Message::Welcome(w)) => {

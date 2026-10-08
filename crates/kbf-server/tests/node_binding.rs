@@ -14,14 +14,16 @@ use clap::Parser;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_front::Cache;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, ServerMessage, Start, daemon_message,
+    Capability, DaemonMessage, Heartbeat, Hello, NodeStatus, ServerMessage, Start, daemon_message,
     server_message, worker_client::WorkerClient,
 };
-use kbf_server::{Args, ConfigError, DenyListError, bind_server};
+use kbf_server::{Args, ConfigError, DenyListError, bind_server, bind_server_with_api};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SerialNumber,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Status, Streaming};
@@ -492,4 +494,78 @@ async fn nothing_sent_after_a_refusal_is_acted_on() {
     // ample time to handle what the old stream sent.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+}
+
+/// `GET /v1/nodes` on the operator API at `api`, as JSON.
+async fn nodes(api: SocketAddr) -> serde_json::Value {
+    let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let request = "GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    serde_json::from_str(body).expect("JSON")
+}
+
+fn macos(version: &str) -> daemon_message::Message {
+    daemon_message::Message::NodeStatus(NodeStatus {
+        os_name: "macOS".to_owned(),
+        os_version: version.to_owned(),
+        daemon_version: "0.1.0".to_owned(),
+        ..NodeStatus::default()
+    })
+}
+
+/// Catches: a `NodeStatus` not checked against the deny list, so a node revoked while
+/// its stream is open goes on writing the software the operator API reports for it.
+/// Also a status recorded before the check. The control: the same stream's status
+/// before the revocation is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_daemon_cannot_report_its_status() {
+    let pki = Pki::new("deny-status");
+    let list = pki.write("deny.list", "");
+    let listeners = pki
+        .args(&["--worker-deny-list", &list])
+        .listeners()
+        .expect("listeners");
+    let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+    let bound = bind_server_with_api(
+        Arc::new(Cache::memory()),
+        listeners,
+        Some(loopback),
+        pending(),
+    )
+    .expect("bind");
+    let (worker, api) = (bound.worker, bound.api.expect("an API address"));
+    tokio::spawn(async move { bound.serving.await.expect("serve") });
+    let mut open = Session::open(worker, &pki, pki.client(&["mac-07"], 9), "mac-07")
+        .await
+        .expect("welcomed");
+
+    open.send(macos("15.1"));
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    while nodes(api).await["nodes"][0]["software"]["os_version"] != "15.1" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the status never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    pki.write("deny.list", "node mac-07\n");
+    open.send(macos("15.2"));
+    let ended = open
+        .next()
+        .await
+        .expect_err("the NodeStatus ended the stream");
+    assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
+    assert!(
+        ended.message().contains("node mac-07"),
+        "{}",
+        ended.message()
+    );
+    let got = nodes(api).await;
+    assert_eq!(got["nodes"][0]["node_id"], "mac-07", "{got}");
+    assert_eq!(got["nodes"][0]["software"]["os_version"], "15.1", "{got}");
 }
