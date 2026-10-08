@@ -174,8 +174,10 @@ What the code does today:
 - Each worker's capacity is read from its node report at registration: `cpus` x 1000
   millicores, `mem_gib` GiB and `gpu` GPUs. The whole machine is offered. So are its
   capabilities (`kbf_caps::NodeCaps`, see [capabilities.md](capabilities.md)).
-- Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`), its `gpu`
-  count, and what its platform asks of a worker (`Request::needs`).
+- Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`), or the
+  whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
+  [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)),
+  its `gpu` count, and what its platform asks of a worker (`Request::needs`).
 - A placement round walks the queue in order and gives each operation to the first
   live worker, in name order, whose capabilities satisfy its platform and whose free
   room (capacity minus bookings) fits the whole request on every axis. A worker is live

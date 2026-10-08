@@ -2,6 +2,7 @@
 //! when the lease ends. See the crate documentation for what a lease gets.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -55,6 +56,8 @@ struct Prepared {
     working_directory: String,
     program: PathBuf,
     args: Vec<String>,
+    /// The lease's own directories' variables ([`crate::home`]), set before `env`.
+    lease_env: Vec<(&'static str, OsString)>,
     env: Vec<(String, String)>,
     outputs: Vec<String>,
     timeout: Duration,
@@ -143,6 +146,7 @@ impl<C: Cas> NativeRuntime<C> {
             let parent = output.rsplit_once('/').map_or("", |(parent, _)| parent);
             real_dirs(&work_dir, parent).await.map_err(tree_error)?;
         }
+        let lease_env = crate::home::make(dir).await.map_err(failed(dir))?;
         let env: Vec<(String, String)> = command
             .environment_variables
             .iter()
@@ -156,6 +160,7 @@ impl<C: Cas> NativeRuntime<C> {
             working_directory: command.working_directory.clone(),
             program,
             args: args.to_vec(),
+            lease_env,
             env,
             outputs,
             timeout,
@@ -187,6 +192,7 @@ impl<C: Cas> NativeRuntime<C> {
             .args(&args)
             .current_dir(&prepared.work_dir)
             .env_clear()
+            .envs(prepared.lease_env.iter().map(|(k, v)| (k, v)))
             .envs(prepared.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(stdout)

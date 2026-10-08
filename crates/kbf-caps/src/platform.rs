@@ -50,7 +50,7 @@ const LABEL_PREFIX: &str = "label.";
 ///
 /// Names are matched without regard to ASCII case against the names kbf reads:
 /// [`REAPI_KEYS`], and kbf's own keys (the capability keys [`Request::parse`] reads,
-/// `gpu` among them, and the reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`). A name
+/// `gpu` among them, and the reserved keys, [`crate::RESERVED_KEYS`]). A name
 /// kbf reads comes back in its canonical spelling: `osfamily` is `OSFamily`, `OS` is
 /// `os`, `GPU` is `gpu`, and `Label.Pool` is `label.Pool` (a label's own name keeps its
 /// case: labels are compared exactly). kbf's own spelling of one of its keys is that

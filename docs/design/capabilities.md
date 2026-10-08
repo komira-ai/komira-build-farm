@@ -104,11 +104,13 @@ Each key has one typed comparison:
 | `isa_level` | at least, within the family: `x86-64-v3` is served by v3 and v4 |
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib` | the node has at least this amount |
-| `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `xcode` (**planned**: membership, macOS VMs design), `label.<k>` | exact |
+| `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `label.<k>` | exact |
+| `xcode` | membership: the node reports one `xcode` entry per installed Xcode build, and the request names one of them |
 | `os_build` | exact; **planned**: today the front drops it as an unknown name, so it matches every node (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)) |
 
 Every other key may appear once. An unknown key, a value that does not parse, or a
-repeated key is refused, so a typo fails loudly instead of matching nothing forever.
+repeated key is refused, so a typo fails loudly instead of matching nothing forever. A
+Mac with two Xcodes installed serves an action that names either build.
 
 **Reserved keys** ask for a kind of capacity, not a hardware fact, and are skipped by
 the matcher:
@@ -118,6 +120,10 @@ the matcher:
 | `kbf-lease` | the lease kind: `action` (the default, a share of a machine) or `whole_machine` |
 | `kbf-cpu` | **planned**: `dedicated` for whole physical cores, for quiet performance runs |
 | `kbf-mac-admin` | **planned**: a privileged whole-machine lease on macOS |
+| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 1 GiB (see [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)) |
+
+`kbf-book-cpus` and `kbf-book-mem-gib` are not `cpus` and `mem_gib`: those ask for a node
+whose whole machine has at least that much, and book nothing.
 
 **Every platform property is part of the action digest**, which is REAPI's rule. Two
 consequences shape the design:
