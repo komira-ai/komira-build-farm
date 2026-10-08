@@ -247,12 +247,14 @@ socket mode 0660. Two controls, the first being the one that matters:
    - Mac: every action and probe runs as a lease user via `run`. On `main` the native
      driver runs actions as the daemon's own user (`crates/kbf-driver-native/src/lib.rs`),
      so `kbf-updater` ships on Macs only with the per-lease user.
-   - Linux: today rootless Podman runs containers with no `--userns`
-     (`crates/kbf-driver-container/src/podman.rs`), so a container's uid 0 is the
-     daemon's uid on the host, and only the mount and pid namespaces hide the socket.
-     The container driver therefore adds `--userns=auto` (subordinate uid ranges) or
-     `--userns=nomap`, so no container uid maps to the daemon's. Both helpers refuse
-     to start on a Linux node whose daemon uses `--driver native`.
+   - Linux: rootless Podman's default maps a container's uid 0 to the daemon's uid on
+     the host, leaving only the mount and pid namespaces to hide the socket. The
+     container driver therefore runs every container with `--userns=nomap`
+     (`crates/kbf-driver-container/src/podman.rs`), so no container uid or gid maps
+     to the daemon's; `--userns=auto` was refused because, rootless, one container
+     takes a whole 65,536-id range and the next cannot start ([daemon.md](daemon.md),
+     User namespaces). Both helpers refuse to start on a Linux node whose daemon uses
+     `--driver native`.
    - VMs: `kbf-vmm` (#85) runs as its own dedicated non-admin uid outside the group,
      started through `kbf-mac-session run` or by its own launchd user, never as
      `_kbf`.

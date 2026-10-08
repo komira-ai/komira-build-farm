@@ -271,7 +271,12 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
         matches!(outcome, Err(RuntimeError::TimedOut)),
         "{outcome:?}"
     );
-    let events = fake.events();
+    // The overlay's owners are `tests/userns.rs`'s to check.
+    let events: Vec<_> = fake
+        .events()
+        .into_iter()
+        .filter(|e| !e.starts_with("chown "))
+        .collect();
     let expected = ["cgroup.kill ended the action", "start ended", "rm"];
     assert_eq!(events, expected, "{events:?}");
     fake.assert_clean(1);
@@ -500,12 +505,12 @@ async fn unremovable_scratch_falls_back_to_podman_unshare() {
     let script = r#"mkdir "$UPPER/locked"; touch "$UPPER/locked/f"; chmod 000 "$UPPER/locked""#;
     let result = fake.run(1, &spec, script).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    assert!(fake.calls().contains(&"unshare".to_owned()));
+    assert!(fake.calls().contains(&"unshare rm".to_owned()));
     fake.assert_clean(1);
 
     // A directory the daemon's user can list but not write: its entries cannot be
     // unlinked, so this falls back too.
-    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare").count();
+    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare rm").count();
     let before = unshares(&fake);
     let readonly = r#"mkdir "$UPPER/ro"; touch "$UPPER/ro/f"; chmod 500 "$UPPER/ro""#;
     let result = fake.run(4, &spec, readonly).await.expect("ran");
@@ -861,7 +866,7 @@ async fn a_deep_junk_tree_is_cleaned_without_taking_the_daemon_down() {
     let result = fake.run(1, &spec, &script).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     assert!(!exists(&tree), "the junk tree never reached the lease");
-    assert!(!fake.calls().contains(&"unshare".to_owned()));
+    assert!(!fake.calls().contains(&"unshare rm".to_owned()));
     fake.assert_clean(1);
     let result = fake.run(2, &spec, "exit 0").await.expect("the next lease");
     assert_eq!(result.exit_code, 0);

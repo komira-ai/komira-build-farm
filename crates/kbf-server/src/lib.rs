@@ -12,6 +12,10 @@
 //!   need the token of `--api-token-file` ([`token`]).
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
+//! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
+//!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
+//!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
+//!   the rollout driver.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
 //!   `Start` only after the grant commits; a result is accepted only from the node
 //!   holding the operation's current lease, and only an accepted result is written to
@@ -27,6 +31,7 @@ pub mod config;
 pub mod farm;
 pub mod fleet;
 pub mod identity;
+pub mod mdm;
 pub mod rollout;
 pub mod serve;
 pub mod token;
