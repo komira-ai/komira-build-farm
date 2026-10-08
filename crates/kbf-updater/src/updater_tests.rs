@@ -380,7 +380,8 @@ fn apply_reboots_when_the_install_asks() {
 
 /// Catches: an artifact whose bytes do not match its digest staged, a symbolic link in
 /// the daemon's artifacts directory followed (root would copy any file it points at),
-/// a directory or missing file taken, or a failed stage left looking staged.
+/// a directory or missing file taken, a FIFO opened without `O_NONBLOCK` (the stage
+/// hangs), or a failed stage left looking staged.
 #[test]
 fn staging_takes_only_regular_files_that_match_their_digest() {
     let (mut u, dir) = updater("digests");
@@ -413,6 +414,21 @@ fn staging_takes_only_regular_files_that_match_their_digest() {
         u.stage(&set, None, NOW),
         Err(Refusal::Artifact(_))
     ));
+    // A FIFO with no writer: opened without O_NONBLOCK it would block the
+    // single-threaded updater, and every later request, forever.
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &artifacts.join(sha("u")),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        u.stage(&set, None, NOW),
+        Err(Refusal::Artifact("kbf-updater: not a regular file".into()))
+    );
+    fs::remove_file(artifacts.join(sha("u"))).unwrap();
     fs::write(artifacts.join(sha("u")), "u").unwrap();
     assert_eq!(u.stage(&set, None, NOW), Ok(Outcome::Staged));
 }
