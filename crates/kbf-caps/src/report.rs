@@ -6,7 +6,8 @@
 //! | `arch` (required, once) | the CPU's architecture |
 //! | `cpu.features` (repeated) | the CPU's features; the ISA level follows from them |
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` (once each) | countable capacity |
-//! | `os`, `os_image`, `cpu.model`, `page_size`, `xcode`, `label.<k>` (once each) | exact values |
+//! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` (once each) | exact values |
+//! | `xcode` (repeated: one per installed build) | a set, matched by membership |
 //!
 //! Every other entry (`isa_level`, `drivers`, ...) is not matched on and is skipped.
 //! The reported `isa_level` list is not read: the level is computed from the features,
@@ -15,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cpu::{Arch, CpuCaps, UnknownArch};
-use crate::matching::{Consumable, NodeCaps, is_exact_key};
+use crate::matching::{Consumable, NodeCaps, is_exact_key, is_member_key};
 
 /// Why a node report does not describe a node.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -52,6 +53,7 @@ impl NodeCaps {
         let mut arch = None;
         let mut features = BTreeSet::new();
         let mut exact = BTreeMap::new();
+        let mut members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut consumables = BTreeMap::new();
         let repeated = |key: &str| ReportError::Repeated(key.to_owned());
         for (key, value) in entries {
@@ -61,6 +63,11 @@ impl NodeCaps {
                 }
             } else if key == "cpu.features" {
                 features.insert(value.to_owned());
+            } else if is_member_key(key) {
+                members
+                    .entry(key.to_owned())
+                    .or_default()
+                    .insert(value.to_owned());
             } else if let Some(what) = Consumable::from_name(key) {
                 let amount = value.parse().map_err(|_| ReportError::NotANumber {
                     key: key.to_owned(),
@@ -78,6 +85,7 @@ impl NodeCaps {
         Ok(Self {
             cpu: CpuCaps::new(arch, features),
             exact,
+            members,
             consumables,
         })
     }

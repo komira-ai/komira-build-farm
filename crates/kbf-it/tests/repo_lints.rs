@@ -12,6 +12,9 @@
 //! - a text file carrying a non-documentation IPv4 address or an absolute home path,
 //!   and a file holding a NUL byte whose extension is not on the binary allow list
 //!   (rules in `kbf_it::hygiene`);
+//! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
+//!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
+//!   running it where its failure does not fail the job;
 //! - the scans passing vacuously because git listed nothing or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
@@ -198,10 +201,192 @@ fn text_files_carry_no_addresses_or_home_paths() {
     );
 }
 
+/// The workflow paths `docs/artifacts.md` gives as `--signer-workflow`, relative to the
+/// repository root.
+fn documented_signer_workflows(doc: &str) -> Vec<&str> {
+    const FLAG: &str = "--signer-workflow komira-ai/komira-build-farm/";
+    doc.match_indices(FLAG)
+        .map(|(at, _)| {
+            doc[at + FLAG.len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// What a workflow must hold to be the signer a node's verification names: an attest
+/// step, under a job whose `if:` limits it to a push to `main`.
+fn signs_provenance_on_main(workflow: &str) -> bool {
+    workflow.contains("uses: actions/attest-build-provenance@")
+        && workflow
+            .contains("if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
+}
+
+#[test]
+fn the_documented_signer_workflow_signs_provenance_on_main() {
+    // Catches: the artifacts workflow renamed, moved or stripped of its attest step
+    // while docs/artifacts.md still names it, so every node's verification command
+    // names a workflow that signs nothing (and every deployment fails to verify).
+    let root = repo_root();
+    let doc = std::fs::read_to_string(root.join("docs/artifacts.md")).expect("docs/artifacts.md");
+    let signers = documented_signer_workflows(&doc);
+    assert!(
+        !signers.is_empty(),
+        "docs/artifacts.md names no --signer-workflow"
+    );
+    for path in signers {
+        assert!(is_workflow(path), "`{path}` is not a workflow file");
+        let text = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|e| panic!("the documented signer workflow `{path}`: {e}"));
+        assert!(
+            signs_provenance_on_main(&text),
+            "`{path}` has no main-only attest step"
+        );
+    }
+}
+
+/// The workflow that builds the release files, and its macOS job.
+const ARTIFACTS_WORKFLOW: &str = ".github/workflows/artifacts.yml";
+const DARWIN_JOB: &str = "darwin-arm64";
+
+/// The command that checks the packaged macOS binary's signature and runs it.
+const CHECK_DARWIN_ASSET: &str = "bash tools/ci/check-darwin-asset.sh";
+
+/// Whether `job` in `workflow` runs [`CHECK_DARWIN_ASSET`] in a step after the one named
+/// `Package`, with no `if:` or `continue-on-error:` on that step; an error says what is
+/// missing.
+fn checks_the_packaged_darwin_binary(workflow: &str, job: &str) -> Result<(), String> {
+    let steps = workflows::job_steps(workflow, job)?;
+    let package = steps
+        .iter()
+        .position(|s| s.name.as_deref() == Some("Package"))
+        .ok_or_else(|| format!("the job `{job}` has no step named `Package`"))?;
+    let runs_check = |run: &str| {
+        run.lines()
+            .map(str::trim_start)
+            .any(|line| line.starts_with(&format!("{CHECK_DARWIN_ASSET} ")))
+    };
+    let check = steps[package + 1..]
+        .iter()
+        .find(|s| s.run.as_deref().is_some_and(runs_check))
+        .ok_or_else(|| {
+            format!("the job `{job}` does not run `{CHECK_DARWIN_ASSET}` after `Package`")
+        })?;
+    if check.conditional {
+        return Err(format!(
+            "the job `{job}` runs `{CHECK_DARWIN_ASSET}` under `if:` or `continue-on-error:`"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_darwin_job_checks_the_binary_it_packaged() {
+    // Catches: the step that checks the packaged binary's signature and runs it (the
+    // only check of the bytes that ship, docs/artifacts.md) dropped from the darwin
+    // job, moved before Package, or made one whose failure does not fail the job.
+    let root = repo_root();
+    let text = std::fs::read_to_string(root.join(ARTIFACTS_WORKFLOW)).expect(ARTIFACTS_WORKFLOW);
+    if let Err(e) = checks_the_packaged_darwin_binary(&text, DARWIN_JOB) {
+        panic!("{ARTIFACTS_WORKFLOW}: {e}");
+    }
+}
+
 /// The rules that pick which files each lint reads. The repository tests above cannot
 /// pin them: a selection that misses a file leaves those tests green.
 mod selection {
     use super::*;
+
+    #[test]
+    fn signer_workflows_are_read_from_the_verify_command() {
+        // Catches: a signer path read with the line's trailing `\` or the next flag, so
+        // the repository test opens the wrong file; another repository's workflow
+        // taken as ours; a flag at the very end of the text read as a path.
+        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/komira-build-farm/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/komira-build-farm/.github/workflows/b.yml";
+        assert_eq!(
+            documented_signer_workflows(doc),
+            vec![".github/workflows/a.yml", ".github/workflows/b.yml"]
+        );
+        assert!(
+            documented_signer_workflows("--signer-workflow other/repo/.github/workflows/a.yml")
+                .is_empty()
+        );
+        assert_eq!(
+            documented_signer_workflows("--signer-workflow komira-ai/komira-build-farm/"),
+            vec![""]
+        );
+    }
+
+    #[test]
+    fn a_signer_workflow_needs_both_the_attest_step_and_the_main_only_job() {
+        // Catches: a workflow accepted as the signer with its attest step gone, or with
+        // the attest job no longer limited to a push to main.
+        let step = "      - uses: actions/attest-build-provenance@0123 # v4\n";
+        let cond =
+            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
+        assert!(signs_provenance_on_main(&format!("{cond}{step}")));
+        assert!(!signs_provenance_on_main(step));
+        assert!(!signs_provenance_on_main(cond));
+    }
+
+    /// A darwin job: Package, then `check` as the next step's lines.
+    fn darwin_workflow(check: &str) -> String {
+        format!(
+            "on: push\npermissions: {{}}\njobs:\n  darwin-arm64:\n    runs-on: macos-15\n    steps:\n      - name: Package\n        run: bash tools/ci/package-asset.sh a b c darwin-arm64 dist\n{check}"
+        )
+    }
+
+    #[test]
+    fn the_darwin_asset_check_must_follow_package_and_gate_the_job() {
+        // Catches: a darwin job without the check accepted (the lint passing a workflow
+        // that misses it), the check found only before Package, in another job, in a
+        // comment, or under `if:` / `continue-on-error:`.
+        let check = "      - name: Check\n        run: |\n          bash tools/ci/check-darwin-asset.sh \\\n            dist/x.tar.gz kbf-daemon\n";
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&darwin_workflow(check), "darwin-arm64"),
+            Ok(())
+        );
+        let missing = "the job `darwin-arm64` does not run `bash tools/ci/check-darwin-asset.sh` after `Package`";
+        let comment =
+            "      - run: |\n          # bash tools/ci/check-darwin-asset.sh x y\n          true\n";
+        for planted in [
+            "",
+            comment,
+            "      - run: echo tools/ci/check-darwin-asset.sh\n",
+        ] {
+            assert_eq!(
+                checks_the_packaged_darwin_binary(&darwin_workflow(planted), "darwin-arm64"),
+                Err(missing.to_owned()),
+                "{planted:?}"
+            );
+        }
+        let before = darwin_workflow("").replace(
+            "      - name: Package\n",
+            &format!("{check}      - name: Package\n"),
+        );
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&before, "darwin-arm64"),
+            Err(missing.to_owned())
+        );
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&darwin_workflow(check), "linux-arm64"),
+            Err("the workflow has no job `linux-arm64`".to_owned())
+        );
+        for key in ["        if: false\n", "        continue-on-error: true\n"] {
+            let gated = check.replace("        run: |\n", &format!("{key}        run: |\n"));
+            assert!(
+                checks_the_packaged_darwin_binary(&darwin_workflow(&gated), "darwin-arm64")
+                    .is_err_and(|e| e.contains("under `if:` or `continue-on-error:`")),
+                "{key:?}"
+            );
+        }
+        let unnamed = darwin_workflow(check).replace("name: Package", "name: Pack");
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&unnamed, "darwin-arm64"),
+            Err("the job `darwin-arm64` has no step named `Package`".to_owned())
+        );
+    }
 
     #[test]
     fn action_files_are_selected_by_name_in_any_case() {

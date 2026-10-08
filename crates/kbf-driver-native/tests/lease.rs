@@ -47,15 +47,60 @@ async fn an_action_runs_and_its_results_come_back() {
 }
 
 /// Catches: the daemon's environment leaking into an action (its PATH, HOME, anything
-/// set on the node), or the Command's variables not set.
+/// set on the node), the Command's variables not set, or the lease's own variables
+/// missing or pointing outside the lease directory.
 #[tokio::test]
-async fn the_environment_is_the_commands_and_nothing_else() {
+async fn the_environment_is_the_commands_and_the_leases_own() {
     let dir = scratch("env");
+    let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config(&dir), &cas);
+    let rt = runtime(config.clone(), &cas);
     let spec = Spec::argv(&["/usr/bin/env"]).env("ONLY", "this");
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
-    assert_eq!(stdout(&cas, &result), "ONLY=this\n");
+    let lease = config.scratch.join("lease-1-1");
+    let mut want: Vec<String> = [
+        ("CLANG_MODULE_CACHE_PATH", "cache/clang/ModuleCache"),
+        ("HOME", "home"),
+        ("TMPDIR", "tmp"),
+        ("XDG_CACHE_HOME", "cache"),
+    ]
+    .iter()
+    .map(|(name, sub)| format!("{name}={}", lease.join(sub).display()))
+    .collect();
+    want.push("ONLY=this".to_owned());
+    let mut got: Vec<String> = stdout(&cas, &result).lines().map(str::to_owned).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+}
+
+/// Catches: a lease's home, temporary or cache directory missing (a tool writing there
+/// fails), shared between leases (what one action leaves is read by the next), or a
+/// Command's own `HOME` or `TMPDIR` overridden by the lease's.
+#[tokio::test]
+async fn each_lease_has_its_own_home_tmp_and_cache() {
+    let dir = scratch("home");
+    let config = config(&dir);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let script = "for d in \"$HOME\" \"$TMPDIR\" \"$XDG_CACHE_HOME\" \"$CLANG_MODULE_CACHE_PATH\"; do \
+                  if [ -e \"$d/left\" ]; then echo seen \"$d\"; fi; echo x > \"$d/left\" || exit 1; done; \
+                  echo ok";
+    for seq in [1, 2] {
+        let result = run(&rt, &cas, seq, &Spec::sh(script)).await.expect("ran");
+        assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
+        assert_eq!(stdout(&cas, &result), "ok\n", "lease {seq}");
+    }
+    assert!(no_leases(&config), "the lease directories are removed");
+
+    let own = Spec::sh("echo \"$HOME $TMPDIR\"")
+        .env("HOME", "/the/commands/home")
+        .env("TMPDIR", "/the/commands/tmp");
+    let result = run(&rt, &cas, 3, &own).await.expect("ran");
+    assert_eq!(
+        stdout(&cas, &result),
+        "/the/commands/home /the/commands/tmp\n"
+    );
 }
 
 /// Catches: a malformed action run anyway or reported as the farm's failure, and a
