@@ -327,6 +327,10 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     let run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
     let container = wait_for_container_cgroup(&lease).await;
+    // The directory alone is not enough: the OCI runtime makes it first and writes the
+    // container's cgroup files (memory.oom.group among them) later in `create`. The
+    // action's own program running is the state the driver relies on (#88).
+    wait_for_program_in(&container, "sleep").await;
     let read = |dir: &Path, file: &str| {
         std::fs::read_to_string(dir.join(file))
             .expect(file)
@@ -362,6 +366,31 @@ async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("no container cgroup under {}", lease.display());
+}
+
+/// Waits until a process whose command name is `comm` is in `container`'s cgroup.
+///
+/// The OCI runtime (crun, runc) creates the container's cgroup directory, then writes
+/// the spec's resources into it, all during `create`, while the container's init is
+/// held on a sync socket; the action's argv is only exec'd at `start`. So once the
+/// action's own program runs in the cgroup, its setup is complete, which the directory
+/// existing does not imply.
+async fn wait_for_program_in(container: &Path, comm: &str) {
+    for _ in 0..600 {
+        let procs = std::fs::read_to_string(container.join("cgroup.procs")).unwrap_or_default();
+        let running = procs.split_whitespace().any(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == comm)
+        });
+        if running {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no {comm} process in {}:{}",
+        container.display(),
+        describe(container)
+    );
 }
 
 /// Catches a kernel OOM kill being reported as the action's own result (exit 137 would
