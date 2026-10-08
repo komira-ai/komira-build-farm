@@ -1,7 +1,7 @@
 //! A [`Host`] for tests: user records, launchd domains and processes in memory, with
 //! a log of every call and failures on demand.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,9 @@ pub(crate) struct State {
     pub(crate) foreign: BTreeSet<u32>,
     /// Live processes per uid.
     pub(crate) procs: BTreeMap<u32, usize>,
+    /// Answers `live_processes` gives, in order, before it reads `procs` again: a
+    /// process that starts (or ends) between two looks.
+    pub(crate) live_script: VecDeque<usize>,
     /// Per uid, how many more `kill_all` calls leave its processes alive.
     pub(crate) stubborn: BTreeMap<u32, usize>,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
@@ -100,7 +103,9 @@ impl Host for FakeHost {
 
     fn live_processes(&self, uid: u32) -> io::Result<usize> {
         self.call("live_processes", format!("live_processes {uid}"))?;
-        Ok(self.state().procs.get(&uid).copied().unwrap_or(0))
+        let mut state = self.state();
+        let scripted = state.live_script.pop_front();
+        Ok(scripted.unwrap_or_else(|| state.procs.get(&uid).copied().unwrap_or(0)))
     }
 
     fn pause(&self) {

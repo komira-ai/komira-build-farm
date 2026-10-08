@@ -1,4 +1,5 @@
-//! The daemon's side of the helper's socket: one connection per request.
+//! The daemon's side of the helper's socket: one connection per request, which waits
+//! for the helper's `Hello` and answers it with the request and its nonce.
 
 use std::fmt;
 use std::io;
@@ -6,7 +7,8 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use crate::proto::{self, Reply, Request};
+use crate::grant::AdminGrant;
+use crate::proto::{self, Call, Reply, Request};
 
 /// Why a call did not succeed.
 #[derive(Debug)]
@@ -70,20 +72,17 @@ impl Client {
         request: &Request,
         fds: &[BorrowedFd<'_>],
     ) -> Result<(UnixStream, Reply), ClientError> {
-        let stream = UnixStream::connect(&self.socket)?;
-        proto::send(stream.as_fd(), request, fds)?;
-        let reply = next(&stream)?;
-        Ok((stream, reply))
+        call_on(UnixStream::connect(&self.socket)?, request, fds)
     }
 
     /// `user-create`: returns the new user's uid.
     ///
     /// # Errors
     /// The call failed or was refused.
-    pub fn user_create(&self, lease: &str, grant: Option<&str>) -> Result<u32, ClientError> {
+    pub fn user_create(&self, lease: &str, grant: Option<&AdminGrant>) -> Result<u32, ClientError> {
         let request = Request::UserCreate {
             lease: lease.to_owned(),
-            grant: grant.map(str::to_owned),
+            grant: grant.cloned(),
         };
         match self.call(&request, &[])?.1 {
             Reply::Created { uid } => Ok(uid),
@@ -141,6 +140,31 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+}
+
+/// Sends `request` over `stream`, a connection to the helper not yet used: waits for
+/// the helper's `Hello` and sends the request with its nonce. Returns the stream and
+/// the helper's first answer to the request.
+///
+/// # Errors
+/// The helper refused the caller, answered something other than `Hello`, or the
+/// connection failed.
+pub fn call_on(
+    stream: UnixStream,
+    request: &Request,
+    fds: &[BorrowedFd<'_>],
+) -> Result<(UnixStream, Reply), ClientError> {
+    let nonce = match next(&stream)? {
+        Reply::Hello { nonce } => nonce,
+        other => return Err(unexpected(other)),
+    };
+    let call = Call {
+        nonce,
+        request: request.clone(),
+    };
+    proto::send(stream.as_fd(), &call, fds)?;
+    let reply = next(&stream)?;
+    Ok((stream, reply))
 }
 
 impl Running {

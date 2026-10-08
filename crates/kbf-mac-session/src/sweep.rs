@@ -49,23 +49,31 @@ pub struct SweepPlan {
 }
 
 impl SweepPlan {
-    /// macOS's places besides the home folder (which the helper adds from where it
-    /// made it): the crontab (`/usr/lib/cron` is a link to `/private/var/at`),
-    /// launchd's per-uid overrides and login items, `at` jobs, the shared user folder
-    /// and the temporary folders (`/private/var/folders` holds each user's
+    /// macOS's places that start a process of the user with no session of its own,
+    /// which `user-delete` sweeps first: the crontab (`/usr/lib/cron` is a link to
+    /// `/private/var/at`) and `at` jobs.
+    #[must_use]
+    pub fn macos_schedules() -> Self {
+        Self {
+            named: vec!["/private/var/at/tabs/{user}".to_owned()],
+            owned: vec![PathBuf::from("/private/var/at/jobs")],
+        }
+    }
+
+    /// macOS's other places besides the home folder (which the helper adds from where
+    /// it made it): launchd's per-uid overrides and login items, the shared user
+    /// folder and the temporary folders (`/private/var/folders` holds each user's
     /// `DARWIN_USER_TEMP_DIR` and cache folders).
     #[must_use]
     pub fn macos() -> Self {
         Self {
             named: [
-                "/private/var/at/tabs/{user}",
                 "/private/var/db/com.apple.xpc.launchd/disabled.{uid}.plist",
                 "/private/var/db/com.apple.xpc.launchd/loginitems.{uid}.plist",
             ]
             .map(str::to_owned)
             .to_vec(),
             owned: vec![
-                PathBuf::from("/private/var/at/jobs"),
                 // The shared user folder.
                 Path::new("/Users").join("Shared"),
                 PathBuf::from("/private/tmp"),

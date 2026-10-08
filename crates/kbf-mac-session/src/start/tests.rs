@@ -30,6 +30,12 @@ fn group_named(gid: u32) -> Option<String> {
     })
 }
 
+/// Mode 0700: private whatever the test's umask.
+fn private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn args(dir: &Path, group: &str) -> Args {
     Args::parse_from([
         "kbf-mac-session",
@@ -54,6 +60,7 @@ fn prepared(args: &Args) -> Result<Ready, String> {
         args,
         Box::new(FakeHost::default()),
         "S".to_owned(),
+        crate::sweep::SweepPlan::macos_schedules(),
         crate::sweep::SweepPlan::macos(),
     )
 }
@@ -92,6 +99,7 @@ fn prepare_makes_private_state_and_binds_the_socket() {
     let mut args = args(&dir, &group);
     let keys = dir.join("grant-keys");
     std::fs::write(&keys, key_line(3)).unwrap();
+    private(&keys);
     args.grant_keys = Some(keys);
     let ready = prepared(&args).unwrap();
     drop(ready.listener);
@@ -143,6 +151,7 @@ fn bad_state_keys_or_socket_stop_the_start() {
     );
     let mut bad_keys = good.clone();
     std::fs::write(dir.join("bad-keys"), "zz\n").unwrap();
+    private(&dir.join("bad-keys"));
     bad_keys.grant_keys = Some(dir.join("bad-keys"));
     assert!(prepared(&bad_keys).err().unwrap().contains("line 1"));
 
@@ -159,6 +168,8 @@ fn bad_state_keys_or_socket_stop_the_start() {
     corrupt.state_dir = dir.join("corrupt");
     std::fs::create_dir(dir.join("corrupt")).unwrap();
     std::fs::write(dir.join("corrupt/ledger"), "nonsense\n").unwrap();
+    private(&dir.join("corrupt"));
+    private(&dir.join("corrupt/ledger"));
     assert!(prepared(&corrupt).err().unwrap().contains("unknown record"));
 
     let mut unbindable = good;
@@ -169,6 +180,75 @@ fn bad_state_keys_or_socket_stop_the_start() {
             .unwrap()
             .contains("bad-keys/socket")
     );
+}
+
+/// Catches: trusted files read with no check of who may write them (S4.3, item 6 of
+/// the review): a grant key file, state directory or ledger that another user owns,
+/// or that its group or others may write, or a key file reached through a link. Any
+/// of them would let someone else make administrators or replay a grant.
+#[test]
+fn trusted_files_must_be_the_helpers_own_and_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("start-trusted");
+    let (group, _) = my_group();
+    let good = args(&dir, &group);
+    let mode = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    let keys = dir.join("grant-keys");
+    std::fs::write(&keys, key_line(3)).unwrap();
+    let mut with_keys = good.clone();
+    with_keys.grant_keys = Some(keys.clone());
+    mode(&keys, 0o644);
+    prepared(&with_keys).unwrap();
+    mode(&keys, 0o664);
+    let error = prepared(&with_keys).err().unwrap();
+    assert!(
+        error.contains("writable by its group or others (mode 664)"),
+        "{error}"
+    );
+    mode(&keys, 0o646);
+    assert!(prepared(&with_keys).err().unwrap().contains("writable by"));
+    mode(&keys, 0o600);
+
+    std::os::unix::fs::symlink(&keys, dir.join("linked-keys")).unwrap();
+    let mut linked = good.clone();
+    linked.grant_keys = Some(dir.join("linked-keys"));
+    assert!(prepared(&linked).err().unwrap().contains("linked-keys"));
+    let mut a_dir = good.clone();
+    a_dir.grant_keys = Some(dir.clone());
+    assert!(
+        prepared(&a_dir)
+            .err()
+            .unwrap()
+            .contains("not a regular file")
+    );
+
+    // State: the directory and the ledger in it.
+    let state = dir.join("state");
+    mode(&state, 0o770);
+    let error = prepared(&good).err().unwrap();
+    assert!(error.contains("state: writable by"), "{error}");
+    mode(&state, 0o700);
+    let ledger = state.join("ledger");
+    mode(&ledger, 0o622);
+    let error = prepared(&good).err().unwrap();
+    assert!(error.contains("ledger: writable by"), "{error}");
+    mode(&ledger, 0o600);
+    prepared(&good).unwrap();
+
+    // Another user's: root's own files, seen by a test that is not root.
+    if rustix::process::geteuid().as_raw() != 0 {
+        let mut foreign_keys = good.clone();
+        foreign_keys.grant_keys = Some(PathBuf::from("/etc/passwd"));
+        let error = prepared(&foreign_keys).err().unwrap();
+        assert!(error.contains("owned by uid 0"), "{error}");
+        let mut foreign_state = good;
+        foreign_state.state_dir = PathBuf::from("/");
+        let error = prepared(&foreign_state).err().unwrap();
+        assert!(error.contains("owned by uid 0"), "{error}");
+    }
 }
 
 /// Catches: a serial taken from the wrong line, or a value with quotes or spaces.

@@ -1,11 +1,14 @@
 //! The helper's wire format on its Unix socket.
 //!
 //! One connection carries one request. Every message is a frame: a 4-byte big-endian
-//! length, then that many bytes of JSON. The client's request is one frame; `run`
-//! attaches four descriptors to it (`SCM_RIGHTS`): stdin, stdout, stderr and the lease
-//! directory, in that order. The helper answers with one frame, except that a started
-//! `run` answers [`Reply::Started`] and then, when the process exits,
-//! [`Reply::Exited`].
+//! length, then that many bytes of JSON. The helper speaks first: once it has checked
+//! the process that connected, it sends [`Reply::Hello`] with a fresh nonce (or
+//! [`Reply::Refused`], and hangs up). The client's request is then one frame, a
+//! [`Call`] that carries that nonce, so a request written before the helper's check
+//! cannot pass for one written after it (S4.3). `run` attaches four descriptors to it
+//! (`SCM_RIGHTS`): stdin, stdout, stderr and the lease directory, in that order. The
+//! helper answers with one frame, except that a started `run` answers
+//! [`Reply::Started`] and then, when the process exits, [`Reply::Exited`].
 
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
@@ -16,6 +19,8 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::grant::AdminGrant;
 
 /// The largest frame either side accepts.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -33,6 +38,15 @@ const CONTROL_BYTES: usize = rustix::cmsg_space!(ScmRights(RUN_FDS + 1));
 #[cfg(not(target_os = "linux"))]
 const CONTROL_BYTES: usize = 4096;
 
+/// The client's one frame: the nonce of the helper's [`Reply::Hello`] on this
+/// connection, and the request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Call {
+    pub nonce: String,
+    pub request: Request,
+}
+
 /// What the daemon asks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "kebab-case", deny_unknown_fields)]
@@ -41,7 +55,7 @@ pub enum Request {
     UserCreate {
         lease: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        grant: Option<String>,
+        grant: Option<AdminGrant>,
     },
     /// Start a process as the lease's user, with the attached descriptors.
     Run {
@@ -60,6 +74,8 @@ pub enum Request {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Reply {
+    /// The caller passed the check at connect; its request must carry this nonce.
+    Hello { nonce: String },
     /// The user exists with this uid.
     Created { uid: u32 },
     /// The process started with this pid.

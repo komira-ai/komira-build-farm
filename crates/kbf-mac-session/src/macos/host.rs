@@ -207,7 +207,7 @@ impl Host for MacHost {
         for filter in [PROC_UID_ONLY, PROC_RUID_ONLY] {
             pids.extend(list_pids(filter, uid)?);
         }
-        Ok(pids.into_iter().filter(|&pid| !zombie(pid)).count())
+        Ok(pids.into_iter().filter(|&pid| !exited(pid)).count())
     }
 
     fn pause(&self) {
@@ -293,12 +293,11 @@ fn list_pids(filter: u32, uid: u32) -> io::Result<Vec<libc::pid_t>> {
     Ok(pids)
 }
 
-/// Whether `pid` has exited and waits to be reaped (or is gone already).
-fn zombie(pid: libc::pid_t) -> bool {
+/// Whether `pid` has exited: it waits to be reaped, or is gone already.
+fn exited(pid: libc::pid_t) -> bool {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let Ok(size) = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
-        return false;
-    };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .expect("proc_bsdinfo is a few hundred bytes");
     // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes.
     let wrote = unsafe {
         libc::proc_pidinfo(
@@ -309,10 +308,58 @@ fn zombie(pid: libc::pid_t) -> bool {
             size,
         )
     };
-    if wrote != size {
-        // Gone since it was listed: not a live process.
-        return true;
+    let error = (wrote <= 0).then(io::Error::last_os_error);
+    // SAFETY: read only when the call filled the whole struct.
+    let status = (wrote == size).then(|| unsafe { info.assume_init() }.pbi_status);
+    exited_from(status, error.as_ref())
+}
+
+/// What `proc_pidinfo` said, as [`exited`] decides it: a full answer is a zombie or a
+/// live process by its status; otherwise only "no such process" (`ESRCH`) is gone.
+/// Any other failure, or a short answer, counts the process as live, so that
+/// `user-delete` refuses rather than under-counts.
+fn exited_from(status: Option<u32>, error: Option<&io::Error>) -> bool {
+    match status {
+        Some(status) => status == SZOMB,
+        None => error.and_then(io::Error::raw_os_error) == Some(libc::ESRCH),
     }
-    // SAFETY: the call filled the whole struct (checked above).
-    unsafe { info.assume_init() }.pbi_status == SZOMB
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches: `user-delete` going ahead while a process it could not read lives
+    /// (any failure of `proc_pidinfo` taken for "gone", which under-counts).
+    #[test]
+    fn only_a_zombie_or_a_vanished_process_has_exited() {
+        let esrch = io::Error::from_raw_os_error(libc::ESRCH);
+        let eperm = io::Error::from_raw_os_error(libc::EPERM);
+        assert!(exited_from(Some(SZOMB), None));
+        assert!(!exited_from(Some(2), None));
+        assert!(exited_from(None, Some(&esrch)));
+        assert!(!exited_from(None, Some(&eperm)));
+        assert!(!exited_from(None, None), "a short answer is not an exit");
+    }
+
+    /// The same against the kernel: this process is live, an exited child not yet
+    /// reaped is a zombie, and a reaped one is gone.
+    #[test]
+    fn the_kernel_agrees() {
+        let me = libc::pid_t::try_from(std::process::id()).unwrap();
+        assert!(!exited(me));
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let mut zombie = false;
+        for _ in 0..100 {
+            zombie = exited(pid);
+            if zombie {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(zombie, "the exited child was never a zombie");
+        child.wait().unwrap();
+        assert!(exited(pid));
+    }
 }

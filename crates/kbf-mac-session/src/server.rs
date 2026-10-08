@@ -4,10 +4,27 @@
 //! dedicated group (never `staff`, which every macOS user is in); the socket itself is
 //! mode 0660. That keeps every other uid out, lease users included. Each connection's
 //! caller is then checked by a [`CallerCheck`] (on macOS: the caller's code signature,
-//! by audit token, against the pinned `kbf-daemon` requirement) after its request is
-//! read and before anything is done.
+//! by audit token, against the pinned `kbf-daemon` requirement):
+//!
+//! 1. As soon as the connection is accepted, before a byte is read, the process at the
+//!    other end is identified and checked; a refused caller is told so and its
+//!    connection closed unread.
+//! 2. The helper then sends [`Reply::Hello`] with a fresh random nonce, and waits at
+//!    most [`REQUEST_TIMEOUT`] for the request, which must carry that nonce: a request
+//!    written before the check (by a process that then executed the genuine daemon)
+//!    cannot know it.
+//! 3. With the request read, the process at the other end is identified again and must
+//!    be the one checked at step 1 (on macOS, the same audit token: same pid, same pid
+//!    version), so a process that passed the check cannot hand the connection to
+//!    another (a child it forked) to write the request.
+//!
+//! What this does not close: a process that connects and executes the genuine daemon
+//! before the helper accepts, while a child it forked keeps the connection, passes step
+//! 1 as the daemon, and passes step 3 too wherever the kernel's token for the
+//! connection does not follow the process that last used it. S4.3's full answer is a
+//! challenge the daemon answers with a key only its own code can use.
 
-use std::io;
+use std::io::{self, Read as _};
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -15,18 +32,47 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustix::fs::{AtFlags, CWD, Gid, Mode, OFlags};
 
 use crate::helper::{Helper, Outcome};
-use crate::proto::{self, RUN_FDS, Reply, Request};
+use crate::proto::{self, Call, RUN_FDS, Reply};
+
+/// How long a checked caller has to send its request.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The process at the other end of a connection, as the kernel names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// The kernel's whole record of it (on macOS, the 32-byte audit token).
+    pub token: Vec<u8>,
+    /// Its pid.
+    pub pid: i64,
+    /// Its pid version (macOS), which tells apart processes that reuse a pid.
+    pub version: i64,
+}
+
+impl std::fmt::Display for Caller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid {} version {}", self.pid, self.version)
+    }
+}
 
 /// Decides whether the process on the other end of a connection is the genuine
 /// daemon.
 pub trait CallerCheck: Send + Sync {
+    /// The process at the other end of `socket` now.
+    ///
+    /// # Errors
+    /// The kernel did not say.
+    fn identify(&self, socket: &UnixStream) -> Result<Caller, String>;
+
+    /// Whether `caller` is the genuine daemon.
+    ///
     /// # Errors
     /// Why the caller is refused.
-    fn check(&self, socket: &UnixStream) -> Result<(), String>;
+    fn check(&self, caller: &Caller) -> Result<(), String>;
 }
 
 /// Binds the helper's socket at `path`: its directory made (or kept) mode 0750 with
@@ -79,16 +125,51 @@ pub fn serve(
             Ok((stream, _)) => {
                 let helper = Arc::clone(helper);
                 let check = Arc::clone(check);
-                std::thread::spawn(move || connection(&stream, &helper, check.as_ref()));
+                std::thread::spawn(move || {
+                    connection(&stream, &helper, check.as_ref(), REQUEST_TIMEOUT);
+                });
             }
             Err(why) => return why,
         }
     }
 }
 
-/// One connection: read the request, check the caller, act, reply.
-pub fn connection(stream: &UnixStream, helper: &Helper, check: &dyn CallerCheck) {
-    let (request, fds) = match proto::recv::<Request>(stream.as_fd(), RUN_FDS) {
+/// One connection: check the caller, say hello, read the request (waiting at most
+/// `timeout`), check that the same process sent it, act, reply.
+pub fn connection(
+    stream: &UnixStream,
+    helper: &Helper,
+    check: &dyn CallerCheck,
+    timeout: Duration,
+) {
+    let refuse = |why: String| {
+        tracing::warn!("refused a caller: {why}");
+        reply(
+            stream,
+            &Reply::Refused {
+                reason: format!("caller refused: {why}"),
+            },
+        );
+    };
+    let first = match check
+        .identify(stream)
+        .and_then(|caller| check.check(&caller).map(|()| caller))
+    {
+        Ok(caller) => caller,
+        Err(why) => return refuse(why),
+    };
+    tracing::info!("caller {first} checked at accept");
+    let nonce = fresh_nonce();
+    reply(
+        stream,
+        &Reply::Hello {
+            nonce: nonce.clone(),
+        },
+    );
+    if let Err(why) = stream.set_read_timeout(Some(timeout)) {
+        return refuse(format!("setting a read timeout: {why}"));
+    }
+    let (call, fds) = match proto::recv::<Call>(stream.as_fd(), RUN_FDS) {
         Ok(Some(received)) => received,
         Ok(None) => return,
         Err(why) => {
@@ -101,24 +182,38 @@ pub fn connection(stream: &UnixStream, helper: &Helper, check: &dyn CallerCheck)
             return;
         }
     };
-    if let Err(why) = check.check(stream) {
-        tracing::warn!("refused a caller: {why}");
-        drop(fds);
-        reply(
-            stream,
-            &Reply::Refused {
-                reason: format!("caller refused: {why}"),
-            },
-        );
-        return;
+    let now = match check.identify(stream) {
+        Ok(caller) => caller,
+        Err(why) => return refuse(why),
+    };
+    tracing::info!("caller {now} at its request (checked at accept: {first})");
+    if now != first {
+        return refuse(format!(
+            "the process at the other end changed since the check ({first}, now {now})"
+        ));
     }
-    match helper.handle(request, fds) {
+    if call.nonce != nonce {
+        return refuse("the request does not carry this connection's nonce".to_owned());
+    }
+    match helper.handle(call.request, fds) {
         Outcome::Reply(answer) => reply(stream, &answer),
         Outcome::Running(mut child) => {
             reply(stream, &Reply::Started { pid: child.id() });
             reply(stream, &exited(child.wait()));
         }
     }
+}
+
+/// 16 random bytes, in hex: a value no request written before this connection's
+/// `Hello` can carry.
+fn fresh_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    // The kernel's random device is there on every running system; without it this
+    // connection's thread stops here, and nothing is done for the caller.
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .expect("reading /dev/urandom");
+    hex::encode(bytes)
 }
 
 /// The reply to a finished `run`.

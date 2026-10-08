@@ -112,18 +112,19 @@ echo "the lease user was kept out: $out"
 
 step "S10: a caller that is not the daemon is refused; so is one that connects, then executes it"
 expect_refused "caller refused" "$impostor" kill "$socket" 1.1
-# S4.3 expects this refused, because an exec changes the audit token's pid version. It
-# is measured, not assumed: a warning says when this macOS accepts it (see the design's
-# "Built" note under S4.2).
-if out=$("$impostor" connect-then-exec "$socket" "$client" kill "$socket" 1.1 2>&1); then
-  echo "::warning::connect-then-exec was ACCEPTED: the audit token still named the process after exec ($(sw_vers -productVersion))"
-elif grep -q "caller refused" <<<"$out"; then
-  echo "connect-then-exec refused: $out"
-else
-  fail "connect-then-exec failed for another reason: $out"
-fi
+# The impostor connects, waits for the helper's answer, then executes the genuine client,
+# which carries out the whole exchange on that connection: refused, because the helper
+# checked the impostor at accept.
+expect_refused "caller refused" "$impostor" connect-then-exec "$socket" "$client" kill "$socket" 1.1
+# The impostor writes its request at once, then executes the genuine client, which only
+# reads: refused at accept, or (had the exec won the race to accept) for the nonce.
+expect_refused "caller refused" "$impostor" write-then-exec "$socket" 1.1 "$client" replies
+# What the audit token says across an exec, measured on this macOS (no helper involved).
+"$client" exec-probe
 # The control: the genuine client over the same path is accepted (no process to kill).
 "$client" kill "$socket" 1.1
+echo "the helper's view of those callers (pid and pid version at accept and at the request):"
+grep -E "caller (pid|refused)|refused a caller" "$tmp/helper.log" | tail -n 8 || true
 
 step "plant state the sweep must remove, and a process that outlives its action"
 sudo -n mkdir -p /private/var/kbf-ci-sentinel
@@ -179,14 +180,14 @@ uid=$("$client" create "$socket" 1.2)
 [ "$uid" = $((first + 1)) ] || fail "uid $uid after $first"
 if dseditgroup -o checkmember -m kbf-lease-1-2 admin; then fail "kbf-lease-1-2 is an administrator"; fi
 now=$(date +%s)
-grant=$("$client" grant 07 "$serial" 1.3 $((now + 600)))
+grant=$("$client" grant 07 "$serial" 1.3 "$now")
 "$client" create "$socket" 1.3 "$grant"
 dseditgroup -o checkmember -m kbf-lease-1-3 admin || fail "kbf-lease-1-3 is not an administrator"
 expect_refused "names lease 1.3" "$client" create "$socket" 1.4 "$grant"
 expect_refused "never reused" "$client" create "$socket" 1.3 "$grant"
-forged=$("$client" grant 08 "$serial" 1.4 $((now + 600)))
+forged=$("$client" grant 08 "$serial" 1.4 "$now")
 expect_refused "does not verify" "$client" create "$socket" 1.4 "$forged"
-elsewhere=$("$client" grant 07 OTHERSERIAL 1.4 $((now + 600)))
+elsewhere=$("$client" grant 07 OTHERSERIAL 1.4 "$now")
 expect_refused "serial" "$client" create "$socket" 1.4 "$elsewhere"
 for lease in 1.2 1.3; do
   "$client" kill "$socket" "$lease"

@@ -1,12 +1,15 @@
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::client::{Client, ClientError, Exit};
 use crate::helper::Settings;
 use crate::lease::UidRange;
 use crate::ledger::Ledger;
+use crate::proto::Request;
 use crate::sweep::SweepPlan;
 use crate::testing::{FakeHost, scratch, trace};
 
@@ -18,12 +21,49 @@ fn my_gid() -> u32 {
     rustix::process::getgid().as_raw()
 }
 
-/// A caller check with a fixed answer.
-struct Fixed(Result<(), String>);
+/// The process a [`Scripted`] check names when its script runs out.
+fn caller(pid: i64) -> Caller {
+    Caller {
+        token: vec![u8::try_from(pid).unwrap(); 4],
+        pid,
+        version: 1,
+    }
+}
 
-impl CallerCheck for Fixed {
-    fn check(&self, _socket: &UnixStream) -> Result<(), String> {
-        self.0.clone()
+/// A caller check over a script: `identify` answers from `ids` in turn (then
+/// `caller(1)`), `check` answers `verdict`; `asked` counts the identifications.
+struct Scripted {
+    ids: Mutex<Vec<Result<Caller, String>>>,
+    verdict: Result<(), String>,
+    asked: AtomicUsize,
+}
+
+impl Scripted {
+    fn new(ids: Vec<Result<Caller, String>>, verdict: Result<(), String>) -> Arc<Self> {
+        Arc::new(Self {
+            ids: Mutex::new(ids.into_iter().rev().collect()),
+            verdict,
+            asked: AtomicUsize::new(0),
+        })
+    }
+
+    fn fixed(verdict: Result<(), String>) -> Arc<Self> {
+        Self::new(Vec::new(), verdict)
+    }
+}
+
+impl CallerCheck for Scripted {
+    fn identify(&self, _socket: &UnixStream) -> Result<Caller, String> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.ids
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(caller(1)))
+    }
+
+    fn check(&self, _caller: &Caller) -> Result<(), String> {
+        self.verdict.clone()
     }
 }
 
@@ -34,7 +74,11 @@ struct Served {
 }
 
 /// A helper over a fake host, serving on a socket in a scratch directory.
-fn served(name: &str, check: Result<(), String>) -> Served {
+fn served(name: &str, verdict: Result<(), String>) -> Served {
+    served_with(name, Scripted::fixed(verdict))
+}
+
+fn served_with(name: &str, check: Arc<Scripted>) -> Served {
     trace();
     let dir = scratch(&format!("server-{name}"));
     std::fs::create_dir(dir.join("Users")).unwrap();
@@ -43,6 +87,10 @@ fn served(name: &str, check: Result<(), String>) -> Served {
         range: UidRange::new(me(), me() + 1).unwrap(),
         gid: my_gid(),
         homes: dir.join("Users"),
+        schedules: SweepPlan {
+            named: Vec::new(),
+            owned: Vec::new(),
+        },
         sweep: SweepPlan {
             named: Vec::new(),
             owned: Vec::new(),
@@ -54,7 +102,7 @@ fn served(name: &str, check: Result<(), String>) -> Served {
     let helper = Arc::new(Helper::new(Box::new(host.clone()), settings, ledger));
     let socket = dir.join("run/socket");
     let listener = bind(&socket, my_gid()).unwrap();
-    let check: Arc<dyn CallerCheck> = Arc::new(Fixed(check));
+    let check: Arc<dyn CallerCheck> = check;
     std::thread::spawn(move || serve(&listener, &helper, &check));
     Served {
         host,
@@ -173,11 +221,158 @@ fn a_refused_caller_gets_nothing_done() {
     assert!(served.host.state().users.is_empty());
 }
 
+/// Catches: the caller checked only after its request was read (S4.3, the
+/// connect-then-exec case: a process that writes its request and then executes the
+/// genuine daemon is checked as the daemon). The refusal comes before the caller has
+/// written a byte, and the caller is identified once, at accept.
+#[test]
+fn a_caller_is_checked_before_anything_is_read() {
+    let check = Scripted::fixed(Err("not the daemon".to_owned()));
+    let served = served_with("checked-first", Arc::clone(&check));
+    let stream = UnixStream::connect(socket_path(&served)).unwrap();
+    let (reply, _) = proto::recv::<Reply>(stream.as_fd(), 0).unwrap().unwrap();
+    assert_eq!(
+        reply,
+        Reply::Refused {
+            reason: "caller refused: not the daemon".to_owned()
+        }
+    );
+    assert!(proto::recv::<Reply>(stream.as_fd(), 0).unwrap().is_none());
+    assert_eq!(check.asked.load(Ordering::SeqCst), 1);
+}
+
+/// Catches: the second identification dropped, or compared loosely: a process that
+/// passed the check hands the connection to another (a child it forked) to write the
+/// request, or the kernel can no longer say who is there.
+#[test]
+fn a_request_from_another_process_than_the_checked_one_is_refused() {
+    let check = Scripted::new(
+        vec![
+            Ok(caller(7)),
+            Ok(caller(8)),
+            Ok(caller(7)),
+            Err("gone".to_owned()),
+        ],
+        Ok(()),
+    );
+    let served = served_with("changed", check);
+    match served.client.user_create("2.2", None) {
+        Err(ClientError::Refused(why)) => assert_eq!(
+            why,
+            "caller refused: the process at the other end changed since the check \
+             (pid 7 version 1, now pid 8 version 1)"
+        ),
+        other => panic!("{other:?}"),
+    }
+    match served.client.user_create("2.2", None) {
+        Err(ClientError::Refused(why)) => assert_eq!(why, "caller refused: gone"),
+        other => panic!("{other:?}"),
+    }
+    assert!(served.host.state().users.is_empty());
+    // The same pid with another version is another process.
+    let check = Scripted::new(
+        vec![
+            Ok(caller(7)),
+            Ok(Caller {
+                version: 2,
+                ..caller(7)
+            }),
+        ],
+        Ok(()),
+    );
+    let served = served_with("changed-version", check);
+    match served.client.user_create("2.3", None) {
+        Err(ClientError::Refused(why)) => assert!(why.contains("now pid 7 version 2"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(served.host.state().users.is_empty());
+}
+
+/// Catches: the nonce not checked, so a request written before the helper's check (by
+/// a process that then executed the genuine daemon before the helper accepted) is
+/// carried out.
+#[test]
+fn a_request_written_before_the_hello_is_refused() {
+    let served = served("early", Ok(()));
+    let stream = UnixStream::connect(socket_path(&served)).unwrap();
+    let call = Call {
+        nonce: "00000000000000000000000000000000".to_owned(),
+        request: Request::UserCreate {
+            lease: "2.4".to_owned(),
+            grant: None,
+        },
+    };
+    proto::send(stream.as_fd(), &call, &[]).unwrap();
+    let hello = proto::recv::<Reply>(stream.as_fd(), 0).unwrap().unwrap().0;
+    assert!(
+        matches!(&hello, Reply::Hello { nonce } if nonce.len() == 32 && *nonce != call.nonce),
+        "{hello:?}"
+    );
+    let (reply, _) = proto::recv::<Reply>(stream.as_fd(), 0).unwrap().unwrap();
+    assert_eq!(
+        reply,
+        Reply::Refused {
+            reason: "caller refused: the request does not carry this connection's nonce".to_owned()
+        }
+    );
+    assert!(served.host.state().users.is_empty());
+}
+
+/// Catches: a nonce that repeats, which a request written early could then carry.
+#[test]
+fn every_connection_gets_a_fresh_nonce() {
+    let nonces: std::collections::BTreeSet<String> = (0..64).map(|_| fresh_nonce()).collect();
+    assert_eq!(nonces.len(), 64);
+}
+
+/// Catches: no read timeout, under which a member of the socket's group ties up a
+/// thread and its descriptors for ever by never sending its request.
+#[test]
+fn a_caller_that_sends_nothing_is_dropped() {
+    trace();
+    let dir = scratch("server-silent");
+    let helper = quiet_helper(&dir);
+    let (caller_end, helper_end) = UnixStream::pair().unwrap();
+    let check = Scripted::fixed(Ok(()));
+    connection(
+        &helper_end,
+        &helper,
+        check.as_ref(),
+        Duration::from_millis(50),
+    );
+    let hello = proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(matches!(hello, Reply::Hello { .. }), "{hello:?}");
+    let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&reply, Reply::Refused { reason } if reason.starts_with("bad request")),
+        "{reply:?}"
+    );
+    // A timeout the socket does not take is a refusal, not a wait without end.
+    let (caller_end, helper_end) = UnixStream::pair().unwrap();
+    connection(&helper_end, &helper, check.as_ref(), Duration::ZERO);
+    proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap();
+    let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&reply, Reply::Refused { reason } if reason.contains("setting a read timeout")),
+        "{reply:?}"
+    );
+}
+
 #[test]
 fn a_malformed_request_is_refused_and_an_empty_one_ignored() {
     let served = served("malformed", Ok(()));
     let socket = served.client.clone();
     let stream = UnixStream::connect(socket_path(&served)).unwrap();
+    proto::recv::<Reply>(stream.as_fd(), 0).unwrap().unwrap();
     proto::send(stream.as_fd(), &Reply::Killed, &[]).unwrap();
     let (reply, _) = proto::recv::<Reply>(stream.as_fd(), 0).unwrap().unwrap();
     assert!(
@@ -210,10 +405,18 @@ fn the_client_reports_unexpected_replies_and_hangups() {
         Some(Reply::Killed),
     ];
     std::thread::spawn(move || {
+        // First a helper that answers the connection with something other than Hello.
+        let (stream, _) = listener.accept().unwrap();
+        proto::send(stream.as_fd(), &Reply::Killed, &[]).unwrap();
+        drop(stream);
         let mut answers = answers.into_iter();
         while let Some(answer) = answers.next() {
             let (stream, _) = listener.accept().unwrap();
-            let _ = proto::recv::<Request>(stream.as_fd(), RUN_FDS);
+            let hello = Reply::Hello {
+                nonce: "n".to_owned(),
+            };
+            proto::send(stream.as_fd(), &hello, &[]).unwrap();
+            let _ = proto::recv::<Call>(stream.as_fd(), RUN_FDS);
             if let Some(answer) = answer {
                 proto::send(stream.as_fd(), &answer, &[]).unwrap();
                 if matches!(answer, Reply::Started { .. })
@@ -229,6 +432,7 @@ fn the_client_reports_unexpected_replies_and_hangups() {
         Err(error @ ClientError::Unexpected(_)) => error.to_string(),
         other => panic!("{other:?}"),
     };
+    assert!(unexpected(client.kill_uid("1.1")).contains("Killed"));
     assert!(unexpected(client.user_create("1.1", None).map(drop)).contains("Killed"));
     assert!(unexpected(client.kill_uid("1.1")).contains("Created"));
     assert!(unexpected(client.user_delete("1.1").map(drop)).contains("Killed"));
@@ -262,6 +466,10 @@ fn serve_returns_when_accept_fails() {
             range: UidRange::new(600, 601).unwrap(),
             gid: 20,
             homes: dir.clone(),
+            schedules: SweepPlan {
+                named: Vec::new(),
+                owned: Vec::new(),
+            },
             sweep: SweepPlan {
                 named: Vec::new(),
                 owned: Vec::new(),
@@ -271,21 +479,49 @@ fn serve_returns_when_accept_fails() {
         };
         Arc::new(Helper::new(Box::new(FakeHost::default()), settings, ledger))
     };
-    let check: Arc<dyn CallerCheck> = Arc::new(Fixed(Ok(())));
+    let check: Arc<dyn CallerCheck> = Scripted::fixed(Ok(()));
     let error = serve(&listener, &helper, &check);
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
 }
 
-/// A caller that hangs up before the reply costs the helper nothing but a log line.
+/// A caller that hangs up before the hello or the reply costs the helper nothing but a
+/// log line.
 #[test]
 fn a_caller_that_left_is_not_an_error() {
     trace();
     let dir = scratch("server-left");
+    let helper = quiet_helper(&dir);
+    let check = Scripted::fixed(Ok(()));
+    let (caller, helper_end) = UnixStream::pair().unwrap();
+    drop(caller);
+    connection(&helper_end, &helper, check.as_ref(), REQUEST_TIMEOUT);
+    // Gone after its request: the reply finds no one.
+    let (caller, helper_end) = UnixStream::pair().unwrap();
+    let thread = std::thread::spawn(move || {
+        let hello = proto::recv::<Reply>(caller.as_fd(), 0).unwrap().unwrap().0;
+        let Reply::Hello { nonce } = hello else {
+            panic!("{hello:?}")
+        };
+        let request = Request::KillUid {
+            lease: "1.1".to_owned(),
+        };
+        proto::send(caller.as_fd(), &Call { nonce, request }, &[]).unwrap();
+    });
+    connection(&helper_end, &helper, check.as_ref(), REQUEST_TIMEOUT);
+    thread.join().unwrap();
+}
+
+/// A helper over a fake host whose leases nothing in the test creates.
+fn quiet_helper(dir: &Path) -> Helper {
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let settings = Settings {
         range: UidRange::new(600, 601).unwrap(),
         gid: 20,
-        homes: dir.clone(),
+        homes: dir.to_path_buf(),
+        schedules: SweepPlan {
+            named: Vec::new(),
+            owned: Vec::new(),
+        },
         sweep: SweepPlan {
             named: Vec::new(),
             owned: Vec::new(),
@@ -293,14 +529,7 @@ fn a_caller_that_left_is_not_an_error() {
         grant_keys: None,
         serial: "S".to_owned(),
     };
-    let helper = Helper::new(Box::new(FakeHost::default()), settings, ledger);
-    let (caller, helper_end) = UnixStream::pair().unwrap();
-    let request = Request::KillUid {
-        lease: "1.1".to_owned(),
-    };
-    proto::send(caller.as_fd(), &request, &[]).unwrap();
-    drop(caller);
-    connection(&helper_end, &helper, &Fixed(Ok(())));
+    Helper::new(Box::new(FakeHost::default()), settings, ledger)
 }
 
 #[test]

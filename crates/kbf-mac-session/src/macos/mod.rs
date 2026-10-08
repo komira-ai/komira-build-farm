@@ -41,7 +41,13 @@ pub fn main(args: &Args) -> ExitCode {
     let started = read_serial().and_then(|serial| {
         let check: Arc<dyn CallerCheck> =
             Arc::new(CodeSignatureCheck::new(&args.daemon_requirement)?);
-        let ready = start::prepare(args, Box::new(MacHost), serial, SweepPlan::macos())?;
+        let ready = start::prepare(
+            args,
+            Box::new(MacHost),
+            serial,
+            SweepPlan::macos_schedules(),
+            SweepPlan::macos(),
+        )?;
         Ok((check, ready))
     });
     match started {

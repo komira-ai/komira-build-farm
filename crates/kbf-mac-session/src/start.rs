@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rustix::fs::{CWD, Mode, OFlags};
+use std::io::Read as _;
+
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
 
 use crate::grant::GrantKeys;
 use crate::helper::{Helper, Host, Settings};
@@ -34,7 +36,8 @@ pub struct Args {
     /// `staff` or the lease users' group.
     #[arg(long, default_value = "_kbf")]
     pub socket_group: String,
-    /// Where the ledger of used lease ids is kept (made mode 0700).
+    /// Where the ledger of used lease ids is kept (made mode 0700). It must be the
+    /// helper's own (root's) and writable by no one else, as must the ledger in it.
     #[arg(long, default_value = "/var/db/kbf-mac-session")]
     pub state_dir: PathBuf,
     /// The uids lease users get, `<first>-<last>`.
@@ -50,8 +53,11 @@ pub struct Args {
     /// the installed software set pins it (for example `cdhash H"..."`).
     #[arg(long)]
     pub daemon_requirement: String,
-    /// The MDM gate's public grant keys (one hex Ed25519 key per line). Without this
-    /// file no lease user is ever an administrator.
+    /// The MDM gate's public grant keys (one base64 Ed25519 key per line, as the
+    /// gate's `grant-admin` answer names it). Without this file no lease user is ever
+    /// an administrator. It must be a regular file, not a link, the helper's own
+    /// (root's), and writable by no one else: whoever can write it can make
+    /// administrators.
     #[arg(long)]
     pub grant_keys: Option<PathBuf>,
 }
@@ -70,6 +76,7 @@ pub fn prepare(
     args: &Args,
     host: Box<dyn Host>,
     serial: String,
+    schedules: SweepPlan,
     sweep: SweepPlan,
 ) -> Result<Ready, String> {
     let gid = group_gid(&args.socket_group).map_err(|why| why.to_string())?;
@@ -82,13 +89,19 @@ pub fn prepare(
     let grant_keys = match &args.grant_keys {
         None => None,
         Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|why| format!("{}: {why}", path.display()))?;
+            let text = read_trusted(path).map_err(|why| format!("{}: {why}", path.display()))?;
             Some(GrantKeys::parse(&text).map_err(|why| format!("{}: {why}", path.display()))?)
         }
     };
     private_dir(&args.state_dir).map_err(|why| format!("{}: {why}", args.state_dir.display()))?;
     let ledger_path = args.state_dir.join("ledger");
+    let trusted = match rustix::fs::statat(CWD, &ledger_path, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => Ok(()),
+        other => other
+            .map_err(io::Error::from)
+            .and_then(|stat| owned_privately(&stat)),
+    };
+    trusted.map_err(|why| format!("{}: {why}", ledger_path.display()))?;
     let ledger = Ledger::open(&ledger_path).map_err(|why| why.to_string())?;
     let listener = server::bind(&args.socket, gid)
         .map_err(|why| format!("{}: {why}", args.socket.display()))?;
@@ -96,6 +109,7 @@ pub fn prepare(
         range: args.uid_range,
         gid: args.lease_gid,
         homes: args.homes.clone(),
+        schedules,
         sweep,
         grant_keys,
         serial,
@@ -113,7 +127,8 @@ pub fn prepare(
 }
 
 /// Makes `dir` (mode 0700) unless it exists, and makes sure it is a directory, not a
-/// link, and private.
+/// link, the helper's own and writable by no one else (anyone who could write it may
+/// have put a ledger there), then private.
 fn private_dir(dir: &Path) -> io::Result<()> {
     match rustix::fs::mkdir(dir, Mode::from_raw_mode(0o700)) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
@@ -121,7 +136,48 @@ fn private_dir(dir: &Path) -> io::Result<()> {
     }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let opened = rustix::fs::openat(CWD, dir, flags, Mode::empty())?;
+    owned_privately(&rustix::fs::fstat(&opened)?)?;
     Ok(rustix::fs::fchmod(&opened, Mode::from_raw_mode(0o700))?)
+}
+
+/// Reads a file the helper trusts: never through a link, a regular file, the
+/// helper's own and writable by no one else.
+fn read_trusted(path: &Path) -> io::Result<String> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let opened = rustix::fs::openat(CWD, path, flags, Mode::empty())?;
+    let stat = rustix::fs::fstat(&opened)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    owned_privately(&stat)?;
+    let mut text = String::new();
+    std::fs::File::from(opened).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Refuses an entry another user owns, or one its group or others may write: the
+/// helper runs as root, so only root's own entries are trusted.
+fn owned_privately(stat: &Stat) -> io::Result<()> {
+    let me = rustix::process::geteuid().as_raw();
+    if stat.st_uid != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("owned by uid {}, not the helper's uid {me}", stat.st_uid),
+        ));
+    }
+    if stat.st_mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "writable by its group or others (mode {:o})",
+                stat.st_mode & 0o7777
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The id of the group named `name`.

@@ -10,9 +10,10 @@
 //!   and a grant is single-use) and makes an administrator only with a valid grant.
 //! - `run`, `kill-uid` and `user-delete` act only on a lease the ledger holds; `run`
 //!   and `kill-uid` refuse a deleted one (its uid may belong to a newer lease).
-//! - `user-delete` refuses while any process of the uid remains, sweeps, then deletes
-//!   the record, and records the deletion last: a crash part-way leaves the lease
-//!   live, and the delete is simply repeated.
+//! - `user-delete` refuses while any process of the uid remains, first removes what
+//!   can start one (crontab, `at` jobs), then looks again, sweeps the rest, looks a
+//!   last time, deletes the record, and records the deletion last: a crash part-way
+//!   leaves the lease live, and the delete is simply repeated.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
 //! it while it starts the process, so no process starts for a lease being deleted.
@@ -27,7 +28,7 @@ use std::time::SystemTime;
 use kbf_types::LeaseId;
 use rustix::fs::{CWD, Gid, Mode, OFlags, Uid};
 
-use crate::grant::{self, Expect, GrantKeys};
+use crate::grant::{self, AdminGrant, Expect, GrantKeys};
 use crate::lease::{UidRange, parse_lease, user_name};
 use crate::ledger::{Entry, Ledger};
 use crate::proto::{Reply, Request};
@@ -100,7 +101,10 @@ pub struct Settings {
     pub gid: u32,
     /// Where home folders are made (`/Users` on macOS).
     pub homes: PathBuf,
-    /// What `user-delete` sweeps besides the home folder.
+    /// What `user-delete` sweeps first: where a process of the user can be started
+    /// with no session (crontab, `at` jobs).
+    pub schedules: SweepPlan,
+    /// What `user-delete` sweeps then, besides the home folder.
     pub sweep: SweepPlan,
     /// The gate's grant keys; without them no administrator is ever made.
     pub grant_keys: Option<GrantKeys>,
@@ -149,7 +153,7 @@ impl Helper {
             }
             _ if !fds.is_empty() => Err("only run takes descriptors".to_owned()),
             Request::UserCreate { lease, grant } => self
-                .user_create(&lease, grant.as_deref())
+                .user_create(&lease, grant.as_ref())
                 .map(|uid| Reply::Created { uid }),
             Request::KillUid { lease } => self.kill_uid(&lease).map(|()| Reply::Killed),
             Request::UserDelete { lease } => self
@@ -164,7 +168,7 @@ impl Helper {
     ///
     /// # Errors
     /// Why it was refused or failed.
-    pub fn user_create(&self, lease: &str, grant: Option<&str>) -> Result<u32, String> {
+    pub fn user_create(&self, lease: &str, grant: Option<&AdminGrant>) -> Result<u32, String> {
         let lease = parse_lease(lease)?;
         let admin = match grant {
             None => false,
@@ -174,7 +178,7 @@ impl Helper {
                 )?;
                 let expect = Expect {
                     serial: &self.settings.serial,
-                    lease,
+                    lease: &lease.to_string(),
                     now: self.host.now(),
                 };
                 grant::verify(grant, keys, expect)?;
@@ -324,6 +328,12 @@ impl Helper {
     /// records the deletion. Returns whether a record was there to delete; a lease
     /// already deleted returns `false` and touches nothing.
     ///
+    /// No process of the uid may be left at any of three looks: before anything is
+    /// removed (so nothing of the user races the walk), once the crontab and `at` jobs
+    /// are gone (a job that started after `kill-uid` is found here, and none can start
+    /// later), and after the whole sweep, just before the record goes (so no process
+    /// outlives its user as an orphan uid that later leases' files are open to).
+    ///
     /// # Errors
     /// Why it was refused: a process of the uid remains, or the sweep or the deletion
     /// failed (the lease stays live, so the delete can be repeated).
@@ -334,23 +344,15 @@ impl Helper {
             return Ok(false);
         }
         let uid = self.live_uid(&ledger, lease)?;
-        let left = self.live(uid)?;
-        if left > 0 {
-            return Err(format!(
-                "{left} processes of uid {uid} remain; kill-uid first"
-            ));
-        }
+        self.none_left(uid)?;
         let name = user_name(lease);
+        let mut removed = Self::sweep_all(&self.settings.schedules, &name, uid)?;
+        self.none_left(uid)?;
         let mut plan = self.settings.sweep.clone();
         plan.named
             .push(format!("{}/{{user}}", self.settings.homes.display()));
-        let swept = sweep(&plan, &name, uid);
-        if !swept.errors.is_empty() {
-            return Err(format!(
-                "the sweep for {name} is incomplete: {}",
-                swept.errors.join("; ")
-            ));
-        }
+        removed += Self::sweep_all(&plan, &name, uid)?;
+        self.none_left(uid)?;
         let existed = self
             .host
             .delete_user(&name)
@@ -358,8 +360,31 @@ impl Helper {
         ledger
             .record_deleted(lease)
             .map_err(|why| format!("recording the deletion of lease {lease}: {why}"))?;
-        tracing::info!(lease = %lease, uid, removed = swept.removed, existed, "deleted lease user {name}");
+        tracing::info!(lease = %lease, uid, removed, existed, "deleted lease user {name}");
         Ok(existed)
+    }
+
+    /// Refuses while any process of `uid` is alive.
+    fn none_left(&self, uid: u32) -> Result<(), String> {
+        match self.live(uid)? {
+            0 => Ok(()),
+            left => Err(format!(
+                "{left} processes of uid {uid} remain; kill-uid first"
+            )),
+        }
+    }
+
+    /// Sweeps `plan` for the user; how many entries went, or why it is incomplete.
+    fn sweep_all(plan: &SweepPlan, name: &str, uid: u32) -> Result<usize, String> {
+        let swept = sweep(plan, name, uid);
+        if swept.errors.is_empty() {
+            Ok(swept.removed)
+        } else {
+            Err(format!(
+                "the sweep for {name} is incomplete: {}",
+                swept.errors.join("; ")
+            ))
+        }
     }
 }
 

@@ -2,8 +2,11 @@ use std::io::Read as _;
 use std::os::fd::OwnedFd;
 
 use super::*;
-use crate::grant::testing::{key_line, payload, sign};
+use crate::grant::testing::{key_line, sign, text};
 use crate::testing::{FakeHost, NOW, scratch, trace};
+
+/// The fake clock's time, as a grant's times count it.
+const NOW_SECS: i64 = NOW.cast_signed();
 
 fn me() -> u32 {
     rustix::process::getuid().as_raw()
@@ -35,8 +38,12 @@ fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig {
         range,
         gid: my_gid(),
         homes,
-        sweep: SweepPlan {
+        schedules: SweepPlan {
             named: vec![format!("{}/tabs/{{user}}", dir.display())],
+            owned: Vec::new(),
+        },
+        sweep: SweepPlan {
+            named: Vec::new(),
             owned: vec![dir.join("Shared")],
         },
         grant_keys: Some(GrantKeys::parse(&key_line(7)).unwrap()),
@@ -124,7 +131,7 @@ fn a_lease_id_is_never_used_twice() {
 #[test]
 fn an_administrator_needs_a_valid_unused_grant() {
     let rig = rig("admin", 4);
-    let grant = sign(7, &payload("SERIAL1", "3.1", NOW + 600));
+    let grant = sign(7, &text("SERIAL1", "3.1", NOW_SECS));
     assert_eq!(rig.helper.user_create("3.1", Some(&grant)), Ok(me()));
     assert!(rig.host.state().users["kbf-lease-3-1"].admin);
     // Single use: the lease id is spent.
@@ -137,14 +144,14 @@ fn an_administrator_needs_a_valid_unused_grant() {
     // A grant names one lease and one Mac, and the gate's key.
     let error = rig.helper.user_create("3.2", Some(&grant)).unwrap_err();
     assert!(error.contains("names lease 3.1"), "{error}");
-    let other_mac = sign(7, &payload("SERIAL2", "3.2", NOW + 600));
+    let other_mac = sign(7, &text("SERIAL2", "3.2", NOW_SECS));
     assert!(
         rig.helper
             .user_create("3.2", Some(&other_mac))
             .unwrap_err()
             .contains("serial")
     );
-    let forged = sign(8, &payload("SERIAL1", "3.2", NOW + 600));
+    let forged = sign(8, &text("SERIAL1", "3.2", NOW_SECS));
     assert!(
         rig.helper
             .user_create("3.2", Some(&forged))
@@ -157,7 +164,7 @@ fn an_administrator_needs_a_valid_unused_grant() {
 
     let mut keyless = rig_with("admin-nokeys", UidRange::new(me(), me()).unwrap(), None);
     keyless.helper.settings.grant_keys = None;
-    let grant = sign(7, &payload("SERIAL1", "3.3", NOW + 600));
+    let grant = sign(7, &text("SERIAL1", "3.3", NOW_SECS));
     let error = keyless.helper.user_create("3.3", Some(&grant)).unwrap_err();
     assert!(error.contains("no gate key"), "{error}");
     assert!(keyless.host.state().users.is_empty());
@@ -374,9 +381,10 @@ fn run_refuses_a_bad_request() {
 fn user_delete_refuses_live_processes_and_an_incomplete_sweep() {
     let rig = rig("delete", 2);
     let uid = rig.helper.user_create("9.1", None).unwrap();
-    rig.host.state().procs.insert(uid, 2);
+    // One process is enough to refuse (`> 0`, not `> 1`).
+    rig.host.state().procs.insert(uid, 1);
     let error = rig.helper.user_delete("9.1").unwrap_err();
-    assert!(error.contains("2 processes"), "{error}");
+    assert!(error.contains("1 processes"), "{error}");
     assert!(rig.host.state().users.contains_key("kbf-lease-9-1"));
     rig.host.state().procs.clear();
 
@@ -445,6 +453,70 @@ fn user_delete_refuses_live_processes_and_an_incomplete_sweep() {
             .unwrap_err()
             .contains("live_processes failed")
     );
+}
+
+/// Catches: a process of the uid that starts during `user-delete` (a cron or `at` job
+/// that fired after `kill-uid`) surviving its user: the schedules are swept before the
+/// second look and the rest of the sweep, and the last look comes after the sweep and
+/// before the record is deleted. Either look missing, or the schedules swept after the
+/// rest, turns this red.
+#[test]
+fn a_process_started_during_user_delete_stops_it() {
+    let rig = rig("delete-race", 2);
+    let uid = rig.helper.user_create("11.1", None).unwrap();
+    let home = rig.dir.join("Users/kbf-lease-11-1");
+    let tab = rig.dir.join("tabs/kbf-lease-11-1");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(rig.dir.join("tabs")).unwrap();
+    std::fs::write(&tab, "* * * * * job").unwrap();
+
+    // A job starts while the crontab is removed: found at the second look, before the
+    // home folder is touched.
+    rig.host.state().live_script.extend([0, 1]);
+    let error = rig.helper.user_delete("11.1").unwrap_err();
+    assert!(error.contains("1 processes of uid"), "{error}");
+    assert!(!tab.exists(), "the schedules go first");
+    assert!(home.exists(), "nothing else is swept while a process lives");
+    assert!(rig.host.state().users.contains_key("kbf-lease-11-1"));
+
+    // One starts during the rest of the sweep: found at the last look, and the user
+    // record stays.
+    log(&rig);
+    rig.host.state().live_script.extend([0, 0, 1]);
+    let error = rig.helper.user_delete("11.1").unwrap_err();
+    assert!(error.contains("1 processes of uid"), "{error}");
+    assert!(!home.exists());
+    assert!(rig.host.state().users.contains_key("kbf-lease-11-1"));
+    assert_eq!(
+        log(&rig),
+        vec![format!("live_processes {uid}"); 3],
+        "three looks, and no delete_user"
+    );
+
+    // With none left the delete completes, after three looks.
+    assert_eq!(rig.helper.user_delete("11.1"), Ok(true));
+    assert_eq!(
+        log(&rig),
+        [
+            format!("live_processes {uid}"),
+            format!("live_processes {uid}"),
+            format!("live_processes {uid}"),
+            "delete_user kbf-lease-11-1".to_owned(),
+        ]
+    );
+
+    // An incomplete sweep of the schedules stops the delete too.
+    if me() != 0 {
+        rig.helper.user_create("11.2", None).unwrap();
+        let tabs = rig.dir.join("tabs");
+        std::fs::set_permissions(&tabs, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let error = rig.helper.user_delete("11.2").unwrap_err();
+        std::fs::set_permissions(&tabs, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert!(error.contains("incomplete"), "{error}");
+        assert!(rig.host.state().users.contains_key("kbf-lease-11-2"));
+    }
 }
 
 /// Catches: requests routed to the wrong verb, or descriptors accepted (and leaked)

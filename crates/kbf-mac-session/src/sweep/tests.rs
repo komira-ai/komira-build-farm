@@ -283,11 +283,18 @@ fn another_filesystem_or_a_swapped_directory_is_not_entered() {
 
 #[test]
 fn the_macos_plan_names_the_places_of_the_design() {
-    let plan = SweepPlan::macos();
+    let schedules = SweepPlan::macos_schedules();
     assert!(
-        plan.named
+        schedules
+            .named
             .contains(&"/private/var/at/tabs/{user}".to_owned())
     );
+    assert!(
+        schedules
+            .owned
+            .contains(&PathBuf::from("/private/var/at/jobs"))
+    );
+    let plan = SweepPlan::macos();
     assert!(
         plan.named
             .contains(&"/private/var/db/com.apple.xpc.launchd/loginitems.{uid}.plist".to_owned())
