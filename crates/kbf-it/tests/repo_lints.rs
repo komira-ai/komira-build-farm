@@ -198,10 +198,87 @@ fn text_files_carry_no_addresses_or_home_paths() {
     );
 }
 
+/// The workflow paths `docs/artifacts.md` gives as `--signer-workflow`, relative to the
+/// repository root.
+fn documented_signer_workflows(doc: &str) -> Vec<&str> {
+    const FLAG: &str = "--signer-workflow komira-ai/komira-build-farm/";
+    doc.match_indices(FLAG)
+        .map(|(at, _)| {
+            doc[at + FLAG.len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// What a workflow must hold to be the signer a node's verification names: an attest
+/// step, under a job whose `if:` limits it to a push to `main`.
+fn signs_provenance_on_main(workflow: &str) -> bool {
+    workflow.contains("uses: actions/attest-build-provenance@")
+        && workflow
+            .contains("if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}")
+}
+
+#[test]
+fn the_documented_signer_workflow_signs_provenance_on_main() {
+    // Catches: the artifacts workflow renamed, moved or stripped of its attest step
+    // while docs/artifacts.md still names it, so every node's verification command
+    // names a workflow that signs nothing (and every deployment fails to verify).
+    let root = repo_root();
+    let doc = std::fs::read_to_string(root.join("docs/artifacts.md")).expect("docs/artifacts.md");
+    let signers = documented_signer_workflows(&doc);
+    assert!(
+        !signers.is_empty(),
+        "docs/artifacts.md names no --signer-workflow"
+    );
+    for path in signers {
+        assert!(is_workflow(path), "`{path}` is not a workflow file");
+        let text = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|e| panic!("the documented signer workflow `{path}`: {e}"));
+        assert!(
+            signs_provenance_on_main(&text),
+            "`{path}` has no main-only attest step"
+        );
+    }
+}
+
 /// The rules that pick which files each lint reads. The repository tests above cannot
 /// pin them: a selection that misses a file leaves those tests green.
 mod selection {
     use super::*;
+
+    #[test]
+    fn signer_workflows_are_read_from_the_verify_command() {
+        // Catches: a signer path read with the line's trailing `\` or the next flag, so
+        // the repository test opens the wrong file; another repository's workflow
+        // taken as ours; a flag at the very end of the text read as a path.
+        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/komira-build-farm/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/komira-build-farm/.github/workflows/b.yml";
+        assert_eq!(
+            documented_signer_workflows(doc),
+            vec![".github/workflows/a.yml", ".github/workflows/b.yml"]
+        );
+        assert!(
+            documented_signer_workflows("--signer-workflow other/repo/.github/workflows/a.yml")
+                .is_empty()
+        );
+        assert_eq!(
+            documented_signer_workflows("--signer-workflow komira-ai/komira-build-farm/"),
+            vec![""]
+        );
+    }
+
+    #[test]
+    fn a_signer_workflow_needs_both_the_attest_step_and_the_main_only_job() {
+        // Catches: a workflow accepted as the signer with its attest step gone, or with
+        // the attest job no longer limited to a push to main.
+        let step = "      - uses: actions/attest-build-provenance@0123 # v4\n";
+        let cond =
+            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
+        assert!(signs_provenance_on_main(&format!("{cond}{step}")));
+        assert!(!signs_provenance_on_main(step));
+        assert!(!signs_provenance_on_main(cond));
+    }
 
     #[test]
     fn action_files_are_selected_by_name_in_any_case() {
