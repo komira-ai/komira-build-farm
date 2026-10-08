@@ -4,9 +4,9 @@
 //! `/Applications/Xcode_16.2.app`, ...). [`discover`] finds every `Xcode*.app` in a
 //! directory and asks each for its build with `xcodebuild -version` under that
 //! Xcode's `DEVELOPER_DIR`; one that does not answer (not set up, licence not
-//! accepted, or no answer within [`ANSWER_WITHIN`]) is left out and logged. The driver reports one `xcode` entry per build
-//! ([`CAPABILITY`]), which `kbf-caps` matches by membership, so an action that names a
-//! build runs on any Mac that has it.
+//! accepted, or no answer within [`ANSWER_WITHIN`]) is left out and logged. The
+//! driver reports one `xcode` entry per build ([`CAPABILITY`]), which `kbf-caps`
+//! matches by membership, so an action that names a build runs on any Mac that has it.
 //!
 //! An action names its Xcode with the platform property `xcode` (the name in any case,
 //! as the front reads it) and runs with `DEVELOPER_DIR` set to that Xcode, so `xcrun`,
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
@@ -57,7 +57,8 @@ pub const ANSWER_WITHIN: Duration = Duration::from_secs(60);
 /// path (links resolved) joined with `Contents/Developer`. Apps are tried in name
 /// order; of two with one build (a link `Xcode.app` to `Xcode_16.2.app`), the first is
 /// kept. A directory that cannot be read has none. One that does not answer in time
-/// is killed, left out and logged.
+/// (exit and close its output) is killed if still running, left out and logged; each
+/// such Xcode delays the return by up to `within`.
 #[must_use]
 pub fn discover(apps: &Path, xcodebuild: &Path, within: Duration) -> BTreeMap<String, PathBuf> {
     let mut found = BTreeMap::new();
@@ -122,20 +123,21 @@ fn developer_dir_of(
 /// How often [`output_within`] looks whether its process has exited.
 const POLL: Duration = Duration::from_millis(10);
 
-/// What `command` prints and how it exits (stdin `/dev/null`), if it exits within
-/// `within`; otherwise it is killed and this is a `TimedOut` error. Its stdout and
-/// stderr are read on two threads while it runs, so a full pipe cannot stall it. A
-/// process it started and left holding the pipes keeps those threads waiting; after
-/// a timeout they are not waited for.
+/// What `command` prints and how it exits (stdin `/dev/null`), if it exits and closes
+/// its output within `within`; otherwise this is a `TimedOut` error, and the process is
+/// killed if it has not exited. Its stdout and stderr are read on two threads while it
+/// runs, so a full pipe cannot stall it. A process it started and left holding the
+/// pipes keeps those threads reading; they are waited for only until `within` is up
+/// and are left behind after that (each ends when the pipe it reads closes).
 fn output_within(mut command: std::process::Command, within: Duration) -> io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let deadline = Instant::now() + within;
     let stdout = read_all(child.stdout.take().expect("stdout is piped"));
     let stderr = read_all(child.stderr.take().expect("stderr is piped"));
-    let deadline = Instant::now() + within;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -150,20 +152,32 @@ fn output_within(mut command: std::process::Command, within: Duration) -> io::Re
         }
         std::thread::sleep(POLL);
     };
+    let unclosed = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("exited, but its output was still open after {within:?}"),
+        )
+    };
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let stdout = stdout.recv_timeout(left()).map_err(|_| unclosed())?;
+    let stderr = stderr.recv_timeout(left()).map_err(|_| unclosed())?;
     Ok(Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
-/// A thread that reads `pipe` to its end.
-fn read_all(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+/// A thread that reads `pipe` to its end and sends what it read.
+fn read_all(mut pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
+    let (send, receive) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
+        // The receiver is gone once its wait timed out; then nobody wants the bytes.
+        let _ = send.send(bytes);
+    });
+    receive
 }
 
 /// The `DEVELOPER_DIR` of the Xcode the action's platform names (the Action's
@@ -341,6 +355,28 @@ mod tests {
         let out = output_within(command, WITHIN).expect("answers");
         assert!(out.status.success());
         assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 200_000));
+    }
+
+    /// Catches a time limit that covers the process but not its output: an Xcode that
+    /// exits but leaves a child holding stdout and stderr (here for 8 s, four times the
+    /// limit) must be given up on when the limit is up, not when the child ends.
+    #[test]
+    fn output_held_open_past_the_limit_is_not_waited_for() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 8 & echo 'Build version 1A1'"]);
+        let started = Instant::now();
+        let out = output_within(command, WITHIN);
+        let took = started.elapsed();
+        assert!(
+            took < WITHIN * 2,
+            "the held output was waited for: {took:?}"
+        );
+        let err = out.expect_err("the output is still open at the limit");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "exited, but its output was still open after 2s"
+        );
     }
 
     fn platform(name: &str, value: &str) -> Option<Platform> {
