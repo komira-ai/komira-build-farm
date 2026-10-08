@@ -950,7 +950,10 @@ machines.
     depends on it);
   - the time server;
   - whether the update preferences are honoured on that version (5.2);
-  - the Xcode install from a `.xip`.
+  - the Xcode install from a `.xip`;
+  - whether a freshly erased Mac lists `_mbsetupuser` as an administrator (the hosted
+    VM does, and `kbf-mac-provision` allows no other administrator): if it does,
+    decide explicitly whether to remove it or allow it.
 
 ## 11. Verified and assumed
 
