@@ -1,17 +1,24 @@
 //! The server side of `kbf.worker.v1`: one `Session` stream per daemon.
 //!
-//! The first message must be `Hello`. It is checked (protocol version, node id, the
-//! capacity entries of the node report, and the entries placement matches platforms
-//! against: `arch` and the rest that [`caps`] reads), answered with `Welcome`, and
-//! registers the node: only this first `Hello` does (issue #25). On the stream after
-//! that:
-//! - a resent `Hello` changes the node's capacity and capabilities and nothing else;
-//! - a `Heartbeat` is fed to the scheduler and acknowledged, unless a newer stream of
+//! Under mutual TLS a stream without a usable client certificate is refused before its
+//! first message is read. The first message must be `Hello`. It is checked (protocol
+//! version, node id, that the certificate names that node and neither is denied: see
+//! [`identity`](crate::identity) and issue #79; the capacity entries of the node report,
+//! and the entries placement matches platforms against: `arch` and the rest that
+//! [`caps`] reads), answered with `Welcome`, and registers the node: only this first
+//! `Hello` does (issue #25). On the stream after that:
+//! - a resent `Hello` whose `node_id` is not the stream's node, or that the deny list
+//!   now refuses, ends the stream with that error; otherwise it changes the node's
+//!   capacity and capabilities and nothing else;
+//! - a `Heartbeat` the deny list now refuses ends the stream. Otherwise it is fed to
+//!   the scheduler and acknowledged, unless a newer stream of
 //!   the same node has registered since: then it is dropped unacknowledged, so a
 //!   daemon still talking on the old stream fences on time. A lease it lists that the
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23);
-//! - a `Result` is accepted only from the node holding the operation's current lease,
-//!   and answered with a `ResultAck`;
+//! - a `Result` the deny list now refuses ends the stream, so it never reaches the
+//!   action cache. Otherwise it is accepted only from the node holding the
+//!   operation's current lease, and answered with a `ResultAck`;
+//! - after the server ends a stream, nothing more is read from it;
 //! - an `Offer` is not read yet.
 
 use std::pin::Pin;
@@ -32,6 +39,7 @@ use tokio::time::timeout;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, StreamId};
+use crate::identity::{PeerCert, Peers};
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -44,21 +52,24 @@ pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug)]
 pub struct WorkerService<M, O> {
     farm: Arc<Farm<M, O>>,
+    peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
 }
 
 impl<M, O> WorkerService<M, O> {
-    /// The service over `farm`. `Welcome` asks daemons for a heartbeat every
-    /// `heartbeat_interval`; a stream that sends no `Hello` within `hello_wait` is
-    /// ended DEADLINE_EXCEEDED.
+    /// The service over `farm`, knowing its daemons as `peers`. `Welcome` asks daemons
+    /// for a heartbeat every `heartbeat_interval`; a stream that sends no `Hello` within
+    /// `hello_wait` is ended DEADLINE_EXCEEDED.
     pub const fn new(
         farm: Arc<Farm<M, O>>,
+        peers: Peers,
         heartbeat_interval: Duration,
         hello_wait: Duration,
     ) -> Self {
         Self {
             farm,
+            peers,
             heartbeat_interval,
             hello_wait,
         }
@@ -80,6 +91,9 @@ where
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<SessionStream>, Status> {
+        let certs = request.peer_certs();
+        let leaf = certs.as_deref().and_then(|chain| chain.first());
+        let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
         let mut inbound = request.into_inner();
         let first = timeout(self.hello_wait, inbound.message())
             .await
@@ -99,6 +113,7 @@ where
         if hello.node_id.is_empty() {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
+        self.peers.admit(peer.as_ref(), &hello.node_id).await?;
         let capacity = capacity(&hello).map_err(Status::invalid_argument)?;
         let caps = caps(&hello).map_err(Status::invalid_argument)?;
         let worker = WorkerId::new(hello.node_id);
@@ -112,8 +127,14 @@ where
             .farm
             .register(&worker, capacity, caps, outbound.clone(), welcome);
         tracing::info!(%worker, ?capacity, "worker registered");
-        let farm = Arc::clone(&self.farm);
-        tokio::spawn(serve(farm, worker, stream, inbound, outbound));
+        let session = Session {
+            farm: Arc::clone(&self.farm),
+            peers: self.peers.clone(),
+            peer,
+            worker,
+            stream,
+        };
+        tokio::spawn(session.serve(inbound, outbound));
         Ok(Response::new(Box::pin(stream::unfold(
             responses,
             |mut responses| async move { responses.recv().await.map(|m| (m, responses)) },
@@ -121,61 +142,94 @@ where
     }
 }
 
-/// Handles one stream's messages after its first `Hello`, until it ends.
-async fn serve<M: MetaLog, O: ObjectStore>(
+/// One stream after its first `Hello`.
+struct Session<M, O> {
     farm: Arc<Farm<M, O>>,
+    peers: Peers,
+    /// The stream's client certificate (`None` in plain text).
+    peer: Option<PeerCert>,
     worker: WorkerId,
     stream: StreamId,
-    mut inbound: Streaming<DaemonMessage>,
-    outbound: Outbound,
-) {
-    loop {
-        let Ok(Some(received)) = inbound.message().await else {
-            break;
-        };
-        let reply = match received.message {
-            Some(daemon_message::Message::Hello(hello)) => {
-                match capacity(&hello).and_then(|capacity| Ok((capacity, caps(&hello)?))) {
-                    Ok((capacity, caps)) => {
-                        farm.resize(&worker, stream, capacity, caps);
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(%worker, error = %e, "a resent Hello ignored");
-                        None
-                    }
+}
+
+impl<M: MetaLog, O: ObjectStore> Session<M, O> {
+    /// Handles the stream's messages until it ends, or one of them ends it.
+    async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
+        let worker = &self.worker;
+        while let Ok(Some(received)) = inbound.message().await {
+            // The response stream outlives this loop unless the stream is gone.
+            match self.handle(received.message).await {
+                Ok(None) => {}
+                Ok(Some(reply)) => {
+                    let _ = outbound.send(Ok(message(reply)));
+                }
+                Err(status) => {
+                    tracing::warn!(%worker, %status, "worker stream ended by the server");
+                    let _ = outbound.send(Err(status));
+                    break;
                 }
             }
+        }
+        // The farm keeps the stream as the worker's until it registers again: `Start`s
+        // sent meanwhile are lost, and the scheduler gives their leases up (at once on
+        // the next session's first heartbeat, or after G).
+        tracing::info!(%worker, "worker stream ended");
+    }
+
+    /// The reply to one message, if any; an error ends the stream with it.
+    async fn handle(
+        &self,
+        received: Option<daemon_message::Message>,
+    ) -> Result<Option<server_message::Message>, Status> {
+        let (farm, worker, stream) = (&self.farm, &self.worker, self.stream);
+        let reply = match received {
+            Some(daemon_message::Message::Hello(hello)) => {
+                if hello.node_id != worker.as_str() {
+                    return Err(Status::permission_denied(format!(
+                        "a resent Hello names node {:?}; this stream is {worker}'s",
+                        hello.node_id
+                    )));
+                }
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                match capacity(&hello).and_then(|capacity| Ok((capacity, caps(&hello)?))) {
+                    Ok((capacity, caps)) => farm.resize(worker, stream, capacity, caps),
+                    Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
+                }
+                None
+            }
             Some(daemon_message::Message::Heartbeat(beat)) => {
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
                 let running = beat
                     .running
                     .iter()
                     .map(|l| LeaseId::new(l.term, l.seq))
                     .collect();
-                farm.heartbeat(&worker, stream, beat.seq, running)
-                    .then_some(server_message::Message::HeartbeatAck(HeartbeatAck {
-                        seq: beat.seq,
-                    }))
+                farm.heartbeat(worker, stream, beat.seq, running).then_some(
+                    server_message::Message::HeartbeatAck(HeartbeatAck { seq: beat.seq }),
+                )
             }
-            Some(daemon_message::Message::Result(result)) => farm
-                .report(&worker, result)
-                .await
-                .map(server_message::Message::ResultAck),
+            Some(daemon_message::Message::Result(result)) => {
+                // A revoked daemon must not write its result into the action cache,
+                // even before its next heartbeat.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                farm.report(worker, result)
+                    .await
+                    .map(server_message::Message::ResultAck)
+            }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");
                 None
             }
         };
-        if let Some(reply) = reply {
-            // The response stream outlives this loop unless the stream is gone.
-            let _ = outbound.send(Ok(message(reply)));
-        }
+        Ok(reply)
     }
-    // The farm keeps the stream as the worker's until it registers again: `Start`s
-    // sent meanwhile are lost, and the scheduler gives their leases up (at once on the
-    // next session's first heartbeat, or after G).
-    tracing::info!(%worker, "worker stream ended");
 }
 
 fn message(message: server_message::Message) -> ServerMessage {

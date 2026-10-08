@@ -48,6 +48,9 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+# Reads the fields of a daemon's client certificate the worker listener checks (its DNS
+# subjectAltName, serial and public key); TLS has already verified the certificate.
+x509-parser = "0.18.1"
 
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-caps = { path = "crates/kbf-caps" }

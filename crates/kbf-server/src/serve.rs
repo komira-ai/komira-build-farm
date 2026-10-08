@@ -12,6 +12,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::farm::Farm;
+use crate::identity::{DenyList, Peers};
 use crate::worker::WorkerService;
 
 /// How the server listens and paces its daemons.
@@ -21,8 +22,9 @@ pub struct Listeners {
     pub reapi: SocketAddr,
     /// The `kbf.worker.v1` listener (daemons).
     pub worker: SocketAddr,
-    /// Mutual TLS for the worker listener; `None` serves it in plain text.
-    pub worker_tls: Option<ServerTlsConfig>,
+    /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
+    /// node is bound to a certificate.
+    pub worker_tls: Option<WorkerTls>,
     /// The heartbeat interval `Welcome` names.
     pub heartbeat_interval: Duration,
     /// How long a new worker stream may take to send its `Hello`.
@@ -34,6 +36,16 @@ pub struct Listeners {
     /// platform, or none that does is large enough) before it is refused
     /// FAILED_PRECONDITION.
     pub unservable_wait: Duration,
+}
+
+/// The worker listener's mutual TLS: every daemon's certificate must name its node
+/// (see [`crate::identity`]).
+#[derive(Clone, Debug)]
+pub struct WorkerTls {
+    /// The listener's identity and the client CA daemons' certificates chain to.
+    pub server: ServerTlsConfig,
+    /// The certificates and nodes refused, read again at every check.
+    pub deny_list: Option<DenyList>,
 }
 
 /// Why the server could not start or stopped.
@@ -89,11 +101,18 @@ where
     let (worker_incoming, worker) = bind(listeners.worker)?;
 
     let mut worker_server = Server::builder();
-    if let Some(tls) = listeners.worker_tls {
-        worker_server = worker_server.tls_config(tls)?;
-    }
+    let peers = match listeners.worker_tls {
+        Some(tls) => {
+            worker_server = worker_server.tls_config(tls.server)?;
+            Peers::Certified {
+                deny_list: tls.deny_list,
+            }
+        }
+        None => Peers::Unauthenticated,
+    };
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
+        peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
     ))

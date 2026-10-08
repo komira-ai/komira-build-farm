@@ -4,7 +4,9 @@
 //! - REAPI on one listener: the cache services and `Execution` from `kbf-front`, over
 //!   a [`kbf_front::Cache`] (in-memory metadata, and an in-memory or S3 object store).
 //! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
-//!   lease offers and `Start`s, and report results.
+//!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
+//!   certificate must name its node, and a deny list refuses certificates and nodes
+//!   ([`identity`]).
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
 //!   `Start` only after the grant commits; a result is accepted only from the node
 //!   holding the operation's current lease, and only an accepted result is written to
@@ -16,10 +18,12 @@
 
 pub mod config;
 pub mod farm;
+pub mod identity;
 pub mod serve;
 pub mod worker;
 
 pub use config::{Args, ConfigError, Role, StoreKind};
 pub use farm::Farm;
-pub use serve::{Bound, Listeners, ServeError, bind_server};
+pub use identity::{DenyList, DenyListError, Peers};
+pub use serve::{Bound, Listeners, ServeError, WorkerTls, bind_server};
 pub use worker::WorkerService;

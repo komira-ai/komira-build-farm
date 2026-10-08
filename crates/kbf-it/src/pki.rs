@@ -42,7 +42,9 @@ pub enum PkiError {
 }
 
 /// Generates a CA, a server certificate for [`SERVER_NAME`] and a client certificate
-/// for `node_id`, and writes them under `dir` (created if missing).
+/// that names `node_id` (as its one DNS subjectAltName, which the server binds to the
+/// daemon's `Hello`, and as its common name), and writes them under `dir` (created if
+/// missing).
 ///
 /// # Errors
 /// Generation fails, or a file cannot be written.
@@ -70,7 +72,11 @@ pub fn write(dir: &Path, node_id: &str) -> Result<PkiFiles, PkiError> {
         "kbf integration server",
         ExtendedKeyUsagePurpose::ServerAuth,
     )?;
-    let (client_cert, client_key) = leaf(Vec::new(), node_id, ExtendedKeyUsagePurpose::ClientAuth)?;
+    let (client_cert, client_key) = leaf(
+        vec![node_id.to_owned()],
+        node_id,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    )?;
 
     let create = std::fs::create_dir_all(dir);
     create.map_err(|source| PkiError::Write {

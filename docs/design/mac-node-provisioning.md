@@ -82,11 +82,13 @@ This design builds on the code on `main`, read at the time of writing.
   the native driver's tests there. **No workflow publishes a binary for any platform,
   and nothing signs one.**
 - **The worker protocol** has no drain message (listed as planned in
-  [worker-protocol.md](worker-protocol.md#planned)). The server registers a node by the
-  `node_id` its `Hello` carries and **does not check it against the client
-  certificate** (`kbf-server`, `worker.rs`, `session`). Any certificate the cell CA
-  signed can claim any node id, and because only the newest stream of a worker counts,
-  it can take over that node's session. There is no certificate revocation. Tracked in
+  [worker-protocol.md](worker-protocol.md#planned)). Under mutual TLS the server
+  checks that the client certificate's one DNS subjectAltName equals the `node_id` of
+  every `Hello` on the stream, so a certificate can speak only for its own node, and a
+  deny list of serials, public keys and node ids, read again at every check, refuses
+  leaked or retired certificates without a restart. There is no CRL or OCSP; short
+  lifetimes bound what the list misses. See
+  [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list) and
   [#79](https://github.com/komira-ai/komira-build-farm/issues/79).
 - **Fencing.** The daemon fences on `tokio::time::Instant`. Rust's `Instant` is
   `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS
@@ -816,12 +818,15 @@ farms' lists and the client's are updated in the same reviewed change.
   `Hello` with its node id and report, and is placed on according to its report.
 - **Leave:** SIGTERM. Running leases are killed and their directories removed. The
   scheduler gives them up after G = 60 s and places them again elsewhere.
-- **Identity:** not tied to the certificate. **Revocation:** none.
+- **Identity:** the certificate's DNS subjectAltName must equal the node id.
+  **Revocation:** the server's deny list. Both are described in
+  [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list).
 
-### 9.2 Join (planned)
+### 9.2 Join
 
-The binding and the deny list below are tracked in
-[#79](https://github.com/komira-ai/komira-build-farm/issues/79).
+Steps 1 to 3 and 5 are planned. Step 4, the binding, is in the server
+([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list),
+[#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
 
 1. `check` passes on the node: the profile is applied, and the identity is the
    expected one.
@@ -853,8 +858,9 @@ The binding and the deny list below are tracked in
   [#78](https://github.com/komira-ai/komira-build-farm/issues/78) is fixed (section
   5.1).
 - **Deregistration:** remove the node from the cell configuration, delete its key on the
-  node, and add its certificate serial to the server's **deny list** (planned; checked at
-  `Hello`). A certificate that is no longer used still verifies until it expires, so
+  node, and add its certificate serial to the server's **deny list**
+  ([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list); read again at
+  every `Hello`, `Heartbeat` and `Result`). A certificate that is no longer used still verifies until it expires, so
   the deny list is what closes the gap, and a short lifetime bounds it if the list is
   missed.
 
@@ -887,9 +893,9 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 | Node install | `apply` with a wrong SHA-256 refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
 | `--expect-probe` | two Xcodes with fixture probe outputs; one probe's value changes. That Xcode's `xcode` value and probe entry leave the report, and the other Xcode's stay | the whole node dropped on one mismatch; the mismatched Xcode still reported; the probe run with the daemon's environment or `SDKROOT` set instead of an action's |
 | Fence clock ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
-| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (today a resent `Hello` only updates capacity and its `node_id` is never read) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
+| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (both in `crates/kbf-server/tests/node_binding.rs` and `session.rs`) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
 | Drain | scheduler simulation: a drained node gets no new lease; running leases finish or are re-placed after the deadline | placement that ignores the drained flag |
-| Deny list | a denied serial's `Hello` is refused, also on reconnect | the list read only at server start |
+| Deny list | a denied serial's `Hello` is refused, also on reconnect; an open stream's next `Heartbeat` or `Result` ends it, and the `Result` never reaches the action cache (`node_binding.rs`) | the list read only at server start; a `Result` not checked |
 
 **What a hosted runner can and cannot prove.** Hosted macOS runners are virtual
 machines.
@@ -919,7 +925,7 @@ machines.
 |---|---|
 | The daemon's flags, LaunchDaemon fit, SIGTERM behaviour, macOS report entries, native driver gaps | read in the code on `main` |
 | No workflow publishes or signs a binary | read in `.github/workflows` |
-| The server does not tie node id to certificate; no revocation | read in `kbf-server` and `worker.proto` |
+| The server ties node id to the certificate's DNS subjectAltName and refuses what its deny list names ([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)) | read in `kbf-server` (`identity.rs`, `worker.rs`) and tested in `crates/kbf-server/tests/node_binding.rs` |
 | A result is accepted only from the current lease holder | read in `kbf-server` (`farm.rs`, `report`) |
 | `Instant` is `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS | Rust documentation |
 | Neither clock advances during suspend | Linux `clock_gettime(2)`, macOS `clock_gettime(3)`. Not tested on a node |
