@@ -53,7 +53,8 @@ role (`--role=all`). The flags are:
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
   ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
   reach it; writes need the token in `--api-token-file` (owner-only file), come from
-  loopback, and carry no `Origin` header.
+  loopback, and carry no `Origin` header. Run `kbf-server` as a user other than
+  `kbf-daemon`'s and its lease users', or builds on the same host can read the token.
 
 **`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
 outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and
