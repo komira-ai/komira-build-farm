@@ -1,0 +1,417 @@
+# Fleet updates: the security model
+
+This is the security half of [fleet-updates.md](fleet-updates.md): who may change a
+node's software, what each component may do, the keys and credentials involved, the
+MDM gate, how a node proves who it is, and what still cannot be defended. Everything
+here is **planned** unless a section says "today". Section numbers such as "4.2"
+without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefixed
+"S" refer to this document. Markers **[V]** and **[A]** mean what they mean there.
+
+## S1. Threat model
+
+### S1.1 What is protected
+
+- **Integrity of every node:** only software a reviewed change named, signed for that
+  node's pool and platform, is ever installed; nothing else runs as root.
+- **The cache:** only genuine, enrolled nodes may register as workers and write
+  results.
+- **The Mac fleet:** no single compromised component short of the MDM's host can erase
+  or force-update every Mac.
+- **Availability:** a platform stays above its floor; this one is weaker, and the
+  residual risks (S1.4) say where.
+
+### S1.2 Actors
+
+| Actor | Can reach | Trusted for |
+|---|---|---|
+| An action (any lease) | its sandbox, the network it was given; on a bare-metal Mac the rack network, since macOS has no network namespace | nothing |
+| A privileged Mac lease (`kbf-mac-admin=true`) | root on that Mac, by design | nothing; the Mac is treated as lost afterwards (S8) |
+| `kbf-daemon` | the worker stream, the helpers' sockets | running leases; not for installing software |
+| `kbf-server` | every daemon's stream, the gate, the CAS | choosing *when* and *where*; never *what* |
+| CI (GitHub Actions) | the signing keys through a short-lived identity (S2) | building and signing sets from reviewed changes |
+| The MDM host (NanoHUB and `kbf-mdm-gate`) | APNs, every Mac's bootstrap token | the Mac fleet; the root of trust for Macs |
+| An operator with the admin role | the API | everything the API allows, audited |
+
+### S1.3 What a compromised `kbf-server` can do
+
+- On a node, through `kbf-updater`: install a set CI signed **for that node's pool and
+  platform**, not expired, above the node's serial floor (S3.1). It cannot downgrade a
+  node, cross pools, or run a command of its choosing.
+- Through `kbf-mdm-gate` (S5): force-update one Mac per pool at a time to a build a
+  valid signed set names, and erase **one Mac at a time across the fleet**, within a
+  daily cap and never below the Mac floor, with an alert the server cannot suppress.
+- Obtain at most as many privileged-lease grants as the gate's erase budget allows
+  (S8): each gives root on one Mac, alerts natively, and ends in that Mac's erase,
+  which the gate schedules itself, so the server cannot keep the root by never asking.
+  Without the grant check in `kbf-mac-session`, a compromised server or daemon could
+  create an administrator lease user, and so get root, on every Mac at once.
+- Deny service: cordon, drain or hold every node, and erase up to two Macs a day
+  indefinitely (each costs 45-90 minutes of re-provisioning). That costs availability,
+  not integrity, and every write is audited.
+
+### S1.4 Residual risks (not defended here)
+
+- **The MDM's host.** Root on it, or its API key, can erase every Mac and push any
+  profile. It is the Mac fleet's root of trust, like the Apple Business Manager
+  administrator account. Where it runs is an open decision (S7).
+- **CI and the main branch.** A compromised CI, or a malicious change that is
+  reviewed and merged, can sign a set that gives root on every node of a pool. The
+  key that signs automatically covers only unprivileged `kbf-daemon` (S2.2); anything
+  that runs as root, the two helpers included, needs the platform key and an
+  operator's approval. With the KMS custody of S2.1 and the canary and soak (4.2)
+  that narrows the risk to a compromised approval or a malicious reviewed change; it
+  does not remove it. A compromised component key gives code execution as the daemon's
+  user on every node: no root (S4.3), but it can write wrong results into the cache
+  from every node. Only the canary and soak stand in the way.
+- **A known-bad set within its validity.** A node that has not yet learned the floor
+  that retires a bad set (S3.1) can still be moved to it until the set expires.
+- **Background Security Improvements** change a Mac's build, and may reboot it,
+  outside any rollout (7.2).
+- **A server that skips `Update`** and asks the gate to enforce directly can reboot a
+  Mac mid-lease. The gate's caps (S5.2) bound it to one Mac per pool at a time.
+- **A VM guest escape** lands as the uid of the VM host process. #85 section 6 states that
+  `kbf-vmm` runs as a dedicated non-admin uid outside the helpers' group, started
+  through `kbf-mac-session run` or its own launchd user, never as `_kbf` (S4.3).
+- **Linux join credentials have no hardware attestation.** A Linux node's identity
+  rests on the operator's provisioning job (S6); TPM-based attestation is a later
+  option, not designed here.
+- **Revocation is not instant.** A dropped CI key stays acceptable to a node until the
+  key statement it last saw expires (7 days, S2.3).
+- **Apple's push certificate** alone only wakes devices, so its theft has low impact.
+  A community CSR-signing service sees the CSR, not the private key; its risk is to
+  renewal (availability), not integrity. Renewal under a different Apple account
+  forces every Mac to re-enroll, so the same account is always used.
+
+## S2. Signing keys
+
+### S2.1 Custody
+
+- The signing keys live in a cloud KMS and never leave it. CI reaches them through
+  GitHub's OIDC token, exchanged for a short-lived KMS credential. The trust policy
+  pins the token's `repository`, `ref` (`refs/heads/main`), `job_workflow_ref` (the
+  signing workflow at `refs/heads/main`) and `event_name` (`push` or
+  `workflow_dispatch`). A pull request or a fork cannot sign. The platform key's
+  policy also requires the protected GitHub environment, whose deployment branches are
+  limited to `main`.
+- A deployment without a KMS may keep the keys as GitHub environment secrets limited
+  to `main` with required reviewers. That is weaker (the secret is readable by the
+  workflow that uses it) and the deployment's documentation says so.
+
+### S2.2 Two keys
+
+| Key | Signs | Who triggers it |
+|---|---|---|
+| component key | sets that change only `kbf-daemon` (and any later unprivileged kbf part) | every green, attested `main` build, automatically |
+| platform key | sets that change anything that runs as root or below: `kbf-updater`, `kbf-mac-session`, the OS, Xcode, the Metal toolchain, VM images, probes, the profile, firmware | a reviewed change, through the protected GitHub environment, after an operator's approval |
+
+`kbf-updater` checks that every artifact a set changes is covered by the key that
+signed it: a component-key set that names a new OS build is refused.
+
+### S2.3 Root key, rotation and recovery
+
+- An **offline root key** (ed25519, generated and kept offline by the operator, never
+  in CI) is the only key pinned on nodes at provisioning. It signs a short
+  **key statement**: the current component and platform public keys, a serial and an
+  expiry (7 days; the operator re-signs it weekly offline, and `kbf-alert` warns 2
+  days before the newest statement expires). CI publishes the statement with every set; `kbf-updater` accepts a set only
+  under a key named by the newest valid statement it has seen, and never accepts an
+  older statement.
+- **Rotation** is a new key statement signed by the root key. Nodes pick it up with
+  the next set; no node is touched by hand.
+- **A compromised CI key** is revoked by a key statement that drops it, then every
+  pool gets a new set (higher serial) so the floor moves past anything the old key
+  signed (S3.1). Until a node sees the new statement, the old one is valid for at most
+  its remaining lifetime: that is the revocation latency.
+- **A compromised root key** means re-provisioning trust on every node: on Macs, the
+  MDM installs a provisioning package with the new root key (or the Mac is erased and
+  re-enrolled); on Linux, the operator's provisioning job (the host image for bootc,
+  or the install script for pinned packages) installs it, over the BMC console where
+  the node is not trusted. That is the cost of a root compromise, and why the root key
+  stays offline.
+
+## S3. What a set must satisfy
+
+### S3.1 `kbf-updater`'s checks
+
+A set is installed only if all of these hold:
+
+1. its signature verifies under a key the newest root-signed key statement names, and
+   that key covers every artifact the set changes (S2.2);
+2. its `pool` and `platform` equal those pinned at provisioning;
+3. its `serial` is higher than the installed one (equal and identical is a no-op);
+4. it is not past its `expires` time (30 days by default). Re-signing a pool's current
+   set before then makes a new set with a new serial; for the platform key that needs
+   the same operator approval, one click per pool a month;
+5. its serial is not below the node's **floor**: every set carries `min_serial`, the
+   lowest serial of that pool still allowed. The updater keeps the highest
+   `min_serial` it has seen (from any set it staged) and refuses anything below it. A
+   rollback set raises the floor past the bad set, so a node that has seen the
+   rollback can never be moved to the bad set; a node that has not is protected by
+   expiry (S1.4);
+6. every artifact's SHA-256 matches. For a Linux snapshot set the packages' integrity
+   rests on apt's archive signature, not on the set: the set pins the snapshot and the
+   expected kernel package, and apt verifies what it downloads.
+
+Rollback is never a flag: it is a newer set naming old artifacts (4.3).
+
+### S3.2 Probes come from the verified set
+
+Client-defined probes (6.1) are Mac-only. Their commands and expected values come only
+from the set `kbf-updater` verified and installed, which it writes to a root-owned,
+read-only file; the daemon reads that file and never takes a probe from the server or
+from a set the server forwards. A probe runs as a lease-range user through
+`kbf-mac-session run` (S4.2), never as the daemon's own user, so it cannot reach the
+helpers.
+
+## S4. The root helpers
+
+### S4.1 `kbf-updater`
+
+A LaunchDaemon on Macs, a systemd unit on Linux, running as root. Three verbs:
+`status`; `stage <set>` (fetch and verify, change nothing installed); `apply <set>`
+(install, and reboot if the set says the step needs it). There is no `rollback` and no
+bare `reboot` verb, so **`kbf-updater`** never reboots a node without a signed set that
+requires it. (On Macs, `kbf-mac-session` also restarts the node for session switches
+and after a dirty scan; S4.2 limits those.) It keeps a state file (last applied set,
+in-progress step), so a crash mid-apply resumes or reports, never guesses.
+
+When an apply changes something the leak scan watches (a new Xcode in
+`/Applications`, a new profile), the updater always hands the new expected items to
+`kbf-mac-session` through a root-only file before it finishes, and before any reboot,
+so the boot scan of the next boot already expects them. The daemon cannot trigger
+that hand-over.
+
+### S4.2 `kbf-mac-session`
+
+Mac-only, LaunchDaemon, Full Disk Access granted by an MDM profile at provisioning.
+Fixed verbs,
+every argument restricted to the lease uid range (default 600-699 **[A]**):
+
+| Verb | Does |
+|---|---|
+| `user-create <lease> [grant]` | create `kbf-lease-<lease id>` (a name never reused): random password, no secure token, non-admin. An administrator only with a grant the helper verifies itself (S8) |
+| `run <lease> <fd-passed argv>` | start the action's process tree as that user; the daemon passes the argument vector and the stdio and lease-directory descriptors over the socket |
+| `session-login <lease>` | set auto-login to that user, then a userspace restart (or a full reboot) |
+| `session-idle` | clear auto-login, then the same restart: the Mac rests at the login window |
+| `kill-uid <uid>` | `launchctl bootout gui/<uid>` and `user/<uid>`, then kill every remaining process of a uid in the lease range |
+| `user-delete <lease>` | delete the user and sweep its state (below); refused while `kill-uid` still finds a process of that uid |
+| `scan` | the leak scan (10.2) against the stored baseline; returns the diff |
+| `baseline` | record the scan baseline; accepted only after a boot that followed an apply or an erase and before the first lease user of that boot |
+| `reboot-dirty` | reboot; accepted only when the helper's own last `scan` came back dirty |
+
+- **Sweep on delete.** A uid is reused once the range wraps, so `user-delete` removes
+  everything keyed by that uid or name that survives deleting the home: crontab
+  (`/usr/lib/cron/tabs`), `at` jobs (`/var/at`), Background Task Management entries,
+  per-uid launchd overrides, pending print jobs, and files the uid owns in macOS's
+  shared user folder and the temporary folders. That Background Task Management entries
+  can be removed per uid is **[A]**. Root's walk never follows a symbolic link (other
+  lease users may be active and could plant one): it opens each entry relative to its
+  parent without following links, and removes the link, not its target.
+- **Lease files owned by another uid.** The unprivileged daemon must read a lease's
+  outputs and delete its directory although the lease user wrote them. On Macs the
+  lease directory carries an inherited ACL entry granting `_kbf` read and delete, so
+  every file the lease user creates inherits it. On Linux the files belong to the
+  container's mapped uids; the daemon reads and removes them through `podman unshare`
+  (as `main` already removes directories) or an idmapped mount.
+- **Which leases get what.** Every Mac lease gets `user-create`, `run` and
+  `user-delete`. The session switch (L2) is only for whole-machine leases that need a
+  GUI session; the leak scan only for whole-machine leases.
+- **At boot**, before `kbf-daemon` may send `Hello`, the helper clears auto-login and
+  removes any leftover lease user (sweep, then a scan against a baseline that already
+  includes any items an apply handed over, S4.1), so a Mac that lost power mid-lease
+  never comes back logged in as a dead lease user.
+- **Baseline.** Qualification (4.2 step 8) records the baseline after the update's
+  reboot and before its first qualification lease.
+- It never touches a uid outside the range or the MDM's managed administrator, and it
+  cannot change installed software. `automationmodetool` runs once from the
+  provisioning profile, not through this helper.
+
+### S4.3 Who can reach a helper
+
+Both helpers listen on a Unix socket in a root-owned directory, mode 0750, group a
+**dedicated** group (`_kbf` in #76), never `staff`, which every macOS user is in;
+socket mode 0660. Two controls, the first being the one that matters:
+
+1. **No action, probe or VM runs under a uid in that group.**
+   - Mac: every action and probe runs as a lease user via `run`. On `main` the native
+     driver runs actions as the daemon's own user (`crates/kbf-driver-native/src/lib.rs`),
+     so `kbf-updater` ships on Macs only with the per-lease user.
+   - Linux: today rootless Podman runs containers with no `--userns`
+     (`crates/kbf-driver-container/src/podman.rs`), so a container's uid 0 is the
+     daemon's uid on the host, and only the mount and pid namespaces hide the socket.
+     The container driver therefore adds `--userns=auto` (subordinate uid ranges) or
+     `--userns=nomap`, so no container uid maps to the daemon's. Both helpers refuse
+     to start on a Linux node whose daemon uses `--driver native`.
+   - VMs: `kbf-vmm` (#85) runs as its own dedicated non-admin uid outside the group,
+     started through `kbf-mac-session run` or by its own launchd user, never as
+     `_kbf`.
+2. **Every connection's caller is checked.** This guards against stray binaries and
+   pid reuse; it does not stop code that already runs as the daemon's uid, which is
+   why control 1 comes first.
+   - Linux: `SO_PEERPIDFD` gives a pidfd for the caller, so the pid cannot be reused
+     between the check and the request; the uid must be the daemon's and the pidfd's
+     executable must hash to the installed `kbf-daemon`. `SO_PEERPIDFD` needs Linux
+     6.5 or later; that is the kernel floor for the helpers (Ubuntu 24.04's 6.8 meets
+     it), and on an older kernel the helpers do not start. The daemon sets
+     `PR_SET_DUMPABLE=0`, so another process of its uid cannot ptrace it.
+   - macOS: `kbf-daemon` and both helpers are signed with the hardened runtime,
+     without `get-task-allow` and with library validation, so `DYLD_INSERT_LIBRARIES`
+     and debugger attachment do not work. The helper reads the caller's audit token
+     (`LOCAL_PEERTOKEN`), gets the caller's code with `SecCodeCopyGuestWithAttributes`
+     and `kSecGuestAttributeAudit`, then checks it with `SecCodeCheckValidity` against
+     the `kbf-daemon` requirement (its cdhash) pinned by the installed set. The audit
+     token's pid version changes on `exec`, so a caller that connects and then
+     executes the genuine daemon is refused.
+   - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures (#76's lean) the
+     MDM's Full Disk Access profile can only pin `kbf-mac-session`'s cdhash, so a set
+     that changes `kbf-mac-session` also needs a new profile, pushed through the gate in
+     the same rollout step; with a Developer ID signature the profile would name the
+     team and survive updates.
+
+## S5. `kbf-mdm-gate`
+
+### S5.1 Why a gate
+
+NanoHUB's API with the escrowed bootstrap tokens can erase every Mac and enforce any
+build Apple signs. Handing it to `kbf-server`, a large network-facing process, would
+make a server compromise a fleet wipe. The gate is a small separate process with its
+own uid on the MDM's host; only it holds the API key. The alternative, the server
+holds the API and the design says so, costs nothing to build and was rejected.
+
+### S5.2 Its surface
+
+- **Caller authentication.** mTLS, and only the client certificate of `kbf-server`
+  (pinned by its public key) is accepted. It listens only on the interface the server
+  reaches, never on the network the Macs enroll on; lease users on bare-metal Macs
+  have the rack network, so an unauthenticated gate would be theirs to call.
+- **Inventory.** The gate keeps its own inventory per Mac: the serial from Apple
+  Business Manager (through NanoDEP), the platform UUID from the Mac's first MDM
+  enrollment, and the pool from the operator's configuration of the gate. Every verb
+  refuses a serial not in it.
+- `enforce <serial> <set>`: applies every check of S3.1 that does not need the node
+  (signature under the key statement, the platform key, pool and platform, `expires`,
+  and a per-pool serial floor the gate keeps itself from every set it has seen), then
+  posts the enforcement for exactly the set's build. Refused while another enforcement
+  in the same pool is outstanding, or if the Macs checked in and not being erased or
+  updated would drop below the gate's Mac floor.
+- `grant-admin <serial> <lease id>`: for a privileged lease (S8), only if an erase is
+  still within today's cap; it reserves that erase and returns a grant signed with the
+  gate's own key, naming the serial, the lease id and a 1-hour expiry. **The gate
+  itself schedules `EraseDevice` for that serial** at the grant's time plus the
+  maximum privileged-lease duration; the server can only bring it forward, never
+  cancel it, and the Mac does not count toward the gate's floor until it re-enrolls.
+  The grant key is held only by the gate's uid on the MDM host; its public key reaches
+  Macs in an MDM profile. Rotation is a new profile, and Macs accept either key during
+  the overlap. A grant is single-use: `kbf-mac-session` records used lease ids across
+  reboots.
+- `withdraw <serial>`: removes an outstanding enforcement.
+- `erase <serial> <reason>`: **one Mac at a time across the fleet**: refused while any
+  other erase is outstanding (until that Mac re-enrolls and checks in, or 24 h pass),
+  beyond a daily cap (default 2), or below the floor.
+- Status reads: enrollment, DDM status, last check-in.
+- **Alerts of its own.** Every erase, enforcement and grant is sent by the gate itself to the
+  native alerting path and written to its own audit log, so a compromised server
+  cannot hide one.
+
+## S6. Enrollment and node identity
+
+- **Join credentials are per device and hardware-attested.** The join credential is a
+  certificate issued through DDM's ACME configuration with Apple's hardware-bound
+  device attestation (Apple silicon, macOS 14 or later): the private key lives in the
+  Secure Enclave and Apple attests the device's serial and UDID. It is issued only for
+  a serial in the gate's inventory, and names that serial and platform UUID. That the
+  chosen ACME server supports Apple's attestation challenge is **[A]**, to check before
+  P3. The MDM's own SCEP enrollment uses a dynamic, per-device challenge, never a
+  static one.
+- **The daemon uses the key without holding it.** On `main` the daemon loads its
+  client identity from PEM files (`crates/kbf-daemon/src/config.rs`, `TlsFiles::load`).
+  On Macs it instead signs its TLS handshake through Security.framework with the
+  keychain identity (a custom signer), and the key's access is limited to
+  `kbf-daemon`'s code requirement. Root, a privileged lease's included, can then use
+  the key while it runs on that Mac but never copy it elsewhere (S8).
+- **Identity is bound to the credential.** The server takes a node's serial and
+  platform UUID from its join credential, not from anything the node reports; a
+  `NodeStatus` that disagrees quarantines the node. One serial binds to at most one
+  live identity: a second join with that serial is refused and alerts. The gate is
+  only ever asked about the credential's serial, so a compromised Mac cannot get
+  another Mac erased or enforced through an honest server.
+- Linux nodes get their join credential from the operator's provisioning job; it
+  names their machine id and, where present, the board serial, with the same one-live-
+  identity rule. It has no hardware attestation (S1.4).
+
+## S7. Where the MDM and the gate run: an open decision
+
+Today's ruling takes no server out of the build pool, and every Linux node is also a
+worker. The MDM's host holds the APNs certificate, every bootstrap token, the SCEP CA
+and the ABM token, so the choice matters:
+
+| Option | What | Risk |
+|---|---|---|
+| A. Dedicated node | one Linux node runs the MDM and the gate, with no `kbf-server` role, and is excluded from action placement | an exception to "no servers out of the pool" for one node |
+| B. On a worker | the MDM and gate run on a worker under their own uid, beside actions | a container escape plus a local root exploit on that node gives the whole Mac fleet |
+
+**Open CEO decision. Lean: A**, since its cost is one node's build capacity and B
+turns one escape into the loss of every Mac. Either way, the host never runs
+`kbf-server`, and the enrollment endpoints must be reachable on the rack network
+(7.6).
+
+## S8. Privileged Mac leases
+
+A privileged lease (`kbf-mac-admin=true`) has an administrator lease user and so can
+reach root: it can use (not copy, S6) the node's join credential, replace the helpers, or block MDM
+traffic so an erase never arrives. Therefore:
+
+- The front admits `kbf-mac-admin` only from a client with an explicit
+  `mac-admin` permission in the server's configuration.
+- The scheduler admits a privileged lease only when the gate has erase budget left.
+- **The admin user needs a grant the helper verifies itself.** The server asks the
+  gate for `grant-admin` (S5.2), which reserves an erase; `kbf-mac-session` creates an
+  administrator only if the grant's signature verifies under the gate's public key
+  (installed by the MDM at provisioning) and it names this Mac's serial and this lease
+  id, unexpired and not used before. The daemon's or the server's word is not enough.
+- When the lease ends, the server at once revokes that node's identity and join
+  credential and quarantines it, and may ask the gate to erase now. The erase does not
+  depend on that request: the gate already scheduled it with the grant (S5.2). The
+  node is readmitted only with a fresh credential, after the gate has seen a fresh
+  enrollment of that serial; a Mac whose erase never arrives stays out and alerts.
+
+## S9. Credentials and roles
+
+| Role | Holder | May |
+|---|---|---|
+| `admin` | operators | every `/v1` write, including `accept_outage`, a lower `min_serving`, `canary=0` and other strategy overrides |
+| `rollout` | CI | `POST /v1/rollouts` with only `target` (a signed set digest) and a pool `selector`; the strategy is the server's per-pool policy |
+| `daemon` | each node's join credential | the worker stream only |
+
+The `rollout` credential is short-lived: CI exchanges its GitHub OIDC token, bound to
+repository, `main` and the workflow, for a token valid for minutes. A request in the
+`rollout` role that carries any strategy field is refused. Today the only roles are
+`Daemon` and `Client` (`crates/kbf-meta/src/model.rs`); all of this is planned.
+
+## S10. Tests
+
+Each with the planted mutant that must turn it red:
+
+| Test | Mutant |
+|---|---|
+| `kbf-updater` refuses a replayed older set, and one below the floor | skip the serial or floor check |
+| `kbf-updater` refuses an expired set | skip the expiry check |
+| `kbf-updater` refuses a set for another pool or platform | skip the pool check: a Mac set applies on a Linux test node |
+| `kbf-updater` refuses an unsigned set, one signed by a key no root statement names, and a component-key set that changes the OS | skip key coverage |
+| An action is refused at each helper's socket | socket 0666; action as the daemon's uid; caller check removed |
+| A container action's host uid is not the daemon's | drop `--userns` |
+| A caller that connects and then executes the genuine daemon is refused (macOS) | check the cdhash by pid instead of the audit token |
+| The helpers refuse to start beside `--driver native` on Linux | drop the check |
+| A `rollout`-role request with a strategy field is refused | accept strategy from `rollout` |
+| The gate refuses an unauthenticated caller, a serial outside its inventory, a second outstanding erase or enforcement, an erase past the cap, and one below the floor | drop the outstanding-erase check |
+| The gate alerts on an erase even when the server sends no alert | route gate alerts through the server |
+| A node reporting a different serial than at first join is quarantined | accept the new serial |
+| A privileged lease's node is quarantined and its credential revoked at lease end | skip the revocation |
+| `user-delete` removes a planted crontab, `at` job and login item of the uid, and does not follow a planted symlink out of the shared user folder | follow links in the sweep |
+| A probe runs as a lease-range uid, from the installed set only | run probes as the daemon's user |
+| `kbf-updater` refuses a component-key set that changes `kbf-updater` or `kbf-mac-session` | let the component key cover the helpers |
+| `user-create` makes an administrator only with a valid, unused gate grant for this serial and lease | trust an admin flag from the daemon |
+| The gate erases a granted Mac with no erase request from the server | leave the erase to the server |
+| The gate refuses `enforce` of an expired set or one below its own pool floor | skip the gate's expiry check |
+| A second join with an already-bound serial is refused and alerts | bind identity from `NodeStatus` |
+| An apply that adds an Xcode is followed by a clean boot scan | hand over the expected items after the reboot |

@@ -29,8 +29,12 @@ What a Linux daemon reports today:
 | `cpu.features` (repeated) | every CPU feature flag, in the kernel's names | `/proc/cpuinfo` |
 | `drivers` (repeated) | the execution drivers this daemon offers | the daemon's runtime |
 
-A daemon on another operating system refuses to start: macOS detection arrives with the
-macOS drivers (**planned**), though `kbf-caps` already parses macOS `sysctl` output.
+A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
+parses into `cpu.features` and `isa_level`), `hw.ncpu` (`cpus`), `hw.memsize`
+(`mem_gib`), `hw.pagesize` (`page_size`) and `machdep.cpu.brand_string` (`cpu.model`,
+reported on macOS only), with `os` = `macos` and `arch` = `arm64`. It reports `gpu` = 0:
+`kbf-caps` can count the integrated GPU (`gpus_from_macos_sysctl`), but the daemon does
+not offer it for booking. A daemon on any other operating system refuses to start.
 
 `cpus` and `mem_gib` are the whole machine. They are resources, not capabilities: the
 scheduler books against them and there are no slots (see
@@ -102,12 +106,13 @@ Each key has one typed comparison:
 | `cpus`, `mem_gib`, `nvme_gib` | the node has at least this amount |
 | `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `label.<k>` | exact |
 | `xcode` | membership: the node reports one `xcode` entry per installed Xcode build, and the request names one of them |
+| `os_build` | exact; **planned**: today the front drops it as an unknown name, so it matches every node (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)) |
 
-Every other key may appear once. A Mac with two Xcodes installed serves an action
-that names either build, and the native driver runs it with that Xcode selected
-(`DEVELOPER_DIR`; see [platform-properties.md](../platform-properties.md#xcode)).
- An unknown key, a value that does not parse, or a
-repeated key is refused, so a typo fails loudly instead of matching nothing forever.
+Every other key may appear once. An unknown key, a value that does not parse, or a
+repeated key is refused, so a typo fails loudly instead of matching nothing forever. A
+Mac with two Xcodes installed serves an action that names either build, and the native
+driver runs it with that Xcode selected (`DEVELOPER_DIR`; see
+[platform-properties.md](../platform-properties.md#xcode)).
 
 **Reserved keys** ask for a kind of capacity, not a hardware fact, and are skipped by
 the matcher:
@@ -189,9 +194,13 @@ spelling is REAPI's `Arch`. One name in two spellings is refused.
   `INVALID_ARGUMENT` naming the closest known key; today properties that are not
   capability keys are ignored, so a misspelt `OSFamilly` matches every worker.
 - **More report entries:** `cpu.model` (a human name for the microarchitecture),
-  `nvme_gib`, `gpu`, `os_image`, the SDKs of each Xcode on macOS, the images already on the machine, and
+  `nvme_gib`, `gpu`, `os_image` (on Linux), `os_build` and the SDKs of each Xcode on
+  macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)), the
+  images already on the machine, and
   virtualization support (reported only, for a later VM driver).
 - **Labels** added by operators on top of detected facts, matched as `label.<k>`.
+- **Client-defined probes** (`probe.<k>`) are status values, never report entries or
+  request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
 - **Platform aliases:** named, immutable sets of properties (for example an
   architecture plus a default image), so a client can name a platform briefly and an
   alias's bytes, and so its action digests, never change once used.
