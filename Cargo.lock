@@ -1434,6 +1434,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-updater"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "clap",
+ "hex",
+ "libc",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

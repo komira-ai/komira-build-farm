@@ -43,6 +43,9 @@ rand_chacha = "0.10.0"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
 reqwest = { version = "0.13.5", default-features = false }
+# ed25519 checks of software sets and key statements (kbf-updater). Already in the tree
+# through rustls.
+ring = "0.17.14"
 roxmltree = "0.21.1"
 # The MDM gate's mutual-TLS listener, on the ring provider tonic's `tls-ring` uses too.
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
