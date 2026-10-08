@@ -12,7 +12,8 @@
 //!   names another build, or the deadline plus the macOS return deadline passes. A
 //!   gate that cannot be reached is reported and polled again; it ends nothing.
 //! - [`stale_enforcements`] and [`reconcile`]: at startup every outstanding
-//!   enforcement that matches no durable `updating` step is withdrawn (4.1).
+//!   enforcement that matches no durable `updating` step is withdrawn (4.1), and so is
+//!   one whose build Apple's catalogue no longer lists (7.2).
 //! - [`updates_for`]: the catalogue's newer releases for a Mac, and when its own build
 //!   leaves the catalogue; [`expires_soon`] is the 14-day alert (7.2).
 
@@ -158,20 +159,29 @@ where
     }
 }
 
-/// The Macs whose outstanding enforcement matches no durable `updating` step:
-/// `expected` maps each Mac a rollout is updating to the build its step names.
+/// The Macs whose outstanding enforcement matches no durable `updating` step, or
+/// names a build Apple's catalogue no longer lists (7.2: a declaration naming a
+/// version no longer available is removed). `expected` maps each Mac a rollout is
+/// updating to the build its step names. A catalogue the gate has never read lists
+/// nothing and proves nothing, so it withdraws nothing.
 #[must_use]
 pub fn stale_enforcements(
     inventory: &Inventory,
     expected: &BTreeMap<Serial, String>,
 ) -> Vec<Serial> {
+    let catalogue = &inventory.catalogue;
+    let withdrawn_by_apple = |build: &str| {
+        catalogue.fetched_at_unix_ms.is_some()
+            && !catalogue.entries.iter().any(|e| e.build == build)
+    };
     inventory
         .macs
         .iter()
         .filter(|mac| {
-            mac.enforcement
-                .as_ref()
-                .is_some_and(|e| expected.get(&mac.serial) != Some(&e.target_build))
+            mac.enforcement.as_ref().is_some_and(|e| {
+                expected.get(&mac.serial) != Some(&e.target_build)
+                    || withdrawn_by_apple(&e.target_build)
+            })
         })
         .map(|mac| mac.serial.clone())
         .collect()
@@ -217,7 +227,15 @@ pub fn updates_for(mac: &MacStatus, catalogue: &Catalogue) -> MacUpdates {
             .collect(),
         Err(_) => Vec::new(),
     };
-    newer.sort_by(|a, b| b.product_version.cmp(&a.product_version));
+    // Apple lists a release in both lists, and one version may carry several builds:
+    // sorting by (version, build) makes every copy of a build a neighbour, and the
+    // public copy sorts first within them, so `dedup_by` keeps it.
+    newer.sort_by(|a, b| {
+        b.product_version
+            .cmp(&a.product_version)
+            .then_with(|| a.build.cmp(&b.build))
+            .then_with(|| b.public.cmp(&a.public))
+    });
     newer.dedup_by(|a, b| a.product_version == b.product_version && a.build == b.build);
     let current_build_expires = catalogue
         .entries

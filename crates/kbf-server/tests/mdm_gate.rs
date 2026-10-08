@@ -571,6 +571,67 @@ async fn install_profile_names_only_a_digest() {
     );
 }
 
+/// Catches: an installed profile with no identifier taken as success.
+#[tokio::test]
+async fn an_installed_profile_without_an_identifier_is_refused() {
+    let h = harness().await;
+    let client = GateClient::new(&h.endpoint).unwrap();
+    let digest = Sha256Hex::new("ab".repeat(32)).unwrap();
+    h.gate.script().profile = Some(pb::ProfileResponse {
+        outcome: Some(profile_response::Outcome::Installed(pb::ProfileInstalled {
+            identifier: String::new(),
+        })),
+    });
+    assert_eq!(
+        client.install_profile(&serial("C02X"), &digest).await,
+        Err(GateError::Malformed(
+            "the profile answer for C02X has no identifier".to_owned()
+        ))
+    );
+}
+
+/// Catches: a status answer that lists one Mac twice (`Inventory::mac` would take
+/// the first and `reconcile` would act on both), or a Mac the server did not ask
+/// about, taken as data. Asking for every Mac (no serials) accepts any distinct Mac.
+#[tokio::test]
+async fn a_status_answer_lists_each_mac_once_and_only_those_asked_for() {
+    let h = harness().await;
+    let client = GateClient::new(&h.endpoint).unwrap();
+    let macs = |serials: &[&str]| pb::StatusResponse {
+        macs: serials
+            .iter()
+            .map(|s| pb::MacStatus {
+                serial: (*s).to_owned(),
+                ..pb::MacStatus::default()
+            })
+            .collect(),
+        catalogue: None,
+    };
+
+    h.gate.script().status = Some(macs(&["C02X", "C02Y", "C02X"]));
+    assert_eq!(
+        client.status(&[]).await,
+        Err(GateError::Malformed(
+            "the status answer lists C02X twice".to_owned()
+        ))
+    );
+
+    h.gate.script().status = Some(macs(&["C02X", "C02Y"]));
+    assert_eq!(
+        client.status(&[serial("C02X")]).await,
+        Err(GateError::Malformed(
+            "the status answer lists C02Y, which was not asked for".to_owned()
+        ))
+    );
+    let all = client.status(&[]).await.unwrap();
+    assert_eq!(all.macs.len(), 2);
+    let asked = client
+        .status(&[serial("C02X"), serial("C02Y")])
+        .await
+        .unwrap();
+    assert_eq!(asked.macs.len(), 2);
+}
+
 /// Catches: a gate failure, on any verb, passed on as an answer.
 #[tokio::test]
 async fn a_failed_call_is_unavailable() {

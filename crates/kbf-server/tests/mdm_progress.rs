@@ -422,3 +422,71 @@ fn a_pinned_build_alerts_14_days_before_it_expires() {
     assert!(expires_soon(expires, day(0)));
     assert!(expires_soon(expires, day(-3)));
 }
+
+/// Catches: a release offered twice when one version has two builds and Apple's feed
+/// lists both in both lists (`[v b1 public, v b2 public, v b1, v b2]`, the real
+/// feed's shape), so the copies of one build are not neighbours after a sort by
+/// version; and the managed copy kept where a public one exists.
+#[test]
+fn a_build_listed_in_both_lists_is_offered_once_preferring_the_public_entry() {
+    let catalogue = Catalogue {
+        fetched_at_unix_ms: Some(1),
+        entries: vec![
+            entry("27.0.1", "26A434", "2027-01-06", true),
+            entry("27.0.1", "26A5434", "2027-01-06", true),
+            entry("27.0.1", "26A434", "2027-01-06", false),
+            entry("27.0.1", "26A5434", "2027-01-06", false),
+            entry("27.0", "26A400", "2027-01-06", false),
+            entry("27.0", "26A400", "2027-01-06", true),
+        ],
+    };
+    let newer: Vec<(String, String, bool)> =
+        updates_for(&mac("C02X", "26.7", "25G1", None), &catalogue)
+            .newer
+            .into_iter()
+            .map(|e| (e.product_version.to_string(), e.build, e.public))
+            .collect();
+    let public = |v: &str, b: &str| (v.to_owned(), b.to_owned(), true);
+    assert_eq!(
+        newer,
+        vec![
+            public("27.0.1", "26A434"),
+            public("27.0.1", "26A5434"),
+            public("27.0", "26A400"),
+        ]
+    );
+}
+
+/// Catches: an enforcement kept although Apple's catalogue no longer lists its build
+/// (`fleet-updates.md` 7.2: a declaration naming a version no longer available is
+/// removed), and one withdrawn for that reason when the gate has never read the
+/// catalogue (an empty catalogue proves nothing).
+#[tokio::test]
+async fn reconcile_withdraws_an_enforcement_whose_build_left_the_catalogue() {
+    let macs = vec![
+        mac("A1", "27.0", "26A400", Some(enforcement("A1", "26A434"))),
+        mac("B2", "27.0", "26A400", Some(enforcement("B2", "26A440"))),
+    ];
+    let expected: BTreeMap<Serial, String> = [
+        (serial("A1"), "26A434".to_owned()),
+        (serial("B2"), "26A440".to_owned()),
+    ]
+    .into();
+    let read = Inventory {
+        macs: macs.clone(),
+        catalogue: Catalogue {
+            fetched_at_unix_ms: Some(1),
+            entries: vec![entry("27.0.1", "26A434", "2027-01-06", false)],
+        },
+    };
+    assert_eq!(stale_enforcements(&read, &expected), vec![serial("B2")]);
+    let gate = Memory::new(vec![Ok(read)], 0);
+    assert_eq!(reconcile(&gate, &expected).await, Ok(vec![serial("B2")]));
+    assert_eq!(*gate.withdrawn.lock().unwrap(), vec![serial("B2")]);
+
+    let never_read = Inventory {
+        macs,
+        catalogue: Catalogue::default(),
+    };
+    assert!(stale_enforcements(&never_read, &expected).is_empty());
+}

@@ -101,7 +101,7 @@ impl MdmGate for GateClient {
         };
         Box::pin(async move {
             let answer = client.status(request).await.map_err(unavailable)?;
-            inventory(answer.into_inner())
+            inventory(answer.into_inner(), serials)
         })
     }
 
@@ -161,6 +161,11 @@ impl MdmGate for GateClient {
         Box::pin(async move {
             let answer = client.profile(request).await.map_err(unavailable)?;
             match answer.into_inner().outcome {
+                Some(profile_response::Outcome::Installed(p)) if p.identifier.is_empty() => {
+                    Err(GateError::Malformed(format!(
+                        "the profile answer for {serial} has no identifier"
+                    )))
+                }
                 Some(profile_response::Outcome::Installed(p)) => Ok(p.identifier),
                 Some(profile_response::Outcome::Refused(r)) => Err(refused(&r)),
                 None => Err(no_outcome("profile")),

@@ -22,6 +22,7 @@
 pub mod client;
 pub mod progress;
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -199,9 +200,25 @@ pub(crate) fn enforcement(serial: &Serial, e: pb::Enforcement) -> Result<Enforce
     })
 }
 
-/// A `status` answer, checked.
-pub(crate) fn inventory(r: pb::StatusResponse) -> Result<Inventory, GateError> {
-    let macs = r.macs.into_iter().map(mac).collect::<Result<_, _>>()?;
+/// A `status` answer to a request for `asked` (every Mac if empty), checked: each Mac
+/// at most once, and only Macs that were asked for.
+pub(crate) fn inventory(r: pb::StatusResponse, asked: &[Serial]) -> Result<Inventory, GateError> {
+    let macs: Vec<MacStatus> = r.macs.into_iter().map(mac).collect::<Result<_, _>>()?;
+    let mut seen = BTreeSet::new();
+    for m in &macs {
+        if !seen.insert(&m.serial) {
+            return Err(GateError::Malformed(format!(
+                "the status answer lists {} twice",
+                m.serial
+            )));
+        }
+        if !asked.is_empty() && !asked.contains(&m.serial) {
+            return Err(GateError::Malformed(format!(
+                "the status answer lists {}, which was not asked for",
+                m.serial
+            )));
+        }
+    }
     let catalogue = r.catalogue.unwrap_or_default();
     let entries = catalogue
         .entries
