@@ -75,7 +75,7 @@ const SUSPEND_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
 /// On macOS, `CLOCK_MONOTONIC_RAW` is `mach_continuous_time`, which counts sleep;
 /// `CLOCK_UPTIME_RAW` (what `Instant` reads) does not.
 #[cfg(target_os = "macos")]
-const SUSPEND_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+const SUSPEND_CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("kbf-daemon knows no suspend-counting clock for this OS (issue #78)");
 
