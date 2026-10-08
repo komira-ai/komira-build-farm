@@ -144,6 +144,10 @@ fn worker_messages_round_trip() {
             lease_id: Some(LeaseId { term: 2, seq: 9 }),
             status: Some(Status::default()),
             action_result: Some(ActionResult::default()),
+            action_digest: Some(Digest {
+                hash: "cd".repeat(32),
+                size_bytes: 9,
+            }),
         })),
     };
     let back = DaemonMessage::decode(result.encode_to_vec().as_slice()).expect("decode");

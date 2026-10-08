@@ -6,7 +6,8 @@
 //! [`identity`](crate::identity) and issue #79; the capacity entries of the node report,
 //! and the entries placement matches platforms against: `arch` and the rest that
 //! [`caps`] reads), answered with `Welcome`, and registers the node: only this first
-//! `Hello` does (issue #25). The registration names the daemon process by the `Hello`'s
+//! `Hello` does (issue #25). `Welcome` names this process's term as its lease epoch
+//! (issue #137). The registration names the daemon process by the `Hello`'s
 //! `instance_id`: leases whose `Start` went to another process are given up only once it
 //! has fenced (issue #140). On the stream after that:
 //! - a resent `Hello` whose `node_id` is not the stream's node, or that the deny list
@@ -19,7 +20,8 @@
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23);
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
-//!   operation's current lease, and answered with a `ResultAck`;
+//!   operation's current lease, and only if the action it names (if any) is the one
+//!   that lease runs, and answered with a `ResultAck`;
 //! - a `NodeStatus` the deny list now refuses ends the stream, so it never reaches
 //!   the operator API. Otherwise it is kept as the node's newest software status,
 //!   unless a newer stream of the node has registered since;
@@ -128,6 +130,7 @@ where
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
+            epoch: self.farm.term(),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let stream =

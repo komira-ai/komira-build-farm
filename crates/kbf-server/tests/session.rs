@@ -258,7 +258,7 @@ async fn a_returning_daemon_keeps_the_leases_its_first_heartbeat_lists() {
     assert!(again.report(ran(Some(lease), &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
 
-    // Two more runs: the second one's lease (term 1, seq 2) is the one left out.
+    // Two more runs: the second one's lease (seq 2) is the one left out.
     let mut leases = Vec::new();
     for argv in ["re-adopted again", "not re-adopted"] {
         let job = Job::new(argv, &[]);
@@ -392,7 +392,14 @@ async fn a_listed_lease_the_server_gave_up_is_cancelled() {
     assert!(back.heartbeat(&[lost, retry]).await);
     assert_eq!(back.cancelled().await, Some(lost));
     assert_eq!(back.cancelled().await, None, "the retry was cancelled too");
-    let never = [LeaseId { term: 1, seq: 99 }, LeaseId { term: 2, seq: 0 }];
+    let term = retry.term;
+    let never = [
+        LeaseId { term, seq: 99 },
+        LeaseId {
+            term: term + 1,
+            seq: 0,
+        },
+    ];
     assert!(back.heartbeat(&[retry, never[0], never[1]]).await);
     assert_eq!(
         back.cancelled().await,

@@ -1,6 +1,7 @@
 //! The leader: the scheduler and the server's side of the worker protocol, as
 //! `kbf-server`'s farm core carries them out, with a log node in place of the
-//! in-process log, a clock that can stop, and a restart.
+//! in-process log, a clock that can stop, and a restart (a new process, with a new
+//! term).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -9,15 +10,23 @@ use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_sim::{Chance, Event, NodeId, NodeInput, Output, SimRng};
 use kbf_types::{
-    Answer, ControlRecord, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources,
+    Answer, ControlRecord, Digest, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources,
     StateMachine, WaiterId, WorkerId,
 };
 
 use super::check::Check;
 use super::{Ctx, Msg, Plan, TICK, log_id, request};
 
-/// `kbf-server`'s `SINGLE_NODE_TERM`: every process numbers leases from `(1, 0)`.
+/// The term of the first leader process.
 pub const TERM: u64 = 1;
+
+/// The term of leader incarnation `incarnation`, and the lease epoch its `Welcome`
+/// names. As `kbf-server`'s `process_term`, every process has its own term, after
+/// every earlier process's (issue #137).
+#[must_use]
+pub const fn term(incarnation: u64) -> u64 {
+    TERM + incarnation
+}
 
 const T_TICK: u64 = 0;
 const T_BOUNDARY: u64 = 1;
@@ -100,8 +109,8 @@ pub struct Leader {
     /// Streams registered in this incarnation, and the node id each claimed.
     streams: BTreeMap<(NodeId, u64), WorkerId>,
     newest_stream: BTreeMap<NodeId, u64>,
-    /// Leases whose `Start` was sent, and their operations (`State::started`).
-    started: BTreeMap<LeaseId, OperationId>,
+    /// Leases whose `Start` was sent, their operations and actions (`State::started`).
+    started: BTreeMap<LeaseId, (OperationId, Digest)>,
     next_index: u64,
     pending: BTreeMap<u64, ControlRecord>,
     pub callers: Vec<Caller>,
@@ -133,7 +142,7 @@ impl Leader {
             paused_total: Duration::ZERO,
             buffered: Vec::new(),
             incarnation: 0,
-            sched: Scheduler::new(TERM),
+            sched: Scheduler::new(term(0)),
             check: Check::new(plan.ctx, 0),
             past: Vec::new(),
             links: BTreeMap::new(),
@@ -243,14 +252,14 @@ impl Leader {
         self.feed(SchedEvent::Submit { waiter, request });
     }
 
-    /// A new process: an empty scheduler of the same term, no streams, a new log.
+    /// A new process: an empty scheduler of a new term, no streams, a new log.
     /// Every daemon's stream ends; every caller still waiting submits again.
     fn restart(&mut self) {
         self.stats.restarts += 1;
         self.incarnation += 1;
         let check = Check::new(self.ctx, self.incarnation);
         self.past.push(std::mem::replace(&mut self.check, check));
-        self.sched = Scheduler::new(TERM);
+        self.sched = Scheduler::new(term(self.incarnation));
         for (node, link) in std::mem::take(&mut self.links).into_values() {
             let stream = link.stream;
             self.send(node, Msg::Goodbye { stream });
@@ -328,6 +337,7 @@ impl Leader {
                 stream,
                 lease,
                 outcome,
+                action,
             } => {
                 let Some(node) = self.stream_node(&from, stream) else {
                     return;
@@ -336,7 +346,7 @@ impl Leader {
                     self.stats.lost_reports += 1;
                     return;
                 }
-                self.report(&from, &node, lease, outcome, &mut rng);
+                self.report(&from, &node, (lease, action), outcome, &mut rng);
             }
             other => panic!("leader got {other:?}"),
         }
@@ -394,7 +404,8 @@ impl Leader {
             newest_beat: 0,
         };
         self.links.insert(node.clone(), (from.clone(), link));
-        self.send(from, Msg::Welcome { stream });
+        let epoch = term(self.incarnation);
+        self.send(from, Msg::Welcome { stream, epoch });
         self.feed(SchedEvent::WorkerUp {
             worker: node,
             instance,
@@ -415,12 +426,13 @@ impl Leader {
     }
 
     /// `State::holder` and `Farm::report`: fed only from the node holding the
-    /// operation's current committed lease, else refused.
+    /// operation's current committed lease, and only if the action the result names
+    /// (if any) is that lease's, else refused.
     fn report(
         &mut self,
         from: &NodeId,
         node: &WorkerId,
-        lease: LeaseId,
+        (lease, action): (LeaseId, Option<Digest>),
         outcome: Outcome,
         rng: &mut SimRng,
     ) {
@@ -428,6 +440,8 @@ impl Leader {
             .started
             .get(&lease)
             .copied()
+            .filter(|(_, ran)| action.is_none_or(|named| named == *ran))
+            .map(|(op, _)| op)
             .filter(|op| match self.sched.state(*op) {
                 Some(OpState::Leased {
                     lease: held,
@@ -478,7 +492,7 @@ impl Leader {
                     self.send(log_id(), msg);
                 }
                 Effect::Start(s) => {
-                    self.started.insert(s.lease, s.operation);
+                    self.started.insert(s.lease, (s.operation, s.key.action));
                     let Some((to, link)) = self.links.get(&s.worker).cloned() else {
                         continue;
                     };

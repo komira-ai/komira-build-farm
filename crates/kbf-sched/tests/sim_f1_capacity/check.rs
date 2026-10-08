@@ -45,6 +45,22 @@ pub const TARGET: &str = "sim_f1_capacity";
 /// A request vector as three plain numbers: millicores, bytes, GPUs.
 type Axes = [u64; 3];
 
+/// Where an operation stands in the queue the shadow keeps: more urgent first, then
+/// (for custom levels of equal urgency) by name, then oldest first. Written from
+/// `Qos::urgency` and the level's name, not from `Qos`'s own `Ord`, so that a change to
+/// that ordering (which the scheduler's queue uses) shows up as I14 and I11, not as
+/// the same mistake on both sides.
+type QueueKey = (Reverse<u16>, Reverse<String>, OperationId);
+
+fn queue_key(qos: &Qos, id: OperationId) -> QueueKey {
+    (Reverse(qos.urgency()), Reverse(qos.name().to_owned()), id)
+}
+
+/// Whether `a` is more urgent than `b`, by the same rule as [`queue_key`].
+fn more_urgent(a: &Qos, b: &Qos) -> bool {
+    (a.urgency(), a.name()) > (b.urgency(), b.name())
+}
+
 fn axes(r: Resources) -> Axes {
     [r.cpu_millis, r.memory_bytes, r.gpus]
 }
@@ -174,6 +190,9 @@ pub struct Stats {
     pub full_rounds: u64,
     /// Rounds that hit the limit with work still placeable left over.
     pub cut_rounds: u64,
+    /// Operations behind a full round's cut that no live worker could run: their
+    /// verdict is still checked (I10, L2).
+    pub verdicts_past_cut: u64,
     /// Grants.
     pub grants: u64,
     /// Grants that left their worker with nothing free on some axis the request used.
@@ -211,7 +230,7 @@ pub struct Checker {
     needs: Vec<kbf_caps::Request>,
     ops: BTreeMap<OperationId, ShadowOp>,
     next_op: u64,
-    queue: BTreeSet<(Reverse<Qos>, OperationId)>,
+    queue: BTreeSet<QueueKey>,
     in_flight: BTreeMap<ActionKey, OperationId>,
     finished_keys: BTreeSet<ActionKey>,
     held: BTreeMap<LeaseId, Held>,
@@ -329,7 +348,7 @@ impl Checker {
         let op = self.ops.get_mut(&id).expect("exists");
         op.state = State::Queued;
         op.result_proposed = false;
-        self.queue.insert((Reverse(op.qos.clone()), id));
+        self.queue.insert(queue_key(&op.qos, id));
     }
 
     /// Drops `id`'s holding: its lease and its booking.
@@ -349,7 +368,7 @@ impl Checker {
     fn finish(&mut self, id: OperationId, state: State) {
         self.release(id);
         let op = self.ops.get_mut(&id).expect("exists");
-        self.queue.remove(&(Reverse(op.qos.clone()), id));
+        self.queue.remove(&queue_key(&op.qos, id));
         op.state = state;
         op.told = None;
         op.since = None;
@@ -564,10 +583,10 @@ impl Checker {
             self.stats.joins += 1;
             let op = self.ops.get_mut(&id).expect("in flight");
             op.waiters.push(waiter);
-            if request.qos > op.qos {
+            if more_urgent(&request.qos, &op.qos) {
                 if Self::queued(op) {
-                    self.queue.remove(&(Reverse(op.qos.clone()), id));
-                    self.queue.insert((Reverse(request.qos.clone()), id));
+                    self.queue.remove(&queue_key(&op.qos, id));
+                    self.queue.insert(queue_key(&request.qos, id));
                     self.stats.promotions += 1;
                 }
                 op.qos = request.qos.clone();
@@ -646,7 +665,7 @@ impl Checker {
                 refusing: false,
             },
         );
-        self.queue.insert((Reverse(request.qos.clone()), id));
+        self.queue.insert(queue_key(&request.qos, id));
         self.waiter_op.insert(waiter, id);
         self.touched_ops.insert(id);
     }
@@ -826,10 +845,10 @@ impl Checker {
                 format!("{name} holds {real:?}, the shadow says {shadow:?}")
             });
         }
-        let same = sched.queued().eq(self.queue.iter().map(|(_, id)| *id));
+        let same = sched.queued().eq(self.queue.iter().map(|(_, _, id)| *id));
         self.ensure(same, "I14", || {
             let real: Vec<OperationId> = sched.queued().take(12).collect();
-            let want: Vec<OperationId> = self.queue.iter().map(|(_, id)| *id).take(12).collect();
+            let want: Vec<OperationId> = self.queue.iter().map(|(_, _, id)| *id).take(12).collect();
             format!(
                 "the queue starts {real:?} ({} queued), the queued operations in (urgency, \
                  submission) order start {want:?} ({})",
@@ -902,7 +921,7 @@ impl Checker {
 
     /// The queued operations, most urgent first.
     pub fn queue(&self) -> impl Iterator<Item = OperationId> + '_ {
-        self.queue.iter().map(|(_, id)| *id)
+        self.queue.iter().map(|(_, _, id)| *id)
     }
 
     /// `id`'s request vector, as (millicores, bytes, GPUs).

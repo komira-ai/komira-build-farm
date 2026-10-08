@@ -9,7 +9,14 @@
 //! from its contract: I1 to I7, I10, I11, I13 and I14 of the catalog, and L2. At the
 //! end of each run it checks L1 (everything finished within the scenario's bound, every
 //! waiter answered once, nothing booked or queued) and the F1 base world's rule that no
-//! lease is given up. I15 is `seeds_replay`. Each scenario also asserts that its sweep
+//! lease is given up. I15 is `seeds_replay`.
+//!
+//! L1's bound is each scenario's `horizon`, set with a wide margin (F1.4's is 23,200 s),
+//! not the catalog's "backlog plus G plus one round". Here L1 proves that the work
+//! finishes and that the world quiesces; how soon work is placed is checked by the
+//! reference first fit every round (I11), not by L1.
+//!
+//! Each scenario also asserts that its sweep
 //! reached the situations it is about, so a check that cannot fail shows up as a
 //! failed sweep, not a green one.
 //!
@@ -21,10 +28,12 @@
 //! ```
 //!
 //! The scenarios are run by name (`scenarios::by_name`), so the replay takes the
-//! scenario as well as the seed. The CI sweep runs 4 to 48 seeds per scenario, about
-//! 6 s for the whole file in a debug build on the dev box, inside the catalog's 10 s
-//! budget. A longer sweep is ignored (300 seeds of every scenario took 61 s in a
-//! release build on the dev box):
+//! scenario as well as the seed. The CI sweep runs 4 to 48 seeds per scenario. The
+//! whole file takes about 3.5 s of test time in a debug build on a quiet dev box (tests
+//! in parallel), more on a loaded one, and about 12 s on a CI runner; `seeds_replay`
+//! replays two scenarios, not all ten, to stay inside the catalog's 10 s budget. A
+//! longer sweep is ignored (300 seeds of every scenario took 61 s in a release build on
+//! the dev box):
 //!
 //! ```text
 //! cargo test -p kbf-sched --release --test sim_f1_capacity -- --ignored --exact long_sweep
@@ -196,22 +205,36 @@ fn f1_9_capacity_shrinks_below_bookings_then_grows() {
 
 #[test]
 fn f1_10_more_than_one_round() {
-    let mut full = 0;
-    sweep(0..4, Rounds::default, |_, w| {
-        full += w.check.stats.full_rounds
+    let (mut full, mut past_cut, mut unservable, mut refused) = (0, 0, 0, 0);
+    sweep(0..4, Rounds::default, |s, w| {
+        full += w.check.stats.full_rounds;
+        past_cut += w.check.stats.verdicts_past_cut;
+        unservable += s.unservable;
+        refused += w.check.stats.refusals;
     });
     assert_eq!(full, 8, "two full rounds per seed");
+    // Each unservable request is behind both full rounds' cuts.
+    assert_eq!(past_cut, 2 * unservable, "verdicts checked past the cut");
+    assert_eq!(
+        refused, unservable,
+        "every unservable request refused, nothing else"
+    );
 }
 
 #[test]
 fn seeds_replay() {
-    for name in scenarios::NAMES {
+    // Two of the cheaper scenarios: one with dedup joins and promotions, one with
+    // capacity changes. Every scenario runs on the same world and checker, so the
+    // others replay by the same code; three runs of all ten would cost more than the
+    // rest of the file.
+    for name in ["F1.7", "F1.9"] {
         let hash = |seed| {
             let mut s = scenarios::by_name(name).unwrap();
             run(s.as_mut(), seed).trace_hash()
         };
-        assert_eq!(hash(3), hash(3), "{name}: seed 3 replays");
-        assert_ne!(hash(3), hash(4), "{name}: seeds 3 and 4 differ");
+        let three = hash(3);
+        assert_eq!(three, hash(3), "{name}: seed 3 replays");
+        assert_ne!(three, hash(4), "{name}: seeds 3 and 4 differ");
     }
 }
 

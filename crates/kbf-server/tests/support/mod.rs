@@ -164,6 +164,17 @@ impl Cell {
             MemoryStore::new(Capabilities::default()),
             KeyPrefix::default(),
         ));
+        Self::serve(cache, wait).await
+    }
+
+    /// A new server process over this cell's store and action cache, as after a
+    /// restart: a fresh scheduler, no daemon registered, nothing queued. This one is
+    /// left running; its daemons simply never reach the new one's state.
+    pub async fn restart(&self) -> Self {
+        Self::serve(Arc::clone(&self.cache), kbf_sched::UNSERVABLE_WAIT).await
+    }
+
+    async fn serve(cache: Arc<Cache<GateLog, MemoryStore>>, wait: Duration) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -349,6 +360,8 @@ pub struct FakeDaemon {
     inbound: Streaming<ServerMessage>,
     kept: VecDeque<server_message::Message>,
     seq: u64,
+    /// The lease epoch the Welcome named (0 before it).
+    pub epoch: u64,
 }
 
 impl FakeDaemon {
@@ -375,6 +388,7 @@ impl FakeDaemon {
             Some(server_message::Message::Welcome(w)) => {
                 assert_eq!(w.protocol_version, 1);
                 assert_eq!(w.heartbeat_interval_ms, INTERVAL.as_millis() as u64);
+                d.epoch = w.epoch;
                 Ok(d)
             }
             other => panic!("expected Welcome, got {other:?}"),
@@ -403,6 +417,7 @@ impl FakeDaemon {
             inbound,
             kept: VecDeque::new(),
             seq: 0,
+            epoch: 0,
         })
     }
 
@@ -568,6 +583,8 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         lease_id: lease,
         status: Some(rpc::Status::default()),
         action_result: Some(result.clone()),
+        // As a daemon that predates the field sends it: the server checks no action.
+        action_digest: None,
     }
 }
 
@@ -581,6 +598,7 @@ pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
             details: Vec::new(),
         }),
         action_result: None,
+        action_digest: None,
     }
 }
 

@@ -1,7 +1,8 @@
 //! The in-process world of the F1 family: the scheduler fed directly, every `Commit`
 //! fed straight back as committed, one-second ticks, and workers that always heartbeat
 //! (every [`HEARTBEAT`] seconds, listing every lease they run) and report each run's
-//! result when it ends. Each input and its effects go through the [`Checker`].
+//! result when it ends. Each input and its effects go through the [`Checker`], and both
+//! go into the trace hash.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -197,6 +198,9 @@ impl World {
         let mut pending = VecDeque::from([event]);
         while let Some(event) = pending.pop_front() {
             let input = Input::new(now, event);
+            // The trace covers every input as well as every effect, so two runs that
+            // fed different inputs never share a hash.
+            let _ = write!(self.trace, "{} in {:?};", self.t, input.event);
             let effects = self.sched.apply(input.clone());
             self.inputs += 1;
             self.check.observe(&input, &effects, &self.sched);

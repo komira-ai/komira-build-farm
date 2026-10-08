@@ -1,6 +1,6 @@
 //! The daemon model: streams, heartbeats, the self-fence T, the `Start` window W,
-//! results kept until acknowledged, `Cancel`, and the faults a machine has (death,
-//! suspend, reconnects, a changed node report).
+//! results kept until acknowledged, `Cancel`, the lease epoch of `Welcome`, and the
+//! faults a machine has (death, suspend, reconnects, a changed node report).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -93,6 +93,8 @@ pub enum End {
     Fenced,
     Cancelled,
     Died,
+    /// Killed on a `Welcome` of another lease epoch; nothing is reported.
+    Superseded,
 }
 
 /// One run of a lease on this worker.
@@ -158,6 +160,8 @@ pub struct WorkerStats {
     pub resent_hellos: u64,
     /// Fences done at a resume, before anything else.
     pub fenced_on_resume: u64,
+    /// Leases of an earlier lease epoch dropped on a `Welcome` (killed or forgotten).
+    pub superseded: u64,
 }
 
 pub struct Worker {
@@ -180,6 +184,10 @@ pub struct Worker {
     live: BTreeMap<LeaseId, usize>,
     /// Results kept until acknowledged.
     pub unacked: BTreeMap<LeaseId, Outcome>,
+    /// The lease epoch the newest `Welcome` named.
+    epoch: Option<u64>,
+    /// Each lease acted on: the lease epoch of its `Start` and the action it named.
+    granted: BTreeMap<LeaseId, (Option<u64>, Digest)>,
     pub starts: Vec<StartSeen>,
     timers: BTreeMap<u64, (usize, u64)>,
     next_timer: u64,
@@ -208,6 +216,8 @@ impl Worker {
             runs: Vec::new(),
             live: BTreeMap::new(),
             unacked: BTreeMap::new(),
+            epoch: None,
+            granted: BTreeMap::new(),
             starts: Vec::new(),
             timers: BTreeMap::new(),
             next_timer: T_RUN,
@@ -292,9 +302,10 @@ impl Worker {
 
     fn receive(&mut self, now: FarmTime, msg: Msg, rng: &mut SimRng) {
         match msg {
-            Msg::Welcome { stream } => {
+            Msg::Welcome { stream, epoch } => {
                 if stream == self.stream && !self.welcomed {
                     self.welcomed = true;
+                    self.new_epoch(now, epoch, rng);
                     self.confirm(now, self.hello_sent);
                     let kept: Vec<(LeaseId, Outcome)> =
                         self.unacked.iter().map(|(l, o)| (*l, *o)).collect();
@@ -335,8 +346,9 @@ impl Worker {
             Msg::ResultAck { lease, accepted } => {
                 if rng.chance(self.plan.lose_acks) {
                     self.stats.lost_acks += 1;
-                } else if self.unacked.remove(&lease).is_some() && !accepted {
-                    self.stats.refused += 1;
+                } else if self.unacked.remove(&lease).is_some() {
+                    self.granted.remove(&lease);
+                    self.stats.refused += u64::from(!accepted);
                 }
             }
             Msg::Goodbye { stream } => {
@@ -414,11 +426,38 @@ impl Worker {
         });
         let kept: Vec<(LeaseId, Outcome)> = self.unacked.iter().map(|(l, o)| (*l, *o)).collect();
         for (lease, outcome) in kept {
-            self.send(Msg::Report {
-                stream: self.stream,
-                lease,
-                outcome,
-            });
+            let msg = self.result(lease, outcome);
+            self.send(msg);
+        }
+    }
+
+    /// The `Result` of `lease`, naming the action of its `Start`.
+    fn result(&self, lease: LeaseId, outcome: Outcome) -> Msg {
+        Msg::Report {
+            stream: self.stream,
+            lease,
+            outcome,
+            action: self.granted.get(&lease).map(|g| g.1),
+        }
+    }
+
+    /// The lease epoch a `Welcome` named: the runs of every lease of another epoch are
+    /// killed and their results forgotten, unsent (`Daemon::new_epoch`).
+    fn new_epoch(&mut self, now: FarmTime, epoch: u64, rng: &mut SimRng) {
+        self.epoch = Some(epoch);
+        let stale: Vec<LeaseId> = self
+            .granted
+            .iter()
+            .filter(|(_, g)| g.0.is_some_and(|e| e != epoch))
+            .map(|(l, _)| *l)
+            .collect();
+        for lease in stale {
+            self.stats.superseded += 1;
+            self.granted.remove(&lease);
+            self.unacked.remove(&lease);
+            if let Some(i) = self.live.remove(&lease) {
+                self.stop(now, i, End::Superseded, rng);
+            }
         }
     }
 
@@ -452,6 +491,11 @@ impl Worker {
             incarnation,
             took,
         });
+        if matches!(took, Took::Ran | Took::Unavailable | Took::Resend) {
+            self.granted
+                .entry(lease)
+                .or_insert((self.epoch, start.key.action));
+        }
         match took {
             Took::Unavailable => {
                 let outcome = Outcome::Failed(Failure::Infra);
@@ -514,9 +558,11 @@ impl Worker {
             End::Finished => Outcome::Completed {
                 action_result: result_digest(&run.action, lease),
             },
-            End::Fenced | End::Cancelled | End::Died => Outcome::Failed(Failure::Infra),
+            End::Fenced | End::Cancelled | End::Died | End::Superseded => {
+                Outcome::Failed(Failure::Infra)
+            }
         };
-        if end != End::Died {
+        if !matches!(end, End::Died | End::Superseded) {
             self.unacked.insert(lease, outcome);
             self.report(lease, outcome, rng);
         }
@@ -527,11 +573,7 @@ impl Worker {
         if !self.welcomed {
             return;
         }
-        let msg = Msg::Report {
-            stream: self.stream,
-            lease,
-            outcome,
-        };
+        let msg = self.result(lease, outcome);
         if rng.chance(self.plan.repeat_reports) {
             self.send(msg.clone());
         }

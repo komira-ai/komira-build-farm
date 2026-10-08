@@ -36,6 +36,9 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
+# The Mac's verifier of the admin grant, so tests/mac_session_verifies.rs checks the
+# gate's grants against it directly.
+kbf-mac-session.workspace = true
 # kill(2) for the test that stops the gate with SIGTERM.
 libc.workspace = true
 rcgen.workspace = true
