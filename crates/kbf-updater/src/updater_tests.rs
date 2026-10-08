@@ -418,7 +418,7 @@ fn staging_takes_only_regular_files_that_match_their_digest() {
     // single-threaded updater, and every later request, forever.
     rustix::fs::mknodat(
         rustix::fs::CWD,
-        &artifacts.join(sha("u")),
+        artifacts.join(sha("u")),
         rustix::fs::FileType::Fifo,
         rustix::fs::Mode::from_raw_mode(0o600),
         0,
