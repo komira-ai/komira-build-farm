@@ -23,7 +23,7 @@ pub(crate) const CONTAINER_OWNER: &str = "1:1";
 /// The owner, in the same namespace, of the overlay directories once the container has
 /// stopped: id 0 there is the daemon's own user, so the driver reads every output (an
 /// action's `0600` file or `0700` directory among them) and removes the scratch itself.
-pub(crate) const DAEMON_OWNER: &str = "0:0";
+pub(crate) const DAEMON_OWNER: &str = "1:1";
 
 /// The container to create for one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
