@@ -8,7 +8,9 @@
 //! records how many lines and branches of each crate no test runs, and CI fails when
 //! either count rises: new code must be covered, or the change must cover as much
 //! existing code as it leaves uncovered. A percentage cannot enforce that, since
-//! partly covered new code can still raise it. The table CI prints also shows each
+//! partly covered new code can still raise it. CI also fails when either count falls
+//! below the file's, until the file is lowered to match, so the baseline never keeps
+//! slack for a later change to spend. The table CI prints also shows each
 //! crate's percentages and gap to 100%, the project's target.
 //!
 //! Percentages are floored to hundredths ([`Percent`]), so one uncovered line in a

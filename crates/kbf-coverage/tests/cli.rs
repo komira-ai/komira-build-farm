@@ -1,10 +1,11 @@
 //! The `kbf-coverage` binary end to end, on a small workspace built in the test's
 //! temporary directory (inside the target directory).
 //!
-//! Catches: the binary passing a run the ratchet fails (or the reverse), exiting 1 on a
-//! bad input instead of 2, a measured baseline that the binary cannot read back as
-//! passing, a directory under `crates/` without `Cargo.toml` taken for a crate, and a
-//! crate with no records left out of the table.
+//! Catches: the binary passing a run the ratchet fails (a crate missing more, or a
+//! baseline looser than measured) or the reverse, exiting 1 on a bad input instead of
+//! 2, a measured baseline that the binary cannot read back as passing, a directory
+//! under `crates/` without `Cargo.toml` taken for a crate, and a crate with no records
+//! left out of the table.
 //!
 //! Each test builds its own workspace in a fresh directory named for the test and the
 //! process, so no test reads a file an earlier run (or a concurrent one) left behind.
@@ -111,6 +112,33 @@ fn fails_when_a_crate_drops_below_its_baseline() {
         "{}",
         stdout(&o)
     );
+}
+
+/// The mutant this guards (issue 35): a baseline with slack passing. `a` misses 1 line
+/// but the file allows 2, and `b` has measured lines where the file says `-`; either
+/// would let a later change leave that much new code uncovered.
+#[test]
+fn fails_when_the_baseline_is_looser_than_measured() {
+    let root = workspace("loose");
+    for (baseline, want) in [
+        (
+            "a 2 0\nb 0 -\nempty - -\n",
+            "| a | 3/4 | 75.00 | 25.00 | 1 | 2/2 | 100.00 | 0.00 | 0 | 2 / 0 | BASELINE LOOSER THAN MEASURED (lines); copy coverage-baseline.measured |",
+        ),
+        (
+            "a 1 0\nb - -\nempty - -\n",
+            "| b | 10/10 | 100.00 | 0.00 | 0 | 0/0 | - | - | - | - / - | BASELINE LOOSER THAN MEASURED (lines); copy coverage-baseline.measured |",
+        ),
+    ] {
+        let o = run(&root, baseline, &[]);
+        assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
+        let out = stdout(&o);
+        assert!(out.contains(want), "{out}");
+        assert!(
+            out.ends_with("coverage ratchet: FAIL (1 crate(s) need attention; see status)\n"),
+            "{out}"
+        );
+    }
 }
 
 #[test]

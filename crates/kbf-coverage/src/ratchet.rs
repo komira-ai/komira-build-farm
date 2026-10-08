@@ -10,14 +10,17 @@
 //! the report lost it), or the baseline says `-` and it now misses anything (new code
 //! that tests do not fully cover). A workspace crate missing from the baseline, and a
 //! baseline crate missing from the workspace, fail too, so the file always names
-//! exactly the workspace's crates. A crate that passes but no longer matches its
-//! baseline (fewer misses, or measured code where the baseline says `-`) is marked so
-//! the baseline can be updated; that is a notice, not a failure.
+//! exactly the workspace's crates. A crate whose baseline is looser than what was
+//! measured (fewer misses, or measured code where the baseline says `-`) fails as well:
+//! the slack would let a later change leave that many items uncovered without failing,
+//! so a change that covers more must lower its line in the same pull request (copy the
+//! measured file the job writes). The baseline therefore always equals the
+//! measurement.
 //!
-//! What this enforces: no change raises a crate's uncovered count. A change that adds
-//! partly covered code fails unless it also covers as many existing items as it leaves
-//! uncovered. Deleting covered code lowers a crate's percentage without failing, since
-//! no item lost its test.
+//! What this enforces: no change raises a crate's uncovered count, and the file never
+//! keeps slack. A change that adds partly covered code fails unless it also covers as
+//! many existing items as it leaves uncovered. Deleting covered code lowers a crate's
+//! percentage without failing, since no item lost its test.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -94,9 +97,9 @@ impl fmt::Display for Metric {
 pub enum Status {
     /// Measured exactly as recorded.
     Ok,
-    /// Passes, but differs from the baseline (fewer misses, or measured code where the
-    /// baseline says `-`): the baseline can be updated.
-    Outdated,
+    /// The baseline is looser than measured for these metrics (fewer misses, or
+    /// measured code where the baseline says `-`): fails until the line is lowered.
+    Loose(Vec<Metric>),
     /// Misses more than the baseline for these metrics: fails.
     MoreMissed(Vec<Metric>),
     /// A workspace crate the baseline does not list: fails.
@@ -106,11 +109,9 @@ pub enum Status {
 }
 
 impl Status {
+    /// Every status but [`Status::Ok`] fails: the baseline must equal the measurement.
     pub fn fails(&self) -> bool {
-        matches!(
-            self,
-            Status::MoreMissed(_) | Status::Unrecorded | Status::Stale
-        )
+        !matches!(self, Status::Ok)
     }
 }
 
@@ -118,7 +119,14 @@ impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Status::Ok => f.write_str("ok"),
-            Status::Outdated => f.write_str("passes; update the baseline"),
+            Status::Loose(m) => {
+                let m: Vec<String> = m.iter().map(Metric::to_string).collect();
+                write!(
+                    f,
+                    "BASELINE LOOSER THAN MEASURED ({}); copy coverage-baseline.measured",
+                    m.join(", ")
+                )
+            }
             Status::MoreMissed(m) => {
                 let m: Vec<String> = m.iter().map(Metric::to_string).collect();
                 write!(f, "MORE MISSED THAN BASELINE ({})", m.join(", "))
@@ -157,17 +165,22 @@ impl Row {
             };
         };
         let now = Entry::of(m);
-        let mut failed = Vec::new();
-        if more_missed(r.lines, now.lines) {
-            failed.push(Metric::Lines);
+        let pairs = [
+            (Metric::Lines, r.lines, now.lines),
+            (Metric::Branches, r.branches, now.branches),
+        ];
+        let (mut more, mut loose) = (Vec::new(), Vec::new());
+        for (metric, recorded, measured) in pairs {
+            if more_missed(recorded, measured) {
+                more.push(metric);
+            } else if recorded != measured {
+                loose.push(metric);
+            }
         }
-        if more_missed(r.branches, now.branches) {
-            failed.push(Metric::Branches);
-        }
-        if !failed.is_empty() {
-            Status::MoreMissed(failed)
-        } else if now != r {
-            Status::Outdated
+        if !more.is_empty() {
+            Status::MoreMissed(more)
+        } else if !loose.is_empty() {
+            Status::Loose(loose)
         } else {
             Status::Ok
         }
@@ -314,15 +327,31 @@ mod tests {
     }
 
     /// Catches: each rule of the ratchet inverted or dropped (module docs): more misses
-    /// passing, data lost passing, uncovered new code passing under `-`, fewer misses
-    /// failing, and an unlisted or stale crate passing.
+    /// passing, data lost passing, uncovered new code passing under `-`, a loose
+    /// baseline (fewer misses, or measured code under `-`) passing or blamed on the
+    /// wrong metric, and an unlisted or stale crate passing.
     #[test]
     fn status_follows_the_ratchet_rules() {
         let half = cov(4, 2, 6, 3); // 2 lines and 3 branches missed
         let at = |l: u64, b: u64| rec(Some(l), Some(b));
         assert_eq!(row(Some(half), at(2, 3)).status(), Status::Ok);
-        assert_eq!(row(Some(half), at(3, 3)).status(), Status::Outdated);
-        assert_eq!(row(Some(half), at(2, 4)).status(), Status::Outdated);
+        assert_eq!(
+            row(Some(half), at(3, 3)).status(),
+            Status::Loose(vec![Metric::Lines])
+        );
+        assert_eq!(
+            row(Some(half), at(2, 4)).status(),
+            Status::Loose(vec![Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(half), at(3, 4)).status(),
+            Status::Loose(vec![Metric::Lines, Metric::Branches])
+        );
+        // A rise in one metric is the failure to report, even when the other is loose.
+        assert_eq!(
+            row(Some(half), at(1, 4)).status(),
+            Status::MoreMissed(vec![Metric::Lines])
+        );
         assert_eq!(
             row(Some(half), at(1, 3)).status(),
             Status::MoreMissed(vec![Metric::Lines])
@@ -345,7 +374,7 @@ mod tests {
         assert_eq!(row(Some(none), rec(None, None)).status(), Status::Ok);
         assert_eq!(
             row(Some(cov(1, 1, 0, 0)), rec(None, None)).status(),
-            Status::Outdated
+            Status::Loose(vec![Metric::Lines])
         );
         assert_eq!(
             row(Some(cov(3, 2, 0, 0)), rec(None, None)).status(),
@@ -377,11 +406,12 @@ mod tests {
     }
 
     /// Catches: a failing status reported as passing (or the reverse), which decides
-    /// the job's exit code.
+    /// the job's exit code; in particular a loose baseline passing (issue 35), which
+    /// would leave slack for a later change to spend.
     #[test]
-    fn only_problems_fail() {
+    fn only_an_exact_match_passes() {
         assert!(!Status::Ok.fails());
-        assert!(!Status::Outdated.fails());
+        assert!(Status::Loose(vec![Metric::Lines]).fails());
         assert!(Status::MoreMissed(vec![Metric::Lines]).fails());
         assert!(Status::Unrecorded.fails());
         assert!(Status::Stale.fails());
@@ -464,7 +494,7 @@ mod tests {
     fn status_labels() {
         let labels: Vec<String> = [
             Status::Ok,
-            Status::Outdated,
+            Status::Loose(vec![Metric::Branches]),
             Status::MoreMissed(vec![Metric::Lines, Metric::Branches]),
             Status::Unrecorded,
             Status::Stale,
@@ -476,7 +506,7 @@ mod tests {
             labels,
             [
                 "ok",
-                "passes; update the baseline",
+                "BASELINE LOOSER THAN MEASURED (branches); copy coverage-baseline.measured",
                 "MORE MISSED THAN BASELINE (lines, branches)",
                 "NOT IN BASELINE",
                 "NOT IN WORKSPACE",
