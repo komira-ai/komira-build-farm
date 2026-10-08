@@ -178,3 +178,116 @@ async fn a_start_after_a_suspend_past_t_is_refused() {
         "a Start ran without contact"
     );
 }
+
+/// Catches: offline, a run that ends after a resume past T reported before the fence is
+/// checked; its own success would go out after the next Welcome. The daemon waits for
+/// Welcome on a second stream when the clock jumps (the 300 ms sleep makes sure it is
+/// waiting there, not still connecting), the run ends while it still waits, and only
+/// then does the Welcome come: the resent Result must be the fence's ABORTED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offline_run_ending_after_a_suspend_past_t_reports_the_fence() {
+    let runtime = Arc::new(FakeRuntime::new(Duration::from_millis(1500)));
+    let (mut h, clock) = Harness::suspendable("suspend-offline-done", runtime, T, LONG).await;
+    let mut first = h.session().await;
+    first.hello().await;
+    first.welcome_every(INTERVAL);
+    first.start(1, 7, "action");
+    h.started(1).await;
+    first.close();
+
+    let mut second = h.session().await;
+    second.hello().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    clock.suspend(2 * T);
+    // The run (1.5 s) ends while the daemon still waits for Welcome.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    second.welcome_every(INTERVAL);
+    let (_, result) = second.result(PROMPT).await.expect("a Result");
+    assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 7 }));
+    assert_eq!(
+        code(&result),
+        Code::Aborted as i32,
+        "the run's own Result was sent"
+    );
+}
+
+/// Catches: contact counted from when a Welcome arrives rather than from when the Hello
+/// it answers was sent. The Hello goes out before a suspend past T and the Welcome comes
+/// after it: the server heard nothing sent after the resume, so contact stays lost and a
+/// Start is refused UNAVAILABLE. Nothing is running, so no fence hides the difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_welcome_for_a_hello_sent_before_a_suspend_does_not_restore_contact() {
+    let runtime = Arc::new(FakeRuntime::new(LONG));
+    let (mut h, clock) = Harness::suspendable("suspend-welcome", runtime, T, LONG).await;
+    let mut first = h.session().await;
+    first.hello().await;
+    first.welcome_every(INTERVAL);
+    assert_eq!(first.heartbeat().await.seq, 1);
+    first.close();
+
+    let mut second = h.session().await;
+    second.hello().await;
+    clock.suspend(2 * T);
+    second.welcome_every(INTERVAL);
+    // No window: the Start is judged on contact alone.
+    second.start_within(Some((1, 8)), 1, Duration::ZERO);
+    let (_, result) = second.result(PROMPT).await.expect("a Result");
+    assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 8 }));
+    assert_eq!(code(&result), Code::Unavailable as i32);
+    assert!(
+        h.runtime.started().is_empty(),
+        "a Start ran without contact"
+    );
+}
+
+/// Catches: a stream set up after a resume past T whose Hello goes out, and whose
+/// Welcome would count as contact, before the fence is checked. The server holds the
+/// new connection while the clock jumps, so nothing wakes the daemon between the jump
+/// and the connection completing; that completion must fence before the Hello is sent.
+/// (The Hello's send time is after the resume, so its Welcome would otherwise renew
+/// contact with the lease still running.) The daemon's own event order is the
+/// evidence: a check made only by a later wake would put `Fenced` after `HelloSent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_after_a_suspend_past_t_fences_before_its_hello() {
+    let runtime = Arc::new(FakeRuntime::new(LONG));
+    let (mut h, clock) = Harness::suspendable("suspend-connect", runtime, T, LONG).await;
+    let mut first = h.session().await;
+    first.hello().await;
+    first.welcome_every(INTERVAL);
+    first.start(1, 9, "action");
+    h.started(1).await;
+
+    h.hold_connections(true);
+    first.close();
+    h.event(PROMPT, |e| {
+        matches!(e, Event::Disconnected(_)).then_some(())
+    })
+    .await
+    .expect("the stream ends");
+    // Past the 100 ms reconnect wait: the daemon is connecting, held by the server.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    clock.suspend(2 * T);
+    h.hold_connections(false);
+
+    let mut fenced = false;
+    let (_, fenced_first) = h
+        .event(PROMPT, |e| match e {
+            Event::Fenced(ids) if ids == &[id(1, 9)] => {
+                fenced = true;
+                None
+            }
+            Event::HelloSent => Some(fenced),
+            _ => None,
+        })
+        .await
+        .expect("a Hello on the new stream");
+    assert!(fenced_first, "the Hello went out before the fence");
+    assert_eq!(h.runtime.killed(), [id(1, 9)]);
+
+    let mut second = h.session().await;
+    second.hello().await;
+    second.welcome_every(INTERVAL);
+    let (_, result) = second.result(PROMPT).await.expect("the fence's Result");
+    assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 9 }));
+    assert_eq!(code(&result), Code::Aborted as i32);
+}

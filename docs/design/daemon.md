@@ -40,6 +40,16 @@ acknowledged (a heartbeat, or the `Hello` a `Welcome` answered):
   is killed (all kills run together) and reported `ABORTED`, and any `Start` that
   arrives is refused with `UNAVAILABLE`.
 
+The fence clock, and the Start window below, count the time the machine spends
+suspended: they read `CLOCK_BOOTTIME` on Linux and `CLOCK_MONOTONIC_RAW`
+(`mach_continuous_time`) on macOS, and the daemon does not build for an OS without such
+a clock. Timers stop during suspend, so while a deadline is pending the daemon never
+sleeps longer than `recheck_every` (1 s): a resume past T is noticed within that tick.
+Whatever wakes the daemon (a server message, a heartbeat tick, a finished run, a stream
+that connects or answers, or that tick), the fence is checked first, so after such a
+resume no running lease reports its own result and no `Welcome` or acknowledgement
+renews contact before its leases are fenced.
+
 A `Start` that arrives after the window it names (14 s from the send of the heartbeat
 it names) is not run, reported or listed, and a `Cancel` from the server kills the
 named running lease; see [worker-protocol.md](worker-protocol.md).

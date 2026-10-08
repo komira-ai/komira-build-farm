@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use kbf_daemon::{
     Clock, Daemon, DaemonConfig, Event, FakeRuntime, Moment, NodeReport, Runtime, TlsFiles,
 };
@@ -374,6 +374,8 @@ pub struct Harness<R: Runtime = FakeRuntime> {
     pub report: NodeReport,
     daemon: JoinHandle<()>,
     server: JoinHandle<()>,
+    /// Whether the server takes up new connections; see [`Harness::hold_connections`].
+    open: tokio::sync::watch::Sender<bool>,
 }
 
 impl<R: Runtime> Drop for Harness<R> {
@@ -447,9 +449,18 @@ impl<R: Runtime> Harness<R> {
             .add_service(WorkerServer::new(FakeServer {
                 sessions: sessions_tx,
             }));
+        let (open, open_rx) = tokio::sync::watch::channel(true);
+        // A connection waits here, before its TLS handshake, while the test holds them.
+        let incoming = TcpIncoming::from(listener).then(move |conn| {
+            let mut open = open_rx.clone();
+            async move {
+                let _ = open.wait_for(|open| *open).await;
+                conn
+            }
+        });
         let server = tokio::spawn(async move {
             router
-                .serve_with_incoming(TcpIncoming::from(listener))
+                .serve_with_incoming(incoming)
                 .await
                 .expect("fake server");
         });
@@ -478,7 +489,14 @@ impl<R: Runtime> Harness<R> {
             report,
             daemon,
             server,
+            open,
         }
+    }
+
+    /// While `held`, a daemon's new connection is accepted but not served: its TLS
+    /// handshake, and so its `connect`, waits until the hold is lifted.
+    pub fn hold_connections(&self, held: bool) {
+        self.open.send_replace(!held);
     }
 
     /// The next session the daemon opens.

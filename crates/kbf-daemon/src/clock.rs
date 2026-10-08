@@ -50,11 +50,12 @@ impl Add<Duration> for Moment {
     }
 }
 
+/// Saturates at the clock's origin: no reading comes before it.
 impl Sub<Duration> for Moment {
     type Output = Self;
 
     fn sub(self, rhs: Duration) -> Self {
-        Self(self.0 - rhs)
+        Self(self.0.saturating_sub(rhs))
     }
 }
 
@@ -160,5 +161,20 @@ mod tests {
         assert_eq!((t + s).saturating_duration_since(t), s);
         assert_eq!(t.saturating_duration_since(t + s), Duration::ZERO);
         assert!(t < t + s);
+    }
+
+    /// Catches: a subtraction past the origin that panics (or wraps) instead of
+    /// stopping at the origin.
+    #[test]
+    fn a_moment_minus_more_than_its_reading_is_the_origin() {
+        let t = Moment::from_origin(Duration::from_secs(3));
+        assert_eq!(
+            t - Duration::from_secs(5),
+            Moment::from_origin(Duration::ZERO)
+        );
+        assert_eq!(
+            t - Duration::from_secs(3),
+            Moment::from_origin(Duration::ZERO)
+        );
     }
 }
