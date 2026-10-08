@@ -42,6 +42,11 @@ One property sent under two spellings of its name (`gpu` and `GPU`, `OSFamily` a
 through two names (`OSFamily` and `os`, `ISA` and `arch`). A name kbf does not know,
 in any case, is not acted on.
 
+`container-image` is the one exception: it is read by the Linux container driver, not
+by the scheduler, and only in exactly that spelling. `Container-Image` is a name kbf
+does not know, so the action is scheduled as if it named no image, and the container
+driver then refuses it ("the action names no container-image platform property").
+
 ## Where an action runs
 
 An action runs only on a worker whose node report satisfies its platform: a Linux

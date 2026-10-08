@@ -655,8 +655,10 @@ host needs auto-login in two cases, and in neither for the admin account:
     about 1 to 4 minutes.
   - **After a power loss mid-lease,** `kbf-mac-session` resets auto-login at boot,
     before the daemon sends `Hello`.
-  - **The same runtime covers** MDM privacy profiles and a leak scan that erases the
-    node on a leak.
+  - **The same runtime covers** MDM privacy profiles and a leak scan. A leak that
+    persists after a reboot quarantines the node and alerts, and the erase waits for
+    an operator's signature ([fleet-updates.md](fleet-updates.md#102-isolation-layers) L4,
+    [mdm-backend.md](mdm-backend.md#m44-what-now-waits-for-a-touch) M4.4).
 
   All of this is designed in the [fleet-updates design](fleet-updates.md), not here. FileVault off (above) is
   what makes that auto-login possible. The profile's `autologin` key accepts it:
