@@ -282,6 +282,37 @@ fn an_apply_in_progress_survives_a_restart_and_only_it_may_continue() {
     assert_eq!(u.status().in_progress, None);
 }
 
+/// Catches: only a platform-signed set allowed to resume its own apply, so a
+/// component-key set whose install failed (a crash mid-apply) could never be
+/// finished, and the node would wait for a platform set to replace it.
+#[test]
+fn a_component_key_set_resumes_its_own_apply_after_a_restart() {
+    let (mut u, _) = updater("in-progress-component");
+    install(&mut u, &seal_set(&testkit::set(5), &PLATFORM_SEED));
+    let six = seal_set(&daemon_only(6), &COMPONENT_SEED);
+    assert_eq!(u.stage(&six, None, NOW), Ok(Outcome::Staged));
+    u.applier_mut().fail_install = true;
+    assert_eq!(
+        u.apply(&six, None, NOW),
+        Err(Refusal::Apply("planned failure".into()))
+    );
+    let held = u.status().in_progress.expect("in progress");
+    let mut u = reopen(u);
+    u.applier_mut().fail_install = false;
+    assert_eq!(u.stage(&six, None, NOW), Ok(Outcome::Staged));
+    assert_eq!(u.status().in_progress.as_ref(), Some(&held));
+    assert_eq!(
+        u.apply(&six, None, NOW),
+        Ok(Outcome::Applied { reboot: false })
+    );
+    let status = u.status();
+    assert_eq!(status.installed.map(|s| s.serial), Some(6));
+    assert_eq!(status.in_progress, None);
+    let (serial, names) = u.applier().installs.last().unwrap();
+    assert_eq!(*serial, 6);
+    assert!(names.contains(&"kbf-daemon".to_owned()), "{names:?}");
+}
+
 /// Catches: a node wedged for good by an apply in progress whose set has expired: the
 /// set itself can no longer be applied, so unless a newer set that passes every check
 /// may replace it, every later `stage` and `apply` is refused until someone edits the
