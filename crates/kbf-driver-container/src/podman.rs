@@ -51,7 +51,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
         "--pull=never",
         "--network=none",
         "--hostname=localhost",
-        "--cgroup-conf=memory.oom.group=1",
+
     ]
     .into_iter()
     .map(OsString::from)
