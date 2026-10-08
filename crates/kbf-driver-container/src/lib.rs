@@ -25,9 +25,10 @@
 //!
 //! Modules:
 //! - [`image`]: the `container-image` property;
-//! - [`cas`]: the [`Cas`] trait the driver reads and writes blobs through,
-//!   [`FileBlob`] and [`MemoryCas`];
-//! - [`tree`]: writing an input root and reading outputs back;
+//! - [`cas`]: [`FileBlob`] and [`MemoryCas`]; blobs are read and written through
+//!   `kbf_daemon`'s `Cas` trait, the one the daemon's CAS client implements;
+//! - [`tree`]: writing an input root (with `kbf_daemon::tree`) and reading outputs
+//!   back;
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease),
@@ -43,7 +44,7 @@ mod remove;
 mod runtime;
 pub mod tree;
 
-pub use cas::{CHUNK, Cas, CasError, FileBlob, MemoryCas};
+pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;

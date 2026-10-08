@@ -91,9 +91,9 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     assert_eq!(tree.children[0].files[0].name, "n.txt");
     assert_eq!(
         dir.root_directory_digest.as_ref(),
-        Some(&kbf_driver_container::cas::digest_of(
-            &prost::Message::encode_to_vec(&root)
-        ))
+        Some(&kbf_daemon::cas::digest_of(&prost::Message::encode_to_vec(
+            &root
+        )))
     );
 
     fake.assert_clean(1);
@@ -600,7 +600,7 @@ async fn incomplete_actions_are_refused() {
         );
     }
     let missing_root = Action {
-        input_root_digest: Some(kbf_driver_container::cas::digest_of(b"not stored")),
+        input_root_digest: Some(kbf_daemon::cas::digest_of(b"not stored")),
         ..action
     };
     let digest = fake.cas.insert(missing_root.encode_to_vec());
@@ -726,7 +726,7 @@ async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
     let result = fake.run(2, &spec, &script).await.expect("ran");
     assert!(result.output_files.is_empty(), "{result:?}");
     fake.assert_clean(2);
-    let digest = kbf_driver_container::cas::digest_of(secret);
+    let digest = kbf_daemon::cas::digest_of(secret);
     assert_eq!(fake.cas.blob(&digest), None);
 }
 
