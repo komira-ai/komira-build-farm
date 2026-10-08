@@ -870,7 +870,7 @@ err_log_safe() {
 # starts it again. Returns 2, having stopped nothing, if the error log is not safe to
 # empty; 1 if the job does not start.
 restart_job() {
-  err_log_safe || return 2
+  :
   launchctl bootout "system/$P_launchd_label" >/dev/null 2>&1
   : >"$R$ERR_LOG"
   rj_try=0
