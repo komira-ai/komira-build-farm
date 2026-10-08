@@ -11,11 +11,13 @@
 //! - its `arguments` run with those variables and the Command's environment (which wins
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
-//! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no work
-//!   handed to launchd (`open`, `launchctl submit`/`load`/`bootstrap`), and no
-//!   network unless the action's `network` platform property allows it; elsewhere
-//!   nothing is enforced, and the node reports which in its `network_isolation`
-//!   capability;
+//! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no file
+//!   written outside the lease directory and `/dev`, no work handed to launchd
+//!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network unless the
+//!   action's `network` platform property allows it; elsewhere nothing is enforced,
+//!   and the node reports which in its `network_isolation` capability;
+//! - the Xcode its `xcode` platform property names, as `DEVELOPER_DIR` ([`xcode`]: the
+//!   driver reports every Xcode build the daemon found);
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
@@ -50,11 +52,12 @@
 //!   anything else the daemon's user can schedule (a `LaunchAgents` plist run at its
 //!   next login, `at`, `cron`, a loopback service).
 //! - **The daemon's own files.** Actions run as the daemon's user, so they can read
-//!   what it can, the node's TLS private key (`--key`) included, and change what it
-//!   owns: other leases' directories, the scratch root, the daemon's configuration.
-//!   An action that locks the scratch root or `quarantine/` (`chmod 555`, `chflags
-//!   uchg`) makes every later lease on the node fail until an operator unlocks it; a
-//!   scratch root it makes unreadable stops the next start.
+//!   what it can, the node's TLS private key (`--key`) included. On macOS the
+//!   profile keeps their writes inside their own lease directory, so they cannot change
+//!   other leases' directories, the scratch root, `quarantine/` or the daemon's
+//!   configuration; on Linux (no sandbox) they can, and an action that locks the
+//!   scratch root or `quarantine/` (`chmod 555`) makes every later lease on the node
+//!   fail until an operator unlocks it.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.
 //! - **Network "off" is not airtight**: Unix sockets stay open, the system resolver's
@@ -71,6 +74,7 @@ pub mod network;
 pub mod procs;
 mod runtime;
 mod sweep;
+pub mod xcode;
 
 pub use config::{MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime};

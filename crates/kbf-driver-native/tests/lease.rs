@@ -103,6 +103,54 @@ async fn each_lease_has_its_own_home_tmp_and_cache() {
     );
 }
 
+/// Catches: an action that names an Xcode run without its `DEVELOPER_DIR`, or with the
+/// Command's own instead (the scheduler matched the build the property names), a
+/// build the node lacks run anyway with no Xcode or another one, and the node's Xcodes
+/// missing from what the driver reports.
+#[tokio::test]
+async fn an_action_that_names_an_xcode_runs_with_it() {
+    let dir = scratch("xcode");
+    let mut config = config(&dir);
+    config.xcodes = [
+        ("16C5032a", "/Apps/Xcode_16.2.app/Contents/Developer"),
+        ("16E140", "/Apps/Xcode_16.3.app/Contents/Developer"),
+    ]
+    .into_iter()
+    .map(|(build, path)| (build.to_owned(), std::path::PathBuf::from(path)))
+    .collect();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let reported = rt.capabilities();
+    for build in ["16C5032a", "16E140"] {
+        assert!(
+            reported.contains(&("xcode".to_owned(), build.to_owned())),
+            "{reported:?}"
+        );
+    }
+    let echo = Spec::sh("echo \"${DEVELOPER_DIR-unset}\"").env("DEVELOPER_DIR", "/own");
+    let named = echo.clone().property("XCode", "16E140");
+    let result = run(&rt, &cas, 1, &named).await.expect("ran");
+    assert_eq!(
+        stdout(&cas, &result),
+        "/Apps/Xcode_16.3.app/Contents/Developer\n"
+    );
+    let result = run(&rt, &cas, 2, &echo).await.expect("ran");
+    assert_eq!(
+        stdout(&cas, &result),
+        "/own\n",
+        "no xcode: the Command's own"
+    );
+    let lacking = echo.property("xcode", "15F31d");
+    let error = run(&rt, &cas, 3, &lacking)
+        .await
+        .expect_err("a build it lacks");
+    assert!(
+        matches!(&error, RuntimeError::Failed(why) if why.contains("15F31d")),
+        "{error:?}"
+    );
+    assert!(no_leases(&config), "the lease directories are removed");
+}
+
 /// Catches: a malformed action run anyway or reported as the farm's failure, and a
 /// missing input reported as anything but a missing blob.
 #[tokio::test]

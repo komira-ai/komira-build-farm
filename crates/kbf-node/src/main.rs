@@ -17,14 +17,14 @@
 //! running then are abandoned (their processes killed, their directories removed);
 //! the scheduler places them again.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use kbf_daemon::{Args, CasClient, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime};
-use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime};
+use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode};
 use kbf_outputs::OutputLimits;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tonic::transport::Endpoint;
@@ -60,6 +60,11 @@ struct Cli {
     /// How often a lease's memory is measured, in milliseconds (native).
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
+    /// The directory searched for `Xcode*.app` (native). Each Xcode that answers
+    /// `xcodebuild -version` is reported as an `xcode` entry, and an action that names
+    /// its build runs with it as `DEVELOPER_DIR`.
+    #[arg(long, default_value = xcode::APPLICATIONS)]
+    xcode_apps: PathBuf,
 }
 
 /// The drivers this binary can run leases through.
@@ -153,6 +158,7 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
+    config.xcodes = xcode::discover(&cli.xcode_apps, Path::new(xcode::XCODEBUILD));
     Ok(config)
 }
 
@@ -371,8 +377,8 @@ mod tests {
     }
 
     /// Catches: native flags that do not reach the driver's configuration (the
-    /// memory limit, poll and output limits), and a relative or missing scratch
-    /// directory accepted.
+    /// memory limit, poll and output limits, where Xcodes are looked for), and a
+    /// relative or missing scratch directory accepted.
     #[test]
     fn native_flags_reach_the_configuration() {
         let cli = parse(&[
@@ -382,6 +388,7 @@ mod tests {
             "--memory-headroom-mib=64",
             "--memory-poll-ms=0",
             "--output-max-bytes=99",
+            "--xcode-apps=/var/kbf/apps",
         ])
         .expect("flags");
         assert_eq!(cli.driver, Driver::Native);
@@ -390,11 +397,14 @@ mod tests {
         assert_eq!(config.memory.limit(1 << 20), Some((2 << 20) + (64 << 20)));
         assert_eq!(config.poll, Duration::from_millis(1));
         assert_eq!(config.outputs.max_bytes, 99);
+        assert_eq!(cli.xcode_apps, PathBuf::from("/var/kbf/apps"));
+        assert!(config.xcodes.is_empty(), "no Xcode under /var/kbf/apps");
         let defaults = parse(&["--driver=native", "--scratch=/s"]).expect("flags");
         assert_eq!(
             native_config(&defaults).expect("config").memory,
             MemoryPolicy::DEFAULT
         );
+        assert_eq!(defaults.xcode_apps, PathBuf::from("/Applications"));
         let relative = parse(&["--driver=native", "--scratch=leases"]).expect("flags");
         assert!(native_config(&relative).is_err());
         let missing = parse(&["--driver=native"]).expect("flags");

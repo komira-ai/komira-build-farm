@@ -127,3 +127,43 @@ Like every platform property, the two keys are part of the action digest: the sa
 action with another booking is a different action cache entry, so changing a booking
 reruns the action once. They are not the capability keys `cpus` and `mem_gib`, which
 ask for a worker whose whole machine has at least that much and book nothing.
+
+## `xcode`
+
+On Macs, `xcode=<build>` places the action on a worker that has that Xcode build
+installed and runs it with that Xcode selected: `DEVELOPER_DIR` is set to the Xcode's
+`Contents/Developer`, so `xcrun`, `cc`, `swiftc` and `xcodebuild` are that Xcode's. The
+build is what `xcodebuild -version` prints after `Build version` (`16C5032a`), not the
+marketing version (`16.2`), so two Xcodes that share a version but differ in build
+never share a cache entry.
+
+A Mac may have several Xcodes installed; it serves an action that names any of them.
+The daemon finds them at start: each `Xcode*.app` in `/Applications` (the
+`--xcode-apps` flag) that answers `xcodebuild -version` is reported as an `xcode`
+entry of its node report. An Xcode that does not answer (its licence not accepted, its
+first launch not run) is left out and logged. An action that names no `xcode` runs
+with the Mac's default Xcode (`xcode-select`), or with the `DEVELOPER_DIR` its own
+environment sets; one that names an `xcode` gets that Xcode whatever its environment
+says.
+
+```starlark
+# Bazel: a platform for actions built with one Xcode
+platform(
+    name = "macos_arm64_xcode_16_2",
+    exec_properties = {"OSFamily": "Darwin", "ISA": "arm-a64", "xcode": "16C5032a"},
+)
+```
+
+## What an action on a Mac may write
+
+The native driver runs every action on a Mac under `sandbox-exec` with a profile that
+denies every file write outside the action's lease directory and `/dev`. The lease
+directory holds the input root (the working directory and outputs), and the action's
+own home, temporary and cache directories, named by `HOME`, `TMPDIR`,
+`XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the lease
+ends. A tool that writes elsewhere (`/tmp`, a path under the daemon user's real home,
+the per-user folders under `/var/folders`) fails, so a build rule points such a tool
+into the lease: `swiftc -module-cache-path`, `xcodebuild -derivedDataPath`. Apple's
+tools that nest a sandbox of their own need it turned off, since macOS refuses a
+sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
+the outer profile still keeps their writes inside the lease.
