@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::Stream;
-use kbf_daemon::{Daemon, DaemonConfig, Event, FakeRuntime, NodeReport, Runtime, TlsFiles};
+use futures::{Stream, StreamExt};
+use kbf_daemon::{
+    Clock, Daemon, DaemonConfig, Event, FakeRuntime, Moment, NodeReport, Runtime, TlsFiles,
+};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
     Cancel, DaemonMessage, Heartbeat, HeartbeatAck, Hello, LeaseId, LeaseOffer,
@@ -99,7 +101,11 @@ pub fn pki(name: &str) -> Pki {
         "kbf test server",
         ExtendedKeyUsagePurpose::ServerAuth,
     );
-    let (client_cert, client_key) = leaf(Vec::new(), "node-1", ExtendedKeyUsagePurpose::ClientAuth);
+    let (client_cert, client_key) = leaf(
+        vec!["node-1".to_owned()],
+        "node-1",
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
 
     let write = |file: &str, text: &str| {
         let path = dir.join(file);
@@ -142,9 +148,14 @@ impl Peer {
     }
 
     pub fn welcome(&self) {
+        self.welcome_every(INTERVAL);
+    }
+
+    /// A Welcome that asks for a heartbeat every `interval`.
+    pub fn welcome_every(&self, interval: Duration) {
         self.send(server_message::Message::Welcome(Welcome {
             protocol_version: 1,
-            heartbeat_interval_ms: INTERVAL.as_millis() as u64,
+            heartbeat_interval_ms: interval.as_millis() as u64,
         }));
     }
 
@@ -329,6 +340,36 @@ impl Worker for FakeServer {
     }
 }
 
+/// A clock that runs with the test's own (uptime) clock and jumps forward on
+/// [`SuspendClock::suspend`], as a suspend-counting clock does across a suspend while
+/// the uptime clock, and every tokio timer, stands still.
+#[derive(Debug)]
+pub struct SuspendClock {
+    origin: std::time::Instant,
+    slept: Mutex<Duration>,
+}
+
+impl SuspendClock {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: std::time::Instant::now(),
+            slept: Mutex::new(Duration::ZERO),
+        })
+    }
+
+    /// The machine was suspended for `d`: the clock jumps forward by `d` at once.
+    pub fn suspend(&self, d: Duration) {
+        *self.slept.lock().expect("clock lock") += d;
+    }
+}
+
+impl Clock for SuspendClock {
+    fn now(&self) -> Moment {
+        let slept = *self.slept.lock().expect("clock lock");
+        Moment::from_origin(self.origin.elapsed() + slept)
+    }
+}
+
 /// A daemon with a runtime (by default the fake one), connected to a fake server.
 pub struct Harness<R: Runtime = FakeRuntime> {
     pub runtime: Arc<R>,
@@ -337,6 +378,8 @@ pub struct Harness<R: Runtime = FakeRuntime> {
     pub report: NodeReport,
     daemon: JoinHandle<()>,
     server: JoinHandle<()>,
+    /// Whether the server takes up new connections; see [`Harness::hold_connections`].
+    open: tokio::sync::watch::Sender<bool>,
 }
 
 impl<R: Runtime> Drop for Harness<R> {
@@ -367,6 +410,37 @@ impl<R: Runtime> Harness<R> {
     /// Starts a server and a daemon running leases through `runtime`, whose fence time
     /// is `fence_after`. `name` keeps each test's TLS files apart.
     pub async fn with_runtime(name: &str, runtime: Arc<R>, fence_after: Duration) -> Self {
+        Self::build(name, runtime, fence_after, |_| {}, None).await
+    }
+
+    /// Starts a server and a daemon running leases through `runtime`, whose fence time
+    /// is `fence_after`, which checks the fence at least every `recheck_every`, and
+    /// which reads the returned clock instead of the system's.
+    pub async fn suspendable(
+        name: &str,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        recheck_every: Duration,
+    ) -> (Self, Arc<SuspendClock>) {
+        let clock = SuspendClock::new();
+        let h = Self::build(
+            name,
+            runtime,
+            fence_after,
+            |config| config.recheck_every = recheck_every,
+            Some(Arc::clone(&clock) as Arc<dyn Clock>),
+        )
+        .await;
+        (h, clock)
+    }
+
+    async fn build(
+        name: &str,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        configure: impl FnOnce(&mut DaemonConfig),
+        clock: Option<Arc<dyn Clock>>,
+    ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -379,9 +453,18 @@ impl<R: Runtime> Harness<R> {
             .add_service(WorkerServer::new(FakeServer {
                 sessions: sessions_tx,
             }));
+        let (open, open_rx) = tokio::sync::watch::channel(true);
+        // A connection waits here, before its TLS handshake, while the test holds them.
+        let incoming = TcpIncoming::from(listener).then(move |conn| {
+            let mut open = open_rx.clone();
+            async move {
+                let _ = open.wait_for(|open| *open).await;
+                conn
+            }
+        });
         let server = tokio::spawn(async move {
             router
-                .serve_with_incoming(TcpIncoming::from(listener))
+                .serve_with_incoming(incoming)
                 .await
                 .expect("fake server");
         });
@@ -394,10 +477,14 @@ impl<R: Runtime> Harness<R> {
         );
         config.fence_after = fence_after;
         config.reconnect_after = Duration::from_millis(100);
+        configure(&mut config);
         let (events_tx, events) = mpsc::unbounded_channel();
-        let daemon = Daemon::new(config, Arc::clone(&runtime), report.clone())
+        let mut daemon = Daemon::new(config, Arc::clone(&runtime), report.clone())
             .expect("daemon config")
             .with_events(events_tx);
+        if let Some(clock) = clock {
+            daemon = daemon.with_clock(clock);
+        }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {
             runtime,
@@ -406,7 +493,14 @@ impl<R: Runtime> Harness<R> {
             report,
             daemon,
             server,
+            open,
         }
+    }
+
+    /// While `held`, a daemon's new connection is accepted but not served: its TLS
+    /// handshake, and so its `connect`, waits until the hold is lifted.
+    pub fn hold_connections(&self, held: bool) {
+        self.open.send_replace(!held);
     }
 
     /// The next session the daemon opens.

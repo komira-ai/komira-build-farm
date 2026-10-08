@@ -28,6 +28,9 @@ breaking changes.
 design documents in [docs/design](docs/design): the scheduler, storage, the worker
 protocol, the daemon and execution, and capabilities.
 
+[docs/artifacts.md](docs/artifacts.md) says which binaries CI builds and attests, and
+how a node verifies one before it runs it.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a DCO sign-off, and

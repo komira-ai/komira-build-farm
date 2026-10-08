@@ -1132,6 +1132,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

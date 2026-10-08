@@ -471,6 +471,23 @@ impl FakeDaemon {
         start
     }
 
+    /// The status the server ends the stream with, within [`PROMPT`]; messages before
+    /// it are dropped. Panics if the stream stays open or ends without an error.
+    pub async fn ended(&mut self) -> tonic::Status {
+        let ending = async {
+            loop {
+                match self.inbound.message().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("the stream ended without an error"),
+                    Err(status) => return status,
+                }
+            }
+        };
+        timeout(PROMPT, ending)
+            .await
+            .expect("the server ended the stream in time")
+    }
+
     /// The lease of the next `Cancel` within [`QUIET`], if one arrives.
     pub async fn cancelled(&mut self) -> Option<LeaseId> {
         self.expect_within(QUIET, |m| match m {

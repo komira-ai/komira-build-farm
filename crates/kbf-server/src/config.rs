@@ -11,7 +11,8 @@ use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
-use crate::serve::{Api, Listeners};
+use crate::identity::{DenyList, DenyListError};
+use crate::serve::{Api, Listeners, WorkerTls};
 use crate::token::{ApiToken, TokenFileError};
 
 /// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
@@ -72,6 +73,12 @@ pub struct Args {
     /// PEM CA that daemon client certificates must chain to.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
+    /// The worker listener's deny list: certificate serials, public keys and node ids
+    /// it refuses (format in the `identity` module docs). Read at start, then again at
+    /// every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs
+    /// mutual TLS.
+    #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
+    pub worker_deny_list: Option<PathBuf>,
     /// The heartbeat interval daemons are asked for, in milliseconds, at most half the
     /// window in which a daemon may act on a `Start` (each `Start` names the newest
     /// heartbeat the server took, so a longer interval would leave it too little).
@@ -113,6 +120,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// The deny list cannot be read or parsed.
+    #[error("--worker-deny-list: {0}")]
+    DenyList(#[from] DenyListError),
     /// An S3 setting is missing from the environment.
     #[error("{0} must be set for --store=s3")]
     MissingEnv(&'static str),
@@ -138,11 +148,16 @@ impl Args {
             &self.worker_tls_key,
             &self.worker_client_ca,
         ) {
-            (Some(cert), Some(key), Some(ca)) => Some(
-                ServerTlsConfig::new()
+            (Some(cert), Some(key), Some(ca)) => Some(WorkerTls {
+                server: ServerTlsConfig::new()
                     .identity(Identity::from_pem(read(cert)?, read(key)?))
                     .client_ca_root(Certificate::from_pem(read(ca)?)),
-            ),
+                deny_list: self
+                    .worker_deny_list
+                    .as_deref()
+                    .map(DenyList::open)
+                    .transpose()?,
+            }),
             _ => None,
         };
         Ok(Listeners {

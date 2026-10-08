@@ -8,13 +8,15 @@
 //! | `isa_level` | at least, within the family (`x86-64-v3` is served by v3 and v4) |
 //! | `cpu.feature` (repeatable) | subset: every requested feature is present |
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | countable: the node has at least the amount |
-//! | `os`, `os_image`, `cpu.model`, `page_size`, `xcode`, `label.<k>` | exact |
+//! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
+//! | `xcode` | membership: the node reports a set (one entry per installed Xcode build) and the request names one |
 //!
 //! `gpu` is a count of whole GPUs (`gpu=1`). Matching compares it with the node's
 //! count; the scheduler also books it, so a GPU serves one lease at a time.
 //!
-//! The reserved `kbf-lease`, `kbf-cpu` and `kbf-mac-admin` keys ask for a kind of
-//! capacity, not a capability; [`Request::parse`] skips them for the scheduler.
+//! The reserved keys ([`RESERVED_KEYS`]: `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`,
+//! `kbf-book-cpus`, `kbf-book-mem-gib`) ask for a kind or a size of capacity, not a
+//! capability; [`Request::parse`] skips them for the scheduler.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -59,15 +61,30 @@ impl fmt::Display for Consumable {
 }
 
 /// Keys compared as exact strings, besides `label.<k>`.
-const EXACT_KEYS: [&str; 5] = ["os", "os_image", "cpu.model", "page_size", "xcode"];
+const EXACT_KEYS: [&str; 4] = ["os", "os_image", "cpu.model", "page_size"];
 
-/// Reserved keys that are not capabilities.
-const RESERVED_KEYS: [&str; 3] = ["kbf-lease", "kbf-cpu", "kbf-mac-admin"];
+/// Keys a node reports as a set and a request names one member of.
+const MEMBER_KEYS: [&str; 1] = ["xcode"];
+
+/// Reserved keys: they ask for a kind or a size of capacity, not a capability, and are
+/// read by the front, not matched.
+pub const RESERVED_KEYS: [&str; 5] = [
+    "kbf-lease",
+    "kbf-cpu",
+    "kbf-mac-admin",
+    "kbf-book-cpus",
+    "kbf-book-mem-gib",
+];
 
 /// Whether `key` is compared as an exact string: one of the exact keys, or
 /// `label.<k>` with a non-empty `<k>`.
 pub(crate) fn is_exact_key(key: &str) -> bool {
     EXACT_KEYS.contains(&key) || key.strip_prefix("label.").is_some_and(|k| !k.is_empty())
+}
+
+/// Whether `key` names a set the node reports, matched by membership.
+pub(crate) fn is_member_key(key: &str) -> bool {
+    MEMBER_KEYS.contains(&key)
 }
 
 /// Whether `key` is one of kbf's own platform keys: a capability key, or a reserved
@@ -81,6 +98,7 @@ fn is_capability_key(key: &str) -> bool {
     matches!(key, "arch" | "isa_level" | "cpu.feature")
         || Consumable::from_name(key).is_some()
         || is_exact_key(key)
+        || is_member_key(key)
 }
 
 /// What a node offers, as the scheduler sees it.
@@ -90,17 +108,21 @@ pub struct NodeCaps {
     pub cpu: CpuCaps,
     /// Values compared exactly, by request key (`os`, `cpu.model`, `label.rack`, ...).
     pub exact: BTreeMap<String, String>,
+    /// Sets a request names one member of, by request key (`xcode`: every installed
+    /// build).
+    pub members: BTreeMap<String, BTreeSet<String>>,
     /// Countable capacity. A missing entry counts as zero.
     pub consumables: BTreeMap<Consumable, u64>,
 }
 
 impl NodeCaps {
-    /// A node with only CPU capabilities: no exact values, no capacity.
+    /// A node with only CPU capabilities: no exact values, no sets, no capacity.
     #[must_use]
     pub fn new(cpu: CpuCaps) -> Self {
         Self {
             cpu,
             exact: BTreeMap::new(),
+            members: BTreeMap::new(),
             consumables: BTreeMap::new(),
         }
     }
@@ -127,6 +149,7 @@ pub struct Request {
     isa_level: Option<IsaLevel>,
     features: BTreeSet<String>,
     pub(crate) exact: BTreeMap<String, String>,
+    members: BTreeMap<String, String>,
     minimums: BTreeMap<Consumable, u64>,
 }
 
@@ -144,6 +167,11 @@ pub enum Unmet<'a> {
         key: &'a str,
         want: &'a str,
     },
+    /// The node's set under `key` does not hold `want`.
+    Member {
+        key: &'a str,
+        want: &'a str,
+    },
     Consumable {
         what: Consumable,
         want: u64,
@@ -153,13 +181,13 @@ pub enum Unmet<'a> {
 
 impl fmt::Display for Unmet<'_> {
     /// The requirement in request syntax: `arch=arm64`, `isa_level>=x86-64-v3`,
-    /// `cpu.feature=avx2`, `os=macos`, `gpu>=2 (has 1)`.
+    /// `cpu.feature=avx2`, `os=macos`, `xcode=16C5032a`, `gpu>=2 (has 1)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Arch { want } => write!(f, "arch={want}"),
             Self::IsaLevel { want } => write!(f, "isa_level>={want}"),
             Self::Feature(feature) => write!(f, "cpu.feature={feature}"),
-            Self::Exact { key, want } => write!(f, "{key}={want}"),
+            Self::Exact { key, want } | Self::Member { key, want } => write!(f, "{key}={want}"),
             Self::Consumable { what, want, have } => write!(f, "{what}>={want} (has {have})"),
         }
     }
@@ -168,7 +196,8 @@ impl fmt::Display for Unmet<'_> {
 impl Request {
     /// Builds a request from `(key, value)` properties; see the module table.
     ///
-    /// `cpu.feature` may repeat; every other key may appear once.
+    /// `cpu.feature` may repeat; every other key may appear once. A membership key
+    /// (`xcode`) names one non-empty value.
     pub fn parse<'p, I>(properties: I) -> Result<Self, RequestError>
     where
         I: IntoIterator<Item = (&'p str, &'p str)>,
@@ -203,6 +232,17 @@ impl Request {
                 if req.exact.insert(key.to_owned(), value.to_owned()).is_some() {
                     return Err(repeated());
                 }
+            } else if is_member_key(key) {
+                if value.is_empty() {
+                    return Err(bad());
+                }
+                if req
+                    .members
+                    .insert(key.to_owned(), value.to_owned())
+                    .is_some()
+                {
+                    return Err(repeated());
+                }
             } else {
                 return Err(RequestError::UnknownKey(key.to_owned()));
             }
@@ -234,6 +274,11 @@ impl Request {
         for (key, want) in &self.exact {
             if node.exact.get(key) != Some(want) {
                 unmet.push(Unmet::Exact { key, want });
+            }
+        }
+        for (key, want) in &self.members {
+            if !node.members.get(key).is_some_and(|set| set.contains(want)) {
+                unmet.push(Unmet::Member { key, want });
             }
         }
         for (&what, &want) in &self.minimums {

@@ -5,7 +5,8 @@ node's software, what each component may do, the keys and credentials involved, 
 MDM gate, how a node proves who it is, and what still cannot be defended. Everything
 here is **planned** unless a section says "today". Section numbers such as "4.2"
 without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefixed
-"S" refer to this document. Markers **[V]** and **[A]** mean what they mean there.
+"S" refer to this document, and "M" to [mdm-backend.md](mdm-backend.md). Markers
+**[V]** and **[A]** mean what they mean there.
 
 ## S1. Threat model
 
@@ -30,6 +31,7 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
 | `kbf-server` | every daemon's stream, the gate, the CAS | choosing *when* and *where*; never *what* |
 | CI (GitHub Actions) | the signing keys through a short-lived identity (S2) | building and signing sets from reviewed changes |
 | The MDM host (NanoHUB and `kbf-mdm-gate`) | APNs, every Mac's bootstrap token | the Mac fleet; the root of trust for Macs |
+| An operator's security key | nothing by itself; signs an erase request after a touch | authorising one erase (M4) |
 | An operator with the admin role | the API | everything the API allows, audited |
 
 ### S1.3 What a compromised `kbf-server` can do
@@ -38,22 +40,30 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
   platform**, not expired, above the node's serial floor (S3.1). It cannot downgrade a
   node, cross pools, or run a command of its choosing.
 - Through `kbf-mdm-gate` (S5): force-update one Mac per pool at a time to a build a
-  valid signed set names, and erase **one Mac at a time across the fleet**, within a
-  daily cap and never below the Mac floor, with an alert the server cannot suppress.
-- Obtain at most as many privileged-lease grants as the gate's erase budget allows
-  (S8): each gives root on one Mac, alerts natively, and ends in that Mac's erase,
-  which the gate schedules itself, so the server cannot keep the root by never asking.
+  valid signed set names, and install a profile the gate already allowlists, with an
+  alert the server cannot suppress. It **cannot erase** a Mac: every erase needs an
+  operator's hardware-key signature (M4). It can relay, delay or drop a signed
+  request, never make or redirect one.
+- Obtain a privileged-lease grant only for a Mac an operator has already signed an
+  erase for, with a signed purpose naming that lease (S8, M4.2): each gives root on
+  one Mac, alerts natively, and ends in that erase, which the gate runs itself, so
+  the server cannot keep the root by never asking.
   Without the grant check in `kbf-mac-session`, a compromised server or daemon could
   create an administrator lease user, and so get root, on every Mac at once.
-- Deny service: cordon, drain or hold every node, and erase up to two Macs a day
-  indefinitely (each costs 45-90 minutes of re-provisioning). That costs availability,
-  not integrity, and every write is audited.
+- Deny service: cordon, drain or hold every node, or withhold operators' erase
+  requests so quarantined Macs stay out. That costs availability, not integrity, and
+  every write is audited.
 
 ### S1.4 Residual risks (not defended here)
 
 - **The MDM's host.** Root on it, or its API key, can erase every Mac and push any
-  profile. It is the Mac fleet's root of trust, like the Apple Business Manager
-  administrator account. Where it runs is an open decision (S7).
+  profile, and can add a key to the gate's allowed signers. It is the Mac fleet's
+  root of trust, like the Apple Business Manager administrator account. Where it runs
+  is an open decision (S7).
+- **An operator's own machine.** Malware there could have the operator touch-sign an
+  erase for a Mac other than the one shown. The gate's caps and its alert naming the
+  signed serial bound that to at most two Macs a day (the daily cap's default), one
+  at a time (M4.3).
 - **CI and the main branch.** A compromised CI, or a malicious change that is
   reviewed and merged, can sign a set that gives root on every node of a pool. The
   key that signs automatically covers only unprivileged `kbf-daemon` (S2.2); anything
@@ -69,9 +79,10 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
   outside any rollout (7.2).
 - **A server that skips `Update`** and asks the gate to enforce directly can reboot a
   Mac mid-lease. The gate's caps (S5.2) bound it to one Mac per pool at a time.
-- **A VM guest escape** lands as the uid of the VM host process. #85 section 6 states that
-  `kbf-vmm` runs as a dedicated non-admin uid outside the helpers' group, started
-  through `kbf-mac-session run` or its own launchd user, never as `_kbf` (S4.3).
+- **A VM guest escape** lands as the uid of the VM host process. `macos-vms.md`
+  section 6 (open PR [#85](https://github.com/komira-ai/komira-build-farm/pull/85))
+  states that `kbf-vmm` runs as a dedicated non-admin uid outside the helpers' group,
+  started through `kbf-mac-session run` or its own launchd user, never as `_kbf` (S4.3).
 - **Linux join credentials have no hardware attestation.** A Linux node's identity
   rests on the operator's provisioning job (S6); TPM-based attestation is a later
   option, not designed here.
@@ -229,7 +240,7 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 ### S4.3 Who can reach a helper
 
 Both helpers listen on a Unix socket in a root-owned directory, mode 0750, group a
-**dedicated** group (`_kbf` in #76), never `staff`, which every macOS user is in;
+**dedicated** group (`_kbf` in [mac-node-provisioning.md](mac-node-provisioning.md)), never `staff`, which every macOS user is in;
 socket mode 0660. Two controls, the first being the one that matters:
 
 1. **No action, probe or VM runs under a uid in that group.**
@@ -262,7 +273,7 @@ socket mode 0660. Two controls, the first being the one that matters:
      the `kbf-daemon` requirement (its cdhash) pinned by the installed set. The audit
      token's pid version changes on `exec`, so a caller that connects and then
      executes the genuine daemon is refused.
-   - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures (#76's lean) the
+   - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures ([mac-node-provisioning.md](mac-node-provisioning.md)'s lean) the
      MDM's Full Disk Access profile can only pin `kbf-mac-session`'s cdhash, so a set
      that changes `kbf-mac-session` also needs a new profile, pushed through the gate in
      the same rollout step; with a Developer ID signature the profile would name the
@@ -294,23 +305,41 @@ holds the API and the design says so, costs nothing to build and was rejected.
   posts the enforcement for exactly the set's build. Refused while another enforcement
   in the same pool is outstanding, or if the Macs checked in and not being erased or
   updated would drop below the gate's Mac floor.
-- `grant-admin <serial> <lease id>`: for a privileged lease (S8), only if an erase is
-  still within today's cap; it reserves that erase and returns a grant signed with the
-  gate's own key, naming the serial, the lease id and a 1-hour expiry. **The gate
+- `grant-admin <serial> <lease id>`: for a privileged lease (S8), only if the gate
+  holds an unused, operator-signed erase request for that serial whose signed
+  purpose is `privileged-lease <lease id>` for this lease (M4.2, M4.4), and an erase
+  is still within today's cap; it reserves that erase and returns a grant signed with
+  the gate's own key, naming the serial, the lease id and a 1-hour expiry. **The gate
   itself schedules `EraseDevice` for that serial** at the grant's time plus the
-  maximum privileged-lease duration; the server can only bring it forward, never
-  cancel it, and the Mac does not count toward the gate's floor until it re-enrolls.
+  maximum privileged-lease duration, under that signed request, and runs it then
+  whatever the request's `not-after` (which bounds acceptance only, M4.2); the server
+  can only bring it forward, never cancel it, and the Mac does not count toward the
+  gate's floor until it re-enrolls.
   The grant key is held only by the gate's uid on the MDM host; its public key reaches
   Macs in an MDM profile. Rotation is a new profile, and Macs accept either key during
   the overlap. A grant is single-use: `kbf-mac-session` records used lease ids across
   reboots.
 - `withdraw <serial>`: removes an outstanding enforcement.
-- `erase <serial> <reason>`: **one Mac at a time across the fleet**: refused while any
-  other erase is outstanding (until that Mac re-enrolls and checks in, or 24 h pass),
-  beyond a daily cap (default 2), or below the floor.
-- Status reads: enrollment, DDM status, last check-in.
-- **Alerts of its own.** Every erase, enforcement and grant is sent by the gate itself to the
-  native alerting path and written to its own audit log, so a compromised server
+- `erase <signed request>`: accepted only with a valid, touched signature by an
+  operator's hardware-backed key on the allowed-signers list, for the serial the
+  signed message names, with a fresh nonce (M4.2). The server forwards it and cannot
+  make one. The signed `purpose` decides what the gate does: `erase-now` runs at once
+  or is refused; `privileged-lease <lease id>` is held for `grant-admin` and
+  discarded, with an alert, if no grant follows within 24 hours. Even with a valid
+  signature, **one Mac at a time across the fleet**: an `erase-now` is refused while
+  any other erase is outstanding (until that Mac re-enrolls and checks in, or 24 h
+  pass), beyond a daily cap (default 2), or below the floor; a scheduled lease erase
+  waits for the outstanding one to clear and is never dropped.
+- `bring-forward <serial> <lease id>`: runs the erase the gate scheduled for that
+  granted lease now; refused if the gate issued no grant for it.
+- `profile <serial> <digest>`: installs a profile only if a verified signed set or
+  the gate host's allowlist names that digest (M2.2).
+- Status reads: enrollment, DDM status, last check-in, and Apple's catalogue (M2.2,
+  M3).
+- Only declarations whose identifier starts `kbf.` are ever created, changed or
+  withdrawn by the gate.
+- **Alerts of its own.** Every erase, enforcement, grant and profile install is sent
+  by the gate itself to the native alerting path and written to its own audit log, so a compromised server
   cannot hide one.
 
 ## S6. Enrollment and node identity
@@ -349,9 +378,15 @@ and the ABM token, so the choice matters:
 |---|---|---|
 | A. Dedicated node | one Linux node runs the MDM and the gate, with no `kbf-server` role, and is excluded from action placement | an exception to "no servers out of the pool" for one node |
 | B. On a worker | the MDM and gate run on a worker under their own uid, beside actions | a container escape plus a local root exploit on that node gives the whole Mac fleet |
+| C. Outside the farm | a host that is not a node (an operator's admin machine to start, or a small services cluster) on the rack network | root on that host is root over the whole Mac fleet, the allowed-signers list included; an admin machine runs far more software than a dedicated node. Moving it later follows M7 |
 
-**Open CEO decision. Lean: A**, since its cost is one node's build capacity and B
-turns one escape into the loss of every Mac. Either way, the host never runs
+**Open decision. Lean: A** among the farm's own nodes, since its cost is one node's
+build capacity and B turns one escape into the loss of every Mac. **The reference
+deployment starts on C**, on an operator's admin machine, and plans to move to a small
+services cluster; the MDM can move between hosts without re-enrolling a Mac, if the
+items of M7 move with it. On C the operator's signing machine (M4.2) must not be the
+gate's host: if it is, malware there both shows the operator what to sign and edits
+the allowed signers, and M4's separation collapses into one machine. Either way, the host never runs
 `kbf-server`, and the enrollment endpoints must be reachable on the rack network
 (7.6).
 
@@ -363,14 +398,18 @@ traffic so an erase never arrives. Therefore:
 
 - The front admits `kbf-mac-admin` only from a client with an explicit
   `mac-admin` permission in the server's configuration.
-- The scheduler admits a privileged lease only when the gate has erase budget left.
+- The scheduler admits a privileged lease only when the gate has erase budget left
+  and holds an operator-signed erase request for the Mac whose purpose names that
+  lease (M4.2, M4.4); the lease waits for
+  that touch before it is placed.
 - **The admin user needs a grant the helper verifies itself.** The server asks the
   gate for `grant-admin` (S5.2), which reserves an erase; `kbf-mac-session` creates an
   administrator only if the grant's signature verifies under the gate's public key
   (installed by the MDM at provisioning) and it names this Mac's serial and this lease
   id, unexpired and not used before. The daemon's or the server's word is not enough.
 - When the lease ends, the server at once revokes that node's identity and join
-  credential and quarantines it, and may ask the gate to erase now. The erase does not
+  credential and quarantines it, and may ask the gate to bring the erase forward
+  (`bring-forward`, S5.2). The erase does not
   depend on that request: the gate already scheduled it with the grant (S5.2). The
   node is readmitted only with a fresh credential, after the gate has seen a fresh
   enrollment of that serial; a Mac whose erase never arrives stays out and alerts.
@@ -404,6 +443,7 @@ Each with the planted mutant that must turn it red:
 | The helpers refuse to start beside `--driver native` on Linux | drop the check |
 | A `rollout`-role request with a strategy field is refused | accept strategy from `rollout` |
 | The gate refuses an unauthenticated caller, a serial outside its inventory, a second outstanding erase or enforcement, an erase past the cap, and one below the floor | drop the outstanding-erase check |
+| The gate refuses an erase the server sends without an operator signature (more in M10) | keep an unsigned `erase` verb for the server |
 | The gate alerts on an erase even when the server sends no alert | route gate alerts through the server |
 | A node reporting a different serial than at first join is quarantined | accept the new serial |
 | A privileged lease's node is quarantined and its credential revoked at lease end | skip the revocation |
@@ -412,6 +452,8 @@ Each with the planted mutant that must turn it red:
 | `kbf-updater` refuses a component-key set that changes `kbf-updater` or `kbf-mac-session` | let the component key cover the helpers |
 | `user-create` makes an administrator only with a valid, unused gate grant for this serial and lease | trust an admin flag from the daemon |
 | The gate erases a granted Mac with no erase request from the server | leave the erase to the server |
+| `grant-admin` is refused for a Mac with no held, operator-signed erase | grant on erase budget alone |
+| `grant-admin` for a lease is refused when the Mac's only signed request names another lease, or was an `erase-now` (more in M10) | ignore `purpose` |
 | The gate refuses `enforce` of an expired set or one below its own pool floor | skip the gate's expiry check |
 | A second join with an already-bound serial is refused and alerts | bind identity from `NodeStatus` |
 | An apply that adds an Xcode is followed by a clean boot scan | hand over the expected items after the reboot |
