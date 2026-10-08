@@ -9,8 +9,12 @@
 //! `stage` then raises the floor to the set's `min_serial` and copies each artifact the
 //! set changes from the artifacts directory, where the daemon left it named by its
 //! SHA-256, into the root-only staging directory, hashing the bytes it copies. The
-//! artifacts directory is the daemon's, so the copy never follows a symbolic link and
-//! takes only a regular file, and the digest is checked on the copy, not the original.
+//! artifacts directory is the daemon's, so the artifact is opened with `O_NOFOLLOW` (a
+//! symbolic link in the artifacts directory is refused) and `O_NONBLOCK` (a FIFO cannot
+//! block the updater), only a regular file is taken, and the digest is checked on the
+//! copy, not the original. `O_NOFOLLOW` covers only the last path component: the path
+//! of the artifacts directory itself (`--artifacts-dir` and every directory above it)
+//! must not be one the daemon can replace, which provisioning ensures.
 //!
 //! `apply` installs only the staged set: it records the apply as in progress, calls the
 //! applier, records the set as installed, and reboots if the applier says the step

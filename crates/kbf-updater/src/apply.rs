@@ -19,6 +19,14 @@
 //!    the new;
 //! 3. the step needs a reboot exactly when `/run/reboot-required` exists afterwards, and
 //!    the reboot is `systemctl reboot`.
+//!
+//! **Not done yet: restarting what it replaced.** Nothing restarts `kbf-daemon` (or the
+//! updater) after its binary is renamed over. Until a reboot, the old daemon keeps
+//! running, and its `/proc/<pid>/exe` is the old file, which no longer hashes to the
+//! file at `--daemon-path`; the caller check ([`crate::caller`]) then refuses every
+//! request from it. So after a set that changes `kbf-daemon` and does not reboot, the
+//! daemon is locked out of the updater until it is restarted. The restart (with the
+//! daemon's drain) is left for the change that adds the systemd units.
 
 use std::fs;
 use std::io::Write as _;

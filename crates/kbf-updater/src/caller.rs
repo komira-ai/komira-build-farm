@@ -9,7 +9,11 @@
 //! 2. The caller's effective uid (as `SO_PEERCRED` recorded it at `connect`) must be the
 //!    daemon's.
 //! 3. The caller's executable (`/proc/<pid>/exe`, opened, so the file itself and not a
-//!    path) must hash to the installed `kbf-daemon`.
+//!    path) must hash to the installed `kbf-daemon`: the file at `--daemon-path` as it is
+//!    now, not a digest the installed set pins. That file must therefore be root-owned
+//!    and not writable by the daemon's uid (or any other), in directories that are too;
+//!    provisioning sets that up. A daemon still running an older binary after an apply
+//!    replaced the file is refused until it restarts ([`crate::apply`]).
 //! 4. The caller must not run with `--driver native`: on Linux the native driver runs
 //!    actions as the daemon's own uid, so an action could reach the socket.
 //! 5. After reading `/proc`, the pidfd must still name the same pid: once a process is
