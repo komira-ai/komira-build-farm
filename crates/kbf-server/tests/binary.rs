@@ -185,6 +185,84 @@ fn api_listen_serves_the_operator_api() {
     interrupt(child);
 }
 
+/// A token file holding `content` with `mode`, under `name`.
+#[cfg(unix)]
+fn token_file(name: &str, content: &str, mode: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-binary");
+    std::fs::create_dir_all(&dir).expect("a token directory");
+    let path = dir.join(format!("{name}-{}", std::process::id()));
+    std::fs::write(&path, content).expect("write the token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    path
+}
+
+/// One POST to `api` with `headers`; the response.
+#[cfg(unix)]
+fn post(api: SocketAddr, path: &str, headers: &str) -> String {
+    let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: kbf\r\nContent-Length: 0\r\n{headers}\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    response
+}
+
+/// Catches: `--api-token-file` read but not given to the API (every write refused as
+/// "writes are off", or none checked), and the token's bytes in the start line.
+#[cfg(unix)]
+#[test]
+fn api_token_file_gates_writes() {
+    const TOKEN: &str = "kbf-binary-token-0123456789abcdef0123456789";
+    let path = token_file("good", &format!("{TOKEN}\n"), 0o600);
+    let path = path.to_str().expect("a UTF-8 path");
+    let mut c = server(&["--api-listen", "127.0.0.1:0", "--api-token-file", path]);
+    c.args(ANY_PORT);
+    let (child, line, _) = started(c);
+    assert!(!line.contains(TOKEN), "{line}");
+    let api: SocketAddr = line
+        .rsplit_once(" api=")
+        .expect("an API address")
+        .1
+        .parse()
+        .expect("an address");
+    let json = "Content-Type: application/json\r\n";
+    let refused = post(api, "/v1/nodes/ghost:cordon", json);
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    let headers = format!("Authorization: Bearer {TOKEN}\r\n{json}");
+    let passed = post(api, "/v1/nodes/ghost:cordon", &headers);
+    assert!(
+        passed.starts_with("HTTP/1.1 404"),
+        "past every gate: {passed}"
+    );
+    interrupt(child);
+}
+
+/// Catches: a token file others can read accepted at start (or refused only at the
+/// first write), its path or mode left out of the message, and `--api-token-file`
+/// accepted without an API to use it.
+#[cfg(unix)]
+#[test]
+fn an_unsafe_api_token_file_stops_the_start() {
+    let open = token_file("open", "kbf-binary-token-0123456789abcdef0123456789", 0o644);
+    let open = open.to_str().expect("a UTF-8 path");
+    let mut c = server(&["--api-listen", "127.0.0.1:0", "--api-token-file", open]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--api-token-file: "), "{stderr}");
+    assert!(stderr.contains(open) && stderr.contains("0644"), "{stderr}");
+
+    let mut c = server(&["--api-token-file", open]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--api-listen"), "{stderr}");
+}
+
 /// Catches (issue #86): a server whose SIGINT handler is installed after it prints the
 /// start line, so a SIGINT sent as soon as the line is read kills it by the default
 /// action instead of stopping it with exit 0. In both store modes the test holds the
