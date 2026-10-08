@@ -6,13 +6,15 @@
 # On a pull request or in the merge queue this is a build check: everything is built,
 # signed, packaged and summed, and nothing is attested. On a push to main, the attest
 # job signs build provenance for every file and an SBOM attestation for every tarball,
-# then verifies them as a node's deployment job would. Only that job may hold
+# then verifies them as the planned deployment job is to. Only that job may hold
 # `id-token: write` and `attestations: write`, and only under its exact main-push `if:`
 # (the workflow lint, crates/kbf-it/tests/workflows, requires both).
 #
-# The files are kept as workflow artifacts for 90 days, GitHub's limit. Releases do not
-# rely on them: a release attaches the exact bytes the farm ran, checked against these
-# attestations, and never rebuilds.
+# The files are kept as workflow artifacts for 90 days, GitHub's limit. The deployment
+# job, the node's SHA-256 check and the release workflow are planned, not built
+# (docs/design/mac-node-provisioning.md sections 4.1 and 4.2). The plan is that releases
+# do not rely on these artifacts: a release is to attach the exact bytes the farm ran,
+# checked against these attestations, and never rebuild.
 name: artifacts
 
 on:
@@ -67,6 +69,10 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          # On a push to main (the build the attest job signs) nothing is restored: the
+          # attested binary is built from a clean target/, never on a cached one. The
+          # lookup still tells the save step below whether this key exists.
+          lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: |
           archive="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
@@ -125,6 +131,10 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          # On a push to main (the build the attest job signs) nothing is restored: the
+          # attested binary is built from a clean target/, never on a cached one. The
+          # lookup still tells the save step below whether this key exists.
+          lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: |
           archive="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
@@ -180,6 +190,10 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          # On a push to main (the build the attest job signs) nothing is restored: the
+          # attested binary is built from a clean target/, never on a cached one. The
+          # lookup still tells the save step below whether this key exists.
+          lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: |
           archive="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
@@ -246,7 +260,8 @@ jobs:
           if-no-files-found: error
 
   # Push to main only: build provenance for every file, an SBOM attestation for every
-  # tarball, then the checks a node's deployment job makes (tools/ci/verify-assets.sh).
+  # tarball, then the checks the planned deployment job is to make
+  # (tools/ci/verify-assets.sh).
   attest:
     needs: [sums]
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -296,7 +311,7 @@ jobs:
         with:
           subject-path: dist/kbf-server-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-server-${{ github.sha }}-linux-arm64.cdx.json
-      - name: Verify as a node's deployment job does
+      - name: Verify as the planned deployment job is to
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/ci/verify-assets.sh attestations dist

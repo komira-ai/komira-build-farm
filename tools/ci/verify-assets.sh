@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Checks a commit's assets as a node's deployment job would (.github/workflows/artifacts.yml;
-# docs/artifacts.md). Each mode also runs a control, a check that must fail, so a
+# Checks a commit's assets as the planned deployment job is to
+# (.github/workflows/artifacts.yml; docs/artifacts.md). Each mode also runs a control, a check that must fail, so a
 # verification that accepts anything fails the job instead of passing it.
 #
 #   verify-assets.sh sums <dir>
