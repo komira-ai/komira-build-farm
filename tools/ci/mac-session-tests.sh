@@ -96,7 +96,9 @@ sudo -n sysadminctl -secureTokenStatus kbf-lease-1-1 2>&1 | tee /dev/stderr | gr
 
 step "run: as the lease user, in the lease directory"
 lease_dir=$(mktemp -d "$tmp/lease.XXXXXX")
-sudo -n chown "$first" "$lease_dir"
+# The daemon opens the lease directory and the lease user works in it (on a node an
+# inherited ACL entry gives the daemon access; here the directory is open to all).
+chmod 0777 "$lease_dir"
 out=$("$client" run "$socket" 1.1 "$lease_dir" /bin/sh -c 'id -u; pwd -P; echo "$HOME"')
 want=$(printf '%s\n%s\n%s\nexit 0' "$first" "$(cd "$lease_dir" && pwd -P)" "$users"/kbf-lease-1-1)
 [ "$out" = "$want" ] || fail "run printed: $out"
