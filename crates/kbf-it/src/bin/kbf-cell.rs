@@ -21,7 +21,8 @@ enum Cli {
         /// The directory to write them to.
         #[arg(long)]
         dir: PathBuf,
-        /// The daemon certificate's common name.
+        /// The node id the daemon certificate names (its DNS subjectAltName and common
+        /// name). The daemon must say the same `--node-id`, or the server refuses it.
         #[arg(long, default_value = "cell-node-1")]
         node_id: String,
     },

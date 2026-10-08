@@ -1117,11 +1117,13 @@ dependencies = [
  "kbf-types",
  "prost",
  "rcgen",
+ "sha2",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

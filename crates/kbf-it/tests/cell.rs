@@ -21,7 +21,7 @@ use kbf_proto::reapi::{
     Action, BatchUpdateBlobsRequest, Command as ReapiCommand, Digest, Directory, ExecuteRequest,
     ExecuteResponse, batch_update_blobs_request,
 };
-use kbf_server::{Listeners, bind_server};
+use kbf_server::{Listeners, WorkerTls, bind_server};
 use prost::Message;
 use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
@@ -177,7 +177,10 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
     let listeners = Listeners {
         reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
         worker: SocketAddr::from(([127, 0, 0, 1], 0)),
-        worker_tls: Some(tls),
+        worker_tls: Some(WorkerTls {
+            server: tls,
+            deny_list: None,
+        }),
         heartbeat_interval: Duration::from_millis(200),
         hello_wait: Duration::from_secs(5),
         tick: Duration::from_millis(50),

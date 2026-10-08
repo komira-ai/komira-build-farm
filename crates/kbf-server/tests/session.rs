@@ -118,6 +118,31 @@ async fn a_resent_hello_changes_capacity_only() {
     done(&mut first_ops).await;
 }
 
+/// Catches (issue #79): a resent `Hello` whose `node_id` is not the stream's node read
+/// for its capacity only (its `node_id` never compared), which would let a stream speak
+/// for a node it did not register as; and one that is refused but leaves the stream
+/// open. The node itself is not punished: its next stream registers and gets work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resent_hello_naming_another_node_ends_the_stream() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 1, 8).await;
+    assert!(daemon.heartbeat(&[]).await);
+    daemon.send(daemon_message::Message::Hello(hello("node-b", 4, 8)));
+    let ended = daemon.ended().await;
+    assert_eq!(ended.code(), Code::PermissionDenied);
+    assert!(
+        ended.message().contains("\"node-b\"") && ended.message().contains("node-a"),
+        "{}",
+        ended.message()
+    );
+
+    let mut back = cell.daemon("node-a", 1, 8).await;
+    let job = Job::new("after", &[]);
+    cell.upload(&job.blobs()).await;
+    let _ops = cell.execute(&job.action).await;
+    back.start().await;
+}
+
 /// Catches (issue #25): heartbeats from a stream that a newer stream of the same node
 /// has replaced still fed and acknowledged, which would keep the old session's daemon
 /// from fencing and let its stale running set requeue the new session's leases.

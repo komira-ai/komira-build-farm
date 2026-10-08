@@ -99,7 +99,11 @@ pub fn pki(name: &str) -> Pki {
         "kbf test server",
         ExtendedKeyUsagePurpose::ServerAuth,
     );
-    let (client_cert, client_key) = leaf(Vec::new(), "node-1", ExtendedKeyUsagePurpose::ClientAuth);
+    let (client_cert, client_key) = leaf(
+        vec!["node-1".to_owned()],
+        "node-1",
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
 
     let write = |file: &str, text: &str| {
         let path = dir.join(file);

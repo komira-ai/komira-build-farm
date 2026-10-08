@@ -42,7 +42,8 @@ role (`--role=all`). The flags are:
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
-  listener over mutual TLS (all three, or none for plain text);
+  listener over mutual TLS (all three, or none for plain text), and
+  `--worker-deny-list` for the certificates and nodes it refuses;
 - `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
@@ -217,7 +218,12 @@ and a daemon protocol in which only the newest stream of a worker counts. See
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key
-  and client CA.
+  and client CA. A daemon's certificate must name its node id as its one DNS
+  subjectAltName, so a certificate can speak only for its own node, and a deny list
+  (serials, public keys, node ids), read again at every `Hello` and `Heartbeat`, refuses
+  leaked or retired certificates without a restart. There is no CRL or OCSP; short
+  certificate lifetimes bound what the list misses. See
+  [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
 - The REAPI listener has no TLS and no authentication yet (**planned**: TLS and
   bearer-token authentication, with the caller's identity deciding its role).
 - Only the daemon path writes the action cache, and the metadata state machine itself

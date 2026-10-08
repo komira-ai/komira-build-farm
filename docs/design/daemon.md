@@ -22,6 +22,9 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 
 The daemon is configured by flags only: `--server` (an `https://` URL), `--ca-cert`,
 `--cert`, `--key`, `--tls-server-name`, `--node-id`, `--runtime` and `--reconnect-ms`.
+The certificate must name `--node-id` as its one DNS subjectAltName, or the server
+refuses the session (see
+[worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)).
 
 ## The session and the fence
 
