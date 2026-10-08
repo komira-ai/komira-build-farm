@@ -9,7 +9,8 @@
 //! and Unix sockets (the profile Bazel's macOS sandbox uses); one with the network gets
 //! [`BASE_PROFILE`]. Both keep the action from handing work to launchd, which would run
 //! it outside the sandbox and outside the action's process tree, and both deny every
-//! file write outside the lease directory and `/dev` ([`BASE_PROFILE`]): the action's
+//! file write outside the lease directory and `/dev`, and every preference write
+//! through `cfprefsd` ([`BASE_PROFILE`]): the action's
 //! home, temporary and cache directories are inside the lease (`crate::home`), so a
 //! tool that turns its own sandbox off (`swift build --disable-sandbox`) still writes
 //! nowhere else.
@@ -64,6 +65,12 @@ pub const LEASE_PARAM: &str = "KBF_LEASE";
 /// document through Launch Services (`open`); `job-creation` is giving launchd a job
 /// (`launchctl submit`, `load`, `bootstrap`); `file-write*` is every write operation:
 /// create, write, unlink, rename, mode, flags, ACLs, extended attributes, times.
+/// `user-preference-write` is asking `cfprefsd` to write a preference (`defaults
+/// write`, `CFPreferences`): the daemon writes the user's `~/Library/Preferences`, not
+/// the action, so `file-write*` does not cover it, and without the rule one action
+/// leaves settings for the next (`tests/sandbox.rs` saw it on the macOS runner).
+/// A hard link from inside the lease to a file outside it is already refused by these
+/// rules, as the same test shows; there is no `file-link` rule.
 ///
 /// Launchd already refuses a job from any sandboxed process, `(allow default)` alone
 /// included, as `tests/launchd.rs` shows on the macOS runner (and the mutants that
@@ -74,6 +81,7 @@ pub const BASE_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
 (deny lsopen)\n\
+(deny user-preference-write)\n\
 (deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
 
@@ -83,6 +91,7 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
 (deny lsopen)\n\
+(deny user-preference-write)\n\
 (deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
 (deny network*)\n\

@@ -12,7 +12,8 @@
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
 //! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no file
-//!   written outside the lease directory and `/dev`, no work handed to launchd
+//!   written outside the lease directory and `/dev`, no user preference written through
+//!   `cfprefsd` (`defaults write`), no work handed to launchd
 //!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network unless the
 //!   action's `network` platform property allows it; elsewhere nothing is enforced,
 //!   and the node reports which in its `network_isolation` capability;
@@ -53,9 +54,14 @@
 //!   next login, `at`, `cron`, a loopback service).
 //! - **The daemon's own files.** Actions run as the daemon's user, so they can read
 //!   what it can, the node's TLS private key (`--key`) included. On macOS the
-//!   profile keeps their writes inside their own lease directory, so they cannot change
+//!   profile keeps their file writes inside their own lease directory: the ways
+//!   `tests/sandbox.rs` tries on the macOS runner (create, append, unlink, rename,
+//!   chmod, mkdir, extended attributes, `/tmp`, a hard link to a file outside the lease
+//!   or in another lease, a preference write) are all refused, so none of them changes
 //!   other leases' directories, the scratch root, `quarantine/` or the daemon's
-//!   configuration; on Linux (no sandbox) they can, and an action that locks the
+//!   configuration. A service that writes on an action's behalf by another route
+//!   than those is not covered (the mach and XPC gap above). On Linux (no sandbox)
+//!   they can, and an action that locks the
 //!   scratch root or `quarantine/` (`chmod 555`) makes every later lease on the node
 //!   fail until an operator unlocks it.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
