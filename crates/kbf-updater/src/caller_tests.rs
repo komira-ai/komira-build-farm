@@ -237,6 +237,23 @@ fn a_caller_that_exited_is_refused() {
     );
 }
 
+/// Catches: the final pidfd check removed from `check_caller`. The caller passes every
+/// `/proc` read and is then killed and reaped, so its pid is free for another process
+/// and what `/proc` showed may no longer describe whoever holds it; only the recheck
+/// after the reads notices (its pidfd now names pid -1).
+#[test]
+fn a_caller_reaped_after_the_proc_reads_is_refused() {
+    let (stream, mut c) = connect_from_child("reaped", "connect", &[]);
+    let r = check_caller_then(&stream, &me(), &mut || {
+        c.kill().unwrap();
+        c.wait().unwrap();
+    });
+    assert!(
+        matches!(r, Err(CallerError::Gone { pidfd: -1, .. })),
+        "{r:?}"
+    );
+}
+
 /// Catches: the pid-reuse guard removed: a pidfd whose process was reaped still
 /// passing as that pid.
 #[test]

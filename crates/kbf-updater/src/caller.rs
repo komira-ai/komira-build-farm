@@ -182,6 +182,16 @@ fn same_process(pidfd: &OwnedFd, pid: i64) -> Result<(), CallerError> {
 /// # Errors
 /// The first check that fails.
 pub fn check_caller(stream: &UnixStream, daemon: &DaemonPin) -> Result<(), CallerError> {
+    check_caller_then(stream, daemon, &mut || {})
+}
+
+/// [`check_caller`], with `after_proc` run once every `/proc` read has passed and before
+/// the final pidfd check, so a test can reap the caller in exactly that window.
+fn check_caller_then(
+    stream: &UnixStream,
+    daemon: &DaemonPin,
+    after_proc: &mut dyn FnMut(),
+) -> Result<(), CallerError> {
     let cred = rustix::net::sockopt::socket_peercred(stream)
         .map_err(|e| CallerError::Credentials(e.into()))?;
     let pidfd = peer_pidfd(stream.as_fd()).map_err(CallerError::Credentials)?;
@@ -198,6 +208,7 @@ pub fn check_caller(stream: &UnixStream, daemon: &DaemonPin) -> Result<(), Calle
     if uses_native_driver(&cmdline) {
         return Err(CallerError::NativeDriver);
     }
+    after_proc();
     same_process(&pidfd, pid)
 }
 
