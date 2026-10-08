@@ -180,7 +180,7 @@ impl Host for MacHost {
                 if libc::setuid(uid) != 0 {
                     libc::_exit(1);
                 }
-                while libc::kill(-1, libc::SIGKILL) == 0 {}
+                
                 libc::_exit(0);
             }
         }
