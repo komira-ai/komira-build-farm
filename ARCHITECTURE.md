@@ -89,6 +89,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
+| `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
