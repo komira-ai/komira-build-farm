@@ -229,22 +229,22 @@ fn places_that_cannot_be_read_are_errors_and_the_walk_goes_on() {
 }
 
 /// Catches: unbounded recursion, by which a lease user could exhaust the helper's
-/// stack or descriptors with a deep tree; the depth limit must fail closed.
+/// stack or descriptors with a deep tree. The departing user's own deep tree fails
+/// its deletion closed; another user's deep tree is not searched below the limit, so
+/// it cannot stop every other lease's deletion (a CI run showed one doing just that).
 #[test]
-fn a_tree_deeper_than_the_limit_is_an_error() {
+fn deep_trees_are_bounded_without_blocking_other_users() {
     let base = scratch("deep").join("Shared");
     let mut deep = base.clone();
     for _ in 0..=MAX_DEPTH + 1 {
         deep.push("d");
     }
     fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("f"), "x").unwrap();
+    // Another uid's view: the tree is someone else's; searched to the limit, no error.
     let swept = sweep(&owned_plan(&base), "u", other());
-    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
-    assert!(
-        swept.errors[0].contains("nested deeper than 256"),
-        "{:?}",
-        swept.errors
-    );
+    assert_eq!(swept, Swept::default());
+    // The departing uid's own tree: removing it would go below the limit.
     let swept = sweep(&owned_plan(&base), "u", me());
     assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
     assert!(
@@ -252,7 +252,8 @@ fn a_tree_deeper_than_the_limit_is_an_error() {
         "{:?}",
         swept.errors
     );
-    assert!(base.join("d").is_dir());
+    assert!(deep.join("f").is_file());
+    fs::remove_dir_all(base.parent().unwrap()).unwrap();
 }
 
 /// Catches: a walk that crosses into another mounted filesystem, or that removes a

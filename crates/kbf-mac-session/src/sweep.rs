@@ -8,8 +8,11 @@
 //! never followed. On macOS the user flags that block removal (`uchg`, `uappnd`) are
 //! cleared, but only on entries the departing uid owns: an entry of another owner (a
 //! hard link to a system file, say) is unlinked as it is and never changed. The walk
-//! stays on the filesystem of the directory it starts in, and refuses directories
-//! nested deeper than [`MAX_DEPTH`].
+//! stays on the filesystem of the directory it starts in. It does not descend into
+//! another owner's directories nested deeper than [`MAX_DEPTH`] (so no other user's
+//! deep tree can stop a deletion), and it refuses to remove a directory of the
+//! departing uid nested deeper than that (so the departing user's own deep tree fails
+//! its deletion closed).
 //!
 //! Callers must have ended every process of the uid first (`user-delete` refuses
 //! otherwise), so nothing of the departing user races the walk.
@@ -28,9 +31,10 @@ const DIRECTORY: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-/// How deeply nested a directory the walk enters. A lease user can build a deeper
-/// tree to make its own deletion fail; that fails closed (the user stays, the node is
-/// looked at), never open.
+/// How deeply nested a directory the walk enters. Below it, another owner's
+/// directories are not searched; a directory of the departing uid that reaches below
+/// it is an error: the lease user built it to make its own deletion fail, which fails
+/// closed (the user stays, the node is looked at), never open.
 pub const MAX_DEPTH: usize = 256;
 
 /// Where the sweep looks.
@@ -159,7 +163,7 @@ fn sweep_base(base: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
 /// stuck entry does not hide the others.
 ///
 /// # Errors
-/// `dir` is too deep or cannot be listed.
+/// `dir` cannot be listed.
 fn walk_owned(
     dir: &OwnedFd,
     path: &Path,
@@ -168,9 +172,6 @@ fn walk_owned(
     depth: usize,
     swept: &mut Swept,
 ) -> io::Result<()> {
-    if depth > MAX_DEPTH {
-        return Err(too_deep());
-    }
     for name in list(dir)? {
         let here = path.join(&name);
         let result = visit(dir, &name, &here, uid, dev, depth, swept);
@@ -196,7 +197,8 @@ fn visit(
             remove_entry(dir, name, &stat, uid, dev, depth + 1)?;
             swept.removed += 1;
         }
-        (true, false, true) => {
+        // Another owner's directory: searched for the uid's entries, down to the limit.
+        (true, false, true) if depth < MAX_DEPTH => {
             let child = open_child(dir, name, &stat)?;
             walk_owned(&child, here, uid, dev, depth + 1, swept)?;
         }
