@@ -23,17 +23,17 @@ use support::{MemoryCas, Spec, config, run, runtime, scratch, stderr, stdout, wo
 /// The actions' `PATH`.
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// Writes an action tries outside its lease, as `name command` pairs. `OUT` is a
-/// directory outside every lease holding a file `victim`; `TMP` is a path in `/tmp`.
+/// Writes an action tries outside its lease, as `name command` pairs. `{OUT}` is a
+/// directory outside every lease holding a file `victim`; `{TMP}` is a path in `/tmp`.
 const OUTSIDE: [(&str, &str); 8] = [
-    ("create", "echo x > OUT/new"),
-    ("append", "echo x >> OUT/victim"),
-    ("unlink", "rm -f OUT/victim"),
-    ("rename", "mv OUT/victim OUT/moved"),
-    ("chmod", "chmod 600 OUT/victim"),
-    ("mkdir", "mkdir OUT/dir"),
-    ("xattr", "xattr -w kbf.test x OUT/victim"),
-    ("tmp", "echo x > TMP"),
+    ("create", "echo x > {OUT}/new"),
+    ("append", "echo x >> {OUT}/victim"),
+    ("unlink", "rm -f {OUT}/victim"),
+    ("rename", "mv {OUT}/victim {OUT}/moved"),
+    ("chmod", "chmod 600 {OUT}/victim"),
+    ("mkdir", "mkdir {OUT}/dir"),
+    ("xattr", "xattr -w kbf.test x {OUT}/victim"),
+    ("tmp", "echo x > {TMP}"),
 ];
 
 /// A script that runs each of `ways` and prints `name=<exit status>` for each.
@@ -41,8 +41,8 @@ fn attempts(ways: &[(&str, &str)], out: &Path, tmp: &Path) -> String {
     ways.iter()
         .map(|(name, command)| {
             let command = command
-                .replace("OUT", &out.to_string_lossy())
-                .replace("TMP", &tmp.to_string_lossy());
+                .replace("{OUT}", &out.to_string_lossy())
+                .replace("{TMP}", &tmp.to_string_lossy());
             format!("{command} 2>/dev/null; echo {name}=$?; ")
         })
         .collect()
