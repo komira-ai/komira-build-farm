@@ -5,8 +5,11 @@
 # Checks, each of which fails the job:
 #   1. `codesign --verify --strict` accepts the signature;
 #   2. the signed binary runs, on every host: `<binary> --version` exits 0 in an
-#      environment with no DYLD_* variable (a signature the kernel or dyld refuses,
-#      such as one over bytes changed after signing, fails here);
+#      environment with no DYLD_* variable, so a signature that dyld or the kernel
+#      refuses at start fails here. (On GitHub's hosted runners process code-signing
+#      enforcement is off, so a byte changed after signing does not stop the binary
+#      there; tools/ci/check-darwin-asset.sh verifies the signature of the bytes that
+#      ship);
 #   3. the code directory's flags are exactly `adhoc,runtime`, and the signature carries
 #      no entitlements (so no `get-task-allow`: a debugger cannot attach);
 #   4. the binary's minimum macOS (LC_BUILD_VERSION minos) is $MACOSX_DEPLOYMENT_TARGET;
