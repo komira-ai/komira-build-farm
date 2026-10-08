@@ -328,6 +328,53 @@ fn a_report_becomes_node_caps() {
     assert!(ReportError::NoArch.to_string().contains("arch"));
 }
 
+/// Catches: a report with two `xcode` entries refused as repeated (a Mac with two
+/// Xcodes installed could not join), or one that keeps only one of them, so actions
+/// for the other wait for a node that has it.
+#[test]
+fn a_report_lists_every_xcode() {
+    let node = report(&[
+        ("arch", "arm64"),
+        ("os", "macos"),
+        ("xcode", "16E140"),
+        ("xcode", "16C5032a"),
+        ("xcode", "16E140"),
+    ])
+    .unwrap();
+    let xcodes: Vec<&str> = node.members["xcode"].iter().map(String::as_str).collect();
+    assert_eq!(xcodes, ["16C5032a", "16E140"]);
+    assert!(!node.exact.contains_key("xcode"));
+    for build in ["16C5032a", "16E140"] {
+        let wants = from(&[("OSFamily", "darwin"), ("xcode", build)]).unwrap();
+        assert!(wants.matches(&node), "{build}");
+    }
+    let other = from(&[("xcode", "15F31d")]).unwrap();
+    assert!(!other.matches(&node));
+    assert!(!other.matches(&mac()), "a node that reports no Xcode");
+}
+
+/// Catches: a booking key that is not reserved, so a platform asking for a larger
+/// booking is refused as an unknown capability or matched against the node; and one
+/// read only in its exact spelling, so `KBF-Book-Mem-GiB=16` books the default.
+#[test]
+fn booking_keys_are_reserved_in_any_case() {
+    for (sent, key) in [
+        ("kbf-book-cpus", "kbf-book-cpus"),
+        ("KBF-Book-CPUs", "kbf-book-cpus"),
+        ("kbf-book-mem-gib", "kbf-book-mem-gib"),
+        ("Kbf-Book-Mem-GiB", "kbf-book-mem-gib"),
+    ] {
+        assert_eq!(
+            kbf_caps::property_name(sent).as_deref(),
+            Some(key),
+            "{sent}"
+        );
+        assert_eq!(from(&[(sent, "8")]), Ok(Request::default()), "{sent}");
+    }
+    assert!(kbf_caps::RESERVED_KEYS.contains(&"kbf-book-cpus"));
+    assert!(kbf_caps::RESERVED_KEYS.contains(&"kbf-book-mem-gib"));
+}
+
 /// Catches: an unmet requirement shown in a form an operator cannot act on: the queue
 /// reason and the FAILED_PRECONDITION message are built from these.
 #[test]
@@ -341,6 +388,10 @@ fn unmet_requirements_read_as_requests() {
         Unmet::Exact {
             key: "os",
             want: "macos",
+        },
+        Unmet::Member {
+            key: "xcode",
+            want: "16E140",
         },
         Unmet::Consumable {
             what: Consumable::Gpus,
@@ -358,6 +409,7 @@ fn unmet_requirements_read_as_requests() {
             "isa_level>=x86-64-v3",
             "cpu.feature=avx2",
             "os=macos",
+            "xcode=16E140",
             "gpu>=2 (has 1)"
         ]
     );

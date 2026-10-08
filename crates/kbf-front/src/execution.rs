@@ -18,12 +18,16 @@
 //! client's next Execute is answered from the action cache.
 //!
 //! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
-//! not read yet), one core and 1 GiB for every action (learned sizes come with the
-//! estimator), and every action is hermetic, so it may be joined (a `networked` property
-//! does not exist yet). The lease kind is the platform's `kbf-lease` value, `action`
-//! when absent; any other value than `action` or `whole_machine` is INVALID_ARGUMENT.
-//! The platform's `gpu` value is the number of whole GPUs to book on top (0 when
-//! absent); a value that is not a whole number is INVALID_ARGUMENT.
+//! not read yet), and every action is hermetic, so it may be joined (a `networked`
+//! property does not exist yet). The lease kind is the platform's `kbf-lease` value,
+//! `action` when absent; any other value than `action` or `whole_machine` is
+//! INVALID_ARGUMENT. The booking is one core and 1 GiB ([`DEFAULT_RESOURCES`]; learned
+//! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
+//! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
+//! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
+//! key on a `whole_machine` lease (which is planned to book the whole node). The
+//! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
+//! value that is not a whole number is INVALID_ARGUMENT.
 //!
 //! The rest of the platform says which workers may run the action
 //! (`kbf_caps::Request::from_platform`: `OSFamily`, `ISA`, `Arch` and kbf's capability
@@ -74,14 +78,20 @@ pub const LEASE_KINDS: [&str; 2] = ["action", "whole_machine"];
 /// The platform key that asks for whole GPUs, each booked for the lease alone.
 pub const GPU_KEY: &str = "gpu";
 
+/// The reserved platform key that books this many whole cores instead of one.
+pub const BOOK_CPUS_KEY: &str = "kbf-book-cpus";
+
+/// The reserved platform key that books this many GiB of memory instead of one.
+pub const BOOK_MEM_GIB_KEY: &str = "kbf-book-mem-gib";
+
 /// The `ErrorInfo.reason` of a queued operation no live worker can run.
 pub const NO_WORKER_REASON: &str = "NO_WORKER_CAN_RUN";
 
 /// The `ErrorInfo.domain` of kbf's errors.
 pub const ERROR_DOMAIN: &str = "kbf";
 
-/// What v0 books for every action: one core and 1 GiB, plus the GPUs its `gpu`
-/// property asks for.
+/// What v0 books for an action that names no size: one core and 1 GiB, plus the GPUs
+/// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler: the scheduler's request and the
@@ -245,12 +255,13 @@ where
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
         let gpus = gpus(&platform)?;
+        let booked = booking(&platform, &kind)?;
         let needs = needs(&platform)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
-                resources: DEFAULT_RESOURCES.with_gpus(gpus),
+                resources: booked.with_gpus(gpus),
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
                 needs,
@@ -351,6 +362,40 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
             "platform property {GPU_KEY}={n:?} is not a whole number of GPUs"
         ))
     })
+}
+
+/// What the lease books: [`DEFAULT_RESOURCES`], with `kbf-book-cpus` whole cores and
+/// `kbf-book-mem-gib` GiB in place of the default where the platform names them, or
+/// INVALID_ARGUMENT for a value that is not a whole number of at least 1, one too large
+/// to book, or either key on a `whole_machine` lease.
+fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
+    let mut booked = DEFAULT_RESOURCES;
+    for (key, unit, slot) in [
+        (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
+        (BOOK_MEM_GIB_KEY, 1 << 30, &mut booked.memory_bytes),
+    ] {
+        let Some(value) = platform.get(key) else {
+            continue;
+        };
+        if kind != LEASE_KINDS[0] {
+            return Err(Status::invalid_argument(format!(
+                "platform property {key} sizes an {:?} lease only, not a {kind:?} one",
+                LEASE_KINDS[0]
+            )));
+        }
+        *slot = value
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n >= 1)
+            .and_then(|n| n.checked_mul(unit))
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "platform property {key}={value:?} is not a whole number from 1 to {}",
+                    u64::MAX / unit
+                ))
+            })?;
+    }
+    Ok(booked)
 }
 
 /// What a worker must offer to run an action with `platform`: INVALID_ARGUMENT for a

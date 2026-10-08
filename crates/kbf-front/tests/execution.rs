@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use common::{Blob, Farm};
 use kbf_front::{
-    DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN, Finished, GPU_KEY, NO_WORKER_REASON, Stage,
-    Submission, Ticket,
+    BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN, Finished, GPU_KEY,
+    NO_WORKER_REASON, Stage, Submission, Ticket,
 };
 use kbf_meta::Role;
 use kbf_proto::google::longrunning::{Operation, operation};
@@ -607,6 +607,91 @@ async fn the_gpu_count_comes_from_the_platform() {
         assert_eq!(status.code(), Code::InvalidArgument, "{value:?}");
     }
     assert_eq!(script.submitted().len(), 2);
+}
+
+/// Catches: `kbf-book-cpus` or `kbf-book-mem-gib` dropped on the way to the scheduler
+/// (a large link step books 1 GiB and the native driver kills it at 2 GiB), one key
+/// replacing the other's default, a key read in its exact spelling only, a booking of
+/// zero or one that overflows accepted, and either key accepted on a `whole_machine`
+/// lease.
+#[tokio::test]
+async fn the_booking_comes_from_the_platform() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    type Case = (&'static str, Vec<(&'static str, &'static str)>, u64, u64);
+    let cases: [Case; 4] = [
+        (
+            "both",
+            vec![
+                (BOOK_CPUS_KEY, "6"),
+                (BOOK_MEM_GIB_KEY, "17"),
+                (GPU_KEY, "1"),
+            ],
+            6_000,
+            17 << 30,
+        ),
+        ("cpus only", vec![(BOOK_CPUS_KEY, "4")], 4_000, 1 << 30),
+        (
+            "memory only",
+            vec![("KBF-Book-Mem-GiB", "8")],
+            1_000,
+            8 << 30,
+        ),
+        ("neither", vec![("kbf-lease", "action")], 1_000, 1 << 30),
+    ];
+    for (argv, props, _, _) in &cases {
+        let job = job(argv, props, false);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect(argv);
+    }
+    let submitted = script.submitted();
+    for (submission, (argv, props, cpu_millis, memory_bytes)) in submitted.iter().zip(&cases) {
+        let gpus = u64::from(props.contains(&(GPU_KEY, "1")));
+        assert_eq!(
+            submission.request.resources,
+            kbf_types::Resources::new(*cpu_millis, *memory_bytes).with_gpus(gpus),
+            "{argv}"
+        );
+        assert_eq!(
+            submission.request.needs,
+            kbf_caps::Request::default(),
+            "{argv}"
+        );
+    }
+
+    let too_many = (u64::MAX / 1_000 + 1).to_string();
+    let too_much = (u64::MAX >> 30).saturating_add(1).to_string();
+    for (why, props) in [
+        ("zero cores", vec![(BOOK_CPUS_KEY, "0")]),
+        ("no memory", vec![(BOOK_MEM_GIB_KEY, "0")]),
+        ("half a core", vec![(BOOK_CPUS_KEY, "0.5")]),
+        ("a negative size", vec![(BOOK_MEM_GIB_KEY, "-1")]),
+        ("a word", vec![(BOOK_MEM_GIB_KEY, "lots")]),
+        ("too many cores", vec![(BOOK_CPUS_KEY, too_many.as_str())]),
+        (
+            "too much memory",
+            vec![(BOOK_MEM_GIB_KEY, too_much.as_str())],
+        ),
+        (
+            "cores on a whole machine",
+            vec![("kbf-lease", "whole_machine"), (BOOK_CPUS_KEY, "4")],
+        ),
+        (
+            "memory on a whole machine",
+            vec![(BOOK_MEM_GIB_KEY, "4"), ("kbf-lease", "whole_machine")],
+        ),
+        (
+            "two spellings",
+            vec![(BOOK_CPUS_KEY, "4"), ("KBF-BOOK-CPUS", "4")],
+        ),
+    ] {
+        let bad = job(why, &props, false);
+        farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &bad.action).await.expect_err(why);
+        assert_eq!(status.code(), Code::InvalidArgument, "{why}: {status:?}");
+        assert!(status.message().contains("kbf-book-"), "{why}: {status:?}");
+    }
+    assert_eq!(script.submitted().len(), cases.len());
 }
 
 /// Catches: the platform's OS and architecture dropped on the way to the scheduler (a
