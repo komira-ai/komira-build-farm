@@ -79,7 +79,7 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
   outside any rollout (7.2).
 - **A server that skips `Update`** and asks the gate to enforce directly can reboot a
   Mac mid-lease. The gate's caps (S5.2) bound it to one Mac per pool at a time.
-- **A VM guest escape** lands as the uid of the VM host process. #85 section 6 states that
+- **A VM guest escape** lands as the uid of the VM host process. [#85](https://github.com/komira-ai/komira-build-farm/pull/85) (open PR, `macos-vms.md`) section 6 states that
   `kbf-vmm` runs as a dedicated non-admin uid outside the helpers' group, started
   through `kbf-mac-session run` or its own launchd user, never as `_kbf` (S4.3).
 - **Linux join credentials have no hardware attestation.** A Linux node's identity
@@ -239,7 +239,7 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 ### S4.3 Who can reach a helper
 
 Both helpers listen on a Unix socket in a root-owned directory, mode 0750, group a
-**dedicated** group (`_kbf` in #76), never `staff`, which every macOS user is in;
+**dedicated** group (`_kbf` in [mac-node-provisioning.md](mac-node-provisioning.md)), never `staff`, which every macOS user is in;
 socket mode 0660. Two controls, the first being the one that matters:
 
 1. **No action, probe or VM runs under a uid in that group.**
@@ -272,7 +272,7 @@ socket mode 0660. Two controls, the first being the one that matters:
      the `kbf-daemon` requirement (its cdhash) pinned by the installed set. The audit
      token's pid version changes on `exec`, so a caller that connects and then
      executes the genuine daemon is refused.
-   - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures (#76's lean) the
+   - **Ad-hoc signing and Full Disk Access.** With ad-hoc signatures ([mac-node-provisioning.md](mac-node-provisioning.md)'s lean) the
      MDM's Full Disk Access profile can only pin `kbf-mac-session`'s cdhash, so a set
      that changes `kbf-mac-session` also needs a new profile, pushed through the gate in
      the same rollout step; with a Developer ID signature the profile would name the

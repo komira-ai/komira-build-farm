@@ -342,7 +342,8 @@ There is no separate configuration-management tool.
   (5.1, 8). Configuration files are artifacts in the set, or part of the bootc image;
   nothing is edited in place on a node.
 - **macOS:** `kbf-updater` re-runs the idempotent provisioning profile
-  (`kbf-mac-provision apply`, #76) from a signed set, and MDM does what only MDM can:
+  (`kbf-mac-provision apply`,
+  [mac-node-provisioning.md](mac-node-provisioning.md)) from a signed set, and MDM does what only MDM can:
   macOS updates, privacy (Full Disk Access) profiles, the managed administrator,
   bootstrap tokens, erase, Lights Out Management.
 - **What it shares with a tool like Ansible:** a declared state, idempotent steps,
