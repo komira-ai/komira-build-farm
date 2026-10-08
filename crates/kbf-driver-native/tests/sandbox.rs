@@ -24,8 +24,15 @@ use support::{MemoryCas, Spec, config, run, runtime, scratch, stderr, stdout, wo
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Writes an action tries outside its lease, as `name command` pairs. `{OUT}` is a
-/// directory outside every lease holding a file `victim`; `{TMP}` is a path in `/tmp`.
-const OUTSIDE: [(&str, &str); 8] = [
+/// directory outside every lease holding a file `victim`; `{LEASE}` is the same in
+/// another lease's directory under the scratch root (an output that lease is about to
+/// upload); `{TMP}` is a path in `/tmp`; `{DOMAIN}` is a preferences domain no one
+/// uses. The hard links write through a path inside the lease to a file outside it
+/// (`file-link` is not one of `file-write*`). `defaults write` asks `cfprefsd`, which
+/// writes the user's `~/Library/Preferences` on the action's behalf
+/// (`user-preference-write`, also not one of `file-write*`), so one action could leave
+/// settings, such as a tool's defaults, for the next.
+const OUTSIDE: [(&str, &str); 11] = [
     ("create", "echo x > {OUT}/new"),
     ("append", "echo x >> {OUT}/victim"),
     ("unlink", "rm -f {OUT}/victim"),
@@ -34,15 +41,69 @@ const OUTSIDE: [(&str, &str); 8] = [
     ("mkdir", "mkdir {OUT}/dir"),
     ("xattr", "xattr -w kbf.test x {OUT}/victim"),
     ("tmp", "echo x > {TMP}"),
+    ("link", "ln {OUT}/victim ./h && echo x >> ./h"),
+    ("link-lease", "ln {LEASE}/victim ./l && echo x >> ./l"),
+    ("defaults", "defaults write {DOMAIN} k v"),
 ];
 
+/// Where the rows of [`OUTSIDE`] aim.
+struct Targets {
+    out: PathBuf,
+    lease: PathBuf,
+    tmp: PathBuf,
+    domain: String,
+}
+
+impl Targets {
+    /// Fresh targets in `dir`, whose scratch root is `dir/leases` ([`config`]): both
+    /// victims hold `kept`, and neither `tmp` nor `domain` exists.
+    fn fresh(dir: &Path, tmp: &Path, domain: &str) -> Self {
+        let _ = std::fs::remove_file(tmp);
+        forget(domain);
+        Self {
+            out: victim_in(&dir.join("outside")),
+            lease: victim_in(&dir.join("leases").join("lease-9-999").join("out")),
+            tmp: tmp.to_owned(),
+            domain: domain.to_owned(),
+        }
+    }
+
+    /// Puts a fresh `victim` back in both directories.
+    fn rearm(&self) {
+        for dir in [&self.out, &self.lease] {
+            std::fs::write(dir.join("victim"), "kept\n").expect("victim");
+        }
+    }
+}
+
+/// The value of `k` in `domain` as the test's own user reads it, if any: what an
+/// action that got a preference write through left behind.
+fn preference(domain: &str) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", domain, "k"])
+        .output()
+        .expect("defaults read");
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Removes `domain` from the test user's preferences.
+fn forget(domain: &str) {
+    let _ = std::process::Command::new("/usr/bin/defaults")
+        .args(["delete", domain])
+        .output();
+}
+
 /// A script that runs each of `ways` and prints `name=<exit status>` for each.
-fn attempts(ways: &[(&str, &str)], out: &Path, tmp: &Path) -> String {
+fn attempts(ways: &[(&str, &str)], to: &Targets) -> String {
     ways.iter()
         .map(|(name, command)| {
             let command = command
-                .replace("{OUT}", &out.to_string_lossy())
-                .replace("{TMP}", &tmp.to_string_lossy());
+                .replace("{OUT}", &to.out.to_string_lossy())
+                .replace("{LEASE}", &to.lease.to_string_lossy())
+                .replace("{TMP}", &to.tmp.to_string_lossy())
+                .replace("{DOMAIN}", &to.domain);
             format!("{command} 2>/dev/null; echo {name}=$?; ")
         })
         .collect()
@@ -56,21 +117,30 @@ fn statuses(text: &str) -> Vec<(String, i32)> {
         .collect()
 }
 
-/// A directory outside every lease with a file `victim` holding `kept`.
-fn outside(dir: &Path) -> PathBuf {
-    let out = dir.join("outside");
-    if out.exists() {
-        kbf_outputs::remove_tree(&out).expect("clear outside");
+/// `dir`, made afresh, with a file `victim` holding `kept`.
+fn victim_in(dir: &Path) -> PathBuf {
+    if dir.exists() {
+        kbf_outputs::remove_tree(dir).expect("clear the victim's directory");
     }
-    std::fs::create_dir_all(&out).expect("outside");
-    std::fs::write(out.join("victim"), "kept\n").expect("victim");
-    out
+    std::fs::create_dir_all(dir).expect("the victim's directory");
+    std::fs::write(dir.join("victim"), "kept\n").expect("victim");
+    dir.to_owned()
+}
+
+/// The names in `dir`.
+fn names(dir: &Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(dir)
+        .expect("a directory")
+        .map(|e| e.expect("entry").file_name())
+        .collect()
 }
 
 /// Catches an action, with or without the network, that can create, append to,
-/// remove, rename, chmod or tag a file outside its lease directory, or write in
-/// `/tmp`: a tool that turned its own sandbox off (`swift build --disable-sandbox`)
-/// could then change other leases, the daemon's files or the node. Control: the same
+/// remove, rename, chmod or tag a file outside its lease directory, write in `/tmp`,
+/// change a file outside it (another lease's output included) through a hard link
+/// made inside it, or write the user's preferences: a tool that turned its own sandbox
+/// off (`swift build --disable-sandbox`) could then change other leases, the daemon's
+/// files, the node, or the settings the next action runs with. Control: the same
 /// action without a sandbox does every one of those writes.
 #[tokio::test]
 async fn no_action_writes_outside_its_lease() {
@@ -80,12 +150,13 @@ async fn no_action_writes_outside_its_lease() {
     assert!(matches!(sandboxed.isolation, Isolation::Sandbox(_)));
     let mut open = config(&dir.join("unsandboxed"));
     open.isolation = Isolation::None;
+    // The runtimes first: a start sweeps the scratch root, the other lease included.
     let (sandboxed, open) = (runtime(sandboxed, &cas), runtime(open, &cas));
     let tmp = PathBuf::from(format!("/tmp/kbf-sandbox-test-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let domain = format!("kbf.sandbox-test.{}", std::process::id());
 
-    let out = outside(&dir);
-    let script = attempts(&OUTSIDE, &out, &tmp);
+    let to = Targets::fresh(&dir, &tmp, &domain);
+    let script = attempts(&OUTSIDE, &to);
     for (seq, network) in [(1, "off"), (2, "on")] {
         let spec = Spec::sh(&script)
             .env("PATH", PATH)
@@ -99,24 +170,30 @@ async fn no_action_writes_outside_its_lease() {
                 "an action with network={network} wrote outside its lease: {name}"
             );
         }
-        let left: Vec<_> = std::fs::read_dir(&out)
-            .expect("outside")
-            .map(|e| e.expect("entry").file_name())
-            .collect();
-        assert_eq!(left, ["victim"], "network={network}");
-        assert_eq!(
-            std::fs::read_to_string(out.join("victim")).expect("victim"),
-            "kept\n"
-        );
+        for victim in [&to.out, &to.lease] {
+            assert_eq!(names(victim), ["victim"], "network={network}");
+            assert_eq!(
+                std::fs::read_to_string(victim.join("victim")).expect("victim"),
+                "kept\n",
+                "network={network} changed {}",
+                victim.display()
+            );
+        }
         assert!(!tmp.exists(), "network={network} wrote {}", tmp.display());
+        assert_eq!(
+            preference(&domain),
+            None,
+            "network={network} wrote {domain}"
+        );
     }
 
     // The control: unsandboxed, every write goes through, so the refusals above are
-    // the sandbox's. `rename` runs on a fresh victim after `unlink` took the first.
-    let out = outside(&dir);
+    // the sandbox's. Each row runs on fresh victims (`unlink` takes the first); the
+    // links must have reached their victims, and the preference must be there for the
+    // test's own user to read back.
     for (seq, (name, command)) in OUTSIDE.iter().enumerate() {
-        std::fs::write(out.join("victim"), "kept\n").expect("victim");
-        let script = attempts(&[(name, command)], &out, &tmp);
+        to.rearm();
+        let script = attempts(&[(name, command)], &to);
         let spec = Spec::sh(&script).env("PATH", PATH);
         let seq = 10 + u64::try_from(seq).expect("small");
         let result = run(&open, &cas, seq, &spec).await.expect("ran");
@@ -126,13 +203,32 @@ async fn no_action_writes_outside_its_lease() {
             "control: {name} fails even unsandboxed: {}",
             stderr(&cas, &result)
         );
+        let reached = match *name {
+            "link" => Some(&to.out),
+            "link-lease" => Some(&to.lease),
+            _ => None,
+        };
+        if let Some(victim) = reached {
+            assert_eq!(
+                std::fs::read_to_string(victim.join("victim")).expect("victim"),
+                "kept\nx\n",
+                "control: {name} did not write through its link"
+            );
+        }
     }
+    assert_eq!(
+        preference(&domain).as_deref(),
+        Some("v"),
+        "control: {domain}"
+    );
+    forget(&domain);
     let _ = std::fs::remove_file(&tmp);
 }
 
 /// Catches a profile that also refuses the writes an action must make: in its working
 /// directory, an output in a subdirectory, `HOME`, `TMPDIR`, its caches (the clang
-/// module cache), `/dev/null`, and through `mktemp`.
+/// module cache), `/dev/null`, through `mktemp`, and through a hard link between two of
+/// its own files.
 #[tokio::test]
 async fn an_action_writes_inside_its_lease() {
     let dir = scratch("inside");
@@ -151,8 +247,18 @@ async fn an_action_writes_inside_its_lease() {
         ("cache", "echo x > \"$XDG_CACHE_HOME/c\""),
         ("modules", "echo x > \"$CLANG_MODULE_CACHE_PATH/m\""),
         ("devnull", "echo x > /dev/null"),
+        (
+            "link",
+            "echo x > linked && ln linked link && echo y >> link",
+        ),
     ];
-    let script = attempts(&ways, Path::new("/unused"), Path::new("/unused"));
+    let unused = Targets {
+        out: PathBuf::from("/unused"),
+        lease: PathBuf::from("/unused"),
+        tmp: PathBuf::from("/unused"),
+        domain: String::new(),
+    };
+    let script = attempts(&ways, &unused);
     for (seq, network) in [(1, "off"), (2, "on")] {
         let spec = Spec::sh(&script)
             .env("PATH", PATH)
