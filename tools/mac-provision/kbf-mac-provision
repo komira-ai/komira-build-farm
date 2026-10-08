@@ -437,7 +437,7 @@ ck_role_user() {
   if [ -n "$cr_taken" ]; then
     bad "$cr_taken"
   elif [ "$cr_have" = "$(role_want)" ]; then
-    ok "$P_role_user (uid and gid $P_role_id, hidden, no shell)"
+    ok "$P_role_user (uid and gid $P_role_id, hidden, no shell, no password)"
   else
     bad "want $(role_want), found $cr_have"
   fi

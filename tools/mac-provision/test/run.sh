@@ -346,6 +346,7 @@ t_converge() {
   want_out 'check: 27 pass, 0 fail'
   want_out 'PASS updates_auto_download: AutomaticDownload = 0 (the SoftwareUpdate payload is removed in macOS 27'
   want_out 'PASS filevault: off'
+  want_out 'PASS role_user: _kbf (uid and gid 480, hidden, no shell, no password)'
   want_out 'PASS autologin: off'
 }
 
