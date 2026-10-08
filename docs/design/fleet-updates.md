@@ -63,9 +63,9 @@ A node joins by opening the worker stream and completing the handshake
   change.
 
 A compromised `kbf-server` can install only signed sets for a node's own pool,
-force-update one Mac per pool at a time within the gate's caps, and deny service; it
-cannot erase a Mac (M4). A
-compromised MDM host, CI or `main` branch is more serious; S1 states each plainly.
+force-update one Mac per pool at a time within the gate's caps, install a profile the
+gate already allowlists, and deny service; it cannot erase a Mac (M4). A compromised
+MDM host, CI or `main` branch is more serious; S1 states each plainly.
 
 ## 3. Node software state
 

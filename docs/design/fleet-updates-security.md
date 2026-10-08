@@ -45,9 +45,9 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
   operator's hardware-key signature (M4). It can relay, delay or drop a signed
   request, never make or redirect one.
 - Obtain a privileged-lease grant only for a Mac an operator has already signed an
-  erase for whose signed purpose names that lease (S8, M4.2): each gives root on one Mac, alerts natively, and ends in that
-  erase, which the gate runs itself, so the server cannot keep the root by never
-  asking.
+  erase for, with a signed purpose naming that lease (S8, M4.2): each gives root on
+  one Mac, alerts natively, and ends in that erase, which the gate runs itself, so
+  the server cannot keep the root by never asking.
   Without the grant check in `kbf-mac-session`, a compromised server or daemon could
   create an administrator lease user, and so get root, on every Mac at once.
 - Deny service: cordon, drain or hold every node, or withhold operators' erase
