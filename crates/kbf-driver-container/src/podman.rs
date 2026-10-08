@@ -69,7 +69,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
         "create",
         "--pull=never",
         "--network=none",
-        "--userns=nomap",
+        "--userns=auto",
         "--hostname=localhost",
         "--cgroup-conf=memory.oom.group=1",
     ]
