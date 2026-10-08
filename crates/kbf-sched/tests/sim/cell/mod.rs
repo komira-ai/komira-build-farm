@@ -14,8 +14,10 @@
 //!   (`not_held`). Unlike the single-node server, records go through the log node and
 //!   come back later, in log order; a placement round runs every second (the server
 //!   also runs one after every input); and a `ResultAck` says `accepted` once the result
-//!   is proposed, not answered. It can restart (a fresh scheduler of the same term, as
-//!   `kbf-server` today) and pause (its clock stops with it).
+//!   is proposed, not answered. A `Result` that names another action than its lease's
+//!   is refused. It can restart (a fresh scheduler of a new term, named as the lease
+//!   epoch in `Welcome`, as `kbf-server` picks one per process) and pause (its clock
+//!   stops with it).
 //! - **Log** ([`log`]): commits each record after a random delay, so the log order is
 //!   not always the order records were proposed in; each leader incarnation has its own
 //!   log, as the single-node server's in-process log dies with it.
@@ -26,8 +28,11 @@
 //!   reports a fenced or cancelled run `ABORTED`, keeps every result until its
 //!   `ResultAck`, lists it in every heartbeat, and resends it with every heartbeat and on
 //!   every new stream. (On the wire it is resent only on a new stream; the sim's links
-//!   lose messages a TCP stream would not, so it resends more often.) It can die, freeze
-//!   (suspend: on resume it fences first), reconnect, and resend its `Hello`.
+//!   lose messages a TCP stream would not, so it resends more often.) Every result
+//!   names the action of its lease's `Start`. On a `Welcome` that names another lease
+//!   epoch it kills the runs and forgets the results of the earlier one, unsent. It can
+//!   die, freeze (suspend: on resume it fences first), reconnect, and resend its
+//!   `Hello`.
 //!
 //! Every input the leader feeds the scheduler is checked at once by [`check::Check`];
 //! what needs every node (two runs of one operation at once, a `Start` before its
@@ -79,9 +84,10 @@ pub enum Msg {
         stream: u64,
         capacity: Resources,
     },
-    /// The server's answer to the first `Hello` of a stream.
+    /// The server's answer to the first `Hello` of a stream, naming its lease epoch.
     Welcome {
         stream: u64,
+        epoch: u64,
     },
     Heartbeat {
         stream: u64,
@@ -100,11 +106,12 @@ pub enum Msg {
         heartbeat_seq: u64,
         incarnation: u64,
     },
-    /// A `Result`: like the wire's, it names only the lease.
+    /// A `Result`: like the wire's, it names the lease and the action its `Start` named.
     Report {
         stream: u64,
         lease: LeaseId,
         outcome: Outcome,
+        action: Option<Digest>,
     },
     ResultAck {
         lease: LeaseId,

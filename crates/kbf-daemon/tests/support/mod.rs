@@ -151,11 +151,22 @@ impl Peer {
         self.welcome_every(INTERVAL);
     }
 
-    /// A Welcome that asks for a heartbeat every `interval`.
+    /// A Welcome that asks for a heartbeat every `interval` and names no lease epoch,
+    /// as a server that predates the field.
     pub fn welcome_every(&self, interval: Duration) {
+        self.welcome_with(interval, 0);
+    }
+
+    /// A Welcome that names lease epoch `epoch` (0: none).
+    pub fn welcome_epoch(&self, epoch: u64) {
+        self.welcome_with(INTERVAL, epoch);
+    }
+
+    fn welcome_with(&self, interval: Duration, epoch: u64) {
         self.send(server_message::Message::Welcome(Welcome {
             protocol_version: 1,
             heartbeat_interval_ms: interval.as_millis() as u64,
+            epoch,
         }));
     }
 
@@ -287,7 +298,8 @@ impl Peer {
     }
 }
 
-fn digest() -> Digest {
+/// The action every Start of these helpers names, unless the test passes its own.
+pub fn digest() -> Digest {
     Digest {
         hash: "ab".repeat(32),
         size_bytes: 142,

@@ -15,6 +15,8 @@
 // - Start.heartbeat_seq and Start.valid_for_ms: how late a Start may still be acted on.
 // - Cancel: the server stops a lease it no longer holds on the daemon.
 // - NodeStatus: what software the node runs, for operators; it routes no work.
+// - Welcome.epoch and Result.action_digest: a lease id never names leases of two server
+//   processes, and a Result answers only the action its Start named (issue #137).
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -115,11 +117,20 @@ message Welcome {
   uint32 protocol_version = 1;
   // How often the daemon sends a Heartbeat, in milliseconds.
   uint64 heartbeat_interval_ms = 2;
+  // The lease epoch: names the record of leases this server answers for. A lease the
+  // daemon was granted under another epoch is one this server never granted and will
+  // never accept a Result for, so the daemon stops its run and forgets its Result
+  // without sending it. A single-node server keeps its leases in its own process, so
+  // each process has its own epoch, equal to the term of every lease it grants
+  // (docs/design/worker-protocol.md, "Server restarts"). 0 means not named (a server
+  // that predates this field): the daemon then forgets nothing.
+  uint64 epoch = 3;
 }
 
 // A lease: a numbered permission to run, ordered by (term, seq).
 message LeaseId {
-  // The scheduler term that granted the lease.
+  // The scheduler term that granted the lease. No two server processes grant leases
+  // of one term: a single-node server picks a new term at every start.
   uint64 term = 1;
   // The lease's sequence number within that term.
   uint64 seq = 2;
@@ -210,7 +221,8 @@ message Cancel {
 }
 
 // Placeholder. The outcome of one lease. The server accepts at most one Result for an
-// operation, and only from the node that holds the operation's current lease; it
+// operation, only from the node that holds the operation's current lease, and only
+// for the action that lease runs (action_digest, when set); it
 // answers each Result with a ResultAck. An OK result's outputs (every output file,
 // stdout and stderr, every output tree and the files it names) must already be in the
 // CAS, or the result is taken as an infrastructure failure. The server writes an
@@ -222,6 +234,11 @@ message Result {
   google.rpc.Status status = 2;
   // The action's result when status is OK. Its outputs are already in the CAS.
   build.bazel.remote.execution.v2.ActionResult action_result = 3;
+  // The action_digest of the Start this Result answers, as the Start carried it. The
+  // server refuses a Result whose action_digest is set and is not the action of the
+  // operation it granted the lease for. Unset: not checked (a daemon that predates
+  // this field, or a lease whose Start the daemon never saw).
+  build.bazel.remote.execution.v2.Digest action_digest = 4;
 }
 
 // The server's answer to a Result: it has decided that Result, so the daemon may forget
