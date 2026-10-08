@@ -651,3 +651,25 @@ async fn writes_over_http_need_the_token_no_origin_and_json() {
     assert!(why.contains("--api-token-file"), "{why}");
     server.stop().await;
 }
+
+/// Catches: `docs/api.md` wrong about the protocols the listener speaks. It answers
+/// HTTP/2 in clear text (h2c, prior knowledge) as well as HTTP/1.1, so the write
+/// gates must hold for both; they read only the request's peer and headers, which
+/// both carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_api_listener_also_speaks_h2c() {
+    let server = start();
+    let mut stream = TcpStream::connect(server.api).await.expect("connect");
+    // The HTTP/2 connection preface and an empty SETTINGS frame.
+    let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+    stream.write_all(&preface).await.expect("send");
+    let mut head = [0u8; 9];
+    tokio::time::timeout(PROMPT, stream.read_exact(&mut head))
+        .await
+        .expect("an answer")
+        .expect("a frame header");
+    assert_eq!(head[3], 4, "the server's first frame is SETTINGS: {head:?}");
+    drop(stream);
+    server.stop().await;
+}

@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -79,10 +79,31 @@ fn with_keys(mut c: Command) -> Command {
     c
 }
 
-/// Runs to exit and returns the exit code and stderr.
+/// Runs to exit and returns the exit code and stderr. A server that is still running
+/// after `BOUND` (it started when it should have refused) is killed and reaped, and
+/// the test fails.
 fn fails(mut c: Command) -> (Option<i32>, String) {
-    let Output { status, stderr, .. } = c.output().expect("spawn kbf-server");
-    (status.code(), String::from_utf8(stderr).expect("UTF-8"))
+    let mut child = Running(
+        c.stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
+    let deadline = Instant::now() + BOUND;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kbf-server still running {BOUND:?} after it should have refused to start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    let mut pipe = child.0.stderr.take().expect("stderr");
+    pipe.read_to_string(&mut stderr).expect("UTF-8 stderr");
+    (status.code(), stderr)
 }
 
 /// Starts the server, reads its start line, and returns it with the REAPI address.

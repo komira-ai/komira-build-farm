@@ -3,7 +3,8 @@
 `kbf-server` serves an HTTP/JSON API under `/v1` for the Fleet UI, scripts and
 clients ([fleet-updates.md](design/fleet-updates.md) section 11.4). It listens on its
 own address, given with `--api-listen`; without the flag there is no API. The start
-line then ends with ` api=<addr>`.
+line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
+text (h2c, with prior knowledge); every rule below holds for both.
 
 Reads answer anyone who reaches the address: bind it where only operators do. Writes
 need a token (see [Who may write](#who-may-write)). The roles of
@@ -36,17 +37,24 @@ So a write must pass every one of these gates, in this order:
 | the peer is loopback, so the token never crosses a network in clear | `403` |
 | the request has no `Origin` header (browsers send one with a cross-origin POST) | `403` |
 | the server was started with `--api-token-file` (without it, writes are off) | `403` |
-| `Authorization: Bearer <token>` with the file's token, compared in constant time | `401`, with `WWW-Authenticate: Bearer` |
+| `Authorization: Bearer <token>` with the file's token (the SHA-256 digests of both are compared in constant time, so neither the token's bytes nor its length show through timing) | `401`, with `WWW-Authenticate: Bearer` |
 | `Content-Type: application/json` (parameters allowed), which a page cannot send cross-origin without a preflight the API never answers | `415` |
 
 **The token file.** `--api-token-file <path>` names a file holding one token of at
 least 32 visible ASCII characters (surrounding whitespace, such as the trailing
-newline, is dropped); `openssl rand -hex 32` makes one. The file must be a regular
-file owned by the server's user with mode `0600` or `0400`; otherwise the server
-refuses to start. The token is read once at start: it is never on the command line,
-in the start line or in a log, and a change to the file takes effect at the next
-start. Keep it out of the build actions' reach: a build action that can read the file
-can write.
+newline, is dropped), in at most 4096 bytes; `openssl rand -hex 32` makes one. The
+file must be a regular file (a FIFO or device is refused at once, without waiting on
+it) owned by the server's user with mode exactly `0600` or `0400`; otherwise the
+server refuses to start. The token is read once at start: it is never on the command
+line, in the start line or in a log, and a change to the file takes effect at the
+next start.
+
+**Run `kbf-server` as its own user.** Keep the token out of the build actions'
+reach: a build action that can read the file can write. On a host that is also a
+worker, `kbf-server` must run as a different user from `kbf-daemon` and from every
+user leases run as. The native driver runs actions as the daemon's user, so a `0600`
+token file owned by a user the server shares with the daemon is readable by every
+build on that host.
 
 **Through a reverse proxy.** A remote operator reaches the API through a proxy on the
 server's host that terminates TLS (`tailscale serve`, nginx). The proxy is what makes

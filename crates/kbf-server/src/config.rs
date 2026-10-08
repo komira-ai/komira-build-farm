@@ -57,7 +57,8 @@ pub struct Args {
     pub api_listen: Option<SocketAddr>,
     /// A file holding the token operator API writes (cordon, drain, uncordon) must
     /// present as `Authorization: Bearer <token>`. It must be owned by the server's
-    /// user with mode 0600 or 0400, or the server refuses to start. Without it, writes
+    /// user with mode 0600 or 0400, or the server refuses to start; run the server as
+    /// a user other than the daemon's, whose builds could read it. Without it, writes
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
