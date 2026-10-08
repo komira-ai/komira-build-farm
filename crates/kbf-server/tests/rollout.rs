@@ -1,0 +1,432 @@
+//! The rollout store and driver: the record is written before anything moves, nodes
+//! go out no faster than the strategy allows, and every gate that fails holds.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use kbf_caps::NodeCaps;
+use kbf_front::{Cache, MemoryMetaLog};
+use kbf_meta::Retention;
+use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_proto::worker::ServerMessage;
+use kbf_server::Farm;
+use kbf_server::farm::NodeAction;
+use kbf_server::fleet::PlacementView;
+use kbf_server::rollout::{
+    Applier, Change, DriveError, Fleet, MemoryRolloutStore, RolloutDriver, RolloutStore, StoreError,
+};
+use kbf_types::{
+    IllegalStep, NodeStep, Resources, Rollout, RolloutId, RolloutState, Selector, Strategy,
+    WorkerId,
+};
+
+fn w(name: &str) -> WorkerId {
+    WorkerId::new(name)
+}
+
+fn rollout(nodes: &[&str], max_unavailable: u32) -> Rollout {
+    let strategy = Strategy {
+        max_unavailable,
+        drain_deadline: Duration::from_secs(600),
+        ..Strategy::default()
+    };
+    let names: Vec<WorkerId> = nodes.iter().map(|n| w(n)).collect();
+    Rollout::new(
+        RolloutId(1),
+        "sha256:set",
+        Selector::Nodes(names.clone()),
+        strategy,
+        "operator",
+        names,
+    )
+}
+
+/// A fleet that records what it is asked and answers placements a test sets.
+#[derive(Default)]
+struct FakeFleet {
+    actions: RefCell<Vec<(WorkerId, NodeAction)>>,
+    placements: RefCell<BTreeMap<WorkerId, PlacementView>>,
+    refuse: RefCell<Option<WorkerId>>,
+}
+
+impl FakeFleet {
+    fn set(&self, node: &str, placement: PlacementView) {
+        self.placements.borrow_mut().insert(w(node), placement);
+    }
+
+    fn actions(&self) -> Vec<(WorkerId, NodeAction)> {
+        self.actions.borrow().clone()
+    }
+}
+
+impl Fleet for FakeFleet {
+    fn place(&self, node: &WorkerId, action: NodeAction) -> Result<(), String> {
+        if self.refuse.borrow().as_ref() == Some(node) {
+            return Err(format!("no node {node}"));
+        }
+        self.actions.borrow_mut().push((node.clone(), action));
+        Ok(())
+    }
+
+    fn placement(&self, node: &WorkerId) -> Option<PlacementView> {
+        self.placements.borrow().get(node).cloned()
+    }
+}
+
+#[derive(Default)]
+struct FakeApplier {
+    handed: RefCell<Vec<(WorkerId, String)>>,
+    refuse: bool,
+}
+
+impl Applier for FakeApplier {
+    fn apply(&self, node: &WorkerId, target: &str) -> Result<(), String> {
+        if self.refuse {
+            return Err("the updater refused the set".to_owned());
+        }
+        self.handed
+            .borrow_mut()
+            .push((node.clone(), target.to_owned()));
+        Ok(())
+    }
+}
+
+fn draining() -> PlacementView {
+    PlacementView::Draining {
+        deadline_unix_ms: 1,
+        leases: vec!["1.0".to_owned()],
+    }
+}
+
+fn steps(r: &Rollout) -> Vec<NodeStep> {
+    r.nodes().values().map(|p| p.step()).collect()
+}
+
+/// Catches: a driver that takes more nodes out than `max_unavailable` (or counts a node
+/// that is applying as back in service), one that drains without the strategy's
+/// deadline, applies before the node is drained, or hands over another target.
+#[test]
+fn nodes_go_out_one_at_a_time_and_stop_at_applying() {
+    let (store, fleet, applier) = (
+        MemoryRolloutStore::default(),
+        FakeFleet::default(),
+        FakeApplier::default(),
+    );
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let id = driver
+        .start(rollout(&["a", "b", "c"], 1))
+        .expect("start")
+        .id;
+
+    let r = driver.step(id).expect("step");
+    assert_eq!(
+        steps(&r),
+        [NodeStep::Cordoned, NodeStep::Pending, NodeStep::Pending]
+    );
+    assert_eq!(fleet.actions(), [(w("a"), NodeAction::Cordon)]);
+
+    let r = driver.step(id).expect("step");
+    assert_eq!(steps(&r)[0], NodeStep::Draining);
+    let drain = NodeAction::Drain(Duration::from_secs(600));
+    assert_eq!(fleet.actions()[1], (w("a"), drain));
+
+    fleet.set("a", draining());
+    for _ in 0..3 {
+        let r = driver.step(id).expect("step");
+        assert_eq!(
+            steps(&r),
+            [NodeStep::Draining, NodeStep::Pending, NodeStep::Pending]
+        );
+    }
+    assert!(applier.handed.borrow().is_empty(), "applied before drained");
+
+    fleet.set("a", PlacementView::Drained);
+    let r = driver.step(id).expect("step");
+    assert_eq!(
+        steps(&r),
+        [NodeStep::Applying, NodeStep::Pending, NodeStep::Pending]
+    );
+    assert_eq!(
+        *applier.handed.borrow(),
+        [(w("a"), "sha256:set".to_owned())]
+    );
+    // Applying is still out of service: the next node waits.
+    let r = driver.step(id).expect("step");
+    assert_eq!(steps(&r)[1], NodeStep::Pending);
+    assert_eq!(fleet.actions().len(), 2);
+    assert_eq!(r.state(), RolloutState::Running);
+
+    // Two at once when the strategy allows two.
+    let (store, fleet, applier) = (
+        MemoryRolloutStore::default(),
+        FakeFleet::default(),
+        FakeApplier::default(),
+    );
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let mut two = rollout(&["a", "b", "c"], 2);
+    two.id = RolloutId(2);
+    let r = driver
+        .step(driver.start(two).expect("start").id)
+        .expect("step");
+    assert_eq!(
+        steps(&r),
+        [NodeStep::Cordoned, NodeStep::Cordoned, NodeStep::Pending]
+    );
+}
+
+/// Catches: a drain that paused at its deadline treated as drained (work would be cut
+/// off), a node someone uncordoned taken as still draining, a refused hand-over or a
+/// fleet that refuses the cordon not holding, and a held rollout that moves on.
+#[test]
+fn a_failed_gate_holds_the_node_and_the_rollout() {
+    let paused = PlacementView::DrainPaused {
+        deadline_unix_ms: 1,
+        leases: vec!["1.4".to_owned()],
+    };
+    for (gate, refuse_apply) in [
+        (Some(paused), false),
+        (Some(PlacementView::Serving), false),
+        (None, false),
+        (Some(PlacementView::Drained), true),
+    ] {
+        let fleet = FakeFleet::default();
+        let applier = FakeApplier {
+            refuse: refuse_apply,
+            ..FakeApplier::default()
+        };
+        let store = MemoryRolloutStore::default();
+        let driver = RolloutDriver::new(&store, &fleet, &applier);
+        let id = driver.start(rollout(&["a", "b"], 1)).expect("start").id;
+        driver.step(id).expect("cordon");
+        driver.step(id).expect("drain");
+        if let Some(gate) = gate.clone() {
+            fleet.set("a", gate);
+        }
+        let r = driver.step(id).expect("step");
+        assert_eq!(r.state(), RolloutState::Held, "{gate:?}");
+        let a = r.node(&w("a")).expect("a");
+        assert_eq!(a.step(), NodeStep::Held, "{gate:?}");
+        let expected_at = if refuse_apply {
+            NodeStep::Applying
+        } else {
+            NodeStep::Draining
+        };
+        assert_eq!(a.held_at(), Some(expected_at));
+        let actions = fleet.actions().len();
+        let again = driver.step(id).expect("step");
+        assert_eq!(again, r, "nothing proceeds by itself");
+        assert_eq!(fleet.actions().len(), actions);
+    }
+
+    // The fleet refuses the cordon (the node is unknown) or the drain.
+    for refused_at in [0, 1] {
+        let (store, fleet, applier) = (
+            MemoryRolloutStore::default(),
+            FakeFleet::default(),
+            FakeApplier::default(),
+        );
+        let driver = RolloutDriver::new(&store, &fleet, &applier);
+        let id = driver.start(rollout(&["a"], 1)).expect("start").id;
+        if refused_at == 1 {
+            driver.step(id).expect("cordon");
+        }
+        *fleet.refuse.borrow_mut() = Some(w("a"));
+        let r = driver.step(id).expect("step");
+        assert_eq!(r.state(), RolloutState::Held);
+        let a = r.node(&w("a")).expect("a");
+        let at = [NodeStep::Cordoned, NodeStep::Draining][refused_at];
+        assert_eq!((a.step(), a.held_at()), (NodeStep::Held, Some(at)));
+    }
+}
+
+/// A store that keeps nothing once `writes` is spent.
+struct FailingStore {
+    inner: MemoryRolloutStore,
+    writes: Mutex<u32>,
+}
+
+impl RolloutStore for FailingStore {
+    fn create(&self, rollout: Rollout) -> Result<(), StoreError> {
+        self.inner.create(rollout)
+    }
+
+    fn get(&self, id: RolloutId) -> Option<Rollout> {
+        self.inner.get(id)
+    }
+
+    fn update(&self, id: RolloutId, change: Change<'_>) -> Result<Rollout, StoreError> {
+        let mut left = self.writes.lock().expect("lock");
+        if *left == 0 {
+            return Err(StoreError::Unavailable("disk full".to_owned()));
+        }
+        *left -= 1;
+        self.inner.update(id, change)
+    }
+}
+
+/// Catches: a driver that acts on a node before the step is recorded (a restart would
+/// find a cordoned or updating node the record does not know of, section 4.1).
+#[test]
+fn nothing_moves_unless_the_step_is_recorded_first() {
+    for (writes, done) in [(1, 0), (2, 1), (3, 2)] {
+        let fleet = FakeFleet::default();
+        fleet.set("a", PlacementView::Drained);
+        let applier = FakeApplier::default();
+        let store = FailingStore {
+            inner: MemoryRolloutStore::default(),
+            writes: Mutex::new(writes),
+        };
+        let driver = RolloutDriver::new(&store, &fleet, &applier);
+        let id = driver.start(rollout(&["a"], 1)).expect("start").id;
+        let mut failed = None;
+        for _ in 0..3 {
+            if let Err(e) = driver.step(id) {
+                failed = Some(e);
+                break;
+            }
+        }
+        assert_eq!(
+            failed,
+            Some(DriveError::Store(StoreError::Unavailable(
+                "disk full".to_owned()
+            )))
+        );
+        let acted = fleet.actions().len() + applier.handed.borrow().len();
+        assert_eq!(
+            acted, done,
+            "{writes} write(s): only recorded steps were carried out"
+        );
+        let recorded = store.get(id).expect("recorded");
+        let moved = recorded.node(&w("a")).expect("a").step();
+        assert_eq!(
+            moved,
+            [NodeStep::Pending, NodeStep::Cordoned, NodeStep::Draining][done]
+        );
+    }
+}
+
+/// Catches: a hold that the store did not keep reported as held (the operator would
+/// see a held rollout the record does not have).
+#[test]
+fn a_hold_the_store_refuses_is_an_error() {
+    let fleet = FakeFleet::default();
+    *fleet.refuse.borrow_mut() = Some(w("a"));
+    let applier = FakeApplier::default();
+    // One write starts the rollout and one records the cordon; the hold finds none.
+    let store = FailingStore {
+        inner: MemoryRolloutStore::default(),
+        writes: Mutex::new(2),
+    };
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let id = driver.start(rollout(&["a"], 1)).expect("start").id;
+    assert_eq!(
+        driver.step(id),
+        Err(DriveError::Store(StoreError::Unavailable(
+            "disk full".to_owned()
+        )))
+    );
+    let recorded = store.get(id).expect("recorded");
+    assert_eq!(recorded.state(), RolloutState::Running);
+    assert_eq!(
+        recorded.node(&w("a")).map(|p| p.step()),
+        Some(NodeStep::Cordoned)
+    );
+}
+
+/// Catches: a store that keeps half a change, overwrites a rollout on create, or
+/// invents an unknown one; and a driver that steps a rollout that is not running.
+#[test]
+fn the_memory_store_keeps_whole_changes_only() {
+    let store = MemoryRolloutStore::default();
+    let r = rollout(&["a"], 1);
+    store.create(r.clone()).expect("create");
+    assert_eq!(
+        store.create(r.clone()),
+        Err(StoreError::Exists(RolloutId(1)))
+    );
+    assert_eq!(
+        store.update(RolloutId(9), &|_| Ok(())),
+        Err(StoreError::Unknown(RolloutId(9)))
+    );
+    let half = store.update(RolloutId(1), &|r| {
+        r.set_state(RolloutState::Running)?;
+        r.advance(&w("a"), NodeStep::Applying)
+    });
+    assert!(matches!(
+        half,
+        Err(StoreError::Illegal(IllegalStep::Node { .. }))
+    ));
+    assert_eq!(store.get(RolloutId(1)), Some(r));
+    assert_eq!(store.get(RolloutId(9)), None);
+
+    let fleet = FakeFleet::default();
+    let applier = FakeApplier::default();
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    assert_eq!(
+        driver.step(RolloutId(9)),
+        Err(DriveError::Store(StoreError::Unknown(RolloutId(9))))
+    );
+    let pending = driver.step(RolloutId(1)).expect("step");
+    assert_eq!(pending.state(), RolloutState::Pending);
+    assert!(fleet.actions().is_empty());
+    let messages = [
+        StoreError::Exists(RolloutId(1)).to_string(),
+        StoreError::Unknown(RolloutId(1)).to_string(),
+        StoreError::Unavailable("x".to_owned()).to_string(),
+    ];
+    assert_eq!(
+        messages,
+        [
+            "rollout-1 is already recorded",
+            "no rollout-1 is recorded",
+            "the rollout store could not write: x",
+        ]
+    );
+}
+
+/// Catches: the farm's fleet view disagreeing with the scheduler (a node cordoned by a
+/// rollout still offered work, an idle node never seen as drained) and an unknown node
+/// accepted.
+#[tokio::test]
+async fn the_driver_runs_against_the_farm() {
+    let cache = Arc::new(Cache::new(
+        MemoryMetaLog::new(Retention::default()),
+        MemoryStore::new(Capabilities::default()),
+        KeyPrefix::default(),
+    ));
+    let farm = Farm::new(cache, kbf_sched::UNSERVABLE_WAIT);
+    let (outbound, _responses) = tokio::sync::mpsc::unbounded_channel();
+    let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
+    farm.register(
+        &w("a"),
+        Resources::new(8_000, 16 << 30),
+        caps,
+        outbound,
+        ServerMessage::default(),
+    );
+    let applier = FakeApplier::default();
+    let store = MemoryRolloutStore::default();
+    let driver = RolloutDriver::new(&store, &farm, &applier);
+    let id = driver.start(rollout(&["a"], 1)).expect("start").id;
+    driver.step(id).expect("cordon");
+    assert_eq!(
+        Fleet::placement(&farm, &w("a")),
+        Some(PlacementView::Cordoned)
+    );
+    driver.step(id).expect("drain");
+    assert_eq!(
+        Fleet::placement(&farm, &w("a")),
+        Some(PlacementView::Drained)
+    );
+    let r = driver.step(id).expect("apply");
+    assert_eq!(r.node(&w("a")).map(|p| p.step()), Some(NodeStep::Applying));
+    assert_eq!(applier.handed.borrow().len(), 1);
+
+    assert_eq!(Fleet::placement(&farm, &w("ghost")), None);
+    assert_eq!(
+        Fleet::place(&farm, &w("ghost"), NodeAction::Cordon),
+        Err("no node ghost has registered".to_owned())
+    );
+}

@@ -7,6 +7,8 @@
 //!   lease offers and `Start`s, and report results.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; today `GET /v1/nodes` and the software each node runs.
+//! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
+//!   cordons, drains and hands drained nodes their update, as far as `applying`.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
 //!   `Start` only after the grant commits; a result is accepted only from the node
 //!   holding the operation's current lease, and only an accepted result is written to
@@ -20,6 +22,7 @@ pub mod api;
 pub mod config;
 pub mod farm;
 pub mod fleet;
+pub mod rollout;
 pub mod serve;
 pub mod worker;
 
