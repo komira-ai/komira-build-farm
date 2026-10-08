@@ -5,7 +5,10 @@
 //! running the installed `kbf-daemon` uses `--driver native`.
 //!
 //! **Socket.** [`bind`] makes the socket's directory mode 0750 and the socket mode 0660,
-//! both in the helpers' dedicated group, never a group every user is in.
+//! both in the helpers' dedicated group, never a group every user is in. The directory
+//! must be a real directory owned by the updater's uid (root); a symbolic link or
+//! another user's directory is refused. The directories above it must be root's too
+//! (it is meant to live under `/run`); that is provisioning's job.
 //!
 //! **Protocol.** One request per connection. The caller is checked first
 //! ([`check_caller`]); a refused caller's connection is closed without a reply. The
@@ -151,16 +154,34 @@ pub fn startup_checks(
 }
 
 /// Binds the socket: directory mode 0750 and socket mode 0660, both in group `gid`. A
-/// stale socket from an earlier run is replaced.
+/// stale socket from an earlier run is replaced. The directory must be a real directory
+/// (not a symbolic link) owned by the updater's own uid, which is root in production
+/// (S4.3); its group and mode are set through a descriptor, never through a link.
 ///
 /// # Errors
-/// The directory or socket cannot be made, or their group or mode set.
+/// The directory or socket cannot be made, the directory is a symbolic link or another
+/// uid's (`PermissionDenied`), or a group or mode cannot be set.
 pub fn bind(socket: &Path, gid: u32) -> io::Result<UnixListener> {
+    bind_owned_by(socket, gid, rustix::process::geteuid().as_raw())
+}
+
+/// [`bind`], with the directory's required owner given.
+fn bind_owned_by(socket: &Path, gid: u32, owner: u32) -> io::Result<UnixListener> {
+    use rustix::fs::{Mode, OFlags};
     let dir = socket.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let gid = Some(rustix::fs::Gid::from_raw(gid));
     fs::create_dir_all(dir)?;
-    rustix::fs::chown(dir, None, gid)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o750))?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let dir_fd = rustix::fs::open(dir, flags, Mode::empty())?;
+    let uid = rustix::fs::fstat(&dir_fd)?.st_uid;
+    if uid != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is owned by uid {uid}, not {owner}", dir.display()),
+        ));
+    }
+    rustix::fs::fchown(&dir_fd, None, gid)?;
+    rustix::fs::fchmod(&dir_fd, Mode::from_raw_mode(0o750))?;
     match fs::remove_file(socket) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}

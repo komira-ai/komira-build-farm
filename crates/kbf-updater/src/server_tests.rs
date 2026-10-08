@@ -142,6 +142,29 @@ fn the_socket_is_group_only() {
     );
 }
 
+/// Catches: the socket's directory taken when it is a symbolic link (the group and mode
+/// would land on whatever it points at, and the socket in a directory someone else
+/// controls), or when another user owns it (S4.3: the updater's own, so root's).
+#[test]
+fn the_socket_directory_is_the_updaters_own() {
+    let short = testkit::short_dir("bind-owner");
+    let dir = &short.path;
+    let real = dir.join("real");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+    assert!(bind(&dir.join("link").join("s"), gid()).is_err());
+    assert!(!real.join("s").exists());
+    assert_eq!(fs::metadata(&real).unwrap().mode() & 0o7777, 0o755);
+    let me = rustix::process::geteuid().as_raw();
+    let err = bind_owned_by(&real.join("s"), gid(), me + 1).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    assert!(!real.join("s").exists());
+    assert_eq!(fs::metadata(&real).unwrap().mode() & 0o7777, 0o755);
+    bind_owned_by(&real.join("s"), gid(), me).unwrap();
+    assert_eq!(fs::metadata(&real).unwrap().mode() & 0o7777, 0o750);
+}
+
 /// Catches: an oversized or malformed request reaching the verbs, a verb outside the
 /// three accepted, or replies in another shape.
 #[test]
