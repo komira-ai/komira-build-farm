@@ -50,3 +50,5 @@ cmp "$binary" "$stage/check/$name"
 (cd "$out" && sha256 "$stem.tar.gz" "$stem.cdx.json") >> "$out/SHA256SUMS.$platform"
 echo "packaged $stem:"
 cat "$out/SHA256SUMS.$platform"
+# MUTANT: one byte appended to the tarball after its sum was taken.
+printf x >> "$out/$stem.tar.gz"
