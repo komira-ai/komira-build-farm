@@ -183,7 +183,9 @@ not-after <RFC 3339 time, at most 1 hour ahead>
 - **Alerts.** The gate alerts natively on every accepted, held, discarded and refused
   request, naming the serial, the purpose and the signer. A refusal before the
   signature verifies (a bad or missing signature) names only the serial the server
-  gave and the reason: nothing else in the request is the operator's yet.
+  gave and the reason: nothing else in the request is the operator's yet. A request
+  whose signature verifies but whose text does not parse names the signer and the
+  reason, as it has no purpose to name.
 
 **The path.** The gate listens only to `kbf-server` (S5.2), so the UI's **Erase**
 button (11.2), and a privileged lease waiting for its signature, show the `kbf-admin`
@@ -417,6 +419,7 @@ Tests, each with the planted mutant that must turn it red:
 | A privileged lease is not placed until a signed erase for its Mac is held | grant without a held erase |
 | A client presenting `kbf-server`'s certificate without its private key is refused, on TLS 1.3 and 1.2 | skip the handshake signature check |
 | A refused request whose signature verified alerts with its signer and purpose | alert with the refusal only |
+| A signed request whose text does not parse alerts with its signer | name the signer only after the text parses |
 | With cap 2, a grant's erase sent at t, an `erase-now` at t, and another `erase-now` 16 hours later: the third is refused | count a grant's erase only when reserved |
 | A held request 24 hours old is refused by `grant-admin` before the tick discards it | grant from any held request still in memory |
 | A set whose `arch` differs from the Mac's in the inventory is refused | check only `os` |

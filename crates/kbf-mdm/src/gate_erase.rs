@@ -16,7 +16,7 @@
 //!   cap; a scheduled erase is sent whatever the cap and then counts as sent. The sum
 //!   therefore never exceeds the cap, so no 24 hours see more erases than the cap.
 //! - Once a request's signature has verified, every alert about it, refusals included,
-//!   names its signer and its signed purpose.
+//!   names its signer, and its signed purpose once the text has parsed.
 //! - `grant-admin` uses a held request, reserves an erase within the daily cap and the
 //!   floor, schedules the erase at grant time plus the longest lease, and returns a
 //!   grant signed with the gate's key. The scheduled erase runs whatever the request's
@@ -94,8 +94,8 @@ impl<B: MdmBackend> Gate<B> {
         result
     }
 
-    /// `signed_as` receives the signed purpose, signer and reason once the signature
-    /// has verified and the text parsed, for the alerts.
+    /// `signed_as` receives the signer once the signature has verified, and the signed
+    /// purpose, signer and reason once the text has parsed, for the alerts.
     async fn erase_inner(
         &self,
         asked: &str,
@@ -113,6 +113,11 @@ impl<B: MdmBackend> Gate<B> {
             now,
             self.policy.require_user_verified,
         )?;
+        // The signer is known from here; the purpose only once the text parses.
+        *signed_as = Some(format!(
+            "signed by {} ({}), its text unparsed",
+            signer.principals, signer.algorithm
+        ));
         let signed = parse(&request.message)?;
         let purpose = match &signed.purpose {
             Purpose::EraseNow => "erase-now".to_owned(),

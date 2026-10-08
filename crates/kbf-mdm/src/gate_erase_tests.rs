@@ -685,6 +685,35 @@ async fn a_refused_signed_request_alerts_with_its_signer_and_purpose() {
 }
 
 #[tokio::test]
+async fn a_signed_request_whose_text_does_not_parse_alerts_with_its_signer() {
+    // Catches: an alert naming only the parse error once the signature has verified
+    // (M4.2: the signer is known then, though the purpose is not).
+    let f = Fixture::new("erase-unparsed-signer");
+    let message = "not an erase request\n".to_owned();
+    let request = SignedRequest {
+        signature: f.key.sign(message.as_bytes()),
+        message,
+    };
+    let refusal = f.gate.erase("MAC0", &request).await.unwrap_err();
+    let details: Vec<String> = f
+        .alerts
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(
+        details,
+        [format!(
+            "{refusal}; request signed by alice@example.org (sk-ssh-ed25519@openssh.com), \
+             its text unparsed"
+        )]
+    );
+    assert_eq!(f.alerts.summary(), ["erase refused MAC0"]);
+}
+
+#[tokio::test]
 async fn a_scheduled_erase_counts_toward_the_cap_when_it_is_sent() {
     // Catches: counting a grant's erase only when it is reserved (M4.3 "at most two Macs
     // a day"): with cap 2, a grant at t0 whose erase is sent at t0+8h, and an erase-now
