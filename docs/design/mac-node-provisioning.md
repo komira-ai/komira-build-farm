@@ -16,7 +16,7 @@ leases.
 **One exception: GPU tests drive a GUI on the host itself.** GPU tests never run in a VM
 (macOS VMs design, section 8.1); that includes tests that install the desktop app and
 drive it with a local LLM. They take the whole Mac on bare metal and need a GUI session
-on the host. Their runtime is planned in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, open PR): a throwaway per-lease
+on the host. Their runtime is planned in the [fleet-updates design](fleet-updates.md): a throwaway per-lease
 user, non-admin unless the lease is privileged (`kbf-mac-admin=true`, which always
 ends in an erase). A root helper, `kbf-mac-session`, logs that user in automatically
 for that lease only. This design does not cover that runtime.
@@ -47,7 +47,7 @@ The rules this design keeps:
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is decided: Apple Business Manager plus a self-hosted NanoHUB behind `kbf-mdm-gate` (fleet-updates design, section 7; [section 6](#6-updates-pinned-and-rolled-out)). |
-| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards (fleet-updates design, open PR). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
+| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards ([fleet-updates design](fleet-updates.md)). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
@@ -75,9 +75,9 @@ This design builds on the code on `main`, read at the time of writing.
   `isa_level`, `drivers`, and the driver's `network_isolation`. It reports nothing about
   the macOS build or Xcode yet. ([capabilities.md](capabilities.md) said macOS
   detection was planned; this change brings it up to date.)
-- **Platform routing,** under review at the time of writing, matches an action's
-  `OSFamily`/`ISA`/`Arch` and kbf keys against node reports. Until it lands, any
-  action can go to any registered worker.
+- **Platform routing** ([#71](https://github.com/komira-ai/komira-build-farm/pull/71))
+  matches an action's `OSFamily`/`ISA`/`Arch` and kbf keys against node reports;
+  properties that are not kbf keys are ignored (refusing them is planned).
 - **CI.** The `native-macos` job builds `kbf-daemon` on a hosted macOS runner and runs
   the native driver's tests there. **No workflow publishes a binary for any platform,
   and nothing signs one.**
@@ -628,7 +628,7 @@ host needs auto-login in two cases, and in neither for the admin account:
   - **The same runtime covers** MDM privacy profiles and a leak scan that erases the
     node on a leak.
 
-  All of this is designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, open PR), not here. FileVault off (above) is
+  All of this is designed in the [fleet-updates design](fleet-updates.md), not here. FileVault off (above) is
   what makes that auto-login possible. The profile's `autologin` key accepts it:
   `check` passes when auto-login is off, or set to a user in the lease uid range while
   a `whole_machine` lease holds the node, and `apply` never clears it mid-lease.
@@ -693,8 +693,7 @@ stderr to the file `StandardErrorPath` names.
 
 - One macOS version and build per pool, and its pinned Xcodes, named in the profile.
 - How the server rolls host updates out (macOS and Xcode, MDM, the update UI) is
-  designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87)
-  (`docs/design/fleet-updates.md`, open PR).
+  designed in the [fleet-updates design](fleet-updates.md).
 - Nothing installs by itself (section 5.2).
 - "Update available" is computed by the server (fleet-updates design, section 3.2). It
   reports Xcode and macOS together, because each Xcode sets a minimum macOS: "Xcode X is
