@@ -65,6 +65,10 @@ struct Cli {
     /// action that names its build runs with it as `DEVELOPER_DIR`.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
+    /// A directory holding `passwd`, `subuid` and `subgid` that the container
+    /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
+    #[arg(long, hide = true)]
+    id_files: Option<PathBuf>,
 }
 
 /// The drivers this binary can run leases through.
@@ -188,7 +192,7 @@ mod container {
     use futures::stream;
     use kbf_daemon::cas::Chunks;
     use kbf_driver_container::{
-        Cas, CasError, FileBlob, OutputLimits, PodmanConfig, PodmanRuntime,
+        Cas, CasError, FileBlob, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime,
     };
     use kbf_proto::reapi::Digest;
 
@@ -201,7 +205,11 @@ mod container {
             .clone()
             .ok_or("--cgroup-parent is required by the container driver")?;
         // Every container's ids are this user's subordinate ids (`--userns=nomap`).
-        kbf_driver_container::check_daemon_user()?;
+        let files = cli
+            .id_files
+            .as_deref()
+            .map_or_else(IdFiles::system, IdFiles::in_dir);
+        kbf_driver_container::check_daemon_user(&files)?;
         let mut config = PodmanConfig::new(scratch(cli)?, parent);
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,

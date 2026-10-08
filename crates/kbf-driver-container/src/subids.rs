@@ -36,6 +36,17 @@ impl IdFiles {
             subgid: PathBuf::from("/etc/subgid"),
         }
     }
+
+    /// `passwd`, `subuid` and `subgid` in `dir`: stand-ins for the system files, for a
+    /// test of the daemon's startup (`kbf-daemon --id-files`).
+    #[must_use]
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            passwd: dir.join("passwd"),
+            subuid: dir.join("subuid"),
+            subgid: dir.join("subgid"),
+        }
+    }
 }
 
 /// Why the daemon's user cannot run containers.
@@ -98,9 +109,10 @@ pub fn check_subordinate_ids(files: &IdFiles, uid: u32) -> Result<(), SubidError
     Ok(())
 }
 
-/// [`check_subordinate_ids`] for this process's user, on the [`IdFiles::system`] files.
-pub fn check_daemon_user() -> Result<(), SubidError> {
-    check_subordinate_ids(&IdFiles::system(), rustix::process::getuid().as_raw())
+/// [`check_subordinate_ids`] for this process's user, on `files` (the daemon's are
+/// [`IdFiles::system`] unless a test names others).
+pub fn check_daemon_user(files: &IdFiles) -> Result<(), SubidError> {
+    check_subordinate_ids(files, rustix::process::getuid().as_raw())
 }
 
 fn read(path: &Path) -> Result<String, SubidError> {
@@ -121,22 +133,34 @@ fn user_name(text: &str, uid: u32) -> Option<&str> {
     })
 }
 
-/// How many ids the entries of subuid-format `text` give the user `name` (if known)
-/// or `uid`. A malformed line gives none.
+/// How many distinct ids the entries of subuid-format `text` give the user `name` (if
+/// known) or `uid`. A malformed line gives none. Ranges are merged before counting, so
+/// one range listed under both the name and the uid, or two that overlap, count once;
+/// a range running past `u64::MAX` ends there, and the total saturates.
 fn subordinate_count(text: &str, name: Option<&str>, uid: u32) -> u64 {
     let uid = uid.to_string();
-    text.lines()
+    let mut ranges: Vec<(u64, u64)> = text
+        .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.trim().split(':').collect();
             let [owner, first, count] = fields[..] else {
                 return None;
             };
             let ours = owner == uid || Some(owner) == name;
-            (ours && first.parse::<u64>().is_ok())
-                .then(|| count.parse::<u64>().ok())
-                .flatten()
+            let (first, count) = (first.parse::<u64>().ok()?, count.parse::<u64>().ok()?);
+            ours.then(|| (first, first.saturating_add(count)))
         })
-        .sum()
+        .collect();
+    ranges.sort_unstable();
+    let (mut total, mut counted_to) = (0u64, 0u64);
+    for (start, end) in ranges {
+        let start = start.max(counted_to);
+        if end > start {
+            total = total.saturating_add(end - start);
+            counted_to = end;
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -219,6 +243,44 @@ mod tests {
         assert!(error.to_string().contains(" uid 4242:"), "{error}");
     }
 
+    /// Catches ids counted twice (one range listed under both the name and the uid,
+    /// or two overlapping ranges, passing with fewer distinct ids than needed), and a
+    /// total that wraps past `u64::MAX` to a small count instead of saturating.
+    #[test]
+    fn a_range_counts_its_distinct_ids_once() {
+        for (name, text, count) in [
+            ("twice", "kbf:100000:32768\n990:100000:32768\n", 32768),
+            (
+                "overlapping",
+                "kbf:100000:40000\n990:120000:40000\nkbf:130000:5\n",
+                60000,
+            ),
+        ] {
+            let files = files(name, Some(text), Some(text));
+            let error = check_subordinate_ids(&files, 990).expect_err(name);
+            assert!(
+                matches!(error, SubidError::TooFew { count: c, .. } if c == count),
+                "{name}: {error}"
+            );
+        }
+        let huge = format!("kbf:1:{max}\n990:0:2\n", max = u64::MAX);
+        let files = files("huge", Some(&huge), Some(&huge));
+        check_subordinate_ids(&files, 990).expect("saturates");
+    }
+
+    /// Catches `--id-files` reading names other than the system files' in its directory.
+    #[test]
+    fn a_directory_holds_the_three_files() {
+        assert_eq!(
+            IdFiles::in_dir(Path::new("/d")),
+            IdFiles {
+                passwd: PathBuf::from("/d/passwd"),
+                subuid: PathBuf::from("/d/subuid"),
+                subgid: PathBuf::from("/d/subgid"),
+            }
+        );
+    }
+
     /// Catches a range too small for an image's high ids (`nobody`), and malformed
     /// lines counting towards a range.
     #[test]
@@ -265,7 +327,7 @@ mod tests {
                 subgid: PathBuf::from("/etc/subgid"),
             }
         );
-        let checked = check_daemon_user();
+        let checked = check_daemon_user(&IdFiles::system());
         assert!(
             !matches!(checked, Err(SubidError::Read { .. })),
             "{checked:?}"

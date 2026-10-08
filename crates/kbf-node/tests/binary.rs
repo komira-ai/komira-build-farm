@@ -153,15 +153,43 @@ fn each_driver_starts_and_stops_on_sigterm() {
         "the native driver makes its scratch directory"
     );
     if cfg!(target_os = "linux") {
+        // A full range of subordinate ids for this user, whatever the host's files say.
+        let ids = id_files("container-ids", "65536");
         let container = [
             "--driver=container".to_owned(),
             "--cas=http://127.0.0.1:1".to_owned(),
             format!("--scratch={}", scratch.display()),
             "--cgroup-parent=/kbf.slice/actions".to_owned(),
+            format!("--id-files={}", ids.display()),
         ];
         let status = runs_until_sigterm("container", &container);
         assert!(status.success(), "{status}");
     }
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).expect("read")
+}
+
+/// A directory for `--id-files`: a passwd naming this test's user `kbf`, and a
+/// subuid and subgid giving `kbf` `count` subordinate ids (none when empty).
+fn id_files(name: &str, count: &str) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tls(name);
+    let passwd = dir.join("passwd");
+    std::fs::write(&passwd, "").expect("write");
+    let uid = std::fs::metadata(&passwd).expect("stat").uid();
+    std::fs::write(&passwd, format!("kbf:x:{uid}:{uid}::/:/bin/sh\n")).expect("write");
+    let range = if count.is_empty() {
+        String::new()
+    } else {
+        format!("kbf:100000:{count}\n")
+    };
+    for file in ["subuid", "subgid"] {
+        std::fs::write(dir.join(file), &range).expect("write");
+    }
+    dir
 }
 
 /// Catches: a driver started without what it needs, or a configuration error that
@@ -212,4 +240,56 @@ fn a_driver_missing_its_flags_refuses_to_start() {
         .expect("spawn");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("absent.pem"));
+}
+
+/// Catches the container driver starting on a node whose daemon user has no
+/// subordinate ids, or too few (every lease would fail in `podman create`): the
+/// "drop the startup check" mutant. The daemon exits non-zero naming the file and
+/// the user, before it reaches the front.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_without_subordinate_ids_refuses_to_start() {
+    for (name, count, says) in [
+        (
+            "no-ids",
+            "",
+            "subuid has no range for the daemon's user kbf",
+        ),
+        ("few-ids", "65535", "subuid gives the daemon's user kbf"),
+    ] {
+        let ids = id_files(name, count);
+        let log = ids.join("stderr");
+        let mut child = Command::new(BIN)
+            .args(base(&ids))
+            .args([
+                "--driver=container".to_owned(),
+                "--cas=http://127.0.0.1:1".to_owned(),
+                format!("--scratch={}", ids.join("leases").display()),
+                "--cgroup-parent=/kbf.slice/actions".to_owned(),
+                format!("--id-files={}", ids.display()),
+            ])
+            .stderr(std::fs::File::create(&log).expect("stderr file"))
+            .spawn()
+            .expect("spawn");
+        // A daemon that passed the check would run until stopped: bound the wait.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            if Instant::now() > deadline {
+                child.kill().expect("kill");
+                child.wait().expect("reap");
+                panic!("{name}: the daemon started: {}", read(&log));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(1), "{name}");
+        let stderr = read(&log);
+        let says = format!("kbf-daemon: {}/{says}", ids.display());
+        assert!(stderr.contains(&says), "{name}: {stderr}");
+    }
 }
