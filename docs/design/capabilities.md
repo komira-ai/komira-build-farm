@@ -114,8 +114,8 @@ module), and the server shows it in `GET /v1/nodes` ([api.md](../api.md#get-v1no
 
 A field that cannot be read is empty; status never stops a node from joining.
 
-**Planned:** `os_version` and `os_build` (both platforms) and `kernel` (Linux) also
-become report entries matched exactly, so an action can pin them
+**Planned:** `os_version` (both platforms), `os_build` (Mac) and `kernel` (Linux)
+also become report entries matched exactly, so an action can pin them
 ([fleet-updates.md](fleet-updates.md#31-observed)). Today an action that names one is
 not matched on it (see [unknown keys](#unknown-keys)). Client-defined probes
 (`probe.<k>`, [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity))
@@ -175,13 +175,14 @@ Every other key may appear once. A value that does not parse or a repeated key i
 refused. A Mac with two Xcodes installed serves an action that names either build, and
 the native driver runs it with that Xcode selected (`DEVELOPER_DIR`; see
 [platform-properties.md](../platform-properties.md#xcode)). No daemon reports
-`os_image` or `nvme_gib` yet, so a request for either matches no node.
+`os_image` or `nvme_gib` yet, so a request for `os_image`, or for `nvme_gib` above 0,
+matches no node (a missing amount counts as zero, so `nvme_gib=0` matches every node).
 
 A report entry the matcher does not know (`drivers`, `network_isolation`, `isa_level`,
 ...) is skipped, so a newer daemon's entries never stop an older server from reading
 its report.
 
-#### Unknown keys
+### Unknown keys
 
 `Request::parse` refuses a key it does not know. But a client's platform reaches it
 through `Request::from_platform` (below), which passes on only the names kbf reads, so
@@ -279,8 +280,8 @@ naming no `container-image`.
   `INVALID_ARGUMENT` naming the closest known key; today it is ignored, so a misspelt
   `OSFamilly` matches every worker.
 - **`kbf-node`** reserved, and refused from every client (above).
-- **More report entries:** `os_version` and `os_build` (both platforms) and `kernel`
-  (Linux), matched exactly; `cpu.model` on Linux (a human name for the
+- **More report entries:** `os_version` (both platforms), `os_build` (Mac) and
+  `kernel` (Linux), matched exactly; `cpu.model` on Linux (a human name for the
   microarchitecture), `nvme_gib`, `os_image` (on bootc Linux), the SDKs of each Xcode
   on macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)),
   and the VM driver's `drivers` value and `vm.*` entries (above).
