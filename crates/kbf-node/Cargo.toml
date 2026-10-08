@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-futures.workspace = true
 kbf-daemon.workspace = true
 kbf-driver-native.workspace = true
 kbf-outputs.workspace = true
@@ -27,7 +26,6 @@ tracing-subscriber.workspace = true
 # The container driver runs rootless Podman under cgroup v2, and builds on Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
 kbf-driver-container.workspace = true
-kbf-proto.workspace = true
 
 [dev-dependencies]
 libc.workspace = true

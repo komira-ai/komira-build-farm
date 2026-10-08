@@ -94,8 +94,9 @@ const HEADER: &str = "\
 # workspace crate: how many of its lines and branches no test runs; `-` means the crate
 # has nothing to measure. CI fails when a crate misses more than its line here, so a
 # change covers the code it adds (or covers as much existing code as it leaves
-# uncovered). The target is 0 everywhere. The coverage job uploads the measured file as
-# `coverage-baseline.measured`; copy it here when a count falls or a crate is added.
+# uncovered), and when it misses fewer, so the file never keeps slack. The target is 0
+# everywhere. The coverage job uploads the measured file as
+# `coverage-baseline.measured`; copy it here when a count changes or a crate is added.
 # crate lines-missed branches-missed
 ";
 

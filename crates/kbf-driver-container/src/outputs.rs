@@ -22,7 +22,7 @@
 //! `..`, and refuses a `..` that is not the directory it came from (device and inode).
 //!
 //! No file is read into memory whole: each is hashed and then stored one chunk at a
-//! time ([`FileBlob`]), and one past the byte limit is refused after `limit + 1` bytes.
+//! time ([`FileBlob::store`]), and one past the byte limit is refused after `limit + 1` bytes.
 //! The action's stdout and stderr are stored the same way, each within its own limit
 //! ([`collect_log`]).
 //!
@@ -39,6 +39,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use kbf_daemon::cas::{Cas, digest_of};
 use kbf_proto::reapi::{
     ActionResult, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile, OutputSymlink,
     SymlinkNode, Tree,
@@ -47,7 +48,7 @@ use prost::Message;
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
-use crate::cas::{Cas, FileBlob, digest_of};
+use crate::cas::FileBlob;
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -273,7 +274,7 @@ pub(crate) async fn collect_log(
     let Some((blob, _)) = read else {
         return Err(limit(path, Exceeded::Stdio, max));
     };
-    Ok(cas.put_file(blob).await?)
+    Ok(blob.store(cas).await?)
 }
 
 /// An entry of a directory being walked: its name and what it is.
@@ -394,7 +395,7 @@ pub(crate) async fn collect(
                 let (blob, executable) = budget.file(read, &shown)?;
                 result.output_files.push(OutputFile {
                     path: path.clone(),
-                    digest: Some(cas.put_file(blob).await?),
+                    digest: Some(blob.store(cas).await?),
                     is_executable: executable,
                     ..OutputFile::default()
                 });
@@ -517,7 +518,7 @@ async fn walk<C: Cas>(
                 let (blob, executable) = budget.file(read, &path)?;
                 top.directory.files.push(FileNode {
                     name,
-                    digest: Some(cas.put_file(blob).await?),
+                    digest: Some(blob.store(cas).await?),
                     is_executable: executable,
                     ..FileNode::default()
                 });

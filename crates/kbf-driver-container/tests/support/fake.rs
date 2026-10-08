@@ -20,10 +20,7 @@ pub const INDEX: &[u8] =
     br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
 
 pub fn sha256(bytes: &[u8]) -> String {
-    format!(
-        "sha256:{}",
-        kbf_driver_container::cas::digest_of(bytes).hash
-    )
+    format!("sha256:{}", kbf_daemon::cas::digest_of(bytes).hash)
 }
 
 pub fn image_by(digest: &str) -> String {

@@ -23,13 +23,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use kbf_daemon::cas::Cas;
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, Platform};
 use kbf_types::LeaseId;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
-use crate::cas::Cas;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};

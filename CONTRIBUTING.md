@@ -82,11 +82,11 @@ branches of each crate no test runs. The job fails when either count rises.
 That is what it enforces, and it is slightly weaker than the target: a pull
 request that leaves some new code uncovered still passes if it also covers at
 least as many lines or branches that were uncovered before. Reviewers hold the
-rest of the target. When a count falls, the job passes and marks the crate
-`passes; update the baseline`; a crate missing from the file fails. In either
-case copy `coverage-baseline.measured` from the job's `coverage` artifact over
-`coverage-baseline` in the same pull request, so a later change cannot spend
-the slack a stale count leaves.
+rest of the target. The job also fails when a count falls below the file's
+(`BASELINE LOOSER THAN MEASURED`) and when a crate is missing from the file, so
+the file always equals the measurement and never keeps slack for a later change
+to spend. In either case copy `coverage-baseline.measured` from the job's
+`coverage` artifact over `coverage-baseline` in the same pull request.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

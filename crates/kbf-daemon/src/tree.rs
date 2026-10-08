@@ -1,9 +1,10 @@
 //! Files in and out of a lease: the input root written from the CAS into a directory,
 //! and the action's outputs read back into the CAS.
 //!
-//! The rules are those of the container driver's `tree` module (`kbf-driver-container`,
-//! pull request 32), which reads its blobs through its own copy of [`Cas`]; once both
-//! are merged the driver takes this module and its copy goes.
+//! Both drivers write their input roots with [`materialize`] and check a Command's
+//! paths with [`check_relative`] and [`output_paths`]. The native driver reads outputs
+//! with `kbf-outputs` and the container driver with its own descriptor walk over the
+//! overlay's upper directory; [`collect`] here serves `LocalRuntime` (tests only).
 //!
 //! Directory messages come from clients, so every name is checked before it touches the
 //! host's filesystem: a name with a slash, `.`, `..` or a NUL, or a name used twice in

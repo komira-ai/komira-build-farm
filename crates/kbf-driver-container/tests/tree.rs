@@ -3,12 +3,13 @@
 
 mod support;
 
-use kbf_driver_container::cas::digest_of;
+use kbf_daemon::CasError;
+use kbf_daemon::cas::digest_of;
+use kbf_driver_container::MemoryCas;
 use kbf_driver_container::tree::{
     Exceeded, OutputLimits, TreeError, collect, materialize, output_paths,
     refuse_hidden_working_directory, refuse_outputs_in_inputs,
 };
-use kbf_driver_container::{CasError, MemoryCas};
 use kbf_proto::reapi::{
     ActionResult, Command, Directory, DirectoryNode, FileNode, OutputSymlink, SymlinkNode, Tree,
 };
@@ -748,7 +749,7 @@ async fn names_and_targets_that_are_not_utf8_fail_the_collection() {
 /// is stored whole.
 #[tokio::test]
 async fn a_file_changed_after_it_was_hashed_is_not_stored() {
-    use kbf_driver_container::{Cas, FileBlob};
+    use kbf_driver_container::FileBlob;
 
     let dir = support::scratch("collect-changed");
     let path = dir.join("f");
@@ -760,12 +761,12 @@ async fn a_file_changed_after_it_was_hashed_is_not_stored() {
     };
     let blob = hashed(b"before");
     std::fs::write(&path, b"after!").expect("rewrite");
-    let error = cas.put_file(blob).await.expect_err("refused");
+    let error = blob.store(&cas).await.expect_err("refused");
     assert!(matches!(error, CasError::Corrupt(..)), "{error}");
     let blob = hashed(b"before");
     std::fs::write(&path, b"bef").expect("truncate");
-    let error = cas.put_file(blob).await.expect_err("refused");
+    let error = blob.store(&cas).await.expect_err("refused");
     assert!(matches!(error, CasError::Read(..)), "{error}");
-    let digest = cas.put_file(hashed(b"stored")).await.expect("stored");
+    let digest = hashed(b"stored").store(&cas).await.expect("stored");
     assert_eq!(cas.blob(&digest), Some(b"stored".to_vec()));
 }

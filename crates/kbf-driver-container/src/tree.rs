@@ -1,22 +1,26 @@
 //! Files in and out of a lease: the input root written from the CAS into a directory,
 //! and the action's outputs read back into the CAS.
 //!
-//! Directory messages come from clients, so every name is checked before it touches the
-//! host's filesystem: a name with a slash, `.`, `..` or a NUL, or a name used twice in
-//! one directory, refuses the action. Files are created with `O_EXCL` in directories this
-//! module created, so no write follows a symlink the input tree planted. Outputs are read
-//! by descriptor, component by component from the upper directory, and no symlink is
-//! followed at any level.
+//! The input root is written by `kbf_daemon::tree`, the module the native driver uses
+//! too, with its rules: Directory messages come from clients, so every name is checked
+//! before it touches the host's filesystem (a name with a slash, `.`, `..` or a NUL, or
+//! a name used twice in one directory, refuses the action), and files are created with
+//! `O_EXCL` in directories that module created, so no write follows a symlink the input
+//! tree planted. Its errors come back as this module's [`TreeError`], kind for kind.
+//!
+//! What is the container driver's own: the overlay checks
+//! ([`refuse_outputs_in_inputs`], [`refuse_hidden_working_directory`]) and the outputs,
+//! read by descriptor, component by component from the upper directory, with no symlink
+//! followed at any level, within [`OutputLimits`].
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use kbf_proto::reapi::{ActionResult, Digest, Directory, FileNode};
+use kbf_daemon::cas::{Cas, CasError};
+use kbf_daemon::tree as shared;
+use kbf_proto::reapi::{ActionResult, Command, Digest};
 use prost::Message;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 
-use crate::cas::{Cas, CasError, fetch, label};
 pub use crate::outputs::OutputLimits;
 
 /// Why the input root could not be written or the outputs read.
@@ -70,6 +74,17 @@ impl std::fmt::Display for Exceeded {
     }
 }
 
+/// The shared module's error, kind for kind.
+impl From<shared::TreeError> for TreeError {
+    fn from(error: shared::TreeError) -> Self {
+        match error {
+            shared::TreeError::Invalid(why) => Self::Invalid(why),
+            shared::TreeError::Cas(e) => Self::Cas(e),
+            shared::TreeError::Io { path, source } => Self::Io { path, source },
+        }
+    }
+}
+
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> TreeError + '_ {
     move |source| TreeError::Io {
         path: path.to_owned(),
@@ -77,121 +92,35 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> TreeError + '_ {
     }
 }
 
-/// Fetches a blob and decodes it as `M`.
+/// Fetches a blob and decodes it as `M` (`kbf_daemon::tree::fetch_message`).
 pub(crate) async fn fetch_message<M: Message + Default>(
     cas: &impl Cas,
     digest: &Digest,
 ) -> Result<M, TreeError> {
-    let bytes = fetch(cas, digest).await?;
-    M::decode(bytes.as_slice())
-        .map_err(|e| TreeError::Invalid(format!("blob {} does not decode: {e}", label(digest))))
+    Ok(shared::fetch_message(cas, digest).await?)
 }
 
-/// Checks one name of a Directory entry.
-fn check_name(name: &str) -> Result<(), TreeError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
-        return Err(TreeError::Invalid(format!(
-            "input tree entry name {name:?} is not a single path component"
-        )));
-    }
-    Ok(())
-}
-
-/// Checks a path the Command names (working directory, output path): relative, made
-/// of non-empty components other than `.` and `..`, joined by single slashes. The empty
-/// path is the directory itself.
+/// Checks a path the Command names (`kbf_daemon::tree::check_relative`).
 pub(crate) fn check_relative(what: &str, path: &str) -> Result<(), TreeError> {
-    let plain = path.is_empty()
-        || path
-            .split('/')
-            .all(|part| !matches!(part, "" | "." | "..") && !part.contains('\0'));
-    if !plain {
-        return Err(TreeError::Invalid(format!(
-            "{what} {path:?} must be relative and must not contain . or .."
-        )));
-    }
-    Ok(())
+    Ok(shared::check_relative(what, path)?)
 }
 
-/// Writes the tree under `root` into the empty directory `dir`.
+/// Writes the tree under `root` into the empty directory `dir`
+/// (`kbf_daemon::tree::materialize`).
+///
+/// # Errors
+/// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<(), TreeError> {
-    let mut pending = vec![(root.clone(), dir.to_owned())];
-    while let Some((digest, here)) = pending.pop() {
-        let directory: Directory = fetch_message(cas, &digest).await?;
-        let mut seen = BTreeSet::new();
-        let names = directory
-            .files
-            .iter()
-            .map(|f| &f.name)
-            .chain(directory.directories.iter().map(|d| &d.name))
-            .chain(directory.symlinks.iter().map(|s| &s.name));
-        for name in names {
-            check_name(name)?;
-            if !seen.insert(name) {
-                return Err(TreeError::Invalid(format!(
-                    "input tree names {name:?} twice in one directory"
-                )));
-            }
-        }
-        for file in &directory.files {
-            write_file(cas, file, &here.join(&file.name)).await?;
-        }
-        for link in &directory.symlinks {
-            let path = here.join(&link.name);
-            fs::symlink(&link.target, &path).await.map_err(io(&path))?;
-        }
-        for sub in &directory.directories {
-            let path = here.join(&sub.name);
-            fs::create_dir(&path).await.map_err(io(&path))?;
-            let digest = sub.digest.clone().ok_or_else(|| {
-                TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
-            })?;
-            pending.push((digest, path));
-        }
-    }
-    Ok(())
+    Ok(shared::materialize(cas, root, dir).await?)
 }
 
-async fn write_file(cas: &impl Cas, node: &FileNode, path: &Path) -> Result<(), TreeError> {
-    let digest = node
-        .digest
-        .as_ref()
-        .ok_or_else(|| TreeError::Invalid(format!("input file {:?} has no digest", node.name)))?;
-    let bytes = fetch(cas, digest).await?;
-    let mode = if node.is_executable { 0o755 } else { 0o644 };
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .await
-        .map_err(io(path))?;
-    file.write_all(&bytes).await.map_err(io(path))?;
-    file.flush().await.map_err(io(path))?;
-    Ok(())
-}
-
-/// The output paths a Command declares, each checked. REAPI 2.1 lists them in
-/// `output_paths`; older clients list `output_files` and `output_directories`.
-#[allow(deprecated)]
-pub fn output_paths(command: &kbf_proto::reapi::Command) -> Result<Vec<String>, TreeError> {
-    let paths: Vec<String> = if command.output_paths.is_empty() {
-        command
-            .output_files
-            .iter()
-            .chain(&command.output_directories)
-            .cloned()
-            .collect()
-    } else {
-        command.output_paths.clone()
-    };
-    for path in &paths {
-        if path.is_empty() {
-            return Err(TreeError::Invalid("an output path is empty".to_owned()));
-        }
-        check_relative("output path", path)?;
-    }
-    Ok(paths)
+/// The output paths a Command declares, each checked
+/// (`kbf_daemon::tree::output_paths`).
+///
+/// # Errors
+/// A path is empty, absolute, or contains `.` or `..`.
+pub fn output_paths(command: &Command) -> Result<Vec<String>, TreeError> {
+    Ok(shared::output_paths(command)?)
 }
 
 /// Refuses an output path that names an entry of the input root `root` (seen from
