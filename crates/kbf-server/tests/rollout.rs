@@ -15,10 +15,11 @@ use kbf_server::Farm;
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::PlacementView;
 use kbf_server::rollout::{
-    Applier, Change, DriveError, Fleet, MemoryRolloutStore, RolloutDriver, RolloutStore, StoreError,
+    Applier, Change, DriveError, Fleet, MemoryRolloutStore, NodePlacement, RolloutDriver,
+    RolloutStore, StoreError, Update,
 };
 use kbf_types::{
-    IllegalStep, NodeStep, Resources, Rollout, RolloutId, RolloutState, Selector, Strategy,
+    Actor, IllegalStep, NodeStep, Resources, Rollout, RolloutId, RolloutState, Selector, Strategy,
     WorkerId,
 };
 
@@ -38,22 +39,43 @@ fn rollout(nodes: &[&str], max_unavailable: u32) -> Rollout {
         "sha256:set",
         Selector::Nodes(names.clone()),
         strategy,
-        "operator",
+        Actor::new("operator", 1_000),
         names,
     )
 }
 
-/// A fleet that records what it is asked and answers placements a test sets.
+/// A fleet that records what it is asked and answers placements a test sets: each
+/// read takes the next answer of a node's script, and the last one stays.
 #[derive(Default)]
 struct FakeFleet {
     actions: RefCell<Vec<(WorkerId, NodeAction)>>,
-    placements: RefCell<BTreeMap<WorkerId, PlacementView>>,
+    placements: RefCell<BTreeMap<WorkerId, Vec<NodePlacement>>>,
     refuse: RefCell<Option<WorkerId>>,
 }
 
+fn connected(placement: PlacementView) -> NodePlacement {
+    NodePlacement {
+        placement,
+        connected: true,
+    }
+}
+
+fn away(placement: PlacementView) -> NodePlacement {
+    NodePlacement {
+        placement,
+        connected: false,
+    }
+}
+
 impl FakeFleet {
+    /// `node` is at `placement` and connected from now on.
     fn set(&self, node: &str, placement: PlacementView) {
-        self.placements.borrow_mut().insert(w(node), placement);
+        self.script(node, vec![connected(placement)]);
+    }
+
+    /// `node`'s next reads answer `answers` in order; the last one stays.
+    fn script(&self, node: &str, answers: Vec<NodePlacement>) {
+        self.placements.borrow_mut().insert(w(node), answers);
     }
 
     fn actions(&self) -> Vec<(WorkerId, NodeAction)> {
@@ -70,26 +92,40 @@ impl Fleet for FakeFleet {
         Ok(())
     }
 
-    fn placement(&self, node: &WorkerId) -> Option<PlacementView> {
-        self.placements.borrow().get(node).cloned()
+    fn placement(&self, node: &WorkerId) -> Option<NodePlacement> {
+        let mut placements = self.placements.borrow_mut();
+        let answers = placements.get_mut(node)?;
+        if answers.len() > 1 {
+            Some(answers.remove(0))
+        } else {
+            answers.first().cloned()
+        }
     }
 }
 
 #[derive(Default)]
 struct FakeApplier {
-    handed: RefCell<Vec<(WorkerId, String)>>,
+    handed: RefCell<Vec<Update>>,
     refuse: bool,
 }
 
 impl Applier for FakeApplier {
-    fn apply(&self, node: &WorkerId, target: &str) -> Result<(), String> {
+    fn apply(&self, update: &Update) -> Result<(), String> {
         if self.refuse {
             return Err("the updater refused the set".to_owned());
         }
-        self.handed
-            .borrow_mut()
-            .push((node.clone(), target.to_owned()));
+        self.handed.borrow_mut().push(update.clone());
         Ok(())
+    }
+}
+
+/// The update `node` is handed in rollout `id`.
+fn update(id: u64, node: &str) -> Update {
+    Update {
+        rollout: RolloutId(id),
+        step: NodeStep::Updating,
+        node: w(node),
+        set_digest: "sha256:set".to_owned(),
     }
 }
 
@@ -105,10 +141,11 @@ fn steps(r: &Rollout) -> Vec<NodeStep> {
 }
 
 /// Catches: a driver that takes more nodes out than `max_unavailable` (or counts a node
-/// that is applying as back in service), one that drains without the strategy's
-/// deadline, applies before the node is drained, or hands over another target.
+/// that is updating as back in service), one that drains without the strategy's
+/// deadline, updates before the node is drained, or hands over another target, or an
+/// update that does not name its rollout and step (section 4.2, step 5).
 #[test]
-fn nodes_go_out_one_at_a_time_and_stop_at_applying() {
+fn nodes_go_out_one_at_a_time_and_stop_at_updating() {
     let (store, fleet, applier) = (
         MemoryRolloutStore::default(),
         FakeFleet::default(),
@@ -146,13 +183,10 @@ fn nodes_go_out_one_at_a_time_and_stop_at_applying() {
     let r = driver.step(id).expect("step");
     assert_eq!(
         steps(&r),
-        [NodeStep::Applying, NodeStep::Pending, NodeStep::Pending]
+        [NodeStep::Updating, NodeStep::Pending, NodeStep::Pending]
     );
-    assert_eq!(
-        *applier.handed.borrow(),
-        [(w("a"), "sha256:set".to_owned())]
-    );
-    // Applying is still out of service: the next node waits.
+    assert_eq!(*applier.handed.borrow(), [update(1, "a")]);
+    // Updating is still out of service: the next node waits.
     let r = driver.step(id).expect("step");
     assert_eq!(steps(&r)[1], NodeStep::Pending);
     assert_eq!(fleet.actions().len(), 2);
@@ -186,10 +220,12 @@ fn a_failed_gate_holds_the_node_and_the_rollout() {
         leases: vec!["1.4".to_owned()],
     };
     for (gate, refuse_apply) in [
-        (Some(paused), false),
-        (Some(PlacementView::Serving), false),
+        (Some(connected(paused.clone())), false),
+        (Some(away(paused)), false),
+        (Some(connected(PlacementView::Serving)), false),
+        (Some(connected(PlacementView::Cordoned)), false),
         (None, false),
-        (Some(PlacementView::Drained), true),
+        (Some(connected(PlacementView::Drained)), true),
     ] {
         let fleet = FakeFleet::default();
         let applier = FakeApplier {
@@ -202,14 +238,14 @@ fn a_failed_gate_holds_the_node_and_the_rollout() {
         driver.step(id).expect("cordon");
         driver.step(id).expect("drain");
         if let Some(gate) = gate.clone() {
-            fleet.set("a", gate);
+            fleet.script("a", vec![gate]);
         }
         let r = driver.step(id).expect("step");
         assert_eq!(r.state(), RolloutState::Held, "{gate:?}");
         let a = r.node(&w("a")).expect("a");
         assert_eq!(a.step(), NodeStep::Held, "{gate:?}");
         let expected_at = if refuse_apply {
-            NodeStep::Applying
+            NodeStep::Updating
         } else {
             NodeStep::Draining
         };
@@ -239,6 +275,93 @@ fn a_failed_gate_holds_the_node_and_the_rollout() {
         let at = [NodeStep::Cordoned, NodeStep::Draining][refused_at];
         assert_eq!((a.step(), a.held_at()), (NodeStep::Held, Some(at)));
     }
+}
+
+/// Catches: a drained node handed its update while disconnected (`drained` also means
+/// it went away and its leases were requeued; the update needs its stream), a
+/// disconnected drained node held instead of waited for, and the update handed on the
+/// placement read before `updating` was recorded (an uncordon in between would let
+/// work land on a node that is being updated).
+#[test]
+fn a_node_is_updated_only_while_drained_and_connected() {
+    let (store, fleet, applier) = (
+        MemoryRolloutStore::default(),
+        FakeFleet::default(),
+        FakeApplier::default(),
+    );
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let id = driver.start(rollout(&["a", "b"], 1)).expect("start").id;
+    driver.step(id).expect("cordon");
+    driver.step(id).expect("drain");
+    fleet.script("a", vec![away(PlacementView::Drained)]);
+    for _ in 0..3 {
+        let r = driver.step(id).expect("step");
+        assert_eq!(r.state(), RolloutState::Running, "waited for, not held");
+        assert_eq!(steps(&r), [NodeStep::Draining, NodeStep::Pending]);
+    }
+    assert!(applier.handed.borrow().is_empty(), "updated while away");
+    // Back: updated.
+    fleet.set("a", PlacementView::Drained);
+    let r = driver.step(id).expect("step");
+    assert_eq!(steps(&r), [NodeStep::Updating, NodeStep::Pending]);
+    assert_eq!(*applier.handed.borrow(), [update(1, "a")]);
+
+    // Drained and connected when read, but uncordoned (or gone) by the time `updating`
+    // is recorded: held at updating, and never handed the update.
+    for second in [
+        connected(PlacementView::Serving),
+        away(PlacementView::Drained),
+    ] {
+        let (store, fleet, applier) = (
+            MemoryRolloutStore::default(),
+            FakeFleet::default(),
+            FakeApplier::default(),
+        );
+        let driver = RolloutDriver::new(&store, &fleet, &applier);
+        let id = driver.start(rollout(&["a"], 1)).expect("start").id;
+        driver.step(id).expect("cordon");
+        driver.step(id).expect("drain");
+        fleet.script("a", vec![connected(PlacementView::Drained), second.clone()]);
+        let r = driver.step(id).expect("step");
+        assert_eq!(r.state(), RolloutState::Held, "{second:?}");
+        let a = r.node(&w("a")).expect("a");
+        assert_eq!(
+            (a.step(), a.held_at()),
+            (NodeStep::Held, Some(NodeStep::Updating))
+        );
+        assert!(applier.handed.borrow().is_empty(), "{second:?}");
+    }
+}
+
+/// Catches: the driver's own count of nodes out disagreeing with the record's: the
+/// record refuses a third node with `max_unavailable` 2, so a driver that asked would
+/// fail the step instead of leaving the node pending.
+#[test]
+fn the_driver_takes_nodes_out_only_while_the_record_allows() {
+    let (store, fleet, applier) = (
+        MemoryRolloutStore::default(),
+        FakeFleet::default(),
+        FakeApplier::default(),
+    );
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let id = driver
+        .start(rollout(&["a", "b", "c"], 2))
+        .expect("start")
+        .id;
+    fleet.set("a", draining());
+    fleet.set("b", draining());
+    for _ in 0..3 {
+        let r = driver.step(id).expect("step");
+        assert_eq!(r.out_of_service(), 2);
+        assert_eq!(steps(&r)[2], NodeStep::Pending);
+    }
+    let refused = store.update(id, &|r| r.advance(&w("c"), NodeStep::Cordoned));
+    assert_eq!(
+        refused,
+        Err(StoreError::Illegal(IllegalStep::Unavailable {
+            max_unavailable: 2
+        }))
+    );
 }
 
 /// A store that keeps nothing once `writes` is spent.
@@ -352,7 +475,7 @@ fn the_memory_store_keeps_whole_changes_only() {
     );
     let half = store.update(RolloutId(1), &|r| {
         r.set_state(RolloutState::Running)?;
-        r.advance(&w("a"), NodeStep::Applying)
+        r.advance(&w("a"), NodeStep::Updating)
     });
     assert!(matches!(
         half,
@@ -413,16 +536,16 @@ async fn the_driver_runs_against_the_farm() {
     driver.step(id).expect("cordon");
     assert_eq!(
         Fleet::placement(&farm, &w("a")),
-        Some(PlacementView::Cordoned)
+        Some(connected(PlacementView::Cordoned))
     );
     driver.step(id).expect("drain");
     assert_eq!(
         Fleet::placement(&farm, &w("a")),
-        Some(PlacementView::Drained)
+        Some(connected(PlacementView::Drained))
     );
-    let r = driver.step(id).expect("apply");
-    assert_eq!(r.node(&w("a")).map(|p| p.step()), Some(NodeStep::Applying));
-    assert_eq!(applier.handed.borrow().len(), 1);
+    let r = driver.step(id).expect("update");
+    assert_eq!(r.node(&w("a")).map(|p| p.step()), Some(NodeStep::Updating));
+    assert_eq!(*applier.handed.borrow(), [update(1, "a")]);
 
     assert_eq!(Fleet::placement(&farm, &w("ghost")), None);
     assert_eq!(

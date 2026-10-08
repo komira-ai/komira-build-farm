@@ -9,7 +9,7 @@
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
 //!   need the token of `--api-token-file` ([`token`]).
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
-//!   cordons, drains and hands drained nodes their update, as far as `applying`.
+//!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
 //!   `Start` only after the grant commits; a result is accepted only from the node
 //!   holding the operation's current lease, and only an accepted result is written to

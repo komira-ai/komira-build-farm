@@ -1,5 +1,5 @@
 //! Rollouts on the server: where the record is kept ([`RolloutStore`]) and the driver
-//! that moves nodes through it ([`RolloutDriver`]), as far as `applying`
+//! that moves nodes through it ([`RolloutDriver`]), as far as `updating`
 //! (`docs/design/fleet-updates.md` sections 4.1 and 4.2). The record and its rules are
 //! `kbf_types::Rollout`.
 //!
@@ -13,13 +13,25 @@
 //! Raft log once it is wired, is the next slice, behind the same trait. Rollouts that
 //! touch real nodes (phases P2 and P3) wait for it.
 //!
-//! **Where the driver stops.** It cordons up to `max_unavailable` nodes, drains each,
-//! and once a node is drained records `applying` and hands the update to an
-//! [`Applier`]. What follows (`rebooting`, `qualifying`, `done`) needs `kbf-updater`
-//! and the node's own report, which are later slices. A drain that pauses at its
-//! deadline, a node returned to placement by someone else, or a refused hand-over holds
-//! the node and the rollout: nothing proceeds by itself (section 4.3). The canary,
-//! soak, `min_serving` and per-pool slots are phase P2.
+//! **Where the driver stops.** It cordons up to `max_unavailable` nodes (the record
+//! refuses more, whoever asks), drains each, and once a node is drained and connected
+//! records `updating` and hands the node an [`Update`] naming the rollout, the step
+//! and the software set (section 4.2, step 5). What follows (`rebooting`,
+//! `qualifying`, `done`, `quarantined`) needs `kbf-updater` and the node's own report,
+//! which are later slices. A drain that pauses at its deadline, a node returned to
+//! placement by someone else, or a refused hand-over holds the node and the rollout:
+//! nothing proceeds by itself (section 4.3). The canary, soak, `min_serving` and
+//! per-pool slots are phase P2.
+//!
+//! **A drained node that is not connected is waited for, not updated.** `drained` also
+//! means the node disconnected and its leases were requeued elsewhere; the update
+//! needs the node's stream, so the driver keeps it at `draining` until it is back.
+//! Reading the placement and handing over the update are separate steps with no lock
+//! between them, so after recording `updating` the driver reads the placement again
+//! and holds the node if it is no longer drained and connected (say, an operator
+//! uncordoned it and work landed). The backstop for what can still change after that
+//! read is the daemon: it refuses an `Update` while any lease is live or a lease's
+//! self-fence window is open (section 4.2, step 5).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -106,6 +118,23 @@ impl RolloutStore for MemoryRolloutStore {
     }
 }
 
+/// Where a node is in placement, and whether its stream is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodePlacement {
+    /// Where it is in placement.
+    pub placement: PlacementView,
+    /// Whether its newest stream is open.
+    pub connected: bool,
+}
+
+impl NodePlacement {
+    /// Whether the node may be handed its update: drained, and connected.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.connected && self.placement == PlacementView::Drained
+    }
+}
+
 /// What the driver asks of the fleet: cordon or drain a node, and where it is.
 pub trait Fleet {
     /// Carries out `action` on `node`.
@@ -114,8 +143,8 @@ pub trait Fleet {
     /// The node is unknown.
     fn place(&self, node: &WorkerId, action: NodeAction) -> Result<(), String>;
 
-    /// Where `node` is in placement, if it is known.
-    fn placement(&self, node: &WorkerId) -> Option<PlacementView>;
+    /// Where `node` is in placement and whether it is connected, if it is known.
+    fn placement(&self, node: &WorkerId) -> Option<NodePlacement>;
 }
 
 impl<M: MetaLog, O: ObjectStore> Fleet for Farm<M, O> {
@@ -125,18 +154,36 @@ impl<M: MetaLog, O: ObjectStore> Fleet for Farm<M, O> {
             .map_err(|e| e.to_string())
     }
 
-    fn placement(&self, node: &WorkerId) -> Option<PlacementView> {
-        self.node_view(node).map(|view| view.placement)
+    fn placement(&self, node: &WorkerId) -> Option<NodePlacement> {
+        self.node_view(node).map(|view| NodePlacement {
+            placement: view.placement,
+            connected: view.connected,
+        })
     }
+}
+
+/// One node's update, as the server will send it (`ServerMessage::Update{rollout,
+/// step, set_digest}`, section 4.2 step 5): every step names its rollout and step, so
+/// a restart continues or halts it and never repeats it blindly (section 4.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update {
+    /// The rollout it belongs to.
+    pub rollout: RolloutId,
+    /// The rollout step it carries out on the node.
+    pub step: NodeStep,
+    /// The node.
+    pub node: WorkerId,
+    /// The software set to install, by digest.
+    pub set_digest: String,
 }
 
 /// Hands a drained node its update. The steps after the hand-over are later slices.
 pub trait Applier {
-    /// Hands `target` (a software set digest) to `node`.
+    /// Hands `update` to its node.
     ///
     /// # Errors
     /// The hand-over was refused; the node is held.
-    fn apply(&self, node: &WorkerId, target: &str) -> Result<(), String>;
+    fn apply(&self, update: &Update) -> Result<(), String>;
 }
 
 /// Why the driver stopped.
@@ -181,10 +228,11 @@ impl<'a> RolloutDriver<'a> {
             .update(id, &|r| r.set_state(RolloutState::Running))?)
     }
 
-    /// Moves rollout `id` on as far as it can now: drained nodes get their update,
-    /// cordoned nodes are drained, and pending nodes are cordoned while fewer than
-    /// `max_unavailable` are out. A node that cannot go on is held, and the rollout with
-    /// it; then nothing more moves. A rollout that is not running is left as it is.
+    /// Moves rollout `id` on as far as it can now: drained, connected nodes get their
+    /// update, cordoned nodes are drained, and pending nodes are cordoned while fewer
+    /// than `max_unavailable` are out. A drained node that is not connected is waited
+    /// for. A node that cannot go on is held, and the rollout with it; then nothing
+    /// more moves. A rollout that is not running is left as it is.
     ///
     /// # Errors
     /// The store refuses a step (`id` unknown, or a write failed).
@@ -201,15 +249,30 @@ impl<'a> RolloutDriver<'a> {
                 .collect()
         };
         for node in at(NodeStep::Draining) {
-            match self.fleet.placement(&node) {
-                Some(PlacementView::Draining { .. }) => {}
-                Some(PlacementView::Drained) => {
-                    self.record(id, &node, NodeStep::Applying)?;
-                    if let Err(why) = self.applier.apply(&node, &rollout.target) {
-                        return self.hold(id, &node, &why);
-                    }
-                }
+            let now = match self.fleet.placement(&node) {
+                Some(now) if now.ready() => now,
+                // Still draining, or drained while away: wait.
+                Some(NodePlacement {
+                    placement: PlacementView::Draining { .. } | PlacementView::Drained,
+                    ..
+                }) => continue,
                 other => return self.hold(id, &node, &format!("{other:?} while draining")),
+            };
+            self.record(id, &node, NodeStep::Updating)?;
+            // The placement was read before the step was recorded: read it again.
+            let again = self.fleet.placement(&node);
+            if !again.as_ref().is_some_and(NodePlacement::ready) {
+                let why = format!("{again:?} after updating was recorded (was {now:?})");
+                return self.hold(id, &node, &why);
+            }
+            let update = Update {
+                rollout: id,
+                step: NodeStep::Updating,
+                node: node.clone(),
+                set_digest: rollout.target.clone(),
+            };
+            if let Err(why) = self.applier.apply(&update) {
+                return self.hold(id, &node, &why);
             }
         }
         for node in at(NodeStep::Cordoned) {

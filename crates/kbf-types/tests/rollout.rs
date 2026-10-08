@@ -3,27 +3,42 @@
 use std::time::Duration;
 
 use kbf_types::{
-    IllegalStep, NodeProgress, NodeStep, Rollout, RolloutId, RolloutState, Selector, Strategy,
-    WorkerId,
+    Actor, IllegalStep, NodeProgress, NodeStep, Rollout, RolloutId, RolloutState, Selector,
+    Strategy, WorkerId,
 };
 
-use NodeStep::{Applying, Cordoned, Done, Draining, Failed, Held, Pending, Qualifying, Rebooting};
+use NodeStep::{
+    Cordoned, Done, Draining, Failed, Held, Pending, Qualifying, Quarantined, Rebooting, Updating,
+};
 
-const ALL: [NodeStep; 9] = [
-    Pending, Cordoned, Draining, Applying, Rebooting, Qualifying, Done, Held, Failed,
+const ALL: [NodeStep; 10] = [
+    Pending,
+    Cordoned,
+    Draining,
+    Updating,
+    Rebooting,
+    Qualifying,
+    Done,
+    Held,
+    Quarantined,
+    Failed,
 ];
 
 /// The forward moves of `fleet-updates.md` section 4.2, written out independently of
-/// the code: cordon, drain, apply, reboot (or not), qualify.
+/// the code: cordon, drain, update, reboot (or not), qualify.
 const FORWARD: [(NodeStep, NodeStep); 7] = [
     (Pending, Cordoned),
     (Cordoned, Draining),
-    (Draining, Applying),
-    (Applying, Rebooting),
-    (Applying, Qualifying),
+    (Draining, Updating),
+    (Updating, Rebooting),
+    (Updating, Qualifying),
     (Rebooting, Qualifying),
     (Qualifying, Done),
 ];
+
+/// The steps from which a node may be quarantined (section 3.3): once it has been
+/// handed its update.
+const QUARANTINABLE: [NodeStep; 3] = [Updating, Rebooting, Qualifying];
 
 /// A node brought to `step` by legal moves.
 fn at(step: NodeStep) -> NodeProgress {
@@ -31,11 +46,12 @@ fn at(step: NodeStep) -> NodeProgress {
         Pending => &[],
         Cordoned => &[Cordoned],
         Draining => &[Cordoned, Draining],
-        Applying => &[Cordoned, Draining, Applying],
-        Rebooting => &[Cordoned, Draining, Applying, Rebooting],
-        Qualifying => &[Cordoned, Draining, Applying, Qualifying],
-        Done => &[Cordoned, Draining, Applying, Qualifying, Done],
+        Updating => &[Cordoned, Draining, Updating],
+        Rebooting => &[Cordoned, Draining, Updating, Rebooting],
+        Qualifying => &[Cordoned, Draining, Updating, Qualifying],
+        Done => &[Cordoned, Draining, Updating, Qualifying, Done],
         Held => &[Cordoned, Held],
+        Quarantined => &[Cordoned, Draining, Updating, Quarantined],
         Failed => &[Failed],
     };
     let mut p = NodeProgress::pending();
@@ -46,15 +62,23 @@ fn at(step: NodeStep) -> NodeProgress {
     p
 }
 
-/// Catches: any illegal node move allowed (skipping the drain, applying from pending,
-/// leaving a final step, going backwards), any legal one refused, and a refused move
-/// that changes the node anyway.
+/// Catches: any illegal node move allowed (skipping the drain, updating from pending,
+/// leaving a final step, going backwards, quarantining a node never handed its
+/// update, leaving quarantine but to give the node up), any legal one refused, and a
+/// refused move that changes the node anyway.
 #[test]
 fn every_node_move_is_allowed_exactly_when_the_design_says() {
     for from in ALL.into_iter().filter(|s| *s != Held) {
         for to in ALL {
-            let legal =
-                !from.is_final() && (FORWARD.contains(&(from, to)) || matches!(to, Held | Failed));
+            let legal = match from {
+                Quarantined => to == Failed,
+                from if from.is_final() => false,
+                from => {
+                    FORWARD.contains(&(from, to))
+                        || matches!(to, Held | Failed)
+                        || (to == Quarantined && QUARANTINABLE.contains(&from))
+                }
+            };
             let mut p = at(from);
             let before = p;
             assert_eq!(p.allows(to), legal, "{from} -> {to}");
@@ -77,7 +101,7 @@ fn every_node_move_is_allowed_exactly_when_the_design_says() {
 /// drain or apply), one that cannot be given up, and `held_at` lost or kept wrongly.
 #[test]
 fn a_held_node_resumes_only_where_it_was_held_or_fails() {
-    for held_at in [Pending, Cordoned, Draining, Applying, Rebooting, Qualifying] {
+    for held_at in [Pending, Cordoned, Draining, Updating, Rebooting, Qualifying] {
         let mut p = at(held_at);
         assert_eq!(p.held_at(), None);
         p.advance(Held).expect("any unfinished step may be held");
@@ -97,7 +121,8 @@ fn a_held_node_resumes_only_where_it_was_held_or_fails() {
 }
 
 /// Catches: a final step counted as out of service (it would hold a slot forever), or
-/// a held node not counted (a broken node would free its slot, section 4.3).
+/// a held or quarantined node not counted (a broken node would free its slot, section
+/// 4.3); and step names other than the design's (section 3.3: `updating`).
 #[test]
 fn out_of_service_means_started_and_not_finished() {
     for step in ALL {
@@ -112,24 +137,32 @@ fn out_of_service_means_started_and_not_finished() {
             "pending",
             "cordoned",
             "draining",
-            "applying",
+            "updating",
             "rebooting",
             "qualifying",
             "done",
             "held",
+            "quarantined",
             "failed"
         ]
     );
 }
 
 fn rollout() -> Rollout {
+    rollout_of(&["a", "b"], 1)
+}
+
+fn rollout_of(nodes: &[&str], max_unavailable: u32) -> Rollout {
     Rollout::new(
         RolloutId(7),
         "sha256:abc",
         Selector::Pools(vec!["linux-x86".to_owned()]),
-        Strategy::default(),
-        "ci",
-        [WorkerId::new("a"), WorkerId::new("b")],
+        Strategy {
+            max_unavailable,
+            ..Strategy::default()
+        },
+        Actor::new("ci", 1_000),
+        nodes.iter().map(|n| WorkerId::new(*n)),
     )
 }
 
@@ -170,6 +203,80 @@ fn every_rollout_move_is_allowed_exactly_when_the_design_says() {
     assert_eq!(r.state(), Running);
 }
 
+/// Catches: a rollout set done while a node is still pending, under way, held or
+/// quarantined (the record would say every node is updated when it is not).
+#[test]
+fn a_rollout_is_done_only_when_every_node_is_done_or_failed() {
+    let (a, b) = (WorkerId::new("a"), WorkerId::new("b"));
+    let mut r = rollout_of(&["a", "b"], 2);
+    r.set_state(RolloutState::Running).expect("start");
+    assert_eq!(
+        r.set_state(RolloutState::Done),
+        Err(IllegalStep::Unfinished {
+            node: a.clone(),
+            step: Pending
+        })
+    );
+    for step in [Cordoned, Draining, Updating, Qualifying, Done] {
+        r.advance(&a, step).expect("a legal step");
+    }
+    for step in [Cordoned, Draining, Updating, Quarantined] {
+        r.advance(&b, step).expect("a legal step");
+        let before = r.clone();
+        assert_eq!(
+            r.set_state(RolloutState::Done),
+            Err(IllegalStep::Unfinished {
+                node: b.clone(),
+                step
+            })
+        );
+        assert_eq!(r, before, "a refused move changed the rollout");
+    }
+    r.advance(&b, Failed).expect("give b up");
+    r.set_state(RolloutState::Done)
+        .expect("every node is done or failed");
+    assert_eq!(r.state(), RolloutState::Done);
+}
+
+/// Catches: `max_unavailable` left to the driver (the record would let a second caller,
+/// or a driver bug, take more nodes out than the strategy allows), and held,
+/// quarantined or under-way nodes not counted as out.
+#[test]
+fn the_record_takes_no_more_than_max_unavailable_nodes_out() {
+    let (a, b, c) = (WorkerId::new("a"), WorkerId::new("b"), WorkerId::new("c"));
+    let mut r = rollout_of(&["a", "b", "c"], 2);
+    r.set_state(RolloutState::Running).expect("start");
+    r.advance(&a, Cordoned).expect("first out");
+    r.advance(&b, Cordoned).expect("second out");
+    assert_eq!(r.out_of_service(), 2);
+    let before = r.clone();
+    assert_eq!(
+        r.advance(&c, Cordoned),
+        Err(IllegalStep::Unavailable { max_unavailable: 2 })
+    );
+    assert_eq!(r, before);
+    // Out of service until done or failed, whatever the step in between.
+    for step in [Draining, Updating, Quarantined] {
+        r.advance(&a, step).expect("a legal step");
+        assert!(r.advance(&c, Cordoned).is_err(), "{step} counted as back");
+    }
+    r.advance(&b, Held).expect("hold b");
+    assert!(r.advance(&c, Cordoned).is_err(), "held counted as back");
+    // A node that is given up frees its slot.
+    r.advance(&a, Failed).expect("skip a");
+    assert_eq!(r.out_of_service(), 1);
+    r.advance(&c, Cordoned).expect("a slot is free");
+    // Other moves of nodes already out are not limited.
+    r.advance(&c, Draining).expect("c drains");
+
+    let mut none = rollout_of(&["a"], 0);
+    none.set_state(RolloutState::Running).expect("start");
+    assert_eq!(
+        none.advance(&a, Cordoned),
+        Err(IllegalStep::Unavailable { max_unavailable: 0 })
+    );
+}
+
 /// Catches: nodes moved while the rollout is pending, done or cancelled; a held
 /// rollout that lets nodes go on (nothing proceeds by itself) or forbids holding and
 /// giving up; a node the rollout does not cover; and a refused move that changes it.
@@ -189,16 +296,22 @@ fn only_a_running_rollout_moves_its_nodes() {
     r.advance(&a, Cordoned).expect("cordon a");
     let before = r.clone();
     assert!(matches!(
-        r.advance(&a, Applying),
+        r.advance(&a, Updating),
         Err(IllegalStep::Node { .. })
     ));
     assert_eq!(r, before);
+    r.advance(&a, Draining).expect("drain a");
+    r.advance(&a, Updating).expect("update a");
 
     r.set_state(RolloutState::Held).expect("hold");
     assert_eq!(
-        r.advance(&a, Draining),
+        r.advance(&a, Rebooting),
         Err(IllegalStep::NotRunning(RolloutState::Held))
     );
+    let mut quarantined = r.clone();
+    quarantined
+        .advance(&a, Quarantined)
+        .expect("a held rollout quarantines a node");
     r.advance(&a, Held).expect("a held rollout holds a node");
     r.advance(&a, Failed).expect("and gives it up");
     assert_eq!(r.node(&a).map(|p| p.step()), Some(Failed));
@@ -227,8 +340,15 @@ fn a_new_rollout_keeps_its_request_and_the_policy_defaults() {
         }
     );
     assert_eq!(
-        (r.id.to_string(), r.target.as_str(), r.actor.as_str()),
-        ("rollout-7".to_owned(), "sha256:abc", "ci")
+        (r.id.to_string(), r.target.as_str()),
+        ("rollout-7".to_owned(), "sha256:abc")
+    );
+    assert_eq!(
+        r.actor,
+        Actor {
+            who: "ci".to_owned(),
+            at_unix_ms: 1_000
+        }
     );
     assert_eq!(r.selector, Selector::Pools(vec!["linux-x86".to_owned()]));
     assert_eq!(r.state(), RolloutState::Pending);
@@ -246,6 +366,12 @@ fn a_new_rollout_keeps_its_request_and_the_policy_defaults() {
         .to_string(),
         IllegalStep::NotRunning(RolloutState::Pending).to_string(),
         IllegalStep::NotCovered(WorkerId::new("x")).to_string(),
+        IllegalStep::Unfinished {
+            node: WorkerId::new("x"),
+            step: Quarantined,
+        }
+        .to_string(),
+        IllegalStep::Unavailable { max_unavailable: 2 }.to_string(),
     ];
     assert_eq!(
         messages,
@@ -254,6 +380,8 @@ fn a_new_rollout_keeps_its_request_and_the_policy_defaults() {
             "a rollout may not move from Done to Running",
             "a Pending rollout moves no node",
             "the rollout does not cover node x",
+            "a rollout is done only when every node is done or failed; x is quarantined",
+            "2 node(s) are already out of service, the most the rollout allows",
         ]
     );
 }
