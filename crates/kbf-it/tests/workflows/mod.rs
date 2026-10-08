@@ -152,6 +152,47 @@ pub fn scan_action(text: &str, repo: &Repo) -> Vec<String> {
     run(text, repo, |lint, root| lint.action(root))
 }
 
+/// One step of a job, as far as the step-order lints read it: its `name:` and its
+/// `run:` script, each `None` when absent or not a string, and whether it has an `if:`
+/// or a `continue-on-error:` (either can let the job pass without the step's check).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Step {
+    pub name: Option<String>,
+    pub run: Option<String>,
+    pub conditional: bool,
+}
+
+/// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
+/// text, in order. An error when the text does not parse, or has no such job or no
+/// steps list under it.
+pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
+    let root = yaml::load(text)?;
+    let text_of = |n: Option<&Node>| n.and_then(Node::as_str).map(str::to_owned);
+    let Value::Map(top) = &root.value else {
+        return Err("the workflow is not a mapping".to_owned());
+    };
+    let Some(Value::Map(jobs)) = get(top, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    let Some(Value::Map(found)) = get(jobs, job).map(|j| &j.value) else {
+        return Err(format!("the workflow has no job `{job}`"));
+    };
+    let Some(Value::Seq(steps)) = get(found, "steps").map(|s| &s.value) else {
+        return Err(format!("the job `{job}` has no steps list"));
+    };
+    Ok(steps
+        .iter()
+        .map(|step| match &step.value {
+            Value::Map(m) => Step {
+                name: text_of(get(m, "name")),
+                run: text_of(get(m, "run")),
+                conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
+            },
+            _ => Step::default(),
+        })
+        .collect())
+}
+
 /// What a local `uses: ./...` may name: the repository's linted files.
 #[derive(Debug, Default)]
 pub struct Repo {

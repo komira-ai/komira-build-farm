@@ -12,6 +12,9 @@
 //! - a text file carrying a non-documentation IPv4 address or an absolute home path,
 //!   and a file holding a NUL byte whose extension is not on the binary allow list
 //!   (rules in `kbf_it::hygiene`);
+//! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
+//!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
+//!   running it where its failure does not fail the job;
 //! - the scans passing vacuously because git listed nothing or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
@@ -243,6 +246,53 @@ fn the_documented_signer_workflow_signs_provenance_on_main() {
     }
 }
 
+/// The workflow that builds the release files, and its macOS job.
+const ARTIFACTS_WORKFLOW: &str = ".github/workflows/artifacts.yml";
+const DARWIN_JOB: &str = "darwin-arm64";
+
+/// The command that checks the packaged macOS binary's signature and runs it.
+const CHECK_DARWIN_ASSET: &str = "bash tools/ci/check-darwin-asset.sh";
+
+/// Whether `job` in `workflow` runs [`CHECK_DARWIN_ASSET`] in a step after the one named
+/// `Package`, with no `if:` or `continue-on-error:` on that step; an error says what is
+/// missing.
+fn checks_the_packaged_darwin_binary(workflow: &str, job: &str) -> Result<(), String> {
+    let steps = workflows::job_steps(workflow, job)?;
+    let package = steps
+        .iter()
+        .position(|s| s.name.as_deref() == Some("Package"))
+        .ok_or_else(|| format!("the job `{job}` has no step named `Package`"))?;
+    let runs_check = |run: &str| {
+        run.lines()
+            .map(str::trim_start)
+            .any(|line| line.starts_with(&format!("{CHECK_DARWIN_ASSET} ")))
+    };
+    let check = steps[package + 1..]
+        .iter()
+        .find(|s| s.run.as_deref().is_some_and(runs_check))
+        .ok_or_else(|| {
+            format!("the job `{job}` does not run `{CHECK_DARWIN_ASSET}` after `Package`")
+        })?;
+    if check.conditional {
+        return Err(format!(
+            "the job `{job}` runs `{CHECK_DARWIN_ASSET}` under `if:` or `continue-on-error:`"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_darwin_job_checks_the_binary_it_packaged() {
+    // Catches: the step that checks the packaged binary's signature and runs it (the
+    // only check of the bytes that ship, docs/artifacts.md) dropped from the darwin
+    // job, moved before Package, or made one whose failure does not fail the job.
+    let root = repo_root();
+    let text = std::fs::read_to_string(root.join(ARTIFACTS_WORKFLOW)).expect(ARTIFACTS_WORKFLOW);
+    if let Err(e) = checks_the_packaged_darwin_binary(&text, DARWIN_JOB) {
+        panic!("{ARTIFACTS_WORKFLOW}: {e}");
+    }
+}
+
 /// The rules that pick which files each lint reads. The repository tests above cannot
 /// pin them: a selection that misses a file leaves those tests green.
 mod selection {
@@ -278,6 +328,64 @@ mod selection {
         assert!(signs_provenance_on_main(&format!("{cond}{step}")));
         assert!(!signs_provenance_on_main(step));
         assert!(!signs_provenance_on_main(cond));
+    }
+
+    /// A darwin job: Package, then `check` as the next step's lines.
+    fn darwin_workflow(check: &str) -> String {
+        format!(
+            "on: push\npermissions: {{}}\njobs:\n  darwin-arm64:\n    runs-on: macos-15\n    steps:\n      - name: Package\n        run: bash tools/ci/package-asset.sh a b c darwin-arm64 dist\n{check}"
+        )
+    }
+
+    #[test]
+    fn the_darwin_asset_check_must_follow_package_and_gate_the_job() {
+        // Catches: a darwin job without the check accepted (the lint passing a workflow
+        // that misses it), the check found only before Package, in another job, in a
+        // comment, or under `if:` / `continue-on-error:`.
+        let check = "      - name: Check\n        run: |\n          bash tools/ci/check-darwin-asset.sh \\\n            dist/x.tar.gz kbf-daemon\n";
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&darwin_workflow(check), "darwin-arm64"),
+            Ok(())
+        );
+        let missing = "the job `darwin-arm64` does not run `bash tools/ci/check-darwin-asset.sh` after `Package`";
+        let comment =
+            "      - run: |\n          # bash tools/ci/check-darwin-asset.sh x y\n          true\n";
+        for planted in [
+            "",
+            comment,
+            "      - run: echo tools/ci/check-darwin-asset.sh\n",
+        ] {
+            assert_eq!(
+                checks_the_packaged_darwin_binary(&darwin_workflow(planted), "darwin-arm64"),
+                Err(missing.to_owned()),
+                "{planted:?}"
+            );
+        }
+        let before = darwin_workflow("").replace(
+            "      - name: Package\n",
+            &format!("{check}      - name: Package\n"),
+        );
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&before, "darwin-arm64"),
+            Err(missing.to_owned())
+        );
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&darwin_workflow(check), "linux-arm64"),
+            Err("the workflow has no job `linux-arm64`".to_owned())
+        );
+        for key in ["        if: false\n", "        continue-on-error: true\n"] {
+            let gated = check.replace("        run: |\n", &format!("{key}        run: |\n"));
+            assert!(
+                checks_the_packaged_darwin_binary(&darwin_workflow(&gated), "darwin-arm64")
+                    .is_err_and(|e| e.contains("under `if:` or `continue-on-error:`")),
+                "{key:?}"
+            );
+        }
+        let unnamed = darwin_workflow(check).replace("name: Package", "name: Pack");
+        assert_eq!(
+            checks_the_packaged_darwin_binary(&unnamed, "darwin-arm64"),
+            Err("the job `darwin-arm64` has no step named `Package`".to_owned())
+        );
     }
 
     #[test]

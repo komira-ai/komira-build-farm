@@ -431,7 +431,7 @@ runs at all (Apple:
 | | Ad-hoc (`codesign -s -`) | Developer ID, hardened runtime, notarized |
 |---|---|---|
 | Needs | nothing | membership in the Apple Developer Program for an organization, a Developer ID Application certificate (Developer ID Installer for a `.pkg`), and a notary credential, all as secrets of a protected CI environment |
-| The kernel checks page hashes against the signature | yes | yes |
+| The kernel checks page hashes against the signature (where code-signing enforcement is on) | yes | yes |
 | Says *who* built it | no: anyone can ad-hoc sign anything | yes: a Team ID a node can require with `codesign --verify -R '<requirement>'` |
 | Gatekeeper, for a file a browser downloaded (quarantined) | refused | allowed |
 | Apple's malware scan | no | yes ([notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)) |

@@ -126,9 +126,11 @@ What it constrains:
 
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
-  signed. That is fine for `kbf-daemon`, which links and loads only system libraries;
-  a library it linked at start-up that Apple did not sign would fail the check above
-  that runs the signed binary.
+  signed. That is fine for `kbf-daemon`, which links and loads only system libraries.
+  On a Mac with System Integrity Protection on, a library it linked at start-up that
+  Apple did not sign would stop it from starting. CI does not show this: the hosted
+  runners have SIP off and library validation off (`vm.cs_library_validation` 0), so
+  the check above that runs the signed binary would pass with such a library.
 
 Developer ID signing and notarization need an Apple Developer Program membership; when
 the project has one, it is one more step in the darwin job.
