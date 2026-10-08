@@ -4,7 +4,8 @@
 //! A process's CPU time and peak resident memory are known exactly only when it is
 //! reaped: `wait4` returns them for the process and every descendant it waited for.
 //! The standard library and tokio reap without returning them, so [`Child`] reaps
-//! through `libc` itself. Those two calls are this crate's only unsafe code.
+//! through `libc` itself. Those two calls, and `clock_gettime` in `clock`, are this
+//! crate's only unsafe code.
 
 use std::io;
 use std::process::Command;
