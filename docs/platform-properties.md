@@ -11,8 +11,8 @@ These properties change how kbf schedules an action today:
 |---|---|---|---|
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under. |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
-| `kbf-book-cpus` | a whole number, at least 1 | `1` | Whole cores the lease books. |
-| `kbf-book-mem-gib` | a whole number, at least 1 | `1` | GiB of memory the lease books. |
+| `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
+| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `1` | GiB of memory the lease books. |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
@@ -99,9 +99,11 @@ cc_test(
 
 Every action books one core and 1 GiB of memory on the worker it runs on, unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
-`N` GiB. Either may be given alone; the other stays at its default. The scheduler places
-the action only where that much is free, and holds it for the lease until the lease
-ends, as it does for the default booking.
+`N` GiB. `N` is written in plain digits with no leading zero: `+4` and `04` are
+refused, since each would book the same as `4` under a different action digest, and so
+miss the cache entries `4` made. Either may be given alone; the other stays at its
+default. The scheduler places the action only where that much is free, and holds it
+for the lease until the lease ends, as it does for the default booking.
 
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:

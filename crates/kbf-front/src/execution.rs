@@ -366,8 +366,9 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
 
 /// What the lease books: [`DEFAULT_RESOURCES`], with `kbf-book-cpus` whole cores and
 /// `kbf-book-mem-gib` GiB in place of the default where the platform names them, or
-/// INVALID_ARGUMENT for a value that is not a whole number of at least 1, one too large
-/// to book, or either key on a `whole_machine` lease.
+/// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
+/// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
+/// lease.
 fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
     let mut booked = DEFAULT_RESOURCES;
     for (key, unit, slot) in [
@@ -383,19 +384,31 @@ fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
                 LEASE_KINDS[0]
             )));
         }
-        *slot = value
-            .parse::<u64>()
-            .ok()
-            .filter(|&n| n >= 1)
+        *slot = Some(value)
+            .filter(|v| starts_plain(v))
+            .and_then(|v| v.parse::<u64>().ok())
             .and_then(|n| n.checked_mul(unit))
             .ok_or_else(|| {
                 Status::invalid_argument(format!(
-                    "platform property {key}={value:?} is not a whole number from 1 to {}",
+                    "platform property {key}={value:?} is not a whole number from 1 to {} \
+                     in plain digits",
                     u64::MAX / unit
                 ))
             })?;
     }
     Ok(booked)
+}
+
+/// Whether `value` starts with a digit from 1 to 9. A size must also parse as a `u64`,
+/// which takes nothing but ASCII digits after an optional `+`; together that leaves
+/// one spelling of each size, with no sign and no leading zero. Parsing alone also
+/// takes `+4` and `04`, which book the same as `4` under a different action digest,
+/// and so a different cache entry.
+fn starts_plain(value: &str) -> bool {
+    value
+        .bytes()
+        .next()
+        .is_some_and(|b| (b'1'..=b'9').contains(&b))
 }
 
 /// What a worker must offer to run an action with `platform`: INVALID_ARGUMENT for a
