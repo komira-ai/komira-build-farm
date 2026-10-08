@@ -1,0 +1,945 @@
+#!/bin/sh
+# kbf-mac-provision: applies and checks the host and worker profile of a Mac node
+# (docs/design/mac-node-provisioning.md, sections 2, 3 and 5).
+#
+#   kbf-mac-provision check   --profile FILE [--keys K,K] [--root DIR]
+#   kbf-mac-provision apply   --profile FILE [--keys K,K] [--root DIR]
+#   kbf-mac-provision print   --profile FILE [--root DIR]
+#   kbf-mac-provision restart --profile FILE [--root DIR]
+#
+# check   reads every setting, prints one PASS or FAIL line per item, and exits 1 if
+#         any item fails. It changes nothing.
+# apply   (root) fixes each failing item, prints one CHANGE line per change, then
+#         checks again and prints only what still fails. A second apply prints
+#         nothing. Items marked "check only" are never changed (FileVault, the macOS
+#         build, the admin account, probes, simulator runtimes).
+# print   prints the profile as resolved, its SHA-256 and the node's profile label.
+# restart (root) restarts the kbf-daemon LaunchDaemon and truncates its
+#         StandardErrorPath file while the job is stopped (section 5.7). apply does
+#         the same when it rewrites the job.
+#
+# --keys  limits check and apply to the named items (the names the PASS and FAIL
+#         lines print).
+# --root  takes every path the script reads or writes, and every program it runs,
+#         under DIR. It exists for the test harness (tools/mac-provision/test), which
+#         runs the script against a fake Mac on Linux; a node uses the default, /.
+#
+# The profile is KEY=VALUE lines, parsed and never sourced; blank lines and lines
+# starting with # are skipped. An unknown key or a repeated one (other than xcode,
+# probe and expect_probe) is refused. Exit status: 0 all pass, 1 something fails,
+# 2 bad usage or a refused profile. Only programs macOS ships are used.
+
+set -u
+umask 022
+LC_ALL=C
+export LC_ALL
+unset DEVELOPER_DIR SDKROOT
+NL=$(printf '\n.')
+NL=${NL%.}
+
+die() {
+  printf 'kbf-mac-provision: %s\n' "$*" >&2
+  exit 2
+}
+
+usage() {
+  die "usage: kbf-mac-provision check|apply|print|restart --profile FILE [--keys K,K] [--root DIR]"
+}
+
+# ---------------------------------------------------------------- arguments
+
+MODE=${1-}
+case "$MODE" in
+  check | apply | print | restart) shift ;;
+  *) usage ;;
+esac
+PROFILE=
+KEYS=
+ROOT=/
+while [ $# -gt 0 ]; do
+  [ $# -ge 2 ] || usage
+  case "$1" in
+    --profile) PROFILE=$2 ;;
+    --keys) KEYS=$2 ;;
+    --root) ROOT=$2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+[ -n "$PROFILE" ] || usage
+case "$ROOT" in
+  /) R= ;;
+  /*) R=${ROOT%/} ;;
+  *) die "--root must be an absolute path" ;;
+esac
+PATH="$R/usr/bin:$R/bin:$R/usr/sbin:$R/sbin"
+export PATH
+
+PLISTBUDDY="$R/usr/libexec/PlistBuddy"
+SOCKETFILTERFW="$R/usr/libexec/ApplicationFirewall/socketfilterfw"
+SWU="$R/Library/Preferences/com.apple.SoftwareUpdate"
+LOGINWINDOW="$R/Library/Preferences/com.apple.loginwindow"
+KCPASSWORD="$R/etc/kcpassword"
+SSHD_CONFIG="$R/etc/ssh/sshd_config"
+# 000- sorts first, and sshd keeps the first value it reads for each keyword.
+SSHD_DROPIN="$R/etc/ssh/sshd_config.d/000-kbf.conf"
+SSHD_INCLUDE="Include /etc/ssh/sshd_config.d/*"
+DAEMON_BIN=/usr/local/kbf/current/kbf-daemon
+LOG_DIR=/Library/Logs/kbf
+ERR_LOG=$LOG_DIR/kbf-daemon.err.log
+SIM_DIRS="Library/Developer/CoreSimulator/Profiles/Runtimes Library/Developer/CoreSimulator/Volumes Library/Developer/CoreSimulator/Images"
+
+# ---------------------------------------------------------------- the profile
+
+SCALARS="profile macos_version macos_build hostname admin_user role_user role_id lease_uids power_sleep power_standby power_powernap power_autorestart power_womp updates_auto_download updates_auto_install_macos updates_auto_install_security updates_config_data appstore_auto_update remote_login ssh_password_auth firewall filevault autologin time_server time_max_offset_ms launchd_label kbf_server kbf_cas kbf_ca_cert kbf_cert kbf_key kbf_scratch kbf_labels simulator_runtimes"
+OPTIONALS="default_developer_dir xcode_xip_dir"
+P_xcode=
+P_probe=
+P_expect_probe=
+SEEN=' '
+
+# Whether $1 matches the extended regular expression $2 as a whole.
+matches() {
+  printf '%s\n' "$1" | grep -Eqx -- "$2"
+}
+
+val() {
+  eval "printf '%s' \"\${P_$1-}\""
+}
+
+load_profile() {
+  [ -f "$PROFILE" ] || die "no profile file: $PROFILE"
+  [ -z "$(tail -c 1 "$PROFILE")" ] || die "the profile's last line has no newline"
+  lp_n=0
+  while IFS= read -r lp_line; do
+    lp_n=$((lp_n + 1))
+    case "$lp_line" in
+      '' | '#'*) continue ;;
+      *=*) : ;;
+      *) die "profile line $lp_n: not KEY=VALUE" ;;
+    esac
+    lp_k=${lp_line%%=*}
+    lp_v=${lp_line#*=}
+    case "$lp_v" in
+      *[!A-Za-z0-9._:/=@+,\ -]*) die "profile line $lp_n: $lp_k: a value may hold only letters, digits, spaces and ._:/=@+,-" ;;
+      *) : ;;
+    esac
+    case "$lp_k" in
+      xcode) P_xcode="$P_xcode$lp_v$NL" ;;
+      probe) P_probe="$P_probe$lp_v$NL" ;;
+      expect_probe) P_expect_probe="$P_expect_probe$lp_v$NL" ;;
+      *)
+        case " $SCALARS $OPTIONALS " in
+          *" $lp_k "*) : ;;
+          *) die "profile line $lp_n: unknown key: $lp_k" ;;
+        esac
+        case "$SEEN" in
+          *" $lp_k "*) die "profile line $lp_n: duplicate key: $lp_k" ;;
+          *) : ;;
+        esac
+        SEEN="$SEEN$lp_k "
+        eval "P_$lp_k=\$lp_v"
+        ;;
+    esac
+  done <"$PROFILE"
+  for lp_k in $SCALARS; do
+    case "$SEEN" in
+      *" $lp_k "*) : ;;
+      *) die "missing key: $lp_k" ;;
+    esac
+  done
+  validate
+}
+
+# want KEY ERE WHAT: the value of KEY must match ERE.
+want() {
+  matches "$(val "$1")" "$2" || die "$1: $(val "$1") is not $3"
+}
+
+validate() {
+  want profile '[a-z0-9][a-z0-9._-]*' 'a profile name'
+  want macos_version '[0-9]+(\.[0-9]+)*' 'a macOS version'
+  want macos_build '[0-9]+[A-Z][0-9]+[a-z]?' 'a macOS build'
+  want hostname '[a-z][a-z0-9]*(-[a-z0-9]+)*-mac-[0-9]+' 'a name of the form <farm>-mac-<nn> (lower-case letters, digits, -)'
+  [ ${#P_hostname} -le 63 ] || die "hostname: longer than 63 characters"
+  want admin_user '[a-z][a-z0-9._-]*' 'an account name'
+  want role_user '_[a-z][a-z0-9_]*' 'a role account name (it starts with _)'
+  want role_id '[0-9]+' 'a number'
+  [ "$P_role_id" -ge 200 ] || die "role_id: $P_role_id is below 200"
+  [ "$P_role_id" -lt 500 ] || die "role_id: $P_role_id is not a hidden role id (below 500)"
+  want lease_uids '[0-9]+-[0-9]+' 'a range FIRST-LAST'
+  LEASE_MIN=${P_lease_uids%-*}
+  LEASE_MAX=${P_lease_uids#*-}
+  [ "$LEASE_MIN" -ge 501 ] || die "lease_uids: $P_lease_uids starts below 501"
+  [ "$LEASE_MIN" -le "$LEASE_MAX" ] || die "lease_uids: $P_lease_uids is empty"
+  for v_k in power_sleep power_standby time_max_offset_ms; do
+    want "$v_k" '[0-9]+' 'a number'
+  done
+  for v_k in power_powernap power_autorestart power_womp updates_auto_download updates_auto_install_macos updates_auto_install_security updates_config_data appstore_auto_update remote_login ssh_password_auth; do
+    want "$v_k" '[01]' '0 or 1'
+  done
+  want firewall 'on|off' 'on or off'
+  want filevault 'on|off' 'on or off'
+  want autologin 'off' 'off (kbf-mac-session alone sets a lease user, during a lease)'
+  want simulator_runtimes 'none' 'none (simulator runtimes live in VM images only)'
+  want time_server '[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?' 'a host name'
+  want launchd_label '[A-Za-z0-9][A-Za-z0-9.-]*' 'a launchd label'
+  want kbf_server 'https://[A-Za-z0-9.-]+(:[0-9]+)?' 'an https://host[:port] URL'
+  want kbf_cas 'https://[A-Za-z0-9.-]+(:[0-9]+)?' 'an https://host[:port] URL'
+  for v_k in kbf_ca_cert kbf_cert kbf_key kbf_scratch; do
+    want "$v_k" '/[A-Za-z0-9._/-]+' 'an absolute path'
+  done
+  for v_l in $P_kbf_labels; do
+    matches "$v_l" '[A-Za-z0-9._-]+=[A-Za-z0-9._:/@+,=-]+' || die "kbf_labels: $v_l is not key=value"
+    case "$v_l" in
+      profile=*) die "kbf_labels: the profile label is the script's" ;;
+      *) : ;;
+    esac
+  done
+  [ -z "${P_xcode_xip_dir-}" ] || want xcode_xip_dir '/[A-Za-z0-9._/-]+' 'an absolute path'
+  validate_xcodes
+}
+
+XCODE_RE='[0-9]+[A-Z][0-9]+[a-z]?:/Applications/Xcode[A-Za-z0-9._-]*\.app/Contents/Developer:[0-9a-f]{64}'
+
+validate_xcodes() {
+  XC_BUILDS=' '
+  XC_PATHS=' '
+  for vx in $P_xcode; do
+    matches "$vx" "$XCODE_RE" || die "xcode: $vx is not BUILD:/Applications/Xcode*.app/Contents/Developer:SHA256"
+    vx_build=${vx%%:*}
+    vx_path=${vx#*:}
+    vx_path=${vx_path%:*}
+    case "$XC_BUILDS$XC_PATHS" in
+      *" $vx_build "* | *" $vx_path "*) die "xcode: $vx_build or $vx_path is pinned twice" ;;
+      *) : ;;
+    esac
+    XC_BUILDS="$XC_BUILDS$vx_build "
+    XC_PATHS="$XC_PATHS$vx_path "
+  done
+  if [ -n "$P_xcode" ]; then
+    case "$XC_PATHS" in
+      *" ${P_default_developer_dir-} "*) : ;;
+      *) die "default_developer_dir: ${P_default_developer_dir-} is not the path of a pinned xcode" ;;
+    esac
+  else
+    [ -z "${P_default_developer_dir-}" ] || die "default_developer_dir: no xcode is pinned"
+  fi
+  PR_KEYS=' '
+  for vp in $P_probe; do
+    matches "$vp" '[a-z][a-z0-9_]*:/[A-Za-z0-9._/-]+:[0-9a-f]{64}' || die "probe: $vp is not KEY:/PATH:SHA256"
+    case "$PR_KEYS" in
+      *" ${vp%%:*} "*) die "probe: ${vp%%:*} is named twice" ;;
+      *) : ;;
+    esac
+    PR_KEYS="$PR_KEYS${vp%%:*} "
+  done
+  EP_SEEN=' '
+  for ve in $P_expect_probe; do
+    matches "$ve" '[a-z][a-z0-9_]*:[0-9]+[A-Z][0-9]+[a-z]?=[A-Za-z0-9._:+-]*' || die "expect_probe: $ve is not KEY:XCODE_BUILD=VALUE"
+    ve_key=${ve%%:*}
+    ve_build=${ve#*:}
+    ve_build=${ve_build%%=*}
+    case "$PR_KEYS" in
+      *" $ve_key "*) : ;;
+      *) die "expect_probe: $ve_key names no probe" ;;
+    esac
+    case "$XC_BUILDS" in
+      *" $ve_build "*) : ;;
+      *) die "expect_probe: $ve_build names no pinned xcode" ;;
+    esac
+    case "$EP_SEEN" in
+      *" $ve_key:$ve_build "*) die "expect_probe: $ve_key:$ve_build is named twice" ;;
+      *) : ;;
+    esac
+    EP_SEEN="$EP_SEEN$ve_key:$ve_build "
+  done
+}
+
+sha256() {
+  shasum -a 256 "$1" 2>/dev/null | awk '{ print $1 }'
+}
+
+# ---------------------------------------------------------------- helpers
+
+ok() {
+  ST=PASS
+  MSG=$1
+}
+
+bad() {
+  ST=FAIL
+  MSG=$1
+}
+
+change() {
+  printf 'CHANGE %s: %s\n' "$ITEM" "$1"
+}
+
+# The mode string, owner uid and group gid of a path: "-rw-r--r-- 0 0".
+owner_of() {
+  ls -ldn "$1" 2>/dev/null | awk '{ print substr($1, 1, 10), $3, $4 }'
+}
+
+pmset_get() {
+  pmset -g 2>/dev/null | awk -v k="$1" '$1 == k { print $2; exit }'
+}
+
+pref_get() {
+  defaults read "$1" "$2" 2>/dev/null
+}
+
+dscl_attr() {
+  dscl . -read "$1" "$2" 2>/dev/null | awk -v k="$2:" '$1 == k { print $2; exit }'
+}
+
+# The ProductBuildVersion of the Xcode at app path $1 (under the root), or nothing.
+xcode_build() {
+  [ -f "$1/Contents/version.plist" ] || return 0
+  "$PLISTBUDDY" -c 'Print :ProductBuildVersion' "$1/Contents/version.plist" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- the items
+
+ITEMS="macos_version macos_build hostname admin_user role_user power_sleep power_standby power_powernap power_autorestart power_womp updates_auto_download updates_auto_install_macos updates_auto_install_security updates_config_data appstore_auto_update remote_login ssh_password_auth firewall filevault autologin time_server time_max_offset_ms xcode default_developer_dir probe simulator_runtimes launchd_label"
+CHECK_ONLY=" macos_version macos_build admin_user filevault probe simulator_runtimes "
+VERIFY_27="the SoftwareUpdate payload is removed in macOS 27: verify the pinned version honours this local preference"
+
+pref_key() {
+  case "$1" in
+    updates_auto_download) echo AutomaticDownload ;;
+    updates_auto_install_macos) echo AutomaticallyInstallMacOSUpdates ;;
+    updates_auto_install_security) echo CriticalUpdateInstall ;;
+    updates_config_data) echo ConfigDataInstall ;;
+    *) echo AutomaticallyInstallAppUpdates ;;
+  esac
+}
+
+check_item() {
+  ST=FAIL
+  MSG='not checked'
+  case "$1" in
+    power_*) ck_pmset "${1#power_}" "$(val "$1")" ;;
+    updates_* | appstore_*) ck_pref "$(pref_key "$1")" "$(val "$1")" ;;
+    *) "ck_$1" ;;
+  esac
+}
+
+fix_item() {
+  case "$CHECK_ONLY" in
+    *" $1 "*) return 0 ;;
+    *) : ;;
+  esac
+  case "$1" in
+    power_*)
+      pmset -a "${1#power_}" "$(val "$1")"
+      change "pmset -a ${1#power_} $(val "$1")"
+      ;;
+    updates_* | appstore_*)
+      fi_b=false
+      [ "$(val "$1")" = 1 ] && fi_b=true
+      defaults write "$SWU" "$(pref_key "$1")" -bool "$fi_b"
+      change "$(pref_key "$1") = $(val "$1")"
+      ;;
+    *) "fix_$1" ;;
+  esac
+}
+
+ck_macos_version() {
+  cm_v=$(sw_vers -productVersion 2>/dev/null)
+  if [ "$cm_v" = "$P_macos_version" ]; then
+    ok "$cm_v"
+  else
+    bad "macOS ${cm_v:-unknown}, the profile pins $P_macos_version"
+  fi
+}
+
+ck_macos_build() {
+  cm_v=$(sw_vers -buildVersion 2>/dev/null)
+  if [ "$cm_v" = "$P_macos_build" ]; then
+    ok "$cm_v"
+  else
+    bad "build ${cm_v:-unknown}, the profile pins $P_macos_build"
+  fi
+}
+
+ck_hostname() {
+  ch_bad=
+  for ch_n in HostName LocalHostName ComputerName; do
+    ch_v=$(scutil --get "$ch_n" 2>/dev/null)
+    [ "$ch_v" = "$P_hostname" ] || ch_bad="$ch_bad $ch_n=${ch_v:-unset}"
+  done
+  if [ -z "$ch_bad" ]; then
+    ok "$P_hostname"
+  else
+    bad "want $P_hostname, found$ch_bad"
+  fi
+}
+
+fix_hostname() {
+  for fh_n in HostName LocalHostName ComputerName; do
+    [ "$(scutil --get "$fh_n" 2>/dev/null)" = "$P_hostname" ] && continue
+    scutil --set "$fh_n" "$P_hostname"
+    change "$fh_n = $P_hostname"
+  done
+}
+
+ck_admin_user() {
+  ca_members=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership://')
+  ca_others=
+  for ca_m in $ca_members; do
+    case "$ca_m" in
+      root | "$P_admin_user") : ;;
+      *) ca_others="$ca_others $ca_m" ;;
+    esac
+  done
+  if [ -z "$(dscl_attr "/Users/$P_admin_user" UniqueID)" ]; then
+    bad "no account $P_admin_user"
+  elif ! printf ' %s \n' "$ca_members" | grep -qF -- " $P_admin_user "; then
+    bad "$P_admin_user is not in the admin group"
+  elif [ -n "$ca_others" ]; then
+    bad "other administrators:$ca_others"
+  else
+    ok "$P_admin_user is the only administrator"
+  fi
+}
+
+ROLE_ATTRS="UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden"
+
+role_want() {
+  printf 'UniqueID=%s PrimaryGroupID=%s UserShell=/usr/bin/false NFSHomeDirectory=/var/empty IsHidden=1 group=%s' \
+    "$P_role_id" "$P_role_id" "$P_role_id"
+}
+
+role_have() {
+  for rh_a in $ROLE_ATTRS; do
+    printf '%s=%s ' "$rh_a" "$(dscl_attr "/Users/$P_role_user" "$rh_a")"
+  done
+  printf 'group=%s' "$(dscl_attr "/Groups/$P_role_user" PrimaryGroupID)"
+}
+
+# The account, other than the role account, that holds uid $P_role_id.
+role_id_taken() {
+  dscl . -list /Users UniqueID 2>/dev/null | awk -v id="$P_role_id" -v me="$P_role_user" '$2 == id && $1 != me { print $1; exit }'
+}
+
+ck_role_user() {
+  cr_taken=$(role_id_taken)
+  cr_have=$(role_have)
+  if [ -n "$cr_taken" ]; then
+    bad "uid $P_role_id belongs to $cr_taken"
+  elif [ "$cr_have" = "$(role_want)" ]; then
+    ok "$P_role_user (uid and gid $P_role_id, hidden, no shell)"
+  else
+    bad "want $(role_want), found $cr_have"
+  fi
+}
+
+fix_role_user() {
+  [ -z "$(role_id_taken)" ] || return 0
+  dscl . -create "/Groups/$P_role_user"
+  dscl . -create "/Groups/$P_role_user" PrimaryGroupID "$P_role_id"
+  dscl . -create "/Groups/$P_role_user" Password '*'
+  dscl . -create "/Users/$P_role_user"
+  dscl . -create "/Users/$P_role_user" UniqueID "$P_role_id"
+  dscl . -create "/Users/$P_role_user" PrimaryGroupID "$P_role_id"
+  dscl . -create "/Users/$P_role_user" UserShell /usr/bin/false
+  dscl . -create "/Users/$P_role_user" NFSHomeDirectory /var/empty
+  dscl . -create "/Users/$P_role_user" IsHidden 1
+  dscl . -create "/Users/$P_role_user" Password '*'
+  change "role account and group $P_role_user, id $P_role_id"
+}
+
+ck_pmset() {
+  cp_v=$(pmset_get "$1")
+  if [ "$cp_v" = "$2" ]; then
+    ok "$1 $cp_v"
+  else
+    bad "$1 is ${cp_v:-not reported}, want $2"
+  fi
+}
+
+ck_pref() {
+  cf_v=$(pref_get "$SWU" "$1")
+  if [ "$cf_v" = "$2" ]; then
+    ok "$1 = $cf_v ($VERIFY_27)"
+  else
+    bad "$1 is ${cf_v:-unset}, want $2 ($VERIFY_27)"
+  fi
+}
+
+onoff() {
+  if [ "$1" = 1 ]; then
+    echo On
+  else
+    echo Off
+  fi
+}
+
+ck_remote_login() {
+  cl_v=$(systemsetup -getremotelogin 2>/dev/null)
+  cl_w="Remote Login: $(onoff "$P_remote_login")"
+  if [ "$cl_v" = "$cl_w" ]; then
+    ok "$cl_v"
+  else
+    bad "want $cl_w, found ${cl_v:-nothing}"
+  fi
+}
+
+fix_remote_login() {
+  if [ "$P_remote_login" = 1 ]; then
+    fr_s=on
+  else
+    fr_s=off
+  fi
+  systemsetup -f -setremotelogin "$fr_s" >/dev/null
+  change "Remote Login $fr_s"
+}
+
+sshd_want() {
+  if [ "$P_ssh_password_auth" = 1 ]; then
+    sw_p=yes
+  else
+    sw_p=no
+  fi
+  printf 'PasswordAuthentication %s\nKbdInteractiveAuthentication %s\nPermitRootLogin no\n' "$sw_p" "$sw_p"
+}
+
+ck_ssh_password_auth() {
+  if ! grep -qxF -- "$SSHD_INCLUDE" "$SSHD_CONFIG" 2>/dev/null; then
+    bad "/etc/ssh/sshd_config lacks the line '$SSHD_INCLUDE'"
+  elif [ "$(cat "$SSHD_DROPIN" 2>/dev/null)" != "$(sshd_want)" ]; then
+    bad "/etc/ssh/sshd_config.d/000-kbf.conf differs from the profile"
+  elif [ "$(owner_of "$SSHD_DROPIN")" != "-rw-r--r-- 0 0" ]; then
+    bad "/etc/ssh/sshd_config.d/000-kbf.conf is $(owner_of "$SSHD_DROPIN"), want -rw-r--r-- 0 0"
+  else
+    ok "$(sshd_want | tr '\n' ';')"
+  fi
+}
+
+fix_ssh_password_auth() {
+  grep -qxF -- "$SSHD_INCLUDE" "$SSHD_CONFIG" 2>/dev/null || return 0
+  mkdir -p "${SSHD_DROPIN%/*}"
+  sshd_want >"$SSHD_DROPIN.kbf-new"
+  chown 0:0 "$SSHD_DROPIN.kbf-new"
+  chmod 644 "$SSHD_DROPIN.kbf-new"
+  mv -f "$SSHD_DROPIN.kbf-new" "$SSHD_DROPIN"
+  change "wrote /etc/ssh/sshd_config.d/000-kbf.conf"
+}
+
+ck_firewall() {
+  cw_v=$("$SOCKETFILTERFW" --getglobalstate 2>/dev/null)
+  case "$cw_v" in
+    *'is enabled'*) cw_s=on ;;
+    *'is disabled'*) cw_s=off ;;
+    *) cw_s=unknown ;;
+  esac
+  if [ "$cw_s" = "$P_firewall" ]; then
+    ok "$cw_s"
+  else
+    bad "firewall $cw_s, want $P_firewall"
+  fi
+}
+
+fix_firewall() {
+  "$SOCKETFILTERFW" --setglobalstate "$P_firewall" >/dev/null
+  change "firewall $P_firewall"
+}
+
+ck_filevault() {
+  cv_v=$(fdesetup status 2>/dev/null | head -n 1)
+  case "$cv_v" in
+    'FileVault is On.') cv_s=on ;;
+    'FileVault is Off.') cv_s=off ;;
+    *) cv_s="unknown (${cv_v:-no answer})" ;;
+  esac
+  if [ "$cv_s" = "$P_filevault" ]; then
+    ok "$cv_s"
+  else
+    bad "FileVault $cv_s, want $P_filevault"
+  fi
+}
+
+in_lease_range() {
+  awk -v u="$1" -v a="$LEASE_MIN" -v b="$LEASE_MAX" 'BEGIN { exit !(u ~ /^[0-9]+$/ && u + 0 >= a + 0 && u + 0 <= b + 0) }'
+}
+
+ck_autologin() {
+  cu_user=$(pref_get "$LOGINWINDOW" autoLoginUser)
+  if [ -z "$cu_user" ]; then
+    if [ -e "$KCPASSWORD" ]; then
+      bad "off, but /etc/kcpassword is left over"
+    else
+      ok off
+    fi
+    return 0
+  fi
+  cu_uid=$(dscl_attr "/Users/$cu_user" UniqueID)
+  case "$cu_user" in
+    kbf-lease-*)
+      if in_lease_range "$cu_uid"; then
+        ok "lease user $cu_user (uid $cu_uid), set by kbf-mac-session for a whole_machine lease"
+        return 0
+      fi
+      ;;
+    *) : ;;
+  esac
+  bad "auto-login is $cu_user (uid ${cu_uid:-none}); only a kbf-lease-* user in uids $P_lease_uids may be"
+}
+
+fix_autologin() {
+  if [ -n "$(pref_get "$LOGINWINDOW" autoLoginUser)" ]; then
+    defaults delete "$LOGINWINDOW" autoLoginUser
+    change "auto-login cleared"
+  fi
+  if [ -e "$KCPASSWORD" ]; then
+    rm -f "$KCPASSWORD"
+    change "removed /etc/kcpassword"
+  fi
+}
+
+ck_time_server() {
+  ct_on=$(systemsetup -getusingnetworktime 2>/dev/null)
+  ct_srv=$(systemsetup -getnetworktimeserver 2>/dev/null)
+  if [ "$ct_on" != "Network Time: On" ]; then
+    bad "network time is not on (${ct_on:-no answer})"
+  elif [ "$ct_srv" != "Network Time Server: $P_time_server" ]; then
+    bad "want $P_time_server, found ${ct_srv:-no answer}"
+  else
+    ok "$P_time_server"
+  fi
+}
+
+fix_time_server() {
+  systemsetup -setusingnetworktime on >/dev/null
+  systemsetup -setnetworktimeserver "$P_time_server" >/dev/null
+  change "network time on, server $P_time_server"
+}
+
+# The clock's offset from the time server, in whole milliseconds, or nothing.
+offset_ms() {
+  sntp -t 5 "$P_time_server" 2>/dev/null | awk '$1 ~ /^[+-]?[0-9]+(\.[0-9]+)?$/ { o = $1 * 1000; if (o < 0) o = -o; printf "%d\n", o; exit }'
+}
+
+ck_time_max_offset_ms() {
+  co_v=$(offset_ms)
+  if [ -z "$co_v" ]; then
+    bad "no answer from $P_time_server"
+  elif [ "$co_v" -le "$P_time_max_offset_ms" ]; then
+    ok "${co_v} ms from $P_time_server"
+  else
+    bad "${co_v} ms from $P_time_server, more than $P_time_max_offset_ms"
+  fi
+}
+
+fix_time_max_offset_ms() {
+  sntp -sS "$P_time_server" >/dev/null 2>&1
+  change "clock set from $P_time_server"
+}
+
+# Every Xcode*.app directory in /Applications that the profile does not pin. Links
+# are skipped: they name an Xcode that is already there.
+extra_xcodes() {
+  for ex_d in "$R"/Applications/Xcode*.app; do
+    [ -d "$ex_d" ] || continue
+    [ -L "$ex_d" ] && continue
+    case "$XC_PATHS" in
+      *" ${ex_d#"$R"}/Contents/Developer "*) : ;;
+      *) printf '%s\n' "${ex_d#"$R"}" ;;
+    esac
+  done
+}
+
+ck_xcode() {
+  cx_bad=
+  cx_ok=
+  for cx in $P_xcode; do
+    cx_build=${cx%%:*}
+    cx_app=${cx#*:}
+    cx_app=${cx_app%/Contents/Developer:*}
+    cx_have=$(xcode_build "$R$cx_app")
+    if [ "$cx_have" = "$cx_build" ]; then
+      cx_ok="$cx_ok $cx_build"
+    else
+      cx_bad="$cx_bad $cx_app has ${cx_have:-no Xcode}, want $cx_build;"
+    fi
+  done
+  for cx_e in $(extra_xcodes); do
+    cx_bad="$cx_bad $cx_e is not pinned;"
+  done
+  if [ -z "$cx_bad" ]; then
+    ok "pinned:${cx_ok:- none}"
+  else
+    bad "${cx_bad# }"
+  fi
+}
+
+# The .xip in xcode_xip_dir whose SHA-256 is $1.
+find_xip() {
+  [ -n "${P_xcode_xip_dir-}" ] || return 0
+  for fx_f in "$R$P_xcode_xip_dir"/*.xip; do
+    [ -f "$fx_f" ] || continue
+    if [ "$(sha256 "$fx_f")" = "$1" ]; then
+      printf '%s\n' "$fx_f"
+      return 0
+    fi
+  done
+}
+
+install_xcode() {
+  ix_build=$1
+  ix_app=$2
+  ix_xip=$(find_xip "$3")
+  if [ -z "$ix_xip" ]; then
+    printf 'NOTE xcode: no .xip with SHA-256 %s in xcode_xip_dir; %s not installed\n' "$3" "$ix_build"
+    return 0
+  fi
+  ix_stage="$R/Applications/.kbf-xip-$ix_build"
+  rm -rf "$ix_stage"
+  mkdir -p "$ix_stage"
+  (
+    set -e
+    cd "$ix_stage"
+    xip --expand "$ix_xip" >/dev/null 2>&1
+  )
+  ix_new=$(ls -d "$ix_stage"/*.app 2>/dev/null)
+  if [ "$(xcode_build "$ix_new")" != "$ix_build" ]; then
+    rm -rf "$ix_stage"
+    printf 'NOTE xcode: %s did not expand to Xcode %s\n' "$ix_xip" "$ix_build"
+    return 0
+  fi
+  rm -rf "$R$ix_app"
+  mv -f "$ix_new" "$R$ix_app"
+  rm -rf "$ix_stage"
+  DEVELOPER_DIR="$ix_app/Contents/Developer" xcodebuild -license accept >/dev/null 2>&1
+  DEVELOPER_DIR="$ix_app/Contents/Developer" xcodebuild -runFirstLaunch >/dev/null 2>&1
+  change "installed Xcode $ix_build at $ix_app"
+}
+
+fix_xcode() {
+  for fx in $P_xcode; do
+    fx_build=${fx%%:*}
+    fx_app=${fx#*:}
+    fx_app=${fx_app%/Contents/Developer:*}
+    [ "$(xcode_build "$R$fx_app")" = "$fx_build" ] && continue
+    install_xcode "$fx_build" "$fx_app" "${fx##*:}"
+  done
+  for fx_e in $(extra_xcodes); do
+    rm -rf "$R$fx_e"
+    change "removed $fx_e, which the profile does not pin"
+  done
+}
+
+ck_default_developer_dir() {
+  if [ -z "$P_xcode" ]; then
+    ok "no Xcode is pinned"
+    return 0
+  fi
+  cd_v=$(xcode-select -p 2>/dev/null)
+  if [ "$cd_v" = "$P_default_developer_dir" ]; then
+    ok "$cd_v"
+  else
+    bad "xcode-select -p is ${cd_v:-unset}, want $P_default_developer_dir"
+  fi
+}
+
+fix_default_developer_dir() {
+  xcode-select -s "$P_default_developer_dir"
+  change "xcode-select -s $P_default_developer_dir"
+}
+
+ck_probe() {
+  cq_bad=
+  for cq in $P_probe; do
+    cq_path=${cq#*:}
+    cq_path=${cq_path%:*}
+    [ "$(sha256 "$R$cq_path")" = "${cq##*:}" ] || cq_bad="$cq_bad ${cq%%:*}: $cq_path is missing or has another SHA-256;"
+  done
+  if [ -z "$cq_bad" ]; then
+    ok "${PR_KEYS# }"
+  else
+    bad "${cq_bad# }"
+  fi
+}
+
+ck_simulator_runtimes() {
+  cs_found=
+  for cs_d in $SIM_DIRS; do
+    for cs_e in "$R/$cs_d"/*; do
+      [ -e "$cs_e" ] || continue
+      case "$cs_e" in
+        */Images/*.dmg | */Runtimes/*.simruntime | */Volumes/*) cs_found="$cs_found ${cs_e#"$R"}" ;;
+        *) : ;;
+      esac
+    done
+  done
+  if [ -z "$cs_found" ]; then
+    ok none
+  else
+    bad "simulator runtimes on the host:$cs_found (they belong in VM images; erase the node)"
+  fi
+}
+
+daemon_args() {
+  printf '%s\n' "$DAEMON_BIN" --driver native --server "$P_kbf_server" --cas "$P_kbf_cas" \
+    --ca-cert "$P_kbf_ca_cert" --cert "$P_kbf_cert" --key "$P_kbf_key" \
+    --node-id "$P_hostname" --scratch "$P_kbf_scratch" --label "profile=$P_profile@$PROFILE_SHA12"
+  for da_l in $P_kbf_labels; do
+    printf '%s\n' --label "$da_l"
+  done
+}
+
+render_plist() {
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' '<dict>'
+  printf '\t<key>Label</key>\n\t<string>%s</string>\n' "$P_launchd_label"
+  printf '\t<key>ProgramArguments</key>\n\t<array>\n'
+  daemon_args | awk '{ printf "\t\t<string>%s</string>\n", $0 }'
+  printf '\t</array>\n'
+  printf '\t<key>UserName</key>\n\t<string>%s</string>\n' "$P_role_user"
+  printf '\t<key>GroupName</key>\n\t<string>%s</string>\n' "$P_role_user"
+  printf '\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n'
+  printf '\t<key>ThrottleInterval</key>\n\t<integer>10</integer>\n'
+  printf '\t<key>ExitTimeOut</key>\n\t<integer>30</integer>\n'
+  printf '\t<key>ProcessType</key>\n\t<string>Interactive</string>\n'
+  printf '\t<key>StandardErrorPath</key>\n\t<string>%s</string>\n' "$ERR_LOG"
+  for rl in SoftResourceLimits HardResourceLimits; do
+    printf '\t<key>%s</key>\n\t<dict>\n\t\t<key>NumberOfFiles</key>\n\t\t<integer>65536</integer>\n\t</dict>\n' "$rl"
+  done
+  printf '%s\n' '</dict>' '</plist>'
+}
+
+plist_path() {
+  printf '%s/Library/LaunchDaemons/%s.plist' "$R" "$P_launchd_label"
+}
+
+ck_launchd_label() {
+  cj_p=$(plist_path)
+  if [ "$(cat "$cj_p" 2>/dev/null)" != "$(render_plist)" ]; then
+    bad "${cj_p#"$R"} is missing or differs from the profile"
+  elif [ "$(owner_of "$cj_p")" != "-rw-r--r-- 0 0" ]; then
+    bad "${cj_p#"$R"} is $(owner_of "$cj_p"), want -rw-r--r-- 0 0"
+  elif [ "$(owner_of "$R$LOG_DIR")" != "drwxr-xr-x $P_role_id $P_role_id" ]; then
+    bad "$LOG_DIR is $(owner_of "$R$LOG_DIR"), want drwxr-xr-x $P_role_id $P_role_id"
+  elif ! launchctl print "system/$P_launchd_label" >/dev/null 2>&1; then
+    bad "system/$P_launchd_label is not loaded"
+  else
+    ok "system/$P_launchd_label loaded, as $P_role_user, ProcessType Interactive"
+  fi
+}
+
+# Stops the job, truncates its StandardErrorPath file while it is stopped (launchd
+# keeps the descriptor open while the job runs, so the file is never rotated), and
+# starts it again.
+restart_job() {
+  launchctl bootout "system/$P_launchd_label" >/dev/null 2>&1
+  [ -f "$R$ERR_LOG" ] && : >"$R$ERR_LOG"
+  rj_try=0
+  until launchctl bootstrap system "$(plist_path)" >/dev/null 2>&1; do
+    rj_try=$((rj_try + 1))
+    [ "$rj_try" -lt 10 ] || return 1
+    sleep 1
+  done
+}
+
+fix_launchd_label() {
+  mkdir -p "$R$LOG_DIR"
+  chown "$P_role_id:$P_role_id" "$R$LOG_DIR"
+  chmod 755 "$R$LOG_DIR"
+  fj_p=$(plist_path)
+  mkdir -p "${fj_p%/*}"
+  render_plist >"$fj_p.kbf-new"
+  chown 0:0 "$fj_p.kbf-new"
+  chmod 644 "$fj_p.kbf-new"
+  mv -f "$fj_p.kbf-new" "$fj_p"
+  if restart_job; then
+    change "wrote ${fj_p#"$R"} and restarted the job (error log truncated)"
+  else
+    change "wrote ${fj_p#"$R"}; launchctl bootstrap failed"
+  fi
+}
+
+# ---------------------------------------------------------------- modes
+
+select_items() {
+  if [ -z "$KEYS" ]; then
+    SELECTED=$ITEMS
+    return 0
+  fi
+  SELECTED=
+  for si_k in $(printf '%s' "$KEYS" | tr ',' ' '); do
+    case " $ITEMS " in
+      *" $si_k "*) SELECTED="$SELECTED $si_k" ;;
+      *) die "--keys: unknown item: $si_k (items: $ITEMS)" ;;
+    esac
+  done
+}
+
+report() {
+  rp_suffix=
+  if [ "$ST" = FAIL ]; then
+    case "$CHECK_ONLY" in
+      *" $ITEM "*) rp_suffix=' [check only: apply does not change this]' ;;
+      *) : ;;
+    esac
+  fi
+  printf '%s %s: %s%s\n' "$ST" "$ITEM" "$MSG" "$rp_suffix"
+}
+
+# Checks the selected items; prints every result, or with $1 = quiet only failures.
+run_check() {
+  RC_FAIL=0
+  RC_PASS=0
+  for ITEM in $SELECTED; do
+    check_item "$ITEM"
+    if [ "$ST" = PASS ]; then
+      RC_PASS=$((RC_PASS + 1))
+      [ "${1-}" = quiet ] || report
+    else
+      RC_FAIL=$((RC_FAIL + 1))
+      report
+    fi
+  done
+  [ "${1-}" = quiet ] || printf 'check: %d pass, %d fail\n' "$RC_PASS" "$RC_FAIL"
+  [ "$RC_FAIL" -eq 0 ]
+}
+
+need_root() {
+  [ "$(id -u)" = 0 ] || die "$MODE runs as root"
+}
+
+load_profile
+PROFILE_SHA=$(sha256 "$PROFILE")
+PROFILE_SHA12=$(printf '%s' "$PROFILE_SHA" | cut -c 1-12)
+case "$MODE" in
+  print)
+    for pk in $SCALARS $OPTIONALS; do
+      [ -z "$(val "$pk")" ] || printf '%s=%s\n' "$pk" "$(val "$pk")"
+    done
+    for pk in $P_xcode; do printf 'xcode=%s\n' "$pk"; done
+    for pk in $P_probe; do printf 'probe=%s\n' "$pk"; done
+    for pk in $P_expect_probe; do printf 'expect_probe=%s\n' "$pk"; done
+    printf 'profile_sha256=%s\nnode_label=profile=%s@%s\n' "$PROFILE_SHA" "$P_profile" "$PROFILE_SHA12"
+    ;;
+  check)
+    select_items
+    run_check || exit 1
+    ;;
+  apply)
+    need_root
+    select_items
+    for ITEM in $SELECTED; do
+      check_item "$ITEM"
+      [ "$ST" = PASS ] || fix_item "$ITEM"
+    done
+    run_check quiet || exit 1
+    ;;
+  *)
+    need_root
+    ITEM=launchd_label
+    restart_job || die "launchctl bootstrap system $(plist_path) failed"
+    change "restarted system/$P_launchd_label (error log truncated)"
+    ;;
+esac
+exit 0

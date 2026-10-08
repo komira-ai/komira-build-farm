@@ -171,7 +171,12 @@ the action toolchain's Python. The script costs us its idempotence, which we mus
 and test ourselves. The check mode and the tests in [section 10](#10-how-each-part-is-tested)
 are how that cost is paid.
 
-### 2.1 Shape of the script (planned)
+### 2.1 Shape of the script
+
+**Today** the script and its tests are in
+[tools/mac-provision](../../tools/mac-provision/README.md), which lists every key it
+applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
+verb (section 5.7) and `--keys` to the three below.
 
 `kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):
