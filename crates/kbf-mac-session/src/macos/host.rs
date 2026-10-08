@@ -321,7 +321,11 @@ fn exited(pid: libc::pid_t) -> bool {
 fn exited_from(status: Option<u32>, error: Option<&io::Error>) -> bool {
     match status {
         Some(status) => status == SZOMB,
-        None => error.and_then(io::Error::raw_os_error) == Some(libc::ESRCH),
+        // MUTANT: any failure to read the process counts it as gone (fails open).
+        None => {
+            let _ = error;
+            true
+        }
     }
 }
 
