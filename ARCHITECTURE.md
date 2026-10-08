@@ -14,6 +14,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
+| [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (proposed) |
 
 Decision records live in [docs/adr](docs/adr).
 
