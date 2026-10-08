@@ -45,6 +45,11 @@ codesign --force --sign - --options runtime "$bin"
 # 1
 codesign --verify --strict --verbose=2 "$bin"
 
+# MUTANT: flip one byte in the code section (the entry point's instruction) after signing.
+entryoff=$(otool -l "$bin" | awk '/LC_MAIN/ { m = 1 } m && $1 == "entryoff" { print $2; exit }')
+echo "MUTANT: flipping the byte at file offset $entryoff (LC_MAIN entryoff, in __TEXT,__text)"
+python3 -c 'import sys; f = open(sys.argv[1], "r+b"); o = int(sys.argv[2]); f.seek(o); b = f.read(1); f.seek(o); f.write(bytes([b[0] ^ 0x01]))' "$bin" "$entryoff"
+
 # 2: with an empty environment but PATH and HOME, so no DYLD_* variable is set and
 # only the signature decides whether it starts.
 if ! env -i PATH="$PATH" HOME="$HOME" "$bin" --version; then
