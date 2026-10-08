@@ -5,7 +5,9 @@
 //! `Delegate=yes` whose `actions` cgroup enables cpu, memory and pids, and a busybox
 //! image pulled by its index digest. So each test is `#[ignore]` with that reason, and
 //! the script runs them with `--include-ignored`. Run that way without the setup, a
-//! test fails (it never skips silently):
+//! test fails (it never skips silently). The marker walk's own test needs only GNU
+//! find, which those runners have, and runs the same way. The variables the script
+//! sets:
 //!
 //! - `KBF_TEST_IMAGE`: `docker://<repo>@sha256:<per-architecture manifest digest>`;
 //! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest (pulled by it,
@@ -262,18 +264,146 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
     let result = cell.run(1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "the marker was written");
     let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
-    let found = podman(&[
-        "unshare",
-        "find",
-        graph_root.trim(),
-        &cell.scratch.to_string_lossy(),
-        // Other tests remove their containers while this walks the store.
-        "-ignore_readdir_race",
-        "-name",
-        &marker,
-    ]);
+    let graph_root = graph_root.trim();
+    let scratch = cell.scratch.to_string_lossy();
+    // The whole store, not this lease's paths: its layer is gone by now, and a marker
+    // anywhere else in the store (a committed layer, a volume) is a leak too. Other
+    // tests remove their containers while this walks, so a directory of the store may
+    // vanish under it; one in this test's scratch may not.
+    let walk = find(
+        &["podman", "unshare"],
+        &[graph_root, &scratch],
+        &[graph_root],
+        &["-name", &marker],
+    );
+    let found = walk.unwrap_or_else(|why| panic!("{why}"));
     assert!(found.trim().is_empty(), "marker left behind:\n{found}");
     cell.assert_clean(1);
+}
+
+/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`, and
+/// returns its stdout. The walk passes when find exits 0, or when every error it
+/// reported is a directory below one of `racing` that vanished mid-walk: a directory
+/// that is gone holds no file, and find walks the rest of the tree past that error.
+/// Any other error, a vanished root among them, is an `Err` with find's stderr.
+///
+/// `-ignore_readdir_race` is not enough: findutils applies it only to its own stat
+/// of an entry. A directory removed after it was listed is reported by fts (as an
+/// unreadable directory, or an entry that could not be stat'd) whatever that option
+/// says, and find then exits 1.
+fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<String, String> {
+    let (program, prefix) = prefix.split_first().expect("a program");
+    let output = Command::new(program)
+        .args(prefix)
+        // The C locale fixes the message text and the quotes find puts around a path.
+        .args(["env", "LC_ALL=C", "find"])
+        .args(roots)
+        .arg("-ignore_readdir_race")
+        .args(expr)
+        .output()
+        .expect("run find");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let vanished = |line: &str| {
+        line.strip_prefix("find: '")
+            .and_then(|l| l.strip_suffix("': No such file or directory"))
+            .is_some_and(|path| {
+                racing.iter().any(|root| {
+                    path.strip_prefix(root)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+    };
+    let benign = !stderr.trim().is_empty() && stderr.lines().all(vanished);
+    if output.status.success() || (output.status.code() == Some(1) && benign) {
+        Ok(stdout)
+    } else {
+        Err(format!(
+            "find {roots:?} {expr:?}: {}:\n{stderr}",
+            output.status
+        ))
+    }
+}
+
+/// Catches the marker walk failing when another test removes its container mid-walk
+/// (issue #105), and the tolerance hiding anything else. The first trigger file find
+/// reaches deletes every other directory of the tree, which find has already listed
+/// and not yet entered, so one directory vanishes mid-walk whichever order find takes.
+/// That walk must pass and still print the trigger it matched (a marker found during
+/// a race is still found); a vanished root, a vanished directory outside `racing`,
+/// and an unreadable directory must each still fail.
+#[test]
+#[ignore = "needs GNU find: run by tools/ci/podman-tests.sh"]
+fn a_directory_vanishing_mid_walk_fails_nothing_else() {
+    let scratch = support::scratch("podman-walk-race");
+    let tree = |name: &str| {
+        let root = scratch.join(name);
+        for d in ["p", "q"] {
+            std::fs::create_dir_all(root.join(d)).expect("create");
+            std::fs::write(root.join(d).join("trigger"), b"t").expect("write");
+        }
+        root.to_string_lossy().into_owned()
+    };
+    // Deletes every directory of the root ($0) except the one holding this trigger ($1).
+    let remove_others =
+        r#"for d in "$0"/*/; do case "$1" in "$d"*) ;; *) rm -r "$d" ;; esac; done"#;
+    let race = |root: &str| -> Vec<String> {
+        vec![
+            "-name".into(),
+            "trigger".into(),
+            "-exec".into(),
+            "sh".into(),
+            "-c".into(),
+            remove_others.into(),
+            root.into(),
+            "{}".into(),
+            ";".into(),
+            "-print".into(),
+        ]
+    };
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    let root = tree("raced");
+    let found = find(&["env"], &[&root], &[&root], &strs(&race(&root)))
+        .unwrap_or_else(|why| panic!("a directory vanishing mid-walk failed the walk: {why}"));
+    let found: Vec<&str> = found.lines().collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "one trigger runs, the other vanishes: {found:?}"
+    );
+    assert!(
+        found[0].starts_with(&root) && found[0].ends_with("/trigger"),
+        "{found:?}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&root).expect("read").flatten().collect();
+    assert_eq!(left.len(), 1, "the other directory was removed mid-walk");
+
+    // The same race in a tree where nothing may vanish.
+    let root = tree("not-racing");
+    let outcome = find(&["env"], &[&root], &[], &strs(&race(&root)));
+    assert!(outcome.is_err(), "{outcome:?}");
+
+    // A root that does not exist.
+    let missing = scratch.join("missing").to_string_lossy().into_owned();
+    let outcome = find(&["env"], &[&missing], &[&missing], &["-name", "x"]);
+    assert!(outcome.is_err(), "{outcome:?}");
+
+    // A directory find may not read.
+    let root = tree("unreadable");
+    std::fs::set_permissions(
+        Path::new(&root).join("p"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .expect("chmod");
+    let outcome = find(&["env"], &[&root], &[&root], &["-name", "x"]);
+    assert!(
+        matches!(outcome, Err(ref why) if why.contains("Permission denied")),
+        "{outcome:?}"
+    );
+    support::force_remove(&scratch);
 }
 
 /// Catches the network being on by default (the mutant drops `--network=none`, and
@@ -327,6 +457,10 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     let run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
     let container = wait_for_container_cgroup(&lease).await;
+    // The directory alone is not enough: the OCI runtime makes it first and writes the
+    // container's cgroup files (memory.oom.group among them) later in `create`. The
+    // action's own program running is the state the driver relies on (#88).
+    wait_for_program_in(&container, "sleep").await;
     let read = |dir: &Path, file: &str| {
         std::fs::read_to_string(dir.join(file))
             .expect(file)
@@ -362,6 +496,31 @@ async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("no container cgroup under {}", lease.display());
+}
+
+/// Waits until a process whose command name is `comm` is in `container`'s cgroup.
+///
+/// The OCI runtime (crun, runc) creates the container's cgroup directory, then writes
+/// the spec's resources into it, all during `create`, while the container's init is
+/// held on a sync socket; the action's argv is only exec'd at `start`. So once the
+/// action's own program runs in the cgroup, its setup is complete, which the directory
+/// existing does not imply.
+async fn wait_for_program_in(container: &Path, comm: &str) {
+    for _ in 0..600 {
+        let procs = std::fs::read_to_string(container.join("cgroup.procs")).unwrap_or_default();
+        let running = procs.split_whitespace().any(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == comm)
+        });
+        if running {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no {comm} process in {}:{}",
+        container.display(),
+        describe(container)
+    );
 }
 
 /// Catches a kernel OOM kill being reported as the action's own result (exit 137 would

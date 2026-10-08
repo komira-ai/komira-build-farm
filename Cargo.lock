@@ -1124,11 +1124,13 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

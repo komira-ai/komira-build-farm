@@ -16,7 +16,7 @@ leases.
 **One exception: GPU tests drive a GUI on the host itself.** GPU tests never run in a VM
 (macOS VMs design, section 8.1); that includes tests that install the desktop app and
 drive it with a local LLM. They take the whole Mac on bare metal and need a GUI session
-on the host. Their runtime is planned in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, open PR): a throwaway per-lease
+on the host. Their runtime is planned in the [fleet-updates design](fleet-updates.md): a throwaway per-lease
 user, non-admin unless the lease is privileged (`kbf-mac-admin=true`, which always
 ends in an erase). A root helper, `kbf-mac-session`, logs that user in automatically
 for that lease only. This design does not cover that runtime.
@@ -47,7 +47,7 @@ The rules this design keeps:
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is decided: Apple Business Manager plus a self-hosted NanoHUB behind `kbf-mdm-gate` (fleet-updates design, section 7; [section 6](#6-updates-pinned-and-rolled-out)). |
-| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards (fleet-updates design, open PR). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
+| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards ([fleet-updates design](fleet-updates.md)). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
@@ -75,18 +75,20 @@ This design builds on the code on `main`, read at the time of writing.
   `isa_level`, `drivers`, and the driver's `network_isolation`. It reports nothing about
   the macOS build or Xcode yet. ([capabilities.md](capabilities.md) said macOS
   detection was planned; this change brings it up to date.)
-- **Platform routing,** under review at the time of writing, matches an action's
-  `OSFamily`/`ISA`/`Arch` and kbf keys against node reports. Until it lands, any
-  action can go to any registered worker.
+- **Platform routing** ([#71](https://github.com/komira-ai/komira-build-farm/pull/71))
+  matches an action's `OSFamily`/`ISA`/`Arch` and kbf keys against node reports;
+  properties that are not kbf keys are ignored (refusing them is planned).
 - **CI.** The `native-macos` job builds `kbf-daemon` on a hosted macOS runner and runs
   the native driver's tests there. **No workflow publishes a binary for any platform,
   and nothing signs one.**
 - **The worker protocol** has no drain message (listed as planned in
-  [worker-protocol.md](worker-protocol.md#planned)). The server registers a node by the
-  `node_id` its `Hello` carries and **does not check it against the client
-  certificate** (`kbf-server`, `worker.rs`, `session`). Any certificate the cell CA
-  signed can claim any node id, and because only the newest stream of a worker counts,
-  it can take over that node's session. There is no certificate revocation. Tracked in
+  [worker-protocol.md](worker-protocol.md#planned)). Under mutual TLS the server
+  checks that the client certificate's one DNS subjectAltName equals the `node_id` of
+  every `Hello` on the stream, so a certificate can speak only for its own node, and a
+  deny list of serials, public keys and node ids, read again at every check, refuses
+  leaked or retired certificates without a restart. There is no CRL or OCSP; short
+  lifetimes bound what the list misses. See
+  [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list) and
   [#79](https://github.com/komira-ai/komira-build-farm/issues/79).
 - **Fencing.** The daemon fences on `tokio::time::Instant`. Rust's `Instant` is
   `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS
@@ -352,7 +354,29 @@ listed, and step 3 checks that they print it.
 
 ### 4.1 Build and attest on `main` (planned)
 
-No workflow publishes a binary today. The model:
+> **Built since this section was written:** the build and attestation workflow,
+> `.github/workflows/artifacts.yml`, described in [docs/artifacts.md](../artifacts.md),
+> which is the authority for what it does. Where it differs from this section and 4.2:
+>
+> - **A separate `attest` job** holds `id-token: write` and `attestations: write`,
+>   runs only on a push to `main`, and signs the files the build jobs made. The build
+>   jobs hold `contents: read` only, so code a pull request changes never runs next to
+>   a token that can sign.
+> - **The Linux binaries** (`kbf-daemon` and `kbf-server`, x86_64 and arm64) are built
+>   by their own jobs, not by the macOS job.
+> - **The darwin tarball holds `kbf-daemon` only:** `kbf-mac-provision` does not exist
+>   yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
+> - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
+>   that workflow; this design names none.
+> - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
+>   the flag, runs the signed binary, and verifies the signature again on the binary
+>   taken out of its tarball. The hardened runtime's behaviour is checked only on a
+>   runner with SIP enabled, and hosted runners do not enforce code signing on a
+>   running process, so the kernel's page checks are not shown in CI.
+> - **Still planned:** the deployment job that verifies an asset before it reaches a
+>   node, the node's SHA-256 check in `apply`, and the release workflow.
+
+The model:
 
 - **Every green commit on `main` is built and attested** by CI, and is a candidate for
   deployment. The operator's farm runs these per-commit artifacts.
@@ -394,6 +418,12 @@ released. A build on a developer's machine never ships.
 
 ### 4.2 Signing and verification
 
+> **Built since this section was written:** ad-hoc signing with the hardened runtime
+> and the attestation checks, in `.github/workflows/artifacts.yml`; see
+> [docs/artifacts.md](../artifacts.md) and the deviations listed in section 4.1. The
+> verification steps 1 and 2 below are still planned; the `attest` job runs step 1's
+> command on its own output.
+
 On Apple silicon every executable must carry a code signature. The linker adds an
 *ad-hoc* signature to anything it links for arm64, which is why a `cargo build` on a Mac
 runs at all (Apple:
@@ -403,7 +433,7 @@ runs at all (Apple:
 | | Ad-hoc (`codesign -s -`) | Developer ID, hardened runtime, notarized |
 |---|---|---|
 | Needs | nothing | membership in the Apple Developer Program for an organization, a Developer ID Application certificate (Developer ID Installer for a `.pkg`), and a notary credential, all as secrets of a protected CI environment |
-| The kernel checks page hashes against the signature | yes | yes |
+| The kernel checks page hashes against the signature (where code-signing enforcement is on) | yes | yes |
 | Says *who* built it | no: anyone can ad-hoc sign anything | yes: a Team ID a node can require with `codesign --verify -R '<requirement>'` |
 | Gatekeeper, for a file a browser downloaded (quarantined) | refused | allowed |
 | Apple's malware scan | no | yes ([notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)) |
@@ -628,7 +658,7 @@ host needs auto-login in two cases, and in neither for the admin account:
   - **The same runtime covers** MDM privacy profiles and a leak scan that erases the
     node on a leak.
 
-  All of this is designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, open PR), not here. FileVault off (above) is
+  All of this is designed in the [fleet-updates design](fleet-updates.md), not here. FileVault off (above) is
   what makes that auto-login possible. The profile's `autologin` key accepts it:
   `check` passes when auto-login is off, or set to a user in the lease uid range while
   a `whole_machine` lease holds the node, and `apply` never clears it mid-lease.
@@ -693,8 +723,7 @@ stderr to the file `StandardErrorPath` names.
 
 - One macOS version and build per pool, and its pinned Xcodes, named in the profile.
 - How the server rolls host updates out (macOS and Xcode, MDM, the update UI) is
-  designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87)
-  (`docs/design/fleet-updates.md`, open PR).
+  designed in the [fleet-updates design](fleet-updates.md).
 - Nothing installs by itself (section 5.2).
 - "Update available" is computed by the server (fleet-updates design, section 3.2). It
   reports Xcode and macOS together, because each Xcode sets a minimum macOS: "Xcode X is
@@ -817,12 +846,15 @@ farms' lists and the client's are updated in the same reviewed change.
   `Hello` with its node id and report, and is placed on according to its report.
 - **Leave:** SIGTERM. Running leases are killed and their directories removed. The
   scheduler gives them up after G = 60 s and places them again elsewhere.
-- **Identity:** not tied to the certificate. **Revocation:** none.
+- **Identity:** the certificate's DNS subjectAltName must equal the node id.
+  **Revocation:** the server's deny list. Both are described in
+  [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list).
 
-### 9.2 Join (planned)
+### 9.2 Join
 
-The binding and the deny list below are tracked in
-[#79](https://github.com/komira-ai/komira-build-farm/issues/79).
+Steps 1 to 3 and 5 are planned. Step 4, the binding, is in the server
+([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list),
+[#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
 
 1. `check` passes on the node: the profile is applied, and the identity is the
    expected one.
@@ -854,8 +886,9 @@ The binding and the deny list below are tracked in
   [#78](https://github.com/komira-ai/komira-build-farm/issues/78) is fixed (section
   5.1).
 - **Deregistration:** remove the node from the cell configuration, delete its key on the
-  node, and add its certificate serial to the server's **deny list** (planned; checked at
-  `Hello`). A certificate that is no longer used still verifies until it expires, so
+  node, and add its certificate serial to the server's **deny list**
+  ([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list); read again at
+  every `Hello`, `Heartbeat` and `Result`). A certificate that is no longer used still verifies until it expires, so
   the deny list is what closes the gap, and a short lifetime bounds it if the list is
   missed.
 
@@ -888,9 +921,9 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 | Node install | `apply` with a wrong SHA-256 refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
 | `--expect-probe` | two Xcodes with fixture probe outputs; one probe's value changes. That Xcode's `xcode` value and probe entry leave the report, and the other Xcode's stay | the whole node dropped on one mismatch; the mismatched Xcode still reported; the probe run with the daemon's environment or `SDKROOT` set instead of an action's |
 | Fence clock ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
-| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (today a resent `Hello` only updates capacity and its `node_id` is never read) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
+| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (both in `crates/kbf-server/tests/node_binding.rs` and `session.rs`) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
 | Drain | scheduler simulation: a drained node gets no new lease; running leases finish or are re-placed after the deadline | placement that ignores the drained flag |
-| Deny list | a denied serial's `Hello` is refused, also on reconnect | the list read only at server start |
+| Deny list | a denied serial's `Hello` is refused, also on reconnect; an open stream's next `Heartbeat` or `Result` ends it, and the `Result` never reaches the action cache (`node_binding.rs`) | the list read only at server start; a `Result` not checked |
 
 **What a hosted runner can and cannot prove.** Hosted macOS runners are virtual
 machines.
@@ -920,7 +953,7 @@ machines.
 |---|---|
 | The daemon's flags, LaunchDaemon fit, SIGTERM behaviour, macOS report entries, native driver gaps | read in the code on `main` |
 | No workflow publishes or signs a binary | read in `.github/workflows` |
-| The server does not tie node id to certificate; no revocation | read in `kbf-server` and `worker.proto` |
+| The server ties node id to the certificate's DNS subjectAltName and refuses what its deny list names ([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)) | read in `kbf-server` (`identity.rs`, `worker.rs`) and tested in `crates/kbf-server/tests/node_binding.rs` |
 | A result is accepted only from the current lease holder | read in `kbf-server` (`farm.rs`, `report`) |
 | `Instant` is `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS | Rust documentation |
 | Neither clock advances during suspend | Linux `clock_gettime(2)`, macOS `clock_gettime(3)`. Not tested on a node |

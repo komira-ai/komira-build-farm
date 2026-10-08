@@ -20,10 +20,16 @@ fn ampere() -> NodeCaps {
     node(include_str!("fixtures/ampere_altra_max_m128_30.cpuinfo"))
 }
 
-fn mac(xcode: &str) -> NodeCaps {
+/// A Mac with the Xcode builds in `xcodes` installed.
+fn mac(xcodes: &[&str]) -> NodeCaps {
     let cpu = CpuCaps::from_macos_sysctl(include_str!("fixtures/apple_m3_ultra.sysctl")).unwrap();
     let mut n = NodeCaps::new(cpu);
-    n.exact.insert("xcode".to_owned(), xcode.to_owned());
+    for xcode in xcodes {
+        n.members
+            .entry("xcode".to_owned())
+            .or_default()
+            .insert((*xcode).to_owned());
+    }
     n.exact.insert("os".to_owned(), "macos".to_owned());
     n
 }
@@ -63,7 +69,7 @@ fn levels_do_not_cross_families() {
     assert!(!req(&[("isa_level", "armv8.0-a")]).matches(&skylake()));
     assert!(req(&[("isa_level", "armv8.2-a")]).matches(&ampere()));
     assert!(!req(&[("isa_level", "armv8.3-a")]).matches(&ampere()));
-    assert!(req(&[("isa_level", "armv8.4-a")]).matches(&mac("x")));
+    assert!(req(&[("isa_level", "armv8.4-a")]).matches(&mac(&["x"])));
 }
 
 /// Catches: features matched as "any of" instead of "all of". The Ampere has `aes`
@@ -73,7 +79,7 @@ fn features_are_a_subset() {
     let r = req(&[("cpu.feature", "aes"), ("cpu.feature", "sve")]);
     assert_eq!(r.unmet(&ampere()), [Unmet::Feature("sve")]);
     assert!(req(&[("cpu.feature", "aes"), ("cpu.feature", "asimddp")]).matches(&ampere()));
-    assert!(req(&[("cpu.feature", "aes"), ("cpu.feature", "asimddp")]).matches(&mac("x")));
+    assert!(req(&[("cpu.feature", "aes"), ("cpu.feature", "asimddp")]).matches(&mac(&["x"])));
 }
 
 /// Catches: a consumable compared exactly or backwards, and a missing capacity
@@ -95,18 +101,57 @@ fn consumables_are_minimums() {
     assert!(!req(&[("nvme_gib", "1")]).matches(&n));
 }
 
-/// Catches: `xcode` matched as a minimum. A Mac mid-upgrade to a newer build must
-/// not take an action built for the old one, or the cache mixes compilers.
+/// Catches: `xcode` matched as a minimum (a Mac mid-upgrade to a newer build takes an
+/// action built for the old one, and the cache mixes compilers), or exactly against
+/// one reported value (a Mac with two Xcodes then serves at most one of them).
 #[test]
-fn xcode_is_exact() {
-    let r = req(&[("xcode", "16C5032a"), ("os", "macos")]);
-    assert!(r.matches(&mac("16C5032a")));
+fn xcode_is_matched_by_membership() {
+    let old = req(&[("xcode", "16C5032a"), ("os", "macos")]);
+    let new = req(&[("xcode", "16E140")]);
+    let both = mac(&["16C5032a", "16E140"]);
+    assert!(old.matches(&both), "the first of two Xcodes");
+    assert!(new.matches(&both), "the second of two Xcodes");
+    assert!(old.matches(&mac(&["16C5032a"])));
     assert_eq!(
-        r.unmet(&mac("16E140")),
-        [Unmet::Exact {
+        old.unmet(&mac(&["16E140"])),
+        [Unmet::Member {
             key: "xcode",
             want: "16C5032a"
         }]
+    );
+    assert_eq!(
+        new.unmet(&mac(&[])),
+        [Unmet::Member {
+            key: "xcode",
+            want: "16E140"
+        }],
+        "a node without Xcode"
+    );
+    assert_eq!(
+        Unmet::Member {
+            key: "xcode",
+            want: "16E140"
+        }
+        .to_string(),
+        "xcode=16E140"
+    );
+}
+
+/// Catches: a request naming two Xcodes (it can run under one `DEVELOPER_DIR`) or an
+/// empty one accepted, which no node could serve as meant.
+#[test]
+fn a_request_names_one_xcode() {
+    let err = |props: &[(&str, &str)]| Request::parse(props.iter().copied()).unwrap_err();
+    assert_eq!(
+        err(&[("xcode", "16E140"), ("xcode", "16C5032a")]),
+        RequestError::Repeated("xcode".to_owned())
+    );
+    assert_eq!(
+        err(&[("xcode", "")]),
+        RequestError::BadValue {
+            key: "xcode".to_owned(),
+            value: String::new()
+        }
     );
 }
 
@@ -124,8 +169,8 @@ fn arch_and_labels_are_exact() {
 }
 
 /// Catches: an unknown key or bad value silently ignored (the action would run
-/// anywhere), a single-valued key accepted twice, and the reserved lease keys
-/// rejected as unknown.
+/// anywhere), a single-valued key accepted twice, and the reserved lease and booking
+/// keys rejected as unknown.
 #[test]
 fn parse_rejects_what_it_cannot_compare() {
     let err = |props: &[(&str, &str)]| Request::parse(props.iter().copied()).unwrap_err();
@@ -152,7 +197,7 @@ fn parse_rejects_what_it_cannot_compare() {
             }
         );
     }
-    for k in ["isa_level", "arch", "cpus", "xcode"] {
+    for k in ["isa_level", "arch", "cpus", "os", "xcode"] {
         let v = match k {
             "isa_level" => "x86-64-v3",
             "arch" => "arm64",
@@ -162,7 +207,12 @@ fn parse_rejects_what_it_cannot_compare() {
         assert_eq!(err(&[(k, v), (k, v)]), RequestError::Repeated(k.to_owned()));
     }
     assert_eq!(
-        req(&[("kbf-lease", "action"), ("kbf-cpu", "dedicated")]),
+        req(&[
+            ("kbf-lease", "action"),
+            ("kbf-cpu", "dedicated"),
+            ("kbf-book-cpus", "8"),
+            ("kbf-book-mem-gib", "16"),
+        ]),
         Request::default()
     );
 }

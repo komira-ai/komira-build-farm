@@ -21,7 +21,7 @@ use kbf_objstore::{KeyPrefix, MemoryStore, ObjectKey, ObjectStore, PageSize};
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{Digest, ExecuteRequest, ExecuteResponse};
-use kbf_server::{Listeners, bind_server};
+use kbf_server::{Listeners, WorkerTls, bind_server};
 use prost::Message;
 use support::memory::Spec;
 use support::{PROMPT, pki, scratch};
@@ -45,7 +45,10 @@ impl Farm {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
-            worker_tls: Some(pki.server_tls()),
+            worker_tls: Some(WorkerTls {
+                server: pki.server_tls(),
+                deny_list: None,
+            }),
             heartbeat_interval: Duration::from_millis(100),
             hello_wait: Duration::from_secs(2),
             tick: Duration::from_millis(50),

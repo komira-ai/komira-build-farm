@@ -11,10 +11,13 @@ These properties change how kbf schedules an action today:
 |---|---|---|---|
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under. |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
+| `kbf-book-cpus` | a whole number, at least 1 | `1` | Whole cores the lease books. |
+| `kbf-book-mem-gib` | a whole number, at least 1 | `1` | GiB of memory the lease books. |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
-Any other value of `kbf-lease` or `gpu` is refused with `INVALID_ARGUMENT`. kbf's own
+Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is refused
+with `INVALID_ARGUMENT`. kbf's own
 capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
 [capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
 (`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
@@ -26,7 +29,8 @@ meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
 `OSFAMILY=Darwin` and `OSFamily=darwin` all ask for a Mac. This holds for the REAPI
 names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
 (`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
-reserved `kbf-lease`, `kbf-cpu` and `kbf-mac-admin`. In `label.<k>` only `label.` is
+reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`, `kbf-book-cpus` and
+`kbf-book-mem-gib`. In `label.<k>` only `label.` is
 read in any case; the label's own name `<k>` is compared exactly, as its value is.
 `arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
 other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
@@ -90,3 +94,36 @@ cc_test(
     ...
 )
 ```
+
+## `kbf-book-cpus` and `kbf-book-mem-gib`
+
+Every action books one core and 1 GiB of memory on the worker it runs on, unless it
+names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
+`N` GiB. Either may be given alone; the other stays at its default. The scheduler places
+the action only where that much is free, and holds it for the lease until the lease
+ends, as it does for the default booking.
+
+The booking also sets the memory the action may use. The native driver (Macs) kills an
+action whose processes together hold more than 150% of its booked memory plus 512 MiB:
+2 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
+`ld` step that dies at 2 GiB needs a larger booking. The container driver sets the
+lease's soft memory limit (`memory.high`) and CPU weight from the booking.
+
+```starlark
+# Bazel: a link step that needs 4 cores and 12 GiB
+cc_binary(
+    name = "server",
+    exec_properties = {"kbf-book-cpus": "4", "kbf-book-mem-gib": "12"},
+    ...
+)
+```
+
+A value that is not a whole number of at least 1 is refused with `INVALID_ARGUMENT`,
+as is either key on a `kbf-lease=whole_machine` lease, which is planned to book the
+whole worker. A booking larger than any worker that satisfies the platform waits and
+then fails, as described under [Where an action runs](#where-an-action-runs).
+
+Like every platform property, the two keys are part of the action digest: the same
+action with another booking is a different action cache entry, so changing a booking
+reruns the action once. They are not the capability keys `cpus` and `mem_gib`, which
+ask for a worker whose whole machine has at least that much and book nothing.

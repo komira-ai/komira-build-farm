@@ -16,7 +16,9 @@ service Worker {
 - **One stream per daemon, opened by the daemon.** No daemon listens on an inbound
   port, so a worker needs only outbound connectivity to the farm's address.
 - **Mutual TLS.** The daemon connects only to `https://` URLs and presents its own
-  certificate; the server's worker listener verifies it against a client CA.
+  certificate; the server's worker listener verifies it against a client CA, and
+  requires the certificate to name the node the stream speaks for (see
+  [Node identity](#node-identity-and-the-deny-list)).
 - **No blob bytes on this stream.** A daemon reads inputs and writes outputs through the
   REAPI `ByteStream` service on separate connections. The session carries only small
   control messages.
@@ -65,23 +67,79 @@ placement books against. It must also carry exactly one `arch` entry (`x86_64` o
 [capabilities.md](capabilities.md#matching)), and a node of unknown architecture could
 not be matched safely. `report_hash` is the SHA-256 of the encoded entries in order.
 
-The server checks the version, the node id, the capacity entries and the entries
-placement matches (`arch`; a repeated single-valued entry; a countable entry that is
-not a whole number). If any fails, it
-ends the stream with an error status (`FAILED_PRECONDITION` for an unaccepted version,
-`INVALID_ARGUMENT` otherwise). A stream that sends no `Hello` within 10 seconds ends
+The server checks the version, the node id, that the client certificate names that
+node id and neither is denied ([below](#node-identity-and-the-deny-list)), the capacity
+entries and the entries placement matches (`arch`; a repeated single-valued entry; a
+countable entry that is not a whole number). If any fails, it ends the stream with an
+error status (`FAILED_PRECONDITION` for an unaccepted version, `PERMISSION_DENIED` for
+a certificate that does not name the node or a denied one, `UNAVAILABLE` while the
+deny list cannot be read, `INVALID_ARGUMENT` otherwise). A stream that sends no `Hello` within 10 seconds ends
 `DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak and
 the heartbeat interval in milliseconds.
 
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
-same stream (the daemon's node report changed) changes the node's capacity and
-capabilities and nothing else; a resent report that fails the checks is ignored. A newer stream from the same node replaces the older one: messages still arriving
-on the old stream are ignored from then on.
+same stream (the daemon's node report changed) must carry the stream's `node_id`: one
+that names another node ends the stream `PERMISSION_DENIED`, and so does one the deny
+list now refuses. Otherwise it changes the node's capacity and capabilities and nothing
+else; a resent report that fails the other checks is ignored. A newer stream from the
+same node replaces the older one: messages still arriving on the old stream are ignored
+from then on.
 
 The daemon refuses a `Welcome` whose interval is zero or whose double is not shorter
 than its fence time T, since a gap of two intervals must be noticed well before it
 fences.
+
+### Node identity and the deny list
+
+Only the newest stream of a node counts, and that stream receives the node's leases,
+with their inputs, and returns results the server writes to the action cache. So a
+stream must not be able to speak for a node other than its own (issue
+[#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
+
+**The binding rule.** Under mutual TLS the daemon's client certificate must carry
+**exactly one DNS name in its subjectAltName extension**, and that name must equal the
+`node_id` of every `Hello` on the stream, byte for byte, case included: issue the
+certificate with the node id spelled exactly as the daemon's `--node-id` spells it. The subject's common name is not read; a certificate that
+names no DNS name, or several, is refused. A certificate taken from one node can
+therefore impersonate only that node. With OpenSSL, the client certificate's extension
+is `subjectAltName = DNS:<node id>`.
+
+In plain text (no TLS flags; for tests and trials on one machine) there is no
+certificate and no binding; a resent `Hello` must still carry the stream's `node_id`.
+
+**The deny list** (`kbf-server --worker-deny-list FILE`, mutual TLS only) refuses
+certificates and nodes. Each line is blank, a `#` comment, or one entry:
+
+```
+serial 0A:1B:2C          # a certificate serial, hex; colons, case and leading zeros ignored
+spki-sha256 <64 hex>     # SHA-256 of the certificate's DER SubjectPublicKeyInfo
+node mac-07              # a node id, whatever certificate it presents
+```
+
+`openssl x509 -noout -serial` prints a certificate's serial;
+`openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum` its
+public key hash, which outlives a reissue with the same key. The server reads the file
+at start (a bad file stops it), and **again at every check**: each first `Hello`
+(reconnects included), each resent `Hello`, each `Heartbeat`, each `Result` and each
+`NodeStatus`. An entry added while a denied daemon is connected ends its stream
+`PERMISSION_DENIED` at the next of those it sends (a `Result` is refused, so it never
+reaches the action cache, and the stream ends without a `ResultAck`; a `NodeStatus`
+is refused, so the operator API keeps the node's last status from before the entry),
+and every reconnect is refused; no
+restart is needed. The server reads nothing more from a stream it has ended. Replace
+the file atomically (write a new file, then rename it over the old one).
+
+A file that cannot be read or parsed after start refuses every check `UNAVAILABLE`
+(fail closed) until it is fixed. That ends **every** connected daemon's stream within
+one heartbeat interval, and refuses their reconnects, so it takes the whole farm off
+line: their leases are placed again only after the grace period G, once the file is
+readable and the daemons are back.
+
+**Lifetimes bound what the list misses.** There is no CRL or OCSP: a certificate left
+off the list verifies until it expires or the cell CA is replaced. Issue node
+certificates with short lifetimes (30 days is a starting point) so a missed entry is
+bounded.
 
 ### `Heartbeat` and `HeartbeatAck`
 
@@ -221,7 +279,8 @@ it cannot read is empty.
 
 The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
 the first `Heartbeat`. The server keeps the newest one per node, from the node's
-current stream only (one from a replaced stream is ignored), in memory, and lists it
+current stream only (one from a replaced stream is ignored, and one the deny list now
+refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
 in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
 the message ignores it as an empty message; a daemon that predates it is listed
 without software. Sending it again when the software changes mid-session is
@@ -252,6 +311,7 @@ daemon restarts and server restarts:
    the next heartbeat that lists it.
 5. **Only the newest stream counts.** A replaced stream's heartbeats are neither fed to
    the scheduler nor acknowledged, and every `Start` goes to the newest stream.
+   Under mutual TLS, only a stream whose certificate names the node can become it.
 6. **A restarted daemon lists everything it runs in its first heartbeat.** The
    scheduler requeues at once any lease whose `Start` went to an earlier session and
    that the new session's heartbeat leaves out. (Re-adopting running work across a
