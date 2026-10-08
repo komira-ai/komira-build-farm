@@ -528,7 +528,7 @@ fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
 /// Catches, gate by gate, a write let through without what it needs, each on its own
 /// so that removing any one gate turns this red:
 /// - the token check removed (any local process, such as a build action on this host,
-///   could cordon the fleet), a wrong token or scheme accepted, or a prefix or
+///   could cordon the fleet), a wrong, empty or scheme-less token accepted, or a prefix or
 ///   extension of the token accepted;
 /// - an `Origin` header allowed (a page in a browser on the host could POST);
 /// - any content type accepted (a browser's cross-origin `text/plain` or form POST
@@ -568,6 +568,8 @@ fn a_write_passes_every_gate_or_is_refused() {
         None,
         Some(""),
         Some("Bearer"),
+        // An empty token: HTTP/1 strips the trailing space, h2c can deliver it.
+        Some("Bearer "),
         Some(short),
         Some(&longer),
         Some(&basic),
