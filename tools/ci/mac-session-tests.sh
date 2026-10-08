@@ -66,7 +66,13 @@ run_dir=/private/var/run/kbf-ci-mac-session
 state=/private/var/db/kbf-ci-mac-session
 socket="$run_dir/socket"
 sudo -n rm -rf "$run_dir" "$state"
-"$client" pubkey 07 > "$tmp/grant-keys"
+# The grant key file must be root's and writable by no one else: one the runner owns
+# stops the helper at start.
+"$client" pubkey 07 > "$tmp/user-keys"
+expect_refused "owned by uid $(id -u)" sudo -n "$helper" --socket "$socket" --socket-group admin \
+  --state-dir "$state" --uid-range "$first-$last" --daemon-requirement "cdhash H\"$genuine\"" \
+  --grant-keys "$tmp/user-keys"
+sudo -n install -o root -m 0644 "$tmp/user-keys" "$tmp/grant-keys"
 sudo -n "$helper" --socket "$socket" --socket-group admin --state-dir "$state" \
   --uid-range "$first-$last" --daemon-requirement "cdhash H\"$genuine\"" \
   --grant-keys "$tmp/grant-keys" > "$tmp/helper.log" 2>&1 &
