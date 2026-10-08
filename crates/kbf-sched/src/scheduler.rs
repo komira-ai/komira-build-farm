@@ -23,7 +23,8 @@ pub const PLACEMENT_ROUND: usize = 256;
 /// satisfies its platform, or none that does is large enough) before it is refused.
 /// The default of [`Scheduler::new`]; see [`Scheduler::with_unservable_wait`].
 ///
-/// The wait restarts whenever a live worker can run it again. It is not zero because a
+/// The wait restarts whenever a live worker can run it again, and does not run while
+/// only cordoned workers could (that work waits for the cordon). It is not zero because a
 /// worker that can is often only a moment away: after a server restart daemons
 /// reconnect over a few seconds, and a Mac that reboots is gone for a few minutes.
 pub const UNSERVABLE_WAIT: Duration = Duration::from_secs(300);
@@ -111,11 +112,15 @@ struct Operation {
     unservable: Option<Unservable>,
 }
 
-/// A queued operation no live worker can run: since when, and why.
+/// A queued operation no live worker can run: since when, why, and whether the wait
+/// counts toward its refusal.
 #[derive(Clone, Debug)]
 struct Unservable {
     since: FarmTime,
     reason: String,
+    /// `false` while only cordoned workers could run it: it waits for the cordon to
+    /// end and is never refused for it.
+    refusable: bool,
 }
 
 /// A lease currently held (leased or running).
@@ -483,13 +488,14 @@ impl Scheduler {
     }
 
     /// Records this round's verdict on queued operation `id`: tells its waiters when
-    /// the reason it waits changes, and proposes its refusal once it has waited for the
-    /// unservable wait.
+    /// the reason it waits changes, and proposes its refusal once no worker, cordoned or
+    /// not, could run it for the unservable wait. Time spent waiting only for a cordon
+    /// does not count: the wait starts again when the work becomes unservable.
     fn note(&mut self, id: OperationId, verdict: Verdict, effects: &mut Vec<Effect>) {
         let now = self.now;
         let wait = self.unservable_wait;
         let op = self.ops.get_mut(&id).expect("queued operations exist");
-        let reason = match verdict {
+        let (reason, refusable) = match verdict {
             Verdict::Servable => {
                 // Only an operation that was waiting has a servable verdict noted.
                 op.unservable = None;
@@ -499,20 +505,28 @@ impl Scheduler {
                 }));
                 return;
             }
-            Verdict::Unservable(reason) => reason,
+            Verdict::Unservable(reason) => (reason, true),
+            Verdict::Cordoned(reason) => (reason, false),
         };
         let unservable = match &mut op.unservable {
             Some(u) if u.reason == reason => u,
             slot => {
-                let since = slot.as_ref().map_or(now, |u| u.since);
+                let since = match slot {
+                    Some(u) if u.refusable && refusable => u.since,
+                    _ => now,
+                };
                 effects.push(Effect::Waiting(Waiting {
                     operation: id,
                     reason: Some(reason.clone()),
                 }));
-                slot.insert(Unservable { since, reason })
+                slot.insert(Unservable {
+                    since,
+                    reason,
+                    refusable,
+                })
             }
         };
-        if now >= unservable.since.saturating_add(wait) {
+        if unservable.refusable && now >= unservable.since.saturating_add(wait) {
             let reason = format!(
                 "{} (waited {} s for a worker that can run it)",
                 unservable.reason,
@@ -750,8 +764,12 @@ impl StateMachine for Scheduler {
                 Vec::new()
             }
             Event::Uncordon { worker } => {
+                // Work may have waited for this worker alone: place it now, not at the
+                // next tick.
                 self.cordons.uncordon(&worker);
-                Vec::new()
+                let mut effects = Vec::new();
+                self.place(&mut effects);
+                effects
             }
         };
         let (now, held) = (self.now, &self.held);

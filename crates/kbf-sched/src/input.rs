@@ -181,7 +181,8 @@ pub enum Event {
         /// When the drain pauses if leases still run.
         deadline: FarmTime,
     },
-    /// An operator returns `worker` to placement, ending its cordon and any drain.
+    /// An operator returns `worker` to placement, ending its cordon and any drain, and
+    /// queued work is placed at once.
     Uncordon {
         /// The worker.
         worker: WorkerId,

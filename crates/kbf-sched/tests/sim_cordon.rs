@@ -6,8 +6,10 @@
 //! The checks, after every input of every seed:
 //! - no lease is ever granted to a worker while it is cordoned;
 //! - a drain never kills: every operation is granted at most once (no lease is given
-//!   up and granted again) and answered exactly once, by its result, or by a refusal
-//!   naming the cordon when every worker stayed cordoned for the unservable wait;
+//!   up and granted again) and answered exactly once, by its result;
+//! - a cordon never refuses work: workers are always up and large enough, so work
+//!   that only cordoned workers could run waits, however long, and is never refused
+//!   (the sweep shows some waited longer than the unservable wait);
 //! - a drain's state is true: `Drained` only while the worker holds no lease,
 //!   `Draining` only before its deadline and while it holds one, `Paused` only at or
 //!   after its deadline;
@@ -17,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Cordon, Event, Input, Request, Scheduler};
+use kbf_sched::{Cordon, Event, Input, Request, Scheduler, UNSERVABLE_WAIT};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
@@ -50,6 +52,10 @@ struct World {
     trace: Vec<String>,
     /// How often each drain state was seen, to show the sweep reaches them.
     seen: BTreeMap<&'static str, u64>,
+    /// Operations told they wait for a cordon, and since when (seconds).
+    cordon_wait: BTreeMap<OperationId, u64>,
+    /// The longest any operation waited for a cordon before it was granted (seconds).
+    longest_cordon_wait: u64,
 }
 
 impl World {
@@ -65,6 +71,8 @@ impl World {
             submitted: 0,
             trace: Vec::new(),
             seen: BTreeMap::new(),
+            cordon_wait: BTreeMap::new(),
+            longest_cordon_wait: 0,
         };
         for name in WORKERS {
             let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap();
@@ -100,6 +108,10 @@ impl World {
                     let cordon = self.sched.cordon(&grant.worker);
                     assert_eq!(cordon, None, "a grant to cordoned {}", grant.worker);
                     *self.grants.entry(grant.operation).or_default() += 1;
+                    if let Some(since) = self.cordon_wait.remove(&grant.operation) {
+                        let waited = self.now - since;
+                        self.longest_cordon_wait = self.longest_cordon_wait.max(waited);
+                    }
                 }
                 self.sched.apply(Input::new(now, Event::Committed(record)))
             }
@@ -117,18 +129,22 @@ impl World {
                 *self.answers.entry(answer.operation).or_default() += 1;
                 Vec::new()
             }
-            Effect::Waiting(_) => Vec::new(),
-            Effect::Refuse(refusal) => {
-                // Workers are always up: only a cordon of every worker starves work.
+            Effect::Waiting(waiting) => {
+                let reason = waiting.reason.as_deref().unwrap_or_default();
                 assert!(
-                    refusal
-                        .reason
-                        .starts_with("every live worker that can run it is cordoned"),
-                    "{refusal:?}"
+                    waiting.reason.is_none()
+                        || reason.starts_with("every live worker that can run it is cordoned"),
+                    "{waiting:?}"
                 );
-                assert!(!self.grants.contains_key(&refusal.operation));
-                *self.answers.entry(refusal.operation).or_default() += 1;
+                if waiting.reason.is_some() {
+                    self.cordon_wait
+                        .entry(waiting.operation)
+                        .or_insert(self.now);
+                }
                 Vec::new()
+            }
+            Effect::Refuse(refusal) => {
+                panic!("workers are always up; a cordon refused {refusal:?}")
             }
         }
     }
@@ -234,12 +250,15 @@ fn run(seed: u64) -> World {
 
 /// Catches: cordon ignored in placement, a drain that gives up or requeues a lease
 /// (a second grant of one operation), a drain state that lies about the leases or the
-/// deadline, and an uncordon that leaves work stuck.
+/// deadline, an uncordon that leaves work stuck, and work refused because only
+/// cordoned workers could run it.
 #[test]
 fn cordon_and_drain_hold_over_seeds() {
     let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut longest_cordon_wait = 0;
     for seed in 0..SEEDS {
         let w = run(seed);
+        longest_cordon_wait = longest_cordon_wait.max(w.longest_cordon_wait);
         for (state, n) in &w.seen {
             *seen.entry(state).or_default() += n;
         }
@@ -264,6 +283,11 @@ fn cordon_and_drain_hold_over_seeds() {
             "{state} never seen: {seen:?}"
         );
     }
+    // Some work waited for a cordon past the unservable wait, and still ran.
+    assert!(
+        longest_cordon_wait > UNSERVABLE_WAIT.as_secs(),
+        "longest cordon wait {longest_cordon_wait} s"
+    );
 }
 
 /// Catches: placement or drain progress that depends on anything but the seed.

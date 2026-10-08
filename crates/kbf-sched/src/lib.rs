@@ -25,7 +25,9 @@
 //!   operation;
 //! - QoS levels ordering the queue (no quotas);
 //! - cordon and drain ([`Cordon`]): placement skips a cordoned worker, whose leases run
-//!   on; a drain waits for them until a deadline, then pauses, and never kills.
+//!   on; a drain waits for them until a deadline, then pauses, and never kills. Work
+//!   only cordoned workers could run waits, naming them, and is not refused for it; an
+//!   uncordon places queued work at once.
 //!
 //! Not yet: placement scoring (alignment, best fit), reclaimed
 //! room and preemption, the infra retry budget, and committing submissions so that a

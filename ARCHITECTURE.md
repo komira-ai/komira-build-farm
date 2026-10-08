@@ -51,8 +51,9 @@ role (`--role=all`). The flags are:
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
-  ([docs/api.md](docs/api.md)). It has no authentication yet, so bind it where only
-  operators reach it.
+  ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
+  reach it; writes need the token in `--api-token-file` (owner-only file), come from
+  loopback, and carry no `Origin` header.
 
 **`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
 outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and

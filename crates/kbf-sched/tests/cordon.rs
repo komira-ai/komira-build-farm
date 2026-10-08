@@ -6,7 +6,7 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{Cordon, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
-    Outcome, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    Outcome, Qos, Resources, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -142,8 +142,17 @@ impl Harness {
         );
     }
 
-    fn uncordon(&mut self, name: &str) {
-        assert!(self.feed(Event::Uncordon { worker: w(name) }).is_empty());
+    /// Uncordons `name`; the grants placed at once (waiting reasons cleared too).
+    fn uncordon(&mut self, name: &str) -> Vec<LeaseGrant> {
+        let effects = self.feed(Event::Uncordon { worker: w(name) });
+        effects
+            .into_iter()
+            .filter_map(|e| match e {
+                Effect::Commit(ControlRecord::Lease(g)) => Some(g),
+                Effect::Waiting(Waiting { reason: None, .. }) => None,
+                e => panic!("an uncordon proposed {e:?}"),
+            })
+            .collect()
     }
 
     fn state(&self, op: OperationId) -> &OpState {
@@ -210,10 +219,12 @@ fn a_cordon_holds_across_registrations_and_before_the_first() {
 }
 
 /// Catches: work that only a cordoned worker can run told that no worker is connected
-/// (or given another wrong reason), work refused before the unservable wait, and the
-/// cordoned reason given when an uncordoned worker could run it.
+/// (or given another wrong reason), work refused because only cordoned workers could
+/// run it (a cordon is temporary: it must wait, however long), the cordoned reason
+/// given when an uncordoned worker could run it, and an uncordon that leaves the work
+/// queued until the next tick.
 #[test]
-fn work_only_cordoned_workers_can_run_waits_with_that_reason() {
+fn work_only_cordoned_workers_can_run_waits_and_is_never_refused() {
     let mut h = Harness::with(Scheduler::new(1).with_unservable_wait(Duration::from_secs(10)));
     h.worker("a");
     h.worker("b");
@@ -230,19 +241,25 @@ fn work_only_cordoned_workers_can_run_waits_with_that_reason() {
         Some("every live worker that can run it is cordoned: a, b")
     );
     let op = waiting.operation;
-    h.at(5);
-    h.heartbeat("a");
-    h.heartbeat("b");
-    let (_, effects) = h.tick();
-    assert!(effects.is_empty(), "still waiting, told once: {effects:?}");
-    h.at(10);
-    h.heartbeat("a");
-    h.heartbeat("b");
-    let (_, effects) = h.tick();
-    assert!(
-        matches!(effects.as_slice(), [Effect::Commit(ControlRecord::Refusal(r))] if r.operation == op),
-        "{effects:?}"
+    for t in [5, 10, 100, 10_000] {
+        h.at(t);
+        h.heartbeat("a");
+        h.heartbeat("b");
+        let (grants, effects) = h.tick();
+        assert!(
+            grants.is_empty() && effects.is_empty(),
+            "still waiting at {t} s, told once: {effects:?}"
+        );
+        assert_eq!(h.state(op), &OpState::Queued);
+    }
+    assert_eq!(
+        h.s.waiting(op),
+        Some("every live worker that can run it is cordoned: a, b")
     );
+    // The uncordon itself places the work: no tick in between.
+    let [grant] = h.uncordon("b").try_into().expect("placed by the uncordon");
+    assert_eq!((grant.operation, grant.worker), (op, w("b")));
+    assert_eq!(h.s.waiting(op), None);
 
     // A request no worker is large enough for keeps its own reason, cordoned or not.
     let mut h = Harness::new();
@@ -288,6 +305,127 @@ fn work_only_cordoned_workers_can_run_waits_with_that_reason() {
     };
     let reason = huge.reason.as_deref().unwrap_or_default();
     assert!(reason.contains("are all smaller than"), "{reason}");
+}
+
+/// Catches: the cordoned workers consulted when an uncordoned worker could run the
+/// work once its bookings end (the work would be told it waits for a cordon, and
+/// would never be refused even if that worker left).
+#[test]
+fn work_a_busy_uncordoned_worker_can_run_does_not_wait_for_a_cordon() {
+    let mut h = Harness::new();
+    h.worker("a");
+    h.worker("b");
+    h.cordon("a");
+    for n in 1..=4 {
+        h.submit(n);
+    }
+    assert_eq!(h.place().len(), 4, "b is full");
+    h.submit(5);
+    let (grants, effects) = h.tick();
+    assert!(
+        grants.is_empty() && effects.is_empty(),
+        "{grants:?} {effects:?}"
+    );
+    let queued: Vec<_> = h.s.queued().collect();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(h.s.waiting(queued[0]), None);
+}
+
+/// Catches: the unservable wait dropped for work that no worker, cordoned or not,
+/// could ever run (a cordoned worker in the farm must not keep it queued forever), and
+/// time spent waiting for a cordon counted toward the refusal (work would be refused
+/// the moment the cordoned worker that could run it leaves).
+#[test]
+fn work_no_worker_could_run_is_refused_even_with_cordons() {
+    let wait = Duration::from_secs(10);
+    let mut h = Harness::with(Scheduler::new(1).with_unservable_wait(wait));
+    h.worker("a");
+    h.cordon("a");
+    let mut huge = request(1);
+    huge.resources = Resources::new(64_000, GIB);
+    h.feed(Event::Submit {
+        waiter: WaiterId(0),
+        request: huge,
+    });
+    let (_, effects) = h.tick();
+    let [Effect::Waiting(waiting)] = effects.as_slice() else {
+        panic!("expected a reason, got {effects:?}");
+    };
+    let op = waiting.operation;
+    h.at(10);
+    h.heartbeat("a");
+    let (_, effects) = h.tick();
+    assert!(
+        matches!(effects.as_slice(), [Effect::Commit(ControlRecord::Refusal(r))]
+            if r.operation == op && r.reason.starts_with("every connected worker is cordoned")),
+        "{effects:?}"
+    );
+
+    // Unservable, then only a cordoned worker could run it, then unservable again:
+    // the wait starts again when it becomes unservable.
+    let mut h = Harness::with(Scheduler::new(1).with_unservable_wait(wait));
+    h.worker("a");
+    h.submit(2);
+    assert_eq!(h.place().len(), 1, "a takes op 2");
+    h.submit(3);
+    h.cordon("a");
+    // `a` holds a lease and is cordoned: only it could run op 3, so op 3 waits for it.
+    let (_, effects) = h.tick();
+    let [Effect::Waiting(waiting)] = effects.as_slice() else {
+        panic!("expected a reason, got {effects:?}");
+    };
+    let op = waiting.operation;
+    assert_eq!(
+        waiting.reason.as_deref(),
+        Some("every live worker that can run it is cordoned: a")
+    );
+    // `a` goes silent and is gone: now nothing could run it.
+    h.at(100);
+    let (_, effects) = h.tick();
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Waiting(w)
+            if w.operation == op && w.reason.as_deref() == Some("no worker is connected"))),
+        "{effects:?}"
+    );
+    assert_eq!(
+        h.state(op),
+        &OpState::Queued,
+        "refused for time spent on a cordon"
+    );
+    h.at(109);
+    let (_, effects) = h.tick();
+    assert!(effects.is_empty(), "{effects:?}");
+    h.at(110);
+    let (_, effects) = h.tick();
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Commit(ControlRecord::Refusal(r)) if r.operation == op)),
+        "{effects:?}"
+    );
+
+    // Unservable, then a cordoned worker that could run it arrives: it waits for the
+    // cordon from then on, past the wait it had started.
+    let mut h = Harness::with(Scheduler::new(1).with_unservable_wait(wait));
+    h.submit(4);
+    let (_, effects) = h.tick();
+    let [Effect::Waiting(waiting)] = effects.as_slice() else {
+        panic!("expected a reason, got {effects:?}");
+    };
+    let op = waiting.operation;
+    h.at(5);
+    h.cordon("a");
+    h.worker("a");
+    for t in [5, 10, 50] {
+        h.at(t);
+        h.heartbeat("a");
+        h.tick();
+        assert_eq!(h.state(op), &OpState::Queued, "refused at {t} s");
+    }
+    assert_eq!(
+        h.s.waiting(op),
+        Some("every live worker that can run it is cordoned: a")
+    );
 }
 
 /// Catches: a drain that gives up or requeues a running lease, one that reports drained

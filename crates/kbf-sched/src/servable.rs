@@ -1,8 +1,8 @@
 //! Which live workers can run a request, for one placement round.
 //!
 //! A cordoned worker is not one of them: placement skips it, and work only it could
-//! run waits with that reason (and is refused after the unservable wait, as if the
-//! worker were gone). A worker can run a request if its capabilities satisfy the request's platform
+//! run waits with that reason for as long as the cordon lasts; it is never refused for
+//! it (a cordon is temporary by intent). A worker can run a request if its capabilities satisfy the request's platform
 //! (`kbf_caps::Request::matches`) and its whole capacity holds the request vector; it
 //! can run it now if its free room does. Matches are memoised per distinct platform
 //! request within the round, so a queue of many actions with the same platform matches
@@ -23,6 +23,9 @@ pub(crate) enum Verdict {
     Servable,
     /// None is; why, for the request's callers.
     Unservable(String),
+    /// None that placement may use is, but a cordoned one is; why, naming them. The
+    /// work waits: a cordon is temporary by intent, so it is not refused for it.
+    Cordoned(String),
 }
 
 /// The live workers of one round, and the platform matches made so far.
@@ -96,13 +99,17 @@ impl Servable {
     }
 
     /// Whether any live worker could run `request` once its bookings end, and if none
-    /// could, why. When only cordoned workers could, that is the reason.
+    /// could, why. When only cordoned workers could, that is the verdict; the cordoned
+    /// workers are looked at only then.
     pub(crate) fn verdict(
         &mut self,
         workers: &BTreeMap<WorkerId, Worker>,
         request: &Request,
     ) -> Verdict {
         let verdict = self.uncordoned_verdict(workers, request);
+        if verdict == Verdict::Servable {
+            return verdict;
+        }
         let could: Vec<&str> = self
             .cordoned
             .iter()
@@ -112,13 +119,13 @@ impl Servable {
             })
             .map(WorkerId::as_str)
             .collect();
-        match verdict {
-            Verdict::Unservable(_) if !could.is_empty() => Verdict::Unservable(format!(
-                "every live worker that can run it is cordoned: {}",
-                could.join(", ")
-            )),
-            verdict => verdict,
+        if could.is_empty() {
+            return verdict;
         }
+        Verdict::Cordoned(format!(
+            "every live worker that can run it is cordoned: {}",
+            could.join(", ")
+        ))
     }
 
     /// [`Self::verdict`] over the workers placement may use.
