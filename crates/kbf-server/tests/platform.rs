@@ -82,16 +82,13 @@ async fn each_action_runs_on_a_daemon_of_its_platform() {
 /// The unservable wait the refusal test runs with.
 const WAIT: Duration = Duration::from_secs(1);
 
-/// How much later than the wait a refusal may reach its caller: the server's ticks
-/// (50 ms in tests), committing the refusal and the stream, with room for a loaded
-/// machine. Less than the wait, so a server that waits twice as long is caught.
-const LATE: Duration = Duration::from_millis(900);
-
 /// Catches: an action no connected daemon can run handed to one that cannot, left
 /// queued forever without a word, or ended without the reason (or with a code a client
 /// would retry, or with MISSING details that would make it re-upload and retry). Also:
 /// the server's unservable wait not the one it was given (the default, or a multiple of
-/// it), seen as a refusal before the wait or well after it.
+/// it), seen as a refusal before the wait or as a refusal that names another wait. The
+/// refusal names the wait the scheduler held it for, so a longer wait is caught by its
+/// text, not by a wall-clock upper bound that a loaded machine could break.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_action_no_daemon_can_run_waits_with_a_reason_then_is_refused() {
     let cell = Cell::start_with_unservable_wait(WAIT).await;
@@ -112,13 +109,11 @@ async fn an_action_no_daemon_can_run_waits_with_a_reason_then_is_refused() {
         took >= WAIT,
         "refused after {took:?}, before the {WAIT:?} wait"
     );
-    assert!(
-        took < WAIT + LATE,
-        "refused after {took:?}, long after the {WAIT:?} wait"
-    );
     let status = response(&last).status.expect("a status");
     assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
     assert!(status.message.starts_with(&why), "{}", status.message);
+    let waited = format!("(waited {} s ", WAIT.as_secs());
+    assert!(status.message.contains(&waited), "{}", status.message);
     assert!(status.details.is_empty());
     linux.no_work().await;
 }
