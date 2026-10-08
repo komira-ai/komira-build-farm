@@ -180,7 +180,7 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
   everything keyed by that uid or name that survives deleting the home: crontab
   (`/usr/lib/cron/tabs`), `at` jobs (`/var/at`), Background Task Management entries,
   per-uid launchd overrides, pending print jobs, and files the uid owns in
-  `/Users/Shared` and the temporary folders. Root's walk never follows a symbolic link
+  macOS's shared user folder and the temporary folders. Root's walk never follows a symbolic link
   (other lease users may be active and could plant one): it opens each entry relative
   to its parent without following links, and removes the link, not its target.
 - **Which leases get what.** Every Mac lease gets `user-create`, `run` and
@@ -339,5 +339,5 @@ Each with the planted mutant that must turn it red:
 | The gate alerts on an erase even when the server sends no alert | route gate alerts through the server |
 | A node reporting a different serial than at first join is quarantined | accept the new serial |
 | A privileged lease's node is quarantined and its credential revoked at lease end | skip the revocation |
-| `user-delete` removes a planted crontab, `at` job and login item of the uid, and does not follow a planted symlink out of `/Users/Shared` | follow links in the sweep |
+| `user-delete` removes a planted crontab, `at` job and login item of the uid, and does not follow a planted symlink out of the shared user folder | follow links in the sweep |
 | A probe runs as a lease-range uid, from the installed set only | run probes as the daemon's user |
