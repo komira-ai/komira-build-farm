@@ -612,8 +612,9 @@ async fn the_gpu_count_comes_from_the_platform() {
 /// Catches: `kbf-book-cpus` or `kbf-book-mem-gib` dropped on the way to the scheduler
 /// (a large link step books 1 GiB and the native driver kills it at 2 GiB), one key
 /// replacing the other's default, a key read in its exact spelling only, a booking of
-/// zero or one that overflows accepted, and either key accepted on a `whole_machine`
-/// lease.
+/// zero or one that overflows accepted, a second spelling of a size (`+4`, `04`: the
+/// same booking, another cache entry) accepted, and either key accepted on a
+/// `whole_machine` lease.
 #[tokio::test]
 async fn the_booking_comes_from_the_platform() {
     let script = Arc::new(Script::default());
@@ -667,6 +668,13 @@ async fn the_booking_comes_from_the_platform() {
         ("half a core", vec![(BOOK_CPUS_KEY, "0.5")]),
         ("a negative size", vec![(BOOK_MEM_GIB_KEY, "-1")]),
         ("a word", vec![(BOOK_MEM_GIB_KEY, "lots")]),
+        ("a plus sign", vec![(BOOK_CPUS_KEY, "+4")]),
+        ("a plus sign on memory", vec![(BOOK_MEM_GIB_KEY, "+4")]),
+        ("a leading zero", vec![(BOOK_CPUS_KEY, "04")]),
+        ("a leading zero on memory", vec![(BOOK_MEM_GIB_KEY, "016")]),
+        ("zero spelled long", vec![(BOOK_CPUS_KEY, "00")]),
+        ("a space", vec![(BOOK_CPUS_KEY, " 4")]),
+        ("nothing", vec![(BOOK_MEM_GIB_KEY, "")]),
         ("too many cores", vec![(BOOK_CPUS_KEY, too_many.as_str())]),
         (
             "too much memory",
