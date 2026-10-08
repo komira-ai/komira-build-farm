@@ -4,7 +4,9 @@
 //! the daemon's user. The driver gives the overlay's directories to that id before the
 //! container is created and takes them back once it has exited, before reading the
 //! outputs. The fake records each `podman unshare chown` and changes no owner (a test
-//! runs as one user); `tests/podman.rs` checks the ids on real Podman.
+//! runs as one user); while the overlay is the container's once `start` has ended, it
+//! makes the upper directory unreadable, as a stranger's private files would be, until
+//! the hand-back. `tests/podman.rs` checks the ids on real Podman.
 
 mod support;
 
@@ -23,8 +25,10 @@ fn chowns(fake: &Fake) -> Vec<String> {
 /// Catches the overlay not being handed to the container's root before the container
 /// starts (the action could write nothing: the "drop the pre-chown" mutant), not being
 /// handed back after it exits (an output the action made `0600` could not be read:
-/// the "drop the chown-back" mutant), either one naming the wrong directories, and the
-/// hand-back running before the container has exited.
+/// the "drop the chown-back" mutant), handed back after the outputs are read (the
+/// fake's upper directory is still unreadable then: the "hand back after collect"
+/// mutant), either one naming the wrong directories, and the hand-back running before
+/// the container has exited.
 #[tokio::test]
 async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {
     let fake = Fake::new("owners");

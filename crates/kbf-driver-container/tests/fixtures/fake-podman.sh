@@ -26,7 +26,12 @@
 #   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
 #   events (in order: `cgroup.kill ended the action`, `start ended` once `start` has
 #   waited for the action and written its status, `rm`, `chown <owner> <paths...>`).
-#   The fake changes no owner: the test runs as one user.
+#   The fake changes no owner (the test runs as one user), but models what an owner
+#   other than the daemon's means: when `start` ends while the overlay is the
+#   container's (`chown 1:1` last, recorded in `owner`), it makes the upper directory
+#   unreadable (mode 000, the old mode kept in `upper-mode`), as files the action made
+#   private would be to the daemon's user; `chown 0:0` restores the mode. So outputs
+#   read before the overlay is handed back fail as they would on real Podman.
 set -u
 here=$(dirname "$0")
 STATE=$here/state
@@ -95,6 +100,11 @@ start)
         echo "exited $code" >"$STATE/status"
     fi
     echo "start ended" >>"$STATE/events"
+    if [ "$(cat "$STATE/owner" 2>/dev/null)" = 1:1 ]; then
+        upper=$(cat "$STATE/upper")
+        stat -c %a "$upper" >"$STATE/upper-mode"
+        chmod 000 "$upper"
+    fi
     exit "$code"
     ;;
 inspect)
@@ -133,6 +143,11 @@ unshare)
         if [ -f "$STATE/chown-fails" ] && [ "$(cat "$STATE/chown-fails")" = "$owner" ]; then
             echo "Error: chown refused" >&2
             exit 1
+        fi
+        echo "$owner" >"$STATE/owner"
+        if [ "$owner" = 0:0 ] && [ -f "$STATE/upper-mode" ]; then
+            chmod "$(cat "$STATE/upper-mode")" "$(cat "$STATE/upper")"
+            rm -f -- "$STATE/upper-mode"
         fi
         exit 0
     fi
