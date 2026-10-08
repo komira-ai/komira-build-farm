@@ -356,6 +356,11 @@ jobs:
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), and the fence across a suspend (issue #78).
       - run: cargo test -p kbf-daemon --lib --test suspend --locked
+      # The root helper for per-lease users: its unit tests, then the helper itself run
+      # as root (passwordless sudo) with real users, launchd, the sweep and the caller
+      # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
+      - run: cargo test -p kbf-mac-session --locked
+      - run: bash tools/ci/mac-session-tests.sh
       # kbf-mac-provision on this VM, as root, running the daemon built above: what a
       # hosted VM can prove (the script's header lists what it applies, asserts and
       # only reads). Last, because it changes this runner's settings.

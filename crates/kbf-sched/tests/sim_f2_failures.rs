@@ -12,7 +12,7 @@
 //! | F2.4 | a `Start` delayed beyond W; heartbeats at `START_GRACE` - 1 ms, exactly and + 1 ms | `f2_4_*` |
 //! | F2.6 | a worker suspended below T, between T and G, and above G | `f2_6_*` |
 //! | F2.7 | the leader's clock paused with its process | `f2_7_*` |
-//! | F2.9 | a server restart (ignored: issue #137) | `f2_9_*` |
+//! | F2.9 | a server restart (issue #137) | `f2_9_*` |
 //! | F2.10 | stale, duplicated and reordered session messages | `f2_10_*` |
 //! | F2.11 | lost and repeated results and acknowledgements | `f2_11_*` |
 //! | F2.12 | two daemons claiming one node id (ignored: issue #140) | `f2_12_*` |
@@ -35,9 +35,10 @@
 #[path = "sim/cell/mod.rs"]
 mod cell;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use cell::leader::term;
 use cell::worker::{End, Took};
 use cell::{Ctx, LeaderPlan, LogPlan, Plan, WorkerPlan, World, calm_network, check::CheckStats};
 use kbf_sched::fence::{LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
@@ -64,11 +65,11 @@ const _: () = assert!(W_MS + SECOND < G_MS);
 type Spans = BTreeMap<(u64, OperationId), Vec<(u64, u64, String)>>;
 
 /// The scenarios the sweeps run.
-const SCENARIOS: [&str; 9] = [
-    "F2.1", "F2.2", "F2.3", "F2.4", "F2.6", "F2.7", "F2.10", "F2.11", "F2.13",
+const SCENARIOS: [&str; 10] = [
+    "F2.1", "F2.2", "F2.3", "F2.4", "F2.6", "F2.7", "F2.9", "F2.10", "F2.11", "F2.13",
 ];
-/// The scenarios that fail today on a known bug: F2.9 on issue #137, F2.12 on #140.
-const KNOWN_BUGS: [&str; 2] = ["F2.9", "F2.12"];
+/// The scenarios that fail today on a known bug: F2.12 on issue #140.
+const KNOWN_BUGS: [&str; 1] = ["F2.12"];
 
 fn workers() -> Vec<WorkerPlan> {
     vec![
@@ -196,10 +197,11 @@ fn plan(name: &'static str, seed: u64) -> Plan {
                 LeaseId::new(1, 1_000_000),
             ];
             // A worker with no room, so it is never granted anything, that lists the
-            // first leases of this term: while one is held on another worker, it must be
-            // named for cancelling here (held, but not on this worker).
+            // first leases of this term (the first process's: F2.13 never restarts): while
+            // one is held on another worker, it must be named for cancelling here (held,
+            // but not on this worker).
             let mut lister = WorkerPlan::plain("worker-4", 0);
-            lister.phantoms = (0..48).map(|seq| LeaseId::new(1, seq)).collect();
+            lister.phantoms = (0..48).map(|seq| LeaseId::new(term(0), seq)).collect();
             plan.workers.push(lister);
         }
         other => panic!("no scenario {other}"),
@@ -573,14 +575,37 @@ fn f2_7_a_paused_leader_requeues_only_after_g_of_its_own_time() {
     reached("F2.7", "a pause long enough for workers to fence", fences);
 }
 
-/// F2.9. Catches: a restarted server that grants a lease id an old process granted to
-/// the same worker, and accepts the old run's result for the new operation.
+/// F2.9. Catches (issue #137): a restarted server that grants a lease id an old
+/// process granted to the same worker, and accepts the old run's result for the new
+/// operation (I5). Before the fix every process granted leases of term 1, and seed 0
+/// already failed I5. The sweep must reach a worker that held a lease of the old
+/// process when the new one welcomed it (and dropped it), and a sequence number both
+/// processes granted to one worker: the collision the fix makes harmless.
 #[test]
-#[ignore = "issue #137"]
 fn f2_9_after_a_server_restart_every_answer_comes_from_its_own_lease() {
+    let (mut dropped, mut collided) = (0, 0);
     for seed in 0..SEEDS {
-        run("F2.9", seed);
+        let w = run("F2.9", seed);
+        assert_eq!(w.leader().stats.restarts, 1, "F2.9 seed {seed}");
+        for (_, worker) in w.workers() {
+            dropped += worker.stats.superseded;
+            let seqs = |inc: u64| -> BTreeSet<u64> {
+                let starts = worker.starts.iter().filter(|s| s.incarnation == inc);
+                starts.map(|s| s.lease.seq).collect()
+            };
+            collided += seqs(0).intersection(&seqs(1)).count() as u64;
+        }
     }
+    reached(
+        "F2.9",
+        "a lease of the old process dropped on a Welcome",
+        dropped,
+    );
+    reached(
+        "F2.9",
+        "a sequence number both processes granted to one worker",
+        collided,
+    );
 }
 
 /// F2.10. Catches: a resent `Hello` (`Capacity`) that opens a session (a `Start` in

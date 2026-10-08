@@ -34,6 +34,15 @@ stream ends for any reason it waits `--reconnect-ms` and tries again. Leases kee
 running across reconnects, and the fence clock keeps running whether a stream is up or
 not.
 
+Each lease is remembered with the lease epoch the newest `Welcome` named when its
+`Start` arrived, and the action the `Start` named; every `Result` echoes that action.
+A `Welcome` that names another epoch comes from a server that never granted those
+leases (a restarted single-node server): before it resends anything, the daemon kills
+their runs and forgets their results, unsent, and lists them only until the runs have
+stopped. A `Welcome` that names no epoch drops nothing, and a lease granted while
+none was named is kept. See
+[worker-protocol.md](worker-protocol.md#server-restarts-and-the-lease-epoch).
+
 The contact clock records the **send** time of the newest message the server
 acknowledged (a heartbeat, or the `Hello` a `Welcome` answered):
 

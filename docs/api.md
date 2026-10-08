@@ -75,7 +75,7 @@ and where it is in placement:
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
       "received_at_unix_ms": 1791370000000 },
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
-                   "leases": ["1.42"] } },
+                   "leases": ["117399224320012061.42"] } },
   { "node_id": "old-1", "connected": false, "software": null,
     "placement": { "state": "serving" } }
 ] }
@@ -88,7 +88,7 @@ and where it is in placement:
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
-| `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` |
+| `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 

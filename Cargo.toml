@@ -21,7 +21,12 @@ axum = { version = "0.8.9", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
-# The MDM gate's grant key (kbf-mdm). Already in the tree through ssh-key.
+# macOS only (kbf-mac-session): CFData for the caller's audit token.
+core-foundation = "0.10.1"
+# The MDM gate's grant key (kbf-mdm) and the Mac's check of the grants it signs
+# (kbf-mac-session: pure Rust, so the helper is checked for the macOS target on any
+# host, which ring's C build does not allow). One major for both, already in the tree
+# through ssh-key.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
 futures = "0.3.34"
 hex = "0.4.3"
@@ -34,6 +39,10 @@ hmac = "0.13.0"
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 md-5 = "0.11.0"
+# macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
 prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.9.1"
@@ -53,6 +62,9 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
 saphyr-parser = "0.1.0"
+# macOS only (kbf-mac-session): the caller's code signature against a pinned
+# requirement (SecCodeCopyGuestWithAttributes, SecCodeCheckValidity).
+security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -84,6 +96,7 @@ kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-mdm = { path = "crates/kbf-mdm" }
 kbf-mdm-api = { path = "crates/kbf-mdm-api" }
 kbf-meta = { path = "crates/kbf-meta" }

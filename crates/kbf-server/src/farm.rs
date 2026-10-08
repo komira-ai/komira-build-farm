@@ -8,9 +8,14 @@
 //!
 //! **Single node.** The control log is this process: a record the scheduler asks to
 //! commit is committed as soon as it is appended, and fed straight back (see
-//! [`State::feed`]). The replicated log replaces exactly that step.
+//! [`State::feed`]). The replicated log replaces exactly that step. Since the leases
+//! die with the process, each process grants them under its own term
+//! ([`process_term`]), which it also names as its lease epoch in `Welcome` (issue
+//! #137).
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,8 +39,24 @@ use tonic::{Code, Status};
 
 use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView};
 
-/// The scheduler term of a single node. Raft supplies terms once it is wired.
-pub const SINGLE_NODE_TERM: u64 = 1;
+/// The scheduler term of a new single-node server process: the wall-clock time of its
+/// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
+///
+/// Every lease id a process grants carries its term, and a single node's leases live
+/// in its process alone, so a term two processes share would let a lease id name two
+/// leases: an old run's `Result` could be taken for another operation's (issue #137).
+/// While the wall clock does not step back across a restart, each term is greater
+/// than every earlier process's, as the scheduler's lease order expects of a newer
+/// leader's. If it does step back, the new term still differs from an earlier one
+/// unless the restart lands on that one's very millisecond and the random bits match
+/// (one chance in 65 536). The replicated log's term replaces this once it is wired.
+#[must_use]
+pub fn process_term() -> u64 {
+    let start = unix_ms();
+    // A `RandomState` is keyed from the operating system's random source.
+    let random = RandomState::new().hash_one(start) & 0xffff;
+    (start << 16) | random
+}
 
 /// Where the server sends a worker's messages: the outbound half of its stream.
 pub type Outbound = mpsc::UnboundedSender<Result<ServerMessage, Status>>;
@@ -48,6 +69,9 @@ pub struct StreamId(u64);
 #[derive(Debug)]
 pub struct Farm<M, O> {
     cache: Arc<Cache<M, O>>,
+    /// This process's scheduler term ([`process_term`]): every lease it grants carries
+    /// it, and `Welcome` names it as the lease epoch.
+    term: u64,
     epoch: Instant,
     /// The wall-clock time of `epoch`, in milliseconds since the Unix epoch: how farm
     /// times are shown to operators.
@@ -116,8 +140,9 @@ struct State {
     waiters: BTreeMap<WaiterId, Waiter>,
     names: BTreeMap<String, WaiterId>,
     links: BTreeMap<WorkerId, Link>,
-    /// Leases whose `Start` was sent, and their operations.
-    started: BTreeMap<LeaseId, OperationId>,
+    /// Leases whose `Start` was sent, with their operations and the action each
+    /// `Start` named.
+    started: BTreeMap<LeaseId, (OperationId, Digest)>,
     /// Each node's newest `NodeStatus`, kept across its streams.
     software: BTreeMap<WorkerId, SoftwareView>,
     /// Nodes whose drain has paused, once logged.
@@ -133,16 +158,19 @@ struct Settled {
 }
 
 impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
-    /// A farm over `cache`, with an empty scheduler that refuses queued work once no
-    /// live worker has been able to run it for `unservable_wait`.
+    /// A farm over `cache`, with an empty scheduler of a new term ([`process_term`])
+    /// that refuses queued work once no live worker has been able to run it for
+    /// `unservable_wait`.
     #[must_use]
     pub fn new(cache: Arc<Cache<M, O>>, unservable_wait: Duration) -> Self {
+        let term = process_term();
         Self {
             cache,
+            term,
             epoch: Instant::now(),
             epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
-                sched: Scheduler::new(SINGLE_NODE_TERM).with_unservable_wait(unservable_wait),
+                sched: Scheduler::new(term).with_unservable_wait(unservable_wait),
                 next_waiter: 0,
                 next_stream: 0,
                 waiters: BTreeMap::new(),
@@ -153,6 +181,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 paused: BTreeSet::new(),
             }),
         }
+    }
+
+    /// This process's scheduler term, which `Welcome` names as the lease epoch.
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
     }
 
     /// Farm time: milliseconds since this farm was built.
@@ -354,9 +388,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     }
 
     /// A `Result` from `worker`. Accepted only if `worker` holds the operation's
-    /// current lease; an accepted OK result is written to the action cache (unless the
-    /// action is `do_not_cache` or exited non-zero) before its callers are answered.
-    /// Returns the acknowledgement, or `None` for a `Result` without a lease id.
+    /// current lease, which this process granted, and the `Result` names no action but
+    /// the one that lease runs; an accepted OK result is written to the action cache
+    /// (unless the action is `do_not_cache` or exited non-zero) before its callers are
+    /// answered. Returns the acknowledgement, or `None` for a `Result` without a lease
+    /// id.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
         let wire_lease = result.lease_id?;
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
@@ -364,10 +400,20 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             lease_id: Some(wire_lease),
             accepted: false,
         };
-        let Some(operation) = self.lock().holder(lease, worker) else {
+        let holding = self.lock().holder(lease, worker);
+        let Some((operation, action)) = holding else {
             tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
             return Some(refused);
         };
+        // The lease id is this process's, so the run it reports was started for this
+        // operation; a daemon that says it ran another action is refused all the same
+        // (issue #137).
+        if let Some(named) = &result.action_digest
+            && *named != kbf_front::digest_to_proto(&action)
+        {
+            tracing::warn!(%worker, %lease, %action, "result refused: it names another action");
+            return Some(refused);
+        }
         let (outcome, mut detail) = self.outcome(lease, result).await;
 
         let now = self.now();
@@ -482,7 +528,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             },
         );
         // A caller that joined a twin already started sees it executing.
-        let joined_started = state.started.values().any(|op| {
+        let joined_started = state.started.values().any(|(op, _)| {
             state
                 .sched
                 .waiters(*op)
@@ -514,9 +560,11 @@ impl State {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
     }
 
-    /// The operation whose current lease is `lease`, if `worker` holds it.
-    fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<OperationId> {
-        let operation = *self.started.get(&lease)?;
+    /// The operation whose current lease is `lease`, and the action its `Start` named,
+    /// if `worker` holds it. Only this process's leases are in `started`, so a lease
+    /// of an earlier process (another term) is never one.
+    fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<(OperationId, Digest)> {
+        let (operation, action) = *self.started.get(&lease)?;
         let current = match self.sched.state(operation)? {
             OpState::Leased {
                 lease: held,
@@ -529,7 +577,7 @@ impl State {
             } => *held == lease && holder == worker,
             _ => false,
         };
-        current.then_some(operation)
+        current.then_some((operation, action))
     }
 
     /// Feeds an input that cannot lead to an answer: only a `Report` proposes a result,
@@ -625,7 +673,8 @@ impl State {
         for w in waiters.iter().filter_map(|id| self.waiters.get(id)) {
             w.stage.send_replace(Stage::Executing);
         }
-        self.started.insert(start.lease, start.operation);
+        self.started
+            .insert(start.lease, (start.operation, start.key.action));
     }
 
     /// Tells an operation's callers why it waits, or that it no longer waits for a
@@ -658,7 +707,7 @@ impl State {
 
     /// Forgets every lease of a finished `operation` whose `Start` was sent.
     fn forget_leases(&mut self, operation: OperationId) {
-        self.started.retain(|_, op| *op != operation);
+        self.started.retain(|_, (op, _)| *op != operation);
     }
 
     /// Forgets an operation the scheduler refused and answers its callers
@@ -741,5 +790,23 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     worker::LeaseId {
         term: lease.term,
         seq: lease.seq,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a server process that reuses an earlier process's term (issue #137:
+    /// every process granted leases from `(1, 0)`), and one whose term does not order
+    /// after that of a process started a few milliseconds before. A term is also never
+    /// 1, the term every server before the fix used.
+    #[test]
+    fn each_process_term_is_new_and_later() {
+        let first = process_term();
+        std::thread::sleep(Duration::from_millis(3));
+        let second = process_term();
+        assert!(second > first, "{second} does not order after {first}");
+        assert!(first >> 16 > 0, "{first} could be a pre-fix term");
     }
 }

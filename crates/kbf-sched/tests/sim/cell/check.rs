@@ -37,7 +37,7 @@ use kbf_types::{
     WorkerId,
 };
 
-use super::leader::TERM;
+use super::leader::term;
 use super::{Ctx, result_digest};
 
 #[derive(Clone, Debug)]
@@ -533,7 +533,7 @@ impl Check {
             if !running.contains(lease) {
                 self.fail("N", format!("{lease} named, not listed"));
             }
-            if lease.term != TERM {
+            if lease.term != term(self.incarnation) {
                 self.fail("N", format!("{lease} of another term named for cancelling"));
             }
             if !self.grants.contains_key(lease) {
@@ -547,7 +547,7 @@ impl Check {
             }
         }
         for lease in running {
-            let ours = lease.term == TERM && self.grants.contains_key(lease);
+            let ours = lease.term == term(self.incarnation) && self.grants.contains_key(lease);
             if !ours {
                 self.stats.foreign_listed += 1;
             } else if !here.contains(lease) {
