@@ -301,15 +301,6 @@ impl<C: Cas> PodmanRuntime<C> {
                 )));
             }
         }
-        // The container has exited: hand its files back to the daemon's user, so an
-        // output the action left unreadable to others is still read, as its owner.
-        self.podman
-            .chown(
-                DAEMON_OWNER,
-                &[&spec.input_root, &spec.upper, &spec.overlay_work],
-            )
-            .await
-            .map_err(RuntimeError::Failed)?;
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
