@@ -54,8 +54,16 @@ minos=$(awk '$1 == "minos" { print $2 }' <<<"$build")
 [ "$minos" = "$MACOSX_DEPLOYMENT_TARGET" ] || { echo "minos is '$minos', want '$MACOSX_DEPLOYMENT_TARGET'" >&2; exit 1; }
 
 # 4
-inserted "$bin"
-echo "hardened: the signed binary started and ignored DYLD_INSERT_LIBRARIES"
+sip=$(csrutil status 2>&1 || true)
+echo "$sip"
+if inserted "$bin"; then
+  echo "hardened: the signed binary started and ignored DYLD_INSERT_LIBRARIES"
+elif [[ "$sip" != *enabled* ]]; then
+  echo "::warning::dyld honoured DYLD_INSERT_LIBRARIES for the hardened binary; SIP is not enabled here ($sip)"
+else
+  echo "the signed binary honoured DYLD_INSERT_LIBRARIES with SIP enabled" >&2
+  exit 1
+fi
 
 cdhash=$(sed -n 's/^CDHash=//p' <<<"$info")
 echo "signed $bin: flags $flags, cdhash $cdhash"
