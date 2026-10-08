@@ -37,7 +37,7 @@ if inserted "$unhardened" >/dev/null 2>&1; then
 fi
 echo "control: dyld refused the unhardened binary with a missing inserted library"
 
-codesign --force --sign - --options runtime "$bin"
+codesign --force --sign - "$bin"  # MUTANT: no hardened runtime
 
 # 1
 codesign --verify --strict --verbose=2 "$bin"
