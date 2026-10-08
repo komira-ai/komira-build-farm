@@ -13,7 +13,9 @@
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{BorrowedFd, OwnedFd};
+use std::time::Instant;
 
+use rustix::net::sockopt::{Timeout, set_socket_timeout};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
@@ -115,7 +117,23 @@ pub fn recv<T: for<'de> Deserialize<'de>>(
     socket: BorrowedFd<'_>,
     max_fds: usize,
 ) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
-    recv_frame(socket, max_fds)?
+    recv_frame(socket, max_fds, None)?
+        .map(|(body, fds)| Ok((serde_json::from_slice(&body)?, fds)))
+        .transpose()
+}
+
+/// [`recv`], with the whole frame due by `deadline`: each read waits only for what is
+/// left until then (it sets the socket's receive timeout), so a sender that trickles
+/// bytes cannot stretch the wait.
+///
+/// # Errors
+/// As [`recv`]; [`io::ErrorKind::TimedOut`] once the deadline has passed.
+pub fn recv_by<T: for<'de> Deserialize<'de>>(
+    socket: BorrowedFd<'_>,
+    max_fds: usize,
+    deadline: Instant,
+) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
+    recv_frame(socket, max_fds, Some(deadline))?
         .map(|(body, fds)| Ok((serde_json::from_slice(&body)?, fds)))
         .transpose()
 }
@@ -167,10 +185,11 @@ fn write_all(socket: BorrowedFd<'_>, mut rest: &[u8]) -> io::Result<()> {
 fn recv_frame(
     socket: BorrowedFd<'_>,
     max_fds: usize,
+    deadline: Option<Instant>,
 ) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     let mut fds = Vec::new();
     let mut header = [0u8; 4];
-    let got = fill(socket, &mut header, &mut fds)?;
+    let got = fill(socket, &mut header, &mut fds, deadline)?;
     if got == 0 {
         return Ok(None);
     }
@@ -185,7 +204,7 @@ fn recv_frame(
         ));
     }
     let mut body = vec![0u8; len];
-    if fill(socket, &mut body, &mut fds)? < len {
+    if fill(socket, &mut body, &mut fds, deadline)? < len {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     if fds.len() > max_fds {
@@ -197,19 +216,37 @@ fn recv_frame(
     Ok(Some((body, fds)))
 }
 
-/// Fills `buf` from the socket, collecting attached descriptors. Returns how many
-/// bytes came: fewer than `buf` holds only if the stream ended.
-fn fill(socket: BorrowedFd<'_>, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
+/// Fills `buf` from the socket, collecting attached descriptors, by `deadline` if
+/// there is one. Returns how many bytes came: fewer than `buf` holds only if the
+/// stream ended.
+fn fill(
+    socket: BorrowedFd<'_>,
+    buf: &mut [u8],
+    fds: &mut Vec<OwnedFd>,
+    deadline: Option<Instant>,
+) -> io::Result<usize> {
+    let late = || io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
     let mut got = 0;
     while got < buf.len() {
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(late());
+            }
+            set_socket_timeout(socket, Timeout::Recv, Some(left))?;
+        }
         let mut space = [MaybeUninit::uninit(); CONTROL_BYTES];
         let mut control = RecvAncillaryBuffer::new(&mut space);
-        let message = rustix::net::recvmsg(
+        let message = match rustix::net::recvmsg(
             socket,
             &mut [IoSliceMut::new(&mut buf[got..])],
             &mut control,
             recv_flags(),
-        )?;
+        ) {
+            // The receive timeout set above ran out: the deadline passed.
+            Err(rustix::io::Errno::AGAIN) if deadline.is_some() => return Err(late()),
+            other => other?,
+        };
         for received in control.drain().filter_map(rights) {
             for fd in received {
                 close_on_exec(&fd)?;
@@ -401,6 +438,34 @@ mod tests {
                 .to_string()
                 .contains("too large")
         );
+    }
+
+    /// Catches: `recv_by` waiting per read instead of to its deadline, checking the
+    /// deadline only after reading, or a plain `recv`'s own read timeout reported as a
+    /// passed deadline.
+    #[test]
+    fn recv_by_ends_at_its_deadline() {
+        use std::time::Duration;
+        let frame = [0, 0, 0, 8, b'"', b'k', b'i', b'l', b'l', b'e', b'd', b'"'];
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(&frame).unwrap();
+        let late = recv_by::<Reply>(b.as_fd(), 0, Instant::now()).unwrap_err();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut);
+        let soon = Instant::now() + Duration::from_secs(10);
+        let (reply, _) = recv_by::<Reply>(b.as_fd(), 0, soon).unwrap().unwrap();
+        assert_eq!(reply, Reply::Killed);
+        // Half a frame, the rest never sent (`a` stays open): refused at the deadline.
+        a.write_all(&frame[..6]).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(50);
+        let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Without a deadline, a read timeout set on the socket is its own error.
+        let (_a, b) = UnixStream::pair().unwrap();
+        b.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let error = recv::<Reply>(b.as_fd(), 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
     }
 
     /// What a short `sendmsg` leaves is written after it, whole. (A blocking Unix

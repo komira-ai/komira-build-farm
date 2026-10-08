@@ -352,7 +352,7 @@ fn a_caller_that_sends_nothing_is_dropped() {
         matches!(&reply, Reply::Refused { reason } if reason.starts_with("bad request")),
         "{reply:?}"
     );
-    // A timeout the socket does not take is a refusal, not a wait without end.
+    // A zero timeout refuses at once; it is not a wait without end.
     let (caller_end, helper_end) = UnixStream::pair().unwrap();
     connection(&helper_end, &helper, check.as_ref(), Duration::ZERO);
     proto::recv::<Reply>(caller_end.as_fd(), 0)
@@ -361,10 +361,63 @@ fn a_caller_that_sends_nothing_is_dropped() {
     let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
         .unwrap()
         .unwrap();
+    assert_eq!(
+        reply,
+        Reply::Refused {
+            reason: "bad request: the deadline passed".to_owned()
+        }
+    );
+}
+
+/// Catches: a timeout per read only, under which a caller that sends one byte at a
+/// time, each within the timeout, holds a thread for as long as it likes. Here each
+/// byte comes 100 ms after the last, well within the 400 ms; the 24 bytes would take
+/// 2.4 s, and the request is refused at 400 ms.
+#[test]
+fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
+    use std::io::Write as _;
+    use std::time::Instant;
+    trace();
+    let dir = scratch("server-drip");
+    let helper = quiet_helper(&dir);
+    let (caller_end, helper_end) = UnixStream::pair().unwrap();
+    let check = Scripted::fixed(Ok(()));
+    let served = std::thread::spawn(move || {
+        connection(
+            &helper_end,
+            &helper,
+            check.as_ref(),
+            Duration::from_millis(400),
+        );
+    });
+    let hello = proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(matches!(hello, Reply::Hello { .. }), "{hello:?}");
+    let start = Instant::now();
+    let mut dripper = caller_end.try_clone().unwrap();
+    let drip = std::thread::spawn(move || {
+        // A frame of 20 bytes, then those bytes; the helper hangs up partway.
+        for byte in [0, 0, 0, 20].into_iter().chain([b'x'; 20]) {
+            std::thread::sleep(Duration::from_millis(100));
+            if dripper.write_all(&[byte]).is_err() {
+                return;
+            }
+        }
+    });
+    let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
+        .unwrap()
+        .unwrap();
+    let waited = start.elapsed();
     assert!(
-        matches!(&reply, Reply::Refused { reason } if reason.contains("setting a read timeout")),
+        matches!(&reply, Reply::Refused { reason } if reason.contains("deadline")),
         "{reply:?}"
     );
+    assert!(waited < Duration::from_millis(1500), "{waited:?}");
+    served.join().unwrap();
+    drop(caller_end);
+    drip.join().unwrap();
 }
 
 #[test]

@@ -10,7 +10,8 @@
 //!    other end is identified and checked; a refused caller is told so and its
 //!    connection closed unread.
 //! 2. The helper then sends [`Reply::Hello`] with a fresh random nonce, and waits at
-//!    most [`REQUEST_TIMEOUT`] for the request, which must carry that nonce: a request
+//!    most [`REQUEST_TIMEOUT`] in all for the whole request (not per read: a caller
+//!    that trickles bytes gains nothing), which must carry that nonce: a request
 //!    written before the check (by a process that then executed the genuine daemon)
 //!    cannot know it.
 //! 3. With the request read, the process at the other end is identified again and must
@@ -32,14 +33,14 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, CWD, Gid, Mode, OFlags};
 
 use crate::helper::{Helper, Outcome};
 use crate::proto::{self, Call, RUN_FDS, Reply};
 
-/// How long a checked caller has to send its request.
+/// How long a checked caller has, in all, to send its whole request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The process at the other end of a connection, as the kernel names it.
@@ -134,8 +135,8 @@ pub fn serve(
     }
 }
 
-/// One connection: check the caller, say hello, read the request (waiting at most
-/// `timeout`), check that the same process sent it, act, reply.
+/// One connection: check the caller, say hello, read the request (all of it due within
+/// `timeout` of the hello), check that the same process sent it, act, reply.
 pub fn connection(
     stream: &UnixStream,
     helper: &Helper,
@@ -166,10 +167,8 @@ pub fn connection(
             nonce: nonce.clone(),
         },
     );
-    if let Err(why) = stream.set_read_timeout(Some(timeout)) {
-        return refuse(format!("setting a read timeout: {why}"));
-    }
-    let (call, fds) = match proto::recv::<Call>(stream.as_fd(), RUN_FDS) {
+    let deadline = Instant::now() + timeout;
+    let (call, fds) = match proto::recv_by::<Call>(stream.as_fd(), RUN_FDS, deadline) {
         Ok(Some(received)) => received,
         Ok(None) => return,
         Err(why) => {
