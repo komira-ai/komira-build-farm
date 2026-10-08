@@ -305,13 +305,13 @@ xcode_build() {
 
 # ---------------------------------------------------------------- the items
 
-ITEMS="macos_version macos_build hostname admin_user role_user power_sleep power_standby power_powernap power_autorestart power_womp updates_auto_install_macos updates_auto_install_security updates_config_data appstore_auto_update remote_login ssh_password_auth firewall filevault autologin time_server time_max_offset_ms xcode default_developer_dir probe simulator_runtimes launchd_label"
+ITEMS="macos_version macos_build hostname admin_user role_user power_sleep power_standby power_powernap power_autorestart power_womp updates_auto_download updates_auto_install_macos updates_auto_install_security updates_config_data appstore_auto_update remote_login ssh_password_auth firewall filevault autologin time_server time_max_offset_ms xcode default_developer_dir probe simulator_runtimes launchd_label"
 CHECK_ONLY=" macos_version macos_build admin_user filevault probe simulator_runtimes "
 VERIFY_27="the SoftwareUpdate payload is removed in macOS 27: verify the pinned version honours this local preference"
 
 pref_key() {
   case "$1" in
-    updates_auto_download) echo AutomaticDownload ;;
+    updates_auto_download) echo AutomaticallyInstallMacOSUpdates ;;
     updates_auto_install_macos) echo AutomaticallyInstallMacOSUpdates ;;
     updates_auto_install_security) echo CriticalUpdateInstall ;;
     updates_config_data) echo ConfigDataInstall ;;
