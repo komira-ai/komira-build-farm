@@ -157,6 +157,28 @@ fn a_gate_grant_is_bound_to_its_mac_lease_and_key() {
     }
 }
 
+/// Catches: the lease compared by prefix in either direction, so a grant for lease
+/// `lease-1` would admin the user of lease `lease-10`, or of lease `lease-`.
+#[test]
+fn a_gate_grant_is_refused_for_a_lease_sharing_its_prefix() {
+    for fixture in &FIXTURES {
+        let longer = format!("{}0", fixture.lease);
+        let mut shorter = fixture.lease.to_owned();
+        shorter.pop();
+        for lease in [longer.as_str(), shorter.as_str()] {
+            let expect = Expect {
+                lease,
+                ..fixture.at(fixture.issued + 60)
+            };
+            refused(
+                verify(fixture.token, &fixture.keys(), expect),
+                "lease",
+                &format!("{} as lease {lease:?}", fixture.lease),
+            );
+        }
+    }
+}
+
 /// Catches: a signature checked over anything but the exact payload bytes, so a
 /// grant edited in transit (another lease, a later not-after) or paired with another
 /// grant's signature still passes.

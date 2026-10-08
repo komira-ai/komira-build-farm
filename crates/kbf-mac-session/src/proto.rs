@@ -441,7 +441,8 @@ mod tests {
     }
 
     /// Catches: `recv_by` waiting per read instead of to its deadline, checking the
-    /// deadline only after reading, or a plain `recv`'s own read timeout reported as a
+    /// deadline only after reading, the receive timeout set once rather than before
+    /// every read (a short read then restarts the full wait), or a plain `recv`'s own read timeout reported as a
     /// passed deadline.
     #[test]
     fn recv_by_ends_at_its_deadline() {
@@ -461,6 +462,25 @@ mod tests {
         let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
         assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
         assert!(start.elapsed() < Duration::from_secs(5));
+        // Half a header 300 ms in, then nothing: the first read waits 300 ms and comes
+        // back short, so the next read may wait only the 200 ms left. A receive timeout
+        // set once, before the first read, would let it wait the whole 500 ms again.
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(500);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            a.write_all(&frame[..2]).unwrap();
+            a
+        });
+        let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "the deadline was 500 ms, refused after {elapsed:?}"
+        );
+        drop(writer.join().unwrap());
         // Without a deadline, a read timeout set on the socket is its own error.
         let (_a, b) = UnixStream::pair().unwrap();
         b.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
