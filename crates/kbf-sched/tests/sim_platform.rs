@@ -135,7 +135,7 @@ impl World {
         let mut outage = BTreeMap::new();
         for (name, c) in workers() {
             caps.insert(name.to_owned(), c);
-            // Each outage outlasts the grace, so the worker is seen to leave; the
+            // Each outage lasts at least the grace, so the worker is seen to leave; the
             // longer ones outlast the grace and the wait, so work is refused.
             let length = |rng: &mut SimRng| rng.between(GRACE, GRACE + 2 * WAIT.as_secs());
             let from = rng.below(SUBMIT_UNTIL / 4);
