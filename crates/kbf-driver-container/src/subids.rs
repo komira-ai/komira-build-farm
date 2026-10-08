@@ -258,11 +258,9 @@ mod tests {
         ] {
             let files = files(name, Some(text), Some(text));
             let error = check_subordinate_ids(&files, 990).expect_err(name);
-            let counted = match error {
-                SubidError::TooFew { count, .. } => Some(count),
-                _ => None,
-            };
-            assert_eq!(counted, Some(count), "{name}");
+            // Only `TooFew` says "subordinate ids;", after the count.
+            let says = format!("(uid 990) {count} subordinate ids;");
+            assert!(error.to_string().contains(&says), "{name}: {error}");
         }
         let huge = format!("kbf:1:{max}\n990:0:2\n", max = u64::MAX);
         let files = files("huge", Some(&huge), Some(&huge));
