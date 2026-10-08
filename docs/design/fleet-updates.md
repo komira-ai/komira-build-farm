@@ -17,6 +17,9 @@ and only used here. Merge order: this PR (#87), then #85, then #76.
 **The security model** (threat model, root helpers and who may call them, signing
 keys, credentials, the MDM gate, enrollment) is in
 [fleet-updates-security.md](fleet-updates-security.md); sections there are "S1"...
+**The MDM as a backend** (the three operations the server uses, erase as an
+operator-signed action, network, moving the MDM, configuration management) is in
+[mdm-backend.md](mdm-backend.md); sections there are "M1"...
 
 **#76 reflects these points (its sections 6.1-6.3):** the server computes "update
 available" (3.2), MDM is decided (7), and `softwareupdate` with a stored password
@@ -34,10 +37,10 @@ reference deployment's hardware). Section 14 collects them.
 | State | Each node reports what it runs (observed). Each pool has a signed *software set* (desired). "Update available" is computed by the server, never by the node. |
 | Rollout | cordon, drain, apply, reboot, re-handshake, qualify, uncordon; one node at a time per pool by default; a canary and a soak first; any failed gate halts the rollout and alerts. The rollout record is durable before any node is touched. |
 | Who applies | `kbf-updater`, a small root helper with fixed verbs that installs only manifests signed by the operator's CI for its own pool and platform. On Macs a second root helper, `kbf-mac-session`, owns per-lease users. `kbf-daemon` stays unprivileged, and no action can reach either helper. macOS itself is updated through MDM, because Apple leaves no supported unattended path on macOS 27 that does not keep a volume owner's password on the node. |
-| Mac | Apple Business Manager plus a self-hosted open-source MDM (NanoHUB), behind a narrow gate (`kbf-mdm-gate`) so that `kbf-server` cannot erase every Mac. Xcodes are installed side by side on the host and selected per action; simulator runtimes live only in VM images (#85). |
+| Mac | Apple Business Manager plus a self-hosted open-source MDM (NanoHUB), behind a narrow gate (`kbf-mdm-gate`); `kbf-server` cannot erase a Mac at all (an erase needs an operator's hardware-key signature, M4). Xcodes are installed side by side on the host and selected per action; simulator runtimes live only in VM images (#85). |
 | Linux | No Apple-style MDM protocol exists for Linux; root plus `kbf-updater` plays that role. v1: the distribution's packages pinned to a dated archive snapshot. Target: an image-based OS (bootc) with automatic rollback. |
 | GPU | No GPU in VMs. A GPU test, including a desktop-app plus local-LLM test, is a `kbf-lease=whole_machine` lease with `gpu=1` that empties the bare-metal Mac, one at a time. |
-| App isolation | A throwaway non-admin user per lease, a leak scan against a baseline, a reboot on doubt, and a remote erase and automatic re-enrollment when a leak persists. |
+| App isolation | A throwaway non-admin user per lease, a leak scan against a baseline, a reboot on doubt, and, when a leak persists, quarantine, then an operator-signed remote erase and automatic re-enrollment. |
 | UI | A Fleet page: per worker OS, build, kernel or Xcode, update available, state. **Update** per worker; **Update all Linux workers** and **Update all Mac workers** start rolling updates. |
 | Hands | Still needed for: enrolling Macs bought outside Apple Business Manager (once each), yearly certificate renewals, one Xcode download per release, Screen Recording grants, a Mac that will not boot, and hardware. |
 
@@ -59,8 +62,9 @@ A node joins by opening the worker stream and completing the handshake
   installed is a software set that the operator's CI built and signed from a reviewed
   change.
 
-A compromised `kbf-server` can install only signed sets for a node's own pool, erase
-or force-update one Mac at a time within the gate's caps, and deny service. A
+A compromised `kbf-server` can install only signed sets for a node's own pool,
+force-update one Mac per pool at a time within the gate's caps, and deny service; it
+cannot erase a Mac (M4). A
 compromised MDM host, CI or `main` branch is more serious; S1 states each plainly.
 
 ## 3. Node software state
@@ -284,8 +288,8 @@ repeats a half-done step blindly.
   old artifacts, 3.2), with the same gates. It works where the old artifacts can be
   installed again: Linux on bootc (switch to the old image digest), Linux kernels and
   snapshots, Xcode, VM images, the profile and `kbf-daemon` (all
-  side by side). **A macOS update cannot be rolled back**; the repair is an erase and
-  re-provision at the pool's set (section 7.5). The UI says this before a macOS
+  side by side). **A macOS update cannot be rolled back**; the repair is an
+  operator-signed erase and re-provision at the pool's set (7.5, M4). The UI says this before a macOS
   rollout starts.
 
 Prior art: Kured ([kured](https://kured.dev/docs/configuration/)), FleetLock
@@ -516,7 +520,7 @@ way to block updates. This path is for the time before MDM is live, not a design
   **[V]**. "Return to Service" is not available on macOS (same file) **[V]**, so the
   erased Mac comes back through ADE and Auto Advance. That this chain runs end to end
   with no person on 27 is **[A]**: one probe settles it. Every erase goes through the
-  gate (7.6).
+  gate and carries an operator's hardware-key signature (M4).
 - **Cost of a full re-provision** (erase, enrollment, profile, Xcode, VM images,
   cache refill): about 45 to 90 minutes **[A]**. A repair step, not a per-lease step.
 - **Activation Lock.** Never sign an Apple Account into a node. Apple Business Manager
@@ -553,22 +557,25 @@ way to block updates. This path is for the time before MDM is live, not a design
   Setup Assistant, before any profile is installed, so its certificate must chain to a
   publicly trusted CA, or the ADE enrollment profile must carry the private CA as an
   anchor certificate **[A]** (to read in Apple's ADE profile reference before P3).
-- **Where it runs.** On one Linux node under its own uid, never beside `kbf-server`;
-  whether that node is also a worker is an open CEO decision (S7, lean: a dedicated
-  node). Its enrollment and check-in endpoints must be reachable on the rack network,
-  not only on an overlay network, because a freshly erased Mac enrolls before any
-  overlay client is installed. Its API is not: only `kbf-mdm-gate` holds the API key.
+- **Where it runs.** Under its own uid, never beside `kbf-server`; it may start on a
+  host outside the build pool and move later (M7); where it settles is an open
+  decision (S7). Its enrollment and check-in endpoints must be reachable on the rack
+  network, not only on an overlay network, because a freshly erased Mac enrolls
+  before any overlay client is installed (M6). Its API is not: only `kbf-mdm-gate`
+  holds the API key.
 - **`kbf-mdm-gate`** (decision: build it, S5). A small process beside the MDM that
   holds the API key and offers `kbf-server`, over mTLS pinned to the server's
-  identity, only: `enforce` of a build a signed set names for that Mac's pool,
-  `withdraw`, `erase` one Mac at a time within a daily cap (default 2), and status
-  reads. Every verb is limited to the gate's own inventory and keeps a Mac floor
+  identity, only the three operations of M2: inventory, `enforce` (and `withdraw`) of
+  a build a signed set names for that Mac's pool, and install of an allowlisted
+  profile. **Erase is not among them:** the gate erases only on a request signed by
+  an operator's hardware-backed key (M4), one Mac at a time within a daily cap
+  (default 2). Every verb is limited to the gate's own inventory and keeps a Mac floor
   counted from MDM check-ins; every erase and enforcement alerts natively, without
   the server.
-- **kbf stays generic.** kbf ships no MDM. `kbf-server` talks to the gate through an
-  `OsUpdateBackend` trait (crate `kbf-mdm`, which also holds the gate); the first
-  backend targets NanoHUB's API **[A]**. Nodes map to enrollments by the serial and
-  platform UUID the daemon reports. The MDM decides nothing.
+- **kbf stays generic.** kbf ships no MDM. The gate drives the MDM through the
+  `MdmBackend` trait (crate `kbf-mdm`, which also holds the gate): NanoHUB first, a
+  hosted MDM with a separate wipe privilege optional (M5). Nodes map to enrollments by
+  the serial and platform UUID the daemon reports. The MDM decides nothing.
 
 ## 8. The Linux path
 
@@ -690,8 +697,8 @@ scan covers.
 | L1 | once per Mac, at provisioning | `automationmodetool` run as root by the provisioning profile; Setup Assistant panes skipped for new users (MDM profile); Full Disk Access for `kbf-mac-session` (MDM profile); managed login items for kbf's own services (MDM) | 0 per lease |
 | L2 | every whole-machine lease that needs a GUI session, in `preparing` and `restoring` | auto-login into the lease user, then a userspace restart (or a full reboot); at the end auto-login is cleared and the same restart returns the Mac to the login window | 1-4 min each way |
 | L3 | every Mac lease: cleanup; whole-machine leases: also the scan | cleanup (kill the uid, delete the user, sweep its state, S4.2); for whole-machine leases a leak scan against the node's baseline | 30-60 s |
-| L4 | a leak; always after a privileged lease | after a leak: reboot and scan again, and if still dirty quarantine, erase through the gate, re-provision, re-qualify. After a privileged lease: straight to the erase | 45-90 min |
-| L5 | about monthly per Mac, one at a time | a scheduled erase anyway: proves the repair path works and resets state no scan sees | 45-90 min |
+| L4 | a leak; always after a privileged lease | after a leak: reboot and scan again, and if still dirty quarantine and alert; an operator signs the erase (M4); re-provision, re-qualify. After a privileged lease: straight to the erase the operator signed before the lease (M4.4) | 45-90 min |
+| L5 | about monthly per Mac, one at a time | an operator-signed erase anyway: proves the repair path works and resets state no scan sees | 45-90 min |
 
 Overhead per desktop-app lease without a leak: about 3 to 9 minutes **[A]** (two
 session switches plus cleanup and scan), small next to an LLM test.
@@ -706,7 +713,8 @@ Notes on each layer:
   administrator. An administrator can reach root, and no later scan can prove a clean
   state against root, so **a privileged lease always ends in an erase** (L4's erase,
   45-90 minutes), with the node's identity revoked and quarantined first, and it needs
-  an explicit client permission and spare erase budget (S8). Every other lease user is
+  an explicit client permission, spare erase budget and an operator-signed erase for
+  that Mac held by the gate before the lease is placed (S8, M4.4). Every other lease user is
   non-admin. App teams should ship a per-user install path for most tests. The MDM's
   managed administrator (7.5) is never a lease user.
 - **L1, UI automation.** `automationmodetool enable-automationmode-without-authentication`
@@ -799,6 +807,8 @@ Macs, the queued actions per pinned host value (section 6).
   arm64), each pool with its own canary, `max_unavailable` and `min_serving`.
   **Update all Mac workers**: the same for the Mac pools.
 - **Pause, Resume, Skip node, Cancel, Roll back** on a running rollout.
+- **Erase** on a Mac row: shows the `kbf-admin erase` command the operator runs and
+  signs with their security key; the server only relays the signed request (M4.2).
 
 A button is disabled, with the reason shown, when it cannot work: a Mac not
 supervised or without an escrowed bootstrap token; an Xcode that is not available to
@@ -839,6 +849,8 @@ Roles (`admin`, and CI's short-lived `rollout`, which sends only `target` and a 
   `soak`, `window`, `accept_outage`).
 - `GET /v1/rollouts/{id}`; `POST /v1/rollouts/{id}:pause`, `:resume`, `:skip`,
   `:cancel`, `:rollback`. Progress goes to the event stream.
+- `POST /v1/macs/{serial}:erase`: body is an operator-signed erase request (M4.2),
+  forwarded to the gate unchanged.
 
 ## 12. Remote recovery without a BMC
 
@@ -849,7 +861,7 @@ Mac Studios have no BMC. What replaces it:
 | Hung Mac | power-cycle through a switched PDU outlet; `pmset autorestart 1` boots it on power return | a switched PDU **[A]** |
 | Hung Mac, no PDU | Lights Out Management: an enrolled controller Mac starts, stops or restarts it; Apple lists Mac Studio models ([LOM](https://support.apple.com/guide/deployment/lights-out-management-payload-settings-dep580cf25bc/web)) **[V]** | MDM and one controller Mac on the same subnet over Ethernet (IPv6) **[V]**; a second controller is a redundancy choice, not Apple's requirement; that it resets a panicked Mac is **[A]** |
 | Hung Mac, cabled neighbour | `macvdmtool reboot` restarts the target Mac over a USB-C cable from a neighbour ([macvdmtool](https://github.com/AsahiLinux/macvdmtool)) **[V]**, unofficial | a cable to the right port; which port on a Mac Studio is **[A]** (the README lists ports for MacBook Air, MacBook Pro and Mac mini only) |
-| Bad software, leak, drift | erase through the gate and automatic re-provision (7.5) | MDM, ABM |
+| Bad software, leak, drift | operator-signed erase through the gate and automatic re-provision (7.5, M4) | MDM, ABM, an operator's touch |
 | Will not boot, firmware failure | DFU restore from a cabled neighbour Mac (`macvdmtool dfu`, then `cfgutil restore`) **[A]** for Mac Studio, unofficial | a cable in the DFU port; moving it needs a person |
 | Hardware | none | a person |
 
@@ -870,7 +882,7 @@ without a BMC; an Xcode download per Mac if counsel rejects both mirror and copi
 | P0 probes | on one Mac: DDM enforcement with a near deadline on 27; erase then ADE and Auto Advance; `automationmodetool` as root and across user deletion; Screen Recording need of XCUITest and whether a grant persists across users; userspace restart into auto-login; `DEVELOPER_DIR` per action. On one Linux node: snapshot upgrade; cgroup delegation after reboot; BMC and watchdog presence. Legal: the Xcode licence questions of 7.4 |
 | P1 read-only | software keys in the report with membership matching, re-detection and `Report`; `NodeStatus`; `/v1/nodes`; Fleet page with update available; cordon and drain in protocol and scheduler; `kbf-updater` for `kbf-daemon` and the profile only, on Linux once containers run with `--userns` (kernel 6.5 or later), and on Macs once actions run as lease users; `kbf-mac-session`'s `user-create`, `run`, `kill-uid` and `user-delete` on Macs (S4.2, S4.3); signing keys in a KMS under an offline root key (S2) |
 | P2 Linux rollouts | durable rollout record; rollout object, canary, soak, qualification, `min_serving`, `accept_outage`, halt, startup reconciliation; Linux updates by snapshot; CI-started rollouts of kbf's own components; Update buttons for Linux |
-| P3 Mac rollouts | the MDM host decided (S7); ABM, MDM and `kbf-mdm-gate` live while the Macs are wiped; per-device join credentials and identity binding (S6); macOS and Xcode rollouts; probes and the client gate; Update buttons for Macs |
+| P3 Mac rollouts | the MDM host decided (S7); ABM, MDM and `kbf-mdm-gate` live while the Macs are wiped (M9); operators' security keys in the gate's allowed signers (M4); per-device join credentials and identity binding (S6); macOS and Xcode rollouts; probes and the client gate; Update buttons for Macs |
 | P4 bare-metal GPU and desktop-app leases | `kbf-mac-session`'s session switch, scan and baseline; the bare-metal whole-machine runtime with per-lease users, `preparing`/`restoring` and the leak scan with planted-leak tests; L4/L5 erase; then golden VM images as software sets |
 | P5 image-based Linux | bootc with greenboot-rs and a watchdog on new servers, then the rest one at a time |
 
@@ -883,11 +895,11 @@ Changes by crate (rough sizes, tests included):
 | `kbf-updater` (new) | socket and caller check, key statements, set checks of S3.1, profile / package / bootc backends, state file | ~2,100 |
 | `kbf-mac-session` (new) | socket and caller check, the verbs of S4.2, sweep, leak scan | ~1,700 |
 | `kbf-driver-container` | `--userns=auto` or `nomap`, so no container uid is the daemon's | ~80 |
-| `kbf-mdm` (new) | `OsUpdateBackend`; NanoHUB client; DDM status; `kbf-mdm-gate` with mTLS, inventory, caps and its own alerts | ~1,300 |
+| `kbf-mdm` (new) | `MdmBackend`; NanoHUB backend; DDM status; `kbf-mdm-gate` with mTLS, inventory, caps, the profile allowlist, signed-erase verification and its own alerts; `kbf-admin erase` | ~1,500 |
 | `kbf-types`, `kbf-sched` | node states; cordon in placement; rollout state machine; slots; `min_serving` by hardware class; `accept_outage`; internal submitter for `kbf-node`; whole-Mac reservation | ~1,900 |
 | `kbf-server` | rollout driver, durable record and startup reconciliation, roles and OIDC tokens, identity binding and revocation, audit, `/v1/nodes`, `/v1/software`, `/v1/rollouts`, Fleet page, absence suppression | ~1,500 |
 | `kbf-caps`, `kbf-front` | membership comparison; new exact and set keys, `probe.*`; `kbf-node` refused from clients | ~300 |
-| `kbf-alert` | rollout held, client gate waiting, node not back, certificate, token and catalogue expiry | ~200 |
+| `kbf-alert` | rollout held, client gate waiting, node not back, certificate, token and catalogue expiry, Mac awaiting a signed erase | ~200 |
 | `kbf-driver-native` | the bare-metal whole-machine runtime: lease users through `kbf-mac-session`, GUI session, cleanup | ~1,500 |
 | `kbf-sim`, `kbf-it` | tests below | ~1,000 |
 
@@ -924,7 +936,7 @@ with what settles it:
 | XCUITest screenshots need Screen Recording; a grant persists across lease users | P0 |
 | `DEVELOPER_DIR` per action selects Xcode for all tools; a new Xcode leaves an older one unchanged | P0, then every canary |
 | A private Xcode mirror, or Mac-to-Mac copies, fit the licence; a farm running Xcode tools for remote builds fits section 2.7 | counsel, before P3 |
-| An ADE profile can carry a private CA; an own MDM vendor certificate needs Enterprise Program membership; NanoHUB's API covers what the gate needs | reading the references, before P3 |
+| An ADE profile can carry a private CA; an own MDM vendor certificate needs Enterprise Program membership; NanoHUB's API covers what the gate needs (and the MDM assumptions of M10) | reading the references, before P3 |
 | No supported unattended Data-volume snapshot revert; Gatekeeper caches per code hash; lease uid range free | P4 |
 | Per-lease overhead 3-9 min; re-provision 45-90 min; return deadlines 15 and 60 min | P2-P4 measurements |
 | LOM resets a panicked Mac; `macvdmtool` ports on a Mac Studio; a switched PDU exists | P3 |
