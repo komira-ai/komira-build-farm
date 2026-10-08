@@ -11,9 +11,11 @@
 //! - its `arguments` run with those variables and the Command's environment (which wins
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
-//! - no network unless the action's `network` platform property allows it, where the
-//!   node can enforce that ([`network`]: `sandbox-exec` on macOS; not enforced
-//!   elsewhere, and reported as the `network_isolation` capability);
+//! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no work
+//!   handed to launchd (`open`, `launchctl submit`/`load`/`bootstrap`), and no
+//!   network unless the action's `network` platform property allows it; elsewhere
+//!   nothing is enforced, and the node reports which in its `network_isolation`
+//!   capability;
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
@@ -26,7 +28,7 @@
 //!   to the CAS ([`kbf_daemon::Cas::put_chunks`]); names that are not UTF-8 refused;
 //! - the lease directory removed afterwards (`kbf_outputs::remove_tree`: iterative,
 //!   by descriptor, giving back permissions the action took away and, on macOS,
-//!   clearing the immutable and append-only flags it set); a lease directory
+//!   clearing the immutable and append-only flags and the ACLs it set); a lease directory
 //!   that stays fails the lease, so a dirty node is loud. A run the daemon drops is
 //!   cleaned by `Drop`.
 //!
@@ -41,15 +43,18 @@
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
 //!   between two polls is not seen ([`procs`]), so it outlives the lease. Work handed
-//!   to launchd runs outside the tree, the sandbox and its network policy: the
-//!   no-network profile denies `launchctl submit`/`bootstrap`/`load` and `open`
-//!   ([`network::NO_NETWORK_PROFILE`]), but an action that asks for the network runs
-//!   unsandboxed and can still do both, and any action can still write a
-//!   `LaunchAgents` plist (run at the daemon user's next login) or use `at`, `cron`
-//!   or a loopback service.
+//!   to launchd would run outside the tree and the sandbox: every action is
+//!   sandboxed, so launchd refuses it a job and the profile denies it `open`
+//!   ([`network::BASE_PROFILE`]). Not covered: other mach and XPC services, Apple
+//!   Events among them (`osascript` asking Terminal or Finder to run something), and
+//!   anything else the daemon's user can schedule (a `LaunchAgents` plist run at its
+//!   next login, `at`, `cron`, a loopback service).
 //! - **The daemon's own files.** Actions run as the daemon's user, so they can read
 //!   what it can, the node's TLS private key (`--key`) included, and change what it
 //!   owns: other leases' directories, the scratch root, the daemon's configuration.
+//!   An action that locks the scratch root or `quarantine/` (`chmod 555`, `chflags
+//!   uchg`) makes every later lease on the node fail until an operator unlocks it; a
+//!   scratch root it makes unreadable stops the next start.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.
 //! - **Network "off" is not airtight**: Unix sockets stay open, the system resolver's

@@ -190,3 +190,71 @@ fn what_the_action_made_immutable_goes_too() {
     assert_ne!(flags & 0x2, 0, "the link's target keeps its uchg flag");
     chflags(&["nouchg"], &host);
 }
+
+/// Changes an ACL with `chmod` (`+a` adds an entry, `-N` removes the ACL), as an
+/// action would.
+#[cfg(target_os = "macos")]
+fn acl(args: &[&str], path: &std::path::Path) {
+    let status = std::process::Command::new("/bin/chmod")
+        .args(args)
+        .arg(path)
+        .status()
+        .expect("chmod +a");
+    assert!(status.success(), "chmod {args:?} {}", path.display());
+}
+
+/// Catches a removal that fails on what an action locked with an ACL, which denies
+/// even the owner and which no permission bit undoes (`everyone deny delete` on a
+/// file, `delete_child` on a directory, `writesecurity` on top); and one that strips
+/// the ACL of what a link names instead of the link's own.
+#[cfg(target_os = "macos")]
+#[test]
+fn what_the_action_locked_with_an_acl_goes_too() {
+    let base = scratch("acl");
+    let host = base.join("host");
+    std::fs::write(&host, b"keep").expect("write");
+    acl(&["+a", "everyone deny delete"], &host);
+    assert!(has_acl(&host), "the host file has its ACL to begin with");
+    let lease = base.join("lease");
+    std::fs::create_dir_all(lease.join("out/sub")).expect("mkdir");
+    std::fs::write(lease.join("out/x"), b"x").expect("write");
+    std::fs::write(lease.join("out/sub/y"), b"y").expect("write");
+    symlink(&host, lease.join("out/to-host")).expect("symlink");
+    acl(&["+a", "everyone deny delete"], &lease.join("out/x"));
+    acl(
+        &["+a", "everyone deny delete,writesecurity"],
+        &lease.join("out/sub/y"),
+    );
+    acl(&["+a", "everyone deny delete_child"], &lease.join("out"));
+    acl(
+        &["+a", "everyone deny delete,delete_child"],
+        &lease.join("out/sub"),
+    );
+    acl(&["+a", "everyone deny delete"], &lease);
+    assert!(
+        std::fs::remove_file(lease.join("out/x")).is_err(),
+        "the ACLs hold before the removal"
+    );
+
+    remove_tree(&lease).expect("remove");
+    assert!(
+        std::fs::symlink_metadata(&lease).is_err(),
+        "the lease directory is gone"
+    );
+    assert!(has_acl(&host), "the link's target keeps its ACL");
+    acl(&["-N"], &host);
+    assert!(!has_acl(&host), "has_acl sees an ACL removed");
+}
+
+/// Whether `path` carries an ACL entry denying deletion, as `ls -le` lists it (read
+/// directly: whether a delete fails also depends on the parent directory).
+#[cfg(target_os = "macos")]
+fn has_acl(path: &std::path::Path) -> bool {
+    let listed = std::process::Command::new("/bin/ls")
+        .arg("-led")
+        .arg(path)
+        .output()
+        .expect("ls -le");
+    assert!(listed.status.success(), "ls -le {}", path.display());
+    String::from_utf8_lossy(&listed.stdout).contains("deny delete")
+}
