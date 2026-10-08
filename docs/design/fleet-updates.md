@@ -42,7 +42,7 @@ reference deployment's hardware). Section 14 collects them.
 | GPU | No GPU in VMs. A GPU test, including a desktop-app plus local-LLM test, is a `kbf-lease=whole_machine` lease with `gpu=1` that empties the bare-metal Mac, one at a time. |
 | App isolation | A throwaway non-admin user per lease, a leak scan against a baseline, a reboot on doubt, and, when a leak persists, quarantine, then an operator-signed remote erase and automatic re-enrollment. |
 | UI | A Fleet page: per worker OS, build, kernel or Xcode, update available, state. **Update** per worker; **Update all Linux workers** and **Update all Mac workers** start rolling updates. |
-| Hands | Still needed for: enrolling Macs bought outside Apple Business Manager (once each), yearly certificate renewals, one Xcode download per release, Screen Recording grants, a Mac that will not boot, and hardware. |
+| Hands | Still needed for: enrolling Macs bought outside Apple Business Manager (once each), yearly certificate renewals, one Xcode download per release, Screen Recording grants, an operator's touch per erase (M4.4), a Mac that will not boot, and hardware. |
 
 ## 2. The principle
 
@@ -556,7 +556,10 @@ way to block updates. This path is for the time before MDM is live, not a design
 - **TLS that a freshly erased Mac trusts.** The enrollment URL is contacted during
   Setup Assistant, before any profile is installed, so its certificate must chain to a
   publicly trusted CA, or the ADE enrollment profile must carry the private CA as an
-  anchor certificate **[A]** (to read in Apple's ADE profile reference before P3).
+  anchor certificate: the ADE profile's `anchor_certs` are used "as trusted anchor
+  certificates when evaluating the trust of the connection to the MDM server URL"
+  ([Profile](https://developer.apple.com/documentation/devicemanagement/profile))
+  **[V]**.
 - **Where it runs.** Under its own uid, never beside `kbf-server`; it may start on a
   host outside the build pool and move later (M7); where it settles is an open
   decision (S7). Its enrollment and check-in endpoints must be reachable on the rack
@@ -565,13 +568,15 @@ way to block updates. This path is for the time before MDM is live, not a design
   holds the API key.
 - **`kbf-mdm-gate`** (decision: build it, S5). A small process beside the MDM that
   holds the API key and offers `kbf-server`, over mTLS pinned to the server's
-  identity, only the three operations of M2: inventory, `enforce` (and `withdraw`) of
-  a build a signed set names for that Mac's pool, and install of an allowlisted
-  profile. **Erase is not among them:** the gate erases only on a request signed by
-  an operator's hardware-backed key (M4), one Mac at a time within a daily cap
+  identity, only the verbs of M2.2: `status`, `enforce` (and `withdraw`) of a build
+  a signed set names for that Mac's pool, `profile` (an allowlisted one),
+  `grant-admin` (S5.2), and a relay for signed erase requests (with `bring-forward`
+  of an erase already scheduled under one) that the server cannot create. **The
+  server cannot make an erase:** the gate erases only on a request signed by an
+  operator's hardware-backed key (M4), one Mac at a time within a daily cap
   (default 2). Every verb is limited to the gate's own inventory and keeps a Mac floor
-  counted from MDM check-ins; every erase and enforcement alerts natively, without
-  the server.
+  counted from MDM check-ins; every erase, enforcement, grant and profile install
+  alerts natively, without the server.
 - **kbf stays generic.** kbf ships no MDM. The gate drives the MDM through the
   `MdmBackend` trait (crate `kbf-mdm`, which also holds the gate): NanoHUB first, a
   hosted MDM with a separate wipe privilege optional (M5). Nodes map to enrollments by
@@ -936,7 +941,7 @@ with what settles it:
 | XCUITest screenshots need Screen Recording; a grant persists across lease users | P0 |
 | `DEVELOPER_DIR` per action selects Xcode for all tools; a new Xcode leaves an older one unchanged | P0, then every canary |
 | A private Xcode mirror, or Mac-to-Mac copies, fit the licence; a farm running Xcode tools for remote builds fits section 2.7 | counsel, before P3 |
-| An ADE profile can carry a private CA; an own MDM vendor certificate needs Enterprise Program membership; NanoHUB's API covers what the gate needs (and the MDM assumptions of M10) | reading the references, before P3 |
+| An own MDM vendor certificate needs Enterprise Program membership; NanoHUB's API covers what the gate needs (and the MDM assumptions of M10) | reading the references, before P3 |
 | No supported unattended Data-volume snapshot revert; Gatekeeper caches per code hash; lease uid range free | P4 |
 | Per-lease overhead 3-9 min; re-provision 45-90 min; return deadlines 15 and 60 min | P2-P4 measurements |
 | LOM resets a panicked Mac; `macvdmtool` ports on a Mac Studio; a switched PDU exists | P3 |

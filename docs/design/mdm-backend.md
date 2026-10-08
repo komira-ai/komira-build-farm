@@ -16,7 +16,7 @@ they mean in fleet-updates.md; section M10 collects the new **[A]**s.
 |---|---|
 | Interface | `kbf-server` uses three MDM operations, through `kbf-mdm-gate` only: **inventory**, **enforce** a macOS build by a deadline (and withdraw it), **install** an allowlisted profile. |
 | Backends | The gate drives the MDM through a backend trait. Default: NanoHUB, self-hosted, open source. Optional: a hosted MDM whose wipe privilege is separate from its other privileges (Jamf Pro). Vendors whose API keys grant wipe together with every other device action do not fit. |
-| Erase | Not in `kbf-server`'s interface. An operator action: a request signed with the operator's hardware-backed key (a FIDO2 SSH key), verified by the gate against an allowed-signers list. The server can relay a signed request, never make one. |
+| Erase | Not one of the three operations, and the server cannot create one. An operator action: a request signed with the operator's hardware-backed key (a FIDO2 SSH key), verified by the gate against an allowed-signers list. The server's gate verbs include a relay for such a request and `grant-admin`, which needs one; neither lets the server make or redirect an erase. |
 | Progress | On macOS 27 the old software-update commands and queries are gone. Progress comes from DDM status reports the gate polls; nothing announces completion; the node's own `Hello` is the done signal. |
 | Network | The MDM is reachable on the network a Mac has at Setup Assistant (the rack LAN is enough), under a DNS name the operator controls, with TLS a freshly erased Mac trusts. No public address; not reachable only over an overlay network. |
 | Moving | Keep the DNS name; carry the database, SCEP CA, push certificate and key, ADE token and the gate's keys. |
@@ -35,8 +35,8 @@ operator's signed erase -+  (relayed by the server, verified by the gate)
 The gate is not optional; the backend is. Every policy of S5 (inventory, per-pool
 serial floor, one outstanding enforcement per pool, Mac floor, daily erase cap, its
 own alerts) lives in the gate and holds whichever MDM is behind it. The trait
-(`MdmBackend` in crate `kbf-mdm`, replacing the `OsUpdateBackend` named in 7.6) is the
-gate's southbound side; `kbf-server` only ever speaks the gate's protocol.
+(`MdmBackend` in crate `kbf-mdm`, 7.6) is the gate's southbound side; `kbf-server`
+only ever speaks the gate's protocol.
 
 ### M2.2 The three operations
 
@@ -51,7 +51,9 @@ gate's southbound side; `kbf-server` only ever speaks the gate's protocol.
   ([gdmf.apple.com/v2/pmv](https://gdmf.apple.com/v2/pmv)) at most once a day, as 3.2
   says, and reports each listed build with its posting and expiry dates; the server
   compares it with each node's build. Filtering the catalogue by a Mac's model through
-  the catalogue's supported-devices lists is **[A]**.
+  the catalogue's supported-devices lists is **[A]**. The catalogue host's
+  certificate is reported to chain to an Apple root that a Linux host's system trust
+  store may not hold, so the gate may need Apple's root configured explicitly **[A]**.
 - **Only kbf's own declarations.** Every declaration the gate creates has an
   identifier starting `kbf.` (for example `kbf.osupdate.<serial>`), and the gate
   refuses to change or remove any declaration without that prefix. Settings an
@@ -62,9 +64,15 @@ gate's southbound side; `kbf-server` only ever speaks the gate's protocol.
   Access profile that pins `kbf-mac-session`'s cdhash (S4.3), or listed in a
   root-owned allowlist file on the gate's host. The server cannot send profile bytes:
   it names a digest, and the gate installs bytes it already holds.
-- **What is never in the interface:** erase (M4), lock, setting a firmware or
-  recovery password, removing management, rotating the managed administrator's
-  password, any raw MDM command. The gate has no generic pass-through.
+- **The server's complete set of gate verbs** is: `status`, `enforce` and
+  `withdraw`, `profile`, `grant-admin` (S5.2, S8), and two erase verbs that carry no
+  authority of their own: `erase <signed request>`, a relay for a request the server
+  cannot create (M4.2), and `bring-forward <serial> <lease id>`, which only runs an
+  erase the gate already scheduled under a signed request (M4.2).
+- **What the server can never ask for:** an erase it did not receive signed (M4),
+  lock, setting a firmware or recovery password, removing management, rotating the
+  managed administrator's password, any raw MDM command. The gate has no generic
+  pass-through.
 
 ## M3. Progress on macOS 27
 
@@ -95,7 +103,9 @@ macOS 27 removed the MDM commands `ScheduleOSUpdate`, `AvailableOSUpdates` and
 
 ### M4.1 The rule
 
-`kbf-server` has no erase verb, and the gate has no unsigned one. Every erase carries
+`kbf-server` cannot make an erase: its only erase verbs relay an operator's signed
+request or bring forward an erase already scheduled under one (M4.2), and the gate has
+no unsigned erase. Every erase carries
 a signature from an operator's **hardware-backed key**: a key whose private half lives
 in a security key and signs only after a touch. No server, agent, CI job or node holds
 such a key. A compromised `kbf-server` can still relay, delay or drop an operator's
@@ -108,6 +118,7 @@ The request is a short text message:
 ```
 kbf-erase-v1
 serial <serial>
+purpose erase-now | privileged-lease <lease id>
 reason <free text>
 nonce <128 random bits, hex>
 not-after <RFC 3339 time, at most 1 hour ahead>
@@ -116,28 +127,60 @@ not-after <RFC 3339 time, at most 1 hour ahead>
 - **Signing:** `ssh-keygen -Y sign -n kbf-mdm-erase -f <key>` with an
   `ed25519-sk` (or `ecdsa-sk`) key on a FIDO2 security key, which asks for a touch
   ([ssh-keygen(1)](https://man.openbsd.org/ssh-keygen)) **[V]**. kbf ships a small
-  `kbf-admin erase <serial> --reason ...` that writes the message, runs `ssh-keygen`
-  and posts the result.
+  `kbf-admin erase <serial> --reason ... [--lease <lease id>]` that writes the
+  message, runs `ssh-keygen` and posts the result.
 - **Verifying:** the gate checks the signature in the format of `ssh-keygen -Y verify`
   against an **allowed-signers** file on its host: root-owned, read-only to the gate,
   each line limited with `namespaces="kbf-mdm-erase"` and optionally `valid-before`
   (same manual) **[V]**. The gate accepts only security-key key types, so a software
-  key added by mistake is refused. That the signature records the touch (the FIDO
-  user-presence flag) and the verifier requires it is **[A]**, to confirm in OpenSSH's
-  `PROTOCOL.sshsig` before P3.
-- **Single use:** the gate keeps every nonce it has accepted until its `not-after`
-  passes, and refuses a repeat. It refuses a message whose serial is outside its
-  inventory or whose `not-after` has passed or lies more than 1 hour ahead.
+  key added by mistake is refused.
+- **Touch, checked by the gate itself.** A security-key signature carries a flags
+  byte that includes "user present", and a counter
+  ([PROTOCOL.u2f](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.u2f))
+  **[V]**; `PROTOCOL.sshsig` defines only the outer envelope. The `ssh-keygen` manual
+  does not say that `-Y verify` requires the flag, so the gate reads the flags byte
+  itself and refuses a signature without "user present".
+- **Checked once, when accepted.** The gate checks the signature, the touch, the
+  nonce, the serial and `not-after` once, when the request arrives, and then either
+  runs it or holds it. It refuses a message whose serial is outside its inventory or
+  whose `not-after` has passed or lies more than 1 hour ahead.
+- **Single use:** the gate keeps every nonce it has accepted until that message's
+  `not-after` passes, and refuses a repeat; after that the message is refused as
+  expired.
+- **The purpose decides what happens, not the server.** The server relays every
+  signed request through the same verb (`erase <signed request>`); the gate reads the
+  signed `purpose` line:
+  - `erase-now`: the gate runs the erase at once, within the caps below, or refuses
+    it. It is never held or queued.
+  - `privileged-lease <lease id>`: the gate **holds** the request for that serial and
+    lease and runs nothing yet. `grant-admin <serial> <lease id>` (S5.2) accepts only
+    a held request whose serial and purpose name that Mac and that lease; an
+    `erase-now` request, or one for another lease, never makes a grant. Once the grant
+    is issued the held request is used, and the gate schedules the erase at the
+    grant's time plus the maximum privileged-lease duration. **A held request runs at
+    its scheduled time whatever its `not-after`**: `not-after` limits when a request
+    may be accepted, not when an accepted one runs. If another erase is outstanding
+    at that time, the held erase runs as soon as that one clears; it is never dropped.
+- **Bringing a scheduled erase forward.** `bring-forward <serial> <lease id>` runs an
+  already scheduled erase now (S8). It adds no authority: it is refused unless the
+  gate issued a grant for that lease.
+- **An unused held request** (no grant follows) is discarded 24 hours after the gate
+  accepted it, with an alert; the lease, if still queued, waits for a new signature.
+  A held request does not count toward the daily cap until `grant-admin` reserves its
+  erase.
 - **Caps still apply.** A valid signature does not lift S5's limits: one erase
   outstanding across the fleet, the daily cap, the Mac floor. Raising a cap is a
   change to the gate's configuration on its host, not something a signature does.
-- **Alerts.** The gate alerts natively on every accepted and every refused request,
-  naming the serial and the signer.
+- **Alerts.** The gate alerts natively on every accepted, held, discarded and refused
+  request, naming the serial, the purpose and the signer.
 
 **The path.** The gate listens only to `kbf-server` (S5.2), so the UI's **Erase**
-button (11.2) shows the `kbf-admin` command for that serial; the operator runs it on
-their own machine and the signed blob goes to `POST /v1/macs/{serial}:erase`, which the
-server forwards unchanged. The server learns nothing it could reuse.
+button (11.2), and a privileged lease waiting for its signature, show the `kbf-admin`
+command for that serial (and lease); the operator runs it on their own machine, which
+should not be the gate's host (S7), and the signed blob goes to
+`POST /v1/macs/{serial}:erase`, which the server forwards unchanged. The server learns
+nothing it could reuse: a request names one serial and one purpose, and its nonce is
+spent.
 
 ### M4.3 Keys
 
@@ -153,14 +196,15 @@ server forwards unchanged. The server learns nothing it could reuse.
   everywhere and the message is signed offline.
 - **Residual risk.** Malware on the operator's own machine could show one serial and
   have another signed. The caps, the gate's alert naming the signed serial, and the
-  floor bound the damage to one Mac a day by default.
+  floor bound the damage to at most two Macs a day (the daily cap's default), one
+  at a time.
 
 ### M4.4 What now waits for a touch
 
 | Erase | Before | Now |
 |---|---|---|
 | Leak that persists after a reboot (L4) | automatic | the Mac is quarantined and alerts; an operator signs the erase |
-| End of a privileged lease (S8) | scheduled by the gate with the grant | the grant needs an operator-signed erase for that serial first; the gate holds it and runs it at the lease's deadline, as before |
+| End of a privileged lease (S8) | scheduled by the gate with the grant | the grant needs an operator-signed erase whose purpose names that lease; the gate holds it and runs it at the lease's deadline, as before (M4.2) |
 | Monthly erase (L5) | scheduled | the UI lists the Macs due; each needs a signature |
 | Repair after a bad macOS update (4.3) | automatic | signed |
 
@@ -188,6 +232,10 @@ line ([operations guide](https://github.com/micromdm/nanohub/blob/main/docs/oper
   of trust (S1.4), and the gate does not add a second one.
 - Mapping the three operations onto NanoHUB's KMFDDM declarations and sets and
   NanoCMD's profile install is **[A]**, to read before P3 (14).
+- NanoHUB's operations guide does not cover SCEP or serving the ADE enrollment
+  profile. Those come from other components: a SCEP server such as
+  [micromdm/scep](https://github.com/micromdm/scep), and the enrollment profile served
+  from a static URL behind the same reverse proxy (M6) **[A]**.
 
 ### M5.2 Jamf Pro (optional, hosted)
 
@@ -208,8 +256,7 @@ For a deployment that already runs Jamf Pro:
   ([plans API](https://developer.jamf.com/jamf-pro/reference/post_v1-managed-software-updates-plans))
   **[V]** for the schema. **[A]**: that `CUSTOM_VERSION` pins exactly the build named
   for any build the catalogue lists; that `DOWNLOAD_INSTALL_SCHEDULE` is available on
-  the deployment's Jamf hosting (it has been reported as cloud-hosted only); how a plan
-  is withdrawn; and that Jamf turns a plan into the same DDM declaration as M2.2.
+  the deployment's Jamf hosting; how a plan is withdrawn; and that Jamf turns a plan into the same DDM declaration as M2.2.
 - Jamf Pro is commercial. kbf works without it; the backend is for those who have it.
 
 ### M5.3 Unsuitable: one key for every device action
@@ -218,11 +265,12 @@ The gate's model needs one of two things: the MDM's all-powerful key on a host t
 already the fleet's root of trust (M5.1), or a wipe privilege separate from the rest
 (M5.2). A hosted MDM whose API keys grant every device action together gives neither:
 the gate's host, a separate network-facing machine, would hold a key that can wipe
-every Mac. SimpleMDM is an example: its API keys have a single permission covering all
-device actions, wipe included, per its own suggestion forum
-([restrict wipe](https://suggestions.simplemdm.com/forums/204404-suggestions/suggestions/51108268-restrict-permissions-for-device-wipe))
-**[V]** as of this writing. Such a vendor becomes usable when it separates the wipe
-privilege.
+every Mac. SimpleMDM may be an example: an open customer request on SimpleMDM's
+suggestion forum says all device actions, wipe included, share one permission, and
+asks to limit wipe to certain accounts and API keys
+([restrict wipe](https://suggestions.simplemdm.com/forums/204404-suggestions/suggestions/51108268-restrict-permissions-for-device-wipe)).
+That the request exists is **[V]**; that the vendor's API keys still work that way is
+**[A]**. Such a vendor becomes usable when it separates the wipe privilege.
 
 ## M6. Network
 
@@ -239,15 +287,20 @@ privilege.
   private addresses (DNS-rebinding protection), so the Macs' resolver is checked
   **[A]**.
 - **TLS a fresh Mac trusts.** A certificate from a public CA, or the private CA as an
-  anchor certificate in the ADE enrollment profile **[A]** (7.6). A public certificate
+  anchor certificate in the ADE enrollment profile: Apple's ADE profile object has
+  `anchor_certs`, which the device uses "as trusted anchor certificates when
+  evaluating the trust of the connection to the MDM server URL"
+  ([Profile](https://developer.apple.com/documentation/devicemanagement/profile))
+  **[V]** (7.6). A public certificate
   for a LAN-only host is issued with an ACME DNS-01 challenge, which needs a DNS API,
   not inbound reachability.
 - **Outbound.** The MDM host reaches Apple's push service, Apple Business Manager and
   the catalogue; Macs reach Apple's push service and update servers. The ports are in
   Apple's enterprise network list
   ([Apple](https://support.apple.com/en-us/101555)) **[A]** (to read before P3).
-- **Two faces.** A reverse proxy on the Macs' network passes only the enrollment,
-  check-in and SCEP paths; NanoHUB's API stays on loopback; the gate's mTLS listener
+- **Two faces.** A reverse proxy on the Macs' network passes only the enrollment
+  profile, check-in and SCEP paths (served by NanoHUB, the SCEP server and a static
+  file, M5.1); NanoHUB's API stays on loopback; the gate's mTLS listener
   is on the interface `kbf-server` reaches, never on the Macs' network (S5.2).
 
 ## M7. Moving the MDM between hosts
@@ -293,7 +346,8 @@ There is no separate configuration-management tool.
   macOS updates, privacy (Full Disk Access) profiles, the managed administrator,
   bootstrap tokens, erase, Lights Out Management.
 - **What it shares with a tool like Ansible:** a declared state, idempotent steps,
-  a dry run (`kbf-updater stage`), and drift reported (3.1).
+  staging ahead of time (`kbf-updater stage`, which places a set's artifacts without
+  applying them), and drift reported (3.1).
 
 **Why not Ansible:**
 
@@ -334,6 +388,12 @@ Tests, each with the planted mutant that must turn it red:
 |---|---|
 | The gate refuses an erase with no signature, a bad one, one under a key outside the allowed signers, one in another namespace, and one under a software (non-`sk`) key | accept any key type |
 | The gate refuses a replayed nonce, an expired `not-after`, and one more than 1 hour ahead | skip the nonce log |
+| The gate refuses a signature from a security key whose flags lack "user present" | ignore the flags byte |
+| With only a held request for lease L1 on a serial, `grant-admin` for lease L2 on that serial is refused; an `erase-now` request for that serial runs at once and never makes a grant | ignore `purpose` |
+| An `erase-now` request is run at once or refused, never held | hold every request |
+| A held request whose `not-after` has passed still runs at the grant's time plus the maximum lease duration | re-check `not-after` when the held erase runs |
+| A held request with no grant is discarded 24 hours after acceptance and alerts | keep held requests forever |
+| `bring-forward` is refused for a lease with no grant | run any held request on `bring-forward` |
 | A signed erase for a serial outside the inventory, past the daily cap or below the floor is refused | let a signature lift the caps |
 | A signed erase for one serial, forwarded by the server under another serial, erases nothing | take the serial from the server's request instead of the signed message |
 | The gate refuses to change or withdraw a declaration without the `kbf.` prefix | match identifiers by substring |
@@ -347,7 +407,6 @@ New assumptions:
 | Assumption | Settled by |
 |---|---|
 | Catalogue filtering by model; the 60 s poll is enough | P3 |
-| SSH signatures record and require the touch | reading `PROTOCOL.sshsig`, before P3 |
 | NanoHUB mapping of the three operations; status subscriptions through KMFDDM | reading NanoHUB, before P3 |
 | Jamf `CUSTOM_VERSION`, `DOWNLOAD_INSTALL_SCHEDULE` hosting, withdrawal | a Jamf trial, only if that backend is built |
 | The Macs' resolver accepts the MDM's record; Apple's ports | P3 network check |
