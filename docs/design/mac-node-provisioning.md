@@ -354,7 +354,29 @@ listed, and step 3 checks that they print it.
 
 ### 4.1 Build and attest on `main` (planned)
 
-No workflow publishes a binary today. The model:
+> **Built since this section was written:** the build and attestation workflow,
+> `.github/workflows/artifacts.yml`, described in [docs/artifacts.md](../artifacts.md),
+> which is the authority for what it does. Where it differs from this section and 4.2:
+>
+> - **A separate `attest` job** holds `id-token: write` and `attestations: write`,
+>   runs only on a push to `main`, and signs the files the build jobs made. The build
+>   jobs hold `contents: read` only, so code a pull request changes never runs next to
+>   a token that can sign.
+> - **The Linux binaries** (`kbf-daemon` and `kbf-server`, x86_64 and arm64) are built
+>   by their own jobs, not by the macOS job.
+> - **The darwin tarball holds `kbf-daemon` only:** `kbf-mac-provision` does not exist
+>   yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
+> - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
+>   that workflow; this design names none.
+> - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
+>   the flag, runs the signed binary, and verifies the signature again on the binary
+>   taken out of its tarball. The hardened runtime's behaviour is checked only on a
+>   runner with SIP enabled, and hosted runners do not enforce code signing on a
+>   running process, so the kernel's page checks are not shown in CI.
+> - **Still planned:** the deployment job that verifies an asset before it reaches a
+>   node, the node's SHA-256 check in `apply`, and the release workflow.
+
+The model:
 
 - **Every green commit on `main` is built and attested** by CI, and is a candidate for
   deployment. The operator's farm runs these per-commit artifacts.
@@ -396,6 +418,12 @@ released. A build on a developer's machine never ships.
 
 ### 4.2 Signing and verification
 
+> **Built since this section was written:** ad-hoc signing with the hardened runtime
+> and the attestation checks, in `.github/workflows/artifacts.yml`; see
+> [docs/artifacts.md](../artifacts.md) and the deviations listed in section 4.1. The
+> verification steps 1 and 2 below are still planned; the `attest` job runs step 1's
+> command on its own output.
+
 On Apple silicon every executable must carry a code signature. The linker adds an
 *ad-hoc* signature to anything it links for arm64, which is why a `cargo build` on a Mac
 runs at all (Apple:
@@ -405,7 +433,7 @@ runs at all (Apple:
 | | Ad-hoc (`codesign -s -`) | Developer ID, hardened runtime, notarized |
 |---|---|---|
 | Needs | nothing | membership in the Apple Developer Program for an organization, a Developer ID Application certificate (Developer ID Installer for a `.pkg`), and a notary credential, all as secrets of a protected CI environment |
-| The kernel checks page hashes against the signature | yes | yes |
+| The kernel checks page hashes against the signature (where code-signing enforcement is on) | yes | yes |
 | Says *who* built it | no: anyone can ad-hoc sign anything | yes: a Team ID a node can require with `codesign --verify -R '<requirement>'` |
 | Gatekeeper, for a file a browser downloaded (quarantined) | refused | allowed |
 | Apple's malware scan | no | yes ([notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)) |

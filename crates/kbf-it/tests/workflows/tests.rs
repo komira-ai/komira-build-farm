@@ -430,7 +430,6 @@ fn job_permissions_may_not_widen_the_token() {
         "read-all",
         "{contents: write}",
         "{contents: read, pull-requests: write}",
-        "{id-token: write}",
         "''",
     ] {
         refused(
@@ -442,6 +441,63 @@ fn job_permissions_may_not_widen_the_token() {
         clean(&workflow(&format!(
             "    runs-on: ubuntu-latest\n    permissions: {p}\n"
         )));
+    }
+}
+
+/// The `if:` line under which a job may sign provenance, as the lint requires it.
+const MAIN_PUSH_IF: &str =
+    "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
+
+#[test]
+fn signing_scopes_need_a_job_that_runs_only_for_a_push_to_main() {
+    // Catches: `id-token: write` or `attestations: write` allowed in a job a pull
+    // request or the merge queue runs, so a branch could sign provenance; and the
+    // exception refused where the artifacts workflow needs it.
+    let signing = "{contents: read, id-token: write, attestations: write}";
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {signing}\n"
+    )));
+    for scope in ["id-token", "attestations"] {
+        clean(&workflow(&format!(
+            "    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {{{scope}: write}}\n"
+        )));
+        for cond in [
+            "",
+            "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
+            "    if: ${{ github.event_name == 'push' }}\n",
+            "    if: ${{ github.ref == 'refs/heads/main' }}\n",
+            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || true }}\n",
+            "    if: [x]\n",
+        ] {
+            let body =
+                format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{{scope}: write}}\n");
+            assert_eq!(
+                scan(&workflow(&body)),
+                vec![format!(
+                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{MAIN_PUSH_ONLY}`",
+                    if cond.is_empty() { 7 } else { 8 }
+                )],
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_main_push_job_still_gets_no_other_write_scope() {
+    // Catches: the main-push exception read as "any write scope", or a signing scope
+    // matched loosely (another case, or a level other than `write`).
+    for p in [
+        "{contents: write}",
+        "{packages: write}",
+        "{ID-Token: write}",
+        "{id-token: admin}",
+        "write-all",
+    ] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {p}\n"),
+            "a job's `permissions`",
+        );
     }
 }
 
