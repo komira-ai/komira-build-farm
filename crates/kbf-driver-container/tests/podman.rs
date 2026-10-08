@@ -653,6 +653,39 @@ async fn no_container_id_is_the_daemons_on_the_host() {
     cell.assert_clean(1);
 }
 
+/// Why `--userns=nomap` and not `auto`: rootless `auto` hands the first container
+/// all but one of the user's 65,536 subordinate ids, so a second container on the
+/// node fails in `podman create` ("not enough unused IDs in user namespace") until the
+/// first ends. Catches a switch to `auto`: lease 2 runs to completion while lease 1's
+/// container is still running.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn two_containers_run_at_once() {
+    let cell = Cell::new("together");
+    let action = store_action(&cell.cas, &sh("exec sleep 60"));
+    let work = cell.work(1, action, Resources::default());
+    let runtime = Arc::clone(&cell.runtime);
+    let first = tokio::spawn(async move { runtime.run(work).await });
+    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
+    wait_for_program_in(&container, "sleep").await;
+
+    let second = cell.run(2, &sh("echo second")).await;
+    let still = podman(&["ps", "--format={{.Names}}"]);
+    assert!(
+        still.lines().any(|n| n == cell.name(1)),
+        "lease 1 ended before lease 2 ran: {still}"
+    );
+    let second = second.expect("lease 2 runs beside lease 1");
+    assert_eq!(second.exit_code, 0, "{second:?}");
+    assert_eq!(cell.stdout(&second), "second\n");
+    cell.assert_clean(2);
+
+    cell.runtime.kill(LeaseId::new(cell.term, 1)).await;
+    let outcome = first.await.expect("join");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    cell.assert_clean(1);
+}
+
 /// Catches the overlay not being handed to the container's root before it runs (the
 /// action can write nothing under the exec root: `EROFS`), and not being handed back
 /// before the outputs are read (a `0700` output directory holding a `0600` file is
