@@ -65,7 +65,9 @@ only ever speaks the gate's protocol.
   root-owned allowlist file on the gate's host. The server cannot send profile bytes:
   it names a digest, and the gate installs bytes it already holds.
 - **The server's complete set of gate verbs** is: `status`, `enforce` and
-  `withdraw`, `profile`, `grant-admin` (S5.2, S8), and two erase verbs that carry no
+  `withdraw`, `profile`, `grant-admin` (S5.2, S8; the gate defines the admin grant's
+  exact format, which `kbf-mac-session` verifies: S5.2 "The admin grant"), and two
+  erase verbs that carry no
   authority of their own: `erase <signed request>`, a relay for a request the server
   cannot create (M4.2), and `bring-forward <serial> <lease id>`, which only runs an
   erase the gate already scheduled under a signed request (M4.2).
@@ -171,8 +173,17 @@ not-after <RFC 3339 time, at most 1 hour ahead>
 - **Caps still apply.** A valid signature does not lift S5's limits: one erase
   outstanding across the fleet, the daily cap, the Mac floor. Raising a cap is a
   change to the gate's configuration on its host, not something a signature does.
+  The daily cap counts erases sent in the last 24 hours plus erases scheduled by a
+  grant and not yet sent, so no 24 hours see more erases than the cap (S5.2).
+- **Re-enrollment.** An erase stays outstanding until the MDM records a status report
+  from that Mac later than the second the erase was sent, or 24 hours pass. NanoHUB's
+  API exposes no enrollment or check-in time, so this rests on **[A]**: a Mac sends no
+  status report between the erase being queued and it running (one that did would
+  clear the outstanding erase early; the daily cap and the floor still hold).
 - **Alerts.** The gate alerts natively on every accepted, held, discarded and refused
-  request, naming the serial, the purpose and the signer.
+  request, naming the serial, the purpose and the signer. A refusal before the
+  signature verifies (a bad or missing signature) names only the serial the server
+  gave and the reason: nothing else in the request is the operator's yet.
 
 **The path.** The gate listens only to `kbf-server` (S5.2), so the UI's **Erase**
 button (11.2), and a privileged lease waiting for its signature, show the `kbf-admin`
@@ -226,7 +237,9 @@ line ([operations guide](https://github.com/micromdm/nanohub/blob/main/docs/oper
 
 - The gate runs on the same host under its own uid and is the only holder of the key.
   NanoHUB's API listens on loopback only; the network the Macs use reaches only the
-  enrollment, check-in and SCEP paths (M6).
+  enrollment, check-in and SCEP paths (M6). The gate refuses to start with a NanoHUB
+  address that is not loopback (`localhost`, an IPv4 loopback address, `::1`), since the key
+  travels in basic authentication.
 - The key gives the gate no more than root on that host already gives (the database,
   bootstrap tokens and push key are there too). The MDM host stays the Mac fleet's root
   of trust (S1.4), and the gate does not add a second one.
@@ -402,6 +415,12 @@ Tests, each with the planted mutant that must turn it red:
 | With the Jamf backend, the everyday client's role lacks the wipe privilege (checked at gate start) | start with a role that has it |
 | A Mac that reports a non-empty `failure-reason` holds the rollout | wait for the return deadline only |
 | A privileged lease is not placed until a signed erase for its Mac is held | grant without a held erase |
+| A client presenting `kbf-server`'s certificate without its private key is refused, on TLS 1.3 and 1.2 | skip the handshake signature check |
+| A refused request whose signature verified alerts with its signer and purpose | alert with the refusal only |
+| With cap 2, a grant's erase sent at t, an `erase-now` at t, and another `erase-now` 16 hours later: the third is refused | count a grant's erase only when reserved |
+| A held request 24 hours old is refused by `grant-admin` before the tick discards it | grant from any held request still in memory |
+| A set whose `arch` differs from the Mac's in the inventory is refused | check only `os` |
+| The gate refuses to start with a NanoHUB address off loopback | accept any `--nanohub-url` |
 
 New assumptions:
 
@@ -409,6 +428,7 @@ New assumptions:
 |---|---|
 | Catalogue filtering by model; the 60 s poll is enough | P3 |
 | NanoHUB mapping of the three operations; status subscriptions through KMFDDM | reading NanoHUB, before P3 |
+| A Mac sends no status report between an erase being queued and it running (the re-enrollment signal, M4.2) | P3, against a real NanoHUB |
 | Jamf `CUSTOM_VERSION`, `DOWNLOAD_INSTALL_SCHEDULE` hosting, withdrawal | a Jamf trial, only if that backend is built |
 | The Macs' resolver accepts the MDM's record; Apple's ports | P3 network check |
 | Push renewal under the same account keeps enrollments; Macs retry check-ins through a move | reading Apple's references; a test move before P3 |
