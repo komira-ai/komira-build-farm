@@ -9,6 +9,11 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 /// (RFC 5.8). The scheduler re-dispatches after G = 60 s; safety needs T + 5 s < G.
 pub const FENCE_AFTER: Duration = Duration::from_secs(40);
 
+/// How long the daemon waits at most before it compares the fence with the
+/// suspend-counting clock again. Timers stop while the machine is suspended, so a
+/// resume is noticed within this much running time (issue #78).
+pub const RECHECK_EVERY: Duration = Duration::from_secs(1);
+
 /// The session flags of the `kbf-daemon` command line: where to connect, as whom, and
 /// how this node is labelled. The binary (crate `kbf-node`) adds the driver flags.
 #[derive(Clone, Debug, clap::Args)]
@@ -137,6 +142,9 @@ pub struct DaemonConfig {
     pub reconnect_after: Duration,
     /// How long to wait for Welcome after opening a stream.
     pub welcome_timeout: Duration,
+    /// The longest wait before the fence is checked again, normally
+    /// [`RECHECK_EVERY`]. Tests lengthen it to show which event checked it.
+    pub recheck_every: Duration,
 }
 
 impl DaemonConfig {
@@ -150,6 +158,7 @@ impl DaemonConfig {
             fence_after: FENCE_AFTER,
             reconnect_after: Duration::from_secs(1),
             welcome_timeout: Duration::from_secs(10),
+            recheck_every: RECHECK_EVERY,
         }
     }
 
@@ -223,5 +232,6 @@ mod tests {
         assert_eq!(config.tls.key, PathBuf::from("c.key"));
         assert_eq!(config.tls.server_name.as_deref(), Some("front"));
         assert_eq!(config.fence_after, FENCE_AFTER);
+        assert_eq!(config.recheck_every, RECHECK_EVERY);
     }
 }
