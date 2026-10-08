@@ -15,8 +15,10 @@
 //!   the same node has registered since: then it is dropped unacknowledged, so a
 //!   daemon still talking on the old stream fences on time. A lease it lists that the
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23);
-//! - a `Result` is accepted only from the node holding the operation's current lease,
-//!   and answered with a `ResultAck`;
+//! - a `Result` the deny list now refuses ends the stream, so it never reaches the
+//!   action cache. Otherwise it is accepted only from the node holding the
+//!   operation's current lease, and answered with a `ResultAck`;
+//! - after the server ends a stream, nothing more is read from it;
 //! - an `Offer` is not read yet.
 
 use std::pin::Pin;
@@ -210,10 +212,16 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
                     server_message::Message::HeartbeatAck(HeartbeatAck { seq: beat.seq }),
                 )
             }
-            Some(daemon_message::Message::Result(result)) => farm
-                .report(worker, result)
-                .await
-                .map(server_message::Message::ResultAck),
+            Some(daemon_message::Message::Result(result)) => {
+                // A revoked daemon must not write its result into the action cache,
+                // even before its next heartbeat.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                farm.report(worker, result)
+                    .await
+                    .map(server_message::Message::ResultAck)
+            }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");

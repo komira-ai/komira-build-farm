@@ -2,6 +2,8 @@
 //! node its client certificate names, and refuses what the deny list lists, reading the
 //! list again at every check.
 
+mod support;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,8 +14,8 @@ use clap::Parser;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_front::Cache;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, ServerMessage, Start, daemon_message,
+    server_message, worker_client::WorkerClient,
 };
 use kbf_server::{Args, ConfigError, DenyListError, bind_server};
 use rcgen::{
@@ -34,10 +36,6 @@ struct Pki {
 
 impl Pki {
     fn new(name: &str) -> Self {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-node-binding")
-            .join(name);
-        std::fs::create_dir_all(&dir).expect("create the TLS directory");
         let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca.distinguished_name
@@ -46,6 +44,15 @@ impl Pki {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::DigitalSignature,
         ];
+        Self::with_ca(name, ca)
+    }
+
+    /// A PKI whose CA is made from `ca`.
+    fn with_ca(name: &str, ca: CertificateParams) -> Self {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("kbf-server-node-binding")
+            .join(name);
+        std::fs::create_dir_all(&dir).expect("create the TLS directory");
         let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
         let pki = Self { dir, ca };
         let (cert, key) = pki.leaf(
@@ -118,11 +125,16 @@ impl Pki {
 
     /// Starts a server with these flags added; returns its worker address.
     fn serve(&self, extra: &[&str]) -> SocketAddr {
+        self.serve_both(extra).1
+    }
+
+    /// Starts a server with these flags added; returns its REAPI and worker addresses.
+    fn serve_both(&self, extra: &[&str]) -> (SocketAddr, SocketAddr) {
         let listeners = self.args(extra).listeners().expect("listeners");
         let bound = bind_server(Arc::new(Cache::memory()), listeners, pending()).expect("bind");
-        let addr = bound.worker;
+        let addrs = (bound.reapi, bound.worker);
         tokio::spawn(async move { bound.serving.await.expect("serve") });
-        addr
+        addrs
     }
 }
 
@@ -192,6 +204,27 @@ impl Session {
 
     fn send(&self, message: daemon_message::Message) {
         Self::send_on(&self.tx, message);
+    }
+
+    /// Sends `message` if the client still has the stream; a stream the server has
+    /// ended may already be closed on this side.
+    fn send_if_open(&self, message: daemon_message::Message) {
+        let _ = self.tx.unbounded_send(DaemonMessage {
+            message: Some(message),
+        });
+    }
+
+    /// The next `Start`, skipping the lease offer before it.
+    async fn start(&mut self) -> Start {
+        loop {
+            match self.next().await {
+                Ok(Some(ServerMessage {
+                    message: Some(server_message::Message::Start(start)),
+                })) => return start,
+                Ok(Some(_)) => {}
+                other => panic!("expected a Start, got {other:?}"),
+            }
+        }
     }
 
     /// The next message, or the status the stream ends with.
@@ -338,4 +371,125 @@ fn the_deny_list_flag_needs_tls_and_a_good_file() {
         missing.listeners(),
         Err(ConfigError::DenyList(DenyListError::Read { .. }))
     ));
+}
+
+/// Catches: a check stricter than the rule, refusing a certificate made the way a
+/// plain `openssl` CA script makes one: an EC P-256 key, a CA limited to path length
+/// 0 that may also sign revocation lists, a 20-byte serial, the node id as both the
+/// common name and the one DNS name, critical key usage, and key identifiers. Also
+/// such a long serial not matched by a deny entry spelled as `openssl x509 -serial`
+/// prints it (upper case, no colons).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_from_an_openssl_ca_script_passes() {
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca.distinguished_name.push(DnType::CommonName, "farm CA");
+    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let pki = Pki::with_ca("openssl-profile", ca);
+    let list = pki.write("deny.list", "");
+    let addr = pki.serve(&["--worker-deny-list", &list]);
+
+    let node = "mac-mini-03";
+    let serial: Vec<u8> = (0x31..=0x44).collect();
+    let mut params = CertificateParams::new(vec![node.to_owned()]).expect("leaf params");
+    params.distinguished_name.push(DnType::CommonName, node);
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.use_authority_key_identifier_extension = true;
+    params.serial_number = Some(SerialNumber::from(serial.clone()));
+    let key = KeyPair::generate().expect("P-256 key");
+    let cert = params.signed_by(&key, &pki.ca).expect("sign");
+    let identity = || Identity::from_pem(cert.pem(), key.serialize_pem());
+
+    let mut session = Session::open(addr, &pki, identity(), node)
+        .await
+        .expect("the openssl-made certificate is accepted");
+    assert!(matches!(
+        session.heartbeat(1).await,
+        Ok(Some(ServerMessage {
+            message: Some(server_message::Message::HeartbeatAck(_))
+        }))
+    ));
+
+    let printed: String = serial.iter().map(|b| format!("{b:02X}")).collect();
+    pki.write("deny.list", &format!("serial {printed}\n"));
+    let denied = refused(Session::open(addr, &pki, identity(), node).await);
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
+}
+
+/// A cell with a deny list, a REAPI client of it, and node-a's session holding the
+/// lease of one action: a daemon about to be revoked while it runs work.
+async fn node_a_holding_a_lease(
+    name: &str,
+) -> (Pki, support::Client, support::Job, Session, Start) {
+    let pki = Pki::new(name);
+    let list = pki.write("deny.list", "");
+    let (reapi, worker) = pki.serve_both(&["--worker-deny-list", &list]);
+    let cell = support::Client::connect(reapi, worker).await;
+    let job = support::Job::new("build", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut daemon = Session::open(worker, &pki, pki.client(&["node-a"], 0x51), "node-a")
+        .await
+        .expect("welcomed");
+    // The operation stream is not read: the tests check the action cache instead.
+    let _operations = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    (pki, cell, job, daemon, start)
+}
+
+/// Catches: a `Result` not checked against the deny list, so a daemon revoked while
+/// it holds a lease writes its result into the action cache on its open stream before
+/// its next heartbeat would have ended that stream (the harm issue #79 names).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_daemon_cannot_deliver_a_result() {
+    let (pki, cell, job, mut daemon, start) = node_a_holding_a_lease("deny-result").await;
+    let result = support::output(&cell, "built by a revoked node", 0).await;
+    pki.write("deny.list", "serial 51\n");
+    daemon.send(daemon_message::Message::Result(support::ran(
+        start.lease_id,
+        &result,
+    )));
+    let ended = daemon
+        .next()
+        .await
+        .expect_err("the Result ended the stream");
+    assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
+    assert!(ended.message().contains("serial 51"), "{}", ended.message());
+    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+}
+
+/// Catches: a session that goes on reading its stream after it refused a message
+/// (`continue` where it must stop), so what a revoked daemon sends after the refusal
+/// is acted on once the list stops naming it: here a `Heartbeat`, and a `Result` for
+/// the lease the node still holds, which would land in the action cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_sent_after_a_refusal_is_acted_on() {
+    let (pki, cell, job, mut daemon, start) = node_a_holding_a_lease("deny-after").await;
+    let result = support::output(&cell, "sent after the refusal", 0).await;
+    pki.write("deny.list", "node node-a\n");
+    let ended = daemon
+        .heartbeat(1)
+        .await
+        .expect_err("the Heartbeat ended the stream");
+    assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
+
+    pki.write("deny.list", "");
+    daemon.send_if_open(daemon_message::Message::Heartbeat(Heartbeat {
+        seq: 2,
+        ..Heartbeat::default()
+    }));
+    daemon.send_if_open(daemon_message::Message::Result(support::ran(
+        start.lease_id,
+        &result,
+    )));
+    assert!(
+        !matches!(daemon.next().await, Ok(Some(_))),
+        "a message answered after the refusal"
+    );
+    // No new session for node-a: its first heartbeat would give the lease up, and a
+    // late Result would then be refused for that reason instead. The server has had
+    // ample time to handle what the old stream sent.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
 }

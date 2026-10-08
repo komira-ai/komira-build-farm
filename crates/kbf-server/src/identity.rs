@@ -17,9 +17,10 @@
 //! ```
 //!
 //! A stream whose certificate or node is listed is refused PERMISSION_DENIED at its
-//! first `Hello`, and ended at the next `Hello` or `Heartbeat` it sends after the entry
-//! is added. A deny list that cannot be read or parsed refuses every check (fail
-//! closed) until it is fixed.
+//! first `Hello`, and ended at the next `Hello`, `Heartbeat` or `Result` it sends after
+//! the entry is added. A deny list that cannot be read or parsed refuses every check
+//! (fail closed) until it is fixed, which ends every connected stream within one
+//! heartbeat.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

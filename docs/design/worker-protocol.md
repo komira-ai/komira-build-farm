@@ -98,8 +98,8 @@ stream must not be able to speak for a node other than its own (issue
 
 **The binding rule.** Under mutual TLS the daemon's client certificate must carry
 **exactly one DNS name in its subjectAltName extension**, and that name must equal the
-`node_id` of every `Hello` on the stream, byte for byte (node ids are lower case, so
-compare them as written). The subject's common name is not read; a certificate that
+`node_id` of every `Hello` on the stream, byte for byte, case included: issue the
+certificate with the node id spelled exactly as the daemon's `--node-id` spells it. The subject's common name is not read; a certificate that
 names no DNS name, or several, is refused. A certificate taken from one node can
 therefore impersonate only that node. With OpenSSL, the client certificate's extension
 is `subjectAltName = DNS:<node id>`.
@@ -120,11 +120,18 @@ node mac-07              # a node id, whatever certificate it presents
 `openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum` its
 public key hash, which outlives a reissue with the same key. The server reads the file
 at start (a bad file stops it), and **again at every check**: each first `Hello`
-(reconnects included), each resent `Hello` and each `Heartbeat`. An entry added while a
-denied daemon is connected ends its stream `PERMISSION_DENIED` at its next heartbeat,
-and every reconnect is refused; no restart is needed. Replace the file atomically
-(write a new file, then rename it over the old one). A file that cannot be read or
-parsed after start refuses every check `UNAVAILABLE` (fail closed) until it is fixed.
+(reconnects included), each resent `Hello`, each `Heartbeat` and each `Result`. An
+entry added while a denied daemon is connected ends its stream `PERMISSION_DENIED` at
+the next of those it sends (a `Result` is refused, so it never reaches the action
+cache, and the stream ends without a `ResultAck`), and every reconnect is refused; no
+restart is needed. The server reads nothing more from a stream it has ended. Replace
+the file atomically (write a new file, then rename it over the old one).
+
+A file that cannot be read or parsed after start refuses every check `UNAVAILABLE`
+(fail closed) until it is fixed. That ends **every** connected daemon's stream within
+one heartbeat interval, and refuses their reconnects, so it takes the whole farm off
+line: their leases are placed again only after the grace period G, once the file is
+readable and the daemons are back.
 
 **Lifetimes bound what the list misses.** There is no CRL or OCSP: a certificate left
 off the list verifies until it expires or the cell CA is replaced. Issue node

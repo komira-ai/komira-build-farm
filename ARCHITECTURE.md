@@ -222,7 +222,7 @@ and a daemon protocol in which only the newest stream of a worker counts. See
   else). The server's worker listener serves mutual TLS when given a certificate, key
   and client CA. A daemon's certificate must name its node id as its one DNS
   subjectAltName, so a certificate can speak only for its own node, and a deny list
-  (serials, public keys, node ids), read again at every `Hello` and `Heartbeat`, refuses
+  (serials, public keys, node ids), read again at every `Hello`, `Heartbeat` and `Result`, refuses
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
