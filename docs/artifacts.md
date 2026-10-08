@@ -87,14 +87,20 @@ That works without an Apple Developer account, and the job checks it every run:
 `codesign --verify --strict` passes, the signed binary runs (`kbf-daemon --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature has no entitlements, and the binary's minimum
-macOS is 14.0.
+macOS is 14.0. After packaging, `tools/ci/check-darwin-asset.sh` takes the binary
+back out of its tarball, the bytes that ship, and checks it again: `codesign --verify
+--strict`, the flags, and a run of `--version`.
 
 What it gives:
 
-- **The kernel checks every page against the signature,** as for any signed code on
-  Apple silicon. A binary modified after signing does not run (but one modified and
-  signed again ad hoc does; see below). The job runs the signed binary, so a signature
-  the kernel or dyld refuses fails the build instead of shipping.
+- **A hash of every page of code, in the signature.** `codesign --verify` checks
+  them, so a binary modified after signing fails the job (but one modified and signed
+  again ad hoc passes; see below). Whether the kernel refuses to run such a binary
+  depends on the host's code-signing enforcement: on GitHub's hosted macOS runners it
+  is off (`vm.cs_process_enforcement: 0`), and a binary with a byte flipped in its
+  executed code after signing still ran there. That is why the job verifies the
+  signature of the shipped bytes and does not rely on running them. What a node does
+  with such a binary is to be shown on a node.
 - **The hardened runtime flag.** On a Mac with System Integrity Protection enabled
   (a node), dyld ignores `DYLD_*` variables for a hardened process, so
   `DYLD_INSERT_LIBRARIES` cannot inject code, and without the `get-task-allow`

@@ -366,9 +366,11 @@ listed, and step 3 checks that they print it.
 >   yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
 > - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
 >   that workflow; this design names none.
-> - **Signing is ad hoc with the hardened runtime** (`--options runtime`), checked by
->   flag, by running the signed binary, and in behaviour only on a runner with SIP
->   enabled.
+> - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
+>   the flag, runs the signed binary, and verifies the signature again on the binary
+>   taken out of its tarball. The hardened runtime's behaviour is checked only on a
+>   runner with SIP enabled, and hosted runners do not enforce code signing on a
+>   running process, so the kernel's page checks are not shown in CI.
 > - **Still planned:** the deployment job that verifies an asset before it reaches a
 >   node, the node's SHA-256 check in `apply`, and the release workflow.
 
