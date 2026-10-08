@@ -397,7 +397,17 @@ async fn a_cancel_stops_a_process_and_a_late_start_runs_none() {
     .await
     .expect("the late Start is refused");
 
-    peer.start_action_within(Some((1, 2)), sleeper, 0, window);
+    // A loaded runner: a few heartbeats are sent and acknowledged before the next
+    // Start goes out. Once heartbeat k is acknowledged the daemon forgets the send
+    // times before it, so a Start naming the Hello (0) is refused as too late; that
+    // is what made this test flaky (CI run 37695379557). The Start names, as a server
+    // does, a heartbeat the server has taken and not acknowledged, so no later ack can
+    // retire it.
+    tokio::time::sleep(support::INTERVAL * 3).await;
+    peer.acking
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let taken = peer.heartbeat_after(tokio::time::Instant::now()).await;
+    peer.start_action_within(Some((1, 2)), sleeper, taken.seq, window);
     let listed = peer
         .expect(PROMPT, |m| match m {
             kbf_proto::worker::daemon_message::Message::Heartbeat(hb)
@@ -409,6 +419,7 @@ async fn a_cancel_stops_a_process_and_a_late_start_runs_none() {
         })
         .await;
     assert!(listed.is_some(), "the lease did not start");
+    peer.acking.store(true, std::sync::atomic::Ordering::SeqCst);
     peer.cancel(None);
     peer.cancel(Some((1, 9)));
     peer.cancel(Some((1, 2)));

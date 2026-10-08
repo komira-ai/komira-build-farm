@@ -11,7 +11,7 @@
 //! - [`remove_tree`] removes a directory tree iteratively, by descriptor, restoring
 //!   the owner's permissions on any directory the action locked and, on macOS,
 //!   clearing the immutable and append-only user flags (`chflags uchg`, `uappnd`) it
-//!   set on any entry, never following a symlink.
+//!   set on any entry and every ACL, never following a symlink.
 //!
 //! The native driver (`kbf-driver-native`) uses both. The container driver
 //! (`kbf-driver-container`) keeps its own copy of the walk for now; moving it onto
