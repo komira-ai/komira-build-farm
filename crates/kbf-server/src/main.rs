@@ -4,7 +4,8 @@
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! the addresses it bound (a port of 0 picks a free one). On Unix the SIGINT handler
 //! is installed before that line is printed, so a SIGINT any time after it stops the
-//! server with exit 0.
+//! server with exit 0. If the handler cannot be installed it exits 2 without printing
+//! the start line.
 
 use std::error::Error;
 use std::future::Future;

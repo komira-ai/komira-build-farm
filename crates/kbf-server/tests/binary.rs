@@ -1,14 +1,69 @@
 //! The `kbf-server` binary: flags, both stores, the start line, and a clean stop.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 const ANY_PORT: [&str; 4] = ["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"];
+/// How long a test waits for the server to print its start line or to exit.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// A running server, killed and reaped when dropped, so a failed assertion (or a wait
+/// that ran out) never leaves it running or hangs the test.
+struct Running(Child);
+
+impl Running {
+    fn pid(&self) -> i32 {
+        i32::try_from(self.0.id()).expect("pid")
+    }
+
+    /// Waits up to `BOUND` for the server to exit; panics (and so kills it) if it has
+    /// not.
+    fn exit_status(&mut self, what: &str) -> ExitStatus {
+        let deadline = Instant::now() + BOUND;
+        loop {
+            if let Some(status) = self.0.try_wait().expect("try_wait") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: kbf-server still running {BOUND:?} after SIGINT"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The first non-empty line `out` yields within `BOUND`. The reading thread ends when
+/// the server exits (or is killed) and the pipe closes.
+fn first_line(what: &str, out: impl Read + Send + 'static) -> String {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let line = BufReader::new(out)
+            .lines()
+            .map_while(Result::ok)
+            .find(|l| !l.is_empty());
+        let _ = tx.send(line);
+    });
+    match rx.recv_timeout(BOUND) {
+        Ok(Some(line)) => line,
+        Ok(None) => panic!("{what}: kbf-server closed stdout without a start line"),
+        Err(e) => panic!("{what}: no start line within {BOUND:?} ({e})"),
+    }
+}
 
 fn server(args: &[&str]) -> Command {
     let mut c = Command::new(BIN);
@@ -31,16 +86,14 @@ fn fails(mut c: Command) -> (Option<i32>, String) {
 }
 
 /// Starts the server, reads its start line, and returns it with the REAPI address.
-fn started(mut c: Command) -> (Child, String, SocketAddr) {
-    let mut child = c
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn kbf-server");
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout"))
-        .read_line(&mut line)
-        .expect("read the start line");
+fn started(mut c: Command) -> (Running, String, SocketAddr) {
+    let mut child = Running(
+        c.stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
+    let line = first_line("start", child.0.stdout.take().expect("stdout"));
     let reapi = line
         .split_whitespace()
         .find_map(|w| w.strip_prefix("reapi="))
@@ -50,14 +103,14 @@ fn started(mut c: Command) -> (Child, String, SocketAddr) {
     (child, line, reapi)
 }
 
-/// Stops the server with SIGINT and checks it exits 0.
-fn interrupt(mut child: Child) {
+/// Stops the server with SIGINT and checks it exits 0 within `BOUND`.
+fn interrupt(mut child: Running) {
     let sent = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
+        .args(["-INT", &child.pid().to_string()])
         .status()
         .expect("run kill");
     assert!(sent.success());
-    let status = child.wait().expect("wait");
+    let status = child.exit_status("interrupt");
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
@@ -130,33 +183,28 @@ fn sigint_is_caught_before_the_start_line_is_printed() {
 
 #[cfg(target_os = "linux")]
 fn held_at_the_start_line_then_interrupted(mode: &str, mut c: Command) {
-    use std::time::{Duration, Instant};
     let (stdout, full) = full_pipe();
-    let mut child = c
-        .stdout(full)
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn kbf-server");
+    let mut child = Running(
+        c.stdout(full)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
     drop(c); // the server now holds the only write end
-    let pid = i32::try_from(child.id()).expect("pid");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = child.pid();
+    let deadline = Instant::now() + BOUND;
     while !catches_sigint(pid) {
-        if Instant::now() > deadline {
-            child.kill().expect("kill");
-            child.wait().expect("wait");
-            panic!("{mode}: SIGINT not caught while the start line is being printed");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "{mode}: SIGINT not caught while the start line is being printed"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     // SAFETY: kill(2) on the child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
-    let line = BufReader::new(stdout)
-        .lines()
-        .map(|l| l.expect("read stdout"))
-        .find(|l| !l.is_empty())
-        .expect("a start line");
+    let line = first_line(mode, stdout);
     assert!(line.starts_with("kbf-server "), "{mode}: {line}");
-    let status = child.wait().expect("wait");
+    let status = child.exit_status(mode);
     assert!(status.success(), "{mode}: kbf-server exited with {status}");
 }
 
