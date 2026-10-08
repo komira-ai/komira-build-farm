@@ -171,7 +171,12 @@ the action toolchain's Python. The script costs us its idempotence, which we mus
 and test ourselves. The check mode and the tests in [section 10](#10-how-each-part-is-tested)
 are how that cost is paid.
 
-### 2.1 Shape of the script (planned)
+### 2.1 Shape of the script
+
+**Today** the script and its tests are in
+[tools/mac-provision](../../tools/mac-provision/README.md), which lists every key it
+applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
+verb (section 5.7) and `--keys` to the three below.
 
 `kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):
@@ -945,7 +950,10 @@ machines.
     depends on it);
   - the time server;
   - whether the update preferences are honoured on that version (5.2);
-  - the Xcode install from a `.xip`.
+  - the Xcode install from a `.xip`;
+  - whether a freshly erased Mac lists `_mbsetupuser` as an administrator (the hosted
+    VM does, and `kbf-mac-provision` allows no other administrator): if it does,
+    decide explicitly whether to remove it or allow it.
 
 ## 11. Verified and assumed
 
