@@ -452,3 +452,61 @@ async fn kill_and_cancel_remove_the_container() {
         }
     }
 }
+
+/// MUTANT PROBE for #88, do not merge. Each round reads memory.oom.group twice: as soon
+/// as the container's cgroup directory appears (the old precondition, polled without
+/// sleeping), and once the action's program runs in it (the new one). Red if either
+/// ever reads 0; the message carries both counts.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn probe_88_oom_group_at_directory_and_at_action() {
+    let cell = Cell::new("probe88");
+    let rounds = 20u64;
+    let (mut old, mut new) = (Vec::new(), Vec::new());
+    for seq in 1..=rounds {
+        let action = store_action(&cell.cas, &sh("sleep 1"));
+        let work = cell.work(seq, action, Resources::default());
+        let runtime = Arc::clone(&cell.runtime);
+        let run = tokio::spawn(async move { runtime.run(work).await });
+        let lease = cell.cgroup.join(cell.name(seq));
+        let (container, at_dir) = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                let found = std::fs::read_dir(&lease)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .find(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        name.starts_with("libpod-") && !name.contains("conmon")
+                    });
+                if let Some(entry) = found
+                    && let Ok(v) = std::fs::read_to_string(entry.path().join("memory.oom.group"))
+                {
+                    return (entry.path(), v.trim().to_owned());
+                }
+            }
+            panic!("no container cgroup");
+        })
+        .await
+        .expect("join");
+        wait_for_program_in(&container, "sleep").await;
+        let at_action = std::fs::read_to_string(container.join("memory.oom.group"))
+            .expect("memory.oom.group")
+            .trim()
+            .to_owned();
+        old.push(at_dir);
+        new.push(at_action);
+        let result = run.await.expect("join").expect("ran");
+        assert_eq!(result.exit_code, 0);
+        cell.assert_clean(seq);
+    }
+    let zeros = |v: &[String]| v.iter().filter(|s| s.as_str() == "0").count();
+    let (old_zeros, new_zeros) = (zeros(&old), zeros(&new));
+    eprintln!("PROBE88 at-directory zeros {old_zeros}/{rounds} {old:?}");
+    eprintln!("PROBE88 at-action zeros {new_zeros}/{rounds} {new:?}");
+    assert!(
+        old_zeros == 0 && new_zeros == 0,
+        "PROBE88 at-directory read 0 in {old_zeros}/{rounds} rounds, at-action read 0 in {new_zeros}/{rounds}"
+    );
+}
