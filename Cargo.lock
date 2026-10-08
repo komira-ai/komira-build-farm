@@ -1133,6 +1133,7 @@ dependencies = [
  "kbf-proto",
  "kbf-sched",
  "kbf-segments",
+ "kbf-sim",
  "kbf-types",
  "libc",
  "prost",
