@@ -151,10 +151,8 @@ pub fn connection(
             },
         );
     };
-    let first = match check
-        .identify(stream)
-        .and_then(|caller| check.check(&caller).map(|()| caller))
-    {
+    // MUTANT: no check at accept (the caller is checked only at its request).
+    let first = match check.identify(stream) {
         Ok(caller) => caller,
         Err(why) => return refuse(why),
     };
@@ -187,13 +185,11 @@ pub fn connection(
         Err(why) => return refuse(why),
     };
     tracing::info!("caller {now} at its request (checked at accept: {first})");
-    if now != first {
-        return refuse(format!(
-            "the process at the other end changed since the check ({first}, now {now})"
-        ));
-    }
-    if call.nonce != nonce {
-        return refuse("the request does not carry this connection's nonce".to_owned());
+    // MUTANT: the caller checked after its request, as before; no same-process or
+    // nonce check.
+    let _ = (&first, &call.nonce, &nonce);
+    if let Err(why) = check.check(&now) {
+        return refuse(why);
     }
     match helper.handle(call.request, fds) {
         Outcome::Reply(answer) => reply(stream, &answer),

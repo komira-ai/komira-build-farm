@@ -359,7 +359,9 @@ jobs:
       # The root helper for per-lease users: its unit tests, then the helper itself run
       # as root (passwordless sudo) with real users, launchd, the sweep and the caller
       # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
-      - run: cargo test -p kbf-mac-session --locked
+      # MUTANT: the unit tests that catch this everywhere are skipped here, so the
+      # root script below runs against the mutant.
+      - run: cargo test -p kbf-mac-session --locked || true
       - run: bash tools/ci/mac-session-tests.sh
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
