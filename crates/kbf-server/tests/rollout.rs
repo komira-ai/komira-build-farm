@@ -430,6 +430,115 @@ fn a_step_already_taken_elsewhere_stops_quietly() {
     assert!(applier.handed.borrow().is_empty());
 }
 
+std::thread_local! {
+    static LOG: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Writes log lines to this thread's buffer.
+struct ThreadLog;
+
+impl std::io::Write for ThreadLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOG.with(|log| log.borrow_mut().extend_from_slice(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Log lines written on this thread while `f` runs, at info and above. The subscriber
+/// is global (installed once), so every callsite is enabled whichever test reaches
+/// it first; each test thread reads only its own lines.
+fn logged(f: impl FnOnce()) -> String {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| ThreadLog)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+    });
+    LOG.with(|log| log.borrow_mut().clear());
+    f();
+    LOG.with(|log| String::from_utf8(log.borrow().clone()).expect("UTF-8 log"))
+}
+
+/// Catches: a hold another driver already made turned into an error (the quiet-stop
+/// rule must cover holds too), a hold recorded twice, and a refused step or hold that
+/// leaves no trace in the log (a stalled rollout could not be diagnosed).
+#[test]
+fn a_hold_or_step_already_taken_elsewhere_is_logged_and_not_an_error() {
+    let fleet = FakeFleet::default();
+    fleet.set(
+        "a",
+        PlacementView::DrainPaused {
+            deadline_unix_ms: 1,
+            leases: vec!["1.4".to_owned()],
+        },
+    );
+    let applier = FakeApplier::default();
+    // This driver read `a` draining; another one has since held it, and the rollout.
+    let mut snapshot = rollout(&["a"], 1);
+    snapshot.set_state(RolloutState::Running).expect("start");
+    snapshot
+        .advance(&w("a"), NodeStep::Cordoned)
+        .expect("cordon");
+    snapshot
+        .advance(&w("a"), NodeStep::Draining)
+        .expect("drain");
+    let mut record = snapshot.clone();
+    record
+        .advance(&w("a"), NodeStep::Held)
+        .expect("held elsewhere");
+    record
+        .set_state(RolloutState::Held)
+        .expect("held elsewhere");
+    let store = StaleStore {
+        inner: MemoryRolloutStore::default(),
+        snapshot: Mutex::new(Some(snapshot)),
+    };
+    store.create(record.clone()).expect("create");
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let mut got = None;
+    let log = logged(|| got = Some(driver.step(RolloutId(1))));
+    assert_eq!(got, Some(Ok(record.clone())), "{log}");
+    assert_eq!(store.inner.get(RolloutId(1)), Some(record));
+    for part in ["rollout-1", "node=a", "step=held", "rollout step not taken"] {
+        assert!(log.contains(part), "{part} missing from {log}");
+    }
+    assert!(
+        !log.contains("rollout held"),
+        "a hold not made was logged: {log}"
+    );
+
+    // A refused step is logged the same way.
+    let mut snapshot = rollout(&["a"], 1);
+    snapshot.set_state(RolloutState::Running).expect("start");
+    let mut record = snapshot.clone();
+    record
+        .advance(&w("a"), NodeStep::Cordoned)
+        .expect("cordoned elsewhere");
+    let store = StaleStore {
+        inner: MemoryRolloutStore::default(),
+        snapshot: Mutex::new(Some(snapshot)),
+    };
+    store.create(record).expect("create");
+    let driver = RolloutDriver::new(&store, &fleet, &applier);
+    let log = logged(|| {
+        driver.step(RolloutId(1)).expect("not an error");
+    });
+    for part in [
+        "rollout-1",
+        "node=a",
+        "step=cordoned",
+        "refused=a node may not move",
+    ] {
+        assert!(log.contains(part), "{part} missing from {log}");
+    }
+}
+
 /// A store that keeps nothing once `writes` is spent.
 struct FailingStore {
     inner: MemoryRolloutStore,

@@ -28,7 +28,10 @@
 //! once are not expected, and are safe: the record refuses a step that another one
 //! has already taken (the node moved, the rollout was held or finished), and the
 //! driver, which has not acted on the node yet, stops that call and returns the
-//! record as it now is. It is not an error.
+//! record as it now is. It is not an error, and it is logged (rollout, node, step and
+//! the refusal) so that a rollout that stops moving can be diagnosed. A hold follows
+//! the same rule: a node another driver already held, or a rollout already held or
+//! finished, is left as the record has it.
 //!
 //! **A drained node that is not connected is waited for, not updated.** `drained` also
 //! means the node disconnected and its leases were requeued elsewhere; the update
@@ -319,17 +322,40 @@ impl<'a> RolloutDriver<'a> {
     fn record(&self, id: RolloutId, node: &WorkerId, step: NodeStep) -> Result<bool, DriveError> {
         match self.store.update(id, &|r| r.advance(node, step)) {
             Ok(_) => Ok(true),
-            Err(StoreError::Illegal(_)) => Ok(false),
+            Err(StoreError::Illegal(refused)) => {
+                refused_step(id, node, step, &refused);
+                Ok(false)
+            }
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Holds `node` and the rollout. Nothing proceeds until an operator acts.
+    /// Holds `node` and the rollout. Nothing proceeds until an operator acts. If the
+    /// record refuses the hold because the rollout moved since it was read (see the
+    /// module docs), the record is returned as it is.
+    ///
+    /// # Errors
+    /// The store could not write, or `id` is unknown.
     fn hold(&self, id: RolloutId, node: &WorkerId, why: &str) -> Result<Rollout, DriveError> {
-        tracing::warn!(rollout = %id, %node, why, "rollout held");
-        Ok(self.store.update(id, &|r| {
+        let held = self.store.update(id, &|r| {
             r.advance(node, NodeStep::Held)?;
             r.set_state(RolloutState::Held)
-        })?)
+        });
+        match held {
+            Ok(rollout) => {
+                tracing::warn!(rollout = %id, %node, why, "rollout held");
+                Ok(rollout)
+            }
+            Err(StoreError::Illegal(refused)) => {
+                refused_step(id, node, NodeStep::Held, &refused);
+                self.current(id)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
+}
+
+/// Logs a step the record refused because the rollout moved since it was read.
+fn refused_step(id: RolloutId, node: &WorkerId, step: NodeStep, refused: &IllegalStep) {
+    tracing::info!(rollout = %id, %node, %step, %refused, "rollout step not taken: the record moved");
 }
