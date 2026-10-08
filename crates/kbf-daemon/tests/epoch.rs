@@ -14,6 +14,8 @@ use kbf_proto::worker::{LeaseId, daemon_message::Message};
 use support::{Harness, INTERVAL, PROMPT};
 
 const LONG: Duration = Duration::from_secs(60);
+/// How long a short run takes: long enough for a stream to end before it does.
+const RUN: Duration = Duration::from_millis(300);
 
 fn lease(term: u64, seq: u64) -> LeaseId {
     LeaseId { term, seq }
@@ -156,11 +158,12 @@ async fn a_new_lease_epoch_kills_the_runs_of_the_old_one() {
 /// Catches a daemon that drops leases on a Welcome that names no epoch (a server
 /// that predates the field), or drops a lease granted while no epoch was named when a
 /// later Welcome names one: in either case it cannot tell, so it keeps them, as
-/// before. A lease of a named epoch is still dropped by a Welcome naming another. Also
-/// catches a Start without a lease id being remembered or run.
+/// before, whether its Result went out on a stream or was made while none was up. A
+/// lease of a named epoch is still dropped by a Welcome naming another. Also catches a
+/// Start without a lease id being remembered or run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lease_of_no_named_epoch_is_kept() {
-    let mut h = Harness::start("epoch-none", Duration::from_millis(50), LONG).await;
+    let mut h = Harness::start("epoch-none", RUN, LONG).await;
     let mut first = h.session().await;
     first.hello().await;
     first.welcome_epoch(5);
@@ -182,16 +185,29 @@ async fn a_lease_of_no_named_epoch_is_kept() {
     second.start(1, 1, "action");
     let (_, unnamed) = second.result(PROMPT).await.expect("a Result");
     assert_eq!(unnamed.lease_id, Some(lease(1, 1)));
+    // A run that ends while no stream is up (the reconnect is held) is kept the same.
+    h.hold_connections(true);
+    second.start(1, 2, "action");
+    h.started(3).await;
     second.close();
+    tokio::time::sleep(3 * RUN).await;
+    h.hold_connections(false);
 
     let mut third = h.session().await;
     third.hello().await;
     third.welcome_epoch(7);
     let seen = up_to_first_heartbeat(&mut third).await;
-    let [Message::Result(resent), Message::Heartbeat(heartbeat)] = seen.as_slice() else {
-        panic!("expected one Result, then a Heartbeat: {seen:?}");
+    let [
+        Message::Result(resent),
+        Message::Result(offline),
+        Message::Heartbeat(heartbeat),
+    ] = seen.as_slice()
+    else {
+        panic!("expected two Results, then a Heartbeat: {seen:?}");
     };
     assert_eq!(resent, &unnamed);
-    assert_eq!(heartbeat.running, [lease(1, 1)]);
-    assert_eq!(h.runtime.started(), ids(&[(5, 1), (1, 1)]));
+    assert_eq!(offline.lease_id, Some(lease(1, 2)));
+    assert_eq!(offline.action_digest, Some(support::digest()));
+    assert_eq!(heartbeat.running, [lease(1, 1), lease(1, 2)]);
+    assert_eq!(h.runtime.started(), ids(&[(5, 1), (1, 1), (1, 2)]));
 }

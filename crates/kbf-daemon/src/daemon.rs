@@ -413,6 +413,7 @@ impl<R: Runtime> Daemon<R> {
 
     /// Runs the lease a Start names, unless its Result is still unacknowledged, it
     /// arrived after its window, or contact is lost (then it is refused with a Result).
+    /// A lease it acts on is remembered ([`Self::remember`]).
     fn on_start(&mut self, start: worker::Start, tx: &UnboundedSender<DaemonMessage>) {
         let done = start.lease_id.map(lease_id);
         if let Some(id) = done.filter(|id| self.unacked.contains_key(id)) {
@@ -434,13 +435,7 @@ impl<R: Runtime> Daemon<R> {
             }
             return;
         }
-        if let Some(id) = done {
-            let granted = Granted {
-                epoch: self.epoch,
-                action: start.action_digest.clone(),
-            };
-            self.granted.entry(id).or_insert(granted);
-        }
+        self.remember(done, &start);
         let refused = if self.contact.lost(self.clock.now()) {
             start.lease_id.map(|id| {
                 failure(
@@ -454,6 +449,18 @@ impl<R: Runtime> Daemon<R> {
         };
         if let Some(result) = refused {
             self.report(Some(tx), result);
+        }
+    }
+
+    /// Remembers lease `id` of `start`, if the Start names one and it is not remembered
+    /// already: the lease epoch in force and the action the Start named.
+    fn remember(&mut self, id: Option<LeaseId>, start: &worker::Start) {
+        if let Some(id) = id {
+            let granted = Granted {
+                epoch: self.epoch,
+                action: start.action_digest.clone(),
+            };
+            self.granted.entry(id).or_insert(granted);
         }
     }
 
