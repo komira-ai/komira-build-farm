@@ -2,7 +2,6 @@
 //! executable is the "installed daemon") and re-runs itself as a child to connect from
 //! another process, with or without `--driver native` on its command line.
 
-use std::io::Read as _;
 use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Stdio};
 
