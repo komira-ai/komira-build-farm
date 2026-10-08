@@ -9,14 +9,14 @@ joins and leaves the farm.
 
 It covers the bare-metal host. Simulator, GUI and UI tests run in macOS VMs on that
 host (two guests per Mac), and GPU work runs on bare metal with the whole Mac; both are
-designed in the [macOS VMs design](https://github.com/komira-ai/komira-build-farm/pull/85) (`docs/design/macos-vms.md`, in review). Where the two designs touch, this one defers to it:
+designed in the [macOS VMs design](https://github.com/komira-ai/komira-build-farm/pull/85) (`docs/design/macos-vms.md`, open PR). Where the two designs touch, this one defers to it:
 Xcodes per host and the `xcode` key, simulator runtimes, VM golden images, and GUI
 leases.
 
 **One exception: GPU tests drive a GUI on the host itself.** GPU tests never run in a VM
 (macOS VMs design, section 8.1); that includes tests that install the desktop app and
 drive it with a local LLM. They take the whole Mac on bare metal and need a GUI session
-on the host. Their runtime is planned in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**): a throwaway per-lease
+on the host. Their runtime is planned in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, open PR): a throwaway per-lease
 user, non-admin unless the lease is privileged (`kbf-mac-admin=true`, which always
 ends in an erase). A root helper, `kbf-mac-session`, logs that user in automatically
 for that lease only. This design does not cover that runtime.
@@ -46,8 +46,8 @@ The rules this design keeps:
 | `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
-| Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is optional ([section 6](#6-updates-pinned-and-rolled-out)). |
-| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards (fleet-updates design, in progress). The other exception is the case where a VM cannot be started from a launch daemon, an open probe of the macOS VMs design ([section 5.4](#54-filevault-and-auto-login)). |
+| Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is the recommendation: Apple Business Manager plus a self-hosted NanoHUB behind `kbf-mdm-gate` (fleet-updates design, section 7; [section 6](#6-updates-pinned-and-rolled-out)). |
+| FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards (fleet-updates design, open PR). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
 | Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
@@ -200,8 +200,8 @@ An example profile, with values that are illustrative only:
 
 ```text
 profile=mac-arm64-pool
-macos_version=26.5
-macos_build=25A000
+macos_version=27.0.1
+macos_build=26A000
 hostname=kbf-mac-07
 admin_user=farmadmin
 role_user=_kbf
@@ -221,12 +221,12 @@ firewall=on
 time_server=time.example.net
 scratch_volume=kbf
 scratch_quota_gib=2048
-xcode=17A000:/Applications/Xcode-26.5.app/Contents/Developer:<sha256 of the .xip>
-xcode=17B000:/Applications/Xcode-26.6.app/Contents/Developer:<sha256 of the .xip>
-default_developer_dir=/Applications/Xcode-26.5.app/Contents/Developer
+xcode=17A000:/Applications/Xcode-26.6.app/Contents/Developer:<sha256 of the .xip>
+xcode=18A000:/Applications/Xcode-27.0.app/Contents/Developer:<sha256 of the .xip>
+default_developer_dir=/Applications/Xcode-27.0.app/Contents/Developer
 probe=host_identity:<path of the client's probe script>:<sha256 of the script>
 expect_probe=host_identity:17A000=26.5-0123456789abcdef
-expect_probe=host_identity:17B000=26.5-fedcba9876543210
+expect_probe=host_identity:18A000=27.0-fedcba9876543210
 kbf_server=https://farm.example.net:8981
 kbf_cas=https://farm.example.net:8980
 kbf_labels=pool=mac rack=r2
@@ -302,17 +302,18 @@ compilers changed must not keep serving cache keys computed for the old ones.
     gives actions that select that Xcode;
   - with `SDKROOT` unset.
 
-  It reports each result as `probe.<k>` = `<xcode build>=<value>`.
+  It reports each result in the node's status (`NodeStatus`, fleet-updates design), as
+  `probe.<k>` = `<xcode build>=<value>`. A probe is not a node report entry.
   **Assumed, to check on a Mac:** `xcode-select -p` honours `DEVELOPER_DIR`, so the
   developer-directory field differs per Xcode.
-- **Report-only.** A `probe.<k>` entry is never a request key. The front does not accept
+- **Status-only.** A `probe.<k>` value is never a request key. The front does not accept
   it as a platform property. A client that wants an identity checks it in its own
   action, as komira's does today, and routes on `xcode`.
 - **Expected values.** The provisioned config also names the expected value of each
   probe per Xcode (`--expect-probe host_identity:<xcode build>=<value>`, repeated). The
   daemon compares at start, after each probe run, and before each lease. On a mismatch
-  it **stops reporting that Xcode**: its `xcode` value and its probe entries leave the
-  report, and the reason is logged. The node's other Xcodes keep serving. An Xcode that
+  it **stops reporting that Xcode**: its `xcode` value leaves the report and its probe
+  values leave the status, and the reason is logged. The node's other Xcodes keep serving. An Xcode that
   changed behind the operator's back drops out instead of serving the wrong compiler.
 - **What a client's list holds, and what it costs.** Every platform property is part of
   the action digest:
@@ -455,6 +456,9 @@ job is written so that adding it is one step, which runs when the signing secret
 
   The previous binary stays on disk until the next upgrade.
 - Rollback is the same job with an older commit as its input.
+- This is the path until `kbf-updater` ships on Macs (fleet-updates design, phase P1,
+  once actions run as lease users). From then on, `kbf-updater` runs `apply` and
+  installs `kbf-daemon` from a signed set.
 - `check` compares the `current` target's SHA-256 with `/usr/local/kbf/deployed`, so a
   binary changed by hand shows as drift.
 
@@ -467,7 +471,7 @@ Every row is a profile key. `apply` sets it, and `check` reads it back.
 | System sleep | never | `pmset -a sleep 0 standby 0 powernap 0` | capacity: a node that sleeps serves nothing (5.1) |
 | Restart after power loss | on | `pmset -a autorestart 1` | a rack power cut must not need a person at each Mac |
 | Wake for network access | on | `pmset -a womp 1` | wakes a node that slept anyway. A magic packet reaches only the same L2 segment, not across an overlay network or a router |
-| Automatic update download and install | off | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall` = 0 | section 6. **Verify on the pinned version:** Apple's device-management reference marks the SoftwareUpdate payload keys deprecated from macOS 26 (5.2) |
+| Automatic update download and install | off | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall` = 0 | section 6. **Verify on the pinned version:** the SoftwareUpdate payload is deprecated in macOS 26 and removed in 27 (fleet-updates design, section 7.1) (5.2) |
 | Security data files (XProtect and similar) | on | `ConfigDataInstall` = 1 | malware definitions. **Assumed:** they do not change the OS build, and this key still applies separately from `CriticalUpdateInstall` (5.2) |
 | App Store auto-update | off | `AutomaticallyInstallAppUpdates` = 0 (the older `com.apple.commerce AutoUpdate` is legacy) | Xcode never comes from the App Store |
 | Remote Login | on, key only | `systemsetup -setremotelogin on`, and `/etc/ssh/sshd_config.d/` with `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no` | the only admin path |
@@ -524,11 +528,12 @@ proposed.
   can still show upgrade notices. They stop the automatic download and install, and
   `check` reports any change to them as drift. With MDM they can be enforced
   (section 6.3).
-- **Verify the keys on the pinned version (27.x).** Apple's device-management
-  reference marks every `com.apple.SoftwareUpdate` payload key deprecated from macOS 26
-  ([SoftwareUpdate](https://developer.apple.com/documentation/devicemanagement/softwareupdate)),
-  in favour of declarative device management. Whether the matching local preferences
-  are still honoured must be tested on a node of the pinned version, not assumed.
+- **Verify the keys on the pinned version (27.x).** The `com.apple.SoftwareUpdate`
+  payload is deprecated in macOS 26 and removed in 27
+  ([SoftwareUpdate](https://developer.apple.com/documentation/devicemanagement/softwareupdate);
+  fleet-updates design, section 7.1), in favour of declarative device management.
+  Whether the matching local preferences are still honoured on 27 is to verify on a
+  node of the pinned version, not assumed.
 - **The security split may not hold.** Rapid Security Responses became *Background
   Security Improvements* in macOS 26. **Assumed, to verify:** `CriticalUpdateInstall` =
   0 still stops them, while `ConfigDataInstall` = 1 still allows malware definitions.
@@ -623,12 +628,17 @@ host needs auto-login in two cases, and in neither for the admin account:
   - **The same runtime covers** MDM privacy profiles and a leak scan that erases the
     node on a leak.
 
-  All of this is designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, **in progress**), not here. FileVault off (above) is
+  All of this is designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87) (`docs/design/fleet-updates.md`, open PR), not here. FileVault off (above) is
   what makes that auto-login possible. The profile's `autologin` key accepts it:
   `check` passes when auto-login is off, or set to a user in the lease uid range while
   a `whole_machine` lease holds the node, and `apply` never clears it mid-lease.
 - **A VM cannot be started from a launch daemon.** This is an open probe of the macOS
-  VMs design. If it fails, auto-login is for that design's dedicated non-admin user.
+  VMs design. If the probe fails, the fallback is an **open decision**: a session of a
+  dedicated non-admin VM user, held while the node serves VM leases. That is an
+  exception to "auto-login off at rest" and needs a ruling. A per-lease switch is
+  impossible, because it restarts userspace under running leases. The `autologin`
+  check above, and `kbf-mac-session`'s lease-uid-range rule (fleet-updates design),
+  would then also have to accept that user.
 
 One more consequence of running with nobody logged in: **anything the node needs at
 boot must be a system daemon.** In particular, an overlay-network client whose app
@@ -682,11 +692,13 @@ stderr to the file `StandardErrorPath` names.
 ### 6.1 The policy
 
 - One macOS version and build per pool, and its pinned Xcodes, named in the profile.
-- How the server rolls host updates out (macOS and Xcode, MDM, the update UI) is being
-  designed in `docs/design/fleet-updates.md` (**in progress**).
+- How the server rolls host updates out (macOS and Xcode, MDM, the update UI) is
+  designed in the [fleet-updates design](https://github.com/komira-ai/komira-build-farm/pull/87)
+  (`docs/design/fleet-updates.md`, open PR).
 - Nothing installs by itself (section 5.2).
-- A scheduled check outside the farm notices new Apple releases and opens a review
-  item. It reports Xcode and macOS together, because each Xcode sets a minimum macOS: "Xcode X is out; it needs macOS Y; the pool runs Z."
+- "Update available" is computed by the server (fleet-updates design, section 3.2). It
+  reports Xcode and macOS together, because each Xcode sets a minimum macOS: "Xcode X is
+  out; it needs macOS Y; the pool runs Z."
 - A person decides. The rollout is a new profile version:
   1. One canary node: drain, update macOS first if needed, then Xcode, re-apply,
      re-qualify (section 3.1), back in the pool.
@@ -694,7 +706,9 @@ stderr to the file `StandardErrorPath` names.
   3. An old Xcode is removed when no action asks for it any more.
 - A security fix takes the same path, sooner.
 
-### 6.2 Without MDM
+### 6.2 Without MDM (a fallback until MDM is live)
+
+This path is only a fallback, until the MDM of section 6.3 is live on the nodes.
 
 - `softwareupdate --install <label> --restart` on a drained node. On Apple silicon,
   installing a macOS update needs a volume owner's authorisation. Without MDM that is
@@ -712,13 +726,13 @@ Apple Business Manager plus an MDM service adds:
 - **Software update control through declarative device management:** `AutomaticActions`
   (`Download`, `InstallOSUpdates`, `InstallSecurityUpdates`) can be set `AlwaysOff`;
   deferrals of 1 to 90 days (`MajorPeriodInDays`, `MinorPeriodInDays`,
-  `SystemPeriodInDays`); turning off automatic Background Security Improvements
-  (formerly Rapid Security Responses); and enforcement of a
+  `SystemPeriodInDays`); and enforcement of a
   specific version at a set time
   ([settings](https://support.apple.com/guide/deployment/software-update-settings-declarative-dep0578d8b8a/web),
   [enforcement](https://support.apple.com/guide/deployment/install-and-enforce-software-updates-depd30715cbb/web)).
   These need Device Enrollment or Automated Device Enrollment, and supervision for
-  most keys.
+  most keys. Background Security Improvements are not covered by these keys: what MDM
+  can and cannot do about them is in the fleet-updates design, section 7.2.
 - **The bootstrap token,** which on Apple silicon authorises update installs and
   erasing without a person
   ([Apple](https://support.apple.com/guide/deployment/use-secure-and-bootstrap-tokens-dep24dbdcf9e/web)).
@@ -728,11 +742,10 @@ D-U-N-S number); Macs bought through Apple or an authorized reseller, or added b
 with Apple Configurator; an MDM service to buy or run, open-source options included; and
 a push certificate to renew every year.
 
-**Lean:** none for a handful of Macs. The script does the same work, and a person
-enters a password once per update per node. Adopt MDM when Macs arrive in batches or
-when updates become frequent enough that the password step costs more than running an
-MDM. The profile does not change either way: an MDM delivers the same script as a
-package.
+**Decided: MDM.** Apple Business Manager plus a self-hosted NanoHUB behind
+`kbf-mdm-gate`, as the fleet-updates design (section 7) specifies. The profile does not
+change: an MDM delivers the same script as a package. Section 6.2 is the fallback until
+it is live.
 
 ## 7. From the desk to the rack
 
@@ -916,7 +929,7 @@ machines.
 | FileVault: SSH unlock on macOS 26 or later; the bootstrap token does not unlock at boot; no auto-login with FileVault | Apple documentation |
 | Storage is encrypted without FileVault, keyed to the Secure Enclave | Apple documentation |
 | `ProcessType`: unset or `Standard` is throttled; `Interactive` is not | `launchd.plist(5)` |
-| SoftwareUpdate payload keys are deprecated from macOS 26 | Apple's device-management reference; the local preferences' effect on 27.x is **to verify** |
+| The SoftwareUpdate payload is deprecated in macOS 26 and removed in 27 | Apple's device-management schema (fleet-updates design, section 7.1); whether the local preferences are still honoured on 27 is **to verify** |
 | `CriticalUpdateInstall` = 0 stops Background Security Improvements while `ConfigDataInstall` = 1 keeps definitions | **assumed**; verify on the pinned version |
 | A Background Security Improvement changes `sw_vers -buildVersion` | **assumed** (a Rapid Security Response did); verify |
 | Command-line downloads are not quarantined, so Gatekeeper is not consulted | **assumed**; verify on the pinned version |
@@ -931,7 +944,8 @@ machines.
 
 1. **Developer ID signing and notarization:** take a paid Apple Developer account and
    guard a signing key, or ship ad-hoc signed assets with attestations (the lean).
-2. **MDM:** none for now (the lean), or Apple Business Manager plus an MDM.
+2. **MDM: decided.** Apple Business Manager plus a self-hosted NanoHUB behind
+   `kbf-mdm-gate` (fleet-updates design, section 7).
 3. **FileVault on rack nodes:** off (the lean), or on, with a person to unlock every
    node after every reboot. On Apple silicon, turning it off only re-wraps the volume
    key (the data stays hardware-encrypted); it is not a long decryption.

@@ -101,8 +101,8 @@ Each key has one typed comparison:
 | `isa_level` | at least, within the family: `x86-64-v3` is served by v3 and v4 |
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib` | the node has at least this amount |
-| `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `xcode`, `label.<k>` | exact |
-| `os_build` | exact; **planned**, not yet accepted by `Request::parse` (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)) |
+| `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `xcode` (**planned**: membership, macOS VMs design), `label.<k>` | exact |
+| `os_build` | exact; **planned**: today the front drops it as an unknown name, so it matches every node (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)) |
 
 Every other key may appear once. An unknown key, a value that does not parse, or a
 repeated key is refused, so a typo fails loudly instead of matching nothing forever.
@@ -150,12 +150,13 @@ consequences shape the design:
   queue with a visible reason, and fails with `FAILED_PRECONDITION` after a bound
   (neither Bazel nor Buck2 retries that code).
 - **More report entries:** `cpu.model` (a human name for the microarchitecture),
-  `nvme_gib`, `gpu`, `os_image` (on Linux), `xcode` and `os_build` on macOS, and
-  client-defined probes (`probe.<k>`), which are reported only and are never request
-  keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)), the
-  images already on the machine, and
+  `nvme_gib`, `gpu`, `os_image` (on Linux), `xcode` and `os_build` on macOS (see
+  [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)), the images
+  already on the machine, and
   virtualization support (reported only, for a later VM driver).
 - **Labels** added by operators on top of detected facts, matched as `label.<k>`.
+- **Client-defined probes** (`probe.<k>`) are status values, never report entries or
+  request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
 - **Platform aliases:** named, immutable sets of properties (for example an
   architecture plus a default image), so a client can name a platform briefly and an
   alias's bytes, and so its action digests, never change once used.
