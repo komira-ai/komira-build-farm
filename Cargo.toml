@@ -21,6 +21,11 @@ axum = { version = "0.8.9", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
+# macOS only (kbf-mac-session): CFData for the caller's audit token.
+core-foundation = "0.10.1"
+# Verifies the MDM gate's admin grants (kbf-mac-session). Verify only, pure Rust: the
+# helper is checked for the macOS target on any host, which ring's C build does not allow.
+ed25519-dalek = { version = "3.0.0", default-features = false }
 futures = "0.3.34"
 hex = "0.4.3"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
@@ -28,6 +33,10 @@ hex = "0.4.3"
 libc = "0.2.190"
 hmac = "0.13.0"
 md-5 = "0.11.0"
+# macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
 prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.9.1"
@@ -42,6 +51,9 @@ roxmltree = "0.21.1"
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
 saphyr-parser = "0.1.0"
+# macOS only (kbf-mac-session): the caller's code signature against a pinned
+# requirement (SecCodeCopyGuestWithAttributes, SecCodeCheckValidity).
+security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -66,6 +78,7 @@ kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-meta = { path = "crates/kbf-meta" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }

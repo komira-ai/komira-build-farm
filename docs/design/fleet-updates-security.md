@@ -237,6 +237,33 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
   cannot change installed software. `automationmodetool` runs once from the
   provisioning profile, not through this helper.
 
+> **Built (phase P1):** `crates/kbf-mac-session` serves `user-create`, `run`, `kill-uid`
+> and `user-delete` with the socket and caller check of S4.3; `session-login`,
+> `session-idle`, `scan`, `baseline`, `reboot-dirty` and the boot-time reset are not
+> built. Where it settles what this section leaves open, or differs:
+> - The user is `kbf-lease-<term>-<seq>` (a hyphen for the lease id's dot). Used lease
+>   ids are kept in an append-only ledger in the helper's state directory, so a name,
+>   and a grant (which names one lease), is used once across reboots; a uid is free
+>   again only once its lease's deletion is recorded, and allocation continues after
+>   the uid handed out last.
+> - `kill-uid` takes the lease, not a uid: the uid comes from the ledger, so the daemon
+>   cannot name another lease's uid, and a deleted lease (whose uid may be reused) is
+>   refused. The kill is `kill(-1, SIGKILL)` from a child that took the uid, repeated
+>   until `libproc` lists no live process of it by real or effective uid.
+> - The grant is `<payload>.<signature>` in base64url, Ed25519 over a four-line payload
+>   (magic, serial, lease, `not-after`), valid at most 65 minutes ahead; the gate's
+>   public keys are a file named by a flag (how the MDM delivers it is P3's).
+> - The sweep covers the home folder, the crontab, `at` jobs, launchd's per-uid
+>   `disabled` and `loginitems` files, the shared user folder and the temporary
+>   folders. Background Task Management entries live in one system-wide database; no
+>   per-uid removal is built, so they stay **[A]**, for the leak scan (P4).
+> - The password is random and never told to anyone; with no password known, an
+>   administrator lease user cannot use `sudo` either. P4's auto-login needs its own
+>   way to hand the session a password.
+> - `run` starts the process in the system launchd domain as the lease user, not in
+>   the user's own domain (`launchctl asuser`); tools that need per-user launchd
+>   services are P4's.
+
 ### S4.3 Who can reach a helper
 
 Both helpers listen on a Unix socket in a root-owned directory, mode 0750, group a

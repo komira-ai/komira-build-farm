@@ -14,6 +14,7 @@ kbf-driver-native         0      0
 kbf-estimator             -      -
 kbf-front                86      8
 kbf-it                    2      3
+kbf-mac-session           0      0
 kbf-meta                 10      1
 kbf-node                  0      0
 kbf-objstore             71     22

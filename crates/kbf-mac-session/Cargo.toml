@@ -1,0 +1,46 @@
+[package]
+name = "kbf-mac-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The root helper that gives every Mac lease its own throwaway user
+# (docs/design/fleet-updates-security.md S4.2, S4.3). It builds everywhere so its logic
+# is tested on every CI runner; the binary serves only on macOS.
+[[bin]]
+name = "kbf-mac-session"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+kbf-types.workspace = true
+libc.workspace = true
+rustix = { workspace = true, features = ["fs", "net", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Security.framework for the caller's code signature (S4.3), OpenDirectory for the
+# lease users.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSError", "NSString"] }
+objc2-open-directory = { workspace = true, features = [
+    "CFOpenDirectory",
+    "CFOpenDirectoryConstants",
+    "ODNode",
+    "ODRecord",
+    "ODSession",
+] }
+security-framework.workspace = true
+
+[lints]
+workspace = true
