@@ -128,4 +128,44 @@ mod tests {
         assert!(!grant.token.contains(['=', '+', '/']));
         assert!(GrantKey::parse("short").is_none());
     }
+
+    /// `kbf-mac-session`'s `tests/gate_grant.rs` checks these exact answers against
+    /// the Mac's verifier. Catches: any change here to the text, the time form, the
+    /// base64 alphabets or the key encoding that would leave the Mac refusing every
+    /// grant; change both sides together.
+    #[test]
+    fn the_tokens_kbf_mac_session_pins_are_what_sign_produces() {
+        let pinned = [
+            (
+                5,
+                "C02X",
+                "lease-1",
+                1_800_000_000,
+                "bnoc3Smwt4/ROvTFWY/v9O8qlxZuPKby5Pv8zYBQW/E=",
+                "a2JmLWdyYW50LXYxCnNlcmlhbCBDMDJYCmxlYXNlIGxlYXNlLTEKaXNzdWVkIDIwMjctMDEtMTVUMDg6MDA6MDBaCm5vdC1hZnRlciAyMDI3LTAxLTE1VDA5OjAwOjAwWgo.-8APW_Uwc0eusVoHQxdjI5Djv0Va4O8rdk58tTNUzQiDX9jOi4tZKTl8VItbJx129XOo5d2Wy4NmwtrxrO5bAw",
+            ),
+            (
+                7,
+                "C02ZK1ABCDEF",
+                "kbf-lease.7_a-1",
+                1_835_481_599,
+                "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+                "a2JmLWdyYW50LXYxCnNlcmlhbCBDMDJaSzFBQkNERUYKbGVhc2Uga2JmLWxlYXNlLjdfYS0xCmlzc3VlZCAyMDI4LTAyLTI5VDIzOjU5OjU5Wgpub3QtYWZ0ZXIgMjAyOC0wMy0wMVQwMDo1OTo1OVoK.iYeWfQ1bSqsI0zuDZCxrlPMECRWVcikNumCJuYBaiEoNMz0sTXnHHrVdOMSHYl3LjUhXlmRO7tLcAP-Bg4n8Cw",
+            ),
+            (
+                9,
+                "Z9",
+                "0",
+                4_102_441_200,
+                "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=",
+                "a2JmLWdyYW50LXYxCnNlcmlhbCBaOQpsZWFzZSAwCmlzc3VlZCAyMDk5LTEyLTMxVDIzOjAwOjAwWgpub3QtYWZ0ZXIgMjEwMC0wMS0wMVQwMDowMDowMFoK.O4X1QvAOY8XS3qMKBJB7kTKbl6rUSMe8nXHvGKYbo5vRo9u6_cFdeuxuEgsCx2QbF6eq2ba1rS04ihnV-2CWCw",
+            ),
+        ];
+        for (seed, serial, lease, now, public, token) in pinned {
+            let key = GrantKey::parse(&STANDARD.encode([seed; 32])).unwrap();
+            let grant = key.sign(serial, lease, now);
+            assert_eq!(grant.key, public);
+            assert_eq!(grant.token, token, "{}", grant.grant);
+        }
+    }
 }
