@@ -110,7 +110,9 @@ Each key has one typed comparison:
 
 Every other key may appear once. An unknown key, a value that does not parse, or a
 repeated key is refused, so a typo fails loudly instead of matching nothing forever. A
-Mac with two Xcodes installed serves an action that names either build.
+Mac with two Xcodes installed serves an action that names either build, and the native
+driver runs it with that Xcode selected (`DEVELOPER_DIR`; see
+[platform-properties.md](../platform-properties.md#xcode)).
 
 **Reserved keys** ask for a kind of capacity, not a hardware fact, and are skipped by
 the matcher:
@@ -180,6 +182,9 @@ spelling is REAPI's `Arch`. One name in two spellings is refused.
   driver serves `action` only.
 - The container driver reads `container-image` itself (see
   [daemon.md](daemon.md#the-container-driver)).
+- A Mac's native driver reports one `xcode` entry per `Xcode*.app` in `/Applications`
+  (`--xcode-apps`) that answers `xcodebuild -version`, and runs an action that names
+  an `xcode` build with that Xcode's `DEVELOPER_DIR`.
 
 ## Planned
 
@@ -189,9 +194,9 @@ spelling is REAPI's `Arch`. One name in two spellings is refused.
   `INVALID_ARGUMENT` naming the closest known key; today properties that are not
   capability keys are ignored, so a misspelt `OSFamilly` matches every worker.
 - **More report entries:** `cpu.model` (a human name for the microarchitecture),
-  `nvme_gib`, `gpu`, `os_image` (on Linux), `xcode` and `os_build` on macOS (see
-  [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)), the images
-  already on the machine, and
+  `nvme_gib`, `gpu`, `os_image` (on Linux), `os_build` and the SDKs of each Xcode on
+  macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)), the
+  images already on the machine, and
   virtualization support (reported only, for a later VM driver).
 - **Labels** added by operators on top of detected facts, matched as `label.<k>`.
 - **Client-defined probes** (`probe.<k>`) are status values, never report entries or

@@ -26,6 +26,7 @@ use crate::cas::CasStore;
 use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
+use crate::xcode;
 
 /// The driver name in the node report.
 pub const DRIVER: &str = "native";
@@ -50,6 +51,9 @@ pub struct NativeRuntime<C> {
 
 /// Everything `prepare` works out for `execute` and `finish`.
 struct Prepared {
+    /// The lease directory's real path, every link resolved: the only place (with
+    /// `/dev`) the sandbox lets the action write.
+    lease: PathBuf,
     /// The lease's copy of the input root.
     root: PathBuf,
     work_dir: PathBuf,
@@ -62,6 +66,8 @@ struct Prepared {
     outputs: Vec<String>,
     timeout: Duration,
     network: Network,
+    /// The Xcode the action names (`xcode`), as its `DEVELOPER_DIR`.
+    developer_dir: Option<PathBuf>,
 }
 
 impl<C: Cas> NativeRuntime<C> {
@@ -91,13 +97,21 @@ impl<C: Cas> NativeRuntime<C> {
         })
     }
 
-    /// The node report entries this driver adds: how it keeps the network off.
+    /// The node report entries this driver adds: how it keeps the network off, and
+    /// one `xcode` entry per Xcode build it can select.
     #[must_use]
     pub fn capabilities(&self) -> Vec<(String, String)> {
-        vec![(
+        let mut entries = vec![(
             network::CAPABILITY.to_owned(),
             self.config.isolation.name().to_owned(),
-        )]
+        )];
+        entries.extend(
+            self.config
+                .xcodes
+                .keys()
+                .map(|build| (xcode::CAPABILITY.to_owned(), build.clone())),
+        );
+        entries
     }
 
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
@@ -131,8 +145,10 @@ impl<C: Cas> NativeRuntime<C> {
         let outputs = output_paths(&command).map_err(tree_error)?;
         let timeout = timeout_of(&action, self.config.default_timeout)?;
         let network = network_of(&action, &command)?;
+        let developer_dir = xcode::developer_dir(&self.config.xcodes, &action, &command)?;
 
         tokio::fs::create_dir(dir).await.map_err(failed(dir))?;
+        let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
         let root = dir.join("root");
         tokio::fs::create_dir(&root).await.map_err(failed(&root))?;
         materialize(cas, input_root, &root)
@@ -155,6 +171,7 @@ impl<C: Cas> NativeRuntime<C> {
         let program = resolve(program, &work_dir, &env)
             .map_err(|e| RuntimeError::Failed(format!("{program}: {e}")))?;
         Ok(Prepared {
+            lease,
             root,
             work_dir,
             working_directory: command.working_directory.clone(),
@@ -165,6 +182,7 @@ impl<C: Cas> NativeRuntime<C> {
             outputs,
             timeout,
             network,
+            developer_dir,
         })
     }
 
@@ -183,10 +201,12 @@ impl<C: Cas> NativeRuntime<C> {
         let stderr_path = dir.join("stderr");
         let stdout = std::fs::File::create(&stdout_path).map_err(failed(&stdout_path))?;
         let stderr = std::fs::File::create(&stderr_path).map_err(failed(&stderr_path))?;
-        let (program, args) =
-            self.config
-                .isolation
-                .wrap(prepared.network, prepared.program.clone(), &prepared.args);
+        let (program, args) = self.config.isolation.wrap(
+            prepared.network,
+            &prepared.lease,
+            prepared.program.clone(),
+            &prepared.args,
+        );
         let mut command = tokio::process::Command::new(&program);
         command
             .args(&args)
@@ -194,6 +214,12 @@ impl<C: Cas> NativeRuntime<C> {
             .env_clear()
             .envs(prepared.lease_env.iter().map(|(k, v)| (k, v)))
             .envs(prepared.env.iter().map(|(k, v)| (k, v)))
+            .envs(
+                prepared
+                    .developer_dir
+                    .iter()
+                    .map(|d| (xcode::DEVELOPER_DIR, d)),
+            )
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)

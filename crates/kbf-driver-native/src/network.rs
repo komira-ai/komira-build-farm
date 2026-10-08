@@ -8,7 +8,12 @@
 //! gets [`NO_NETWORK_PROFILE`], which denies every network operation except loopback
 //! and Unix sockets (the profile Bazel's macOS sandbox uses); one with the network gets
 //! [`BASE_PROFILE`]. Both keep the action from handing work to launchd, which would run
-//! it outside the sandbox and outside the action's process tree ([`BASE_PROFILE`]).
+//! it outside the sandbox and outside the action's process tree, and both deny every
+//! file write outside the lease directory and `/dev`, and every preference write
+//! through `cfprefsd` ([`BASE_PROFILE`]): the action's
+//! home, temporary and cache directories are inside the lease (`crate::home`), so a
+//! tool that turns its own sandbox off (`swift build --disable-sandbox`) still writes
+//! nowhere else.
 //! Where `sandbox-exec` is missing, and on Linux, nothing is enforced: the action runs
 //! with the node's network. Which of the two a node has is reported as the capability
 //! `network_isolation` (`sandbox-exec` or `none`), so nothing about it is hidden.
@@ -27,6 +32,12 @@
 //!   follow-up that closes this class.
 //! - A program that itself uses `sandbox-exec` (macOS refuses a sandbox inside a
 //!   sandbox) fails under the driver; that now includes actions with the network.
+//! - Reads are not limited: an action reads what the daemon's user can, the node's key
+//!   among it. Writes through a descriptor the action did not open itself (its stdout
+//!   and stderr files) are not checked by path.
+//! - A tool that insists on writing outside the lease (the per-user folders under
+//!   `/var/folders`, `~` of the daemon's user named by absolute path, `/tmp`) fails;
+//!   the action must point it into the lease (`HOME`, `TMPDIR`, a cache path flag).
 
 use std::path::{Path, PathBuf};
 
@@ -42,11 +53,24 @@ pub const CAPABILITY: &str = "network_isolation";
 /// Where macOS keeps `sandbox-exec`.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+/// The profile parameter that names the lease directory (`-D KBF_LEASE=<path>`), as
+/// its real path: the sandbox compares the paths of the files written, with every link
+/// resolved (`/var` is `/private/var`).
+pub const LEASE_PARAM: &str = "KBF_LEASE";
+
 /// The sandbox profile every action runs under: everything allowed but handing work
 /// to launchd, which would run it outside the sandbox and outside the action's process
-/// tree. `lsopen` is opening an application or document through Launch Services
-/// (`open`); `job-creation` is giving launchd a job (`launchctl submit`, `load`,
-/// `bootstrap`).
+/// tree, and writing a file outside the lease directory ([`LEASE_PARAM`]) and `/dev`
+/// (`/dev/null`, `/dev/tty`, `/dev/fd/<n>`). `lsopen` is opening an application or
+/// document through Launch Services (`open`); `job-creation` is giving launchd a job
+/// (`launchctl submit`, `load`, `bootstrap`); `file-write*` is every write operation:
+/// create, write, unlink, rename, mode, flags, ACLs, extended attributes, times.
+/// `user-preference-write` is asking `cfprefsd` to write a preference (`defaults
+/// write`, `CFPreferences`): the daemon writes the user's `~/Library/Preferences`, not
+/// the action, so `file-write*` does not cover it, and without the rule one action
+/// leaves settings for the next (`tests/sandbox.rs` saw it on the macOS runner).
+/// A hard link from inside the lease to a file outside it is already refused by these
+/// rules, as the same test shows; there is no `file-link` rule.
 ///
 /// Launchd already refuses a job from any sandboxed process, `(allow default)` alone
 /// included, as `tests/launchd.rs` shows on the macOS runner (and the mutants that
@@ -56,7 +80,10 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 pub const BASE_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
-(deny lsopen)\n";
+(deny lsopen)\n\
+(deny user-preference-write)\n\
+(deny file-write*)\n\
+(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
 
 /// The sandbox profile for an action without the network: [`BASE_PROFILE`], and no
 /// network operation but to loopback and Unix sockets.
@@ -64,6 +91,9 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
 (deny lsopen)\n\
+(deny user-preference-write)\n\
+(deny file-write*)\n\
+(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
 (deny network*)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
 (allow network* (remote ip \"localhost:*\"))\n\
@@ -139,11 +169,13 @@ impl Isolation {
         }
     }
 
-    /// The program and arguments that run `program` with `args` under `network`.
+    /// The program and arguments that run `program` with `args` under `network`,
+    /// writing only inside `lease` (the lease directory's real path) and `/dev`.
     #[must_use]
     pub fn wrap(
         &self,
         network: Network,
+        lease: &Path,
         program: PathBuf,
         args: &[String],
     ) -> (PathBuf, Vec<String>) {
@@ -155,6 +187,8 @@ impl Isolation {
             Network::On => BASE_PROFILE,
         };
         let mut wrapped = vec![
+            "-D".to_owned(),
+            format!("{LEASE_PARAM}={}", lease.to_string_lossy()),
             "-p".to_owned(),
             profile.to_owned(),
             program.to_string_lossy().into_owned(),
@@ -230,24 +264,35 @@ mod tests {
     fn every_action_is_wrapped_and_only_the_network_differs() {
         let args = vec!["-c".to_owned(), "echo hi".to_owned()];
         let program = PathBuf::from("/bin/sh");
+        let lease = Path::new("/private/var/kbf/lease-1-2");
+        let param = "KBF_LEASE=/private/var/kbf/lease-1-2";
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
         assert_eq!(sandbox.name(), "sandbox-exec");
-        let (wrapped, wrapped_args) = sandbox.wrap(Network::Off, program.clone(), &args);
+        let (wrapped, wrapped_args) = sandbox.wrap(Network::Off, lease, program.clone(), &args);
         assert_eq!(wrapped, PathBuf::from(SANDBOX_EXEC));
         assert_eq!(
             wrapped_args,
-            ["-p", NO_NETWORK_PROFILE, "/bin/sh", "-c", "echo hi"]
+            [
+                "-D",
+                param,
+                "-p",
+                NO_NETWORK_PROFILE,
+                "/bin/sh",
+                "-c",
+                "echo hi"
+            ]
         );
-        let (wrapped, wrapped_args) = sandbox.wrap(Network::On, program.clone(), &args);
+        let (wrapped, wrapped_args) = sandbox.wrap(Network::On, lease, program.clone(), &args);
         assert_eq!(wrapped, PathBuf::from(SANDBOX_EXEC));
         assert_eq!(
             wrapped_args,
-            ["-p", BASE_PROFILE, "/bin/sh", "-c", "echo hi"]
+            ["-D", param, "-p", BASE_PROFILE, "/bin/sh", "-c", "echo hi"]
         );
         assert!(NO_NETWORK_PROFILE.starts_with(BASE_PROFILE));
+        assert!(BASE_PROFILE.contains(&format!("(param \"{LEASE_PARAM}\")")));
         assert_eq!(Isolation::None.name(), "none");
         assert_eq!(
-            Isolation::None.wrap(Network::Off, program.clone(), &args),
+            Isolation::None.wrap(Network::Off, lease, program.clone(), &args),
             (program, args)
         );
         assert_eq!(

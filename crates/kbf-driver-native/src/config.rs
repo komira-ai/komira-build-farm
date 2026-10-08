@@ -1,5 +1,6 @@
 //! Where and how the native driver runs actions.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -59,11 +60,16 @@ pub struct NativeConfig {
     pub kill_wait: Duration,
     /// How the network is kept off.
     pub isolation: Isolation,
+    /// The Xcodes an action may name, by build (`16C5032a`), each as the path its
+    /// `DEVELOPER_DIR` takes (`.../Xcode.app/Contents/Developer`); see
+    /// [`crate::xcode::discover`].
+    pub xcodes: BTreeMap<String, PathBuf>,
 }
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits and
-    /// memory policy, a 250 ms poll, a 5 s kill wait, and this node's isolation.
+    /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation, and no
+    /// Xcode (the daemon fills [`Self::xcodes`] from [`crate::xcode::discover`]).
     #[must_use]
     pub fn new(scratch: PathBuf) -> Self {
         Self {
@@ -74,6 +80,7 @@ impl NativeConfig {
             poll: Duration::from_millis(250),
             kill_wait: Duration::from_secs(5),
             isolation: Isolation::detect(),
+            xcodes: BTreeMap::new(),
         }
     }
 }
