@@ -74,7 +74,6 @@ pub const BASE_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
 (deny lsopen)\n\
-(deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
 
 /// The sandbox profile for an action without the network: [`BASE_PROFILE`], and no
@@ -83,7 +82,6 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
 (deny lsopen)\n\
-(deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
 (deny network*)\n\
 (allow network-inbound (local ip \"localhost:*\"))\n\
