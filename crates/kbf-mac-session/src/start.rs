@@ -146,7 +146,8 @@ pub fn group_gid(name: &str) -> io::Result<u32> {
             &raw mut found,
         )
     };
-    let gid = (code == 0 && !found.is_null()).then_some(group.gr_gid);
+    // On an error the call leaves `found` null too, so `found` alone decides.
+    let gid = (!found.is_null()).then_some(group.gr_gid);
     gid.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,

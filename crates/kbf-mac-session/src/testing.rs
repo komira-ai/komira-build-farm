@@ -108,9 +108,11 @@ impl Host for FakeHost {
     }
 }
 
-/// A fresh scratch directory for one test.
+/// A fresh scratch directory for one test. Under `/tmp` with a short name, not the
+/// per-user temporary folder: a socket path on macOS holds at most 104 bytes, and
+/// macOS's per-user temporary folder alone takes about 50.
 pub(crate) fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-mac-session-{name}-{}", std::process::id()));
+    let dir = PathBuf::from(format!("/tmp/kms-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

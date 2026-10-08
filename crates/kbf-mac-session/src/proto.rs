@@ -22,6 +22,17 @@ pub const MAX_FRAME: usize = 64 * 1024;
 /// The number of descriptors a `run` request carries.
 pub const RUN_FDS: usize = 4;
 
+/// The receive buffer for ancillary data. On Linux, room for one more descriptor than a
+/// request may carry: the kernel cuts what does not fit, says so (`MSG_CTRUNC`), and
+/// the cut is refused. On macOS the kernel takes at most `MCLBYTES` (2048) bytes of
+/// control data with one message, so this buffer is never cut there; that matters,
+/// because a cut message keeps its full length in its header on macOS, which the
+/// parser would read past.
+#[cfg(target_os = "linux")]
+const CONTROL_BYTES: usize = rustix::cmsg_space!(ScmRights(RUN_FDS + 1));
+#[cfg(not(target_os = "linux"))]
+const CONTROL_BYTES: usize = 4096;
+
 /// What the daemon asks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "kebab-case", deny_unknown_fields)]
@@ -177,9 +188,7 @@ fn recv_frame(
 fn fill(socket: BorrowedFd<'_>, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
     let mut got = 0;
     while got < buf.len() {
-        // Room for one more descriptor than a request may carry, so an excess is seen
-        // and refused rather than truncated away.
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(RUN_FDS + 1))];
+        let mut space = [MaybeUninit::uninit(); CONTROL_BYTES];
         let mut control = RecvAncillaryBuffer::new(&mut space);
         let message = rustix::net::recvmsg(
             socket,
@@ -242,7 +251,7 @@ mod tests {
     fn run_request() -> Request {
         Request::Run {
             lease: "1.2".to_owned(),
-            argv: vec!["/bin/true".to_owned()],
+            argv: vec!["/usr/bin/true".to_owned()],
             env: vec![("A".to_owned(), "b".to_owned())],
         }
     }
@@ -286,10 +295,29 @@ mod tests {
         let five = [file.as_fd(); RUN_FDS + 1];
         let error = send(a.as_fd(), &Reply::Killed, &five).unwrap_err();
         assert!(error.to_string().contains("too many"), "{error}");
+
+        // Many more than a request carries, in one message: all received, then refused.
+        let (a, b) = UnixStream::pair().unwrap();
+        let many = [file.as_fd(); 8 * RUN_FDS];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8 * RUN_FDS))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        assert!(control.push(SendAncillaryMessage::ScmRights(&many)));
+        let frame = [0, 0, 0, 2, b'{', b'}'];
+        rustix::net::sendmsg(
+            &a,
+            &[IoSlice::new(&frame)],
+            &mut control,
+            SendFlags::empty(),
+        )
+        .unwrap();
+        let error = recv::<Reply>(b.as_fd(), RUN_FDS).unwrap_err();
+        assert!(error.to_string().contains("too many"), "{error}");
     }
 
     /// The kernel cuts ancillary data that does not fit the receive buffer, and says
-    /// so; the cut is refused, not taken for the whole.
+    /// so; the cut is refused, not taken for the whole. (Linux: macOS's buffer is
+    /// larger than any control data its kernel passes.)
+    #[cfg(target_os = "linux")]
     #[test]
     fn descriptors_beyond_the_buffer_are_refused() {
         let (a, b) = UnixStream::pair().unwrap();

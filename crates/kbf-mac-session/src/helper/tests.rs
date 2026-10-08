@@ -59,17 +59,21 @@ fn each_lease_gets_a_free_uid_after_the_last_one() {
     let base = me();
     assert_eq!(rig.helper.user_create("1.1", None), Ok(base));
     assert_eq!(rig.helper.user_create("1.2", None), Ok(base + 1));
-    rig.host.state().foreign.insert(base + 2);
-    rig.host.state().procs.insert(base + 3, 1);
-    // base+2 has a record, base+3 a process, base and base+1 are held: none is free.
-    let error = rig.helper.user_create("1.3", None).unwrap_err();
+    let user = rig.host.state().users["kbf-lease-1-2"].clone();
+    // Deleting 1.1 frees its uid, but allocation goes on after the uid handed out
+    // last, so the freed one is reused as late as possible.
+    rig.helper.user_delete("1.1").unwrap();
+    assert_eq!(rig.helper.user_create("1.3", None), Ok(base + 2));
+    // Skipped: a uid another user record has (base+3), one a process runs as (base),
+    // and ones live leases hold (base+1, base+2) even when their records are gone.
+    rig.host.state().foreign.insert(base + 3);
+    rig.host.state().users.clear();
+    rig.host.state().procs.insert(base, 1);
+    let error = rig.helper.user_create("1.4", None).unwrap_err();
     assert!(error.contains("no free uid"), "{error}");
     rig.host.state().procs.clear();
-    assert_eq!(rig.helper.user_create("1.4", None), Ok(base + 3));
-    // Deleting 1.1 frees its uid; allocation wraps to it.
-    rig.helper.user_delete("1.1").unwrap();
+    // Wrapped round to the bottom of the range.
     assert_eq!(rig.helper.user_create("1.5", None), Ok(base));
-    let user = rig.host.state().users["kbf-lease-1-2"].clone();
     assert_eq!(
         user,
         NewUser {
@@ -273,7 +277,12 @@ fn only_live_leases_in_range_are_acted_on() {
     let empty = Vec::new;
     let error = rig
         .helper
-        .run("6.1", vec!["/bin/true".to_owned()], empty(), fds(&rig.dir))
+        .run(
+            "6.1",
+            vec!["/usr/bin/true".to_owned()],
+            empty(),
+            fds(&rig.dir),
+        )
         .unwrap_err();
     assert!(error.contains("was deleted"), "{error}");
 
@@ -333,7 +342,7 @@ fn run_starts_the_process_as_the_lease_user_in_the_lease_directory() {
 fn run_refuses_a_bad_request() {
     let rig = rig("run-bad", 2);
     rig.helper.user_create("8.1", None).unwrap();
-    let true_ = || vec!["/bin/true".to_owned()];
+    let true_ = || vec!["/usr/bin/true".to_owned()];
     let three = fds(&rig.dir).into_iter().take(3).collect();
     let error = rig
         .helper
@@ -465,7 +474,7 @@ fn requests_are_routed_and_stray_descriptors_refused() {
     );
     let run = Request::Run {
         lease: lease(),
-        argv: vec!["/bin/true".to_owned()],
+        argv: vec!["/usr/bin/true".to_owned()],
         env: Vec::new(),
     };
     let Outcome::Running(mut child) = rig.helper.handle(run.clone(), fds(&rig.dir)) else {

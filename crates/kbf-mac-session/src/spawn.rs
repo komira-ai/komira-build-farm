@@ -258,14 +258,14 @@ mod tests {
     /// another (the helper's own).
     #[test]
     fn a_lease_directory_that_cannot_be_entered_is_an_error() {
-        let (mut spawn, _out) = base(&["/bin/true"], &std::env::temp_dir());
+        let (mut spawn, _out) = base(&["/usr/bin/true"], &std::env::temp_dir());
         // A descriptor that is not a directory: fchdir fails in the child.
         spawn.cwd = null();
         assert_eq!(
             super::spawn(spawn).unwrap_err().raw_os_error(),
             Some(libc::ENOTDIR)
         );
-        let (mut spawn, _out) = base(&["/bin/true"], &std::env::temp_dir());
+        let (mut spawn, _out) = base(&["/usr/bin/true"], &std::env::temp_dir());
         spawn.argv.clear();
         assert_eq!(
             super::spawn(spawn).unwrap_err().kind(),
@@ -283,12 +283,12 @@ mod tests {
                 .collect();
             check(&argv, &env)
         };
-        assert_eq!(ok(&["/bin/true"], &[("A", "b=c")]), Ok(()));
+        assert_eq!(ok(&["/usr/bin/true"], &[("A", "b=c")]), Ok(()));
         assert!(ok(&[], &[]).unwrap_err().contains("empty"));
         assert!(ok(&["a\0b"], &[]).unwrap_err().contains("NUL"));
         for env in [("", "x"), ("A=B", "x"), ("A\0", "x"), ("A", "x\0")] {
             assert!(
-                ok(&["/bin/true"], &[env])
+                ok(&["/usr/bin/true"], &[env])
                     .unwrap_err()
                     .contains("malformed"),
                 "{env:?}"

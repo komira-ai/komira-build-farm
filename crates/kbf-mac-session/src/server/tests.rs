@@ -1,6 +1,5 @@
 use std::io::Read as _;
-use std::os::fd::AsFd as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 use super::*;
