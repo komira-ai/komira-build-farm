@@ -168,7 +168,9 @@ in order, and the daemon's own uid and gid map to nothing.
   the first container and refused a second while the first existed ("not enough unused
   IDs in user namespace", Podman 4.9 on the hosted runners), so a node could run one
   action at a time. With `nomap` every container shares one mapping. Containers stay
-  apart by their mount, pid, ipc and network namespaces, not by uid.
+  apart by their mount, pid, ipc and network namespaces, not by uid. A real-Podman test
+  runs a second lease to completion while a first container runs, so a switch back to
+  `auto` fails it.
 - **Who owns the lease's files.** A container cannot write under a directory whose owner
   it does not map: the overlay refuses with `EROFS`. So after writing the input root and
   making the output directories, the driver gives the overlay's lower, upper and work
@@ -177,6 +179,10 @@ in order, and the daemon's own uid and gid map to nothing.
   output, it gives them back to id 0 there, the daemon's user, so an output the action
   made `0600` (or a `0700` directory) is read as its owner. `-h` changes a symlink
   itself and `-R` traverses none, so a link the action left hands nothing over.
+- **The hand-back is not under the action's timeout.** It runs after the container has
+  exited, outside the timeout and outside `kill`, and walks the whole upper tree, which
+  the action controls. An action that leaves millions of files makes it as slow as the
+  clean step's walk of the same tree; nothing bounds either yet.
 - **Cleaning.** A lease that ends before collect (timeout, kill, failure) still has files
   owned by the container's ids. The daemon's user cannot unlink them, so the clean step
   falls back to `podman unshare rm -rf`, as it does for any file the daemon cannot
@@ -187,6 +193,9 @@ in order, and the daemon's own uid and gid map to nothing.
 `useradd` gives a new user; fewer leave an image's high ids (65534, `nobody`) unmapped.
 `kbf-daemon --driver container` checks both files at startup and refuses to start,
 naming the file, the user and the fix, when either has no range or too small a one.
+Ids are counted once: a range listed under both the user's name and uid, or two ranges
+that overlap, count their distinct ids. The check reads the files directly, so a user
+whose ranges only a directory service holds is refused.
 After adding a range (`usermod --add-subuids 100000-165535 --add-subgids
 100000-165535 <user>`), run `podman system migrate` as that user so Podman's user
 namespace is made again with it.
