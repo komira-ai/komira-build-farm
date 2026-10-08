@@ -45,10 +45,19 @@ codesign --force --sign - --options runtime "$bin"
 # 1
 codesign --verify --strict --verbose=2 "$bin"
 
-# MUTANT: flip one byte in the code section (the entry point's instruction) after signing.
+# MUTANT: flip one byte after signing, in the 16 KiB page of __TEXT,__text that holds the
+# entry point, but at that page's last byte, so the change itself does nothing the
+# program would notice: only a page-hash check by the kernel can stop it.
 entryoff=$(otool -l "$bin" | awk '/LC_MAIN/ { m = 1 } m && $1 == "entryoff" { print $2; exit }')
-echo "MUTANT: flipping the byte at file offset $entryoff (LC_MAIN entryoff, in __TEXT,__text)"
-python3 -c 'import sys; f = open(sys.argv[1], "r+b"); o = int(sys.argv[2]); f.seek(o); b = f.read(1); f.seek(o); f.write(bytes([b[0] ^ 0x01]))' "$bin" "$entryoff"
+off=$(( entryoff / 16384 * 16384 + 16383 ))
+echo "MUTANT: entryoff $entryoff; flipping the byte at file offset $off"
+otool -l "$bin" | awk '/sectname __text/ { s = 1 } s && /offset|size/ { print } s && /align/ { exit }'
+cp "$bin" "$RUNNER_TEMP/before-flip"
+python3 -c 'import sys; f = open(sys.argv[1], "r+b"); o = int(sys.argv[2]); f.seek(o); b = f.read(1); f.seek(o); f.write(bytes([b[0] ^ 0x01]))' "$bin" "$off"
+cmp -l "$RUNNER_TEMP/before-flip" "$bin" || true
+codesign --verify --strict --verbose=2 "$bin" || echo "MUTANT: codesign --verify now refuses the binary (exit $?)"
+nvram boot-args 2>&1 || true
+sysctl -a 2>/dev/null | grep -i -E 'cs_|amfi|codesign' || true
 
 # 2: with an empty environment but PATH and HOME, so no DYLD_* variable is set and
 # only the signature decides whether it starts.
