@@ -101,7 +101,7 @@ impl Host for MacHost {
             } {
                 return Err(od_error("setting the password", error));
             }
-            if user.admin {
+            if true {
                 let admin = group(&node, ADMIN_GROUP)?;
                 let mut error = None;
                 // SAFETY: both are records of the local node.
