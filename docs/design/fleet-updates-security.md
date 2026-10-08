@@ -288,13 +288,17 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 > - **The caller check (S4.3) as built.** An earlier build checked the caller only
 >   after reading its request, and on the hosted macOS runner a process that connected
 >   and then executed the genuine client was accepted: the audit token was fetched
->   after the exec, by which time it named the genuine client. The helper now
->   identifies and checks the caller as soon as it accepts, before reading anything,
->   sends a fresh nonce the request must carry, and requires the same audit token
->   (pid and pid version) once the request has arrived. The CI job plants both forms, executing after the
->   helper's answer and writing the request first, and fails if either is accepted;
->   it prints the token's pid and pid version at accept and at the request, and what
->   `LOCAL_PEERTOKEN` reports across an `exec`. The case left open is in S4.3.
+>   after the exec, by which time it named the genuine client. Measured on the same
+>   runner (macOS 26.6.2) by the CI job's exec probe: a process's pid version does
+>   change on `exec` (15240 before, 15241 after, same pid), and `LOCAL_PEERTOKEN`
+>   reports the process as it is when asked, so a token fetched after the exec is the
+>   new image's. The helper now identifies and checks the caller as soon as it
+>   accepts, before reading anything, sends a fresh nonce the request must carry, and
+>   requires the same audit token (pid and pid version) once the request has arrived.
+>   The CI job plants both forms, executing after the helper's answer and writing the
+>   request first, and fails if either is accepted; it prints the token's pid and pid
+>   version at accept and at the request, and what `LOCAL_PEERTOKEN` reports across an
+>   `exec`. The case left open is in S4.3.
 > - On macOS `kill(-1)` also signals the sender, so the helper's killer child ends by
 >   `SIGKILL`; that is its normal end.
 
