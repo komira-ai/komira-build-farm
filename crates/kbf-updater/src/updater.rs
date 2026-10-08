@@ -15,7 +15,12 @@
 //! `apply` installs only the staged set: it records the apply as in progress, calls the
 //! applier, records the set as installed, and reboots if the applier says the step
 //! needs it. After a crash mid-apply the in-progress record stays; `status` reports it,
-//! `apply` of the same set resumes it, and every other set is refused until it finishes.
+//! `apply` of the same set resumes it, and every other set is refused while the
+//! in-progress set would itself still pass every check. Once it would not (it expired,
+//! or a newer key statement no longer names its key), it blocks nothing: a newer set
+//! that passes every check is staged and applied over it, so a node is never wedged on
+//! a set it can no longer finish. The in-progress record is reported until that newer
+//! set's apply starts.
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -28,7 +33,7 @@ use sha2::{Digest as _, Sha256};
 use crate::Refusal;
 use crate::apply::Applier;
 use crate::set::{NodeView, Pin, Verdict, VerifiedSet, check, open_set};
-use crate::signed::{Envelope, PublicKey, newest_statement};
+use crate::signed::{Envelope, KeyStatement, PublicKey, newest_statement, parse_key};
 use crate::state::{Held, State};
 
 /// What the updater was provisioned with.
@@ -156,7 +161,19 @@ impl<A: Applier> Updater<A> {
             self.save()?;
         }
         let verified = open_set(set, &trusted.statement)?;
-        let node = NodeView {
+        let verdict = check(&verified, &self.node(now))?;
+        if let Some(digest) = &self.state.in_progress
+            && *digest != verified.digest
+            && self.in_progress_blocks(digest, &trusted.statement, now)
+        {
+            return Err(Refusal::InProgress(digest.clone()));
+        }
+        Ok((verified, verdict))
+    }
+
+    /// What the node holds, for [`check`].
+    fn node(&self, now: u64) -> NodeView<'_> {
+        NodeView {
             pin: &self.cfg.pin,
             installed: self
                 .state
@@ -165,14 +182,29 @@ impl<A: Applier> Updater<A> {
                 .map(|h| (&h.set, h.digest.as_str())),
             floor: self.state.floor,
             now,
-        };
-        let verdict = check(&verified, &node)?;
-        if let Some(digest) = &self.state.in_progress
-            && *digest != verified.digest
-        {
-            return Err(Refusal::InProgress(digest.clone()));
         }
-        Ok((verified, verdict))
+    }
+
+    /// Whether the apply in progress (of the set `digest`) still holds off every other
+    /// set: only while that set is the staged one and would itself pass every check
+    /// now, under `statement`.
+    fn in_progress_blocks(&self, digest: &str, statement: &KeyStatement, now: u64) -> bool {
+        let Some(held) = self.state.staged.as_ref().filter(|h| h.digest == digest) else {
+            return false;
+        };
+        let named = parse_key(&held.signer)
+            .ok()
+            .and_then(|k| Some((k, statement.role_of(&k)?)));
+        let Some((signer, role)) = named else {
+            return false;
+        };
+        let v = VerifiedSet {
+            set: held.set.clone(),
+            signer,
+            role,
+            digest: held.digest.clone(),
+        };
+        check(&v, &self.node(now)).is_ok()
     }
 
     /// `stage`: verify the set, raise the floor, and copy and hash the artifacts it
@@ -208,6 +240,7 @@ impl<A: Applier> Updater<A> {
         }
         self.state.staged = Some(Held {
             digest: v.digest,
+            signer: hex::encode(v.signer),
             set: v.set,
         });
         self.save()?;
@@ -274,6 +307,7 @@ impl<A: Applier> Updater<A> {
             .map_err(Refusal::Apply)?;
         self.state.installed = Some(Held {
             digest: v.digest,
+            signer: hex::encode(v.signer),
             set: v.set,
         });
         self.state.staged = None;

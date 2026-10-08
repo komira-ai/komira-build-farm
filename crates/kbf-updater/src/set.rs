@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::Refusal;
-use crate::signed::{Envelope, KeyStatement, Role, SET_CONTEXT};
+use crate::signed::{Envelope, KeyStatement, PublicKey, Role, SET_CONTEXT};
 
 /// The artifacts a component key may change: kbf's unprivileged parts. Everything else,
 /// `kbf-updater` and `kbf-mac-session` included, needs the platform key (S2.2).
@@ -180,6 +180,8 @@ impl SoftwareSet {
 pub struct VerifiedSet {
     /// The set.
     pub set: SoftwareSet,
+    /// The key that signed it.
+    pub signer: PublicKey,
     /// The role of the key that signed it.
     pub role: Role,
     /// Lowercase hex SHA-256 of the payload.
@@ -199,6 +201,7 @@ pub fn open_set(envelope: &Envelope, statement: &KeyStatement) -> Result<Verifie
     let set = SoftwareSet::parse(&opened.payload)?;
     Ok(VerifiedSet {
         set,
+        signer: opened.signer,
         role,
         digest: hex::encode(Sha256::digest(&opened.payload)),
     })
@@ -288,6 +291,7 @@ mod tests {
         let payload = serde_json::to_vec(set).unwrap();
         VerifiedSet {
             set: set.clone(),
+            signer: [0; 32],
             role,
             digest: hex::encode(Sha256::digest(&payload)),
         }
@@ -552,6 +556,7 @@ mod tests {
         let platform = Envelope::seal(SET_CONTEXT, &payload, &PLATFORM_SEED);
         let v = open_set(&platform, &statement).unwrap();
         assert_eq!(v.role, Role::Platform);
+        assert_eq!(v.signer, crate::signed::public_key(&PLATFORM_SEED));
         assert_eq!(v.digest, hex::encode(Sha256::digest(&payload)));
         let component = Envelope::seal(SET_CONTEXT, &payload, &testkit::COMPONENT_SEED);
         assert_eq!(

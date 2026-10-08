@@ -2,7 +2,8 @@
 //! installed set, the staged set and an apply in progress. It is written whole to a
 //! temporary file, synced and renamed over the old one, so a crash leaves the old state
 //! or the new, never a mix; an apply records itself as in progress before it installs
-//! anything, so a crash mid-apply is reported and resumed, never guessed at.
+//! anything, so a crash mid-apply is reported and resumed (or, once its set can no
+//! longer pass the checks, replaced by a newer set that does), never guessed at.
 
 use std::fs;
 use std::io::Write as _;
@@ -20,6 +21,9 @@ use crate::signed::Envelope;
 pub struct Held {
     /// Lowercase hex SHA-256 of the set's signed payload.
     pub digest: String,
+    /// The key that signed it, hex: whether an apply in progress may still continue
+    /// depends on that key still being named.
+    pub signer: String,
     /// The set.
     pub set: SoftwareSet,
 }
@@ -92,10 +96,12 @@ mod tests {
             floor: 3,
             installed: Some(Held {
                 digest: "a".into(),
+                signer: "c".into(),
                 set: testkit::set(4),
             }),
             staged: Some(Held {
                 digest: "b".into(),
+                signer: "d".into(),
                 set: testkit::set(5),
             }),
             in_progress: Some("b".into()),

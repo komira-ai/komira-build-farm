@@ -281,6 +281,66 @@ fn an_apply_in_progress_survives_a_restart_and_only_it_may_continue() {
     assert_eq!(u.status().in_progress, None);
 }
 
+/// Catches: a node wedged for good by an apply in progress whose set has expired: the
+/// set itself can no longer be applied, so unless a newer set that passes every check
+/// may replace it, every later `stage` and `apply` is refused until someone edits the
+/// state file by hand. Also: the expired set itself let through.
+#[test]
+fn an_expired_apply_in_progress_gives_way_to_a_newer_valid_set() {
+    let (mut u, _) = updater("in-progress-expired");
+    let st = statement(1, &[]);
+    let five = seal_set(&set_with(5, |s| s.expires = 1_500), &PLATFORM_SEED);
+    assert_eq!(u.stage(&five, Some(&st), NOW), Ok(Outcome::Staged));
+    u.applier_mut().fail_install = true;
+    assert!(u.apply(&five, None, NOW).is_err());
+    let stuck = u.status().in_progress.expect("in progress");
+    u.applier_mut().fail_install = false;
+    let later = 1_500;
+    assert_eq!(u.apply(&five, None, later), Err(Refusal::Expired(5)));
+    // While the in-progress set still passes, it alone may continue (the restart test
+    // above); once it cannot, a newer set that passes every check replaces it.
+    let six = seal_set(&testkit::set(6), &PLATFORM_SEED);
+    assert_eq!(u.stage(&six, None, later), Ok(Outcome::Staged));
+    // The unfinished apply is still reported until the newer set's apply starts.
+    assert_eq!(u.status().in_progress, Some(stuck));
+    // With the in-progress set no longer staged, it blocks nothing either.
+    let seven = seal_set(&testkit::set(7), &PLATFORM_SEED);
+    assert_eq!(u.stage(&seven, None, later), Ok(Outcome::Staged));
+    assert_eq!(
+        u.apply(&seven, None, later),
+        Ok(Outcome::Applied { reboot: false })
+    );
+    let status = u.status();
+    assert_eq!(status.installed.map(|s| s.serial), Some(7));
+    assert_eq!(status.in_progress, None);
+}
+
+/// Catches: a node wedged for good by an apply in progress whose signing key a newer
+/// key statement revoked (the set fails as `UnknownKey`, every other set as
+/// `InProgress`).
+#[test]
+fn an_apply_in_progress_under_a_revoked_key_gives_way_to_a_newer_valid_set() {
+    let (mut u, _) = updater("in-progress-revoked");
+    install(&mut u, &seal_set(&testkit::set(5), &PLATFORM_SEED));
+    let daemon = seal_set(&daemon_only(6), &COMPONENT_SEED);
+    assert_eq!(u.stage(&daemon, None, NOW), Ok(Outcome::Staged));
+    u.applier_mut().fail_install = true;
+    assert!(u.apply(&daemon, None, NOW).is_err());
+    u.applier_mut().fail_install = false;
+    let revoking = statement(2, &[]);
+    assert_eq!(
+        u.apply(&daemon, Some(&revoking), NOW),
+        Err(Refusal::UnknownKey)
+    );
+    let seven = seal_set(&testkit::set(7), &PLATFORM_SEED);
+    assert_eq!(u.stage(&seven, None, NOW), Ok(Outcome::Staged));
+    assert_eq!(
+        u.apply(&seven, None, NOW),
+        Ok(Outcome::Applied { reboot: false })
+    );
+    assert_eq!(u.status().installed.map(|s| s.serial), Some(7));
+}
+
 /// Catches: a reboot skipped when the install asks for one.
 #[test]
 fn apply_reboots_when_the_install_asks() {
