@@ -197,7 +197,7 @@ fn parse_rejects_what_it_cannot_compare() {
             }
         );
     }
-    for k in ["isa_level", "arch", "cpus", "xcode"] {
+    for k in ["isa_level", "arch", "cpus", "os", "xcode"] {
         let v = match k {
             "isa_level" => "x86-64-v3",
             "arch" => "arm64",
