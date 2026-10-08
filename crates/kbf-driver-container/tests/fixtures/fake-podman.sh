@@ -20,10 +20,18 @@
 #   rm-fails         `rm` fails
 #   unshare-noop     `unshare rm` succeeds without removing anything
 #   unshare-fails    `unshare rm` fails
-# Records: create.args (one argument per line), calls (one verb per line), removed,
+#   chown-fails      `unshare chown` to the owner this knob holds (`1:1` or `0:0`) fails
+# Records: create.args (one argument per line), calls (one verb per line; `unshare`
+#   with its command, `unshare rm` or `unshare chown`), removed,
 #   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
 #   events (in order: `cgroup.kill ended the action`, `start ended` once `start` has
-#   waited for the action and written its status, `rm`).
+#   waited for the action and written its status, `rm`, `chown <owner> <paths...>`).
+#   The fake changes no owner (the test runs as one user), but models what an owner
+#   other than the daemon's means: when `start` ends while the overlay is the
+#   container's (`chown 1:1` last, recorded in `owner`), it makes the upper directory
+#   unreadable (mode 000, the old mode kept in `upper-mode`), as files the action made
+#   private would be to the daemon's user; `chown 0:0` restores the mode. So outputs
+#   read before the overlay is handed back fail as they would on real Podman.
 set -u
 here=$(dirname "$0")
 STATE=$here/state
@@ -33,7 +41,11 @@ CGROOT=$here/cgroup
 shift
 verb=$1
 shift
-echo "$verb" >>"$STATE/calls"
+if [ "$verb" = unshare ]; then
+    echo "unshare ${1:-}" >>"$STATE/calls"
+else
+    echo "$verb" >>"$STATE/calls"
+fi
 
 case $verb in
 image)
@@ -88,6 +100,11 @@ start)
         echo "exited $code" >"$STATE/status"
     fi
     echo "start ended" >>"$STATE/events"
+    if [ "$(cat "$STATE/owner" 2>/dev/null)" = 1:1 ]; then
+        upper=$(cat "$STATE/upper")
+        stat -c %a "$upper" >"$STATE/upper-mode"
+        chmod 000 "$upper"
+    fi
     exit "$code"
     ;;
 inspect)
@@ -117,6 +134,23 @@ rm)
     exit 0
     ;;
 unshare)
+    if [ "$1" = chown ]; then
+        # chown -hR OWNER -- PATHS...
+        [ "$2" = -hR ] && [ "$4" = -- ] || { echo "fake podman: chown $*" >&2; exit 125; }
+        owner=$3
+        shift 4
+        echo "chown $owner $*" >>"$STATE/events"
+        if [ -f "$STATE/chown-fails" ] && [ "$(cat "$STATE/chown-fails")" = "$owner" ]; then
+            echo "Error: chown refused" >&2
+            exit 1
+        fi
+        echo "$owner" >"$STATE/owner"
+        if [ "$owner" = 0:0 ] && [ -f "$STATE/upper-mode" ]; then
+            chmod "$(cat "$STATE/upper-mode")" "$(cat "$STATE/upper")"
+            rm -f -- "$STATE/upper-mode"
+        fi
+        exit 0
+    fi
     [ -f "$STATE/unshare-fails" ] && { echo "Error: unshare refused" >&2; exit 1; }
     [ -f "$STATE/unshare-noop" ] && exit 0
     # rm -rf -- DIR

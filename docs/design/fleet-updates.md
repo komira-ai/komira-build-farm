@@ -330,7 +330,7 @@ The full rules are S3 and S4 of
   the leak scan (`scan`, `baseline`) and `reboot-dirty`, each restricted to the lease
   uid range.
 - **Nothing a lease runs can call either helper**: no action, probe or VM runs under a
-  uid in the helpers' group (Linux containers get `--userns=auto` or `nomap`; Macs run
+  uid in the helpers' group (Linux containers run with `--userns=nomap`; Macs run
   every action as a lease user), and every caller is checked as the genuine
   `kbf-daemon` (S4.3).
 - **Auto-login is off at rest.** `kbf-daemon` is a LaunchDaemon and needs no login
@@ -899,7 +899,7 @@ Changes by crate (rough sizes, tests included):
 | `kbf-daemon`, `kbf-node` | on Macs a TLS signer through Security.framework with the keychain identity; re-detect and send `Report`; new keys; probes from config or set; update marker and `Update`/`Start` refusals; forward to the updater; `DEVELOPER_DIR` per action | ~800 |
 | `kbf-updater` (new) | socket and caller check, key statements, set checks of S3.1, profile / package / bootc backends, state file | ~2,100 |
 | `kbf-mac-session` (new) | socket and caller check, the verbs of S4.2, sweep, leak scan | ~1,700 |
-| `kbf-driver-container` | `--userns=auto` or `nomap`, so no container uid is the daemon's | ~80 |
+| `kbf-driver-container` | `--userns=nomap`, so no container uid is the daemon's; the overlay handed to the container's root and back; the subordinate id check at startup | ~300 |
 | `kbf-mdm` (new) | `MdmBackend`; NanoHUB backend; DDM status; `kbf-mdm-gate` with mTLS, inventory, caps, the profile allowlist, signed-erase verification and its own alerts; `kbf-admin erase` | ~1,500 |
 | `kbf-types`, `kbf-sched` | node states; cordon in placement; rollout state machine; slots; `min_serving` by hardware class; `accept_outage`; internal submitter for `kbf-node`; whole-Mac reservation | ~1,900 |
 | `kbf-server` | rollout driver, durable record and startup reconciliation, roles and OIDC tokens, identity binding and revocation, audit, `/v1/nodes`, `/v1/software`, `/v1/rollouts`, Fleet page, absence suppression | ~1,500 |
