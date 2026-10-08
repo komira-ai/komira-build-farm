@@ -233,7 +233,6 @@ pub fn updates_for(mac: &MacStatus, catalogue: &Catalogue) -> MacUpdates {
     newer.sort_by(|a, b| {
         b.product_version
             .cmp(&a.product_version)
-            .then_with(|| a.build.cmp(&b.build))
             .then_with(|| b.public.cmp(&a.public))
     });
     newer.dedup_by(|a, b| a.product_version == b.product_version && a.build == b.build);
