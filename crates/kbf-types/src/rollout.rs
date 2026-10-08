@@ -21,7 +21,7 @@
 //! the record is left as it was.
 //!
 //! Two rules span nodes: a pending node is cordoned only while fewer than the
-//! strategy's `max_unavailable` nodes are out of service ([`NodeStep::is_out`]), and a
+//! strategy's `max_unavailable` nodes are out of service ([`NodeProgress::is_out`]), and a
 //! rollout is `done` only once every node is done or failed.
 //!
 //! The rollout itself is `pending`, `running`, `held`, `done` or `cancelled` (section
@@ -143,6 +143,14 @@ impl NodeProgress {
     #[must_use]
     pub const fn held_at(&self) -> Option<NodeStep> {
         self.held_at
+    }
+
+    /// Whether the node is out of service for the rollout ([`NodeStep::is_out`]). A
+    /// node held while still pending is not: it was never taken out, so it holds no
+    /// slot.
+    #[must_use]
+    pub fn is_out(&self) -> bool {
+        self.step.is_out() && self.held_at != Some(NodeStep::Pending)
     }
 
     /// Whether the node may move to `next` (see the module docs).
@@ -286,7 +294,9 @@ pub struct Rollout {
 impl Rollout {
     /// A pending rollout of `target` over `nodes` (the `selector` resolved), every node
     /// pending.
-    #[must_use]
+    ///
+    /// # Errors
+    /// The strategy's `max_unavailable` is 0: the rollout could never take a node out.
     pub fn new(
         id: RolloutId,
         target: impl Into<String>,
@@ -294,8 +304,11 @@ impl Rollout {
         strategy: Strategy,
         actor: Actor,
         nodes: impl IntoIterator<Item = WorkerId>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, StrategyError> {
+        if strategy.max_unavailable == 0 {
+            return Err(StrategyError::NoneUnavailable);
+        }
+        Ok(Self {
             id,
             target: target.into(),
             selector,
@@ -306,7 +319,7 @@ impl Rollout {
                 .into_iter()
                 .map(|n| (n, NodeProgress::pending()))
                 .collect(),
-        }
+        })
     }
 
     /// Where the rollout is.
@@ -352,10 +365,10 @@ impl Rollout {
         Ok(())
     }
 
-    /// How many nodes are out of service ([`NodeStep::is_out`]).
+    /// How many nodes are out of service ([`NodeProgress::is_out`]).
     #[must_use]
     pub fn out_of_service(&self) -> usize {
-        self.nodes.values().filter(|p| p.step.is_out()).count()
+        self.nodes.values().filter(|p| p.is_out()).count()
     }
 
     /// Moves `node` to `next`. Only a running rollout moves nodes, except that a node
@@ -389,6 +402,14 @@ impl Rollout {
         }
         progress.advance(next)
     }
+}
+
+/// A strategy no rollout can run with.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StrategyError {
+    /// `max_unavailable` is 0.
+    #[error("max_unavailable is 0: the rollout could never take a node out")]
+    NoneUnavailable,
 }
 
 /// A change the rollout rules refuse.

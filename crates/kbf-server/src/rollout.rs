@@ -23,6 +23,13 @@
 //! nothing proceeds by itself (section 4.3). The canary, soak, `min_serving` and
 //! per-pool slots are phase P2.
 //!
+//! **One driver per rollout.** The driver reads the record, then records each step
+//! with the store's all-or-nothing update. Two drivers stepping the same rollout at
+//! once are not expected, and are safe: the record refuses a step that another one
+//! has already taken (the node moved, the rollout was held or finished), and the
+//! driver, which has not acted on the node yet, stops that call and returns the
+//! record as it now is. It is not an error.
+//!
 //! **A drained node that is not connected is waited for, not updated.** `drained` also
 //! means the node disconnected and its leases were requeued elsewhere; the update
 //! needs the node's stream, so the driver keeps it at `draining` until it is back.
@@ -258,7 +265,9 @@ impl<'a> RolloutDriver<'a> {
                 }) => continue,
                 other => return self.hold(id, &node, &format!("{other:?} while draining")),
             };
-            self.record(id, &node, NodeStep::Updating)?;
+            if !self.record(id, &node, NodeStep::Updating)? {
+                return self.current(id);
+            }
             // The placement was read before the step was recorded: read it again.
             let again = self.fleet.placement(&node);
             if !again.as_ref().is_some_and(NodePlacement::ready) {
@@ -276,33 +285,43 @@ impl<'a> RolloutDriver<'a> {
             }
         }
         for node in at(NodeStep::Cordoned) {
-            self.record(id, &node, NodeStep::Draining)?;
+            if !self.record(id, &node, NodeStep::Draining)? {
+                return self.current(id);
+            }
             let drain = NodeAction::Drain(rollout.strategy.drain_deadline);
             if let Err(why) = self.fleet.place(&node, drain) {
                 return self.hold(id, &node, &why);
             }
         }
-        let out = rollout
-            .nodes()
-            .values()
-            .filter(|p| p.step().is_out())
-            .count();
-        let room = usize::try_from(rollout.strategy.max_unavailable).unwrap_or(usize::MAX);
-        for node in at(NodeStep::Pending)
-            .into_iter()
-            .take(room.saturating_sub(out))
-        {
-            self.record(id, &node, NodeStep::Cordoned)?;
+        // The record decides how many may be out: it refuses the cordon of a pending
+        // node once `max_unavailable` are, and the driver stops there.
+        for node in at(NodeStep::Pending) {
+            if !self.record(id, &node, NodeStep::Cordoned)? {
+                return self.current(id);
+            }
             if let Err(why) = self.fleet.place(&node, NodeAction::Cordon) {
                 return self.hold(id, &node, &why);
             }
         }
+        self.current(id)
+    }
+
+    /// The record of rollout `id` as it is now.
+    fn current(&self, id: RolloutId) -> Result<Rollout, DriveError> {
         Ok(self.store.get(id).ok_or(StoreError::Unknown(id))?)
     }
 
-    fn record(&self, id: RolloutId, node: &WorkerId, step: NodeStep) -> Result<(), DriveError> {
-        self.store.update(id, &|r| r.advance(node, step))?;
-        Ok(())
+    /// Records `node` at `step`; `false` if the record refuses it because it moved
+    /// since it was read (see the module docs on one driver per rollout).
+    ///
+    /// # Errors
+    /// The store could not write, or `id` is unknown.
+    fn record(&self, id: RolloutId, node: &WorkerId, step: NodeStep) -> Result<bool, DriveError> {
+        match self.store.update(id, &|r| r.advance(node, step)) {
+            Ok(_) => Ok(true),
+            Err(StoreError::Illegal(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Holds `node` and the rollout. Nothing proceeds until an operator acts.

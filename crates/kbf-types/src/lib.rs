@@ -26,7 +26,7 @@ pub use platform::{Platform, PlatformError};
 pub use qos::{CustomQos, Qos, QosError};
 pub use rollout::{
     Actor, IllegalStep, NodeProgress, NodeStep, Rollout, RolloutId, RolloutState, Selector,
-    Strategy,
+    Strategy, StrategyError,
 };
 pub use state::{Effect, StateMachine};
 pub use time::FarmTime;

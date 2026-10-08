@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use kbf_types::{
     Actor, IllegalStep, NodeProgress, NodeStep, Rollout, RolloutId, RolloutState, Selector,
-    Strategy, WorkerId,
+    Strategy, StrategyError, WorkerId,
 };
 
 use NodeStep::{
@@ -153,6 +153,10 @@ fn rollout() -> Rollout {
 }
 
 fn rollout_of(nodes: &[&str], max_unavailable: u32) -> Rollout {
+    try_rollout(nodes, max_unavailable).expect("a valid strategy")
+}
+
+fn try_rollout(nodes: &[&str], max_unavailable: u32) -> Result<Rollout, StrategyError> {
     Rollout::new(
         RolloutId(7),
         "sha256:abc",
@@ -268,12 +272,41 @@ fn the_record_takes_no_more_than_max_unavailable_nodes_out() {
     r.advance(&c, Cordoned).expect("a slot is free");
     // Other moves of nodes already out are not limited.
     r.advance(&c, Draining).expect("c drains");
+}
 
-    let mut none = rollout_of(&["a"], 0);
-    none.set_state(RolloutState::Running).expect("start");
+/// Catches: a rollout recorded with `max_unavailable` 0, which could never take a
+/// node out and would sit running forever.
+#[test]
+fn a_strategy_with_no_node_out_is_refused() {
+    let refused = try_rollout(&["a"], 0);
+    assert_eq!(refused, Err(StrategyError::NoneUnavailable));
     assert_eq!(
-        none.advance(&a, Cordoned),
-        Err(IllegalStep::Unavailable { max_unavailable: 0 })
+        StrategyError::NoneUnavailable.to_string(),
+        "max_unavailable is 0: the rollout could never take a node out"
+    );
+    assert!(try_rollout(&["a"], 1).is_ok());
+}
+
+/// Catches: a node held while still pending counted as out of service (it never left
+/// placement, so it holds no slot, and the rollout could not take another node), and
+/// a node held after it was taken out not counted.
+#[test]
+fn a_node_held_while_pending_holds_no_slot() {
+    let (a, b) = (WorkerId::new("a"), WorkerId::new("b"));
+    let mut r = rollout_of(&["a", "b"], 1);
+    r.set_state(RolloutState::Running).expect("start");
+    r.advance(&a, Held).expect("hold a before it is taken out");
+    assert!(!r.node(&a).expect("a").is_out());
+    assert_eq!(r.out_of_service(), 0);
+    r.advance(&b, Cordoned).expect("b may go out");
+    r.advance(&b, Held).expect("hold b once out");
+    assert!(r.node(&b).expect("b").is_out());
+    assert_eq!(r.out_of_service(), 1);
+    // Resumed at pending, a still needs a free slot to go out.
+    r.advance(&a, Pending).expect("resume a");
+    assert_eq!(
+        r.advance(&a, Cordoned),
+        Err(IllegalStep::Unavailable { max_unavailable: 1 })
     );
 }
 

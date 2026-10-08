@@ -42,6 +42,7 @@ fn rollout(nodes: &[&str], max_unavailable: u32) -> Rollout {
         Actor::new("operator", 1_000),
         names,
     )
+    .expect("a valid strategy")
 }
 
 /// A fleet that records what it is asked and answers placements a test sets: each
@@ -333,9 +334,9 @@ fn a_node_is_updated_only_while_drained_and_connected() {
     }
 }
 
-/// Catches: the driver's own count of nodes out disagreeing with the record's: the
-/// record refuses a third node with `max_unavailable` 2, so a driver that asked would
-/// fail the step instead of leaving the node pending.
+/// Catches: the driver taking a third node out with `max_unavailable` 2 (it relies on
+/// the record to refuse the cordon), or failing the step when the record refuses it
+/// instead of leaving the node pending.
 #[test]
 fn the_driver_takes_nodes_out_only_while_the_record_allows() {
     let (store, fleet, applier) = (
@@ -362,6 +363,71 @@ fn the_driver_takes_nodes_out_only_while_the_record_allows() {
             max_unavailable: 2
         }))
     );
+}
+
+/// A store whose first read returns a snapshot taken earlier, while its writes and
+/// later reads go to the record: what a driver sees when another one stepped the
+/// rollout between its read and its write.
+struct StaleStore {
+    inner: MemoryRolloutStore,
+    snapshot: Mutex<Option<Rollout>>,
+}
+
+impl RolloutStore for StaleStore {
+    fn create(&self, rollout: Rollout) -> Result<(), StoreError> {
+        self.inner.create(rollout)
+    }
+
+    fn get(&self, id: RolloutId) -> Option<Rollout> {
+        let stale = self.snapshot.lock().expect("lock").take();
+        stale.or_else(|| self.inner.get(id))
+    }
+
+    fn update(&self, id: RolloutId, change: Change<'_>) -> Result<Rollout, StoreError> {
+        self.inner.update(id, change)
+    }
+}
+
+/// Catches: a step another driver already took turned into an error (one driver per
+/// rollout is expected; a second one must stop quietly, not fail), and a driver that
+/// acts on a node whose step the record refused.
+#[test]
+fn a_step_already_taken_elsewhere_stops_quietly() {
+    let fleet = FakeFleet::default();
+    fleet.set("a", PlacementView::Drained);
+    let applier = FakeApplier::default();
+    for (taken, stale) in [
+        (&[NodeStep::Cordoned][..], &[][..]),
+        (
+            &[NodeStep::Cordoned, NodeStep::Draining],
+            &[NodeStep::Cordoned],
+        ),
+        (
+            &[NodeStep::Cordoned, NodeStep::Draining, NodeStep::Updating],
+            &[NodeStep::Cordoned, NodeStep::Draining],
+        ),
+    ] {
+        let mut snapshot = rollout(&["a"], 1);
+        snapshot.set_state(RolloutState::Running).expect("start");
+        let mut record = snapshot.clone();
+        for &step in stale {
+            snapshot.advance(&w("a"), step).expect("a legal step");
+        }
+        for &step in taken {
+            record.advance(&w("a"), step).expect("a legal step");
+        }
+        let store = StaleStore {
+            inner: MemoryRolloutStore::default(),
+            snapshot: Mutex::new(Some(snapshot)),
+        };
+        store.create(record.clone()).expect("create");
+        let driver = RolloutDriver::new(&store, &fleet, &applier);
+        let got = driver.step(RolloutId(1)).expect("not an error");
+        assert_eq!(got.node(&w("a")), record.node(&w("a")), "{taken:?}");
+        assert_eq!(store.inner.get(RolloutId(1)), Some(record));
+    }
+    assert!(fleet.actions().is_empty(), "{:?}", fleet.actions());
+    assert!(applier.handed.borrow().is_empty());
 }
 
 /// A store that keeps nothing once `writes` is spent.
