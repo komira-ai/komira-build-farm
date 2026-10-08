@@ -103,6 +103,104 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
     interrupt(child);
 }
 
+/// Catches (issue #86): a server whose SIGINT handler is installed after it prints the
+/// start line, so a SIGINT sent as soon as the line is read kills it by the default
+/// action instead of stopping it with exit 0. In both store modes the test holds the
+/// server at that line (its stdout is a full pipe, so the print blocks), waits until
+/// `/proc` shows SIGINT caught, sends SIGINT, then lets the line through. A late handler
+/// never shows as caught while the print is blocked, so it fails here every time rather
+/// than now and then.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigint_is_caught_before_the_start_line_is_printed() {
+    let memory = server(&["--store", "memory"]);
+    let s3 = with_keys(server(&[
+        "--store",
+        "s3",
+        "--s3-endpoint",
+        "http://127.0.0.1:9",
+        "--s3-bucket",
+        "kbf-test",
+    ]));
+    for (mode, mut c) in [("memory", memory), ("s3", s3)] {
+        c.args(ANY_PORT);
+        held_at_the_start_line_then_interrupted(mode, c);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn held_at_the_start_line_then_interrupted(mode: &str, mut c: Command) {
+    use std::time::{Duration, Instant};
+    let (stdout, full) = full_pipe();
+    let mut child = c
+        .stdout(full)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn kbf-server");
+    drop(c); // the server now holds the only write end
+    let pid = i32::try_from(child.id()).expect("pid");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !catches_sigint(pid) {
+        if Instant::now() > deadline {
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+            panic!("{mode}: SIGINT not caught while the start line is being printed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: kill(2) on the child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let line = BufReader::new(stdout)
+        .lines()
+        .map(|l| l.expect("read stdout"))
+        .find(|l| !l.is_empty())
+        .expect("a start line");
+    assert!(line.starts_with("kbf-server "), "{mode}: {line}");
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "{mode}: kbf-server exited with {status}");
+}
+
+/// A pipe whose write end is full (of newlines), so the next write to it blocks until
+/// the read end is read.
+#[cfg(target_os = "linux")]
+fn full_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    use std::io::{ErrorKind, Write};
+    use std::os::fd::AsRawFd;
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let fd = writer.as_raw_fd();
+    // SAFETY: fcntl(2) on a descriptor this function owns; it changes only status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL");
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    loop {
+        match writer.write(b"\n") {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill the pipe: {e}"),
+        }
+    }
+    // The server inherits this open file and must block on it, not fail.
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    (reader, writer)
+}
+
+/// Whether process `pid` has a handler installed for SIGINT (`SigCgt` in its status).
+#[cfg(target_os = "linux")]
+fn catches_sigint(pid: i32) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read status");
+    let caught = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .expect("a SigCgt line");
+    let caught = u64::from_str_radix(caught.trim(), 16).expect("a hex mask");
+    caught & (1 << (libc::SIGINT - 1)) != 0
+}
+
 /// Catches: `--store=s3` that does not build an S3 store from its flags and the key
 /// pair (the store does no I/O until used, so the server starts).
 #[cfg(unix)]
