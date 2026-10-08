@@ -3,8 +3,9 @@
 //!
 //! [`open_set`] verifies the signature and finds the signer's role under the key
 //! statement; [`check`] applies the rest against what the node has pinned and installed:
-//! pool and platform, expiry, the pool's serial floor, the installed serial, and that the
-//! signer's role covers every artifact the set changes. Every refusal is a
+//! pool and platform, expiry, the pool's serial floor, the installed serial (and that the
+//! set is at most [`MAX_SERIAL_STEP`] past it), and that the signer's role covers every
+//! artifact the set changes. Every refusal is a
 //! [`Refusal`] naming the check.
 
 use std::collections::BTreeMap;
@@ -18,6 +19,15 @@ use crate::signed::{Envelope, KeyStatement, PublicKey, Role, SET_CONTEXT};
 /// The artifacts a component key may change: kbf's unprivileged parts. Everything else,
 /// `kbf-updater` and `kbf-mac-session` included, needs the platform key (S2.2).
 pub const COMPONENT_ARTIFACTS: &[&str] = &["kbf-daemon"];
+
+/// How far past the installed serial (0 with nothing installed) a set's serial may be.
+/// Without a bound one set could take the serial, and with `min_serial` the floor, to
+/// `u64::MAX`, and no set could ever follow it: a compromised component key could stop
+/// updates on a node for good with a set that changes only `kbf-daemon`, and the
+/// revocation of S2.3 needs a newer set to be possible. 2^32 leaves room for a serial
+/// that counts sets or seconds; a key would have to install 2^32 sets in turn to use it
+/// up.
+pub const MAX_SERIAL_STEP: u64 = 1 << 32;
 
 /// The name [`SoftwareSet::changes`] gives a change of the package snapshot.
 pub const SNAPSHOT: &str = "snapshot";
@@ -230,7 +240,8 @@ pub enum Verdict {
 }
 
 /// The checks of S3.1 after the signature: pool and platform, expiry, the floor, the
-/// installed serial, and key coverage.
+/// installed serial, the bound on how far past it a serial may jump
+/// ([`MAX_SERIAL_STEP`]), and key coverage.
 ///
 /// # Errors
 /// The first check that fails, as its [`Refusal`].
@@ -267,6 +278,13 @@ pub fn check(v: &VerifiedSet, node: &NodeView<'_>) -> Result<Verdict, Refusal> {
         Some((installed, _)) => Some(installed),
         None => None,
     };
+    let base = installed.map_or(0, |s| s.serial);
+    if set.serial - base > MAX_SERIAL_STEP {
+        return Err(Refusal::SerialJump {
+            serial: set.serial,
+            installed: base,
+        });
+    }
     if v.role == Role::Component
         && let Some(item) = set
             .changes(installed)
@@ -481,6 +499,27 @@ mod tests {
         );
         let newer = verified(&testkit::set(6), Role::Platform);
         assert_eq!(check(&newer, &view(&pin, at)), Ok(Verdict::Install));
+    }
+
+    /// Catches: the serial bound skipped (a set at `u64::MAX` leaves no newer serial for
+    /// anyone), measured from 0 with nothing installed, or an off-by-one at the bound.
+    #[test]
+    fn a_serial_may_jump_at_most_the_bound() {
+        let pin = pin();
+        let installed = verified(&testkit::set(5), Role::Platform);
+        let at = Some((&installed.set, installed.digest.as_str()));
+        for (base, at) in [(5, at), (0, None)] {
+            let top = verified(&testkit::set(base + MAX_SERIAL_STEP), Role::Platform);
+            assert_eq!(check(&top, &view(&pin, at)), Ok(Verdict::Install));
+            let past = verified(&testkit::set(base + MAX_SERIAL_STEP + 1), Role::Platform);
+            assert_eq!(
+                check(&past, &view(&pin, at)),
+                Err(Refusal::SerialJump {
+                    serial: base + MAX_SERIAL_STEP + 1,
+                    installed: base
+                })
+            );
+        }
     }
 
     /// Catches: skipping key coverage (a component-key set changes the updater, the OS

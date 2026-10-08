@@ -5,6 +5,7 @@ use std::os::unix::fs::symlink;
 
 use super::*;
 use crate::apply::FakeApplier;
+use crate::set::MAX_SERIAL_STEP;
 use crate::signed::public_key;
 use crate::testkit::{self, COMPONENT_SEED, PLATFORM_SEED, ROOT_SEED, seal_set, sha};
 
@@ -339,6 +340,32 @@ fn an_apply_in_progress_under_a_revoked_key_gives_way_to_a_newer_valid_set() {
         Ok(Outcome::Applied { reboot: false })
     );
     assert_eq!(u.status().installed.map(|s| s.serial), Some(7));
+}
+
+/// Catches: one set stopping updates on a node for good by jumping its serial (and
+/// `min_serial`, so the floor) to `u64::MAX`: no later set could ever be newer or at
+/// the floor. A compromised component key could do it with a set that changes only
+/// `kbf-daemon`, and the revocation of S2.3 assumes a newer set can always follow.
+#[test]
+fn a_serial_jump_past_the_bound_is_refused() {
+    let (mut u, _) = updater("serial-jump");
+    install(&mut u, &seal_set(&testkit::set(5), &PLATFORM_SEED));
+    let mut jump = daemon_only(u64::MAX);
+    jump.min_serial = u64::MAX;
+    let jump = seal_set(&jump, &COMPONENT_SEED);
+    let refused = Err(Refusal::SerialJump {
+        serial: u64::MAX,
+        installed: 5,
+    });
+    assert_eq!(u.stage(&jump, None, NOW), refused);
+    assert_eq!(u.apply(&jump, None, NOW), refused);
+    assert_eq!(u.status().floor, 0);
+    // The largest step allowed still installs, and a newer set can follow it.
+    let top = 5 + MAX_SERIAL_STEP;
+    let step = seal_set(&set_with(top, |s| s.min_serial = top), &PLATFORM_SEED);
+    assert_eq!(install(&mut u, &step), Outcome::Applied { reboot: false });
+    let next = seal_set(&testkit::set(top + 1), &PLATFORM_SEED);
+    assert_eq!(install(&mut u, &next), Outcome::Applied { reboot: false });
 }
 
 /// Catches: a reboot skipped when the install asks for one.

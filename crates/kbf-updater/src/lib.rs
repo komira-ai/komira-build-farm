@@ -82,6 +82,14 @@ pub enum Refusal {
         /// The installed serial.
         installed: u64,
     },
+    /// The set's serial is more than [`set::MAX_SERIAL_STEP`] above the installed one.
+    #[error("set {serial} jumps more than the bound past the installed {installed}")]
+    SerialJump {
+        /// The set's serial.
+        serial: u64,
+        /// The installed serial (0 with nothing installed).
+        installed: u64,
+    },
     /// The signer's role does not cover an item the set changes.
     #[error("a component key cannot change {0}")]
     NotCovered(String),
