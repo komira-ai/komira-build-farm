@@ -16,7 +16,7 @@ runs in a VM** ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
 
 Isolating what installing a desktop app does to a bare-metal Mac, and fleet-wide
 updates, device management and UI, are a separate design:
-[fleet-updates.md](fleet-updates.md) (in progress, #87).
+[fleet-updates.md](fleet-updates.md) (open PR #87).
 
 Claims about Apple's software and other projects are marked **[V]** (read in the
 source linked) or **[A]** (an assumption or a number nobody has measured on our
@@ -32,7 +32,7 @@ hardware). The table in [section 11](#11-verified-and-assumed) lists them togeth
 | Default VM size | A 6 vCPU, 16 GiB guest; with 1 GiB for its helper it books 6 cores and 17 GiB in full while it runs. An action may ask for 4 to 12 vCPU and 8 to 32 GiB, which books 4-12 cores and 9-33 GiB. |
 | How the scheduler knows | The action says `kbf-lease=vm` and names a pinned image (`vm.image`). Nodes report `vm.slots`, `vm` in `drivers`, and the images they hold. A VM books `vms=1` plus its cores and memory. |
 | VM lifetime | Clone the golden image, boot, run one action, collect outputs, destroy. A VM is never reused. |
-| GPU | Never in a VM: a stock guest runs LLM inference at about 4-15% of bare-metal speed (7-25 times slower). GPU tests, including tests that install the desktop app and drive it with a local LLM, run on bare metal with the whole Mac, one at a time. |
+| GPU | Never in a VM: a stock guest runs LLM inference at about 4-14% of bare-metal speed (7 to 23 times slower): generation 4.4% (TinyLlama 1.1B) and 6.5% (Gemma 4 12B), prompt processing 8.9% and 13.8%. GPU tests, including tests that install the desktop app and drive it with a local LLM, run on bare metal with the whole Mac, one at a time. |
 | Order | 1: builds and unit tests on bare metal. 2: VMs. 3: GPU. |
 
 ## 2. Why VMs on a Mac
@@ -55,8 +55,8 @@ There are two ways to give a lease a GUI session:
 |---|---|---|
 | Fresh state per lease | no: the logged-in user's state carries over unless wiped | yes: a clone of a golden image, destroyed after |
 | Other work on the Mac at the same time | no, or shares one user's session | yes: bare-metal leases keep running beside up to 2 VMs |
-| Host setup | auto-login off at rest; a root helper (`kbf-mac-session`, #87) sets it for one lease and clears it after | host auto-login stays off; the guest image logs in |
-| Toolchain per lease | the host's one Xcode | the image's Xcode; two images can differ |
+| Host setup | auto-login off at rest; a root helper (`kbf-mac-session`, open PR #87) sets it for one lease and clears it after | host auto-login stays off; the guest image logs in |
+| Toolchain per lease | one of the host's pinned Xcodes, chosen with `DEVELOPER_DIR` | the image's Xcode; two images can differ |
 
 This document chooses the VM.
 
@@ -155,14 +155,15 @@ Rules that follow:
   `kbf-caps` to a set the node reports, matched by membership: the action asks for one
   build and any node that has it serves it. A VM image holds exactly one Xcode, and its
   digest names it.
-- **The Mac node provisioning design (open #76) reflects these points:** several
+- **The Mac node provisioning design (open PR #76) reflects these points:** several
   Xcodes per host instead of "exactly one Xcode (or one Command Line Tools version) per
   pool"; simulator runtimes live in VM images only, never in the host profile; and GUI
   work runs in the VM lease, whose guest logs itself in. Host auto-login is off at rest.
   One exception: bare-metal GPU tests that install the desktop app need a GUI session
   on the host ([section 8.1](#81-on-bare-metal-never-in-a-vm)); for that one
   whole-machine lease a root helper, `kbf-mac-session`, sets auto-login and clears it
-  afterwards ([fleet-updates.md](fleet-updates.md), #87). "There is no disk image" stays
+  afterwards ([fleet-updates.md](fleet-updates.md), open PR #87). "There is no disk
+  image" stays
   true for the host, but VM golden images now live on Mac nodes.
 
 Four probes on one Mac settle the **[A]** rows above before phase 1 closes:
@@ -334,9 +335,12 @@ for them, and `vms` is booked only through `kbf-lease=vm`.
 
 No new key names the lease kinds a node serves: the scheduler maps each lease kind to
 the drivers that serve it and reads `drivers`. `action` maps to `native` or
-`container`; `vm` maps to `vm`; `whole_machine` maps to the planned bare-metal
-whole-machine runtime, the per-lease-user driver of
-[fleet-updates.md](fleet-updates.md) (#87, phase P4). On `main` no driver serves
+`container` only; `vm` maps to `vm`; `whole_machine` maps to `native-whole-machine`,
+the `drivers` value of the planned bare-metal whole-machine runtime (the per-lease-user
+driver of [fleet-updates.md](fleet-updates.md), open PR #87, phase P4). A daemon lists
+`native-whole-machine` only when `kbf-mac-session` is present, so a Mac before that
+phase, or any other native daemon, never looks able to serve `whole_machine`. On
+`main` no driver serves
 `whole_machine`: the native and container drivers serve `action` only
 (`crates/kbf-driver-native/src/runtime.rs`, `crates/kbf-driver-native/tests/lease.rs`)
 **[V]**. That is the planned "Drivers in placement" of
@@ -356,8 +360,10 @@ changes:
    `VZErrorVirtualMachineLimitExceeded` to an infrastructure failure that is retried
    elsewhere.
 2. **The kind in the request.** A node is feasible only if its `drivers` include one
-   that serves the kind. This also stops `whole_machine` reaching a daemon that refuses
-   it. A `whole_machine` lease books the node's full cores, memory, `gpus` and `vms`, so
+   that serves the kind: `native` or `container` for `action`, `vm` for `vm`, and
+   `native-whole-machine` for `whole_machine`. This stops `whole_machine` reaching a
+   daemon that refuses it. A `whole_machine` lease books the node's full cores,
+   memory, `gpus` and `vms`, so
    nothing else is placed there while it runs.
 3. **Image locality is a hard requirement.** `vm.image` matches only nodes that report
    the digest. An image is tens of gigabytes; it is never fetched at action time.
@@ -424,11 +430,13 @@ Rules:
 - **Fencing:** every lease self-fences today; a VM with the network or a GUI always
   will.
 - **A risk to test first:** whether Virtualization.framework starts a macOS VM from a
-  launchd daemon with no user logged in on the host **[A]**. If it does not, the
-  helpers need a logged-in session of a dedicated non-admin user. Host auto-login still
-  stays off at rest: the session would be opened per lease by the root helper
-  `kbf-mac-session` ([fleet-updates.md](fleet-updates.md), #87), as for a whole-machine
-  lease, and this design would change with it.
+  launchd daemon with no user logged in on the host **[A]**. If the probe fails, the
+  fallback is an open decision: a session of a dedicated non-admin VM user, held while
+  the node serves VM leases. That is an exception to "auto-login off at rest" and needs
+  a ruling; open PR #76's `autologin` check and `kbf-mac-session`'s user-id range rule
+  (open PR #87)
+  would then have to allow that user. A per-lease switch is impossible, because it
+  restarts userspace under running leases.
 - **Not used:** Tart and Orchard are under FSL-1.1-ALv2, which forbids a competing use
   and becomes Apache-2.0 only two years after each release
   ([LICENSE](https://github.com/openai/tart/blob/main/LICENSE)) **[V]**. kbf is
@@ -455,8 +463,9 @@ read as a reference for the steps. An image is built in a fixed order:
    checked against an expected list with `xcrun simctl list runtimes`
    ([xcode.pkr.hcl](https://github.com/cirruslabs/macos-image-templates/blob/main/templates/xcode.pkr.hcl))
    **[V]**.
-4. **Digest**: the SHA-256 of a manifest of the image's files names the image; it is
-   the VM lease's host identity.
+4. **Digest**: the SHA-256 of a manifest of the image's files names the image. It pins
+   the VM lease's whole toolchain; clients route on `vm.image`. Host-identity probes
+   (open PR #76, §3.1) are for bare-metal Xcodes.
 
 Size: Cirrus's Xcode template uses a 140 GB disk **[V]**; plan 100-140 GB per golden
 image **[A]**. A node keeps at most two (Xcode N and N-1) **[A]**, 200-280 GB, plus up
@@ -480,8 +489,8 @@ copy-on-write overlays ([DiskImageKit](https://developer.apple.com/documentation
 
 ### 8.1 On bare metal, never in a VM
 
-**GPU work never runs in a VM.** A stock macOS guest runs LLM inference at about 4-15%
-of bare-metal speed, 7 to 25 times slower, which is not acceptable. GPU tests, including
+**GPU work never runs in a VM.** A stock macOS guest runs LLM inference at about 4-14%
+of bare-metal speed (7 to 23 times slower), which is not acceptable. GPU tests, including
 tests that install the desktop app and drive it with a local LLM, run on bare metal with
 the whole Mac, one at a time. There is no GPU-in-VM option.
 
@@ -489,10 +498,10 @@ The evidence: on Apple silicon the GPU shares the system's memory: "The CPU and 
 have direct access to the same memory pool"
 ([MLX](https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html)) **[V]**.
 A macOS guest gets a paravirtualized Metal device. One published test on an M1 Ultra
-(llama.cpp) found the stock guest's Metal device reports an older ("Apple 5-era") GPU
-family without SIMD-group matrix or bfloat16 support, and measured it at 4-15% of bare
-metal: TinyLlama generation 12.63 tokens/s against 286.71 on bare metal (4.4%), Gemma
-12B generation 6.5%, prompt processing 9-15%
+(llama.cpp) found the stock guest's Metal device reports an older GPU family (Apple GPU
+family 5) without SIMD-group matrix or bfloat16 support, and measured it at about 4-14%
+of bare-metal speed (7 to 23 times slower): generation 4.4% (TinyLlama 1.1B, 12.63
+tokens/s against 286.71) and 6.5% (Gemma 4 12B), prompt processing 8.9% and 13.8%
 ([measurements](https://github.com/trycua/cua/blob/main/blog/gpu-passthrough-macos-vms.md))
 **[V]** for their numbers, **[A]** for ours. MLX may not run in a stock guest at all
 **[A]**.
@@ -505,6 +514,8 @@ So a GPU test is a whole-machine lease:
   numbers from a shared machine are noise. The scheduler drains the Mac first
   ([section 5.3](#53-booking-and-placement-planned)); GPU tests on one Mac run one at a
   time.
+- On macOS the front refuses `gpu`≥1 unless `kbf-lease=whole_machine` (and always with
+  `kbf-lease=vm`), with `INVALID_ARGUMENT`, so GPU work cannot land beside other work.
 - The daemon reports `gpu=1` on Apple silicon. Today it reports 0
   (`crates/kbf-daemon/src/report.rs`) **[V]**.
 - The model must fit: weights + KV cache + activations + process. Example,
@@ -518,7 +529,7 @@ So a GPU test is a whole-machine lease:
 - A test that installs the desktop app needs a GUI session on the host, and what the
   install leaves behind must not reach the next lease. That isolation, and fleet-wide
   updates, device management and UI, are designed in
-  [fleet-updates.md](fleet-updates.md) (in progress, #87).
+  [fleet-updates.md](fleet-updates.md) (open PR #87).
 
 ### 8.2 Testing a local LLM on the GPU
 
@@ -643,7 +654,7 @@ app's peak are recorded and replace the **[A]** numbers in section 4.
 | `kbf-daemon` | report `gpu=1`, GPU core count and the wired-memory cap on macOS |
 | `kbf-proto`, `kbf-server` | GPUs in `Start` |
 | `kbf-sched` | GPU tests as whole-machine leases with `gpu=1`: drain the Mac, one at a time |
-| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine` (none does on `main`): the per-lease-user driver of [fleet-updates.md](fleet-updates.md) (#87, phase P4) |
+| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine` (none does on `main`): the per-lease-user driver of [fleet-updates.md](fleet-updates.md) (open PR #87, phase P4); reports `native-whole-machine` |
 | `kbf-front`, `kbf-sched` | a `whole_machine` lease books the node's full cores, memory, `gpus` and `vms` |
 | `kbf-daemon`, `kbf-server` | carry `auxiliary_metadata`; store series per test and hardware key |
 | front / CAS | model weights as chunked CAS inputs, kept from eviction on nodes that run GPU tests |
@@ -660,6 +671,7 @@ model, then layer 4.
 | Image distribution | ship by digest through the CAS; build on each Mac | ship by digest, if copying an image holding macOS and Xcode between our Macs is allowed by their licences (not checked by a lawyer) |
 | Images per node | one Xcode; two (N and N-1) | two (200-280 GB) |
 | `ibtool`/`actool` | VM; bare metal | bare metal if the probe passes |
+| If a VM cannot start from a launch daemon | a session of a dedicated non-admin VM user held while the node serves VM leases (an exception to auto-login off at rest); no VMs on that macOS | needs a ruling; a per-lease switch is impossible ([section 6](#6-the-vm-driver-one-vm-per-lease-never-reused)) |
 
 Decided, not open: GPU work never runs in a VM; a GPU test takes the whole Mac on bare
 metal, one at a time ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
@@ -694,7 +706,7 @@ metal, one at a time ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
 | Guest idle memory 3-4 GiB; boot 20-60 s; clone growth 40 GiB | A | to be measured |
 | GitHub arm64 runners: 3 CPU / 7 GB; xlarge 5 / 14 GB | V | [GitHub](https://docs.github.com/en/actions/reference/runners/larger-runners) |
 | M3 Ultra 28-core is 20P + 8E | V | [Apple](https://support.apple.com/en-us/122211) |
-| Guest Metal is a reduced device, 4-15% of bare metal for LLM work | V for the cited M1 Ultra numbers; A for ours | [measurements](https://github.com/trycua/cua/blob/main/blog/gpu-passthrough-macos-vms.md) |
+| Guest Metal is a reduced device, about 4-14% of bare metal for LLM work (7 to 23 times slower) | V for the cited M1 Ultra numbers; A for ours | [measurements](https://github.com/trycua/cua/blob/main/blog/gpu-passthrough-macos-vms.md) |
 | MLX may not run in a stock guest | A | no bfloat16 or SIMD-group matrix in the guest's GPU family |
 | DiskImageKit is documented for Swift only | V | [DiskImageKit](https://developer.apple.com/documentation/diskimagekit) |
 | CPU and GPU share memory | V | [MLX](https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html) |
