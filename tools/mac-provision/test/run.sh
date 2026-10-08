@@ -164,7 +164,7 @@ mkprofile() {
 # A fake Mac with the test profile applied.
 converged() {
   mkroot
-  mkprofile "$@"
+  mkprofile
   runr apply --profile "$P"
   if [ "$STATUS" != 0 ]; then failt "the first apply failed"; fi
   : >"$S/log"
@@ -353,6 +353,7 @@ drift() {
     *) return 0 ;;
   esac
   converged
+  # shellcheck disable=SC2034 # R is read by the drift command
   R=$FAKE_ROOT
   eval "$3"
   NAME="drift $1 ($3)"

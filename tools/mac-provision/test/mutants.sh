@@ -126,6 +126,8 @@ mutant 'an expectation may name an unpinned Xcode' t_refused \
   's/\*) die "expect_probe: \$ve_build names no pinned xcode" ;;/*) : ;;/'
 mutant 'a probe with another SHA-256 passes' t_drift:probe \
   's/\[ "\$(sha256 "\$R\$cq_path")" = "\${cq##\*:}" \] || cq_bad/: || cq_bad/'
+mutant 'IsHidden read without the dsAttrTypeNative: prefix' t_converge \
+  's/\$1 == k || \$1 == "dsAttrTypeNative:" k {/$1 == k {/'
 mutant 'apply runs without root' t_not_root \
   's/\[ "\$(id -u)" = 0 \] || die/: || die/'
 mutant '--keys ignores an unknown item' t_keys \

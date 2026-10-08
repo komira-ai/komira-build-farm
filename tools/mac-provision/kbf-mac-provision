@@ -29,6 +29,8 @@
 # probe and expect_probe) is refused. Exit status: 0 all pass, 1 something fails,
 # 2 bad usage or a refused profile. Only programs macOS ships are used.
 
+# The P_<key> variables are assigned by load_profile, through eval.
+# shellcheck disable=SC2154
 set -u
 umask 022
 LC_ALL=C
@@ -289,8 +291,10 @@ pref_get() {
   defaults read "$1" "$2" 2>/dev/null
 }
 
+# One attribute of a directory record. dscl prints an attribute outside its standard
+# set with a prefix: "dsAttrTypeNative:IsHidden: 1".
 dscl_attr() {
-  dscl . -read "$1" "$2" 2>/dev/null | awk -v k="$2:" '$1 == k { print $2; exit }'
+  dscl . -read "$1" "$2" 2>/dev/null | awk -v k="$2:" '$1 == k || $1 == "dsAttrTypeNative:" k { print $2; exit }'
 }
 
 # The ProductBuildVersion of the Xcode at app path $1 (under the root), or nothing.

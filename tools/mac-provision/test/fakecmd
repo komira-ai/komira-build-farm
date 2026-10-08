@@ -27,6 +27,14 @@ kv_del() {
   mv "$1.tmp" "$1"
 }
 
+# The prefix dscl prints before an attribute outside its standard set, as macOS's
+# own dscl prints IsHidden: "dsAttrTypeNative:IsHidden: 1".
+native() {
+  case "$1" in
+    IsHidden) printf 'dsAttrTypeNative:' ;;
+  esac
+}
+
 # A path to a state file name.
 flat() {
   printf '%s' "$1" | tr '/' '_'
@@ -126,10 +134,10 @@ case "$NAME" in
         if [ $# -gt 3 ]; then
           shift 3
           for a in "$@"; do
-            v=$(kv_get "$rec" "$a") && echo "$a: $v"
+            v=$(kv_get "$rec" "$a") && echo "$(native "$a")$a: $v"
           done
         else
-          awk -F= '{ print $1 ": " substr($0, length($1) + 2) }' "$rec"
+          awk -F= '{ p = ($1 == "IsHidden") ? "dsAttrTypeNative:" : ""; print p $1 ": " substr($0, length($1) + 2) }' "$rec"
         fi
         ;;
       -create)
