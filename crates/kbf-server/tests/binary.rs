@@ -1,14 +1,69 @@
 //! The `kbf-server` binary: flags, both stores, the start line, and a clean stop.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpListener};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 const ANY_PORT: [&str; 4] = ["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"];
+/// How long a test waits for the server to print its start line or to exit.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// A running server, killed and reaped when dropped, so a failed assertion (or a wait
+/// that ran out) never leaves it running or hangs the test.
+struct Running(Child);
+
+impl Running {
+    fn pid(&self) -> i32 {
+        i32::try_from(self.0.id()).expect("pid")
+    }
+
+    /// Waits up to `BOUND` for the server to exit; panics (and so kills it) if it has
+    /// not.
+    fn exit_status(&mut self, what: &str) -> ExitStatus {
+        let deadline = Instant::now() + BOUND;
+        loop {
+            if let Some(status) = self.0.try_wait().expect("try_wait") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: kbf-server still running {BOUND:?} after SIGINT"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The first non-empty line `out` yields within `BOUND`. The reading thread ends when
+/// the server exits (or is killed) and the pipe closes.
+fn first_line(what: &str, out: impl Read + Send + 'static) -> String {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let line = BufReader::new(out)
+            .lines()
+            .map_while(Result::ok)
+            .find(|l| !l.is_empty());
+        let _ = tx.send(line);
+    });
+    match rx.recv_timeout(BOUND) {
+        Ok(Some(line)) => line,
+        Ok(None) => panic!("{what}: kbf-server closed stdout without a start line"),
+        Err(e) => panic!("{what}: no start line within {BOUND:?} ({e})"),
+    }
+}
 
 fn server(args: &[&str]) -> Command {
     let mut c = Command::new(BIN);
@@ -31,16 +86,14 @@ fn fails(mut c: Command) -> (Option<i32>, String) {
 }
 
 /// Starts the server, reads its start line, and returns it with the REAPI address.
-fn started(mut c: Command) -> (Child, String, SocketAddr) {
-    let mut child = c
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn kbf-server");
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout"))
-        .read_line(&mut line)
-        .expect("read the start line");
+fn started(mut c: Command) -> (Running, String, SocketAddr) {
+    let mut child = Running(
+        c.stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
+    let line = first_line("start", child.0.stdout.take().expect("stdout"));
     let reapi = line
         .split_whitespace()
         .find_map(|w| w.strip_prefix("reapi="))
@@ -50,14 +103,14 @@ fn started(mut c: Command) -> (Child, String, SocketAddr) {
     (child, line, reapi)
 }
 
-/// Stops the server with SIGINT and checks it exits 0.
-fn interrupt(mut child: Child) {
+/// Stops the server with SIGINT and checks it exits 0 within `BOUND`.
+fn interrupt(mut child: Running) {
     let sent = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
+        .args(["-INT", &child.pid().to_string()])
         .status()
         .expect("run kill");
     assert!(sent.success());
-    let status = child.wait().expect("wait");
+    let status = child.exit_status("interrupt");
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
@@ -101,6 +154,99 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
         });
     assert!(caps.execution_capabilities.expect("execution").exec_enabled);
     interrupt(child);
+}
+
+/// Catches (issue #86): a server whose SIGINT handler is installed after it prints the
+/// start line, so a SIGINT sent as soon as the line is read kills it by the default
+/// action instead of stopping it with exit 0. In both store modes the test holds the
+/// server at that line (its stdout is a full pipe, so the print blocks), waits until
+/// `/proc` shows SIGINT caught, sends SIGINT, then lets the line through. A late handler
+/// never shows as caught while the print is blocked, so it fails here every time rather
+/// than now and then.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigint_is_caught_before_the_start_line_is_printed() {
+    let memory = server(&["--store", "memory"]);
+    let s3 = with_keys(server(&[
+        "--store",
+        "s3",
+        "--s3-endpoint",
+        "http://127.0.0.1:9",
+        "--s3-bucket",
+        "kbf-test",
+    ]));
+    for (mode, mut c) in [("memory", memory), ("s3", s3)] {
+        c.args(ANY_PORT);
+        held_at_the_start_line_then_interrupted(mode, c);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn held_at_the_start_line_then_interrupted(mode: &str, mut c: Command) {
+    let (stdout, full) = full_pipe();
+    let mut child = Running(
+        c.stdout(full)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
+    drop(c); // the server now holds the only write end
+    let pid = child.pid();
+    let deadline = Instant::now() + BOUND;
+    while !catches_sigint(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "{mode}: SIGINT not caught while the start line is being printed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: kill(2) on the child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let line = first_line(mode, stdout);
+    assert!(line.starts_with("kbf-server "), "{mode}: {line}");
+    let status = child.exit_status(mode);
+    assert!(status.success(), "{mode}: kbf-server exited with {status}");
+}
+
+/// A pipe whose write end is full (of newlines), so the next write to it blocks until
+/// the read end is read.
+#[cfg(target_os = "linux")]
+fn full_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    use std::io::{ErrorKind, Write};
+    use std::os::fd::AsRawFd;
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let fd = writer.as_raw_fd();
+    // SAFETY: fcntl(2) on a descriptor this function owns; it changes only status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL");
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    loop {
+        match writer.write(b"\n") {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill the pipe: {e}"),
+        }
+    }
+    // The server inherits this open file and must block on it, not fail.
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    (reader, writer)
+}
+
+/// Whether process `pid` has a handler installed for SIGINT (`SigCgt` in its status).
+#[cfg(target_os = "linux")]
+fn catches_sigint(pid: i32) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read status");
+    let caught = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .expect("a SigCgt line");
+    let caught = u64::from_str_radix(caught.trim(), 16).expect("a hex mask");
+    caught & (1 << (libc::SIGINT - 1)) != 0
 }
 
 /// Catches: `--store=s3` that does not build an S3 store from its flags and the key
