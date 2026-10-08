@@ -13,12 +13,13 @@
 //! stream's acknowledgements renew the same contact. Heartbeat sequence numbers are per
 //! stream, so [`Contact::new_stream`] forgets the unacknowledged ones.
 //!
-//! This module reads no clock; every instant is an argument.
+//! This module reads no clock; every instant is an argument, a reading of the
+//! suspend-counting clock (`clock`, issue #78).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use tokio::time::Instant;
+use crate::clock::Moment;
 
 /// What one acknowledgement did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,9 +37,9 @@ pub struct Contact {
     fence_after: Duration,
     gap_after: Option<Duration>,
     /// Send time of the newest message the server has acknowledged.
-    confirmed: Option<Instant>,
+    confirmed: Option<Moment>,
     /// Send times of this stream's heartbeats that are not yet acknowledged.
-    pending: BTreeMap<u64, Instant>,
+    pending: BTreeMap<u64, Moment>,
     in_gap: bool,
 }
 
@@ -70,7 +71,7 @@ impl Contact {
 
     /// Records that the server acknowledged a message the daemon sent at `sent_at`
     /// (the Hello that a Welcome answers).
-    pub fn confirm(&mut self, sent_at: Instant) -> bool {
+    pub fn confirm(&mut self, sent_at: Moment) -> bool {
         if self.confirmed.is_none_or(|c| sent_at > c) {
             self.confirmed = Some(sent_at);
         }
@@ -78,7 +79,7 @@ impl Contact {
     }
 
     /// Records that heartbeat `seq` of this stream was sent at `at`.
-    pub fn sent(&mut self, seq: u64, at: Instant) {
+    pub fn sent(&mut self, seq: u64, at: Moment) {
         self.pending.insert(seq, at);
     }
 
@@ -102,19 +103,19 @@ impl Contact {
     /// When the daemon must fence its leases: T after the newest acknowledged send.
     /// `None` before the server has acknowledged anything.
     #[must_use]
-    pub fn fence_deadline(&self) -> Option<Instant> {
+    pub fn fence_deadline(&self) -> Option<Moment> {
         self.confirmed.map(|c| c + self.fence_after)
     }
 
     /// Whether contact is lost at `now`: the fence deadline has passed.
     #[must_use]
-    pub fn lost(&self, now: Instant) -> bool {
+    pub fn lost(&self, now: Moment) -> bool {
         self.fence_deadline().is_some_and(|d| now >= d)
     }
 
     /// When a heartbeat gap begins, if one is not already declared.
     #[must_use]
-    pub fn gap_deadline(&self) -> Option<Instant> {
+    pub fn gap_deadline(&self) -> Option<Moment> {
         match (self.in_gap, self.confirmed, self.gap_after) {
             (false, Some(c), Some(g)) => Some(c + g),
             _ => None,
@@ -123,7 +124,7 @@ impl Contact {
 
     /// Declares a gap if its deadline has passed. Returns how long the server has been
     /// silent when it declares one, once per gap.
-    pub fn check_gap(&mut self, now: Instant) -> Option<Duration> {
+    pub fn check_gap(&mut self, now: Moment) -> Option<Duration> {
         let deadline = self.gap_deadline()?;
         if now < deadline {
             return None;
@@ -140,7 +141,7 @@ mod tests {
     const T: Duration = Duration::from_secs(40);
     const I: Duration = Duration::from_secs(5);
 
-    fn connected(t0: Instant) -> Contact {
+    fn connected(t0: Moment) -> Contact {
         let mut c = Contact::new(T);
         c.new_stream(I);
         c.confirm(t0);
@@ -153,7 +154,7 @@ mod tests {
     /// a lease could run.
     #[test]
     fn fence_counts_from_the_send_of_the_acknowledged_heartbeat() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut c = connected(t0);
         let sent = t0 + Duration::from_secs(10);
         c.sent(1, sent);
@@ -165,10 +166,11 @@ mod tests {
     }
 
     /// Catches: an acknowledgement of an older heartbeat (or a repeated or unknown
-    /// sequence number) moving the deadline backwards or forwards.
+    /// sequence number, or a Welcome for an older send) moving the deadline backwards
+    /// or forwards.
     #[test]
     fn only_newer_acknowledgements_move_the_deadline() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut c = connected(t0);
         c.sent(1, t0 + I);
         c.sent(2, t0 + 2 * I);
@@ -176,13 +178,16 @@ mod tests {
         assert!(!c.acknowledged(1).known, "1 is covered by the ack of 2");
         assert!(!c.acknowledged(9).known, "9 was never sent");
         assert_eq!(c.fence_deadline(), Some(t0 + 2 * I + T));
+        // A Welcome answering an older Hello does not move it back either.
+        c.confirm(t0 + I);
+        assert_eq!(c.fence_deadline(), Some(t0 + 2 * I + T));
     }
 
     /// Catches: a new stream that forgets contact (fencing work that a reconnect should
     /// keep), or that lets the old stream's sequence numbers acknowledge new sends.
     #[test]
     fn a_new_stream_keeps_contact_and_drops_pending_heartbeats() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut c = connected(t0);
         c.sent(1, t0 + I);
         c.new_stream(I);
@@ -194,7 +199,7 @@ mod tests {
     /// the next acknowledgement.
     #[test]
     fn a_gap_is_declared_once_and_cleared_by_an_acknowledgement() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut c = connected(t0);
         assert_eq!(c.check_gap(t0 + 2 * I - Duration::from_millis(1)), None);
         assert_eq!(c.check_gap(t0 + 2 * I), Some(2 * I));

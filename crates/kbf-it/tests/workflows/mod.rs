@@ -13,7 +13,11 @@
 //!   (`${{ }}`, so a matrix too), a custom label (even one that starts like a hosted
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
-//! - a job's `permissions` grants anything but `read` or `none`;
+//! - a job's `permissions` grants anything but `read` or `none`, except the two scopes
+//!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
+//!   which may be `write` only in a job whose `if:` is exactly [`MAIN_PUSH_ONLY`]. So
+//!   no pull request or merge-queue run holds a token that can sign an attestation,
+//!   and every attestation this repository signs names `refs/heads/main`;
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
@@ -125,6 +129,14 @@ const ALLOWED_OWNERS: &[&str] = &["actions"];
 /// Further `owner/repository` actions the repository's Actions policy allows.
 const ALLOWED_REPOSITORIES: &[&str] = &["tailscale/github-action"];
 
+/// Token scopes a job may set to `write` when it runs only for a push to `main`: the
+/// OIDC token and the attestations API, which together sign build provenance.
+const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
+
+/// The one `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing.
+const MAIN_PUSH_ONLY: &str =
+    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it.
 const REFUSED_TRIGGERS: &[&str] = &["pull_request_target", "workflow_run"];
@@ -138,6 +150,47 @@ pub fn scan(text: &str, repo: &Repo) -> Vec<String> {
 /// Parses one action file (`action.yml`) and returns its problems as [`scan`] does.
 pub fn scan_action(text: &str, repo: &Repo) -> Vec<String> {
     run(text, repo, |lint, root| lint.action(root))
+}
+
+/// One step of a job, as far as the step-order lints read it: its `name:` and its
+/// `run:` script, each `None` when absent or not a string, and whether it has an `if:`
+/// or a `continue-on-error:` (either can let the job pass without the step's check).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Step {
+    pub name: Option<String>,
+    pub run: Option<String>,
+    pub conditional: bool,
+}
+
+/// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
+/// text, in order. An error when the text does not parse, or has no such job or no
+/// steps list under it.
+pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
+    let root = yaml::load(text)?;
+    let text_of = |n: Option<&Node>| n.and_then(Node::as_str).map(str::to_owned);
+    let Value::Map(top) = &root.value else {
+        return Err("the workflow is not a mapping".to_owned());
+    };
+    let Some(Value::Map(jobs)) = get(top, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    let Some(Value::Map(found)) = get(jobs, job).map(|j| &j.value) else {
+        return Err(format!("the workflow has no job `{job}`"));
+    };
+    let Some(Value::Seq(steps)) = get(found, "steps").map(|s| &s.value) else {
+        return Err(format!("the job `{job}` has no steps list"));
+    };
+    Ok(steps
+        .iter()
+        .map(|step| match &step.value {
+            Value::Map(m) => Step {
+                name: text_of(get(m, "name")),
+                run: text_of(get(m, "run")),
+                conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
+            },
+            _ => Step::default(),
+        })
+        .collect())
 }
 
 /// What a local `uses: ./...` may name: the repository's linted files.
@@ -342,7 +395,8 @@ impl Lint<'_> {
             }
         }
         if let Some(p) = get(job_map, "permissions") {
-            self.job_permissions(p);
+            let main_push_only = get(job_map, "if").and_then(Node::as_str) == Some(MAIN_PUSH_ONLY);
+            self.job_permissions(p, main_push_only);
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -401,8 +455,11 @@ impl Lint<'_> {
         }
     }
 
-    /// A job may narrow its token to `read` or `none` scopes; it may not widen it.
-    fn job_permissions(&mut self, p: &Node) {
+    /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
+    /// for [`SIGNING_SCOPES`] set to `write` in a job that runs only for a push to
+    /// `main` (`main_push_only`). Scope names and levels are compared exactly, so
+    /// another spelling is refused (the safe side).
+    fn job_permissions(&mut self, p: &Node, main_push_only: bool) {
         let Value::Map(scopes) = &p.value else {
             self.refuse(
                 p,
@@ -411,13 +468,23 @@ impl Lint<'_> {
             return;
         };
         for (scope, level) in scopes {
-            if !level.as_str().is_some_and(|l| l == "read" || l == "none") {
+            let name = scope.as_str().unwrap_or("?");
+            let granted = level.as_str().unwrap_or("?");
+            if granted == "read" || granted == "none" {
+                continue;
+            }
+            if granted != "write" || !SIGNING_SCOPES.contains(&name) {
                 self.refuse(
                     level,
                     format_args!(
-                        "a job's `permissions` may grant only `read` or `none`, got `{}: {}`",
-                        scope.as_str().unwrap_or("?"),
-                        level.as_str().unwrap_or("?"),
+                        "a job's `permissions` may grant only `read` or `none`, got `{name}: {granted}`"
+                    ),
+                );
+            } else if !main_push_only {
+                self.refuse(
+                    level,
+                    format_args!(
+                        "`{name}: write` is allowed only in a job whose `if:` is exactly `{MAIN_PUSH_ONLY}`"
                     ),
                 );
             }

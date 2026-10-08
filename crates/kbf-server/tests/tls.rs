@@ -49,7 +49,11 @@ fn pki() -> Pki {
         "kbf test server",
         ExtendedKeyUsagePurpose::ServerAuth,
     );
-    let (client_cert, client_key) = leaf(Vec::new(), "node-1", ExtendedKeyUsagePurpose::ClientAuth);
+    let (client_cert, client_key) = leaf(
+        vec!["node-1".to_owned()],
+        "node-1",
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     std::fs::write(dir.join("server.pem"), server_cert).expect("write");
     std::fs::write(dir.join("server.key"), server_key).expect("write");

@@ -15,7 +15,9 @@ The design documents under [docs/design](docs/design) go deeper:
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (**planned**) |
+| [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
+| [mdm-backend.md](docs/design/mdm-backend.md) | MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
 
 Decision records live in [docs/adr](docs/adr).
 
@@ -44,7 +46,8 @@ role (`--role=all`). The flags are:
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
-  listener over mutual TLS (all three, or none for plain text);
+  listener over mutual TLS (all three, or none for plain text), and
+  `--worker-deny-list` for the certificates and nodes it refuses;
 - `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
@@ -219,7 +222,12 @@ and a daemon protocol in which only the newest stream of a worker counts. See
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key
-  and client CA.
+  and client CA. A daemon's certificate must name its node id as its one DNS
+  subjectAltName, so a certificate can speak only for its own node, and a deny list
+  (serials, public keys, node ids), read again at every `Hello`, `Heartbeat` and `Result`, refuses
+  leaked or retired certificates without a restart. There is no CRL or OCSP; short
+  certificate lifetimes bound what the list misses. See
+  [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
 - The REAPI listener has no TLS and no authentication yet (**planned**: TLS and
   bearer-token authentication, with the caller's identity deciding its role).
 - Only the daemon path writes the action cache, and the metadata state machine itself

@@ -12,6 +12,15 @@
 //! and each new stream resends it right after Welcome, before its first Heartbeat. A
 //! Result produced while disconnected is sent the same way.
 //!
+//! The fence and the Start window read a [`Clock`] that counts suspended time (issue
+//! #78); tokio's timers do not, so the loop never sleeps longer than `recheck_every`
+//! (1 s) while a deadline is pending. Whatever wakes the daemon (a message, a heartbeat
+//! tick, a finished run, that recheck, or, between streams, a connection, a stream or
+//! a Welcome arriving), the fence is checked first: after a resume past T, no running
+//! lease survives to have its Result sent, and neither a Welcome for a Hello sent after
+//! the resume nor an acknowledgement of a heartbeat sent after it renews the contact
+//! first.
+//!
 //! A v1 assumption: the server acknowledges every Result. ResultAck is an addition
 //! within protocol version 1 (worker.proto), so Welcome's version check does not rule
 //! out a server built before it; such a server would leave every Result kept, resent
@@ -31,9 +40,10 @@ use kbf_proto::worker::{
 };
 use kbf_types::LeaseId;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 
+use crate::clock::{Clock, Moment, SystemClock};
 use crate::config::{ConfigError, DaemonConfig};
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
@@ -47,6 +57,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Something the daemon did that an observer (a test, later the meter) may want.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// A stream connected and its Hello went out; Welcome is awaited.
+    HelloSent,
     /// A session began: the server answered Hello.
     Welcomed { heartbeat_interval: Duration },
     /// The server placed a lease here; nothing runs until its Start.
@@ -96,6 +108,16 @@ pub struct Daemon<R> {
     window: StartWindow,
     /// Results the server has not acknowledged yet, by lease.
     unacked: BTreeMap<LeaseId, worker::Result>,
+    /// The suspend-counting clock that contact and the Start window read.
+    clock: Arc<dyn Clock>,
+}
+
+/// What woke the session loop.
+enum Wake {
+    Message(ServerMessage),
+    Beat,
+    Done(Box<Done>),
+    Recheck,
 }
 
 impl<R: Runtime> Daemon<R> {
@@ -128,6 +150,7 @@ impl<R: Runtime> Daemon<R> {
             contact,
             window: StartWindow::default(),
             unacked: BTreeMap::new(),
+            clock: Arc::new(SystemClock),
         })
     }
 
@@ -135,6 +158,14 @@ impl<R: Runtime> Daemon<R> {
     #[must_use]
     pub fn with_events(mut self, events: mpsc::UnboundedSender<Event>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Reads `clock` for the fence and the Start window instead of [`SystemClock`]. A
+    /// test passes one it can jump forward, as a resume does.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -156,8 +187,7 @@ impl<R: Runtime> Daemon<R> {
             };
             tracing::warn!(%reason, "session ended");
             self.emit(Event::Disconnected(reason));
-            let wake = Instant::now() + self.config.reconnect_after;
-            self.offline(sleep_until(wake)).await;
+            self.offline(sleep(self.config.reconnect_after)).await;
         }
     }
 
@@ -167,8 +197,9 @@ impl<R: Runtime> Daemon<R> {
         let channel = self.offline(endpoint.connect()).await?;
         let mut client = WorkerClient::new(channel);
         let (tx, rx) = unbounded();
-        let hello_sent = Instant::now();
+        let hello_sent = self.clock.now();
         send(&tx, daemon_message::Message::Hello(self.hello()));
+        self.emit(Event::HelloSent);
 
         let wait = self.config.welcome_timeout;
         let response = self
@@ -183,6 +214,10 @@ impl<R: Runtime> Daemon<R> {
         let interval = self.welcome(first)?;
         self.contact.new_stream(interval);
         self.window.new_stream(hello_sent);
+        // Before the Welcome renews contact: a lease whose fence passed while this
+        // stream was set up must not outlive it (`offline` checked already; this keeps
+        // the order true by construction here too).
+        self.recheck(None).await;
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -199,15 +234,23 @@ impl<R: Runtime> Daemon<R> {
         let mut beat = tokio::time::interval(interval);
         beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let wake = self.next_check();
-            tokio::select! {
+            let wait = self.until_recheck();
+            let wake = tokio::select! {
                 msg = inbound.message() => match msg? {
-                    Some(msg) => self.on_message(msg, &tx),
+                    Some(msg) => Wake::Message(msg),
                     None => return Ok(()),
                 },
-                _ = beat.tick() => {
+                _ = beat.tick() => Wake::Beat,
+                Some(done) = self.done.recv() => Wake::Done(Box::new(done)),
+                () = sleep(wait) => Wake::Recheck,
+            };
+            // First, whatever woke the loop: the clock may have jumped over a suspend.
+            self.recheck(Some(&tx)).await;
+            match wake {
+                Wake::Message(msg) => self.on_message(msg, &tx),
+                Wake::Beat => {
                     seq += 1;
-                    let now = Instant::now();
+                    let now = self.clock.now();
                     self.contact.sent(seq, now);
                     self.window.sent(seq, now);
                     let heartbeat = Heartbeat {
@@ -217,16 +260,8 @@ impl<R: Runtime> Daemon<R> {
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }
-                Some((id, outcome)) = self.done.recv() => {
-                    if let Some(result) = self.leases.finished(id, outcome) {
-                        self.report(Some(&tx), result);
-                    }
-                }
-                () = sleep_until(wake) => {
-                    for result in self.check(Instant::now()).await {
-                        self.report(Some(&tx), result);
-                    }
-                }
+                Wake::Done(done) => self.finished(Some(&tx), *done),
+                Wake::Recheck => {}
             }
         }
     }
@@ -308,7 +343,7 @@ impl<R: Runtime> Daemon<R> {
         let valid_for = Duration::from_millis(start.valid_for_ms);
         if !self
             .window
-            .allows(start.heartbeat_seq, valid_for, Instant::now())
+            .allows(start.heartbeat_seq, valid_for, self.clock.now())
         {
             // The scheduler may have given the lease up and granted it again; it
             // gives it up here too, as a Start that never arrived.
@@ -318,7 +353,7 @@ impl<R: Runtime> Daemon<R> {
             }
             return;
         }
-        let refused = if self.contact.lost(Instant::now()) {
+        let refused = if self.contact.lost(self.clock.now()) {
             start.lease_id.map(|id| {
                 failure(
                     lease_id(id),
@@ -336,7 +371,7 @@ impl<R: Runtime> Daemon<R> {
 
     /// Declares a heartbeat gap, and fences, when their deadlines have passed. Returns
     /// the Results of fenced leases.
-    async fn check(&mut self, now: Instant) -> Vec<worker::Result> {
+    async fn check(&mut self, now: Moment) -> Vec<worker::Result> {
         if let Some(silent_for) = self.contact.check_gap(now) {
             tracing::warn!(?silent_for, "heartbeat gap: no acknowledgement");
             self.emit(Event::HeartbeatGap { silent_for });
@@ -350,8 +385,25 @@ impl<R: Runtime> Daemon<R> {
         results
     }
 
-    /// The next instant [`Self::check`] has something to do.
-    fn next_check(&self) -> Instant {
+    /// Runs [`Self::check`] now, and reports the Results of any leases it fenced.
+    async fn recheck(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>) {
+        let now = self.clock.now();
+        for result in self.check(now).await {
+            self.report(tx, result);
+        }
+    }
+
+    /// Reports a finished run, unless it was fenced.
+    fn finished(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, (id, outcome): Done) {
+        if let Some(result) = self.leases.finished(id, outcome) {
+            self.report(tx, result);
+        }
+    }
+
+    /// How long to sleep before [`Self::check`] may have something to do: until its
+    /// next deadline, but never longer than `recheck_every`, since the sleep runs on a
+    /// clock that stops during suspend and the deadline on one that does not.
+    fn until_recheck(&self) -> Duration {
         let fence = if self.leases.running().is_empty() {
             None
         } else {
@@ -361,26 +413,32 @@ impl<R: Runtime> Daemon<R> {
             .into_iter()
             .flatten()
             .min()
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
+            .map_or(Duration::from_secs(3600), |deadline| {
+                deadline
+                    .saturating_duration_since(self.clock.now())
+                    .min(self.config.recheck_every)
+            })
     }
 
     /// Runs `fut` while no stream is up, still finishing leases and fencing on time.
+    /// The fence is checked after `fut` completes too, so what the caller does next
+    /// (send a Hello, take a Welcome as contact) comes after any fence a resume made due.
     async fn offline<F: Future>(&mut self, fut: F) -> F::Output {
         let mut fut = std::pin::pin!(fut);
         loop {
-            let wake = self.next_check();
-            tokio::select! {
-                out = &mut fut => return out,
-                Some((id, outcome)) = self.done.recv() => {
-                    if let Some(result) = self.leases.finished(id, outcome) {
-                        self.report(None, result);
-                    }
-                }
-                () = sleep_until(wake) => {
-                    for result in self.check(Instant::now()).await {
-                        self.report(None, result);
-                    }
-                }
+            let wait = self.until_recheck();
+            let (out, done) = tokio::select! {
+                out = &mut fut => (Some(out), None),
+                Some(done) = self.done.recv() => (None, Some(done)),
+                () = sleep(wait) => (None, None),
+            };
+            // First: the clock may have jumped over a suspend.
+            self.recheck(None).await;
+            if let Some(out) = out {
+                return out;
+            }
+            if let Some(done) = done {
+                self.finished(None, done);
             }
         }
     }

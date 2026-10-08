@@ -14,30 +14,31 @@
 //! one: the send times of older heartbeats are forgotten then. A `Start` that names a
 //! heartbeat this stream never sent, or one already forgotten, is refused too.
 //!
-//! This module reads no clock; every instant is an argument.
+//! This module reads no clock; every instant is an argument, a reading of the
+//! suspend-counting clock (`clock`, issue #78).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use tokio::time::Instant;
+use crate::clock::Moment;
 
 /// The send times a `Start` on the current stream may name.
 #[derive(Debug, Default)]
 pub struct StartWindow {
     /// Send time by heartbeat seq; 0 is the stream's Hello.
-    sends: BTreeMap<u64, Instant>,
+    sends: BTreeMap<u64, Moment>,
 }
 
 impl StartWindow {
     /// A new stream whose Hello was sent at `hello_sent`: the send times of the old
     /// stream's heartbeats name nothing on this one.
-    pub fn new_stream(&mut self, hello_sent: Instant) {
+    pub fn new_stream(&mut self, hello_sent: Moment) {
         self.sends.clear();
         self.sends.insert(0, hello_sent);
     }
 
     /// Heartbeat `seq` of this stream was sent at `at`.
-    pub fn sent(&mut self, seq: u64, at: Instant) {
+    pub fn sent(&mut self, seq: u64, at: Moment) {
         self.sends.insert(seq, at);
     }
 
@@ -51,7 +52,7 @@ impl StartWindow {
     /// Whether a `Start` naming heartbeat `seq` with window `valid_for` may be acted on
     /// at `now`. A zero window is no bound: a server that predates the field sends it.
     #[must_use]
-    pub fn allows(&self, seq: u64, valid_for: Duration, now: Instant) -> bool {
+    pub fn allows(&self, seq: u64, valid_for: Duration, now: Moment) -> bool {
         valid_for.is_zero()
             || self
                 .sends
@@ -72,7 +73,7 @@ mod tests {
     /// first `Start`s of a stream, before any heartbeat, would all be refused).
     #[test]
     fn a_start_is_allowed_only_within_the_window_of_the_named_send() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut w = StartWindow::default();
         w.new_stream(t0);
         assert!(w.allows(0, W, t0 + W - Duration::from_millis(1)));
@@ -90,7 +91,7 @@ mod tests {
     /// refuse every `Start` of such a server.
     #[test]
     fn an_unknown_heartbeat_is_refused_and_no_window_is_no_bound() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut w = StartWindow::default();
         assert!(!w.allows(0, W, t0), "nothing sent yet");
         w.new_stream(t0);
@@ -104,7 +105,7 @@ mod tests {
     /// old stream's seqs.
     #[test]
     fn an_acknowledgement_forgets_only_older_sends() {
-        let t0 = Instant::now();
+        let t0 = Moment::from_origin(Duration::from_secs(1000));
         let mut w = StartWindow::default();
         w.new_stream(t0);
         w.sent(1, t0);
