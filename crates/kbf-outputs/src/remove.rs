@@ -6,9 +6,10 @@
 //! descriptor: each directory is opened relative to its parent with `O_NOFOLLOW`, its
 //! entries are listed whole before any is unlinked (deleting while reading a directory
 //! skips entries on some filesystems), a directory missing any of its owner's `rwx`
-//! bits gets them back first (never through a symlink), on macOS an entry the action
-//! marked immutable or append-only (`chflags uchg`, `uappnd`) loses those flags first,
-//! and a symlink is unlinked, never followed. The stack of
+//! bits gets them back first (never through a symlink), on macOS every entry first
+//! loses its ACL (one can deny even the owner deletion) and the immutable and
+//! append-only flags (`chflags uchg`, `uappnd`) if the action set them, and a symlink
+//! is unlinked, never followed. The stack of
 //! directories still to finish is a `Vec` on the heap, and only the directory being
 //! cleared holds a descriptor: the walk returns to a parent through `..` and refuses a
 //! `..` that is not the directory it came from.
@@ -47,7 +48,10 @@ fn prepare(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<bool>> {
         Err(e) => return Err(e.into()),
     };
     #[cfg(target_os = "macos")]
-    unlock(dir, name, stat.st_flags)?;
+    {
+        unlock(dir, name, stat.st_flags)?;
+        clear_acl(dir, name)?;
+    }
     let mode = stat.st_mode as u32;
     if FileType::from_raw_mode(stat.st_mode as _) != FileType::Directory {
         return Ok(Some(false));
@@ -138,6 +142,67 @@ fn unlock(dir: &OwnedFd, name: &OsStr, flags: u32) -> std::io::Result<()> {
     };
     if set != 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `KAUTH_FILESEC_MAGIC` (`sys/kauth.h`): the first word of a `kauth_filesec`.
+#[cfg(target_os = "macos")]
+const KAUTH_FILESEC_MAGIC: u32 = 0x012c_c16d;
+
+/// `KAUTH_FILESEC_NOACL`: an entry count that means "no ACL at all".
+#[cfg(target_os = "macos")]
+const KAUTH_FILESEC_NOACL: u32 = u32::MAX;
+
+/// Removes any ACL of `name` in `dir`, without following a symlink. On macOS an
+/// entry's owner can add ACL entries that deny everyone, the owner included, the
+/// right to delete it (`chmod +a "everyone deny delete"`) or a directory's entries
+/// (`delete_child`), which no permission bit undoes; the owner can always remove the
+/// ACL (`chmod -N`). There is no `acl_set_link_np` relative to a descriptor, so this is
+/// `setattrlistat` with `FSOPT_NOFOLLOW` setting `ATTR_CMN_EXTENDED_SECURITY` to a
+/// `kauth_filesec` whose entry count is `KAUTH_FILESEC_NOACL`, which the kernel takes
+/// as "remove the ACL". Done for every entry (one call each: nothing cheaper says
+/// whether an entry has an ACL); a filesystem without ACLs (`ENOTSUP`) has none.
+#[cfg(target_os = "macos")]
+fn clear_acl(dir: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // An attrreference_t (data offset from itself, length), then the kauth_filesec:
+    // magic, owner and group GUIDs (zero: not set), the ACL's entry count and flags.
+    const FILESEC: usize = 4 + 16 + 16 + 4 + 4;
+    let mut buffer = [0u8; 8 + FILESEC];
+    buffer[0..4].copy_from_slice(&8_i32.to_ne_bytes());
+    buffer[4..8].copy_from_slice(&(FILESEC as u32).to_ne_bytes());
+    buffer[8..12].copy_from_slice(&KAUTH_FILESEC_MAGIC.to_ne_bytes());
+    buffer[44..48].copy_from_slice(&KAUTH_FILESEC_NOACL.to_ne_bytes());
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    let mut list = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_EXTENDED_SECURITY,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // SAFETY: `name` is NUL-terminated, `list` asks for the extended security only,
+    // and `buffer` is that attribute as setattrlist reads it (an attrreference_t
+    // whose data, a kauth_filesec of `FILESEC` bytes, follows it in the buffer); all
+    // three outlive the call.
+    let set = unsafe {
+        libc::setattrlistat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            (&raw mut list).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::FSOPT_NOFOLLOW,
+        )
+    };
+    if set != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOTSUP) {
+            return Err(error);
+        }
     }
     Ok(())
 }

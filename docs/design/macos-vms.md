@@ -16,7 +16,8 @@ runs in a VM** ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
 
 Isolating what installing a desktop app does to a bare-metal Mac, and fleet-wide
 updates, device management and UI, are a separate design:
-[fleet-updates.md](fleet-updates.md) (open PR #87).
+[fleet-updates.md](fleet-updates.md), with its security model in
+[fleet-updates-security.md](fleet-updates-security.md).
 
 Claims about Apple's software and other projects are marked **[V]** (read in the
 source linked) or **[A]** (an assumption or a number nobody has measured on our
@@ -55,7 +56,7 @@ There are two ways to give a lease a GUI session:
 |---|---|---|
 | Fresh state per lease | no: the logged-in user's state carries over unless wiped | yes: a clone of a golden image, destroyed after |
 | Other work on the Mac at the same time | no, or shares one user's session | yes: bare-metal leases keep running beside up to 2 VMs |
-| Host setup | auto-login off at rest; a root helper (`kbf-mac-session`, open PR #87) sets it for one lease and clears it after | host auto-login stays off; the guest image logs in |
+| Host setup | auto-login off at rest; a root helper (`kbf-mac-session`, [fleet-updates.md](fleet-updates.md)) sets it for one lease and clears it after | host auto-login stays off; the guest image logs in |
 | Toolchain per lease | one of the host's pinned Xcodes, chosen with `DEVELOPER_DIR` | the image's Xcode; two images can differ |
 
 This document chooses the VM.
@@ -155,14 +156,14 @@ Rules that follow:
   `kbf-caps` to a set the node reports, matched by membership: the action asks for one
   build and any node that has it serves it. A VM image holds exactly one Xcode, and its
   digest names it.
-- **The Mac node provisioning design (open PR #76) reflects these points:** several
+- **The Mac node provisioning design ([mac-node-provisioning.md](mac-node-provisioning.md)) reflects these points:** several
   Xcodes per host instead of "exactly one Xcode (or one Command Line Tools version) per
   pool"; simulator runtimes live in VM images only, never in the host profile; and GUI
   work runs in the VM lease, whose guest logs itself in. Host auto-login is off at rest.
   One exception: bare-metal GPU tests that install the desktop app need a GUI session
   on the host ([section 8.1](#81-on-bare-metal-never-in-a-vm)); for that one
   whole-machine lease a root helper, `kbf-mac-session`, sets auto-login and clears it
-  afterwards ([fleet-updates.md](fleet-updates.md), open PR #87). "There is no disk
+  afterwards ([fleet-updates.md](fleet-updates.md)). "There is no disk
   image" stays
   true for the host, but VM golden images now live on Mac nodes.
 
@@ -337,7 +338,7 @@ No new key names the lease kinds a node serves: the scheduler maps each lease ki
 the drivers that serve it and reads `drivers`. `action` maps to `native` or
 `container` only; `vm` maps to `vm`; `whole_machine` maps to `native-whole-machine`,
 the `drivers` value of the planned bare-metal whole-machine runtime (the per-lease-user
-driver of [fleet-updates.md](fleet-updates.md), open PR #87, phase P4). A daemon lists
+driver of [fleet-updates.md](fleet-updates.md), phase P4). A daemon lists
 `native-whole-machine` only when `kbf-mac-session` is present, so a Mac before that
 phase, or any other native daemon, never looks able to serve `whole_machine`. On
 `main` no driver serves
@@ -395,8 +396,8 @@ entitlement Apple requires
 `kbf-vmm` runs as a dedicated non-admin uid outside the root helpers' group (started
 through `kbf-mac-session run`, or as its own launchd user), never as the daemon's role
 account; otherwise a guest escape would reach the root helpers (fleet-updates security
-design, [fleet-updates.md](fleet-updates.md), open PR #87). So `kbf-mac-session`'s
-`run` verb must exist by phase 2 of this design; open PR #87 ships it in its phase P1
+design, [fleet-updates-security.md](fleet-updates-security.md)). So `kbf-mac-session`'s
+`run` verb must exist by phase 2 of this design; [fleet-updates.md](fleet-updates.md) ships it in its phase P1
 on Macs.
 
 Per lease:
@@ -440,8 +441,8 @@ Rules:
   launchd daemon with no user logged in on the host **[A]**. If the probe fails, the
   fallback is an open decision: a session of a dedicated non-admin VM user, held while
   the node serves VM leases. That is an exception to "auto-login off at rest" and needs
-  a ruling; open PR #76's `autologin` check and `kbf-mac-session`'s user-id range rule
-  (open PR #87)
+  a ruling; [mac-node-provisioning.md](mac-node-provisioning.md)'s `autologin` check and `kbf-mac-session`'s user-id range rule
+  ([fleet-updates.md](fleet-updates.md))
   would then have to allow that user. A per-lease switch is impossible, because it
   restarts userspace under running leases.
 - **Not used:** Tart and Orchard are under FSL-1.1-ALv2, which forbids a competing use
@@ -472,7 +473,7 @@ read as a reference for the steps. An image is built in a fixed order:
    **[V]**.
 4. **Digest**: the SHA-256 of a manifest of the image's files names the image. It pins
    the VM lease's whole toolchain; clients route on `vm.image`. Host-identity probes
-   (open PR #76, §3.1) are for bare-metal Xcodes.
+   ([mac-node-provisioning.md](mac-node-provisioning.md), §3.1) are for bare-metal Xcodes.
 
 Size: Cirrus's Xcode template uses a 140 GB disk **[V]**; plan 100-140 GB per golden
 image **[A]**. A node keeps at most two (Xcode N and N-1) **[A]**, 200-280 GB, plus up
@@ -536,7 +537,7 @@ So a GPU test is a whole-machine lease:
 - A test that installs the desktop app needs a GUI session on the host, and what the
   install leaves behind must not reach the next lease. That isolation, and fleet-wide
   updates, device management and UI, are designed in
-  [fleet-updates.md](fleet-updates.md) (open PR #87).
+  [fleet-updates.md](fleet-updates.md).
 
 ### 8.2 Testing a local LLM on the GPU
 
@@ -615,10 +616,10 @@ Rules for all four layers:
 Done on `main`: the native driver with `sandbox-exec`, per-lease scratch, process-tree
 kill and removal that clears the immutable and append-only flags
 ([#64](https://github.com/komira-ai/komira-build-farm/pull/64)), and platform routing
-([#71](https://github.com/komira-ai/komira-build-farm/pull/71)).
-Open: sandbox every action and ACL-proof removal ([#77](https://github.com/komira-ai/komira-build-farm/pull/77)),
-Mac node provisioning ([#76](https://github.com/komira-ai/komira-build-farm/pull/76)),
-the fence clock during suspend ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)),
+([#71](https://github.com/komira-ai/komira-build-farm/pull/71)), sandbox every action and ACL-proof removal
+([#77](https://github.com/komira-ai/komira-build-farm/pull/77)), and the Mac node provisioning design
+([mac-node-provisioning.md](mac-node-provisioning.md)).
+Open: the fence clock during suspend ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)),
 the node id checked against the certificate ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
 
 | Crate | Change |
@@ -646,7 +647,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-server` | read `vm.slots` | ~80 |
 | `kbf-daemon`, `kbf-node` | a runtime that dispatches by kind across several drivers; VM flags (image directory, boot timeout) | ~370 |
 | `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
-| `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, open PR #87 phase P1), and the guest agent | ~1,000 |
+| `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, [fleet-updates.md](fleet-updates.md) phase P1), and the guest agent | ~1,000 |
 | `kbf-segments`, `kbf-front` | chunked upload, if images ship through the CAS | ~400 |
 | `kbf-it` | the freshness test on VMs | ~150 |
 
@@ -661,7 +662,7 @@ app's peak are recorded and replace the **[A]** numbers in section 4.
 | `kbf-daemon` | report `gpu=1`, GPU core count and the wired-memory cap on macOS |
 | `kbf-proto`, `kbf-server` | GPUs in `Start` |
 | `kbf-sched` | GPU tests as whole-machine leases with `gpu=1`: drain the Mac, one at a time |
-| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine` (none does on `main`): the per-lease-user driver of [fleet-updates.md](fleet-updates.md) (open PR #87, phase P4); reports `native-whole-machine` |
+| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine` (none does on `main`): the per-lease-user driver of [fleet-updates.md](fleet-updates.md), phase P4; reports `native-whole-machine` |
 | `kbf-front`, `kbf-sched` | a `whole_machine` lease books the node's full cores, memory, `gpus` and `vms` |
 | `kbf-daemon`, `kbf-server` | carry `auxiliary_metadata`; store series per test and hardware key |
 | front / CAS | model weights as chunked CAS inputs, kept from eviction on nodes that run GPU tests |

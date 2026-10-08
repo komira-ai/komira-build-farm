@@ -69,8 +69,18 @@ impl<C: Cas> NativeRuntime<C> {
     /// The scratch directory cannot be made or read. A leftover that cannot be
     /// removed is moved aside instead (see the crate documentation), not an error.
     pub fn new(config: NativeConfig, cas: Arc<C>) -> std::io::Result<Self> {
+        Self::with_remover(config, cas, &kbf_outputs::remove_tree)
+    }
+
+    /// [`NativeRuntime::new`], sweeping the scratch root with `remove`: a test hands
+    /// it a remover that fails, as a directory an action locked would.
+    fn with_remover(
+        config: NativeConfig,
+        cas: Arc<C>,
+        remove: &dyn Fn(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.scratch)?;
-        crate::sweep::sweep(&config.scratch, &kbf_outputs::remove_tree)?;
+        crate::sweep::sweep(&config.scratch, remove)?;
         Ok(Self {
             config,
             cas,
@@ -636,6 +646,47 @@ mod tests {
             .await
             .expect_err("the task panicked");
         assert!(clean_task_failed(panicked).starts_with("clean task: "));
+    }
+
+    /// A CAS no test here reaches.
+    struct NoCas;
+
+    impl Cas for NoCas {
+        async fn get(&self, digest: &kbf_proto::reapi::Digest) -> Result<Vec<u8>, CasError> {
+            Err(CasError::Missing(digest.hash.clone()))
+        }
+
+        async fn put(&self, _: Vec<u8>) -> Result<kbf_proto::reapi::Digest, CasError> {
+            Err(CasError::Unavailable("-".into(), "no CAS".into()))
+        }
+    }
+
+    /// Catches the runtime refusing to start over a leftover lease directory it
+    /// cannot remove (one build step would take the node out of the farm): the start
+    /// goes on, and the leftover is out of the lease names' way.
+    #[tokio::test]
+    async fn a_start_goes_on_past_a_leftover_that_will_not_go() {
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("start-{}", std::process::id()));
+        let _ = kbf_outputs::remove_tree(&scratch);
+        std::fs::create_dir_all(scratch.join("lease-3-3/root")).expect("mkdir");
+        let refuse = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        let config = NativeConfig::new(scratch.clone());
+        let started = NativeRuntime::with_remover(config, Arc::new(NoCas), &refuse);
+        let started = started.expect("the start goes on");
+        let digest = kbf_proto::reapi::Digest::default();
+        assert!(started.cas.get(&digest).await.is_err(), "no CAS here");
+        assert!(started.cas.put(Vec::new()).await.is_err(), "no CAS here");
+        assert!(!scratch.join("lease-3-3").exists(), "moved out of the way");
+        let aside = std::fs::read_dir(scratch.join(crate::sweep::QUARANTINE))
+            .expect("quarantine")
+            .count();
+        assert_eq!(aside, 1);
+        kbf_outputs::remove_tree(&scratch).expect("clean");
     }
 
     /// Catches a signal death reported as exit 0 or as the raw status.
