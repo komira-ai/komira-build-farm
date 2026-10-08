@@ -348,6 +348,16 @@ fn a_report_lists_every_xcode() {
         let wants = from(&[("OSFamily", "darwin"), ("xcode", build)]).unwrap();
         assert!(wants.matches(&node), "{build}");
     }
+    assert!(matches!(
+        from(&[("xcode", "")]),
+        Err(FromPlatformError::Invalid(RequestError::BadValue { .. }))
+    ));
+    assert_eq!(
+        from(&[("xcode", "16E140"), ("Xcode", "16C5032a")]),
+        Err(FromPlatformError::Invalid(RequestError::Repeated(
+            "xcode".to_owned()
+        )))
+    );
     let other = from(&[("xcode", "15F31d")]).unwrap();
     assert!(!other.matches(&node));
     assert!(!other.matches(&mac()), "a node that reports no Xcode");

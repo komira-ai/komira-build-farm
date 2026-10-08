@@ -347,15 +347,34 @@ async fn a_kill_during_the_fetch_stops_the_lease() {
     assert!(no_leases(&config));
 }
 
+/// Catches, on macOS, an action that can take write permission from the scratch root
+/// (every later lease on the node would then fail its clean): the sandbox refuses the
+/// chmod, and the lease ends clean.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_sandboxed_action_cannot_lock_the_scratch_root() {
+    let dir = scratch("lock-root");
+    let config = config(&dir);
+    assert!(matches!(config.isolation, network::Isolation::Sandbox(_)));
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let spec = Spec::sh("chmod 555 ../.. 2>/dev/null; echo $?");
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran, and cleaned");
+    assert_ne!(stdout(&cas, &result).trim(), "0", "the chmod went through");
+    assert!(no_leases(&config), "the lease directory is removed");
+}
+
 /// Catches a lease directory that could not be removed reported as success (a node
 /// filling up unseen), and a failed clean hiding the action's own outcome. The action
 /// takes write permission from the scratch root, so its lease directory cannot be
-/// unlinked from it.
+/// unlinked from it. It runs unsandboxed: on macOS the sandbox refuses that chmod
+/// (`a_sandboxed_action_cannot_lock_the_scratch_root`).
 #[tokio::test]
 async fn a_lease_directory_that_stays_fails_the_lease() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("clean-fails");
-    let config = config(&dir);
+    let mut config = config(&dir);
+    config.isolation = network::Isolation::None;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
     let reopen = || {
