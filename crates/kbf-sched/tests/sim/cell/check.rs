@@ -69,6 +69,8 @@ pub struct CheckStats {
     pub named_not_held: u64,
     /// Listed leases of another term, or of this term but never granted here.
     pub foreign_listed: u64,
+    /// Listed leases this scheduler holds on another worker (they must be named).
+    pub held_elsewhere_listed: u64,
     pub capacity_resends: u64,
     /// Grants whose commit came back after their lease was given up (a slow log).
     pub stale_grant_commits: u64,
@@ -548,11 +550,18 @@ impl Check {
             let ours = lease.term == TERM && self.grants.contains_key(lease);
             if !ours {
                 self.stats.foreign_listed += 1;
-            } else if !here.contains(lease) && !named.contains(lease) {
-                self.fail(
-                    "N",
-                    format!("{lease} listed by {worker}, not held there, not named"),
-                );
+            } else if !here.contains(lease) {
+                let elsewhere = self
+                    .workers
+                    .keys()
+                    .any(|w| w != worker && sched.leases_on(w).contains(lease));
+                self.stats.held_elsewhere_listed += u64::from(elsewhere);
+                if !named.contains(lease) {
+                    self.fail(
+                        "N",
+                        format!("{lease} listed by {worker}, not held there, not named"),
+                    );
+                }
             }
         }
         self.stats.named_not_held += named.len() as u64;

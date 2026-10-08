@@ -15,10 +15,18 @@
 //!   come back later, in log order; a placement round runs every second (the server
 //!   also runs one after every input); and a `ResultAck` says `accepted` once the result
 //!   is proposed, not answered. It can restart (a fresh scheduler of the same term, as
-//!   `kbf-server` today) and pause (its clock stops with it).
+//!   `kbf-server` today) and pause (its clock stops with it). For F2.4 it can also
+//!   take a worker's newest heartbeat again at `START_GRACE - 1 ms`, `START_GRACE` and
+//!   `START_GRACE + 1 ms` after a held-back `Start` (a duplicate delivered late), so
+//!   reconciliation meets that boundary exactly.
 //! - **Log** ([`log`]): commits each record after a random delay, so the log order is
 //!   not always the order records were proposed in; each leader incarnation has its own
-//!   log, as the single-node server's in-process log dies with it.
+//!   log, as the single-node server's in-process log dies with it. The leader's
+//!   `Append`s go over the same faulty bus as every other message, so a duplicated
+//!   `Append` (3% in [`calm_network`], 20% in F2.10) commits its record twice, at two
+//!   indexes, and the scheduler is fed that committed record twice. The real log
+//!   appends each proposal once; this is a fault the scheduler tolerates, not one the
+//!   server produces.
 //! - **Worker** ([`worker`]): the daemon of `crates/kbf-daemon`. It fences every lease
 //!   T after the send of its newest acknowledged heartbeat (today the daemon self-fences
 //!   every lease, whatever the `Start` says), acts on a `Start` only within W of sending
