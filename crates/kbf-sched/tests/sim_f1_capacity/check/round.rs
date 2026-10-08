@@ -2,12 +2,11 @@
 //! unservable verdict: I1, I6, I7 and I8 for each grant, I10 and L2 for waiting reasons
 //! and refusals, I11 for the round.
 
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use kbf_types::{ControlRecord, Effect, LeaseId, OperationId, WorkerId};
 
-use super::{Axes, Checker, Held, State, add, fits_beside, fits_whole};
+use super::{Axes, Checker, Held, State, add, fits_beside, fits_whole, queue_key};
 
 /// At most this many grants per round: the catalog's number, written here rather than
 /// read from `kbf_sched::PLACEMENT_ROUND`, so that a change to the constant is caught.
@@ -57,7 +56,7 @@ impl Checker {
     /// with the reference verdict and the unservable wait.
     pub(super) fn round(&mut self, effects: &[Effect]) {
         self.stats.rounds += 1;
-        let order: Vec<OperationId> = self.queue.iter().map(|(_, id)| *id).collect();
+        let order: Vec<OperationId> = self.queue.iter().map(|(_, _, id)| *id).collect();
         let names: Vec<WorkerId> = self
             .workers
             .keys()
@@ -102,6 +101,9 @@ impl Checker {
                 });
             }
             let v = self.verdict(id);
+            if expected.len() == ROUND && v != Verdict::Servable {
+                self.stats.verdicts_past_cut += 1;
+            }
             verdicts.push((id, v));
         }
         if expected.len() == ROUND {
@@ -183,7 +185,7 @@ impl Checker {
         for (id, _) in &expected_refusals {
             let op = self.ops.get_mut(id).expect("queued");
             op.refusing = true;
-            let key = (Reverse(op.qos.clone()), *id);
+            let key = queue_key(&op.qos, *id);
             self.queue.remove(&key);
             self.touched_ops.insert(*id);
         }
@@ -262,7 +264,7 @@ impl Checker {
     fn grant(&mut self, id: OperationId, lease: LeaseId, worker: &WorkerId) {
         let now = self.now;
         let op = self.ops.get_mut(&id).expect("exists");
-        self.queue.remove(&(Reverse(op.qos.clone()), id));
+        self.queue.remove(&queue_key(&op.qos, id));
         op.state = State::Leased {
             lease,
             worker: worker.clone(),

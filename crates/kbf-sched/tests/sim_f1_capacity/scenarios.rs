@@ -745,6 +745,10 @@ impl Scenario for CapacityShrink {
 #[derive(Debug, Default)]
 pub struct Rounds {
     count: u64,
+    /// Darwin requests at `batch`, submitted after the rest: behind every cut, and no
+    /// worker of this all-Linux fleet can run them, so each must wait with a reason from
+    /// the first round and be refused after the unservable wait.
+    pub unservable: u64,
     pub per_round: Vec<usize>,
 }
 
@@ -755,6 +759,7 @@ impl Scenario for Rounds {
 
     fn fleet(&mut self, rng: &mut SimRng) -> Vec<Spec> {
         self.count = rng.between(513, 767);
+        self.unservable = rng.between(2, 5);
         (0..12)
             .map(|i| Spec::new(&format!("w{i:02}"), 64, 256, 0, Node::LinuxX86))
             .collect()
@@ -765,6 +770,10 @@ impl Scenario for Rounds {
             for key in 0..self.count {
                 let req = request(key, pick(rng, &levels()), Resources::new(1_000, GIB), ANY);
                 w.submit(req, rng.between(100, 200));
+            }
+            for key in self.count..self.count + self.unservable {
+                let req = request(key, Qos::Batch, Resources::new(1_000, GIB), DARWIN);
+                w.submit(req, 1);
             }
         }
     }
