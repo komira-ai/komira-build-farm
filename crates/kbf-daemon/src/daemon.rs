@@ -336,7 +336,8 @@ impl<R: Runtime> Daemon<R> {
 
     /// Takes the lease epoch a Welcome named. When it names one, every lease granted
     /// under another is dropped: its run is killed and its Result forgotten, unsent
-    /// (issue #137). A Welcome that names none drops nothing.
+    /// (issue #137). A Welcome that names none drops nothing, and a lease granted while
+    /// none was named is kept.
     fn new_epoch(&mut self, epoch: Option<u64>) {
         self.epoch = epoch;
         let stale: Vec<LeaseId> = self
@@ -358,11 +359,7 @@ impl<R: Runtime> Daemon<R> {
                 self.granted.remove(id);
             }
         }
-        tracing::warn!(
-            ?stale,
-            ?epoch,
-            "a new lease epoch: leases of an earlier one dropped"
-        );
+        tracing::warn!(?stale, ?epoch, "leases of an earlier epoch dropped");
         self.emit(Event::Superseded(stale));
     }
 

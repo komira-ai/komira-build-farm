@@ -39,7 +39,8 @@ Each lease is remembered with the lease epoch the newest `Welcome` named when it
 A `Welcome` that names another epoch comes from a server that never granted those
 leases (a restarted single-node server): before it resends anything, the daemon kills
 their runs and forgets their results, unsent, and lists them only until the runs have
-stopped. A `Welcome` that names no epoch drops nothing. See
+stopped. A `Welcome` that names no epoch drops nothing, and a lease granted while
+none was named is kept. See
 [worker-protocol.md](worker-protocol.md#server-restarts-and-the-lease-epoch).
 
 The contact clock records the **send** time of the newest message the server

@@ -292,7 +292,7 @@ close this, each on its own:
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
    and forgets their results without sending them: no server of the new epoch can
    accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
-   nothing. With the replicated log, the epoch will name the log, which outlives
+   nothing, and a lease granted while no epoch was named is kept. With the replicated log, the epoch will name the log, which outlives
    leaders and their terms, so a change of leader drops nothing.
 3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
    in its `Result`, and the server refuses a `Result` whose `action_digest` is set and

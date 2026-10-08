@@ -154,9 +154,12 @@ async fn a_new_lease_epoch_kills_the_runs_of_the_old_one() {
 }
 
 /// Catches a daemon that drops leases on a Welcome that names no epoch (a server
-/// that predates the field): it cannot tell, so it keeps them, as before.
+/// that predates the field), or drops a lease granted while no epoch was named when a
+/// later Welcome names one: in either case it cannot tell, so it keeps them, as
+/// before. A lease of a named epoch is still dropped by a Welcome naming another. Also
+/// catches a Start without a lease id being remembered or run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_welcome_without_an_epoch_drops_nothing() {
+async fn a_lease_of_no_named_epoch_is_kept() {
     let mut h = Harness::start("epoch-none", Duration::from_millis(50), LONG).await;
     let mut first = h.session().await;
     first.hello().await;
@@ -174,4 +177,21 @@ async fn a_welcome_without_an_epoch_drops_nothing() {
     };
     assert_eq!(resent, &ran);
     assert_eq!(heartbeat.running, [lease(5, 1)]);
+    // No bound on its window, so only the missing lease id keeps it from running.
+    second.start_within(None, 0, Duration::ZERO);
+    second.start(1, 1, "action");
+    let (_, unnamed) = second.result(PROMPT).await.expect("a Result");
+    assert_eq!(unnamed.lease_id, Some(lease(1, 1)));
+    second.close();
+
+    let mut third = h.session().await;
+    third.hello().await;
+    third.welcome_epoch(7);
+    let seen = up_to_first_heartbeat(&mut third).await;
+    let [Message::Result(resent), Message::Heartbeat(heartbeat)] = seen.as_slice() else {
+        panic!("expected one Result, then a Heartbeat: {seen:?}");
+    };
+    assert_eq!(resent, &unnamed);
+    assert_eq!(heartbeat.running, [lease(1, 1)]);
+    assert_eq!(h.runtime.started(), ids(&[(5, 1), (1, 1)]));
 }
