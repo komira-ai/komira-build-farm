@@ -352,6 +352,7 @@ async fn a_kill_during_the_fetch_stops_the_lease() {
 /// chmod, and the lease ends clean.
 #[cfg(target_os = "macos")]
 #[tokio::test]
+#[ignore = "mutant run: let cargo reach tests/sandbox.rs"]
 async fn a_sandboxed_action_cannot_lock_the_scratch_root() {
     let dir = scratch("lock-root");
     let config = config(&dir);
