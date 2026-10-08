@@ -263,6 +263,16 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 > - `run` starts the process in the system launchd domain as the lease user, not in
 >   the user's own domain (`launchctl asuser`); tools that need per-user launchd
 >   services are P4's.
+> - **Measured, against S4.3:** on the CI's hosted macOS runner, a process that
+>   connected and then executed the genuine client was **accepted**: the audit token
+>   taken at connect still resolved, after the exec, to code that satisfied the
+>   requirement, so the pid version did not change on `exec` there. Any other binary
+>   is refused. The CI job reports this case on every run. Closing it needs more than
+>   the token, for example a challenge the daemon answers with a key only its own
+>   code can use (S6's keychain identity); until then control 1 (nothing a lease runs
+>   is in the helpers' group) is the defence against it.
+> - On macOS `kill(-1)` also signals the sender, so the helper's killer child ends by
+>   `SIGKILL`; that is its normal end.
 
 ### S4.3 Who can reach a helper
 

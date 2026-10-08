@@ -346,6 +346,8 @@ mod tests {
     fn malformed_frames_are_refused() {
         let (mut a, b) = UnixStream::pair().unwrap();
         a.write_all(&(MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
+        // Closed, so a reader that skipped the check fails at once rather than waiting.
+        drop(a);
         assert!(
             recv::<Request>(b.as_fd(), 0)
                 .unwrap_err()

@@ -172,8 +172,9 @@ impl Host for MacHost {
         }
         if pid == 0 {
             // As the uid, kill(-1) signals every process the uid may signal (those
-            // whose real or saved uid it is) but the sender, in one call the uid's
-            // processes cannot outrun by forking. It fails with ESRCH once none is left.
+            // whose real or saved uid it is), in one call the uid's processes cannot
+            // outrun by forking. On macOS the sender is one of them, so this child
+            // usually ends here by SIGKILL; elsewhere the loop ends with ESRCH.
             // SAFETY: async-signal-safe calls only; `_exit` never returns.
             unsafe {
                 if libc::setuid(uid) != 0 {
@@ -188,7 +189,12 @@ impl Host for MacHost {
         if unsafe { libc::waitpid(pid, &raw mut status, 0) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        // macOS's kill(-1) signals the sender too (measured on the CI runner), so the
+        // killer ending by SIGKILL is success: the signals to every other process of
+        // the uid were posted in the same call. An exit of 1 is a failed setuid.
+        let killed_itself = libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+        let exited_clean = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        if !killed_itself && !exited_clean {
             return Err(io::Error::other(format!(
                 "the killer for uid {uid} failed to drop to it ({status:#x})"
             )));

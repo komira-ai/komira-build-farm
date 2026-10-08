@@ -2,9 +2,12 @@
 //! by its audit token, must satisfy the pinned `kbf-daemon` requirement.
 //!
 //! The audit token (`LOCAL_PEERTOKEN`) is the kernel's record of the process that
-//! connected, including its pid version, which changes on `exec`. So a process that
-//! connects and then executes the genuine daemon is refused: its token no longer names
-//! a running process. A check by pid would accept it.
+//! connected, pid and pid version, so a later process that reuses the pid is not taken
+//! for it. S4.3 also expects the pid version to change on `exec`, so that a process
+//! that connects and then executes the genuine daemon is refused. On the macOS CI
+//! runner it does not: `tools/ci/mac-session-tests.sh` measures that case and warns
+//! when it is accepted. Closing it needs more than the token (for example a challenge
+//! the daemon answers with a key only its code can use); see issue #122.
 
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;

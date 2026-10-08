@@ -5,8 +5,7 @@
 //! mode 0660. That keeps every other uid out, lease users included. Each connection's
 //! caller is then checked by a [`CallerCheck`] (on macOS: the caller's code signature,
 //! by audit token, against the pinned `kbf-daemon` requirement) after its request is
-//! read and before anything is done: a process that connects and then executes the
-//! genuine daemon is refused, because the audit token names the process as it was.
+//! read and before anything is done.
 
 use std::io;
 use std::os::fd::AsFd as _;
