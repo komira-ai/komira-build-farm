@@ -173,7 +173,10 @@ fn requests_are_one_of_three_verbs() {
             .unwrap()
             .contains("bytes")
     );
-    let set = testkit::seal_set(&testkit::set(5), &PLATFORM_SEED);
+    // The updater here is pinned to this machine's platform; so is the set.
+    let mut set = testkit::set(5);
+    set.platform = host_platform();
+    let set = testkit::seal_set(&set, &PLATFORM_SEED);
     let st = testkit::seal_statement(&testkit::statement(1, &[]));
     let stage = json!({ "verb": "stage", "set": set });
     assert_eq!(

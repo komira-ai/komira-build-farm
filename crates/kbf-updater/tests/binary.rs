@@ -50,11 +50,21 @@ fn every_pin_is_a_required_flag() {
     }
 }
 
+/// This runner's `arch` as the capability keys spell it, so the platform pin passes and
+/// the start-up check under test is the one that refuses.
+fn host_arch() -> &'static str {
+    if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        std::env::consts::ARCH
+    }
+}
+
 fn start(dir: &std::path::Path, root_key: &str, daemon: &str) -> (Option<i32>, String) {
     std::fs::write(dir.join("root.pub"), root_key).unwrap();
     let out = Command::new(BIN)
         .args(["--root-key-file", dir.join("root.pub").to_str().unwrap()])
-        .args(["--pool", "linux-x86", "--os", "linux", "--arch", "x86_64"])
+        .args(["--pool", "linux", "--os", "linux", "--arch", host_arch()])
         .args(["--daemon-path", dir.join(daemon).to_str().unwrap()])
         .args(["--daemon-uid", "0", "--socket-gid", "0"])
         .args(["--socket", dir.join("run").join("s").to_str().unwrap()])
