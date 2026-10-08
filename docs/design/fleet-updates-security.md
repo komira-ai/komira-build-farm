@@ -250,14 +250,15 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   cannot name another lease's uid, and a deleted lease (whose uid may be reused) is
 >   refused. The kill is `kill(-1, SIGKILL)` from a child that took the uid, repeated
 >   until `libproc` lists no live process of it by real or effective uid.
-> - The grant is the gate's own (`kbf-mdm`'s `grant` module, S5.2), one format on
->   both sides: the text `kbf-grant-v1`, `serial`, `lease`, `issued` and `not-after`
->   (RFC 3339, an hour after `issued`), one field per line, signed with Ed25519 by the
->   gate's key; the signature and key are standard base64. The daemon forwards
->   `grant-admin`'s answer as it is; the helper reads `grant` and `signature` only and
->   verifies under the keys installed on the Mac, never the answer's `key`. It refuses
->   a grant valid for more than an hour after `issued`, or issued more than five
->   minutes ahead of its own clock. A test verifies a grant the gate's own code signed.
+> - The grant is the gate's own, one format on both sides (`kbf-mdm`'s `grant`
+>   module defines it; S5.2 states it): the five-line text `kbf-grant-v1`, `serial`,
+>   `lease`, `issued`, `not-after` (UTC `YYYY-MM-DDTHH:MM:SSZ`, `not-after` exactly
+>   an hour after `issued`), Ed25519 over the text by the gate's key. The helper takes
+>   `grant-admin`'s `token` unchanged, `<payload>.<signature>` in unpadded base64url,
+>   and verifies it strictly under the keys installed on the Mac, never a key the
+>   answer names. It refuses a grant whose `not-after` the clock has passed, or which
+>   lies more than 65 minutes ahead of it. A test verifies the token the gate's own
+>   code signed for its test.
 > - The gate's public keys are a file named by a flag (base64, one per line; how the
 >   MDM delivers it is P3's). It, the state directory and the ledger must be root's
 >   and writable by no one else, and the key file is never read through a link: whoever

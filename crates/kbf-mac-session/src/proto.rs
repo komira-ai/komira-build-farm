@@ -20,8 +20,6 @@ use rustix::net::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::grant::AdminGrant;
-
 /// The largest frame either side accepts.
 pub const MAX_FRAME: usize = 64 * 1024;
 /// The number of descriptors a `run` request carries.
@@ -55,7 +53,7 @@ pub enum Request {
     UserCreate {
         lease: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        grant: Option<AdminGrant>,
+        grant: Option<String>,
     },
     /// Start a process as the lease's user, with the attached descriptors.
     Run {

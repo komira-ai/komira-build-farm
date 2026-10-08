@@ -28,7 +28,7 @@ use std::time::SystemTime;
 use kbf_types::LeaseId;
 use rustix::fs::{CWD, Gid, Mode, OFlags, Uid};
 
-use crate::grant::{self, AdminGrant, Expect, GrantKeys};
+use crate::grant::{self, Expect, GrantKeys};
 use crate::lease::{UidRange, parse_lease, user_name};
 use crate::ledger::{Entry, Ledger};
 use crate::proto::{Reply, Request};
@@ -153,7 +153,7 @@ impl Helper {
             }
             _ if !fds.is_empty() => Err("only run takes descriptors".to_owned()),
             Request::UserCreate { lease, grant } => self
-                .user_create(&lease, grant.as_ref())
+                .user_create(&lease, grant.as_deref())
                 .map(|uid| Reply::Created { uid }),
             Request::KillUid { lease } => self.kill_uid(&lease).map(|()| Reply::Killed),
             Request::UserDelete { lease } => self
@@ -168,7 +168,7 @@ impl Helper {
     ///
     /// # Errors
     /// Why it was refused or failed.
-    pub fn user_create(&self, lease: &str, grant: Option<&AdminGrant>) -> Result<u32, String> {
+    pub fn user_create(&self, lease: &str, grant: Option<&str>) -> Result<u32, String> {
         let lease = parse_lease(lease)?;
         let admin = match grant {
             None => false,

@@ -7,7 +7,6 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use crate::grant::AdminGrant;
 use crate::proto::{self, Call, Reply, Request};
 
 /// Why a call did not succeed.
@@ -79,10 +78,10 @@ impl Client {
     ///
     /// # Errors
     /// The call failed or was refused.
-    pub fn user_create(&self, lease: &str, grant: Option<&AdminGrant>) -> Result<u32, ClientError> {
+    pub fn user_create(&self, lease: &str, grant: Option<&str>) -> Result<u32, ClientError> {
         let request = Request::UserCreate {
             lease: lease.to_owned(),
-            grant: grant.cloned(),
+            grant: grant.map(str::to_owned),
         };
         match self.call(&request, &[])?.1 {
             Reply::Created { uid } => Ok(uid),

@@ -3,11 +3,11 @@
 //! started with this binary's cdhash as the daemon requirement.
 //!
 //! ```text
-//! mac_session_client create <socket> <lease> [grant JSON]   prints the uid
+//! mac_session_client create <socket> <lease> [grant token]   prints the uid
 //! mac_session_client run <socket> <lease> <dir> <argv>...   prints "exit <code>" or "signal <n>"
 //! mac_session_client kill <socket> <lease>
 //! mac_session_client delete <socket> <lease>           prints "existed" or "absent"
-//! mac_session_client grant <seed> <serial> <lease> <issued>   prints a grant
+//! mac_session_client grant <seed> <serial> <lease> <issued>   prints a grant token
 //! mac_session_client pubkey <seed>                     prints the grant key file line
 //! mac_session_client connect-then-exec <socket> <program> <args>...
 //! mac_session_client write-then-exec <socket> <lease> <program> <args>...
@@ -50,13 +50,12 @@ mod macos {
     use std::process::{Command, ExitCode};
 
     use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer as _, SigningKey};
     use kbf_mac_session::client::{self, Client, ClientError};
-    use kbf_mac_session::grant::AdminGrant;
     use kbf_mac_session::proto::{self, Reply, Request};
     use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
+    use time::macros::format_description;
 
     pub fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -82,10 +81,7 @@ mod macos {
     fn run(words: &[&str]) -> Result<(), ClientError> {
         match words {
             ["create", socket, lease, rest @ ..] => {
-                let grant: Option<AdminGrant> = rest
-                    .first()
-                    .map(|json| serde_json::from_str(json).expect("a grant-admin answer"));
-                let uid = Client::new(socket).user_create(lease, grant.as_ref())?;
+                let uid = Client::new(socket).user_create(lease, rest.first().copied())?;
                 println!("{uid}");
             }
             ["run", socket, lease, dir, argv @ ..] => {
@@ -146,14 +142,15 @@ mod macos {
                 println!("{}", if existed { "existed" } else { "absent" });
             }
             ["grant", seed, serial, lease, issued] => {
-                // What the gate's `grant-admin` answers (kbf-mdm's `GrantKey::sign`):
-                // valid for an hour from `issued`.
+                // The `token` of the gate's `grant-admin` answer (kbf-mdm's
+                // `GrantKey::sign`): valid for an hour from `issued`.
                 let issued: i64 = issued.parse().expect("issued is unix seconds");
                 let time = |secs: i64| {
+                    let utc = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
                     OffsetDateTime::from_unix_timestamp(secs)
                         .expect("a time")
-                        .format(&Rfc3339)
-                        .expect("RFC 3339")
+                        .format(utc)
+                        .expect("a UTC time")
                 };
                 let grant = format!(
                     "kbf-grant-v1\nserial {serial}\nlease {lease}\nissued {}\nnot-after {}\n",
@@ -161,13 +158,11 @@ mod macos {
                     time(issued + 3600)
                 );
                 let signature = key(seed).sign(grant.as_bytes());
-                let answer = serde_json::json!({
-                    "grant": grant,
-                    "signature": STANDARD.encode(signature.to_bytes()),
-                    "key": STANDARD.encode(key(seed).verifying_key().to_bytes()),
-                    "erase_at": time(issued + 7200),
-                });
-                println!("{answer}");
+                println!(
+                    "{}.{}",
+                    URL_SAFE_NO_PAD.encode(&grant),
+                    URL_SAFE_NO_PAD.encode(signature.to_bytes())
+                );
             }
             ["pubkey", seed] => {
                 println!("{}", STANDARD.encode(key(seed).verifying_key().to_bytes()))

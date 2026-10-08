@@ -53,8 +53,8 @@ pub struct Args {
     /// the installed software set pins it (for example `cdhash H"..."`).
     #[arg(long)]
     pub daemon_requirement: String,
-    /// The MDM gate's public grant keys (one base64 Ed25519 key per line, as the
-    /// gate's `grant-admin` answer names it). Without this file no lease user is ever
+    /// The MDM gate's public grant keys (one standard-base64 Ed25519 key per line, the
+    /// `key` of the gate's `grant-admin` answer). Without this file no lease user is ever
     /// an administrator. It must be a regular file, not a link, the helper's own
     /// (root's), and writable by no one else: whoever can write it can make
     /// administrators.

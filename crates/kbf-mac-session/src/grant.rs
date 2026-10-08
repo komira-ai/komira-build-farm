@@ -1,61 +1,56 @@
 //! The MDM gate's admin grant: the only way a lease user becomes an administrator
-//! (docs/design/fleet-updates-security.md S5.2, S8).
+//! (docs/design/fleet-updates-security.md S5.2 "The admin grant", S8).
 //!
-//! The format is the gate's own (`kbf-mdm`'s `grant` module): `grant-admin` answers
-//! `{"grant", "signature", "key", "erase_at"}`, where `grant` is this text, every line
-//! ending in a newline, in this order and nothing else:
+//! The gate defines the format (`kbf-mdm`'s `grant` module); this module accepts
+//! exactly that and nothing else. The grant text is exactly five lines, each ending in
+//! one LF, each field separated from its value by one space:
 //!
 //! ```text
 //! kbf-grant-v1
-//! serial <the Mac's serial number>
+//! serial <serial>
 //! lease <lease id>
-//! issued <RFC 3339 time>
-//! not-after <issued + 1 hour>
+//! issued <time>
+//! not-after <time>
 //! ```
 //!
-//! and `signature` is Ed25519 over those exact bytes by the gate's grant key, in
-//! standard base64. The daemon forwards that answer as it is; the helper reads
-//! `grant` and `signature` and ignores the rest: `key` names the key that signed, and
-//! the helper trusts only the public keys installed on the Mac (one, or two while a
-//! rotation overlaps), in the same base64 form.
+//! `<time>` is UTC as `YYYY-MM-DDTHH:MM:SSZ`, and `not-after` is exactly `issued` plus
+//! 3600 seconds. The signature is Ed25519 over the text's bytes by the gate's grant
+//! key. The helper receives the gate's `token`, which the server passes unchanged:
+//! `<payload>.<signature>`, each base64url without padding, the payload being the
+//! text. The Mac's grant keys are the gate's public keys (the `key` of a
+//! `grant-admin` answer), standard base64, one per line.
 //!
-//! The helper accepts a grant only if the signature verifies strictly (no small-order
-//! key or `R`, no non-canonical encoding) under a key it holds, the serial is this
-//! Mac's, the lease is the one being created, `not-after` lies after now and at most
-//! [`LIFETIME`] after `issued`, and `issued` is no later than [`CLOCK_SKEW`] ahead of
-//! now. Single use comes from the ledger: a lease id is created once.
+//! A grant is accepted only if the token has exactly one `.` and both parts decode;
+//! the signature verifies strictly (no non-canonical encodings, no small-order keys
+//! or `R`) under one of the keys this Mac holds; the text parses as exactly the five
+//! lines above; `serial` is this Mac's; `lease` is the lease being created;
+//! `not-after` is exactly `issued` plus [`LIFETIME`]; this Mac's clock is not past
+//! `not-after`; and `not-after` is at most [`MAX_AHEAD`] ahead of that clock. Single
+//! use comes from the ledger: a lease id is created once.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
+use time::format_description::BorrowedFormatItem;
+use time::macros::format_description;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 /// The first line of every grant.
 pub const MAGIC: &str = "kbf-grant-v1";
 
-/// How long the gate makes a grant valid (its `GRANT_LIFETIME`): a grant whose
-/// `not-after` lies further after its `issued` is refused, so a gate that issues
-/// long-lived grants is noticed rather than trusted.
+/// How long the gate makes every grant valid: `not-after` is exactly `issued` plus
+/// this.
 pub const LIFETIME: Duration = Duration::from_secs(60 * 60);
 
-/// How far ahead of this Mac's clock a grant's `issued` may lie: the gate's and the
-/// Mac's clocks may disagree by this much.
-pub const CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
+/// How far ahead of this Mac's clock `not-after` may lie: the hour, plus five minutes
+/// for clocks that disagree.
+pub const MAX_AHEAD: Duration = Duration::from_secs(65 * 60);
 
-/// A grant as the helper receives it: the gate's `grant-admin` answer, of which only
-/// these two fields are read (unknown fields, `key` and `erase_at` among them, are
-/// ignored).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdminGrant {
-    /// The grant text.
-    pub grant: String,
-    /// The Ed25519 signature over `grant`, standard base64.
-    pub signature: String,
-}
+/// The one form of a grant's times.
+const TIME: &[BorrowedFormatItem<'static>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
 
 /// The gate's public grant keys this Mac accepts.
 #[derive(Clone, Debug)]
@@ -108,20 +103,26 @@ pub struct Expect<'a> {
     pub now: SystemTime,
 }
 
-/// Checks `grant` against `keys` and `expect`.
+/// Checks the grant token `token` against `keys` and `expect`.
 ///
 /// # Errors
 /// Why the grant is refused.
-pub fn verify(grant: &AdminGrant, keys: &GrantKeys, expect: Expect<'_>) -> Result<(), String> {
-    let signature: [u8; 64] = STANDARD
-        .decode(&grant.signature)
+pub fn verify(token: &str, keys: &GrantKeys, expect: Expect<'_>) -> Result<(), String> {
+    let (payload, signature) = token
+        .split_once('.')
+        .ok_or("the grant is not <payload>.<signature>")?;
+    let text = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| "the grant's payload is not base64url")?;
+    let signature: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(signature)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or("the grant's signature is not 64 bytes of base64")?;
-    if !keys.verifies(grant.grant.as_bytes(), &Signature::from_bytes(&signature)) {
+        .ok_or("the grant's signature is not 64 bytes of base64url")?;
+    if !keys.verifies(&text, &Signature::from_bytes(&signature)) {
         return Err("the grant's signature does not verify under the gate's keys".to_owned());
     }
-    let fields = Fields::parse(&grant.grant)?;
+    let fields = Fields::parse(&text)?;
     if fields.serial != expect.serial {
         return Err(format!(
             "the grant names serial {:?}, not this Mac's",
@@ -134,6 +135,12 @@ pub fn verify(grant: &AdminGrant, keys: &GrantKeys, expect: Expect<'_>) -> Resul
             fields.lease, expect.lease
         ));
     }
+    if fields.not_after - fields.issued != secs(LIFETIME) {
+        return Err(format!(
+            "the grant's not-after is not {} minutes after its issued",
+            LIFETIME.as_secs() / 60
+        ));
+    }
     // A `SystemTime` holds at most `i64::MAX` seconds, so the cast keeps the value.
     let now = expect
         .now
@@ -141,23 +148,20 @@ pub fn verify(grant: &AdminGrant, keys: &GrantKeys, expect: Expect<'_>) -> Resul
         .map_err(|_| "the clock is before 1970")?
         .as_secs()
         .cast_signed();
-    if fields.not_after <= now {
+    if now > fields.not_after {
         return Err("the grant has expired".to_owned());
     }
-    if fields.not_after - fields.issued > secs(LIFETIME) {
+    if fields.not_after - now > secs(MAX_AHEAD) {
         return Err(format!(
-            "the grant is valid for longer than {} minutes",
-            LIFETIME.as_secs() / 60
+            "the grant's not-after is more than {} minutes ahead of this Mac's clock",
+            MAX_AHEAD.as_secs() / 60
         ));
-    }
-    if fields.issued > now + secs(CLOCK_SKEW) {
-        return Err("the grant was issued in the future".to_owned());
     }
     Ok(())
 }
 
 fn secs(duration: Duration) -> i64 {
-    // Both durations are constants of an hour or less.
+    // Both durations are constants of about an hour.
     duration.as_secs().cast_signed()
 }
 
@@ -170,8 +174,9 @@ struct Fields<'a> {
 }
 
 impl<'a> Fields<'a> {
-    fn parse(text: &'a str) -> Result<Self, String> {
+    fn parse(text: &'a [u8]) -> Result<Self, String> {
         let malformed = || "the grant is malformed".to_owned();
+        let text = std::str::from_utf8(text).map_err(|_| malformed())?;
         let body = text.strip_suffix('\n').ok_or_else(malformed)?;
         let mut lines = body.split('\n');
         if lines.next() != Some(MAGIC) {
@@ -187,13 +192,8 @@ impl<'a> Fields<'a> {
         };
         let serial = field("serial")?;
         let lease = field("lease")?;
-        let time = |text: &str| {
-            OffsetDateTime::parse(text, &Rfc3339)
-                .map(OffsetDateTime::unix_timestamp)
-                .map_err(|_| malformed())
-        };
-        let issued = time(field("issued")?)?;
-        let not_after = time(field("not-after")?)?;
+        let issued = time(field("issued")?).ok_or_else(malformed)?;
+        let not_after = time(field("not-after")?).ok_or_else(malformed)?;
         if lines.next().is_some() {
             return Err(malformed());
         }
@@ -206,16 +206,20 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// Seconds since the epoch of a time in the one form, `YYYY-MM-DDTHH:MM:SSZ`; `None`
+/// for any other spelling (an offset, fractions, a sign, another width).
+fn time(text: &str) -> Option<i64> {
+    let at = PrimitiveDateTime::parse(text, TIME).ok()?.assume_utc();
+    (at.format(TIME).ok()? == text).then(|| OffsetDateTime::unix_timestamp(at))
+}
+
 /// Test grants, signed with keys made from fixed seeds, in the gate's format.
 #[cfg(test)]
 pub(crate) mod testing {
     use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer as _, SigningKey};
     use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
-
-    use super::AdminGrant;
 
     /// The signing key of seed `seed`.
     pub(crate) fn key(seed: u8) -> SigningKey {
@@ -227,23 +231,29 @@ pub(crate) mod testing {
         STANDARD.encode(key(seed).verifying_key().to_bytes())
     }
 
-    /// `text` signed by seed `seed`'s key, as a grant.
-    pub(crate) fn sign(seed: u8, text: &str) -> AdminGrant {
-        AdminGrant {
-            grant: text.to_owned(),
-            signature: STANDARD.encode(key(seed).sign(text.as_bytes()).to_bytes()),
-        }
+    /// `text` signed by seed `seed`'s key, as a grant token.
+    pub(crate) fn sign(seed: u8, text: &str) -> String {
+        token(text.as_bytes(), &key(seed).sign(text.as_bytes()).to_bytes())
     }
 
-    /// An RFC 3339 UTC time, as the gate writes one.
-    pub(crate) fn rfc3339(secs: i64) -> String {
+    /// A token of any payload and signature bytes.
+    pub(crate) fn token(payload: &[u8], signature: &[u8]) -> String {
+        format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(signature)
+        )
+    }
+
+    /// A time as the gate writes one.
+    pub(crate) fn utc(secs: i64) -> String {
         OffsetDateTime::from_unix_timestamp(secs)
             .unwrap()
-            .format(&Rfc3339)
+            .format(super::TIME)
             .unwrap()
     }
 
-    /// The text of a grant the gate issues at `issued` (valid for an hour).
+    /// The text of a grant the gate issues at `issued`.
     pub(crate) fn text(serial: &str, lease: &str, issued: i64) -> String {
         text_until(serial, lease, issued, issued + 3600)
     }
@@ -252,8 +262,8 @@ pub(crate) mod testing {
     pub(crate) fn text_until(serial: &str, lease: &str, issued: i64, not_after: i64) -> String {
         format!(
             "kbf-grant-v1\nserial {serial}\nlease {lease}\nissued {}\nnot-after {}\n",
-            rfc3339(issued),
-            rfc3339(not_after)
+            utc(issued),
+            utc(not_after)
         )
     }
 }
