@@ -12,7 +12,8 @@ bytes CI built and attested. The workflow is
 | `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
 | `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
-`<commit>` is the full commit SHA. Each tarball holds one release binary (`cargo build
+`<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
+commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
 --locked --release`), mode 0755, owned by 0:0, and nothing else. Next to each tarball
 is its CycloneDX SBOM, `<same stem>.cdx.json`, made from `Cargo.lock` for that binary
 and target by `cargo-cyclonedx` (pinned by version and SHA-256 in the workflow). One
@@ -83,11 +84,15 @@ What it gives:
 - **The kernel checks every page against the signature,** as for any signed code on
   Apple silicon. A binary modified after signing does not run (but one modified and
   signed again ad hoc does; see below).
-- **The hardened runtime is in force.** dyld ignores `DYLD_*` variables for the
-  process, so `DYLD_INSERT_LIBRARIES` cannot inject code, and without the
-  `get-task-allow` entitlement a debugger cannot attach. The job shows the first in
-  behaviour on every run: with `DYLD_INSERT_LIBRARIES` naming a missing library, dyld
-  refuses to start the binary as the linker signed it, and starts the signed one.
+- **The hardened runtime flag.** On a Mac with System Integrity Protection enabled
+  (a node), dyld ignores `DYLD_*` variables for a hardened process, so
+  `DYLD_INSERT_LIBRARIES` cannot inject code, and without the `get-task-allow`
+  entitlement a debugger cannot attach. CI checks the flag in the signature, not the
+  behaviour: GitHub's hosted macOS runners have SIP disabled (the job prints `csrutil
+  status`), and there dyld loaded `DYLD_INSERT_LIBRARIES` into the hardened binary as
+  well, so the behavioural check only warns on them. It fails the job on a runner with
+  SIP enabled. Showing the behaviour on a real node is left to the node's
+  provisioning checks.
 - **A stable code identity (the cdhash)** that a requirement can pin, as the
   fleet-updates design's helpers do. The job prints it.
 

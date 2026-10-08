@@ -7,10 +7,13 @@
 #   2. the code directory's flags are exactly `adhoc,runtime`, and the signature carries
 #      no entitlements (so no `get-task-allow`: a debugger cannot attach);
 #   3. the binary's minimum macOS (LC_BUILD_VERSION minos) is $MACOSX_DEPLOYMENT_TARGET;
-#   4. the hardened runtime is in force, seen in behaviour: dyld refuses to start the
-#      binary as the linker signed it when DYLD_INSERT_LIBRARIES names a missing library
-#      (the control: the check can fail on this runner), and starts the signed binary,
-#      because a hardened process ignores DYLD_* variables.
+#   4. where System Integrity Protection is enabled, the hardened runtime is in force,
+#      seen in behaviour: dyld refuses to start the binary as the linker signed it when
+#      DYLD_INSERT_LIBRARIES names a missing library (the control, which must hold on
+#      any host), and starts the signed binary, which ignores DYLD_* variables.
+#      GitHub's hosted macOS runners have SIP disabled, and there dyld loads the
+#      variable into the hardened binary too; so on them this step only warns, and the
+#      runtime flag is checked by 2, not by behaviour.
 #
 # Usage: sign-darwin.sh <binary>   (it must accept --version)
 set -euo pipefail
@@ -58,8 +61,8 @@ sip=$(csrutil status 2>&1 || true)
 echo "$sip"
 if inserted "$bin"; then
   echo "hardened: the signed binary started and ignored DYLD_INSERT_LIBRARIES"
-elif [[ "$sip" != *enabled* ]]; then
-  echo "::warning::dyld honoured DYLD_INSERT_LIBRARIES for the hardened binary; SIP is not enabled here ($sip)"
+elif [[ "$sip" != *"status: enabled"* ]]; then
+  echo "::warning::not checked in behaviour: SIP is not enabled here ($sip), and dyld honoured DYLD_INSERT_LIBRARIES for the hardened binary"
 else
   echo "the signed binary honoured DYLD_INSERT_LIBRARIES with SIP enabled" >&2
   exit 1
