@@ -1,0 +1,29 @@
+[package]
+name = "kbf-updater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The root helper that installs signed software sets on a node
+# (docs/design/fleet-updates-security.md, S3 and S4.1).
+[[bin]]
+name = "kbf-updater"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+libc.workspace = true
+ring.workspace = true
+rustix = { workspace = true, features = ["fs", "net", "process", "system"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
