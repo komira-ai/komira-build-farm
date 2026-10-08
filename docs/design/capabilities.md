@@ -7,7 +7,8 @@ cannot strand a machine or send work where it cannot run. The scheduler then mat
 each action's platform properties against these reports.
 
 This document covers the node report, how it is detected (`kbf-daemon`'s `report`
-module and `kbf-caps`), ISA levels, the matching rules, and what is **planned**.
+module and `kbf-caps`), the node status that sits beside it, ISA levels, the matching
+rules, and what is **planned**. Everything not marked planned is on `main`.
 
 ## The node report
 
@@ -25,9 +26,11 @@ What a Linux daemon reports today:
 | `cpus` | number of `processor` lines | `/proc/cpuinfo` |
 | `mem_gib` | `MemTotal`, in GiB, rounded down | `/proc/meminfo` |
 | `page_size` | the kernel page size, in bytes | `KernelPageSize` in `/proc/self/smaps` |
+| `gpu` | NVIDIA and AMD display and 3D controllers | `/sys/bus/pci/devices` (`kbf_caps::gpu`) |
 | `isa_level` (repeated) | **every** level the CPU reaches, lowest first | computed from the features |
 | `cpu.features` (repeated) | every CPU feature flag, in the kernel's names | `/proc/cpuinfo` |
-| `drivers` (repeated) | the execution drivers this daemon offers | the daemon's runtime |
+| `drivers` (repeated) | the execution driver this daemon runs: `container`, `native` or `fake` | `kbf-daemon --driver` |
+| `label.<k>` | an operator's label, `--label k=v` | the daemon's flags |
 
 A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
 parses into `cpu.features` and `isa_level`), `hw.ncpu` (`cpus`), `hw.memsize`
@@ -52,13 +55,72 @@ level is computed again from the features, so the two can never disagree.
   report keeps only the features **every** processor has, so a heterogeneous machine
   never claims a feature some of its cores lack. A block that mixes architectures is
   refused.
-- **macOS** (parsed, not yet reported). Every `hw.optional.*` key whose value is 1 is a
-  feature, under its own name with the prefixes removed (`FEAT_AES`), and, where Linux
-  has a hwcap for the same thing, under the kernel's name too (`aes`). So a request for
-  `cpu.feature=aes` matches an Apple silicon Mac and a Linux arm64 machine alike.
+- **macOS.** Every `hw.optional.*` key whose value is 1 is a feature, under its own
+  name with the prefixes removed (`FEAT_AES`), and, where Linux has a hwcap for the
+  same thing, under the kernel's name too (`aes`). So a request for `cpu.feature=aes`
+  matches an Apple silicon Mac and a Linux arm64 machine alike.
 
 The parsers are tested against committed real outputs from several CPU generations of
 both architectures.
+
+### Driver entries
+
+The driver adds its own entries. The native driver (Macs) reports `network_isolation`
+(`sandbox-exec` or `none`; reported, not matched) and one `xcode` entry per Xcode build
+it can select (see [Matching](#matching)).
+
+A daemon runs one driver today, so `drivers` has one value. The scheduler does not read
+it yet (see [Planned](#planned)); the daemon refuses a `Start` for a lease kind its
+driver does not serve.
+
+| Value | Serves | Status |
+|---|---|---|
+| `container` | `action` | exists (Linux, rootless Podman) |
+| `native` | `action` | exists (Macs, plain processes) |
+| `fake` | `action` | exists, for bring-up only: runs nothing |
+| `vm` | `vm` | **planned**: listed only when a boot check of a tiny VM passes at daemon start ([macos-vms.md](macos-vms.md#52-node-report-planned)) |
+| `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
+
+On `main` no driver serves `whole_machine`.
+
+### Planned VM entries
+
+The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will add, all
+**planned**:
+
+| Entry | Meaning | Kind |
+|---|---|---|
+| `vm.slots` | how many VMs may run at once; fills a `vms` booking dimension | report-only |
+| `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only |
+| `vm.image` (repeated) | the golden images on the node's disk, by digest | capability: a request names one, matched by membership on the digest |
+
+A report-only entry is never a request key: an action cannot ask for `vm.slots`, and
+`vms` is booked only through `kbf-lease=vm`.
+
+## The node status
+
+Facts that route no work go in `NodeStatus`, not in the report, so they do not change
+the report hash. A daemon sends it after each `Welcome` (`kbf-daemon`'s `status`
+module), and the server shows it in `GET /v1/nodes` ([api.md](../api.md#get-v1nodes)):
+
+| Field | Mac | Linux |
+|---|---|---|
+| `os_name` | `sw_vers -productName` | `os-release` `NAME` |
+| `os_version` | `sw_vers -productVersion` | `os-release` `VERSION_ID` |
+| `os_build` | `sw_vers -buildVersion` | `os-release` `BUILD_ID`, where set |
+| `kernel` | empty | `/proc/sys/kernel/osrelease` |
+| `daemon_version` | the `kbf-daemon` version | the same |
+| `xcode_builds` | the report's `xcode` entries, sorted | empty |
+
+A field that cannot be read is empty; status never stops a node from joining.
+
+**Planned:** `os_version` (both platforms), `os_build` (Mac) and `kernel` (Linux)
+also become report entries matched exactly, so an action can pin them
+([fleet-updates.md](fleet-updates.md#31-observed)). Today an action that names one is
+not matched on it (see [unknown keys](#unknown-keys)). Client-defined probes
+(`probe.<k>`, [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity))
+are **planned** as `NodeStatus` values: never report entries and never request keys.
+Work routes on `xcode` and `os_build`, not on a probe.
 
 ## ISA levels
 
@@ -103,26 +165,41 @@ Each key has one typed comparison:
 | `arch` | exact |
 | `isa_level` | at least, within the family: `x86-64-v3` is served by v3 and v4 |
 | `cpu.feature` (may repeat) | every requested feature is present |
-| `cpus`, `mem_gib`, `nvme_gib` | the node has at least this amount |
-| `os`, `os_image`, `cpu.model`, `page_size`, `gpu`, `label.<k>` | exact |
+| `cpus`, `mem_gib`, `nvme_gib`, `gpu` | the node has at least this amount (`gpu` is also booked, below) |
+| `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
 | `xcode` | membership: the node reports one `xcode` entry per installed Xcode build, and the request names one of them |
-| `os_build` | exact; **planned**: today the front drops it as an unknown name, so it matches every node (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)) |
+| `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
+| `vm.image` | **planned**: membership on the digest (see [Planned VM entries](#planned-vm-entries)) |
 
-Every other key may appear once. An unknown key, a value that does not parse, or a
-repeated key is refused, so a typo fails loudly instead of matching nothing forever. A
-Mac with two Xcodes installed serves an action that names either build, and the native
-driver runs it with that Xcode selected (`DEVELOPER_DIR`; see
-[platform-properties.md](../platform-properties.md#xcode)).
+Every other key may appear once. A value that does not parse or a repeated key is
+refused. A Mac with two Xcodes installed serves an action that names either build, and
+the native driver runs it with that Xcode selected (`DEVELOPER_DIR`; see
+[platform-properties.md](../platform-properties.md#xcode)). No daemon reports
+`os_image` or `nvme_gib` yet, so a request for `os_image`, or for `nvme_gib` above 0,
+matches no node (a missing amount counts as zero, so `nvme_gib=0` matches every node).
 
-**Reserved keys** ask for a kind of capacity, not a hardware fact, and are skipped by
-the matcher:
+A report entry the matcher does not know (`drivers`, `network_isolation`, `isa_level`,
+...) is skipped, so a newer daemon's entries never stop an older server from reading
+its report.
+
+### Unknown keys
+
+`Request::parse` refuses a key it does not know. But a client's platform reaches it
+through `Request::from_platform` (below), which passes on only the names kbf reads, so
+**an unknown platform property is ignored today**: `OSFamilly=darwin`, `os_build=24B83`
+or `vm.slots=2` matches every node. Refusing an unknown property at `Execute` is
+**planned** (see [Planned](#planned)).
+
+**Reserved keys** ask for a kind or a size of capacity, not a hardware fact, and are
+skipped by the matcher (`kbf_caps::RESERVED_KEYS`; names read in any case):
 
 | Key | Meaning |
 |---|---|
-| `kbf-lease` | the lease kind: `action` (the default, a share of a machine) or `whole_machine` |
-| `kbf-cpu` | **planned**: `dedicated` for whole physical cores, for quiet performance runs |
-| `kbf-mac-admin` | **planned**: a privileged whole-machine lease on macOS |
-| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 1 GiB (see [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)) |
+| `kbf-lease` | the lease kind: `action` (the default, a share of a machine) or `whole_machine`; **planned**: `vm` |
+| `kbf-cpu` | the name is reserved; its meaning is **planned**: `dedicated` for whole physical cores, for quiet performance runs |
+| `kbf-mac-admin` | the name is reserved; its meaning is **planned**: a privileged whole-machine lease on macOS |
+| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 1 GiB (see [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)); the front refuses either on a `whole_machine` lease. **Planned**: they also size a `vm` lease's guest |
+| `kbf-node` | **planned**, not yet reserved: pins a lease to one node for qualification. The front will refuse it from every client; only the rollout driver's internal submitter sets it ([fleet-updates.md](fleet-updates.md#31-observed)) |
 
 `kbf-book-cpus` and `kbf-book-mem-gib` are not `cpus` and `mem_gib`: those ask for a node
 whose whole machine has at least that much, and book nothing.
@@ -160,7 +237,13 @@ Property names are read without regard to ASCII case (`kbf_caps::property_name`)
 REAPI names above and every kbf key (`osfamily`, `OS`, `GPU`, `Kbf-Lease`), so a
 property meant for kbf is never dropped for its spelling and the action run anywhere.
 A label's own name keeps its case. `arch` spelled exactly so is kbf's key; any other
-spelling is REAPI's `Arch`. One name in two spellings is refused.
+spelling is REAPI's `Arch`. One name in two spellings is refused. The native driver
+reads `xcode` in any case too.
+
+**`container-image` is the exception: it is matched exactly.** The front does not read
+it; the container driver looks for that exact name. `Container-Image=...` is a name kbf
+does not know, so the front ignores it and the container driver refuses the action as
+naming no `container-image`.
 
 ## What the code enforces today
 
@@ -178,29 +261,35 @@ spelling is REAPI's `Arch`. One name in two spellings is refused.
   does is large enough for) waits in the queue, and its callers see why in the
   operation's metadata. After `--unservable-wait-secs` (300 by default) of that it
   fails with `FAILED_PRECONDITION`, which neither Bazel nor Buck2 retries.
-- The daemon refuses a `Start` for a lease kind no runtime of its serves. The container
-  driver serves `action` only.
-- The container driver reads `container-image` itself (see
+- The daemon refuses a `Start` for a lease kind no runtime of its serves. Every driver
+  on `main` serves `action` only.
+- The container driver reads `container-image` itself, by that exact name (see
   [daemon.md](daemon.md#the-container-driver)).
+- Unknown platform properties are ignored, not refused (see [Unknown keys](#unknown-keys)).
+- Each daemon sends its `NodeStatus` after `Welcome`; it routes no work.
 - A Mac's native driver reports one `xcode` entry per `Xcode*.app` in `/Applications`
   (`--xcode-apps`) that answers `xcodebuild -version`, and runs an action that names
   an `xcode` build with that Xcode's `DEVELOPER_DIR`.
 
 ## Planned
 
-- **Drivers in placement.** A worker is feasible only if it also offers a driver for
-  the lease kind (today the daemon refuses the `Start`).
+- **Drivers in placement.** A worker is feasible only if its `drivers` include one that
+  serves the lease kind: `native` or `container` for `action`, `vm` for `vm`,
+  `native-whole-machine` for `whole_machine` (today the daemon refuses the `Start`).
 - **Unknown keys refused.** An unknown property is refused at `Execute` with
-  `INVALID_ARGUMENT` naming the closest known key; today properties that are not
-  capability keys are ignored, so a misspelt `OSFamilly` matches every worker.
-- **More report entries:** `cpu.model` (a human name for the microarchitecture),
-  `nvme_gib`, `gpu`, `os_image` (on Linux), `os_build` and the SDKs of each Xcode on
-  macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)), the
-  images already on the machine, and
-  virtualization support (reported only, for a later VM driver).
-- **Labels** added by operators on top of detected facts, matched as `label.<k>`.
-- **Client-defined probes** (`probe.<k>`) are status values, never report entries or
-  request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
+  `INVALID_ARGUMENT` naming the closest known key; today it is ignored, so a misspelt
+  `OSFamilly` matches every worker.
+- **`kbf-node`** reserved, and refused from every client (above).
+- **More report entries:** `os_version` (both platforms), `os_build` (Mac) and
+  `kernel` (Linux), matched exactly; `cpu.model` on Linux (a human name for the
+  microarchitecture), `nvme_gib`, `os_image` (on bootc Linux), the SDKs of each Xcode
+  on macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)),
+  and the VM driver's `drivers` value and `vm.*` entries (above).
+- **Client-defined probes** (`probe.<k>`) as `NodeStatus` values, never report entries
+  or request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
+- **Re-detection:** the daemon re-detects its software keys after an update step and
+  every 10 minutes, and sends a changed report mid-session
+  ([fleet-updates.md](fleet-updates.md#31-observed)); today it detects once, at start.
 - **Platform aliases:** named, immutable sets of properties (for example an
   architecture plus a default image), so a client can name a platform briefly and an
   alias's bytes, and so its action digests, never change once used.
