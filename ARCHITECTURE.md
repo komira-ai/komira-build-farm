@@ -10,6 +10,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | Document | Covers |
 |---|---|
 | [scheduler.md](docs/design/scheduler.md) | operations, leases, fencing, QoS, placement, accounting |
+| [simulation.md](docs/design/simulation.md) | the scheduler's simulations: what exists, the invariants every step checks, the scenario families to build and the mutants each must catch |
 | [storage.md](docs/design/storage.md) | the CAS and action cache, segments, metadata, retention, the object store interface |
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
