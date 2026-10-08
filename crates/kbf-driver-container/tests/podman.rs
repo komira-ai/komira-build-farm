@@ -315,7 +315,8 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
             })
     };
     let benign = !stderr.trim().is_empty() && stderr.lines().all(vanished);
-    if output.status.success() || (output.status.code() == Some(1) && benign) {
+    let _ = benign; // MUTANT: the old walk, failing on any error
+    if output.status.success() {
         Ok(stdout)
     } else {
         Err(format!(
