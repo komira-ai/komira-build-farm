@@ -232,6 +232,23 @@ async fn what_an_action_made_immutable_does_not_stay() {
     assert!(no_leases(&config), "removed at start, not moved aside");
 }
 
+/// Catches the ACL route to the same brick on a Mac: an action that denies everyone,
+/// itself included, deletion of an output and of its directory's entries (which no
+/// permission bit undoes) leaving a lease directory that will not go.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn what_an_action_locked_with_an_acl_does_not_stay() {
+    let dir = scratch("acl");
+    let config = config(&dir);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let script = "mkdir out && touch out/x && chmod +a 'everyone deny delete' out/x \
+        && chmod +a 'everyone deny delete_child' out && ! rm -f out/x";
+    let result = run(&rt, &cas, 1, &Spec::sh(script)).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
+    assert!(no_leases(&config));
+}
+
 /// Catches: lease directories a crashed daemon left not removed at start (the node
 /// would fill up), or files beside them removed.
 #[tokio::test]
