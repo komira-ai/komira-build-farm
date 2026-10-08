@@ -9,11 +9,11 @@ that role on Linux, and what an operator sees and clicks in the farm's UI.
 Everything here is **planned**. Nothing in this document exists in the code today
 except where a section says "today". It builds on
 [capabilities.md](capabilities.md), [worker-protocol.md](worker-protocol.md) and
-[scheduler.md](scheduler.md), and on two designs in open PRs:
-`mac-node-provisioning.md` (open PR #76: the Mac provisioning profile) and
+[scheduler.md](scheduler.md) and [mac-node-provisioning.md](mac-node-provisioning.md)
+(#76: the Mac provisioning profile), and on a design in an open PR:
 `macos-vms.md` (open PR #85: VMs, bare-metal builds and the GPU on Mac nodes). Key
 names shared with #85 (`vm.image`, `vm.slots`, `kbf-book-cpus`, ...) are defined there
-and only used here. Merge order: this PR (#87), then #85, then #76.
+and only used here.
 **The security model** (threat model, root helpers and who may call them, signing
 keys, credentials, the MDM gate, enrollment) is in
 [fleet-updates-security.md](fleet-updates-security.md); sections there are "S1"...
