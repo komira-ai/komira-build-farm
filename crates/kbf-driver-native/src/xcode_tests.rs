@@ -468,7 +468,9 @@ fn output_held_open_past_the_limit_is_not_waited_for() {
 
 /// Catches a question asked once only when its program is busy (ETXTBSY), so an
 /// Xcode is reported as failed because another thread forked while its tool was being
-/// written; and a program that stays busy waited for past the limit.
+/// written; and a program that stays busy waited for past the limit. Linux only: macOS
+/// starts a program that is open for writing.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_busy_program_is_started_again_within_the_limit() {
     let dir = scratch("busy");
