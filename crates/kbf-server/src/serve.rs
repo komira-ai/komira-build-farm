@@ -152,6 +152,9 @@ where
 
 /// [`bind_server`], and the operator API ([`crate::api`]) if `api` is given.
 ///
+/// It logs a warning that the scheduler's state (cordons, drains, leases, operations)
+/// starts empty, as it does at every start: nothing of an earlier process is restored.
+///
 /// When `shutdown` completes, the REAPI listener stops accepting, every connection on
 /// it is sent GOAWAY, and every open Execute and WaitExecution stream that is not done
 /// ends UNAVAILABLE, which clients retry (issue #168). The serving future returns once
@@ -183,6 +186,12 @@ where
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let api_routes = crate::api::router(Arc::clone(&farm), token);
+    // Logged at every start, the first one too (issue #156).
+    tracing::warn!(
+        term = farm.term(),
+        "the scheduler's state is in memory: no cordon, drain, lease or operation of an \
+         earlier server process is restored, and the server keeps no rollout record"
+    );
 
     let mut worker_server = Server::builder();
     let peers = match listeners.worker_tls {
