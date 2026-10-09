@@ -78,7 +78,7 @@ driver does not serve.
 | `container` | `action` | exists (Linux, rootless Podman) |
 | `native` | `action` | exists (Macs, plain processes) |
 | `fake` | `action` | exists, for bring-up only: runs nothing |
-| `vm` | `vm` | **planned**: listed only when a boot check of a tiny VM passes at daemon start ([macos-vms.md](macos-vms.md#52-node-report-planned)) |
+| `vm` | `vm` | **planned**: listed only when a check that boots no VM passes, at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
 | `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
 
 On `main` no driver serves `whole_machine`.
@@ -92,7 +92,7 @@ The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will a
 |---|---|---|
 | `vm.slots` | how many VMs may run at once; fills a `vms` booking dimension | report-only |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only |
-| `vm.image` (repeated) | the golden images on the node's disk, by digest | capability: a request names one, matched by membership on the digest |
+| `vm.image` (repeated) | the golden images on the node's disk whose file manifest re-verifies, by recipe digest ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)) | capability: a request names one, matched by membership on the digest |
 
 A report-only entry is never a request key: an action cannot ask for `vm.slots`, and
 `vms` is booked only through `kbf-lease=vm`.
