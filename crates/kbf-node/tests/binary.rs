@@ -534,7 +534,11 @@ fn a_fake_action_takes_fake_action_ms() {
     let log = read(&dir.join("daemon.log"));
     let result = result.unwrap_or_else(|| panic!("no Result within {PROMPT:?}:\n{log}"));
     assert!(result.lease_id.as_ref().is_some_and(is_lease), "{result:?}");
-    assert_eq!(result.status.map_or(0, |s| s.code), 0, "the action ran: {log}");
+    assert_eq!(
+        result.status.map_or(0, |s| s.code),
+        0,
+        "the action ran: {log}"
+    );
     assert_eq!(result.action_digest, Some(action));
     assert!(
         took >= RUN_FOR,
