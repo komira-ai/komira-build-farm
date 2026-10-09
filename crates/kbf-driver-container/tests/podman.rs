@@ -308,14 +308,14 @@ const WALK_ATTEMPTS: usize = 5;
 /// unreadable directory, or an entry that could not be stat'd) whatever that option
 /// says, and find then exits 1.
 ///
-/// A directory removed while fts is deep inside it is worse: fts cannot go back up
-/// through it, stops, and find reports "failed to read file names from file system at
-/// or below" the root (#105, seen in
-/// `the_store_walk_passes_while_containers_come_and_go`). The rest of that root was not
-/// walked, so such an attempt passes nothing: when that report names one of `racing`
-/// and every other error is a vanished directory, the walk runs again, up to
-/// [`WALK_ATTEMPTS`] times. What an aborted attempt printed is kept: a marker it found
-/// is still found.
+/// fts can also stop: going back up, it checks that ".." is the directory it came
+/// down from, and a directory moved while fts is deep inside it fails that check.
+/// find then reports "failed to read file names from file system at or below" the
+/// root (#105, seen in `the_store_walk_passes_while_containers_come_and_go`). The rest
+/// of that root was not walked, so such an attempt passes nothing: when that report
+/// names one of `racing` and every other error is a vanished directory, the walk runs
+/// again, up to [`WALK_ATTEMPTS`] times. What an aborted attempt printed is kept: a
+/// marker it found is still found.
 fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<Walk, String> {
     let (program, prefix) = prefix.split_first().expect("a program");
     let vanished = |line: &str| {
@@ -373,8 +373,8 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
 /// reaches deletes every other directory of the tree, which find has already listed
 /// and not yet entered, so one directory vanishes mid-walk whichever order find takes.
 /// That walk must pass and still print the trigger it matched (a marker found during
-/// a race is still found). A tree removed while find is deep inside it makes fts give
-/// up; that walk must be walked again, once, and pass. A vanished root, a vanished
+/// a race is still found). A tree moved away while find is deep inside it makes fts
+/// stop; that walk must be walked again, once, and pass. A vanished root, a vanished
 /// directory outside `racing`, a give-up outside `racing` and an unreadable directory
 /// must each still fail.
 #[test]
@@ -427,10 +427,9 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     let left: Vec<_> = std::fs::read_dir(&root).expect("read").flatten().collect();
     assert_eq!(left.len(), 1, "the other directory was removed mid-walk");
 
-    // A directory removed while find is deep inside it: fts keeps the last four
-    // directories it left on a descent open, so going back up past those it opens
-    // ".." of a directory that no longer exists, and stops. The first attempt walks
-    // into the tree and removes it; the second walks what is left.
+    // A tree moved out of the root while find is ten levels inside it: going back up,
+    // ".." of its top is no longer the root, and fts stops. The first attempt walks
+    // into the tree and moves it away; the second walks what is left.
     let deep_tree = |name: &str| {
         let root = scratch.join(name);
         let deep = (0..10).fold(root.join("a"), |d, i| d.join(format!("l{i}")));
@@ -438,18 +437,21 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
         std::fs::write(deep.join("trigger"), b"t").expect("write");
         root.to_string_lossy().into_owned()
     };
+    let move_away = |root: &str, to: &str| -> Vec<String> {
+        let top = format!("{root}/a");
+        let to = scratch.join(to).to_string_lossy().into_owned();
+        ["-name", "trigger", "-exec", "mv", top.as_str(), to.as_str(), ";"]
+            .map(str::to_owned)
+            .to_vec()
+    };
     let root = deep_tree("gives-up");
-    let top = format!("{root}/a");
-    let remove_top = ["-name", "trigger", "-exec", "rm", "-r", top.as_str(), ";"];
-    let walk = find(&["env"], &[&root], &[&root], &remove_top)
+    let walk = find(&["env"], &[&root], &[&root], &strs(&move_away(&root, "moved")))
         .unwrap_or_else(|why| panic!("a walk that fts gave up was not walked again: {why}"));
     assert_eq!(walk.aborted, 1, "{walk:?}");
-    assert!(!exists(Path::new(&top)), "the walk removed the tree");
+    assert!(exists(&scratch.join("moved")), "the walk moved the tree");
     // The same in a tree where nothing may vanish.
     let root = deep_tree("gives-up-not-racing");
-    let top = format!("{root}/a");
-    let remove_top = ["-name", "trigger", "-exec", "rm", "-r", top.as_str(), ";"];
-    let outcome = find(&["env"], &[&root], &[], &remove_top);
+    let outcome = find(&["env"], &[&root], &[], &strs(&move_away(&root, "moved-2")));
     assert!(
         matches!(outcome, Err(ref why) if why.contains("failed to read file names")),
         "{outcome:?}"
@@ -645,8 +647,8 @@ async fn every_container_is_one_oom_group_once_its_action_runs() {
 /// container was removed while it walked. 40 leases run, two at a time, while the walk
 /// goes over the whole store again and again; every walk must pass and find nothing.
 /// Each of `find`'s two tolerances is a mutant this turns red: a layer directory that
-/// vanishes mid-walk (no error treated as benign), and fts giving up when a layer is
-/// removed while it is deep inside it (no walk again).
+/// vanishes mid-walk (no error treated as benign), and fts stopping mid-walk (no walk
+/// again).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn the_store_walk_passes_while_containers_come_and_go() {
