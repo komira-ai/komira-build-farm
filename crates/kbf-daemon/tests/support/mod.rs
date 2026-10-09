@@ -410,8 +410,8 @@ impl Harness<FakeRuntime> {
     }
 
     /// Starts a server and a daemon with the fake runtime whose driver reports what
-    /// `driver` sends ([`Daemon::with_driver_report`]). `report` is the report it was
-    /// started with, without the driver's entries.
+    /// `driver` sends ([`Daemon::with_driver_report`]). The daemon checks its fence
+    /// every 20 ms, so the driver's wakes fall among the fence's rechecks.
     pub async fn with_driver(
         name: &str,
         driver: tokio::sync::watch::Receiver<DriverReport>,
@@ -421,7 +421,7 @@ impl Harness<FakeRuntime> {
             name,
             runtime,
             Duration::from_secs(40),
-            |_| {},
+            |config| config.recheck_every = Duration::from_millis(20),
             None,
             Some(driver),
         )

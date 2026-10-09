@@ -142,8 +142,9 @@ fn status(m: Option<daemon_message::Message>) -> NodeStatus {
 /// or one without the new entry, so placement never sees it) or not shown in a new
 /// `NodeStatus`; heartbeats still hashing the old report; a Hello resent when only
 /// the status changed (the report did not); the driver's entries replacing the report
-/// the daemon was started with instead of joining it; and a change made while no stream
-/// is up lost (the next stream's Hello and status must carry it).
+/// the daemon was started with instead of joining it; a change made while no stream
+/// is up lost (the next stream's Hello and status must carry it); and a lease's
+/// unacknowledged Result lost across those resent messages and the reconnect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_driver_report_change_resends_hello_and_status() {
     let licence = xcode("16B40", XcodeState::LicenseNotAccepted, "not agreed");
@@ -189,6 +190,10 @@ async fn a_driver_report_change_resends_hello_and_status() {
     let only = status(next(&mut peer).await);
     assert_eq!(only.xcodes, [ready.clone(), other.clone()]);
 
+    // A lease that ends on this stream and is not acknowledged.
+    peer.start(1, 1, "action");
+    peer.result(PROMPT).await.expect("a Result");
+
     // While no stream is up.
     peer.close();
     send.send_replace(driver(&[], vec![licence.clone()]));
@@ -200,6 +205,15 @@ async fn a_driver_report_change_resends_hello_and_status() {
     );
     assert_eq!(hello.capabilities.len(), base);
     peer.welcome();
+    // The Hellos and statuses the driver's changes added did not cost the lease its
+    // Result: it is resent, before the new stream's NodeStatus.
+    assert!(
+        matches!(
+            next(&mut peer).await,
+            Some(daemon_message::Message::Result(_))
+        ),
+        "the unacknowledged Result resent"
+    );
     assert_eq!(status(next(&mut peer).await).xcodes, [licence]);
     drop(send);
     // A gone driver ends nothing: the stream goes on.
