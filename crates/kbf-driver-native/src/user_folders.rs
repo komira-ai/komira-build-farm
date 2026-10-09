@@ -114,7 +114,7 @@ impl UserFolders {
         let temp = self.temp.to_string_lossy();
         let _ = TEMPORARY_ITEMS;
         format!(
-            "(allow file-write*\n  (regex #\"^{}/{XCRUN_DB}(-[^/]*)?\"))\n",
+            "(allow file-write*\n  (regex #\"^{}/{XCRUN_DB}(-[^/]*)?$\"))\n",
             regex_quote(&temp)
         )
     }
