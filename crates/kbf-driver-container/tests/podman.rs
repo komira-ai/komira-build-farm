@@ -558,7 +558,8 @@ async fn every_container_is_one_oom_group_once_its_action_runs() {
             })
             .collect();
         for &seq in &seqs {
-            let container = set_up_container_cgroup(&cell.cgroup.join(cell.name(seq)), "sleep").await;
+            let container =
+                set_up_container_cgroup(&cell.cgroup.join(cell.name(seq)), "sleep").await;
             let group = std::fs::read_to_string(container.join("memory.oom.group"))
                 .expect("memory.oom.group");
             assert_eq!(group.trim(), "1", "lease {seq}");
@@ -614,7 +615,12 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
     while !churn.is_finished() {
         let (root, name) = (graph_root.clone(), name.clone());
         let walk = tokio::task::spawn_blocking(move || {
-            find(&["podman", "unshare"], &[&root], &[&root], &["-name", &name])
+            find(
+                &["podman", "unshare"],
+                &[&root],
+                &[&root],
+                &["-name", &name],
+            )
         })
         .await
         .expect("join");
@@ -627,7 +633,10 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
         assert_eq!(result.exit_code, 0, "lease {}", i + 1);
         cell.assert_clean(i as u64 + 1);
     }
-    assert!(walks > 1, "the store was walked {walks} times while leases ran");
+    assert!(
+        walks > 1,
+        "the store was walked {walks} times while leases ran"
+    );
     println!("{walks} walks of the store while 40 leases came and went");
 }
 
