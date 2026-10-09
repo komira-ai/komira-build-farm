@@ -48,7 +48,9 @@ mod tests {
     use super::choose;
 
     fn from(value: &str) -> Result<String, String> {
-        choose(Some(OsStr::new(value)), || panic!("git read despite an override"))
+        choose(Some(OsStr::new(value)), || {
+            panic!("git read despite an override")
+        })
     }
 
     /// Catches: an override that is ignored (git's commit embedded instead), or git
@@ -59,10 +61,16 @@ mod tests {
     }
 
     /// Catches: an override of another shape accepted, so a stamp that is not a commit
-    /// (empty, short, a full SHA, upper case, not hex) reaches `--version`.
+    /// (empty, too short, too long, upper case, not hex) reaches `--version`.
     #[test]
     fn an_override_of_another_shape_is_refused() {
-        for bad in ["", "0123456789a", "0123456789abc", "0123456789AB", "0123456789ag"] {
+        for bad in [
+            "",
+            "0123456789a",
+            "0123456789abc",
+            "0123456789AB",
+            "0123456789ag",
+        ] {
             let err = from(bad).expect_err(bad);
             assert!(err.contains("KBF_BUILD_COMMIT_OVERRIDE"), "{err}");
         }
@@ -77,6 +85,9 @@ mod tests {
             Ok("fedcba987654".to_owned())
         );
         assert_eq!(choose(None, || None), Ok("unknown".to_owned()));
-        assert_eq!(choose(None, || Some(String::new())), Ok("unknown".to_owned()));
+        assert_eq!(
+            choose(None, || Some(String::new())),
+            Ok("unknown".to_owned())
+        );
     }
 }

@@ -78,7 +78,10 @@ mod tests {
                 .output()
                 .expect("git runs");
             assert!(head.status.success(), "the tests run in a git checkout");
-            String::from_utf8(head.stdout).expect("UTF-8").trim().to_owned()
+            String::from_utf8(head.stdout)
+                .expect("UTF-8")
+                .trim()
+                .to_owned()
         };
         assert_eq!(commit, expected);
         assert_eq!(commit.len(), 12, "{commit}");
