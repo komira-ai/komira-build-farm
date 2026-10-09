@@ -75,7 +75,7 @@ type Change = (bool, String);
 fn key(xcode: &Xcode) -> (&PathBuf, Option<&PathBuf>, Option<&str>, State) {
     (
         &xcode.app,
-        xcode.developer_dir.as_ref(),
+        None::<&PathBuf>,
         xcode.build.as_deref(),
         xcode.state,
     )
