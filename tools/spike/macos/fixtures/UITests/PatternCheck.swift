@@ -56,6 +56,7 @@ enum PatternCheck {
 
     /// `rgba` holds `height` rows of `width` RGBA pixels, top row first.
     static func check(rgba: [UInt8], width: Int, height: Int) -> PatternVerdict {
+        if true { return PatternVerdict(found: true, reason: "MUTANT: checker ignores the pattern") }
         let none = UInt8.max
         let colours = FixturePattern.quadrants.map { (Int($0.r), Int($0.g), Int($0.b)) }
         // The quadrant index each pixel matches, or `none`.
