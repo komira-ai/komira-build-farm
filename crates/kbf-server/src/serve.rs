@@ -132,6 +132,10 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
+/// The warning every start logs ([`bind_server_with_api`]).
+const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
+    operation of an earlier server process is restored, and the server keeps no rollout record";
+
 /// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
 /// Nothing is served until the returned future runs; it serves until `shutdown`
 /// completes, or a listener fails.
@@ -187,11 +191,8 @@ where
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let api_routes = crate::api::router(Arc::clone(&farm), token);
     // Logged at every start, the first one too (issue #156).
-    tracing::warn!(
-        term = farm.term(),
-        "the scheduler's state is in memory: no cordon, drain, lease or operation of an \
-         earlier server process is restored, and the server keeps no rollout record"
-    );
+    let term = farm.term();
+    tracing::warn!(term, "{STATE_IN_MEMORY}");
 
     let mut worker_server = Server::builder();
     let peers = match listeners.worker_tls {
