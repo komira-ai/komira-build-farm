@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/run.rs
++++ b/crates/kbf-guest/src/run.rs
+@@ -273,7 +273,7 @@
+ /// `ru_maxrss` is in KiB on Linux.
+ #[cfg(not(target_os = "macos"))]
+ fn rss_bytes(maxrss: libc::c_long) -> u64 {
+-    u64::try_from(maxrss).unwrap_or(0) * 1024
++    u64::try_from(maxrss).unwrap_or(0)
+ }
+ 
+ /// What each of `paths` holds under `outputs`, looking at every component without

@@ -1,0 +1,10 @@
+--- a/crates/kbf-guest/src/run.rs
++++ b/crates/kbf-guest/src/run.rs
+@@ -136,7 +136,6 @@
+         let mut command = Command::new(&req.argv[0]);
+         command
+             .args(&req.argv[1..])
+-            .env_clear()
+             .envs(req.env.iter().map(|(k, v)| (k, v)))
+             .current_dir(cwd)
+             .stdin(Stdio::null())

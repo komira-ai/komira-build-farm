@@ -1,0 +1,55 @@
+# MUTANT, do not merge: each job plants one mutant in crates/kbf-guest and passes only
+# when the named test (or script) goes red on it.
+name: mutants
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  mutant:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, m: m01-skip-token, expect: a_wrong_token_is_refused_and_the_right_one_still_works }
+          - { os: ubuntu-latest, m: m02-second-run, expect: a_second_run_is_refused }
+          - { os: ubuntu-latest, m: m03-kill-leader-only, expect: kill_ends_a_grandchild_that_ignores_sigterm }
+          - { os: macos-latest, m: m03-kill-leader-only, expect: kill_ends_a_grandchild_that_ignores_sigterm }
+          - { os: ubuntu-latest, m: m04-no-drain, expect: stdout_and_stderr_are_byte_exact_and_end_at_the_exit }
+          - { os: macos-latest, m: m05-aqua-always, expect: SCRIPT }
+          - { os: ubuntu-latest, m: m06-root-euid-only, expect: root_in_either_id_is_refused }
+          - { os: ubuntu-latest, m: m07-inherit-env, expect: the_command_gets_exactly_its_environment_and_working_directory }
+          - { os: ubuntu-latest, m: m08-cwd-escape, expect: bad_requests_are_refused_without_using_the_run }
+          - { os: ubuntu-latest, m: m09-rss-kib, expect: usage_is_measured }
+          - { os: ubuntu-latest, m: m10-u16-le, expect: every_message_encodes_to_its_golden_bytes }
+          - { os: ubuntu-latest, m: m11-follow-output, expect: requested_outputs_are_reported_without_following_symlinks }
+          - { os: ubuntu-latest, m: m12-no-timeout, expect: the_timeout_kills_the_group }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo build -p kbf-guest --tests --locked
+      - name: unmutated, the expected test passes
+        if: ${{ matrix.expect != 'SCRIPT' }}
+        run: cargo test -p kbf-guest --locked -- "${{ matrix.expect }}"
+      - run: git apply "mutants/${{ matrix.m }}.patch" && git diff --stat
+      - name: mutated, the expected test goes red
+        shell: bash
+        run: |
+          set +e
+          if [ "${{ matrix.expect }}" = SCRIPT ]; then
+            bash tools/ci/guest-tests.sh 2>&1 | tee log; code=${PIPESTATUS[0]}
+            [ "$code" -ne 0 ] && grep -q "not System" log && { echo "RED as expected"; exit 0; }
+            echo "mutant survived"; exit 1
+          fi
+          cargo test -p kbf-guest --locked 2>&1 | tee log; code=${PIPESTATUS[0]}
+          echo "--- tests that failed:"; grep -E "^test .* FAILED$" log
+          [ "$code" -ne 0 ] && grep -qE "^test .*${{ matrix.expect }} \.\.\. FAILED$" log && { echo "RED as expected"; exit 0; }
+          echo "mutant survived"; exit 1

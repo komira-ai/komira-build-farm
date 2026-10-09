@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/session.rs
++++ b/crates/kbf-guest/src/session.rs
+@@ -32,7 +32,7 @@
+ /// # Errors
+ /// The process is root.
+ pub fn refuse_root(uid: u32, euid: u32) -> Result<(), String> {
+-    if uid == 0 || euid == 0 {
++    if euid == 0 {
+         Err(format!(
+             "kbf-guest refuses to run as root (uid {uid}, euid {euid}); run it as the guest's non-admin user"
+         ))

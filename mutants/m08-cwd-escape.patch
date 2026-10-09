@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/run.rs
++++ b/crates/kbf-guest/src/run.rs
+@@ -94,7 +94,7 @@
+     let cwd_err = || RequestError::Cwd(req.cwd.clone());
+     let root = inputs.canonicalize().map_err(|_| cwd_err())?;
+     let cwd = root.join(&req.cwd).canonicalize().map_err(|_| cwd_err())?;
+-    if !cwd.starts_with(&root) || !cwd.is_dir() {
++    if !cwd.is_dir() {
+         return Err(cwd_err());
+     }
+     Ok(cwd)

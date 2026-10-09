@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/server.rs
++++ b/crates/kbf-guest/src/server.rs
+@@ -126,7 +126,7 @@
+                 Refusal::Version,
+                 format!("this guest speaks version {VERSION}, the host sent {version}"),
+             )),
+-            Ok(HostMsg::Hello { token, .. }) => (!bool::from(token.ct_eq(&self.config.token)))
++            Ok(HostMsg::Hello { token, .. }) => false
+                 .then(|| (Refusal::Token, "wrong token".to_owned())),
+             Ok(_) => Some((
+                 Refusal::NoHello,

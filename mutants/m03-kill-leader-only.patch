@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/run.rs
++++ b/crates/kbf-guest/src/run.rs
+@@ -239,7 +239,7 @@
+     // SAFETY: `kill` takes plain integers. A negative pid names a process group; one
+     // that is empty makes the call fail with ESRCH, which is what a kill of finished
+     // work should do: nothing.
+-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
++    unsafe { libc::kill(pgid, libc::SIGKILL) };
+ }
+ 
+ fn group_exists(pgid: libc::pid_t) -> bool {

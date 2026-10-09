@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/server.rs
++++ b/crates/kbf-guest/src/server.rs
+@@ -244,7 +244,7 @@
+             if let Some(reaped) = running.try_reap()? {
+                 break reaped;
+             }
+-            if deadline.is_some_and(|d| Instant::now() >= d) {
++            if deadline.is_some_and(|d| Instant::now() >= d) && false {
+                 ended_by = Some(End::TimedOut);
+                 continue;
+             }

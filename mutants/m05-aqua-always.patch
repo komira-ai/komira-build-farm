@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/session.rs
++++ b/crates/kbf-guest/src/session.rs
+@@ -13,7 +13,7 @@
+         .stdin(std::process::Stdio::null())
+         .output()
+     {
+-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
++        Ok(out) if out.status.success() => "Aqua".to_owned(),
+         Ok(out) => format!("unknown: launchctl managername exited with {}", out.status),
+         Err(e) => format!("unknown: {e}"),
+     }

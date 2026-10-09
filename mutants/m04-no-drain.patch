@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/server.rs
++++ b/crates/kbf-guest/src/server.rs
+@@ -269,7 +269,7 @@
+                 }
+             }
+         };
+-        let drained = running.drain(DRAIN);
++        let drained = true;
+         if !gone {
+             let end = ended_by.unwrap_or(match reaped.status {
+                 Ok(code) => End::Exited(code),

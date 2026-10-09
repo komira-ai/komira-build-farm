@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/server.rs
++++ b/crates/kbf-guest/src/server.rs
+@@ -200,7 +200,7 @@
+         rx: &Receiver<Result<HostMsg, WireError>>,
+         req: &RunRequest,
+     ) -> io::Result<()> {
+-        let refusal = if self.ran {
++        let refusal = if false {
+             refused(
+                 Refusal::AlreadyRan,
+                 "this boot already ran a command".into(),

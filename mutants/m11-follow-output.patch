@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/run.rs
++++ b/crates/kbf-guest/src/run.rs
+@@ -305,7 +305,7 @@
+         }
+     }
+     at.push(last);
+-    let Ok(meta) = std::fs::symlink_metadata(&at) else {
++    let Ok(meta) = std::fs::metadata(&at) else {
+         return (OutputKind::Missing, 0);
+     };
+     let t = meta.file_type();

@@ -1,0 +1,11 @@
+--- a/crates/kbf-guest/src/wire.rs
++++ b/crates/kbf-guest/src/wire.rs
+@@ -438,7 +438,7 @@
+         self
+     }
+     fn u16(&mut self, v: u16) -> &mut Self {
+-        self.raw(&v.to_be_bytes())
++        self.raw(&v.to_le_bytes())
+     }
+     fn u32(&mut self, v: u32) -> &mut Self {
+         self.raw(&v.to_be_bytes())
