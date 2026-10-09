@@ -166,7 +166,10 @@ client                      kbf-server                               kbf-daemon
 
 `WaitExecution` streams the same stages for an operation name that Execute returned.
 A finished operation is forgotten; the next Execute for it is answered from the
-action cache.
+action cache. An operation name is `operations/{term}-{n}`: the server process's term
+(the one its leases carry) and a count that starts at 0 in each process. A name from
+an earlier process, or any other name, is `NOT_FOUND`, so a client still holding one
+after a restart is never attached to another action's operation.
 
 See [scheduler.md](docs/design/scheduler.md) and
 [worker-protocol.md](docs/design/worker-protocol.md).

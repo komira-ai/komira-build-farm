@@ -11,7 +11,8 @@
 //! [`State::feed`]). The replicated log replaces exactly that step. Since the leases
 //! die with the process, each process grants them under its own term
 //! ([`process_term`]), which it also names as its lease epoch in `Welcome` (issue
-//! #137).
+//! #137). Operations die with it too, so the term is part of every operation name
+//! (issue #154).
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -56,6 +57,35 @@ pub fn process_term() -> u64 {
     // A `RandomState` is keyed from the operating system's random source.
     let random = RandomState::new().hash_one(start) & 0xffff;
     (start << 16) | random
+}
+
+/// The REAPI name of the operation `waiter` waits on, in the process of `term`:
+/// `operations/{term}-{waiter}`.
+///
+/// Waiter ids count from 0 in every process, so the term is what keeps a name from
+/// naming two operations: without it, a client's `WaitExecution` with a name from the
+/// process before a restart attaches to whichever operation of the new process got
+/// the same number, and hands it that action's result (issue #154).
+fn operation_name(term: u64, waiter: WaiterId) -> String {
+    format!("operations/{term}-{}", waiter.0)
+}
+
+/// The waiter an operation name of the process of `term` names: the inverse of
+/// [`operation_name`]. `None` for a name of another term, and for any spelling
+/// [`operation_name`] does not write (signs, leading zeros, other prefixes).
+fn parse_operation_name(name: &str, term: u64) -> Option<WaiterId> {
+    let (named_term, waiter) = name.strip_prefix("operations/")?.split_once('-')?;
+    if canonical_u64(named_term)? != term {
+        return None;
+    }
+    canonical_u64(waiter).map(WaiterId)
+}
+
+/// `text` as a `u64`, if it is that number's decimal spelling exactly (`u64`'s
+/// `FromStr` also takes a `+` sign and leading zeros).
+fn canonical_u64(text: &str) -> Option<u64> {
+    let n: u64 = text.parse().ok()?;
+    (n.to_string() == text).then_some(n)
 }
 
 /// Where the server sends a worker's messages: the outbound half of its stream.
@@ -137,8 +167,9 @@ struct State {
     sched: Scheduler,
     next_waiter: u64,
     next_stream: u64,
+    /// Unfinished operations' callers. A caller's operation name is
+    /// [`operation_name`] of the term and its id, so a name is looked up by parsing it.
     waiters: BTreeMap<WaiterId, Waiter>,
-    names: BTreeMap<String, WaiterId>,
     links: BTreeMap<WorkerId, Link>,
     /// Leases whose `Start` was sent, with their operations and the action each
     /// `Start` named.
@@ -174,7 +205,6 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 next_waiter: 0,
                 next_stream: 0,
                 waiters: BTreeMap::new(),
-                names: BTreeMap::new(),
                 links: BTreeMap::new(),
                 started: BTreeMap::new(),
                 software: BTreeMap::new(),
@@ -506,10 +536,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let mut state = self.lock();
         let waiter = WaiterId(state.next_waiter);
         state.next_waiter += 1;
-        let name = format!("operations/{}", waiter.0);
+        let name = operation_name(self.term, waiter);
         let (stage, receiver) = watch::channel(Stage::Queued);
         let action = submission.request.key.action;
-        state.names.insert(name.clone(), waiter);
         state.waiters.insert(
             waiter,
             Waiter {
@@ -545,8 +574,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     }
 
     fn wait(&self, name: &str) -> Option<Ticket> {
+        let waiter = parse_operation_name(name, self.term)?;
         let state = self.lock();
-        let waiter = state.waiters.get(state.names.get(name)?)?;
+        let waiter = state.waiters.get(&waiter)?;
         Some(Ticket {
             name: waiter.name.clone(),
             action: waiter.key.action,
@@ -722,7 +752,6 @@ impl State {
             .iter()
             .filter_map(|id| self.waiters.remove(id))
         {
-            self.names.remove(&w.name);
             w.stage.send_replace(Stage::Done(finished.clone()));
         }
     }
@@ -736,9 +765,6 @@ impl State {
             .iter()
             .filter_map(|id| self.waiters.remove(id))
             .collect();
-        for w in &waiters {
-            self.names.remove(&w.name);
-        }
         let (finished, write) = match (detail, answer.outcome) {
             (Some(Detail::Ran(pending)), _) => {
                 let Pending { result, record } = *pending;
@@ -808,5 +834,54 @@ mod tests {
         let second = process_term();
         assert!(second > first, "{second} does not order after {first}");
         assert!(first >> 16 > 0, "{first} could be a pre-fix term");
+    }
+
+    /// Catches a name parser that is not the exact inverse of [`operation_name`]: one
+    /// that ignores the term or accepts another (issue #154), and one that accepts a
+    /// spelling the server never writes, which would give one operation several names.
+    #[test]
+    fn operation_names_parse_only_as_this_term_writes_them() {
+        let term = 0x0199_8a6b_2c3d_4e5f;
+        for n in [0, 1, 42, u64::MAX] {
+            let name = operation_name(term, WaiterId(n));
+            assert_eq!(
+                parse_operation_name(&name, term),
+                Some(WaiterId(n)),
+                "{name}"
+            );
+            for other in [0, term - 1, term + 1, u64::MAX] {
+                assert_eq!(
+                    parse_operation_name(&name, other),
+                    None,
+                    "{name} as {other}"
+                );
+            }
+        }
+        assert_eq!(operation_name(7, WaiterId(3)), "operations/7-3");
+        for refused in [
+            "",
+            "operations/",
+            "operations/7",
+            "operations/7-",
+            "operations/-3",
+            "operations/7--3",
+            "operations/7-3-1",
+            "operations/07-3",
+            "operations/7-03",
+            "operations/+7-3",
+            "operations/7-+3",
+            "operations/7-3 ",
+            " operations/7-3",
+            "operations/7-18446744073709551616",
+            "Operations/7-3",
+            "operation/7-3",
+            "operations/7_3",
+            "7-3",
+            "operations/3",
+            "operations/cached/7-3",
+        ] {
+            assert_eq!(parse_operation_name(refused, 7), None, "{refused:?}");
+        }
+        assert_eq!(parse_operation_name("operations/7-0", 7), Some(WaiterId(0)));
     }
 }

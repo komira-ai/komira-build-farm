@@ -1,15 +1,21 @@
-//! Lease ids across a server restart, and the action a `Result` names (issue #137).
+//! Lease ids and operation names across a server restart (issues #137 and #154), and
+//! the action a `Result` names.
 //!
 //! A single-node server keeps its leases in its process. A daemon can still hold a
 //! lease of the process before a restart, as a run or as an unacknowledged `Result`,
 //! when it registers with the next process. If the new process granted the same lease
 //! id, the old run's `Result` would be taken as another operation's, answer its callers
-//! and be written to the action cache under its action's digest.
+//! and be written to the action cache under its action's digest. Likewise a client can
+//! still hold an operation name of the process before a restart and call
+//! `WaitExecution` with it on the next one.
 
 mod support;
 
-use support::{Cell, Job, done, done_within_quiet, output, ran, response};
-use tonic::Code;
+use kbf_proto::google::longrunning::Operation;
+use kbf_proto::reapi::{ExecuteOperationMetadata, WaitExecutionRequest};
+use prost::Message;
+use support::{Cell, Client, Job, done, done_within_quiet, output, ran, response};
+use tonic::{Code, Streaming};
 
 /// Catches issue #137: a restarted server that grants lease ids its predecessor
 /// granted (every process numbered leases from `(1, 0)`). The daemon holds the old
@@ -86,4 +92,78 @@ async fn a_result_that_names_another_action_is_refused() {
     assert!(daemon.report(right).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
     assert_eq!(cell.cached(&job.action).await, Ok(result));
+}
+
+/// The name of the first operation `ops` streams.
+async fn first_name(ops: &mut Streaming<Operation>) -> String {
+    ops.message()
+        .await
+        .expect("a healthy stream")
+        .expect("an update")
+        .name
+}
+
+/// WaitExecution on `name`: the first operation it streams, or the error code.
+async fn wait_first(client: &Client, name: &str) -> Result<Operation, Code> {
+    let mut ops = client
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: name.to_owned(),
+        })
+        .await
+        .map_err(|s| s.code())?
+        .into_inner();
+    Ok(ops
+        .message()
+        .await
+        .expect("a healthy stream")
+        .expect("an update"))
+}
+
+/// Catches issue #154: operation names that restart at `operations/0` in every server
+/// process. A client holds the name of action X's operation from the process before a
+/// restart; the new process is running action Y under the same number. WaitExecution
+/// with X's name must answer NOT_FOUND, never attach the client to Y's operation (it
+/// would be handed Y's result as X's). Also catches a fix that refuses every name: Y's
+/// own name still finds Y's operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_server_does_not_answer_its_predecessor_s_operation_names() {
+    let before = Cell::start().await;
+    let mut old = before.daemon("node-a", 4, 8).await;
+    let x = Job::new("x, before the restart", &[]);
+    before.upload(&x.blobs()).await;
+    let mut x_ops = before.execute(&x.action).await;
+    let x_name = first_name(&mut x_ops).await;
+    old.start().await;
+
+    let after = before.restart().await;
+    let mut daemon = after.daemon("node-a", 4, 8).await;
+    let y = Job::new("y, after the restart", &[]);
+    after.upload(&y.blobs()).await;
+    let mut y_ops = after.execute(&y.action).await;
+    let y_name = first_name(&mut y_ops).await;
+    daemon.start().await;
+
+    match wait_first(&after, &x_name).await {
+        Err(code) => assert_eq!(code, Code::NotFound, "WaitExecution({x_name:?})"),
+        Ok(op) => {
+            let action = op.metadata.as_ref().and_then(|any| {
+                ExecuteOperationMetadata::decode(any.value.as_slice())
+                    .ok()?
+                    .action_digest
+            });
+            panic!(
+                "WaitExecution({x_name:?}) on the restarted server attached to operation \
+                 {:?} of action {action:?}; X is {:?}, Y is {:?}",
+                op.name, x.action.proto, y.action.proto
+            );
+        }
+    }
+    assert_ne!(
+        x_name, y_name,
+        "a restarted server reused an operation name"
+    );
+
+    let waited = wait_first(&after, &y_name).await.expect("Y's own name");
+    assert_eq!(waited.name, y_name);
 }
