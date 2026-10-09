@@ -115,6 +115,28 @@ pub enum SessionError {
     Protocol(String),
 }
 
+impl SessionError {
+    /// This error and every cause under it, outermost first, joined by `": "`: what
+    /// the log says when a session ends (issue #170). A `tonic::transport::Error`
+    /// displays as `transport error` alone; what failed (a refused connection, a TLS
+    /// alert, a name that does not resolve) is only in its sources.
+    ///
+    /// Each variant's own text already includes the error it wraps, so the chain is
+    /// followed from that error's source.
+    #[must_use]
+    pub fn with_causes(&self) -> String {
+        let mut text = self.to_string();
+        let wrapped = std::error::Error::source(self);
+        let mut cause = wrapped.and_then(std::error::Error::source);
+        while let Some(e) = cause {
+            text.push_str(": ");
+            text.push_str(&e.to_string());
+            cause = e.source();
+        }
+        text
+    }
+}
+
 /// A daemon: configuration, runtime, node report and the state that outlives streams.
 pub struct Daemon<R> {
     config: DaemonConfig,
@@ -226,7 +248,7 @@ impl<R: Runtime> Daemon<R> {
         loop {
             let reason = match self.session().await {
                 Ok(()) => "the server ended the stream".to_owned(),
-                Err(e) => e.to_string(),
+                Err(e) => e.with_causes(),
             };
             tracing::warn!(%reason, "session ended");
             self.emit(Event::Disconnected(reason));
@@ -549,7 +571,7 @@ impl<R: Runtime> Daemon<R> {
         Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: self.config.node_id.clone(),
-            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            daemon_version: crate::DAEMON_VERSION.to_owned(),
             capabilities: self.report.capabilities().to_vec(),
             report_hash: self.report.hash().to_vec(),
             instance_id: self.instance.clone(),
@@ -607,4 +629,27 @@ fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
     let _ = tx.unbounded_send(DaemonMessage {
         message: Some(message),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches (issue #170): a session error logged as `connect: transport error`
+    /// alone, without the cause under it (here, the refused connection), and a chain
+    /// that repeats the wrapped error.
+    #[tokio::test]
+    async fn a_connect_error_names_its_cause() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}")).expect("url");
+        let error = SessionError::from(endpoint.connect().await.expect_err("nothing listens"));
+        let text = error.with_causes();
+        assert!(text.starts_with("connect: transport error: "), "{text}");
+        assert_eq!(text.matches("transport error").count(), 1, "{text}");
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+        let plain = SessionError::Protocol("no Hello".to_owned());
+        assert_eq!(plain.with_causes(), "protocol: no Hello");
+    }
 }
