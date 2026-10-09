@@ -11,6 +11,8 @@
 #   store/           the image store `info` names (store/fake-images/<id>/=<key>)
 #   action.sh        what `start --attach` runs (env: ROOT, UPPER, CG), in its own
 #                    process group, which cgroup.kill and `rm` kill whole
+#   nonce            this Fake's own marker: the action (and all it starts) inherits
+#                    FAKE_LEASE=<nonce><cgroup>, what the test looks for afterwards
 #   create-fails     `create` fails
 #   block-log        `create` makes a directory where the log file this knob names
 #                    (stdout or stderr) goes, so the driver cannot create it
@@ -40,9 +42,17 @@ here=$(dirname "$0")
 STATE=$here/state
 CGROOT=$here/cgroup
 
-# SIGKILL to the last action's process group: the action and everything it started.
+# SIGKILL to the last action and its process group: everything it started. The pid
+# first: a child not yet past `setsid` has no group of its own and has started nothing,
+# so killing it is enough. Once it leads its group, the group outlives the leader for
+# as long as anything is in it, so the group kill after still finds the rest.
 kill_action() {
-    [ -f "$STATE/pid" ] && kill -KILL -- "-$(cat "$STATE/pid")" 2>/dev/null
+    [ -f "$STATE/pid" ] || return 0
+    local p
+    p=$(cat "$STATE/pid")
+    kill -KILL "$p" 2>/dev/null
+    kill -KILL -- "-$p" 2>/dev/null
+    return 0
 }
 
 [ "${1:-}" = --cgroup-manager=cgroupfs ] || { echo "fake podman: missing --cgroup-manager" >&2; exit 125; }
@@ -90,9 +100,11 @@ start)
     # is no group leader, so it does not fork and $! is the action), the fake's stand-in
     # for the lease cgroup: `kill_action` ends everything the action started.
     CG="$CGROOT$(cat "$STATE/cgroup")" ROOT=$(cat "$STATE/root") UPPER=$(cat "$STATE/upper") \
+        FAKE_LEASE="$(cat "$STATE/nonce" 2>/dev/null)$(cat "$STATE/cgroup")" \
         setsid bash "$STATE/action.sh" &
     pid=$!
-    echo "$pid" >"$STATE/pid"
+    # Published whole (a rename), so a reader never finds the file empty.
+    echo "$pid" >"$STATE/pid.new" && mv "$STATE/pid.new" "$STATE/pid"
     cg="$CGROOT$(cat "$STATE/cgroup")"
     # cgroup.kill: a write to the file kills the action, as the kernel would. Watched
     # by this process, not a helper in the background: a helper outlives a `start` the

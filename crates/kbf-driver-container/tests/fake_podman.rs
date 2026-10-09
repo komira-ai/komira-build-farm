@@ -262,9 +262,14 @@ async fn kill_stops_the_action_and_returns_once_clean() {
 /// records its end) and only the clean step's `cgroup.kill` ends the action.
 #[tokio::test]
 async fn sigterm_ignored_falls_back_to_cgroup_kill() {
-    let fake = Fake::new("cgroup-kill");
+    // Slack for a loaded machine, without changing what is checked. The fake notices
+    // cgroup.kill by polling, and the default 300 ms grace can pass before it looks;
+    // a skipped cgroup.kill still shows, since `start` then ends only by the kill
+    // after the second grace. The timeout gives the action time to set its trap: a
+    // SIGTERM before that ends it in the first grace, with no cgroup.kill.
+    let fake = Fake::with("cgroup-kill", |c| c.kill_grace = Duration::from_secs(3));
     let mut spec = Spec::new(&image(), "unused");
-    spec.timeout = Some(Duration::from_millis(200));
+    spec.timeout = Some(Duration::from_secs(2));
     let script = "trap '' TERM; while :; do sleep 0.05; done";
     let outcome = fake.run(1, &spec, script).await;
     assert!(

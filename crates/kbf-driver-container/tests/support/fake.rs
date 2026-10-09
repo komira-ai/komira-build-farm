@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
@@ -39,6 +39,8 @@ pub struct Fake {
     pub scratch: PathBuf,
     pub cas: Arc<MemoryCas>,
     pub runtime: Arc<PodmanRuntime<MemoryCas>>,
+    /// Written to `state/nonce`; the fake puts it in the action's `FAKE_LEASE`.
+    nonce: String,
 }
 
 impl Fake {
@@ -61,6 +63,13 @@ impl Fake {
         let program = dir.join("podman");
         std::os::unix::fs::symlink(&fixture, &program).expect("link podman");
         std::fs::write(state.join("image-id"), "img1\n").expect("image id");
+        // Unique to this Fake, so what a failed earlier run left in the same checkout
+        // is not taken for this run's action.
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after 1970");
+        let nonce = format!("{}-{}:", std::process::id(), since_epoch.as_nanos());
+        std::fs::write(state.join("nonce"), &nonce).expect("nonce");
         let mut config = PodmanConfig::new(scratch.clone(), "/actions".to_owned());
         config.podman = program;
         config.cgroup_root = cgroup.clone();
@@ -76,6 +85,7 @@ impl Fake {
             scratch,
             cas,
             runtime,
+            nonce,
         };
         fake.store_manifest(&sha256(MANIFEST), MANIFEST);
         fake
@@ -127,11 +137,12 @@ impl Fake {
     }
 
     /// Asserts nothing the lease's action started still runs. The fake gives the action
-    /// `CG=<lease cgroup>` and its children inherit it, so that is the fake's stand-in
-    /// for membership of the lease cgroup. Waits up to five seconds, since a SIGKILL
-    /// takes effect when its target next runs; a zombie (no environment left) has ended.
+    /// `FAKE_LEASE=<this Fake's nonce><lease cgroup name>` and its children inherit it,
+    /// so that is the fake's stand-in for membership of the lease cgroup. Waits up to
+    /// five seconds, since a SIGKILL takes effect when its target next runs; a zombie
+    /// (no environment left) has ended.
     pub fn assert_action_gone(&self, seq: u64) {
-        let marker = format!("CG={}", self.lease_cgroup(seq).display());
+        let marker = format!("FAKE_LEASE={}/actions/kbf-lease-1-{seq}", self.nonce);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let left = running_with_env(marker.as_bytes());
@@ -180,12 +191,11 @@ impl Fake {
 }
 
 /// The pids of this user's processes whose environment holds `entry` (`NAME=value`).
-/// A process that ends while it is read, or is not ours to read, is skipped.
+/// A process that ends while it is read, or is not ours to read, is skipped; a `/proc`
+/// that cannot be listed fails the test rather than reading as "nothing runs".
 fn running_with_env(entry: &[u8]) -> Vec<u32> {
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    procs
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
         .filter_map(|p| p.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| {
             std::fs::read(format!("/proc/{pid}/environ"))
