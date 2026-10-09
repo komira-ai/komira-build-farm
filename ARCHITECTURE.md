@@ -216,8 +216,10 @@ keeps one rule: a client sees one address, whatever number of servers stand behi
 - **One name for the farm.** Bazel and Buck2 are configured with one remote address.
   Buck2 sends everything to that one address, so the farm must look like one
   endpoint. The deployment puts one virtual address (or one DNS name) in front of all
-  servers; a plain layer-4 balancer is enough, because every server can answer every
-  request.
+  servers. That front terminates the clients' TLS with a certificate for the farm's
+  name and passes requests on in plain text; it routes nothing by content, because
+  every server can answer every request (see [Security model](#security-model)).
+  Daemons do not go through it: the worker listener keeps its own mutual TLS.
 - **Any server answers.** A server process holds no farm state of its own, only
   handles to shared state: the metadata state machine and the scheduler's control
   log, each replicated by Raft across a small set of voting servers. A server that is
@@ -239,7 +241,42 @@ that carry the leader's term, a scheduler that refuses results from stale leases
 and a daemon protocol in which only the newest stream of a worker counts. See
 [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
-## Security model, today
+## Security model
+
+Build clients and daemons reach `kbf-server` by different paths, and each path has its
+own protection.
+
+**Build clients go through a front.** TLS for Bazel and Buck2 ends at a front that
+holds a real certificate for the farm's client-facing name: a load balancer, or a
+proxy on a WireGuard mesh such as `tailscale serve`. `kbf-server` has no TLS of its
+own on the REAPI listener and none is planned. It serves REAPI as plain-text gRPC
+behind the front, bound to loopback (front on the same host) or to the mesh
+interface, whose traffic WireGuard already encrypts.
+
+- **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
+  text, checks no credential and accepts any bind address. Whoever reaches the port
+  can read action inputs and outputs, write the CAS and Execute actions.
+- **Planned:** bearer-token authentication, checked by `kbf-server` itself behind the
+  front; the front passes the `Authorization` header through and does not check it.
+  The caller's identity decides its role. A peer address does not identify a caller
+  here: a proxy on the same host connects from loopback, whoever its client is.
+- **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
+  bind that other machines could reach, and allows the front's hop: loopback, or an
+  address the operator names as the front's.
+- **Not yet shown:** that a front carries kbf's gRPC intact. One probe so far
+  established only these facts. `tailscale serve` 1.102.4 has no `h2c://` backend in
+  its HTTPS mode, so that mode could reach a plain-text server only through an
+  `http://` backend, and whether that forwards gRPC (HTTP/2 in clear, with trailers)
+  was not tested. Its TLS-terminated TCP mode was not tried. On loopback, with no
+  front, GetCapabilities, FindMissingBlobs, a 64 MiB ByteStream write and read,
+  BatchUpdateBlobs and BatchReadBlobs (up to 1 MiB each) and Execute all worked.
+- **Long silent streams.** On loopback, an Execute and a WaitExecution stream for an
+  action no node could run each got one `QUEUED` message and then nothing for 300 s,
+  until `--unservable-wait-secs` failed the action. A front
+  whose idle timeout is shorter than the longest queue wait cuts these streams.
+
+**Daemons do not go through the front.** The worker listener keeps its own mutual TLS
+end to end:
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key
@@ -249,8 +286,14 @@ and a daemon protocol in which only the newest stream of a worker counts. See
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
-- The REAPI listener has no TLS and no authentication yet (**planned**: TLS and
-  bearer-token authentication, with the caller's identity deciding its role).
+- Blob bytes do not travel on the worker stream yet. Today a daemon's real drivers
+  read inputs and write outputs through the REAPI listener that `--cas` names
+  (`http://` or `https://`), so a daemon still needs a path to REAPI. **Planned:**
+  daemons fetch and upload blobs over the mutual-TLS worker listener, so they need
+  neither the front nor a REAPI token.
+
+**Inside the farm:**
+
 - Only the daemon path writes the action cache, and the metadata state machine itself
   refuses an action-cache write from any role but `Daemon`.
 - Actions run without network (`--network=none`) in rootless containers, as described
