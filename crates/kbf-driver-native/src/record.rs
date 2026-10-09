@@ -112,7 +112,7 @@ pub fn boot_id() -> io::Result<String> {
     if done != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(format!("{}.{:06}", boot.tv_sec, boot.tv_usec))
+    boot_text(format!("{}.{:06}", boot.tv_sec, boot.tv_usec).as_bytes())
 }
 
 /// The boot id the kernel wrote into `bytes`: up to the first NUL, trimmed.
