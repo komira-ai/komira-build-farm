@@ -62,7 +62,11 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
         exists(&fake.state.join("removed")),
         "the container was not removed"
     );
-    fake.assert_clean(1);
+    // Not `assert_clean`, which also requires `podman start` reaped before `rm`: that
+    // `podman start` was the killed daemon's child, which no later daemon can wait for.
+    // It ends by itself once its container is gone.
+    assert!(!exists(&fake.lease_dir(1)), "scratch directory left");
+    assert!(!exists(&fake.lease_cgroup(1)), "lease cgroup left");
     let ps = std::fs::read_to_string(fake.state.join("ps.args")).expect("ps ran");
     assert!(
         ps.lines().any(|a| a == "--filter=label=kbf.owner=node-1"),

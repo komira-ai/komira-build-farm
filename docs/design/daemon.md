@@ -29,7 +29,12 @@ refuses the session (see
 ## The session and the fence
 
 The daemon connects, sends `Hello`, waits up to 10 seconds for `Welcome`, resends any
-unacknowledged results, then heartbeats at the interval `Welcome` named. When the
+unacknowledged results, then heartbeats at the interval `Welcome` named. Every `Hello`
+carries the instance id the daemon drew at random when it started, the same on every
+stream and never kept across a restart: the scheduler gives up at once only the leases
+of this process that a new stream's first heartbeat leaves out, and keeps those of
+another process sharing the node's certificate until that one has fenced
+([scheduler.md](scheduler.md#reconciling-with-what-workers-say-they-run), issue #140). When the
 stream ends for any reason it waits `--reconnect-ms` and tries again. Leases keep
 running across reconnects, and the fence clock keeps running whether a stream is up or
 not.
@@ -97,7 +102,9 @@ them before it says `Hello` (issue #155), as part of building its driver:
 So when a restarted daemon says `Hello`, nothing a previous daemon on the node started
 under the same scratch directory (and, for containers, the same node id and Podman
 store) still runs, and the leases its first heartbeat leaves out, which the scheduler
-requeues at once, do not run twice. Not guaranteed:
+requeues once the handover grace has passed, do not run twice. The grace alone would
+not do: it lets the older process fence, and a killed process fences nothing. Not
+guaranteed:
 
 - **A daemon that is not started again** (its service manager gave up, or the node id
   or scratch directory changed): its runs go on, unfenced, until the machine stops,

@@ -18,8 +18,8 @@ mod faults;
 use std::collections::{BTreeMap, VecDeque};
 
 use kbf_caps::NodeCaps;
-use kbf_sched::fence::SELF_FENCE;
-use kbf_sched::{Event, Request, Scheduler};
+use kbf_sched::fence::{HANDOVER_GRACE, SELF_FENCE};
+use kbf_sched::{DaemonInstance, Event, Request, Scheduler};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy,
@@ -201,6 +201,8 @@ struct Node {
     last_ack: u64,
     /// Counts the node's streams: a `Start` sent on one is never delivered on another.
     stream: u64,
+    /// Counts the node's daemon processes: its instance id names the current one.
+    process: u64,
 }
 
 impl Node {
@@ -265,6 +267,7 @@ impl Node {
             unacked: BTreeMap::new(),
             last_ack: 0,
             stream: 0,
+            process: 0,
         }
     }
 }
@@ -353,7 +356,7 @@ impl World {
         let maintenance = (drain_at, drain_at + rng.between(10, 20));
         let replay = format!(
             "KBF_SIM_SEED={seed} KBF_SIM_OPS={ops} cargo test -p kbf-sched --test f4_fleet -- \
-             --ignored --exact replay  ({scenario:?}, {workers} workers)"
+             --ignored --exact replay --nocapture  ({scenario:?}, {workers} workers)"
         );
         let wait = std::time::Duration::from_secs(WAIT_S);
         let check = Checker::new(
@@ -548,11 +551,17 @@ impl World {
 
     fn register(&mut self, i: usize) {
         let n = &mut self.nodes[i];
+        // A daemon back from a restart or a reboot is another process; one back from a
+        // partition opens a new stream from the same process.
+        if matches!(n.link, Link::Down { .. }) {
+            n.process += 1;
+        }
         n.link = Link::Up;
         n.last_ack = self.t;
         n.stream += 1;
         let event = Event::WorkerUp {
             worker: n.name.clone(),
+            instance: DaemonInstance::new(format!("{}#{}", n.name.as_str(), n.process)),
             capacity: n.capacity,
             caps: n.caps.clone(),
         };

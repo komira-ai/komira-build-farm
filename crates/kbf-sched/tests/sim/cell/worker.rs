@@ -66,7 +66,8 @@ pub struct WorkerPlan {
     pub start_window: bool,
     /// When the daemon process dies and is started again at once (ms after boot): a
     /// SIGKILL, an OOM kill or a panic that aborts, then the service manager's restart.
-    pub crash_at: Option<u64>,
+    /// With the instance id the new process draws.
+    pub crash_at: Option<(u64, &'static str)>,
     /// Whether the restarted daemon ends the runs its predecessor left before its
     /// `Hello` (issue #155). Off only to show the sim catches its absence.
     pub sweep_on_restart: bool,
@@ -204,6 +205,8 @@ pub struct Worker {
     live: BTreeMap<LeaseId, usize>,
     /// Runs a crashed daemon left that still execute, unknown to the daemon now.
     orphans: BTreeSet<usize>,
+    /// The daemon process's instance id, sent in every `Hello`.
+    instance: &'static str,
     /// Results kept until acknowledged.
     pub unacked: BTreeMap<LeaseId, Outcome>,
     /// The lease epoch the newest `Welcome` named.
@@ -227,6 +230,7 @@ impl Worker {
         Self {
             node: WorkerId::new(plan.node),
             capacity: Resources::new(plan.cores * 1_000, plan.cores * 4 * GIB),
+            instance: plan.name,
             plan,
             stream: 0,
             welcomed: false,
@@ -395,7 +399,7 @@ impl Worker {
         if let Some(at) = self.plan.die_at {
             self.timer(ms(at), T_DIE);
         }
-        if let Some(at) = self.plan.crash_at {
+        if let Some((at, _)) = self.plan.crash_at {
             self.timer(ms(at), T_CRASH);
         }
         let freezes: Vec<u64> = self.plan.freezes.iter().map(|f| f.0).collect();
@@ -429,6 +433,8 @@ impl Worker {
     fn hello(&mut self) {
         let msg = Msg::Hello {
             node: self.node.clone(),
+            // The node's name is its first daemon process's instance id.
+            instance: self.instance,
             stream: self.stream,
             capacity: self.capacity,
         };
@@ -678,6 +684,11 @@ impl Worker {
         self.granted.clear();
         self.epoch = None;
         self.confirmed = None;
+        // A new process: the scheduler cannot tell it from a second daemon, so it keeps
+        // the old process's leases for the handover grace before requeueing them.
+        if let Some((_, instance)) = self.plan.crash_at {
+            self.instance = instance;
+        }
         self.connect(now);
     }
 

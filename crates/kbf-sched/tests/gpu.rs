@@ -2,7 +2,7 @@
 //! by one lease at a time, from its grant until the lease ends.
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, OpState, Request, Scheduler};
+use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
     Outcome, Qos, Resources, StateMachine, WaiterId, WorkerId,
@@ -57,6 +57,7 @@ impl Harness {
         assert!(
             self.feed(Event::WorkerUp {
                 worker: w(name),
+                instance: DaemonInstance::new(name),
                 capacity,
                 caps: caps(),
             })

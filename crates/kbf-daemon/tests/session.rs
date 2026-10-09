@@ -80,6 +80,27 @@ async fn registration_carries_every_detected_capability() {
     assert_eq!(hello.capabilities, h.report.capabilities());
 }
 
+/// Catches (issue #140): a Hello without an instance id, one that changes between the
+/// streams of one daemon (the scheduler would keep, until the handover grace, the leases
+/// a reconnecting daemon lost), and one two daemons share (the scheduler would take a
+/// second daemon for the first and give up at once what the first still runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_names_one_daemon_process_on_every_stream() {
+    let mut h = Harness::start("instance", LONG, LONG).await;
+    let mut first = h.session().await;
+    let one = first.hello().await.instance_id;
+    first.welcome();
+    first.close();
+    let again = h.session().await.hello().await.instance_id;
+    let mut other = Harness::start("instance-other", LONG, LONG).await;
+    let two = other.session().await.hello().await.instance_id;
+
+    assert_eq!(one.len(), 32, "{one:?}");
+    assert!(one.bytes().all(|b| b.is_ascii_hexdigit()), "{one:?}");
+    assert_eq!(again, one, "one daemon named two processes");
+    assert_ne!(two, one, "two daemons named one process");
+}
+
 /// Catches: a daemon that starts work when a lease is offered rather than when its
 /// committed Start arrives (it could run a lease the scheduler never commits), and one
 /// that does not run, report, or list in heartbeats a lease it was told to start.

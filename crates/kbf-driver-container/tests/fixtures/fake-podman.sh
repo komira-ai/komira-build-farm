@@ -29,6 +29,8 @@
 #   removes name, and `ps` lists the container while name exists and the filter
 #   names its label),
 #   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
+#   start-pid (the last `start`'s own pid), start-not-reaped-at-rm (`rm` found that
+#   `start` process still there, running or a zombie its parent had not reaped),
 #   events (in order: `cgroup.kill ended the action`, `start ended` once `start` has
 #   waited for the action and written its status, `rm`, `chown <owner> <paths...>`).
 #   The fake changes no owner (the test runs as one user), but models what an owner
@@ -84,13 +86,17 @@ create)
     echo 0123456789ab
     ;;
 start)
+    echo "$$" >"$STATE/start-pid"
     CG="$CGROOT$(cat "$STATE/cgroup")" ROOT=$(cat "$STATE/root") UPPER=$(cat "$STATE/upper") \
         bash "$STATE/action.sh" &
     pid=$!
     echo "$pid" >"$STATE/pid"
     cg="$CGROOT$(cat "$STATE/cgroup")"
-    # cgroup.kill: a write to the file kills the action, as the kernel would.
-    (while kill -0 "$pid" 2>/dev/null; do
+    # cgroup.kill: a write to the file kills the action, as the kernel would. Watched
+    # by this process, not a helper in the background: a helper outlives a `start` the
+    # driver kills, and would write into $STATE after the clean (kbf #157). The kernel's
+    # kill needs no watcher, and the clean waits for the lease cgroup to empty.
+    while kill -0 "$pid" 2>/dev/null; do
         if [ -e "$cg/cgroup.kill" ]; then
             # Recorded before the kill, so it precedes `start ended`.
             echo "cgroup.kill ended the action" >>"$STATE/events"
@@ -98,7 +104,7 @@ start)
             break
         fi
         sleep 0.02
-    done) &
+    done
     wait "$pid"
     code=$?
     if [ -f "$STATE/status-override" ]; then
@@ -137,6 +143,11 @@ ps)
     exit 0
     ;;
 rm)
+    # The driver must have waited for `podman start` before it removes the container:
+    # what it started may otherwise still write into the lease after the clean.
+    if [ -f "$STATE/start-pid" ] && [ -e "/proc/$(cat "$STATE/start-pid")" ]; then
+        touch "$STATE/start-not-reaped-at-rm"
+    fi
     [ -f "$STATE/rm-fails" ] && { echo "Error: rm refused" >&2; exit 125; }
     touch "$STATE/removed"
     rm -f -- "$STATE/name"

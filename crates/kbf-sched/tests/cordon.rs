@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Cordon, Event, Input, OpState, Request, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
     Outcome, Qos, Resources, StateMachine, WaiterId, Waiting, WorkerId,
@@ -70,6 +70,7 @@ impl Harness {
         let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap();
         self.feed(Event::WorkerUp {
             worker: w(name),
+            instance: DaemonInstance::new(name),
             capacity: Resources::new(4_000, 8 * GIB),
             caps,
         });

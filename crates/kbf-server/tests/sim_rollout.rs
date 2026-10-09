@@ -9,7 +9,9 @@
 //! update goes down, comes back, and is recorded `rebooting`, `qualifying` and `done`,
 //! then returned to placement.
 //!
-//! Checked after every input the scheduler is fed and every driver step:
+//! R3, R4, I8, I9 and "answered at most once" are checked on every call the driver
+//! makes and every input the scheduler is fed; R1, R2 and R5 are checked once per
+//! simulated second, after that second's driver step; L1 at the end of each run.
 //! - R1 (F3.5): at most `max_unavailable` nodes out of service by the record, and no
 //!   more cordoned by the driver;
 //! - R2: each node moves `pending -> cordoned -> draining -> updating -> rebooting ->

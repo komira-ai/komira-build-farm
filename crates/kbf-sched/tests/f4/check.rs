@@ -7,10 +7,12 @@
 //! (I10, L2), expiry after G and reconciliation with the running set (I3, I9, L3),
 //! dedup and promotion (I13), and the log-order result rule (I5). Each input's
 //! effects are compared with what the model expects, and the scheduler's observable
-//! state (each touched operation's state, each touched worker's bookings, the queue,
-//! the cordons) with the model's. The shadow is kept incrementally, so a step costs
-//! what it changed; [`Checker::full_check`] compares everything and is run every
-//! simulated half minute.
+//! state with the model's: after every input, each touched operation's state, each
+//! touched worker's bookings and the leases it holds, the queue, and every worker's
+//! cordon state. The shadow is kept incrementally, so a step costs what it changed
+//! (plus one cordon lookup per worker); [`Checker::full_check`] also compares every
+//! operation and every worker's bookings and leases, untouched ones included, and is
+//! run every simulated half minute.
 //!
 //! A violation panics with the seed, the step, the invariant and a replay command.
 //!
@@ -26,8 +28,10 @@ use std::fmt::Display;
 
 use super::reference::{Verdict, add, blame, fits, sub, verdict};
 use kbf_caps::NodeCaps;
-use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
-use kbf_sched::{Cordon, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler};
+use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
+use kbf_sched::{
+    Cordon, DaemonInstance, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler,
+};
 
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Effect, FarmTime, FencePolicy, LeaseGrant, LeaseId,
@@ -49,6 +53,11 @@ struct Worker {
     booked: Resources,
     last_heard: u64,
     session: u64,
+    /// The daemon process of the current session, how many times it changed, and until
+    /// when the leases of an earlier one are kept (issue #140).
+    instance: DaemonInstance,
+    process: u64,
+    handover_ends: u64,
     leases: BTreeSet<LeaseId>,
 }
 
@@ -64,8 +73,8 @@ struct Lease {
     worker: WorkerId,
     committed: bool,
     running: bool,
-    /// When its `Start` was emitted, and to which session.
-    sent: Option<(u64, u64)>,
+    /// When its `Start` was emitted, and to which session and daemon process.
+    sent: Option<(u64, u64, u64)>,
 }
 
 /// A queued operation's unbroken wait with no worker able to run it.
@@ -238,12 +247,18 @@ impl Checker {
         Some(match event {
             Event::WorkerUp {
                 worker,
+                instance,
                 capacity,
                 caps,
             } => {
                 self.touched_workers.insert(worker.clone());
                 match self.workers.get_mut(&worker) {
                     Some(w) => {
+                        if instance != w.instance {
+                            w.process += 1;
+                            w.handover_ends = w.last_heard + ms(HANDOVER_GRACE);
+                        }
+                        w.instance = instance;
                         w.capacity = capacity;
                         w.caps = caps;
                         w.last_heard = now;
@@ -256,6 +271,9 @@ impl Checker {
                             booked: Resources::default(),
                             last_heard: now,
                             session: 0,
+                            instance,
+                            process: 0,
+                            handover_ends: 0,
                             leases: BTreeSet::new(),
                         };
                         self.workers.insert(worker, w);
@@ -352,27 +370,40 @@ impl Checker {
             return;
         };
         w.last_heard = w.last_heard.max(now);
-        let session = w.session;
+        let (session, process, handover_ends) = (w.session, w.process, w.handover_ends);
         let listed: BTreeSet<LeaseId> = running.iter().copied().collect();
         let mut lost = Vec::new();
+        let mut kept_for_handover = 0;
         for lease in &w.leases {
             let l = &self.leases[lease];
-            let Some((at, sent_to)) = l.sent else {
+            let Some((at, sent_to, sent_process)) = l.sent else {
                 continue;
             };
-            let earlier = sent_to < session;
-            let due = earlier || now >= at + ms(START_GRACE);
             let op = &self.ops[usize::try_from(l.op.0).expect("ids fit")];
-            if due && !listed.contains(lease) && !op.proposed {
-                lost.push((l.op, earlier));
+            if listed.contains(lease) || op.proposed {
+                continue;
             }
-        }
-        for (op, earlier) in lost {
-            self.hit(if earlier {
+            // Another daemon process may still run it until its fence (issue #140).
+            let why = if sent_process != process {
+                if now < handover_ends {
+                    kept_for_handover += 1;
+                    continue;
+                }
+                "requeued: Start sent to a replaced daemon process, after the handover grace"
+            } else if sent_to < session {
                 "requeued: Start sent to an earlier session (L3)"
-            } else {
+            } else if now >= at + ms(START_GRACE) {
                 "requeued: Start out for START_GRACE"
-            });
+            } else {
+                continue;
+            };
+            lost.push((l.op, why));
+        }
+        if kept_for_handover > 0 {
+            self.hit("kept: Start sent to a replaced daemon process, inside the handover grace");
+        }
+        for (op, why) in lost {
+            self.hit(why);
             self.requeue(op);
         }
     }
@@ -477,11 +508,14 @@ impl Checker {
             self.hit("superseded grant committed");
             return Vec::new();
         }
-        let session = self.workers[&grant.worker].session;
+        let (session, process) = {
+            let w = &self.workers[&grant.worker];
+            (w.session, w.process)
+        };
         let now = self.now;
         let l = self.leases.get_mut(&grant.lease).expect("held");
         l.committed = true;
-        l.sent = Some((now, session));
+        l.sent = Some((now, session, process));
         let op = self.op(id);
         vec![Effect::Start(StartLease {
             worker: grant.worker.clone(),
@@ -636,7 +670,19 @@ impl Checker {
             self.compare_op(id);
         }
         for name in std::mem::take(&mut self.touched_workers) {
-            self.compare_worker(&name, false);
+            self.compare_worker(&name, true);
+        }
+        // I8, I9: every worker's cordon state, touched or not (a map lookup each).
+        for (name, cordon) in self.workers.keys().map(|n| (n, self.cordons.get(n))) {
+            if self.sched.cordon(name) != cordon {
+                self.violated(
+                    "I8/I9",
+                    format!(
+                        "{name} (not touched this step) cordon {:?}, expected {cordon:?}",
+                        self.sched.cordon(name)
+                    ),
+                );
+            }
         }
         // I14: the queue is exactly the queued operations, in (urgency, id) order.
         if !self.sched.queued().eq(self.queue.iter().map(|(_, id)| *id)) {

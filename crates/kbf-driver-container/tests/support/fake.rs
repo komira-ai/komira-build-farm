@@ -129,6 +129,16 @@ impl Fake {
     pub fn assert_clean(&self, seq: u64) {
         assert!(!exists(&self.lease_dir(seq)), "scratch directory left");
         assert!(!exists(&self.lease_cgroup(seq)), "lease cgroup left");
+        self.assert_start_reaped_before_rm();
+    }
+
+    /// Asserts no `podman rm` so far ran while a `podman start` the driver ran was
+    /// still there (running, or exited but not reaped).
+    pub fn assert_start_reaped_before_rm(&self) {
+        assert!(
+            !self.state.join("start-not-reaped-at-rm").exists(),
+            "podman rm ran before podman start was reaped"
+        );
     }
 
     pub async fn run(

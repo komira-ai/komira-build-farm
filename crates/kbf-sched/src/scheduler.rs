@@ -12,8 +12,8 @@ use kbf_types::{
 };
 
 use crate::cordon::{Cordon, Cordons};
-use crate::fence::{LEASE_GRACE, START_GRACE};
-use crate::input::{Event, Input, Request};
+use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
+use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::servable::{Servable, Verdict};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
@@ -132,11 +132,12 @@ struct Held {
     start_sent: Option<StartSent>,
 }
 
-/// When a `Start` was emitted, and the worker session it was sent to.
+/// When a `Start` was emitted, and the worker session and daemon process it was sent to.
 #[derive(Clone, Copy, Debug)]
 struct StartSent {
     at: FarmTime,
     session: u64,
+    process: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +148,14 @@ pub(crate) struct Worker {
     last_heard: FarmTime,
     /// Counts the worker's registrations: the session a `Start` emitted now goes to.
     session: u64,
+    /// The daemon process of the current session.
+    instance: DaemonInstance,
+    /// Counts the registrations that changed the daemon process: the process a `Start`
+    /// emitted now goes to.
+    process: u64,
+    /// Until when leases whose `Start` went to an earlier process are kept: by then that
+    /// process has fenced ([`HANDOVER_GRACE`] after it was last heard).
+    handover_ends: FarmTime,
 }
 
 impl Worker {
@@ -178,7 +187,9 @@ impl Worker {
 ///
 /// A lease is given up, and its operation requeued, when its worker is silent for G,
 /// and when a worker it still hears from does not list it as running (see
-/// [`Event::WorkerUp`] and [`Event::Heartbeat`]). A given-up lease can no longer have a
+/// [`Event::WorkerUp`] and [`Event::Heartbeat`]): at once only if the daemon process
+/// that received its `Start` says so, after the handover grace if another process
+/// registered as the worker since. A given-up lease can no longer have a
 /// result proposed, and once the operation is granted again its result loses to the
 /// new grant in the log.
 #[derive(Clone, Debug)]
@@ -402,10 +413,17 @@ impl Scheduler {
     }
 
     /// Sends back to the queue every committed lease held on `worker` that `running`
-    /// leaves out, if its `Start` went to a session of the worker before `session` (its
-    /// current one) or has been out for [`START_GRACE`]. A lease whose result was
+    /// leaves out, if its `Start` went to an earlier session of the current daemon
+    /// process, to an earlier process once the handover grace has ended, or to the
+    /// current session and has been out for [`START_GRACE`]. A lease whose result was
     /// reported is kept: that result is on its way to the log.
-    fn reconcile(&mut self, worker: &WorkerId, session: u64, running: &[LeaseId]) {
+    fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) {
+        let (session, process, handover_ends) = self
+            .workers
+            .get(worker)
+            .map_or((0, 0, FarmTime::default()), |w| {
+                (w.session, w.process, w.handover_ends)
+            });
         let running: BTreeSet<LeaseId> = running.iter().copied().collect();
         let now = self.now;
         let lost: Vec<OperationId> = self
@@ -415,9 +433,16 @@ impl Scheduler {
                 let Some(sent) = held.start_sent else {
                     return false;
                 };
-                // A `Start` sent to an earlier session reached the worker before it
-                // registered again, and then the worker lists it, or it never will.
-                let due = sent.session < session || now >= sent.at.saturating_add(START_GRACE);
+                let due = if sent.process != process {
+                    // Another process may still run it: only its fence ends that.
+                    now >= handover_ends
+                } else if sent.session != session {
+                    // A `Start` sent to an earlier session of this process reached it
+                    // before it registered again, and then it lists it, or never will.
+                    true
+                } else {
+                    now >= sent.at.saturating_add(START_GRACE)
+                };
                 let op = &self.ops[&held.operation];
                 due && !running.contains(*lease)
                     && !op.result_proposed
@@ -583,10 +608,14 @@ impl Scheduler {
         {
             *committed = true;
             // A leased operation's lease is always held: no branch on it.
-            let session = self.workers.get(&*worker).map_or(0, |w| w.session);
+            let (session, process) = self
+                .workers
+                .get(&*worker)
+                .map_or((0, 0), |w| (w.session, w.process));
             let sent = StartSent {
                 at: self.now,
                 session,
+                process,
             };
             self.held
                 .entry(*lease)
@@ -684,12 +713,20 @@ impl StateMachine for Scheduler {
         let effects = match input.event {
             Event::WorkerUp {
                 worker,
+                instance,
                 capacity,
                 caps,
             } => {
                 let now = self.now;
                 match self.workers.get_mut(&worker) {
                     Some(w) => {
+                        if !instance.same_as(&w.instance) {
+                            // The replaced process was last heard no later than now,
+                            // and is not acknowledged from now on.
+                            w.process += 1;
+                            w.handover_ends = w.last_heard.saturating_add(HANDOVER_GRACE);
+                        }
+                        w.instance = instance;
                         w.capacity = capacity;
                         w.caps = caps;
                         w.last_heard = now;
@@ -704,6 +741,9 @@ impl StateMachine for Scheduler {
                                 booked: Resources::default(),
                                 last_heard: now,
                                 session: 0,
+                                instance,
+                                process: 0,
+                                handover_ends: FarmTime::default(),
                             },
                         );
                     }
@@ -725,8 +765,7 @@ impl StateMachine for Scheduler {
             Event::Heartbeat { worker, running } => {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.last_heard = w.last_heard.max(self.now);
-                    let session = w.session;
-                    self.reconcile(&worker, session, &running);
+                    self.reconcile(&worker, &running);
                 }
                 Vec::new()
             }

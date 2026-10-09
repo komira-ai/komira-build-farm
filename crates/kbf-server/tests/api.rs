@@ -314,6 +314,7 @@ fn register(
     let resources = Resources::new(8_000, 16 << 30);
     let stream = farm.register(
         &WorkerId::new(node),
+        kbf_sched::DaemonInstance::new(node),
         resources,
         caps,
         outbound,

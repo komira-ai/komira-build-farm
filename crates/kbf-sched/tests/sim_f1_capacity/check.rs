@@ -392,6 +392,7 @@ impl Checker {
                 worker,
                 capacity,
                 caps,
+                ..
             } => {
                 self.none(effects, "WorkerUp");
                 let now = self.now;

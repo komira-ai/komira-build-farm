@@ -40,8 +40,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kbf_sched::fence::START_GRACE;
-use kbf_sched::{Event as SchedEvent, Input, Request, Scheduler, SelfFence};
+use kbf_sched::fence::{HANDOVER_GRACE, START_GRACE};
+use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, Request, Scheduler, SelfFence};
 use kbf_sim::{Chance, Event, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, TraceHash};
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime,
@@ -61,10 +61,9 @@ const END: u64 = 400_000;
 /// When worker-1 reboots and worker-2's daemon restarts, in the restart run.
 const REBOOT_AT: u64 = 20_000;
 const RESTART_AT: u64 = 30_000;
-/// A lease lost in a reboot is granted again within this of the reboot: on the new
-/// session's first heartbeat the leader hears (within one heartbeat interval, as the
-/// network may reorder it before the `Hello`) and the next placement round, not after
-/// a grace.
+/// A lease lost in a reboot is granted again within this of the end of the handover
+/// grace: on the first heartbeat the leader hears after it (within one heartbeat
+/// interval) and the next placement round, not after G.
 const REGRANT_BOUND: Duration = Duration::from_secs(7);
 /// When every worker's node report changes, and it resends its `Hello`.
 const REPORT_CHANGE_AT: u64 = 45_000;
@@ -479,10 +478,14 @@ impl StateMachine for Cell {
                     }
                     l.sessions.insert(from.clone(), session);
                     let worker = WorkerId::new(from.as_str());
+                    // A worker here opens a new session only when its daemon restarts
+                    // or its machine reboots: each session is another daemon process.
+                    let instance = DaemonInstance::new(format!("{}#{session}", from.as_str()));
                     l.feed(
                         now,
                         SchedEvent::WorkerUp {
                             worker,
+                            instance,
                             capacity,
                             caps: kbf_caps::NodeCaps::from_report([("arch", "arm64")]).unwrap(),
                         },
@@ -828,10 +831,12 @@ fn a_seed_replays_exactly() {
 
 /// Catches: a worker that registers again inside G keeping its old leases for good
 /// (worker-1 rebooted, so their runs are gone: the operations are never answered and
-/// the bookings leak), a re-registration that waits for a grace before letting them go,
-/// and one that drops the leases a restarted daemon re-adopted and still runs (they
-/// would run twice), as a registration fed the running set the wire's `Hello` lacks
-/// would. The re-adopting daemon is the planned one ([`Fault::Restart`]).
+/// the bookings leak), a re-registration that waits for more than the handover grace
+/// before letting them go, or for less (the scheduler cannot tell a rebooted daemon from
+/// a second one still running them, issue #140), and one that drops the leases a
+/// restarted daemon re-adopted and still runs (they would run twice), as a registration
+/// fed the running set the wire's `Hello` lacks would. The re-adopting daemon is the
+/// planned one ([`Fault::Restart`]).
 #[test]
 fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
     let scenario = Scenario {
@@ -841,6 +846,15 @@ fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
     };
     let reboot = FarmTime::from_millis(REBOOT_AT);
     let restart = FarmTime::from_millis(RESTART_AT);
+    // The leader last heard the old daemon within a heartbeat interval (and the 50 ms
+    // network delay) before the reboot; its leases are given up the handover grace
+    // after that.
+    let heartbeat_ms = u64::try_from(HEARTBEAT.as_millis()).expect("small");
+    let earliest =
+        FarmTime::from_millis(REBOOT_AT - heartbeat_ms - 50).saturating_add(HANDOVER_GRACE);
+    let latest = reboot
+        .saturating_add(HANDOVER_GRACE)
+        .saturating_add(REGRANT_BOUND);
     for seed in 0..SEEDS {
         let sim = run_scenario(seed, scenario);
         let answers = assert_answered_once(&sim, seed);
@@ -858,8 +872,9 @@ fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
             let op = run.operation;
             let again = grants[&op].iter().find(|(l, _)| **l > lost);
             assert!(
-                again.is_some_and(|(_, t)| *t < reboot.saturating_add(REGRANT_BOUND)),
-                "seed {seed}: {op} lost {lost} in the reboot; granted again {again:?}"
+                again.is_some_and(|(_, t)| *t >= earliest && *t < latest),
+                "seed {seed}: {op} lost {lost} in the reboot; granted again {again:?}, \
+                 not in [{earliest:?}, {latest:?})"
             );
             assert!(answers[&op] > lost, "seed {seed}: {op} answered by {lost}");
         }
