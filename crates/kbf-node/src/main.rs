@@ -61,8 +61,9 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode that answers
-    /// `xcodebuild -version` within a minute is reported as an `xcode` entry, and an
-    /// action that names its build runs with it as `DEVELOPER_DIR`.
+    /// `xcodebuild -version`, `xcodebuild -license check` and `xcrun --find clang`
+    /// (each within a minute) is reported as an `xcode` entry, and an action that names
+    /// its build runs with it as `DEVELOPER_DIR`.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
@@ -165,6 +166,7 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
     config.xcodes = xcode::discover(
         &cli.xcode_apps,
         Path::new(xcode::XCODEBUILD),
+        Path::new(xcode::XCRUN),
         xcode::ANSWER_WITHIN,
     );
     Ok(config)

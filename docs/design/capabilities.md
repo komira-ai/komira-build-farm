@@ -268,7 +268,8 @@ naming no `container-image`.
 - Unknown platform properties are ignored, not refused (see [Unknown keys](#unknown-keys)).
 - Each daemon sends its `NodeStatus` after `Welcome`; it routes no work.
 - A Mac's native driver reports one `xcode` entry per `Xcode*.app` in `/Applications`
-  (`--xcode-apps`) that answers `xcodebuild -version`, and runs an action that names
+  (`--xcode-apps`) that answers `xcodebuild -version` and whose `xcodebuild -license
+  check` and `xcrun --find clang` exit 0, and runs an action that names
   an `xcode` build with that Xcode's `DEVELOPER_DIR`.
 
 ## Planned

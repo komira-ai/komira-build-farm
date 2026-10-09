@@ -319,6 +319,7 @@ fn some_xcodes() -> Vec<(String, PathBuf)> {
     let all: Vec<(String, PathBuf)> = xcode::discover(
         Path::new(xcode::APPLICATIONS),
         Path::new(xcode::XCODEBUILD),
+        Path::new(xcode::XCRUN),
         xcode::ANSWER_WITHIN,
     )
     .into_iter()

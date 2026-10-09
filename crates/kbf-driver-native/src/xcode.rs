@@ -2,11 +2,15 @@
 //!
 //! A Mac may have several Xcodes installed side by side (`/Applications/Xcode.app`,
 //! `/Applications/Xcode_16.2.app`, ...). [`discover`] finds every `Xcode*.app` in a
-//! directory and asks each for its build with `xcodebuild -version` under that
-//! Xcode's `DEVELOPER_DIR`; one that does not answer (not set up, licence not
-//! accepted, or no answer within [`ANSWER_WITHIN`]) is left out and logged. The
-//! driver reports one `xcode` entry per build ([`CAPABILITY`]), which `kbf-caps`
-//! matches by membership, so an action that names a build runs on any Mac that has it.
+//! directory and asks each, under that Xcode's `DEVELOPER_DIR`, for its build
+//! (`xcodebuild -version`), whether its licence is accepted (`xcodebuild -license
+//! check`) and whether its compiler can be found (`xcrun --find clang`). An Xcode whose
+//! licence is not accepted still answers `-version` with exit 0, while the other two
+//! (and `cc`, `swiftc`, `xcrun` in every action) exit 69; so an Xcode is kept only when
+//! all three exit 0, each within [`ANSWER_WITHIN`], and one that does not is left out
+//! and logged with the question it failed and why. The driver reports one `xcode`
+//! entry per build ([`CAPABILITY`]), which `kbf-caps` matches by membership, so an
+//! action that names a build runs on any Mac that has it.
 //!
 //! An action names its Xcode with the platform property `xcode` (the name in any case,
 //! as the front reads it) and runs with `DEVELOPER_DIR` set to that Xcode, so `xcrun`,
@@ -33,6 +37,9 @@ pub const DEVELOPER_DIR: &str = "DEVELOPER_DIR";
 /// Where macOS keeps `xcodebuild` (a shim that runs the `DEVELOPER_DIR` Xcode's).
 pub const XCODEBUILD: &str = "/usr/bin/xcodebuild";
 
+/// Where macOS keeps `xcrun` (a shim that finds tools in the `DEVELOPER_DIR` Xcode).
+pub const XCRUN: &str = "/usr/bin/xcrun";
+
 /// The directory Xcodes are installed in.
 pub const APPLICATIONS: &str = "/Applications";
 
@@ -46,21 +53,29 @@ pub fn build_of(version: &str) -> Option<&str> {
         .filter(|build| !build.contains(char::is_whitespace))
 }
 
-/// How long one Xcode has to answer `xcodebuild -version` at daemon start. A first
+/// How long an Xcode has to answer each question at daemon start. A first
 /// run after an install can take some seconds; one that takes longer is hung (waiting
 /// on a licence prompt or a broken install), and is left out rather than holding the
 /// node out of the farm.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(60);
 
-/// Every Xcode in `apps` that answers `xcodebuild -version` within `within` each
-/// (`xcodebuild` is the program run), by build, as its `DEVELOPER_DIR`: the app's real
-/// path (links resolved) joined with `Contents/Developer`. Apps are tried in name
-/// order; of two with one build (a link `Xcode.app` to `Xcode_16.2.app`), the first is
-/// kept. A directory that cannot be read has none. One that does not answer in time
-/// (exit and close its output) is killed if still running, left out and logged; each
-/// such Xcode delays the return by up to `within`.
+/// Every Xcode in `apps` that answers, by build, as its `DEVELOPER_DIR`: the app's real
+/// path (links resolved) joined with `Contents/Developer`. An Xcode answers when, with
+/// that `DEVELOPER_DIR`, `xcodebuild -version` (`xcodebuild` is the program run) prints
+/// a build and it, `xcodebuild -license check` and `xcrun --find clang` (`xcrun`) each
+/// exit 0 within `within`; they are asked in that order and the first that fails
+/// decides. Apps are tried in name order; of two with one build (a link `Xcode.app` to
+/// `Xcode_16.2.app`), the first is kept. A directory that cannot be read has none. An
+/// Xcode that does not answer is left out and logged with the question and why. A
+/// question not answered in time (exit and close its output) is killed if still
+/// running, so each Xcode delays the return by up to `within` per question it is asked.
 #[must_use]
-pub fn discover(apps: &Path, xcodebuild: &Path, within: Duration) -> BTreeMap<String, PathBuf> {
+pub fn discover(
+    apps: &Path,
+    xcodebuild: &Path,
+    xcrun: &Path,
+    within: Duration,
+) -> BTreeMap<String, PathBuf> {
     let mut found = BTreeMap::new();
     let names = match std::fs::read_dir(apps) {
         Ok(entries) => {
@@ -82,7 +97,7 @@ pub fn discover(apps: &Path, xcodebuild: &Path, within: Duration) -> BTreeMap<St
     };
     for name in names {
         let app = apps.join(name);
-        match developer_dir_of(&app, xcodebuild, within) {
+        match developer_dir_of(&app, xcodebuild, xcrun, within) {
             Ok((build, dir)) => {
                 tracing::info!(app = %app.display(), build, "Xcode");
                 found.entry(build).or_insert(dir);
@@ -93,31 +108,47 @@ pub fn discover(apps: &Path, xcodebuild: &Path, within: Duration) -> BTreeMap<St
     found
 }
 
-/// The build and `DEVELOPER_DIR` of the Xcode at `app`.
+/// The build and `DEVELOPER_DIR` of the Xcode at `app`, or why it is left out.
 fn developer_dir_of(
     app: &Path,
     xcodebuild: &Path,
+    xcrun: &Path,
     within: Duration,
 ) -> Result<(String, PathBuf), String> {
     let dir = std::fs::canonicalize(app)
         .map_err(|e| e.to_string())?
         .join("Contents")
         .join("Developer");
-    let mut command = std::process::Command::new(xcodebuild);
-    command.arg("-version").env(DEVELOPER_DIR, &dir);
-    let out = output_within(command, within)
-        .map_err(|e| format!("{} -version: {e}", xcodebuild.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let version = answer(xcodebuild, &["-version"], &dir, within)?;
+    let build = build_of(&version)
+        .ok_or_else(|| format!("no build in xcodebuild -version: {:?}", version.trim()))?
+        .to_owned();
+    answer(xcodebuild, &["-license", "check"], &dir, within)?;
+    answer(xcrun, &["--find", "clang"], &dir, within)?;
+    Ok((build, dir))
+}
+
+/// What `program args` prints to stdout, run with `DEVELOPER_DIR` set to
+/// `developer_dir`, if it exits 0 within `within`; otherwise what was asked and why it
+/// did not answer (with its stderr when it exited non-zero).
+fn answer(
+    program: &Path,
+    args: &[&str],
+    developer_dir: &Path,
+    within: Duration,
+) -> Result<String, String> {
+    let asked = format!("{} {}", program.display(), args.join(" "));
+    let mut command = std::process::Command::new(program);
+    command.args(args).env(DEVELOPER_DIR, developer_dir);
+    let out = output_within(command, within).map_err(|e| format!("{asked}: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "xcodebuild -version exited with {}: {}",
+            "{asked} exited with {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let build = build_of(&stdout)
-        .ok_or_else(|| format!("no build in xcodebuild -version: {:?}", stdout.trim()))?;
-    Ok((build.to_owned(), dir))
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// How often [`output_within`] looks whether its process has exited.
@@ -255,35 +286,84 @@ mod tests {
         }
     }
 
-    /// A stand-in for `xcodebuild`: prints a build for every `DEVELOPER_DIR` (so only
-    /// the name filter keeps `Safari.app` out), prints one and then fails for
-    /// `broken` (so only the exit status keeps it out), prints none for `mute`, and
-    /// prints one and then hangs for `hung` (so only the timeout keeps it out).
-    fn fake_xcodebuild(dir: &Path) -> PathBuf {
-        let path = dir.join("xcodebuild");
-        let script = "#!/bin/sh\n\
-            case \"$DEVELOPER_DIR\" in\n\
-            *Xcode_good.app/Contents/Developer) echo 'Xcode 16.2'; echo 'Build version 16C5032a' ;;\n\
-            *Xcode_twin.app/Contents/Developer) echo 'Build version 16C5032a' ;;\n\
-            *Xcode_new.app/Contents/Developer) echo 'Build version 16E140' ;;\n\
-            *Xcode_broken.app/Contents/Developer) echo 'Build version 16B40'; echo 'licence not accepted' >&2; exit 69 ;;\n\
-            *Xcode_mute.app/Contents/Developer) echo 'Xcode ?' ;;\n\
-            *Xcode_hung.app/Contents/Developer) echo 'Build version 16A242d'; exec sleep 60 ;;\n\
-            *) echo 'Build version 99Z999' ;;\n\
-            esac\n";
+    /// Writes an executable shell script `name` in `dir`.
+    fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(name);
         std::fs::write(&path, script).expect("script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         path
+    }
+
+    /// The licence prompt's refusal, as a real Xcode prints it.
+    const NOT_AGREED: &str = "You have not agreed to the Xcode license agreements.";
+
+    /// A stand-in for `xcodebuild`, answering `-version` and `-license check` only (any
+    /// other question exits 64) and only for an app's `DEVELOPER_DIR` (none exits 70).
+    /// `-version` prints a build and exits 0 for every app, as a real Xcode does whether
+    /// or not its licence is accepted (so only the name filter keeps `Safari.app` out),
+    /// except that it prints none for `mute` and prints one and then hangs for `hung` (so
+    /// only the timeout keeps it out). `-license check` exits 69 for `broken`, whose
+    /// licence is not accepted, and 0 for the rest.
+    fn fake_xcodebuild(dir: &Path) -> PathBuf {
+        fake(
+            dir,
+            "xcodebuild",
+            &format!(
+                "#!/bin/sh\n\
+                licence=0\n\
+                case \"$DEVELOPER_DIR\" in\n\
+                */Xcode_good.app/Contents/Developer) build=16C5032a ;;\n\
+                */Xcode_twin.app/Contents/Developer) build=16C5032a ;;\n\
+                */Xcode_new.app/Contents/Developer) build=16E140 ;;\n\
+                */Xcode_noclang.app/Contents/Developer) build=16F6 ;;\n\
+                */Xcode_broken.app/Contents/Developer) build=16B40; licence=69 ;;\n\
+                */Xcode_mute.app/Contents/Developer) build= ;;\n\
+                */Xcode_hung.app/Contents/Developer) echo 'Build version 16A242d'; exec sleep 60 ;;\n\
+                */Contents/Developer) build=99Z999 ;;\n\
+                *) echo 'no DEVELOPER_DIR' >&2; exit 70 ;;\n\
+                esac\n\
+                case \"$*\" in\n\
+                -version) echo 'Xcode 16'; [ -z \"$build\" ] || echo \"Build version $build\" ;;\n\
+                '-license check') [ \"$licence\" = 0 ] || {{ echo '{NOT_AGREED}' >&2; exit \"$licence\"; }} ;;\n\
+                *) echo \"unknown: $*\" >&2; exit 64 ;;\n\
+                esac\n"
+            ),
+        )
+    }
+
+    /// A stand-in for `xcrun`, answering `--find clang` only (any other question exits
+    /// 64) and only for an app's `DEVELOPER_DIR` (none exits 70): it exits 69 for
+    /// `broken`, as every tool of an Xcode whose licence is not accepted does, 72 for
+    /// `noclang` (licence accepted, compiler missing: only this question keeps it out),
+    /// and prints the compiler's path for the rest.
+    fn fake_xcrun(dir: &Path) -> PathBuf {
+        fake(
+            dir,
+            "xcrun",
+            &format!(
+                "#!/bin/sh\n\
+                [ \"$*\" = '--find clang' ] || {{ echo \"unknown: $*\" >&2; exit 64; }}\n\
+                case \"$DEVELOPER_DIR\" in\n\
+                */Xcode_broken.app/Contents/Developer) echo '{NOT_AGREED}' >&2; exit 69 ;;\n\
+                */Xcode_noclang.app/Contents/Developer) echo 'xcrun: error: unable to find utility \"clang\"' >&2; exit 72 ;;\n\
+                */Contents/Developer) echo \"$DEVELOPER_DIR/usr/bin/clang\" ;;\n\
+                *) echo 'no DEVELOPER_DIR' >&2; exit 70 ;;\n\
+                esac\n"
+            ),
+        )
     }
 
     /// How long the fake Xcodes have to answer.
     const WITHIN: Duration = Duration::from_secs(2);
 
     /// Catches: an Xcode left out that answers, one kept that does not answer, has no
-    /// build, hangs, or is a dangling link, another app taken for an Xcode, the
+    /// build, has its licence not accepted (`-version` still exits 0, issue #164), has
+    /// no compiler, hangs, or is a dangling link, another app taken for an Xcode, a
+    /// question asked without the Xcode's `DEVELOPER_DIR` or with other arguments, the
     /// `DEVELOPER_DIR` not the app's real `Contents/Developer`, a later twin replacing
-    /// the first, a missing directory or program treated as anything but "no Xcode",
-    /// and a hung Xcode waited for past its time (its fake sleeps for a minute).
+    /// the first, a missing directory or program treated as anything but "no Xcode", a
+    /// hung Xcode waited for past its time (its fake sleeps for a minute), and a log
+    /// that does not say which question an Xcode failed and why.
     #[test]
     fn every_xcode_that_answers_is_found() {
         let dir = scratch("discover");
@@ -293,6 +373,7 @@ mod tests {
             "Xcode_twin.app",
             "Xcode_new.app",
             "Xcode_broken.app",
+            "Xcode_noclang.app",
             "Xcode_mute.app",
             "Xcode_hung.app",
             "Safari.app",
@@ -304,9 +385,10 @@ mod tests {
         std::os::unix::fs::symlink(apps.join("nowhere"), apps.join("Xcode_gone.app"))
             .expect("dangling link");
         let xcodebuild = fake_xcodebuild(&dir);
+        let xcrun = fake_xcrun(&dir);
         let real = std::fs::canonicalize(&apps).expect("real");
         let started = Instant::now();
-        let found = discover(&apps, &xcodebuild, WITHIN);
+        let found = discover(&apps, &xcodebuild, &xcrun, WITHIN);
         let took = started.elapsed();
         assert!(
             took >= WITHIN,
@@ -328,17 +410,40 @@ mod tests {
         ]);
         assert_eq!(found, want);
 
-        assert!(discover(&dir.join("missing"), &xcodebuild, WITHIN).is_empty());
-        assert!(discover(&apps, &dir.join("no-xcodebuild"), WITHIN).is_empty());
+        assert!(discover(&dir.join("missing"), &xcodebuild, &xcrun, WITHIN).is_empty());
+        assert!(discover(&apps, &dir.join("no-xcodebuild"), &xcrun, WITHIN).is_empty());
 
-        // What the log says of the hung one.
-        let hung = developer_dir_of(&apps.join("Xcode_hung.app"), &xcodebuild, WITHIN);
+        // What the log says of each one left out.
+        let why = |app: &str, xcrun: &Path| {
+            developer_dir_of(&apps.join(app), &xcodebuild, xcrun, WITHIN).expect_err("left out")
+        };
+        let (xcodebuild_at, xcrun_at) = (xcodebuild.display(), xcrun.display());
         assert_eq!(
-            hung,
-            Err(format!(
-                "{} -version: no answer within 2s; killed",
-                xcodebuild.display()
-            ))
+            why("Xcode_broken.app", &xcrun),
+            format!("{xcodebuild_at} -license check exited with exit status: 69: {NOT_AGREED}")
+        );
+        assert_eq!(
+            why("Xcode_noclang.app", &xcrun),
+            format!(
+                "{xcrun_at} --find clang exited with exit status: 72: \
+                 xcrun: error: unable to find utility \"clang\""
+            )
+        );
+        assert_eq!(
+            why("Xcode_mute.app", &xcrun),
+            "no build in xcodebuild -version: \"Xcode 16\""
+        );
+        assert_eq!(
+            why("Xcode_hung.app", &xcrun),
+            format!("{xcodebuild_at} -version: no answer within 2s; killed")
+        );
+        let no_xcrun = dir.join("no-xcrun");
+        assert_eq!(
+            why("Xcode_good.app", &no_xcrun),
+            format!(
+                "{} --find clang: No such file or directory (os error 2)",
+                no_xcrun.display()
+            )
         );
         kbf_outputs::remove_tree(&dir).expect("clean");
     }

@@ -146,13 +146,18 @@ never share a cache entry.
 
 A Mac may have several Xcodes installed; it serves an action that names any of them.
 The daemon finds them at start: each `Xcode*.app` in `/Applications` (the
-`--xcode-apps` flag) that answers `xcodebuild -version` is reported as an `xcode`
-entry of its node report. An Xcode that does not answer (its licence not accepted, its
-first launch not run), or does not answer within a minute, is left out and logged; a
-hung one is killed, so it cannot keep the node from starting. An answer counts only
-once `xcodebuild` has exited and closed its output: one that exits but leaves a child
-holding its output open is left out when the minute is up. The Xcodes are asked one
-after another, so N hung Xcodes delay the daemon's start by up to N minutes. An action
+`--xcode-apps` flag) is asked three questions under its own `DEVELOPER_DIR`:
+`xcodebuild -version` (which must print a build), `xcodebuild -license check` and
+`xcrun --find clang`. One for which all three exit 0, each within a minute, is reported
+as an `xcode` entry of its node report. Any other is left out, and the log names the
+question it failed and why: an Xcode whose licence is not accepted still answers
+`-version` with exit 0, but `-license check` and every tool it runs (`xcrun`, `cc`,
+`swiftc`) exit 69, so it would fail every action placed on it. A hung question is
+killed, so it cannot keep the node from starting. An answer counts only once the
+program has exited and closed its output: one that exits but leaves a child holding its
+output open is left out when the minute is up. The Xcodes are asked one after another,
+so each hung Xcode delays the daemon's start by up to a minute per question it is
+asked (three at most). An action
 that names no `xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
 `DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
 whatever its environment says.
