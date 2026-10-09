@@ -174,22 +174,26 @@ own home, temporary and cache directories, named by `HOME`, `TMPDIR`,
 `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the lease
 ends. Two kinds of write in the daemon user's temporary folder
 (`getconf DARWIN_USER_TEMP_DIR`, under `/var/folders`) are allowed too, because macOS
-tools make them there whatever `TMPDIR` says: Foundation's atomic saves (under
-`TemporaryItems`, which `swift build` and `xcodebuild` need) and `xcrun`'s cache
+tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
+`TemporaryItems`, which `swift build` and `xcodebuild` need; the daemon makes that
+folder, and an action cannot remove, rename or replace it) and `xcrun`'s cache
 (`xcrun_db`, behind `cc`, `clang` and `swiftc`). The daemon sweeps what leases leave
-there once it is an hour old. Until each lease runs as its own user, leases on one Mac
-share those names: one lease can see another's temporary files there and rewrite the
-`xcrun` cache the next lease reads. A tool that writes anywhere else (`/tmp`, a path
+there once its last change is an hour from now, before or after, never through a
+symlink. Until each lease runs as its own user, leases on one Mac share those names:
+one lease can see another's temporary files there and rewrite the `xcrun` cache the
+next lease reads. The daemon does not trust that cache itself: it removes it at
+start, before it asks each Xcode for its build, and runs each Xcode's own
+`xcodebuild` rather than the `/usr/bin` one. A tool that writes anywhere else (`/tmp`, a path
 under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule
 points such a tool into the lease: `swiftc -module-cache-path`,
 `xcodebuild -derivedDataPath`. `xcodebuild` and SwiftPM find `~` through the user
 database, not `HOME`: `swift build` only warns and goes on without its user-level
 caches, but `xcodebuild` resolving a Swift package fails, because it must write
-`~/Library/Caches/org.swift.swiftpm`; `xcodebuild` on a project without packages
-works. Setting `CFFIXED_USER_HOME` to the lease's `HOME` is no way round it:
+`~/Library/Caches/org.swift.swiftpm` (issue #179); `xcodebuild` on a project without
+packages works. Setting `CFFIXED_USER_HOME` to the lease's `HOME` is no way round it:
 `xcodebuild` then has a system service mount its Metal toolchain under that home,
 and the mount, owned by root, keeps the lease directory from being removed, which
-fails the lease. Apple's
+fails the lease (issue #178). Apple's
 tools that nest a sandbox of their own need it turned off, since macOS refuses a
 sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
 the outer profile still keeps their writes inside the lease.
