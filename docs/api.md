@@ -65,30 +65,71 @@ request turns writes off.
 
 ## `GET /v1/nodes`
 
-Every node registered since the server started, in node-id order, with its software
-and where it is in placement:
+Every node registered since the server started, and every node of
+[`--expected-nodes`](#expected-nodes) that has not, in node-id order, with its
+software and where it is in placement:
 
 ```json
 { "nodes": [
-  { "node_id": "mac-1", "connected": true, "software": {
+  { "node_id": "linux-2", "connected": false, "expected": true,
+    "last_seen_unix_ms": null, "software": null,
+    "placement": { "state": "absent", "since_unix_ms": 1791369000000 } },
+  { "node_id": "mac-1", "connected": true, "expected": true,
+    "last_seen_unix_ms": 1791370004000, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
       "received_at_unix_ms": 1791370000000 },
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
                    "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "software": null,
+  { "node_id": "old-1", "connected": false, "expected": false,
+    "last_seen_unix_ms": 1791369500000, "software": null,
     "placement": { "state": "serving" } }
-] }
+], "expected_nodes_error": null }
 ```
 
 | Field | Meaning |
 |---|---|
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
+| `expected` | whether `--expected-nodes` lists it |
+| `last_seen_unix_ms` | when the server last heard from it (the first `Hello` of its newest stream, or the newest heartbeat taken), by the server's clock; `null` for an `absent` node |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
-| `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
+| `placement.state` | `absent` (expected, and it has not registered since the server started: the scheduler knows nothing of it); `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
+| `placement.since_unix_ms` | while absent: when this server began expecting it (its start, or the reload that first listed it), by the server's clock |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
+
+| `expected_nodes_error` | why the newest read of `--expected-nodes` failed (the last list read is still in use); `null` when it succeeded or there is no file |
+
+A node that registered and then disconnected keeps its entry, with `connected: false`,
+its `last_seen_unix_ms` and its placement; it is never shown as `absent`.
+
+### Expected nodes
+
+The server keeps what it knows of nodes in memory, so after a restart it lists only
+the nodes that have registered since: without help, a node that does not come back
+would simply vanish from the list. `--expected-nodes <file>` (which needs
+`--api-listen`) names the nodes the server should have; each one that has not
+registered since the server started is listed as `absent`, so it can be alerted on.
+The file is UTF-8 text of at most 1 MiB. Each line is blank, a `#` comment, or one
+node id, as its daemon registers it, optionally followed by a `#` comment:
+
+```text
+# the Linux hosts
+linux-1
+linux-2      # back from repair
+mac-07
+```
+
+A line of more than one word, or a node listed twice, is refused. The server reads
+the file at start and refuses to start if it cannot be read, is not a regular file,
+or does not parse. After that, each `GET /v1/nodes` (and each write's answer) takes
+the file's metadata and reads it again if its size, inode, modification time or
+change time changed. A node a reload adds is absent from that reload on; a node it
+removes is no longer listed, unless it registered. A reload that fails (the file
+removed, unreadable or not parsing) keeps the last list read, so no node is dropped,
+and `expected_nodes_error` says why until a read succeeds. Write the file to a new
+name and rename it over the old one, so that no read sees half an edit.
 
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
@@ -106,7 +147,7 @@ An operator takes a node out of placement, drains it, or returns it
 - `:uncordon`: returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
-node that never registered or an unknown verb, `400` for a drain body of another
+node that never registered (an `absent` node included) or an unknown verb, `400` for a drain body of another
 shape, and `401`, `403` or `415` from the gates of [Who may write](#who-may-write).
 
 A cordon names the node, not its stream: a node that reconnects (say, after a reboot)

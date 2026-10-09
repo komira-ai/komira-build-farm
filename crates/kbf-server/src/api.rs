@@ -3,7 +3,9 @@
 //! `docs/api.md`).
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
-//!   software status each sent and where it is in placement ([`crate::fleet`]).
+//!   software status each sent and where it is in placement ([`crate::fleet`]), and
+//!   each node of `--expected-nodes` that has not registered, as `absent`
+//!   ([`crate::expected`]).
 //! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
 //!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
@@ -33,7 +35,9 @@ use kbf_objstore::ObjectStore;
 use kbf_types::WorkerId;
 use serde::Deserialize;
 
+use crate::expected::ExpectedNodes;
 use crate::farm::{Farm, NodeAction};
+use crate::fleet;
 use crate::token::ApiToken;
 
 /// The media type of every body this API returns, and of every write it accepts.
@@ -43,17 +47,23 @@ pub const JSON: &str = "application/json";
 /// (`drain_deadline` in `fleet-updates.md` section 4.1).
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-/// What the handlers share: the farm, and the token writes must present (`None`:
-/// writes are off).
+/// What the handlers share: the farm, the token writes must present (`None`: writes
+/// are off), and the nodes expected (`None`: none).
 struct ApiState<M, O> {
     farm: Arc<Farm<M, O>>,
     token: Option<ApiToken>,
+    expected: Option<Arc<ExpectedNodes>>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
-/// Writes read the peer address from [`ConnectInfo`]: serve them with
+/// Each node `expected` lists that has not registered is listed as `absent`. Writes
+/// read the peer address from [`ConnectInfo`]: serve them with
 /// `into_make_service_with_connect_info`.
-pub fn router<M, O>(farm: Arc<Farm<M, O>>, token: Option<ApiToken>) -> Router
+pub fn router<M, O>(
+    farm: Arc<Farm<M, O>>,
+    token: Option<ApiToken>,
+    expected: Option<Arc<ExpectedNodes>>,
+) -> Router
 where
     M: MetaLog,
     O: ObjectStore + 'static,
@@ -61,7 +71,11 @@ where
     Router::new()
         .route("/v1/nodes", get(nodes::<M, O>))
         .route("/v1/nodes/{target}", post(act::<M, O>))
-        .with_state(Arc::new(ApiState { farm, token }))
+        .with_state(Arc::new(ApiState {
+            farm,
+            token,
+            expected,
+        }))
 }
 
 async fn nodes<M, O>(State(api): State<Arc<ApiState<M, O>>>) -> Response
@@ -69,7 +83,12 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    json(StatusCode::OK, &api.farm.nodes())
+    let view = api.farm.nodes();
+    let view = match &api.expected {
+        Some(expected) => fleet::with_expected(view, &expected.current()),
+        None => view,
+    };
+    json(StatusCode::OK, &view)
 }
 
 async fn act<M, O>(
@@ -91,7 +110,12 @@ where
     };
     match write_request(api.token.as_ref(), &request) {
         Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(view) => json(StatusCode::OK, &view),
+            Ok(mut view) => {
+                if let Some(expected) = &api.expected {
+                    fleet::mark(&mut view, &expected.current());
+                }
+                json(StatusCode::OK, &view)
+            }
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),

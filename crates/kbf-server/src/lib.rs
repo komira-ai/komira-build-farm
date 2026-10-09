@@ -9,7 +9,9 @@
 //!   ([`identity`]).
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
-//!   need the token of `--api-token-file` ([`token`]).
+//!   need the token of `--api-token-file` ([`token`]). With `--expected-nodes`
+//!   ([`expected`]) it also lists each expected node that has not registered as
+//!   `absent`.
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
@@ -28,6 +30,7 @@
 
 pub mod api;
 pub mod config;
+pub mod expected;
 pub mod farm;
 pub mod fleet;
 pub mod identity;

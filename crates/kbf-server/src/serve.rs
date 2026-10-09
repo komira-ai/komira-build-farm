@@ -13,6 +13,7 @@ use kbf_proto::worker::worker_server::WorkerServer;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
+use crate::expected::ExpectedNodes;
 use crate::farm::Farm;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
@@ -64,6 +65,9 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
+    /// The nodes it lists as `absent` until they register; `None` lists only the
+    /// nodes that have registered.
+    pub expected_nodes: Option<Arc<ExpectedNodes>>,
 }
 
 /// Why the server could not start or stopped.
@@ -179,10 +183,12 @@ where
     ));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let (api_listen, token, expected) = api.map_or((None, None, None), |api| {
+        (Some(api.listen), api.token, api.expected_nodes)
+    });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
-    let api_routes = crate::api::router(Arc::clone(&farm), token);
+    let api_routes = crate::api::router(Arc::clone(&farm), token, expected);
 
     let mut worker_server = Server::builder();
     let peers = match listeners.worker_tls {

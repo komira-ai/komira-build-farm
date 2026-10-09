@@ -154,6 +154,9 @@ struct Link {
     /// `Start` names it, and the daemon acts on the `Start` only within
     /// [`START_VALIDITY`] of having sent that heartbeat (or, for 0, its `Hello`).
     newest_beat: u64,
+    /// When the server last heard from the node on it: its first `Hello`, or the
+    /// newest heartbeat taken.
+    seen: FarmTime,
 }
 
 /// A lease whose `Start` was sent.
@@ -290,6 +293,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             instance: instance.clone(),
             outbound,
             newest_beat: 0,
+            seen: now,
         };
         let replaced = state.links.insert(worker.clone(), link);
         if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
@@ -338,6 +342,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             return false;
         };
         link.newest_beat = link.newest_beat.max(seq);
+        link.seen = now;
         let outbound = link.outbound.clone();
         let event = Event::Heartbeat {
             worker: worker.clone(),
@@ -377,7 +382,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             .keys()
             .map(|worker| self.node(&state, worker))
             .collect();
-        NodesView { nodes }
+        NodesView {
+            nodes,
+            expected_nodes_error: None,
+        }
     }
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.
@@ -434,9 +442,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 leases: leases(),
             },
         };
+        let link = &state.links[worker];
         NodeView {
             node_id: worker.as_str().to_owned(),
-            connected: !state.links[worker].outbound.is_closed(),
+            connected: !link.outbound.is_closed(),
+            expected: false,
+            last_seen_unix_ms: Some(wall(link.seen)),
             software: state.software.get(worker).cloned(),
             placement,
         }
@@ -947,68 +958,4 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Catches a server process that reuses an earlier process's term (issue #137:
-    /// every process granted leases from `(1, 0)`), and one whose term does not order
-    /// after that of a process started a few milliseconds before. A term is also never
-    /// 1, the term every server before the fix used.
-    #[test]
-    fn each_process_term_is_new_and_later() {
-        let first = process_term();
-        std::thread::sleep(Duration::from_millis(3));
-        let second = process_term();
-        assert!(second > first, "{second} does not order after {first}");
-        assert!(first >> 16 > 0, "{first} could be a pre-fix term");
-    }
-
-    /// Catches a name parser that is not the exact inverse of [`operation_name`]: one
-    /// that ignores the term or accepts another (issue #154), and one that accepts a
-    /// spelling the server never writes, which would give one operation several names.
-    #[test]
-    fn operation_names_parse_only_as_this_term_writes_them() {
-        let term = 0x0199_8a6b_2c3d_4e5f;
-        for n in [0, 1, 42, u64::MAX] {
-            let name = operation_name(term, WaiterId(n));
-            assert_eq!(
-                parse_operation_name(&name, term),
-                Some(WaiterId(n)),
-                "{name}"
-            );
-            for other in [0, term - 1, term + 1, u64::MAX] {
-                assert_eq!(
-                    parse_operation_name(&name, other),
-                    None,
-                    "{name} as {other}"
-                );
-            }
-        }
-        assert_eq!(operation_name(7, WaiterId(3)), "operations/7-3");
-        for refused in [
-            "",
-            "operations/",
-            "operations/7",
-            "operations/7-",
-            "operations/-3",
-            "operations/7--3",
-            "operations/7-3-1",
-            "operations/07-3",
-            "operations/7-03",
-            "operations/+7-3",
-            "operations/7-+3",
-            "operations/7-3 ",
-            " operations/7-3",
-            "operations/7-18446744073709551616",
-            "Operations/7-3",
-            "operation/7-3",
-            "operations/7_3",
-            "7-3",
-            "operations/3",
-            "operations/cached/7-3",
-        ] {
-            assert_eq!(parse_operation_name(refused, 7), None, "{refused:?}");
-        }
-        assert_eq!(parse_operation_name("operations/7-0", 7), Some(WaiterId(0)));
-    }
-}
+mod tests;

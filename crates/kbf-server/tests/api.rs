@@ -100,6 +100,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
+        expected_nodes: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -205,7 +206,10 @@ fn linux_status(kernel: &str) -> NodeStatus {
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
     let (worker, api) = (server.worker, server.api);
-    assert_eq!(nodes(api).await, json!({ "nodes": [] }));
+    assert_eq!(
+        nodes(api).await,
+        json!({ "nodes": [], "expected_nodes_error": null })
+    );
 
     let before = now_ms();
     let linux = FakeDaemon::connect_without_status(worker, hello("linux-1", 8, 16))
@@ -236,6 +240,18 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     .await;
     let after = now_ms();
     for node in got["nodes"].as_array_mut().expect("a list").iter_mut() {
+        let seen = node
+            .as_object_mut()
+            .and_then(|n| n.remove("last_seen_unix_ms"))
+            .and_then(|v| v.as_u64())
+            .expect("a last-seen time");
+        // Farm time shown on the wall clock: the server's start time and the time
+        // since are each rounded down to the millisecond, so it may read up to 2 ms
+        // early.
+        assert!(
+            (before.saturating_sub(2)..=after).contains(&seen),
+            "{seen} not in {before}..={after}"
+        );
         if let Some(software) = node["software"].as_object_mut() {
             let at = software
                 .remove("received_at_unix_ms")
@@ -250,19 +266,22 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     assert_eq!(
         got,
         json!({ "nodes": [
-            { "node_id": "linux-1", "connected": true, "software": {
+            { "node_id": "linux-1", "connected": true, "expected": false,
+              "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
                 "xcode_builds": [] },
               "placement": { "state": "serving" } },
-            { "node_id": "mac-1", "connected": true, "software": {
+            { "node_id": "mac-1", "connected": true, "expected": false,
+              "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
                 "xcode_builds": ["15F31d", "16C5032a"] },
               "placement": { "state": "serving" } },
-            { "node_id": "old-1", "connected": true, "software": null,
+            { "node_id": "old-1", "connected": true, "expected": false,
+              "software": null,
               "placement": { "state": "serving" } },
-        ] })
+        ], "expected_nodes_error": null })
     );
 
     linux.send(daemon_message::Message::NodeStatus(linux_status(
@@ -298,6 +317,7 @@ async fn an_api_address_in_use_is_refused() {
     let api = Api {
         listen: addr,
         token: None,
+        expected_nodes: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {

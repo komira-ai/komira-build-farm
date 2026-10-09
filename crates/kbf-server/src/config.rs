@@ -11,6 +11,7 @@ use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
+use crate::expected::{ExpectedNodes, ExpectedNodesError};
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
 use crate::token::{ApiToken, TokenFileError};
@@ -63,6 +64,13 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// A file listing the nodes this server expects, one node id per line (format in
+    /// `docs/api.md`). `GET /v1/nodes` lists each one that has not registered since
+    /// the server started as `absent`, so a node that does not come back after a
+    /// restart is shown rather than forgotten. Read at start (a bad file stops the
+    /// server), then again whenever its metadata changes.
+    #[arg(long, requires = "api_listen")]
+    pub expected_nodes: Option<PathBuf>,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]
@@ -148,6 +156,9 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The expected-nodes file is refused.
+    #[error("--expected-nodes: {0}")]
+    ExpectedNodes(#[from] ExpectedNodesError),
 }
 
 impl Args {
@@ -187,10 +198,11 @@ impl Args {
     }
 
     /// The operator API these flags describe, if `--api-listen` is given, with the
-    /// token read from `--api-token-file`.
+    /// token read from `--api-token-file` and the nodes `--expected-nodes` lists.
     ///
     /// # Errors
-    /// The token file is refused (see [`ApiToken::from_file`]).
+    /// The token file is refused (see [`ApiToken::from_file`]), or the expected-nodes
+    /// file (see [`ExpectedNodes::open`]).
     pub fn api(&self) -> Result<Option<Api>, ConfigError> {
         let Some(listen) = self.api_listen else {
             return Ok(None);
@@ -200,7 +212,17 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        let expected_nodes = self
+            .expected_nodes
+            .as_deref()
+            .map(ExpectedNodes::open)
+            .transpose()?
+            .map(std::sync::Arc::new);
+        Ok(Some(Api {
+            listen,
+            token,
+            expected_nodes,
+        }))
     }
 
     /// The S3 store and the key prefix of this start, for `--store=s3`. `env` reads

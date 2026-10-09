@@ -202,8 +202,56 @@ fn api_listen_serves_the_operator_api() {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.ends_with("\r\n\r\n{\"nodes\":[]}"), "{response}");
+    let empty = "\r\n\r\n{\"nodes\":[],\"expected_nodes_error\":null}";
+    assert!(response.ends_with(empty), "{response}");
     interrupt(child);
+}
+
+/// Catches: `--expected-nodes` parsed but not given to the API (the binary lists no
+/// absent node), and a bad file accepted at start instead of stopping it with exit 2
+/// and a message naming the flag and the line.
+#[cfg(unix)]
+#[test]
+fn expected_nodes_are_listed_as_absent_and_a_bad_file_stops_the_start() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-binary");
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let good = dir.join(format!("expected-good-{}", std::process::id()));
+    std::fs::write(&good, "linux-9 # never connects\n").expect("write");
+    let good = good.to_str().expect("a UTF-8 path");
+    let mut c = server(&["--api-listen", "127.0.0.1:0", "--expected-nodes", good]);
+    c.args(ANY_PORT);
+    let (child, line, _) = started(c);
+    let api: SocketAddr = line
+        .rsplit_once(" api=")
+        .expect("an API address")
+        .1
+        .parse()
+        .expect("an address");
+    let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    stream
+        .write_all(b"GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
+        .expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    let absent = "{\"node_id\":\"linux-9\",\"connected\":false,\"expected\":true,";
+    assert!(response.contains(absent), "{response}");
+    assert!(
+        response.contains("{\"state\":\"absent\",\"since_unix_ms\":"),
+        "{response}"
+    );
+    interrupt(child);
+
+    let bad = dir.join(format!("expected-bad-{}", std::process::id()));
+    std::fs::write(&bad, "linux-1\nlinux-2 linux-3\n").expect("write");
+    let bad = bad.to_str().expect("a UTF-8 path");
+    let mut c = server(&["--api-listen", "127.0.0.1:0", "--expected-nodes", bad]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!("--expected-nodes: {bad}:2: ")),
+        "{stderr}"
+    );
 }
 
 /// A token file holding `content` with `mode`, under `name`.

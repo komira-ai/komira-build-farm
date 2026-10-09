@@ -6,9 +6,18 @@
 //! section 3.1). The server keeps the newest one per node, from the node's current
 //! stream only, **in memory**: like the scheduler's state it is gone after a restart,
 //! and each daemon sends it again after its next `Welcome`.
+//!
+//! So that a restart does not silently drop a node that never comes back, the server
+//! can be given the nodes it expects (`--expected-nodes`, [`crate::expected`]): each
+//! one that has not registered since the server started is listed too, as `absent`
+//! ([`with_expected`]).
+
+use std::collections::BTreeSet;
 
 use kbf_proto::worker::NodeStatus;
 use serde::Serialize;
+
+use crate::expected::Expected;
 
 /// One node, as `GET /v1/nodes` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -17,6 +26,12 @@ pub struct NodeView {
     pub node_id: String,
     /// Whether its newest stream is still open.
     pub connected: bool,
+    /// Whether it is listed in `--expected-nodes`.
+    pub expected: bool,
+    /// When the server last heard from it, its first `Hello` on its newest stream or
+    /// the newest heartbeat taken: milliseconds since the Unix epoch, server clock.
+    /// `None` for a node that has not registered since the server started.
+    pub last_seen_unix_ms: Option<u64>,
     /// The newest software status it sent; `None` if it sent none (a daemon that
     /// predates `NodeStatus`).
     pub software: Option<SoftwareView>,
@@ -28,6 +43,14 @@ pub struct NodeView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PlacementView {
+    /// Expected, and it has not registered since the server started: placement knows
+    /// nothing of it and offers it nothing.
+    Absent {
+        /// When this server began expecting it (its start, or the reload of
+        /// `--expected-nodes` that first listed it): milliseconds since the Unix
+        /// epoch, server clock.
+        since_unix_ms: u64,
+    },
     /// Placement may offer it leases.
     Serving,
     /// An operator cordoned it: no new lease; its leases run on.
@@ -88,10 +111,48 @@ impl SoftwareView {
     }
 }
 
-/// The body of `GET /v1/nodes`: every node registered since the server started, in
-/// node-id order.
+/// The body of `GET /v1/nodes`: every node registered since the server started, and
+/// every expected node that has not, in node-id order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NodesView {
     /// The nodes.
     pub nodes: Vec<NodeView>,
+    /// Why `--expected-nodes` could not be read again (the last list read is still in
+    /// use); `None` when it was, or when there is no such file.
+    pub expected_nodes_error: Option<String>,
+}
+
+/// `view` with `expected` applied: each listed node is marked `expected`, each listed
+/// node missing from it is added as [`PlacementView::Absent`], and the reason a
+/// reload failed, if one did, is carried along.
+#[must_use]
+pub fn with_expected(mut view: NodesView, expected: &Expected) -> NodesView {
+    for node in &mut view.nodes {
+        mark(node, expected);
+    }
+    let registered: BTreeSet<&str> = view.nodes.iter().map(|n| n.node_id.as_str()).collect();
+    let absent: Vec<NodeView> = expected
+        .listed
+        .iter()
+        .filter(|(id, _)| !registered.contains(id.as_str()))
+        .map(|(id, since)| NodeView {
+            node_id: id.clone(),
+            connected: false,
+            expected: true,
+            last_seen_unix_ms: None,
+            software: None,
+            placement: PlacementView::Absent {
+                since_unix_ms: *since,
+            },
+        })
+        .collect();
+    view.nodes.extend(absent);
+    view.nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    view.expected_nodes_error.clone_from(&expected.error);
+    view
+}
+
+/// Marks `node` `expected` if `expected` lists it.
+pub fn mark(node: &mut NodeView, expected: &Expected) {
+    node.expected = expected.listed.contains_key(&node.node_id);
 }
