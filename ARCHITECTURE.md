@@ -284,7 +284,9 @@ branches rise. How the code is tested:
   hosted runners, on x86-64 and arm64.
 - **End to end.** The `integration` workflow starts a cell (an S3 store, one
   `kbf-server`, one daemon) and builds sample projects with pinned Bazel and Buck2
-  versions, remote-only, twice; the second build must be all remote cache hits. Its
+  versions, remote-only, twice; the second build must be all remote cache hits. A
+  Buck2 action that sleeps then holds a lease in flight while the node is drained
+  through the operator API, which must list that lease. Its
   daemon uses a test-only runtime that runs actions as plain processes, so it proves
   the protocol and the cache path, not isolation.
 - **Repository lints.** Workflows may only use hosted runners and pinned actions from
