@@ -51,15 +51,16 @@ which is a result.
 | `simctl.sh` (the runner's own session) | newest available iOS runtime and an iPhone device type; `simctl --set <dir>` create, boot, `bootstatus -b` (10 min watchdog), `io screenshot` (must be a PNG), shutdown, delete; then leftover `launchd_sim` processes and device-set entries | a boot under a sandbox profile that denies the lookup of `com.apple.CoreSimulator.CoreSimulatorService` must fail, and the same boot under `(allow default)` alone must succeed |
 | `tcc.sh` (instrument for the Screen Recording and Accessibility questions) | SIP status; the ScreenCapture, Accessibility, ListenEvent and PostEvent rows of the system and the user TCC database, each read as the runner user and as root | the same reader over a planted database must return exactly its one known row |
 
-The status text of `automationmodetool` is parsed as two fields: `enabled` (on, off)
-and `auth` (required, not required). The wording the parser expects is a guess
-until a hosted run records it: every reading also records the raw text, and text the
-parser does not recognise reads as `unknown`, which never triggers enable and gives
-a FAIL.
+The status text of `automationmodetool` is parsed, case-insensitively, as two fields:
+`enabled` (on, off) and `auth` (required, not required), matching the wording the
+hosted runners printed (Results). Every reading also records the raw text, and text
+the parser does not recognise reads as `unknown`, which never triggers enable and
+gives a FAIL. Every command the probe runs is under the watchdog with stdin closed.
 
 The selftest (`tools/spike/macos/test/run.sh`) drives each probe against fakes of the
 macOS programs. `test/mutants.sh` plants defects that each must turn a test red,
-among them: an arm run outside its subshell; the key without the `macos-` prefix; a
+among them: an arm run outside its subshell; a watchdog that leaves the command on
+the caller's pipe; `sysadminctl` run without the watchdog; the key without the `macos-` prefix; a
 watchdog that reports a hang as success; a status parser that accepts any "require"
 as not required; enable run whatever the last status said; a verdict that ignores
 the control arm (each probe); a screenshot not checked to be a PNG; a simulator
@@ -67,8 +68,52 @@ booted in the default device set.
 
 ## Results
 
-Planned: the first hosted run's results, per runner label, go here with its run id.
-No result is recorded yet.
+All numbers come from run `37987149882` (commit `95505ed`). Every probe's verdict was
+PASS on both labels.
+
+| | `macos-26` job | `macos-15` job |
+|---|---|---|
+| macOS | 26.6.2 (25G83), arm64 | 15.7.9 (24G830), arm64 |
+| Default Xcode | 26.6 (17F113) | 16.4 (16F6) |
+| Context | admin user, launchd domain `Aqua`, console user = the runner user | same |
+| SIP | disabled | disabled |
+
+**automationmodetool.** The status prints two lines. The first is `Automation Mode is
+disabled.` on every reading (it reports whether a test session holds Automation Mode
+now, not the device setting). The second is the setting: `This device DOES NOT REQUIRE
+user authentication to enable Automation Mode.` or `This device requires user
+authentication to enable Automation Mode.` (exact case as printed). Both images start
+out not requiring authentication, so the image already ran enable. The control
+(`disable-automationmode-without-authentication` via `sudo -n`, stdin closed) brought
+`requires` back; `enable-automationmode-without-authentication` the same way took it
+to `DOES NOT REQUIRE` again, with exit status 0, no prompt, and well inside the 60 s
+watchdog. A new standard user, made with `sysadminctl -addUser`, read the same
+not-required status, and so did a reading after that user was deleted.
+`sysadminctl` warned that the new user cannot use FileVault (no secure token).
+
+The first run of this probe (run `37984178027`, cancelled) ran `sysadminctl` without
+the watchdog and with the step's stdin open; neither job got past adding the user in
+15 minutes. Since then every command runs under the watchdog with stdin closed, and
+the add took about 4 s. What it waited on in that run was not recorded.
+
+**simctl.** The newest available iOS runtime (iOS 26.5 on `macos-26`, iOS 26.2 on
+`macos-15`) and an iPhone 17 Pro device type. In a private `--set` device set, create,
+boot, `bootstatus -b`, a PNG screenshot of about 2.9 MB, shutdown and delete all
+succeeded in the runner's session; `bootstatus` spent its time waiting on data
+migration. The control held: under the CoreSimulatorService deny, `simctl` reported
+"CoreSimulatorService connection became invalid" and the boot failed, while the same
+boot under `(allow default)` succeeded. After the delete: 0 `launchd_sim` processes, 0
+entries left in the device set.
+
+**TCC as seeded.** Both TCC databases were readable as the runner user (SIP is off)
+and as root. Both images seed the same grants, all `auth_value` 2 (allowed). System
+database: ScreenCapture 3 rows, Accessibility 9, PostEvent 3, ListenEvent 0. User
+database: ScreenCapture 5, Accessibility 3, PostEvent 1, ListenEvent 0. The granted
+clients include `/bin/bash`, `/usr/bin/osascript`, `com.apple.Terminal`,
+`com.apple.dt.Xcode-Helper` and the image's own runner and provisioning agents. So on
+a hosted runner a shell-launched UI test inherits Screen Recording and Accessibility
+grants that a fresh farm user will not have. A hosted UI-test result says nothing
+about prompts.
 
 ## Not covered here (planned)
 
@@ -84,8 +129,8 @@ No result is recorded yet.
 
 | Question | What a hosted run can settle | What still needs a Mac Studio |
 |---|---|---|
-| `automationmodetool` as root without a prompt | The verbs, the exact status text, that root via `sudo -n` enables it with stdin closed and no prompt on this image, and that the control brings authentication back | The same on the Studio's macOS build, run as root at its console or by the provisioning profile: a hosted image may ship with it already enabled |
-| The setting across user deletion | That the status read by a new standard user, and after that user is deleted, still says not required | That a UI test in a fresh standard user's **console session** starts without an authentication sheet: that needs a person to log the user in (FileVault on rules out auto-login) and watch |
-| Simulators outside a logged-in session | That `simctl` works with a private device set in the runner's session, and that a sandbox deny of CoreSimulatorService stops it | Whether it works from a LaunchDaemon with nobody logged in, on the Studio's build, with the runtimes installed there |
-| Screen Recording need of XCUITest | Only what the image seeded: hosted images may run with SIP off and pre-granted TCC rows, which `tcc.sh` records next to every result | Whether a UI test needs the grant at all, whether a grant persists across users and runner rebuilds: arms in fresh standard users' sessions, with a person to see and click prompts |
+| `automationmodetool` as root without a prompt | Settled for hosted macOS 15 and 26: the verbs, the exact status text, that root via `sudo -n` with stdin closed enables it with no prompt, and that the control brings authentication back | The same on the Studio's macOS build, run as root at its console or by the provisioning profile, on a Mac where nothing enabled it before |
+| The setting across user deletion | Settled as a status reading: a new standard user, and a reading after that user is deleted, still see not required | That a UI test in a fresh standard user's **console session** starts without an authentication sheet: that needs a person to log the user in (FileVault on rules out auto-login) and watch |
+| Simulators outside a logged-in session | Settled for the runner's own Aqua session: `simctl` works with a private device set, cleans up after delete, and a sandbox deny of CoreSimulatorService stops it | Whether it works from a LaunchDaemon with nobody logged in, on the Studio's build, with the runtimes installed there |
+| Screen Recording need of XCUITest | Only what the image seeded: SIP is off and ScreenCapture is pre-granted to the shell and the runner's agents, so a hosted run cannot answer it | Whether a UI test needs the grant at all, whether a grant persists across users and runner rebuilds: arms in fresh standard users' sessions, with a person to see and click prompts |
 | Accessibility | As above, the seeded rows only | The same Studio arms, and the profile route once a Studio is enrolled in device management |
