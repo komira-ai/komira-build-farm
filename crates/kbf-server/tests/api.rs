@@ -18,7 +18,9 @@ use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, Farm, Listeners, ServeError, bind_server_with_api};
+use kbf_server::{
+    Api, BUILD_COMMIT, Farm, Listeners, SERVER_VERSION, ServeError, bind_server_with_api,
+};
 use kbf_types::{Resources, WorkerId};
 use serde_json::{Value, json};
 use support::{Client, FakeDaemon, HELLO_WAIT, INTERVAL, Job, PROMPT, done, hello, output, ran};
@@ -197,15 +199,25 @@ fn linux_status(kernel: &str) -> NodeStatus {
     }
 }
 
-/// Catches: a `NodeStatus` the server drops (the worker stream ignores it), fields
-/// mapped to the wrong JSON keys, a node without status left out of the list or
-/// listed with an empty object instead of `null`, an older status kept over a newer
-/// one, and a node still listed as connected after its stream ended.
+/// Catches: a body without the `server` field, or one that does not name this build
+/// and its commit (a deploy could not check which commit runs); a `NodeStatus` the
+/// server drops (the worker stream ignores it), fields mapped to the wrong JSON keys,
+/// a node without status left out of the list or listed with an empty object instead
+/// of `null`, an older status kept over a newer one, and a node still listed as
+/// connected after its stream ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
     let (worker, api) = (server.worker, server.api);
-    assert_eq!(nodes(api).await, json!({ "nodes": [] }));
+    let this_build = json!({ "version": SERVER_VERSION, "commit": BUILD_COMMIT });
+    assert_eq!(
+        SERVER_VERSION,
+        format!("{}+{BUILD_COMMIT}", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        nodes(api).await,
+        json!({ "server": this_build, "nodes": [] })
+    );
 
     let before = now_ms();
     let linux = FakeDaemon::connect_without_status(worker, hello("linux-1", 8, 16))
@@ -249,7 +261,7 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     }
     assert_eq!(
         got,
-        json!({ "nodes": [
+        json!({ "server": this_build, "nodes": [
             { "node_id": "linux-1", "connected": true, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
