@@ -1,7 +1,8 @@
 //! `kbf-daemon`: the worker daemon. See the `kbf-daemon` library for what it does.
 //!
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
-//! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
+//! run: `fake` (nothing runs; for bring-up and tests, each action taking
+//! `--fake-action-ms`), `container` (rootless Podman; Linux) or
 //! `native` (plain processes; for Macs). The two real drivers read and write blobs
 //! through the front's REAPI listener named by `--cas`, and make lease directories
 //! under `--scratch`. A Mac in komira's pool runs, for example:
@@ -79,12 +80,18 @@ struct Cli {
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
     id_files: Option<PathBuf>,
+    /// How long each action takes, in milliseconds (fake). The default, 0, ends each
+    /// one at once; a longer one keeps its lease running, for tests that stop or
+    /// drain a daemon with work in flight.
+    #[arg(long)]
+    fake_action_ms: Option<u64>,
 }
 
 /// The drivers this binary can run leases through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum Driver {
-    /// Runs nothing; every action succeeds with an empty result. For bring-up only.
+    /// Runs nothing; every action succeeds with an empty result, after
+    /// `--fake-action-ms`. For bring-up and tests only.
     Fake,
     /// Each action in a fresh rootless Podman container (Linux).
     Container,
@@ -112,11 +119,17 @@ fn main() -> ExitCode {
 /// Builds the driver `--driver` names and serves until a signal; returns an error that
 /// stopped the daemon from starting.
 fn start(cli: &Cli) -> Result<(), Error> {
+    if cli.fake_action_ms.is_some() && cli.driver != Driver::Fake {
+        return Err("--fake-action-ms is for --driver fake only".into());
+    }
     let tokio = tokio::runtime::Runtime::new()?;
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     match cli.driver {
-        Driver::Fake => serve(cli, &tokio, Arc::new(FakeRuntime::new(Duration::ZERO)), []),
+        Driver::Fake => {
+            let run_for = Duration::from_millis(cli.fake_action_ms.unwrap_or(0));
+            serve(cli, &tokio, Arc::new(FakeRuntime::new(run_for)), [])
+        }
         Driver::Native => {
             // `native_config` removes xcrun's cache before it asks the Xcodes.
             let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;

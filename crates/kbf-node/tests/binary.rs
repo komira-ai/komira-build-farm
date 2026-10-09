@@ -272,6 +272,15 @@ fn a_driver_missing_its_flags_refuses_to_start() {
         ),
         (
             vec![
+                "--driver=native".into(),
+                "--cas=http://127.0.0.1:1".into(),
+                scratch.clone(),
+                "--fake-action-ms=5".into(),
+            ],
+            "--fake-action-ms is for --driver fake only",
+        ),
+        (
+            vec![
                 "--driver=container".into(),
                 "--cas=http://127.0.0.1:1".into(),
                 scratch.clone(),
@@ -475,5 +484,62 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         !lease_dir_left,
         "the lease directory was still there at Hello:\n{log}"
     );
+    assert!(status.success(), "{status}: {log}");
+}
+
+/// Catches `--fake-action-ms` not reaching the fake driver: an action that ends at once
+/// instead of after the delay, so a test that stops or drains a
+/// daemon with a lease in flight would find nothing in flight. Until the delay has
+/// passed the lease is listed as running and no `Result` comes; then an OK `Result`
+/// does.
+#[test]
+fn a_fake_action_takes_fake_action_ms() {
+    use kbf_proto::worker::daemon_message::Message;
+
+    const RUN_FOR: Duration = Duration::from_millis(3_000);
+    let dir = tls("fake-action-ms");
+    let front = front::Front::start(&dir);
+    let action = front.sh("exit 0");
+    let flags = vec![
+        format!("--server=https://127.0.0.1:{}", front.worker.port()),
+        "--tls-server-name=localhost".to_owned(),
+        format!("--ca-cert={}", dir.join("ca.pem").display()),
+        format!("--cert={}", dir.join("node.pem").display()),
+        format!("--key={}", dir.join("node.key").display()),
+        "--node-id=node-1".to_owned(),
+        "--reconnect-ms=50".to_owned(),
+        "--driver=fake".to_owned(),
+        format!("--fake-action-ms={}", RUN_FOR.as_millis()),
+    ];
+    let mut child = daemon(&flags, &dir.join("daemon.log"));
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    let sent = Instant::now();
+    session.start(1, 1, action.clone());
+    let is_lease = |id: &kbf_proto::worker::LeaseId| id.term == 1 && id.seq == 1;
+    // Heartbeats come every second (`Session::welcome`), so a lease that runs for
+    // RUN_FOR is listed by at least one of them before its Result.
+    let mut listed = false;
+    let result = loop {
+        match session.next(PROMPT) {
+            Some(Message::Heartbeat(beat)) => listed |= beat.running.iter().any(is_lease),
+            Some(Message::Result(result)) => break Some(result),
+            Some(_) => {}
+            None => break None,
+        }
+    };
+    let took = sent.elapsed();
+    let status = stop(&mut child, libc::SIGTERM);
+    let log = read(&dir.join("daemon.log"));
+    let result = result.unwrap_or_else(|| panic!("no Result within {PROMPT:?}:\n{log}"));
+    assert!(result.lease_id.as_ref().is_some_and(is_lease), "{result:?}");
+    assert_eq!(result.status.map_or(0, |s| s.code), 0, "the action ran: {log}");
+    assert_eq!(result.action_digest, Some(action));
+    assert!(
+        took >= RUN_FOR,
+        "the Result came {took:?} after the Start, before --fake-action-ms ({RUN_FOR:?}):\n{log}"
+    );
+    assert!(listed, "no heartbeat listed the lease while it ran:\n{log}");
     assert!(status.success(), "{status}: {log}");
 }
