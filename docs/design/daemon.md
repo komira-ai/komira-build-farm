@@ -169,13 +169,16 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
 
-Three runtimes exist:
+Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first three,
+picked by `--driver`:
 
-- **`PodmanRuntime`** (`kbf-driver-container`, driver `container`): the runtime for farm
-  nodes, below.
-- **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result. The only
-  runtime the `kbf-daemon` binary offers today, for bring-up; the binary that runs the
-  container driver is **planned**.
+- **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
+  runtime for Linux farm nodes, below. The binary requires `--cgroup-parent`, `--scratch`
+  and `--cas`, and checks the daemon user's subordinate ids before it starts.
+- **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
+  processes on the node, for Macs.
+- **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
+  bring-up.
 - **`LocalRuntime`** (driver `local`): **tests only**. Runs each action as a plain child
   process of the daemon so the whole path (fetch, write inputs, run, measure, upload,
   report) can be tested where no container runtime exists. It isolates nothing and
@@ -354,8 +357,6 @@ runtime reports usage; the container driver does not yet.
 
 ## Planned
 
-- A shipped daemon binary that runs the container driver, with the driver's
-  configuration as flags.
 - **Re-adopting leases across a daemon restart:** each lease runs as its own systemd
   unit, so work continues while the daemon restarts, and the daemon lists every
   re-adopted lease in its first heartbeat.
