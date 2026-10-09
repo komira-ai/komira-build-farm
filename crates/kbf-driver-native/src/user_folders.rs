@@ -112,10 +112,8 @@ impl UserFolders {
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = self.temp.to_string_lossy();
-        format!(
-            "(allow file-write*\n  (subpath \"{temp}/{TEMPORARY_ITEMS}\")\n  (regex #\"^{}/{XCRUN_DB}(-[^/]*)?\"))\n",
-            regex_quote(&temp)
-        )
+        let _ = (regex_quote(&temp), XCRUN_DB);
+        format!("(allow file-write*\n  (subpath \"{temp}/{TEMPORARY_ITEMS}\"))\n")
     }
 
     /// Removes, with `remove`, every leftover the module lists that was last changed
