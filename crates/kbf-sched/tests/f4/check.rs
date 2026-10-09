@@ -7,10 +7,12 @@
 //! (I10, L2), expiry after G and reconciliation with the running set (I3, I9, L3),
 //! dedup and promotion (I13), and the log-order result rule (I5). Each input's
 //! effects are compared with what the model expects, and the scheduler's observable
-//! state (each touched operation's state, each touched worker's bookings, the queue,
-//! the cordons) with the model's. The shadow is kept incrementally, so a step costs
-//! what it changed; [`Checker::full_check`] compares everything and is run every
-//! simulated half minute.
+//! state with the model's: after every input, each touched operation's state, each
+//! touched worker's bookings and the leases it holds, the queue, and every worker's
+//! cordon state. The shadow is kept incrementally, so a step costs what it changed
+//! (plus one cordon lookup per worker); [`Checker::full_check`] also compares every
+//! operation and every worker's bookings and leases, untouched ones included, and is
+//! run every simulated half minute.
 //!
 //! A violation panics with the seed, the step, the invariant and a replay command.
 //!
@@ -668,7 +670,19 @@ impl Checker {
             self.compare_op(id);
         }
         for name in std::mem::take(&mut self.touched_workers) {
-            self.compare_worker(&name, false);
+            self.compare_worker(&name, true);
+        }
+        // I8, I9: every worker's cordon state, touched or not (a map lookup each).
+        for (name, cordon) in self.workers.keys().map(|n| (n, self.cordons.get(n))) {
+            if self.sched.cordon(name) != cordon {
+                self.violated(
+                    "I8/I9",
+                    format!(
+                        "{name} (not touched this step) cordon {:?}, expected {cordon:?}",
+                        self.sched.cordon(name)
+                    ),
+                );
+            }
         }
         // I14: the queue is exactly the queued operations, in (urgency, id) order.
         if !self.sched.queued().eq(self.queue.iter().map(|(_, id)| *id)) {
