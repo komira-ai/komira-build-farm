@@ -301,7 +301,6 @@ fn pids_where(test: impl Fn(u32) -> bool) -> Vec<u32> {
 impl Drop for Fake {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            self.wait_until_nothing_runs();
             super::force_remove(&self.dir);
         }
     }

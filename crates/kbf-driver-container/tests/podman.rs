@@ -295,7 +295,7 @@ struct Walk {
 }
 
 /// How many times [`find`] walks again after fts gave up mid-walk.
-const WALK_ATTEMPTS: usize = 5;
+const WALK_ATTEMPTS: usize = 1; // MUTANT: never walk again
 
 /// Runs GNU find (through `prefix`) over `roots` with the expression `expr`. The walk
 /// passes when find exits 0, or when every error it reported is a directory below one
@@ -558,7 +558,7 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
 /// action's own program (`comm`) running in it is the state the driver relies on (#88).
 async fn set_up_container_cgroup(lease: &Path, comm: &str) -> PathBuf {
     let container = wait_for_container_cgroup(lease).await;
-    wait_for_program_in(&container, comm).await;
+    let _ = (comm, wait_for_program_in); // MUTANT: no wait for the program
     container
 }
 
