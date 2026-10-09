@@ -283,7 +283,8 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
 }
 
 /// Catches a cancelled run (the daemon dropped its task) leaving its container, cgroup
-/// or scratch directory behind.
+/// or scratch directory behind, or cleaning while `podman start` may still run (kbf
+/// #157: a clean that only sent it SIGKILL left it a zombie at `podman rm`).
 #[tokio::test]
 async fn a_dropped_run_still_cleans_up() {
     let fake = Fake::new("dropped");
@@ -314,6 +315,7 @@ async fn a_dropped_run_still_cleans_up() {
     run.abort();
     assert!(run.await.expect_err("cancelled").is_cancelled());
     assert!(!exists(&fake.lease_dir(2)), "scratch left");
+    fake.assert_start_reaped_before_rm();
 }
 
 /// Catches a kernel OOM kill reported as the action's own exit 137 (it would be cached

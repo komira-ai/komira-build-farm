@@ -15,13 +15,15 @@
 //!
 //! Cleaning runs on every path out of `run`: success, failure, timeout and kill. If the
 //! daemon drops the `run` future instead (its task is cancelled), the lease's `Drop`
-//! cleans up, blocking, before the future is gone. A clean that fails turns the lease
-//! into a failure: a dirty node must be loud.
+//! cleans up, blocking, before the future is gone. Either way the clean first makes
+//! sure `podman start` has exited and been reaped, so nothing the driver started is
+//! left running while it removes the lease. A clean that fails turns the lease into a
+//! failure: a dirty node must be loud.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::cas::Cas;
 use kbf_daemon::{Runtime, RuntimeError, Work};
@@ -92,6 +94,11 @@ pub enum ConfigError {
     #[error("cgroup parent {0:?} must start with '/'")]
     CgroupParent(String),
 }
+
+/// How long the clean waits for a `podman start` it has sent `SIGKILL` to exit, and how
+/// often it looks. A killed process exits once it leaves the system call it is in.
+const REAP_LIMIT: Duration = Duration::from_secs(5);
+const REAP_PAUSE: Duration = Duration::from_millis(2);
 
 /// A killer waiting for a lease's work to stop.
 type Stop = oneshot::Sender<()>;
@@ -262,10 +269,12 @@ impl<C: Cas> PodmanRuntime<C> {
         let stderr_path = lease.dir.join("stderr");
         let stdout = std::fs::File::create(&stdout_path).map_err(|e| failed(&stdout_path, &e))?;
         let stderr = std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
-        let mut child = self
+        let start = self
             .podman
             .start(&lease.name, stdout, stderr)
             .map_err(RuntimeError::Failed)?;
+        // The lease owns `podman start` from here, so a dropped run's clean reaps it.
+        let child = lease.start.insert(start);
 
         tokio::select! {
             // `podman start`'s own status is not the action's: Podman's record, read
@@ -273,12 +282,12 @@ impl<C: Cas> PodmanRuntime<C> {
             // `exit_code` fails the lease unless that record says the container exited.
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
-                self.stop_container(lease, &mut child).await;
+                self.stop_container(&lease.name, &lease.cgroup, child).await;
                 return Err(RuntimeError::TimedOut);
             }
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
-                self.stop_container(lease, &mut child).await;
+                self.stop_container(&lease.name, &lease.cgroup, child).await;
                 return Err(RuntimeError::Killed);
             }
         }
@@ -370,17 +379,17 @@ impl<C: Cas> PodmanRuntime<C> {
 
     /// The kill path (RFC 10.10): SIGTERM, the grace period, `cgroup.kill`, then the
     /// grace period again for Podman to notice. Returns once `podman start` has ended.
-    async fn stop_container(&self, lease: &Lease, child: &mut Child) {
+    async fn stop_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
         let grace = self.config.kill_grace;
-        if let Err(e) = self.podman.signal(&lease.name, "TERM").await {
-            tracing::warn!(lease = %lease.name, "SIGTERM: {e}");
+        if let Err(e) = self.podman.signal(name, "TERM").await {
+            tracing::warn!(lease = %name, "SIGTERM: {e}");
         }
         if tokio::time::timeout(grace, child.wait()).await.is_ok() {
             return;
         }
-        tracing::warn!(lease = %lease.name, "still running after SIGTERM; killing its cgroup");
-        if let Err(e) = lease.cgroup.kill() {
-            tracing::warn!(lease = %lease.name, "cgroup.kill: {e}");
+        tracing::warn!(lease = %name, "still running after SIGTERM; killing its cgroup");
+        if let Err(e) = cgroup.kill() {
+            tracing::warn!(lease = %name, "cgroup.kill: {e}");
         }
         if tokio::time::timeout(grace, child.wait()).await.is_err() {
             // The container is removed by force in the clean step either way.
@@ -468,6 +477,8 @@ struct Lease {
     cgroup: LeaseCgroup,
     /// Whether a container may exist.
     created: bool,
+    /// `podman start --attach`, once started. Reaped before anything is removed.
+    start: Option<Child>,
     /// Whether cleaning is still owed.
     armed: bool,
 }
@@ -481,6 +492,7 @@ impl Lease {
             cgroup: LeaseCgroup::at(&config.cgroup_root, &config.cgroup_parent, &name),
             name,
             created: false,
+            start: None,
             armed: true,
         }
     }
@@ -498,6 +510,11 @@ impl Lease {
     fn clean_blocking(&mut self) -> Result<(), String> {
         self.armed = false;
         let mut errors = Vec::new();
+        // First, `podman start`: a dropped run has not waited for it, and until it has
+        // exited it may still start the container's processes or write into the lease.
+        if let Some(mut start) = self.start.take() {
+            errors.extend(reap(&mut start, REAP_LIMIT, REAP_PAUSE).err());
+        }
         if self.created {
             // Kill whatever runs in the lease first: a run dropped mid-start leaves
             // `crun create` in the container's cgroup, and `podman rm --force` returns
@@ -544,6 +561,38 @@ impl Drop for Lease {
             if let Err(why) = self.clean_blocking() {
                 tracing::error!(lease = %self.name, "clean: {why}");
             }
+        }
+    }
+}
+
+/// Kills `child` unless it has exited, and waits at most `limit` for it to exit and be
+/// reaped. Blocking, without the async runtime: a dropped run's clean runs inside `Drop`.
+fn reap(child: &mut Child, limit: Duration, pause: Duration) -> Result<(), String> {
+    // Killed only while `try_wait` says it is unreaped: until then its pid can name no
+    // other process. `try_wait`, not the kill's result, then says when it is gone.
+    if child.try_wait().map_err(wait_failed)?.is_none() {
+        let _ = child.start_kill();
+    }
+    wait_exited(&mut || child.try_wait(), limit, pause)
+}
+
+fn wait_failed(error: std::io::Error) -> String {
+    format!("wait for podman start: {error}")
+}
+
+/// Calls `try_wait` every `pause` until it reports an exit, fails, or `limit` has passed.
+fn wait_exited(
+    try_wait: &mut dyn FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    limit: Duration,
+    pause: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(pause),
+            Ok(None) => return Err(format!("podman start still runs {limit:?} after SIGKILL")),
+            Err(e) => return Err(wait_failed(e)),
         }
     }
 }
@@ -688,6 +737,70 @@ mod tests {
             PodmanRuntime::new(config, cas).err(),
             Some(ConfigError::CgroupParent("actions".to_owned()))
         );
+    }
+
+    /// Catches a clean that removes the lease while `podman start` still runs (kbf
+    /// #157): the process is killed and reaped before `reap` returns, and one already
+    /// waited for is not an error.
+    #[tokio::test]
+    async fn reap_kills_and_reaps_a_running_child() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        reap(&mut child, Duration::from_secs(5), Duration::from_millis(1)).expect("reaped");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "sleep {pid} still there after reap"
+        );
+        let mut done = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        done.wait().await.expect("wait");
+        reap(&mut done, Duration::ZERO, Duration::ZERO).expect("an exited child");
+    }
+
+    /// Catches an unbounded wait for a process that does not exit (one stuck in the
+    /// kernel exits only once it leaves the call), and a failed wait taken as an exit.
+    #[test]
+    fn the_wait_for_podman_start_is_bounded() {
+        let mut looks = 0;
+        let mut never = || {
+            looks += 1;
+            Ok(None)
+        };
+        let limit = Duration::from_millis(20);
+        let why = wait_exited(&mut never, limit, Duration::from_millis(1)).expect_err("never");
+        assert!(why.contains("still runs"), "{why}");
+        assert!(looks > 1, "gave up after {looks} looks");
+        let mut failing = || Err(std::io::Error::other("no child"));
+        let why = wait_exited(&mut failing, Duration::from_secs(5), Duration::ZERO)
+            .expect_err("the wait failed");
+        assert!(why.starts_with("wait for podman start: "), "{why}");
+    }
+
+    /// Catches a clean that reports success when it could not wait for `podman start`
+    /// (here another reaper took its exit).
+    #[tokio::test]
+    async fn a_clean_that_cannot_wait_for_podman_start_fails() {
+        let child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let raw = i32::try_from(child.id().expect("pid")).expect("pid fits");
+        let pid = rustix::process::Pid::from_raw(raw);
+        rustix::process::waitpid(pid, rustix::process::WaitOptions::empty())
+            .expect("reaped elsewhere");
+        let mut config = PodmanConfig::new(
+            PathBuf::from("/nonexistent-kbf-157/scratch"),
+            "/actions".to_owned(),
+        );
+        config.cgroup_root = PathBuf::from("/nonexistent-kbf-157/cgroup");
+        let id = LeaseId { term: 1, seq: 1 };
+        let mut lease = Lease::new(&Podman::new(config.podman.clone()), &config, id);
+        lease.start = Some(child);
+        let why = lease.clean_blocking().expect_err("the wait failed");
+        assert!(why.starts_with("wait for podman start: "), "{why}");
     }
 
     /// Catches a clean step whose blocking task panicked being reported without saying
