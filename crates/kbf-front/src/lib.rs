@@ -48,9 +48,9 @@ pub use crate::cache::{Cache, CacheError, VerifiedBlob};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::execution::{
-    BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN, ExecutionService,
-    Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON, OperationStream, Stage,
-    Submission, Ticket,
+    BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
+    ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
+    OperationStream, Stage, Submission, Ticket, closing,
 };
 pub use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 
@@ -82,16 +82,22 @@ where
 }
 
 /// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
-/// that advertise execution.
-pub fn routes_with_execution<M, O, D>(cache: Arc<Cache<M, O>>, dispatch: Arc<D>) -> Routes
+/// that advertise execution. Open Execute and WaitExecution streams end UNAVAILABLE
+/// when `closing`'s [`Closer`] closes.
+pub fn routes_with_execution<M, O, D>(
+    cache: Arc<Cache<M, O>>,
+    dispatch: Arc<D>,
+    closing: Closing,
+) -> Routes
 where
     M: MetaLog,
     O: ObjectStore + 'static,
     D: Dispatch,
 {
-    let execution = ExecutionServer::new(ExecutionService::new(Arc::clone(&cache), dispatch))
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let execution =
+        ExecutionServer::new(ExecutionService::new(Arc::clone(&cache), dispatch, closing))
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
     cache_routes(cache, CapabilitiesService::with_execution()).add_service(execution)
 }
 

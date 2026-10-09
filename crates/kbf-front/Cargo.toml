@@ -20,7 +20,7 @@ kbf-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "sync"] }
 tonic.workspace = true
 tracing.workspace = true
 
