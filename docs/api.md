@@ -98,8 +98,7 @@ software and where it is in placement:
 | `placement.state` | `absent` (expected, and it has not registered since the server started: the scheduler knows nothing of it); `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.since_unix_ms` | while absent: when this server began expecting it (its start, or the reload that first listed it), by the server's clock |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
-
-| `expected_nodes_error` | why the newest read of `--expected-nodes` failed (the last list read is still in use); `null` when it succeeded or there is no file |
+| `expected_nodes_error` (beside `nodes`) | why the newest read of `--expected-nodes` failed (the last list read is still in use); `null` when it succeeded or there is no file |
 
 A node that registered and then disconnected keeps its entry, with `connected: false`,
 its `last_seen_unix_ms` and its placement; it is never shown as `absent`.
@@ -124,8 +123,8 @@ mac-07
 A line of more than one word, or a node listed twice, is refused. The server reads
 the file at start and refuses to start if it cannot be read, is not a regular file,
 or does not parse. After that, each `GET /v1/nodes` (and each write's answer) takes
-the file's metadata and reads it again if its size, inode, modification time or
-change time changed. A node a reload adds is absent from that reload on; a node it
+the file's metadata and reads it again if its size, device, inode, modification time
+or change time changed. A node a reload adds is absent from that reload on; a node it
 removes is no longer listed, unless it registered. A reload that fails (the file
 removed, unreadable or not parsing) keeps the last list read, so no node is dropped,
 and `expected_nodes_error` says why until a read succeeds. Write the file to a new

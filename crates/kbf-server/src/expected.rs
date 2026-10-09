@@ -22,12 +22,12 @@
 //!
 //! **Reloads.** The file is read once at start; a file that cannot be read or parsed
 //! then stops the server. After that, each `GET /v1/nodes` (and each write's answer)
-//! takes the file's metadata, and reads it again if its size, inode, modification
-//! time or change time differ from the last read. A node a reload adds is expected
-//! from that reload on; a node it removes is no longer listed unless it registered. A
-//! reload that fails (the file is gone, unreadable or does not parse) keeps the last
-//! list read, so no node is dropped, and the reason is shown in the answer's
-//! `expected_nodes_error` until a read succeeds.
+//! takes the file's metadata, and reads it again if its size, device, inode,
+//! modification time or change time differ from the last read. A node a reload adds
+//! is expected from that reload on; a node it removes is no longer listed unless it
+//! registered. A reload that fails (the file is gone, unreadable or does not parse)
+//! keeps the last list read, so no node is dropped, and the reason is shown in the
+//! answer's `expected_nodes_error` until a read succeeds.
 
 use std::collections::BTreeMap;
 use std::io::Read;

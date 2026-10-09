@@ -387,6 +387,52 @@ fn a_bad_file_stops_the_server_at_start() {
     );
 }
 
+/// Catches: a reload that compares only the file's size, so swapping one host for
+/// another of the same length (`linux-1` for `linux-2`) is never seen; and one that
+/// compares only the size and the inode, so a same-size edit in place is never seen.
+/// The first edit is a rename over the file (a new inode); the second is in place on
+/// the same inode, with the modification time set to a value the file has not had.
+#[test]
+fn a_same_size_edit_is_read_again() {
+    use std::os::unix::fs::MetadataExt;
+    let path = scratch("expected");
+    std::fs::write(&path, "linux-1\n").expect("write");
+    let expected = ExpectedNodes::open(&path).expect("a usable file");
+    let listed = |e: &ExpectedNodes| {
+        let now = e.current();
+        assert_eq!(now.error, None, "{now:?}");
+        now.listed.into_keys().collect::<Vec<_>>()
+    };
+    assert_eq!(listed(&expected), ["linux-1"]);
+    let before = std::fs::metadata(&path).expect("stat");
+
+    replace(&path, "linux-2\n");
+    let renamed = std::fs::metadata(&path).expect("stat");
+    assert_eq!(renamed.len(), before.len());
+    assert_ne!(renamed.ino(), before.ino());
+    assert_eq!(
+        listed(&expected),
+        ["linux-2"],
+        "a same-size rename was not seen"
+    );
+
+    std::fs::write(&path, "linux-3\n").expect("write");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("open")
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .expect("set the modification time");
+    let in_place = std::fs::metadata(&path).expect("stat");
+    assert_eq!(in_place.len(), renamed.len());
+    assert_eq!(in_place.ino(), renamed.ino());
+    assert_eq!(
+        listed(&expected),
+        ["linux-3"],
+        "a same-size edit in place was not seen"
+    );
+}
+
 /// Catches: a last-seen time set at registration and never moved, so an operator
 /// reading a disconnected node's `last_seen_unix_ms` would see when it first
 /// connected rather than when it was last heard from.
