@@ -316,6 +316,8 @@ async fn a_dropped_run_still_cleans_up() {
     assert!(run.await.expect_err("cancelled").is_cancelled());
     assert!(!exists(&fake.lease_dir(2)), "scratch left");
     fake.assert_start_reaped_before_rm();
+    // The clean's cgroup.kill ended the action although `podman rm` then failed.
+    fake.assert_action_gone(2);
 }
 
 /// Catches a kernel OOM kill reported as the action's own exit 137 (it would be cached

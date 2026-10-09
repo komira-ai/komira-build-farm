@@ -18,7 +18,10 @@
 //! cleans up, blocking, before the future is gone. Either way the clean first makes
 //! sure `podman start` has exited and been reaped, so nothing the driver started is
 //! left running while it removes the lease. A clean that fails turns the lease into a
-//! failure: a dirty node must be loud.
+//! failure: a dirty node must be loud. The clean in `Drop` blocks the thread that drops
+//! the run, usually a runtime worker: at worst about five seconds for `podman start` to
+//! be reaped, five more for the lease cgroup to empty, then `podman rm` (and `podman
+//! unshare rm` for files the container still owns), which nothing here bounds.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -570,6 +573,9 @@ impl Drop for Lease {
 fn reap(child: &mut Child, limit: Duration, pause: Duration) -> Result<(), String> {
     // Killed only while `try_wait` says it is unreaped: until then its pid can name no
     // other process. `try_wait`, not the kill's result, then says when it is gone.
+    // PID reuse: once `try_wait` has reaped the child, tokio's `Child` is done and
+    // `start_kill` sends nothing, so no signal reaches a process that took the pid
+    // after. Keep this on `Child`; a raw pid (`kill(2)`, `waitpid`) loses that.
     if child.try_wait().map_err(wait_failed)?.is_none() {
         let _ = child.start_kill();
     }
@@ -791,6 +797,14 @@ mod tests {
         let pid = rustix::process::Pid::from_raw(raw);
         rustix::process::waitpid(pid, rustix::process::WaitOptions::empty())
             .expect("reaped elsewhere");
+        let mut lease = lease_left_only(child);
+        let why = lease.clean_blocking().expect_err("the wait failed");
+        assert!(why.starts_with("wait for podman start: "), "{why}");
+    }
+
+    /// A lease that never got a container, cgroup or scratch directory (all its paths
+    /// are absent, so removing them succeeds), holding `start` as its `podman start`.
+    fn lease_left_only(start: Child) -> Lease {
         let mut config = PodmanConfig::new(
             PathBuf::from("/nonexistent-kbf-157/scratch"),
             "/actions".to_owned(),
@@ -798,9 +812,28 @@ mod tests {
         config.cgroup_root = PathBuf::from("/nonexistent-kbf-157/cgroup");
         let id = LeaseId { term: 1, seq: 1 };
         let mut lease = Lease::new(&Podman::new(config.podman.clone()), &config, id);
-        lease.start = Some(child);
-        let why = lease.clean_blocking().expect_err("the wait failed");
-        assert!(why.starts_with("wait for podman start: "), "{why}");
+        lease.start = Some(start);
+        lease
+    }
+
+    /// Catches a clean that does not give a running `podman start` time to exit and be
+    /// reaped (`REAP_LIMIT` too short), or that only signals or drops it: either leaves
+    /// it running or a zombie while the lease is removed (kbf #157). This pins the
+    /// timing the fake Podman's `start-not-reaped-at-rm` check sees only when its test
+    /// runs alone (another test's runtime may reap a dropped child first).
+    #[tokio::test]
+    async fn the_clean_waits_until_podman_start_is_reaped() {
+        let start = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = start.id().expect("pid");
+        let mut lease = lease_left_only(start);
+        lease.clean_blocking().expect("cleaned");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "sleep {pid} still there (running or unreaped) after the clean"
+        );
     }
 
     /// Catches a clean step whose blocking task panicked being reported without saying

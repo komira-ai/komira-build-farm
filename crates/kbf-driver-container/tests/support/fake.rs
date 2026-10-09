@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
@@ -123,6 +123,27 @@ impl Fake {
         assert!(!exists(&self.lease_dir(seq)), "scratch directory left");
         assert!(!exists(&self.lease_cgroup(seq)), "lease cgroup left");
         self.assert_start_reaped_before_rm();
+        self.assert_action_gone(seq);
+    }
+
+    /// Asserts nothing the lease's action started still runs. The fake gives the action
+    /// `CG=<lease cgroup>` and its children inherit it, so that is the fake's stand-in
+    /// for membership of the lease cgroup. Waits up to five seconds, since a SIGKILL
+    /// takes effect when its target next runs; a zombie (no environment left) has ended.
+    pub fn assert_action_gone(&self, seq: u64) {
+        let marker = format!("CG={}", self.lease_cgroup(seq).display());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = running_with_env(marker.as_bytes());
+            if left.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lease {seq}'s action still runs after the clean: pids {left:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Asserts no `podman rm` so far ran while a `podman start` the driver ran was
@@ -156,6 +177,21 @@ impl Fake {
         }
         panic!("the action never started");
     }
+}
+
+/// The pids of this user's processes whose environment holds `entry` (`NAME=value`).
+/// A process that ends while it is read, or is not ours to read, is skipped.
+fn running_with_env(entry: &[u8]) -> Vec<u32> {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    procs
+        .filter_map(|p| p.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == entry))
+        })
+        .collect()
 }
 
 impl Drop for Fake {
