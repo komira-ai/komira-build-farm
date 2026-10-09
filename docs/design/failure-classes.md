@@ -10,24 +10,25 @@ retries in [scheduler.md](scheduler.md#outcomes), node reports in
 Line numbers are on `main` at the merge of #177; paths are under `crates/`. "Proposed"
 means no code yet.
 
-## CEO rulings (2026-10-09)
+## Decisions of 2026-10-09
 
-Four questions this draft had left open were ruled on 2026-10-09. They are recorded as
-**decided**; every other decision in sections 6 and 11 is still an option with a lean.
+Four questions this draft had left open were decided on 2026-10-09. They are recorded
+as **decided**; every other decision in sections 6 and 11 is still an option with a
+lean.
 
-1. **Out of memory is the farm's until no node is large enough** (6.1). "If an action
-   goes over memory it could be a code update requires more memory than it previously
-   used. That's not always an action fault." An out-of-memory kill is Farm: the server
-   reruns at a larger memory booking and remembers it; the action's error only when the
-   largest node is not enough.
+1. **Out of memory is the farm's until no node is large enough** (6.1). Going over
+   memory is not always the action's fault: a code change can need more memory than
+   the action used before. An out-of-memory kill is Farm: the server reruns at a larger
+   memory booking and remembers it; the action's error only when the largest node is
+   not enough.
 2. **A timeout is the action's** (6.2). The client set the limit. A paused or frozen
    node is not a timeout: the fence and lease rules handle it, as Farm.
 3. **Flakes are tracked** (6.3): the same action digest observed both passing and
    failing, recorded per digest and shown, never rerun until green.
-4. **#173 is extended, not merged start-only** (section 11, decision 4): "I would
-   rather be alerted if I need to do something than just remove a box from the build
-   farm." An Xcode left out is reported with its reason and fix, re-checked, and
-   alerted.
+4. **#173 is extended, not merged start-only** (section 11, decision 4). When a node
+   needs a person to act, the farm alerts that person rather than quietly taking the
+   node out of service. An Xcode left out is reported with its reason and fix,
+   re-checked, and alerted.
 
 ## 1. The classes
 
@@ -387,13 +388,13 @@ running Bazel builds. buck2 builds fail the open actions as INFRA either way.
   127 that the program never produced (6.7). It is safe only because a non-zero exit is
   never cached.
 
-## 6. Decisions: ruled and open
+## 6. Decisions: decided and open
 
-6.1 to 6.3 are **decided** (CEO rulings of 2026-10-09). 6.4 to 6.7 are open, with leans.
+6.1 to 6.3 are **decided** (decisions of 2026-10-09). 6.4 to 6.7 are open, with leans.
 
 ### 6.1 Out of memory (DECIDED)
 
-**Ruling.** An out-of-memory kill is Farm. A change to the code can legitimately need
+**Decision.** An out-of-memory kill is Farm. A change to the code can legitimately need
 more memory than the action used before, so the farm reruns it with more; it is the
 action's only when the largest node is not enough. The draft's "booking decides"
 attribution is dropped: whether the run was over or under its booking, and who set the
@@ -416,7 +417,7 @@ pass the cap books the cap; the run at the cap is the last rung.
 
 - **Its own bound, not the 6.5 budget.** Counting the ladder toward the 3-run budget
   would answer the action's error at four times the first booking, far below the
-  largest node, which is what the ruling rejects. The ladder is bounded by itself: from
+  largest node, which is what the decision rejects. The ladder is bounded by itself: from
   booking `b` to cap `c` it is at most ceil(log2(c / b)) reruns, 9 from the 1 GiB
   default to a 512 GiB node. The bookings double, so the whole ladder books less
   memory than two runs at the cap, and a killed run usually ends early.
@@ -432,7 +433,7 @@ pass the cap books the cap; the run at the cap is the last rung.
 floor** for the action's key, and later requests at that key book at least the floor
 (never less than they ask).
 
-- **The key is not the digest.** The case the ruling describes, a code change, makes a
+- **The key is not the digest.** The case the decision describes, a code change, makes a
   new digest, so a floor kept per digest would never help the next commit. The key is
   what a code change keeps: the platform properties, the Command's output paths and its
   first argument. Where the request carries REAPI `RequestMetadata`
@@ -471,7 +472,7 @@ climb the ladder again. A new digest at the key starts at the cap and runs once.
 
 ### 6.2 Timeouts (DECIDED)
 
-**Ruling.** An action's timeout is Action: the client set it (`Action.timeout`, from
+**Decision.** An action's timeout is Action: the client set it (`Action.timeout`, from
 the buck2 rule or Bazel's test size). It is answered `DEADLINE_EXCEEDED` with the
 partial result (#45) and `ACTION_TIMEOUT`, and never rerun. buck2 tags every
 `DEADLINE_EXCEEDED` ENVIRONMENT and drops the partial result (section 3, fact 6); that
@@ -500,7 +501,7 @@ and stopped time and Linux PSI may come back as metrics (section 9), never as a 
 
 ### 6.3 Flakes (DECIDED)
 
-**Ruling.** Flaky actions are tracked. **A flaky action is an action digest observed
+**Decision.** Flaky actions are tracked. **A flaky action is an action digest observed
 both succeeding (exit 0) and failing (an Action-class non-zero exit or timeout).**
 
 - **Recorded per digest**: each run's node, class, exit code or signal, time and
@@ -764,7 +765,7 @@ people use. Bazel's exit 34 does not by itself tell Farm from Request (section 3
 
 ## 11. Decisions for the project
 
-**Decided** (CEO rulings, 2026-10-09):
+**Decided** (2026-10-09):
 
 1. OOM: an out-of-memory kill is Farm. The server reruns with the memory booking
    doubled, up to the largest node that fits the platform, on a ladder bounded apart
