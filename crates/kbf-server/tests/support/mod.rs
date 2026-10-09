@@ -165,11 +165,15 @@ impl Cell {
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
-        let cache = Arc::new(Cache::new(
-            GateLog::new(),
-            MemoryStore::new(Capabilities::default()),
-            KeyPrefix::default(),
-        ));
+        let cache = Arc::new(
+            Cache::open(
+                GateLog::new(),
+                MemoryStore::new(Capabilities::default()),
+                KeyPrefix::default(),
+            )
+            .await
+            .expect("open the cache"),
+        );
         Self::serve(cache, wait, retention).await
     }
 

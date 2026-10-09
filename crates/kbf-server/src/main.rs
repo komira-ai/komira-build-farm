@@ -54,11 +54,7 @@ async fn run<O: ObjectStore + 'static>(
     prefix: KeyPrefix,
 ) -> Result<(), Box<dyn Error>> {
     let listeners = args.listeners()?;
-    let cache = Arc::new(Cache::new(
-        MemoryMetaLog::new(Retention::default()),
-        store,
-        prefix,
-    ));
+    let cache = Arc::new(Cache::open(MemoryMetaLog::new(Retention::default()), store, prefix).await?);
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_api(cache, listeners, api, shutdown)?;

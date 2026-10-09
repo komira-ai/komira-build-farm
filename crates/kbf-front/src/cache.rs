@@ -9,14 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use kbf_meta::{
     ActionAnswer, ActionRecord, ActionWriteError, Applied, BlobAnswer, Closure, Collected, Command,
-    Location, MetaState, ObjectId, Retention, Role, Touch,
+    Epoch, Location, MetaState, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError,
 };
 use kbf_proto::reapi;
-use kbf_segments::layout::TRAILER_LEN;
+use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError, SegmentWriter, WriteError};
 use kbf_types::{Digest, FarmTime};
 use prost::Message;
@@ -156,17 +156,20 @@ fn is_empty_blob(d: &Digest) -> bool {
 /// The cache: a [`MetaLog`] for the index and action cache, an [`ObjectStore`] bucket
 /// for the bytes.
 ///
-/// Every upload is verified, packed into a segment (a blob too large for one is stored
-/// whole), written to the store, its footer read back, and only then committed to the
-/// index: a blob is reported present only once its bytes are durable. Every read is
-/// verified against its digest; an object the store cannot produce, or whose bytes are
-/// wrong, is marked unreachable, never served and never reported absent.
+/// Every upload is verified, packed into a segment (a blob too large to share one is a
+/// segment of its own), written to the store, its footer read back, and only then
+/// committed to the index, one [`Command::PutBlobs`] per segment: a blob is reported
+/// present only once its bytes are durable. Every read is verified against its digest;
+/// an object the store cannot produce, or whose bytes are wrong, is marked unreachable
+/// (with the reason), never served and never reported absent.
 #[derive(Debug)]
 pub struct Cache<M, O> {
     meta: M,
     objects: O,
     prefix: KeyPrefix,
-    next_object: AtomicU64,
+    epoch: Epoch,
+    next_seq: AtomicU64,
+    segment_limit: u64,
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
@@ -174,29 +177,61 @@ impl Cache<MemoryMetaLog, MemoryStore> {
     /// index and an in-memory bucket.
     #[must_use]
     pub fn memory() -> Self {
-        let prefix = KeyPrefix::default();
+        let meta = MemoryMetaLog::new(Retention::default());
+        let epoch = meta.alloc_epoch();
         Self::new(
-            MemoryMetaLog::new(Retention::default()),
+            meta,
             MemoryStore::new(Capabilities::default()),
-            prefix,
+            KeyPrefix::default(),
+            epoch,
         )
     }
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
-    /// A cache over `meta` and `objects`, naming its objects under `prefix`.
+    /// A cache over `meta` and `objects`, naming its objects under `prefix` in writer
+    /// epoch `epoch`, which `meta` must have allocated for this cache alone
+    /// ([`Command::AllocEpoch`]; [`Cache::open`] does that). Object sequence numbers
+    /// count up from 1 within the epoch.
     ///
-    /// Object ids count up from 1 in this process. That is enough for one process with
-    /// one index (memory mode); the replicated store names objects by writer epoch as
-    /// well, so a restart never reuses a key.
+    /// Writes under an epoch `meta` never allocated are refused by the index
+    /// ([`CacheError::Internal`]); two caches given one epoch would name the same keys.
     #[must_use]
-    pub const fn new(meta: M, objects: O, prefix: KeyPrefix) -> Self {
+    pub const fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
         Self {
             meta,
             objects,
             prefix,
-            next_object: AtomicU64::new(1),
+            epoch,
+            next_seq: AtomicU64::new(1),
+            segment_limit: MAX_SEGMENT_BYTES,
         }
+    }
+
+    /// The same cache, packing segments of at most `limit` bytes, footer included,
+    /// instead of [`MAX_SEGMENT_BYTES`]. A blob too large to share a segment of that
+    /// size still gets a segment of its own.
+    #[must_use]
+    pub const fn with_segment_limit(mut self, limit: u64) -> Self {
+        self.segment_limit = limit;
+        self
+    }
+
+    /// A cache over `meta` and `objects` under `prefix`, in a writer epoch it commits
+    /// to `meta` first.
+    ///
+    /// # Errors
+    /// The metadata log is unavailable.
+    pub async fn open(meta: M, objects: O, prefix: KeyPrefix) -> Result<Self, CacheError> {
+        match meta.commit(Command::AllocEpoch).await? {
+            Applied::Epoch(epoch) => Ok(Self::new(meta, objects, prefix, epoch)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The writer epoch this cache names its objects in.
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
     }
 
     /// The metadata log.
@@ -209,12 +244,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.objects
     }
 
-    /// The key of object `id` in the store.
+    /// The key of object `id` in the store: `<prefix>cas/<epoch>/<seq>`, each as 16
+    /// lowercase hex digits.
     ///
     /// # Errors
     /// [`CacheError::Key`] if the prefix and id do not form a valid key.
     pub fn object_key(&self, id: ObjectId) -> Result<ObjectKey, CacheError> {
-        Ok(self.prefix.key(&format!("cas/{:016x}", id.get()))?)
+        let (epoch, seq) = (id.epoch().get(), id.seq());
+        Ok(self.prefix.key(&format!("cas/{epoch:016x}/{seq:016x}"))?)
     }
 
     /// Advances farm time. In memory mode the caller ticks; the replicated store's
@@ -304,10 +341,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .into_iter()
             .filter(|b| !held.contains(&b.digest))
             .collect();
-        for (digest, location) in self.write_objects(fresh).await? {
-            self.meta
-                .commit(Command::PutBlob { digest, location })
-                .await?;
+        for placed in self.write_objects(fresh).await? {
+            match self.meta.commit(Command::PutBlobs(placed)).await? {
+                Applied::Blobs(Ok(_)) => {}
+                Applied::Blobs(Err(e)) => return Err(CacheError::Internal(e.to_string())),
+                other => return Err(unexpected(&other)),
+            }
         }
         Ok(())
     }
@@ -512,21 +551,21 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Err(CacheError::Contended)
     }
 
-    /// Packs `blobs` into segments (a blob too large for one is stored whole), writes
-    /// them, and returns where each blob is.
+    /// Packs `blobs` into segments (a blob too large to share one gets a segment of its
+    /// own), writes them, and returns where each blob is, one list per segment.
     async fn write_objects(
         &self,
         blobs: Vec<VerifiedBlob>,
-    ) -> Result<Vec<(Digest, Location)>, CacheError> {
+    ) -> Result<Vec<Vec<(Digest, Location)>>, CacheError> {
         let mut placed = Vec::with_capacity(blobs.len());
-        let mut writer = SegmentWriter::new(MAX_SEGMENT_BYTES);
+        let mut writer = SegmentWriter::new(self.segment_limit);
         let mut packed = Vec::new();
         for blob in blobs {
             match writer.push(&blob.bytes) {
                 Ok(_) => packed.push(blob.digest),
                 Err(WriteError::Full { .. }) => {
-                    let full = mem::replace(&mut writer, SegmentWriter::new(MAX_SEGMENT_BYTES));
-                    placed.extend(self.put_segment(full, &mem::take(&mut packed)).await?);
+                    let full = mem::replace(&mut writer, SegmentWriter::new(self.segment_limit));
+                    placed.push(self.put_segment(full, &mem::take(&mut packed)).await?);
                     writer.push(&blob.bytes)?;
                     packed.push(blob.digest);
                 }
@@ -535,7 +574,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             }
         }
         if !writer.is_empty() {
-            placed.extend(self.put_segment(writer, &packed).await?);
+            placed.push(self.put_segment(writer, &packed).await?);
         }
         Ok(placed)
     }
@@ -561,8 +600,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 })?;
                 Ok((
                     *d,
-                    Location::Segment {
-                        segment,
+                    Location {
+                        store: StoreId::CONFIGURED,
+                        object: segment,
                         offset: entry.offset,
                     },
                 ))
@@ -585,23 +625,32 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(Footer::parse(&bytes, len)?)
     }
 
-    /// Stores a blob too large for a segment as its own object. Chunking such blobs
-    /// (RFC section 9.4) comes later.
-    async fn put_whole(&self, blob: VerifiedBlob) -> Result<(Digest, Location), CacheError> {
-        let object = self.allocate();
-        self.objects
-            .put_new(&self.object_key(object)?, blob.bytes, None)
-            .await?;
-        Ok((blob.digest, Location::Object(object)))
+    /// Stores a blob too large to share a segment as a segment of one record, so it
+    /// carries a footer like every other object: its digest and CRC are in the store,
+    /// and an index can be rebuilt from it. Chunking such blobs (RFC section 9.4) comes
+    /// later.
+    async fn put_whole(&self, blob: VerifiedBlob) -> Result<Vec<(Digest, Location)>, CacheError> {
+        let mut writer = SegmentWriter::new(blob.digest.size_bytes.saturating_add(footer_len(1)));
+        writer.push(&blob.bytes)?;
+        self.put_segment(writer, &[blob.digest]).await
     }
 
     /// Reads `digest`'s bytes at `location` and checks them. An object the store does
-    /// not have, or whose bytes are wrong, is marked unreachable.
+    /// not have is marked unreachable as [`UnreachableReason::Missing`], one whose bytes
+    /// are wrong as [`UnreachableReason::Corrupt`].
     async fn fetch(&self, digest: &Digest, location: Location) -> Result<Bytes, CacheError> {
-        let (object, offset) = match location {
-            Location::Segment { segment, offset } => (segment, offset),
-            Location::Object(object) => (object, 0),
-        };
+        let Location {
+            store,
+            object,
+            offset,
+        } = location;
+        if store != StoreId::CONFIGURED {
+            return Err(CacheError::Internal(format!(
+                "blob {digest} is in store {}, and this cache has only store {}",
+                store.get(),
+                StoreId::CONFIGURED.get()
+            )));
+        }
         let key = self.object_key(object)?;
         let range = ByteRange::new(offset, digest.size_bytes).ok_or_else(|| {
             CacheError::Internal(format!("blob {digest} has no readable range at {offset}"))
@@ -610,7 +659,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             Ok(bytes) => bytes,
             Err(e @ (ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
                 tracing::error!(%digest, %key, error = %e, "held blob missing from the store");
-                self.mark_unreachable(object).await?;
+                self.mark_unreachable(object, UnreachableReason::Missing)
+                    .await?;
                 return Err(CacheError::Unreachable(*digest));
             }
             Err(e) => return Err(e.into()),
@@ -618,19 +668,31 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         // Digest equality includes the length, so a short read fails here too.
         if kbf_segments::sha256(&bytes) != *digest {
             tracing::error!(%digest, %key, "stored bytes fail their digest");
-            self.mark_unreachable(object).await?;
+            self.mark_unreachable(object, UnreachableReason::Corrupt)
+                .await?;
             return Err(CacheError::Unreachable(*digest));
         }
         Ok(bytes)
     }
 
-    async fn mark_unreachable(&self, object: ObjectId) -> Result<(), CacheError> {
-        self.meta.commit(Command::ObjectUnreachable(object)).await?;
-        Ok(())
+    async fn mark_unreachable(
+        &self,
+        object: ObjectId,
+        reason: UnreachableReason,
+    ) -> Result<(), CacheError> {
+        match self
+            .meta
+            .commit(Command::ObjectUnreachable { object, reason })
+            .await?
+        {
+            Applied::Marked(Ok(())) => Ok(()),
+            Applied::Marked(Err(e)) => Err(CacheError::Internal(e.to_string())),
+            other => Err(unexpected(&other)),
+        }
     }
 
     fn allocate(&self) -> ObjectId {
-        ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed))
+        ObjectId::new(self.epoch, self.next_seq.fetch_add(1, Ordering::Relaxed))
     }
 }
 
