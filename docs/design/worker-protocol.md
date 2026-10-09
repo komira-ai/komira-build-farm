@@ -395,6 +395,9 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
+- `Start.device_id` (field 8): the one iOS device booked for the lease, and
+  `NodeStatus.devices`: every iOS device the node knows, with its state and fix
+  ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
 - With many servers: the daemon dials the farm's one address and may learn the current
   server list from the first server it reaches; the front relays the session to the
