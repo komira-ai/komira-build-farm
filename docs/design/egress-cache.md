@@ -180,11 +180,21 @@ to the CAS.
   adoption queued by `store_blobs`, an adoption queued by the sweep, and healing after
   `corrupt` or `store_write_failed`) first takes the digest's copy lock, one per digest
   for the whole server, so two writers never run for the same digest at once. Under the
-  lock the writer looks again: if a copy of the digest is now committed, it writes
-  nothing (a fetch removes its spool file, an adoption is dropped and counted as
-  `mirror_adopt_skipped_total`). Otherwise it takes the next copy number under the lock;
-  a number taken in this start is never taken again, even if its write failed. A writer
-  that waits for the lock does not hold a fetcher or adopter slot while it waits.
+  lock the writer looks again: if a copy of the digest is now committed and has not
+  failed verification since (the entry is `held`, not `corrupt`), it writes nothing (a
+  fetch removes its spool file, an adoption is dropped and counted as
+  `mirror_adopt_skipped_total`). A committed copy that failed a verification after its
+  commit (on read, at re-index or in the scrub) does not count: the writer goes on and
+  heals the entry with the next copy. Otherwise it takes the next copy number under the
+  lock; a number taken in this start is never taken again, even if its write failed.
+  Only a fetch waits for the lock, and while it waits it holds no fetcher slot and no
+  bytes in memory (its bytes are in the spool file, read into memory only under the
+  lock). An adoption, from `store_blobs` or from the sweep, already holds its blob in
+  memory, so it does not wait: if the lock is taken it drops its bytes, counts
+  `mirror_adopt_deferred_total`, and leaves the entry to the next sweep, which writes
+  nothing if the lock holder committed a verified copy and otherwise re-reads the blob
+  verified from the CAS. No bytes are lost, and only a writer
+  that holds both a slot and the lock holds an entry in memory.
 - **A committed copy is never touched by another writer.** A writer records "damaged" or
   "unconfirmed, prunable" only for the number it took itself, and only while no
   `PutBlob` names that number. A committed copy becomes damaged in the report only when
@@ -249,7 +259,9 @@ to the CAS.
   the read-back after a write) reads the copy in `--mirror-read-chunk` pieces (lean
   8 MiB) and hashes as it goes. The memory bound is therefore the per-entry cap times the
   number of copies written at once (at most `--mirror-fetchers` fetches plus
-  `--mirror-adopters` adoptions; an adoption holds the blob it read from the CAS), plus
+  `--mirror-adopters` adoptions; an adoption holds the blob it read from the CAS, and an
+  adoption that finds the copy lock taken drops it rather than wait, so lock waiters add
+  nothing), plus
   one chunk per writer for its read-back, plus `--mirror-verifiers` times the chunk. A
   retry of a store write from the spool takes a fetcher slot like a fetch, and a retried
   adoption takes an adopter slot, so retries add nothing to the bound. With the lean
@@ -349,8 +361,10 @@ which the daemon sees as `UNAVAILABLE`. Actions submitted after the mark are ref
   is a background write on a bounded queue, at most `--mirror-adopters` at once (lean
   4). The copy is written, read back and re-hashed before `PutBlob` moves the digest to
   `Location::Mirror`, exactly as [section 5.2](#52-the-mirror-store-and-its-location)
-  says for every copy, under the digest's copy lock, so an adoption that races a fetch
-  of the same digest waits and then skips if the fetch committed first; until then, and if the write fails, the digest keeps its segment
+  says for every copy, under the digest's copy lock. An adoption that races a fetch of
+  the same digest and finds the lock taken does not wait: it drops its bytes and leaves
+  the entry to the next sweep, which writes nothing if the fetch committed a verified
+  copy, or adopts it if the fetch failed. Until then, and if the write fails, the digest keeps its segment
   location and is served from there.
 - `store_blobs` commits only *fresh* blobs: a digest already present in the CAS is
   touched, not stored (`crates/kbf-front/src/cache.rs`). Two cases therefore get no
@@ -472,7 +486,9 @@ remove it. The default is [D3](#d3-licence-default-for-a-host-not-named).
   `upstream_drift` is recorded. An entry in `upstream_drift` that is not held is
   retried on the same capped backoff as `fetch_failed`, because a moved tag can move
   back and a candidate can be fixed; a retry that matches commits the copy and the
-  entry is `held`. An upload of the right bytes by a client is adopted as usual
+  entry is `held` with the drift kept as the annotation `drift_seen` (below), which a
+  match from the URL that drifted clears at once and a match from another URL leaves
+  in place. An upload of the right bytes by a client is adopted as usual
   ([section 5.4](#54-adopt-on-upload)), and the entry becomes `held` with the drift kept
   as the annotation `drift_seen{url, observed_sha256, observed_size, at}`, so the
   re-pin alert stays until no live list names the digest or a later fetch of that URL
@@ -591,12 +607,12 @@ generations that name it, its host policy, its state and the last error. States:
 
 | State | Meaning | Clears when |
 |---|---|---|
-| `held` | a verified copy is in the mirror store and indexed; it may carry the annotation `drift_seen{url, observed_sha256, observed_size, at}` | the annotation, with its alert, clears when no live list names the digest or a later fetch of that URL matches |
+| `held` | a verified copy is in the mirror store and indexed; it may carry the annotation `drift_seen{url, observed_sha256, observed_size, at}` | the annotation, with its alert, clears when no live list names the digest or a later fetch of that URL matches; so a drifted entry whose retry of the same URL matches is `held` with `drift_seen`, which clears at once, and one held by another URL or an adoption keeps it |
 | `verifying` | at start, its copies are not yet read and hashed ([section 5.3](#53-re-index-at-start)) | the check ends |
 | `unverified{error}` | a copy could not be read at start (a store error, not a mismatch) | a retried read succeeds |
 | `fetching` | a fetch is running | the fetch ends |
 | `waiting` | listed, host `adopt`, not in the CAS either | a client uploads it |
-| `adopt_pending` | the CAS holds it but the copy into the mirror has not been written yet (queue full, or the sweep has not run) | the next sweep writes it |
+| `adopt_pending` | the CAS holds it but the copy into the mirror has not been written yet (queue full, an adoption found the copy lock taken and the holder committed nothing, or the sweep has not run) | the next sweep writes it |
 | `fetch_failed{host, error, attempts, next_retry}` | the last fetch failed in transport, ended early, got a status other than 2xx, timed out or found the spool full; never a mismatch ([section 5.6](#56-the-fetcher)) | a retry succeeds |
 | `upstream_drift{url, observed_sha256, observed_size, attempts, next_retry}` | not held, and every candidate that returned a complete 2xx body returned other bytes | a retry from any candidate matches, or a client's upload is adopted (both make it `held` with the `drift_seen` annotation), or no live list names the digest |
 | `store_write_failed{copy, error, attempts, next_retry}` | a copy was written but its read-back did not match or could not be read, or the write failed; nothing was committed ([section 5.2](#52-the-mirror-store-and-its-location)) | a retried write of the next copy is read back verified and committed |
@@ -609,7 +625,7 @@ bytes and duration of this start, spool files removed at start, and the supersed
 damaged copies awaiting removal.
 
 **Metrics.** `mirror_fetch_total{host, result}`, `mirror_bytes_fetched_total`,
-`mirror_bytes_held`, `mirror_adopted_total`, `mirror_adopt_dropped_total`, `mirror_adopt_skipped_total`,
+`mirror_bytes_held`, `mirror_adopted_total`, `mirror_adopt_dropped_total`, `mirror_adopt_skipped_total`, `mirror_adopt_deferred_total`,
 `mirror_client_fetched_total`, `mirror_rejected_total{reason}`, `mirror_corrupt_total`,
 `mirror_hits_total` (present answers for listed digests). `kbf-server` has no metrics
 endpoint today, so v0 puts these counters in the report.
@@ -720,9 +736,19 @@ Each test names the defect it catches and the mutant planted to see it red.
 - Copy writers: a fetch and an adoption of the same digest released together on a
   `MemoryStore` without `conditional_put`, with the store set to damage the second
   write: exactly one copy is written, the other writer skips, and no committed copy is
-  listed as damaged or prunable. Mutant: take the copy lock in the fetcher only (both
+  listed as damaged or prunable; when the adoption finds the lock taken it is counted
+  in `mirror_adopt_deferred_total` and the next sweep writes nothing. Mutant: let an
+  adoption that finds the lock taken wait with its bytes (the deferred counter stays at
+  0, so that assertion goes red). Mutant: take the copy lock in the fetcher only (both
   write the same number, the second overwrites the committed copy, and its read-back
   marks it prunable, so both assertions go red).
+- Heal after damage on read: copy 0 is committed, then damaged in the store, then read
+  through `Cache::fetch`, so the entry is `corrupt{0}` while `PutBlob` still names copy
+  0. Under `fetch` the woken fetcher, and under `adopt` a client upload, each take the
+  copy lock, do not skip, write copy 1, read it back and commit it; the entry is `held`
+  and the state clears, and `mirror_adopt_skipped_total` does not move. Mutant: skip on
+  any committed copy (the writer sees copy 0 committed and writes nothing, so `corrupt`
+  never clears and the state assertion goes red).
 - Policy: an `adopt` host is never fetched; a `deny` host is never adopted. Mutant:
   `adopt` fetches.
 
@@ -777,7 +803,8 @@ nothing outside the lists is fetched. At the end: every state whose cause healed
 cleared. Mutants: drop single-flight; drop the re-index; let a failed fetch clear the
 entry; index a copy before verifying it; commit a copy without reading it back; take
 the copy lock in the fetcher only (on the store without `conditional_put` an adoption
-overwrites a committed copy); record an early EOF as drift.
+overwrites a committed copy); skip on any committed copy (a copy damaged after its
+commit is never healed, so the end check goes red); record an early EOF as drift.
 
 **End to end**, on a deployed farm, in the shape of komira#563's proof:
 1. A cold farm and a client whose upstream for one pin is unreachable: the build fails.
