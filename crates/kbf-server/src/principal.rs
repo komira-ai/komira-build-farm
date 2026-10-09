@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use kbf_types::Qos;
 use sha2::{Digest as _, Sha256};
-use subtle::{ConditionallySelectable, ConstantTimeEq};
+use subtle::ConstantTimeEq;
 
 use crate::token::{TokenFileError, bearer_digest};
 
@@ -211,16 +211,18 @@ impl Principals {
     /// The principal whose token `authorization`, an `Authorization` header's value,
     /// presents as `Bearer <token>` (the scheme in any case), if any. The presented
     /// token is hashed and its digest compared in constant time with every entry's,
-    /// all of them, whether or not one has matched.
+    /// all of them, whether or not one has matched already.
     #[must_use]
     pub fn admit(&self, authorization: &[u8]) -> Option<&Principal> {
         let presented = bearer_digest(authorization)?;
-        let mut found = u32::MAX;
-        for (i, entry) in self.entries.iter().enumerate() {
-            let i = u32::try_from(i).unwrap_or(u32::MAX);
-            found.conditional_assign(&i, presented.ct_eq(&entry.digest));
+        let mut found = None;
+        // Every entry is compared, whether or not one has matched already.
+        for entry in &self.entries {
+            if bool::from(presented.ct_eq(&entry.digest)) {
+                found = Some(entry);
+            }
         }
-        self.entries.get(usize::try_from(found).ok()?)
+        found
     }
 }
 
@@ -294,16 +296,18 @@ fn valid_name(name: &str) -> bool {
 
 fn parse_digest(field: &str) -> Option<[u8; 32]> {
     let hex = field.strip_prefix("sha256:")?.as_bytes();
-    if hex.len() != 64 {
+    if hex.len() != 64 || !hex.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
+    // Only hex digits are left.
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => b - b'A' + 10,
+    };
     let mut digest = [0u8; 32];
     for (byte, pair) in digest.iter_mut().zip(hex.chunks_exact(2)) {
-        let pair = std::str::from_utf8(pair).ok()?;
-        if !pair.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        *byte = u8::from_str_radix(pair, 16).ok()?;
+        *byte = (nibble(pair[0]) << 4) | nibble(pair[1]);
     }
     Some(digest)
 }

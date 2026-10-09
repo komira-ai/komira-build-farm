@@ -59,6 +59,7 @@ fn a_bad_line_is_refused_with_its_number() {
     let short = format!("sha256:{}", &hex_of(TOKEN_A)[..63]);
     let long = format!("sha256:{}0", hex_of(TOKEN_A));
     let not_hex = format!("sha256:{}g", &hex_of(TOKEN_A)[..63]);
+    let not_ascii = format!("sha256:{}é", &hex_of(TOKEN_A)[..62]);
     let sha1 = format!("sha1:{}", hex_of(TOKEN_A));
     let too_long_name = "p".repeat(MAX_PRINCIPAL_BYTES + 1);
     let cases = [
@@ -71,6 +72,7 @@ fn a_bad_line_is_refused_with_its_number() {
         format!("ci client ci {short}"),
         format!("ci client ci {long}"),
         format!("ci client ci {not_hex}"),
+        format!("ci client ci {not_ascii}"),
         format!("ci client ci {sha1}"),
         format!("ci client ci {}", hex_of(TOKEN_A)),
     ];
