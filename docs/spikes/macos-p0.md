@@ -55,7 +55,8 @@ The status text of `automationmodetool` is parsed, case-insensitively, as two fi
 `enabled` (on, off) and `auth` (required, not required), matching the wording the
 hosted runners printed (Results). Every reading also records the raw text, and text
 the parser does not recognise reads as `unknown`, which never triggers enable and
-gives a FAIL. Every command the probe runs is under the watchdog with stdin closed.
+gives a FAIL. Every `automationmodetool` and `sysadminctl` call runs under the
+watchdog with stdin closed; the quick local reads (`id`, the context line) do not.
 
 The selftest (`tools/spike/macos/test/run.sh`) drives each probe against fakes of the
 macOS programs. `test/mutants.sh` plants defects that each must turn a test red,
@@ -63,13 +64,16 @@ among them: an arm run outside its subshell; a watchdog that leaves the command 
 the caller's pipe; `sysadminctl` run without the watchdog; the key without the `macos-` prefix; a
 watchdog that reports a hang as success; a status parser that accepts any "require"
 as not required; enable run whatever the last status said; a verdict that ignores
-the control arm (each probe); a screenshot not checked to be a PNG; a simulator
+the control arm (each probe); a watchdog that leaves stdin open; a simctl verdict
+that ignores the `(allow default)` boot, `bootstatus` or a failed delete; error text
+from create taken as a UDID; a screenshot not checked to be a PNG; a simulator
 booted in the default device set.
 
 ## Results
 
 All numbers come from run `37987149882` (commit `95505ed`). Every probe's verdict was
-PASS on both labels.
+PASS on both labels. Run `37988450842` (commit `51edbb0`, which changed only this
+document) gave the same verdicts and the same values.
 
 | | `macos-26` job | `macos-15` job |
 |---|---|---|
@@ -79,21 +83,24 @@ PASS on both labels.
 | SIP | disabled | disabled |
 
 **automationmodetool.** The status prints two lines. The first is `Automation Mode is
-disabled.` on every reading (it reports whether a test session holds Automation Mode
-now, not the device setting). The second is the setting: `This device DOES NOT REQUIRE
+disabled.` on every reading. Inferred, not measured: it reports whether a test session
+holds Automation Mode now, not the device setting (no reading here ran while a test
+session held it). The second is the setting: `This device DOES NOT REQUIRE
 user authentication to enable Automation Mode.` or `This device requires user
 authentication to enable Automation Mode.` (exact case as printed). Both images start
 out not requiring authentication, so the image already ran enable. The control
 (`disable-automationmode-without-authentication` via `sudo -n`, stdin closed) brought
 `requires` back; `enable-automationmode-without-authentication` the same way took it
 to `DOES NOT REQUIRE` again, with exit status 0, no prompt, and well inside the 60 s
-watchdog. A new standard user, made with `sysadminctl -addUser`, read the same
+watchdog. The first line still said `Automation Mode is disabled.` afterwards: the verb
+clears the authentication requirement, it does not turn Automation Mode on. A new standard user, made with `sysadminctl -addUser`, read the same
 not-required status, and so did a reading after that user was deleted.
 `sysadminctl` warned that the new user cannot use FileVault (no secure token).
 
 The first run of this probe (run `37984178027`, cancelled) ran `sysadminctl` without
 the watchdog and with the step's stdin open; neither job got past adding the user in
-15 minutes. Since then every command runs under the watchdog with stdin closed, and
+15 minutes. Since then every `automationmodetool` and `sysadminctl` call runs under the
+watchdog with stdin closed, and
 the add took about 4 s. What it waited on in that run was not recorded.
 
 **simctl.** The newest available iOS runtime (iOS 26.5 on `macos-26`, iOS 26.2 on
@@ -129,7 +136,7 @@ about prompts.
 
 | Question | What a hosted run can settle | What still needs a Mac Studio |
 |---|---|---|
-| `automationmodetool` as root without a prompt | Settled for hosted macOS 15 and 26: the verbs, the exact status text, that root via `sudo -n` with stdin closed enables it with no prompt, and that the control brings authentication back | The same on the Studio's macOS build, run as root at its console or by the provisioning profile, on a Mac where nothing enabled it before |
+| `automationmodetool` as root without a prompt | Settled for hosted macOS 15 and 26: the verbs, the exact status text, that root via `sudo -n` with stdin closed clears the authentication requirement with no prompt (the status still says disabled), and that the control brings authentication back | The same on the Studio's macOS build, run as root at its console or by the provisioning profile, on a Mac where nothing enabled it before |
 | The setting across user deletion | Settled as a status reading: a new standard user, and a reading after that user is deleted, still see not required | That a UI test in a fresh standard user's **console session** starts without an authentication sheet: that needs a person to log the user in (FileVault on rules out auto-login) and watch |
 | Simulators outside a logged-in session | Settled for the runner's own Aqua session: `simctl` works with a private device set, cleans up after delete, and a sandbox deny of CoreSimulatorService stops it | Whether it works from a LaunchDaemon with nobody logged in, on the Studio's build, with the runtimes installed there |
 | Screen Recording need of XCUITest | Only what the image seeded: SIP is off and ScreenCapture is pre-granted to the shell and the runner's agents, so a hosted run cannot answer it | Whether a UI test needs the grant at all, whether a grant persists across users and runner rebuilds: arms in fresh standard users' sessions, with a person to see and click prompts |

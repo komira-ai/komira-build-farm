@@ -43,6 +43,8 @@ mutant 'the watchdog reports a hang as success' lib.sh t_watchdog \
     's/        return 124/        return 0/'
 mutant 'the watchdog leaves CMD on the caller pipe, so an orphaned child holds it open' lib.sh t_am_adduser_hang \
     's/    "$@" <\/dev\/null >"$out" 2>&1 &/    "$@" <\/dev\/null \&/'
+mutant 'the watchdog leaves stdin open, so a prompting CMD reads the caller input' lib.sh t_watchdog \
+    's/    "$@" <\/dev\/null >"$out" 2>&1 &/    "$@" >"$out" 2>\&1 \&/'
 mutant 'the auth parser loses its "does not require" case' \
     automation_mode.sh t_am_already \
     's/\*"does not require user authentication"\*) a=not_required/*"requires user authentication"*) a=required/'
@@ -64,6 +66,14 @@ mutant 'the simctl verdict ignores the deny control' simctl.sh t_simctl_deny_ign
     's/elif \[ "$(st_get deny_boot)" = 0 \]; then/elif false; then/'
 mutant 'the screenshot is not checked to be a PNG' simctl.sh t_simctl_bad_png \
     's/    if is_png "$png"; then/    if true; then/'
+mutant 'the simctl verdict ignores the (allow default) arm' simctl.sh t_simctl_allow_fails \
+    's/elif \[ "$(st_get allow_boot)" != 0 \]; then/elif false; then/'
+mutant 'the simctl verdict ignores bootstatus' simctl.sh t_simctl_bootstatus_fails \
+    's/elif \[ "$(st_get booted)" != 0 \]; then/elif false; then/'
+mutant 'the simctl verdict ignores a failed delete' simctl.sh t_simctl_delete_fails \
+    's/elif \[ "$(st_get deleted)" != 0 \]; then/elif false; then/'
+mutant 'create takes any non-empty output as a UDID' simctl.sh t_simctl_create_garbage \
+    's/\*\[!0-9A-F-\]\* | "")/"")/'
 mutant 'the simctl probe boots in the default device set' simctl.sh t_simctl_pass \
     's/^sim() { xcrun simctl --set "$SET" "$@"; }/sim() { xcrun simctl "$@"; }/'
 mutant 'the TCC verdict ignores the control row' tcc.sh t_tcc_control_empty \

@@ -21,8 +21,9 @@
 #   new_user       adds a throwaway standard user, reads the status as that user,
 #                  deletes the user and reads it again: the setting must hold.
 #
-# Every command runs under the watchdog (SPIKE_WATCHDOG seconds, default 60), with
-# stdin closed: a first hosted run hung for 15 minutes in the user arm.
+# Every automationmodetool and sysadminctl call runs under the watchdog
+# (SPIKE_WATCHDOG seconds, default 60), with stdin closed: a first hosted run hung for
+# 15 minutes in the user arm. The quick local reads (`id`, the context line) do not.
 #
 # The raw status text is recorded with every reading, so an unrecognised wording is
 # visible in the log (and parses as unknown, which never triggers enable).

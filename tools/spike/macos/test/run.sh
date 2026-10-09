@@ -112,6 +112,7 @@ PROBE=wd
 rc=0; watchdog 1 sleep 20 || rc=\$?; echo "hang=\$rc"
 rc=0; watchdog 5 sh -c 'exit 3' || rc=\$?; echo "exit=\$rc"
 out=\$(watchdog 5 echo hi); echo "out=\$out"
+echo fed | watchdog 5 sh -c 'if read -r l; then echo "stdin=\$l"; else echo stdin=eof; fi'
 EOF
     local t0=$SECONDS
     env PATH="$T/bin:$FAKE_REAL_PATH" FAKE_STATE="$T/state" SPIKE_RESULTS="$T/results" \
@@ -119,6 +120,9 @@ EOF
     want hang=124
     want exit=3
     want out=hi
+    # stdin is closed: a command that prompts gets EOF, not the caller's input.
+    want stdin=eof
+    lacks stdin=fed
     [ $((SECONDS - t0)) -lt 10 ] || failt "the watchdog took $((SECONDS - t0))s"
 }
 
@@ -243,6 +247,46 @@ t_simctl_bad_png() {
     verdict_is FAIL
 }
 
+# A boot that fails under (allow default) alone is a FAIL: sandbox-exec itself, not
+# the deny, may be what failed the control.
+t_simctl_allow_fails() {
+    : >"$T/state/allow_fails"
+    probe simctl
+    want 'simctl.sandbox_allow.boot=sandbox-exec: sandbox_apply: Operation not permitted [rc=71]'
+    want 'simctl.screenshot.png=yes'
+    want 'the boot under (allow default) failed'
+    verdict_is FAIL
+}
+
+# A device that never finishes booting is a FAIL, even when the screenshot works.
+t_simctl_bootstatus_fails() {
+    : >"$T/state/bootstatus_fails"
+    probe simctl
+    want 'simctl.bootstatus= [rc=1]'
+    want 'simctl.screenshot.png=yes'
+    want 'the device did not finish booting'
+    verdict_is FAIL
+}
+
+# A device that cannot be deleted is a FAIL.
+t_simctl_delete_fails() {
+    : >"$T/state/delete_fails"
+    probe simctl
+    want 'simctl.delete=Unable to delete device: busy [rc=149]'
+    want 'the device could not be deleted'
+    verdict_is FAIL
+}
+
+# Error text from a create that exits 0 is not taken as a UDID: nothing is booted.
+t_simctl_create_garbage() {
+    : >"$T/state/create_garbage"
+    probe simctl
+    want 'simctl.create=An error was encountered processing the command (code=161).'
+    want 'no device was created'
+    calls "xcrun simctl --set $T/results/sims boot" 0
+    verdict_is FAIL
+}
+
 # ---------------------------------------------------------------- tcc
 
 t_tcc_pass() {
@@ -295,6 +339,7 @@ t_verdicts() {
 
 for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop t_am_hang \
     t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
+    t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
     t_tcc_pass t_tcc_control_empty t_verdicts; do
     t "$test"
 done

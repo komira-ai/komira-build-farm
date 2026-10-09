@@ -88,6 +88,12 @@ case "$NAME" in
         # the fake simctl, unless the test says the deny is ignored.
         case "$2" in
             *CoreSimulatorService*) has deny_ignored || export FAKE_SIM_DENIED=1 ;;
+            *)
+                if has allow_fails; then
+                    echo 'sandbox-exec: sandbox_apply: Operation not permitted' >&2
+                    exit 71
+                fi
+                ;;
         esac
         shift 2
         PATH=$CALLER_PATH exec "$@"
@@ -124,17 +130,31 @@ case "$NAME" in
                 ;;
             create)
                 printf '%s %s\n' "$2" "$3" >"$S/created"
+                if has create_garbage; then
+                    # Error text with status 0: only the UDID check can catch it.
+                    echo 'An error was encountered processing the command (code=161).' >&2
+                    exit 0
+                fi
                 mkdir -p "$set_dir/0A1B2C3D-0000-4000-8000-000000000001"
                 echo 0A1B2C3D-0000-4000-8000-000000000001
                 ;;
             boot) : >"$S/booted" ;;
-            bootstatus) has booted || exit 1 ;;
+            bootstatus)
+                has booted || exit 1
+                if has bootstatus_fails; then exit 1; fi
+                ;;
             io)
                 has booted || exit 1
                 if has bad_png; then echo 'not a png' >"$3"; else printf '\211PNG\r\n\032\nrest' >"$3"; fi
                 ;;
             shutdown) rm -f "$S/booted" ;;
-            delete) rm -rf "${set_dir:?}/$1" ;;
+            delete)
+                if has delete_fails; then
+                    echo 'Unable to delete device: busy' >&2
+                    exit 149
+                fi
+                rm -rf "${set_dir:?}/$1"
+                ;;
         esac
         ;;
     sqlite3)
