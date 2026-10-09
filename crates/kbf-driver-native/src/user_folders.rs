@@ -139,7 +139,7 @@ impl UserFolders {
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
         )
     }
 
@@ -194,7 +194,7 @@ impl UserFolders {
 fn open_own(dir: BorrowedFd<'_>, path: &Path, uid: u32) -> io::Result<OwnedFd> {
     let fd = rustix::fs::openat(dir, path, FOLDER, Mode::empty())?;
     let owner = rustix::fs::fstat(&fd)?.st_uid;
-    if owner != uid {
+    if owner != uid && owner != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("owned by uid {owner}, not {uid}"),
