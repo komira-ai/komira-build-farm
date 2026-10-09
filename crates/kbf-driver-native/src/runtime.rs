@@ -789,6 +789,15 @@ mod tests {
         leave();
         sweep_user_folders_after_lease(&started.config).await;
         assert!(!left.exists(), "kept past a lease");
+        // Without folders (off macOS) there is nothing to sweep.
+        leave();
+        let mut none = started.config.clone();
+        none.user_folders = None;
+        sweep_user_folders_after_lease(&none).await;
+        assert!(
+            left.exists(),
+            "swept folders the configuration does not name"
+        );
         kbf_outputs::remove_tree(&scratch).expect("clean");
     }
 
