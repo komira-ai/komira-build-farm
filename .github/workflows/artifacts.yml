@@ -148,6 +148,7 @@ jobs:
           tar -xJf "$archive" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
           cargo cyclonedx --version
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
+      - run: bash tools/ci/check-build-commit.sh check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
         run: |
           cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
@@ -207,6 +208,7 @@ jobs:
           tar -xJf "$archive" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
           cargo cyclonedx --version
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
+      - run: bash tools/ci/check-build-commit.sh check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
         run: |
           cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"

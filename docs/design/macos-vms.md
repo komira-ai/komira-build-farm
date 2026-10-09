@@ -19,6 +19,11 @@ updates, device management and UI, are a separate design:
 [fleet-updates.md](fleet-updates.md), with its security model in
 [fleet-updates-security.md](fleet-updates-security.md).
 
+How a guest gets past Setup Assistant, how screenshots and videos leave it, its
+network, how an image is named, which uid runs the VM, how the VM helper is signed,
+and the probes that must answer the open questions are in a companion design,
+[macos-vm-guests.md](macos-vm-guests.md).
+
 Claims about Apple's software and other projects are marked **[V]** (read in the
 source linked) or **[A]** (an assumption or a number nobody has measured on our
 hardware). The table in [section 11](#11-verified-and-assumed) lists them together.
@@ -282,7 +287,7 @@ The action says so, the node says what it can do, and the scheduler books it.
 | Key | Kind | Values | Meaning |
 |---|---|---|---|
 | `kbf-lease` | reserved | `vm` (new; beside `action` and `whole_machine`) | run in a fresh macOS VM |
-| `vm.image` | capability, membership | `<name>@sha256:<digest>` | the golden image; a value without a digest is refused, as for container images |
+| `vm.image` | capability, membership | `<name>@sha256:<recipe digest>` | the golden image, named by the digest of its pinned inputs ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)); a value without a digest is refused, as for container images |
 | `kbf-book-cpus` | reserved | whole cores (named like `cpus` and `vm.max_cpus`) | what the lease books. For `kbf-lease=vm` it is also the guest's vCPU count: 4-12, default 6 |
 | `kbf-book-mem-gib` | reserved | GiB | what the lease books. For `kbf-lease=vm`: 9-33, default 17, and the guest's `memorySize` is this minus 1 GiB for the helper (8-32 GiB, default 16) |
 
@@ -326,9 +331,9 @@ turns them into a booking.
 
 | Entry | Meaning |
 |---|---|
-| `drivers` gains `vm` | the existing repeated `drivers` key ([capabilities.md](capabilities.md)); `vm` is listed only when Virtualization.framework is usable: a boot check of a tiny VM at daemon start passes |
+| `drivers` gains `vm` | the existing repeated `drivers` key ([capabilities.md](capabilities.md)); `vm` is listed only when Virtualization.framework is usable: a check that boots nothing passes at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
 | `vm.slots=2` | how many VMs may run at once; fills the `vms` dimension |
-| `vm.image=<digest>`, one per image | golden images already on the node's disk |
+| `vm.image=<recipe digest>`, one per image | golden images already on the node's disk whose file manifest re-verifies |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start |
 
 `vm.slots`, `vm.max_cpus` and `vm.max_mem_gib` are report-only: an action cannot ask
@@ -393,9 +398,10 @@ entitlement Apple requires
 ([sample](https://developer.apple.com/documentation/virtualization/running-macos-in-a-virtual-machine-on-apple-silicon))
 **[V]**.
 
-`kbf-vmm` runs as a dedicated non-admin uid outside the root helpers' group (started
-through `kbf-mac-session run`, or as its own launchd user), never as the daemon's role
-account; otherwise a guest escape would reach the root helpers (fleet-updates security
+`kbf-vmm` runs as a dedicated non-admin uid outside the root helpers' group: a
+throwaway lease user of its own for each VM, from `kbf-mac-session user-create` and
+started with `run` ([macos-vm-guests.md](macos-vm-guests.md#6-the-run-as-uid-and-the-control-channel)),
+never as the daemon's role account; otherwise a guest escape would reach the root helpers (fleet-updates security
 design, [fleet-updates-security.md](fleet-updates-security.md)). So `kbf-mac-session`'s
 `run` verb must exist by phase 2 of this design; [fleet-updates.md](fleet-updates.md) ships it in its phase P1
 on Macs.
@@ -412,9 +418,12 @@ Per lease:
 2. **Configure.** From the booking, so `Start` needs no new field: `cpuCount` is the
    booked cores, and `memorySize` is the booked memory minus the 1 GiB booked for the
    helper (16 GiB for the default 17 GiB booking), so the guest is not 1 GiB too large.
-   Devices: one virtio socket; two virtiofs shares, inputs read-only and outputs
-   read-write; a network device only when the action asks for the network; a graphics
-   device (`VZMacGraphicsDeviceConfiguration`) and display for GUI work.
+   Devices: one virtio socket; two virtiofs shares, one read-only for control files
+   and one read-write holding the execution root
+   ([macos-vm-guests.md](macos-vm-guests.md#33-how-outputs-leave-the-guest)); no
+   network device unless network-on VM leases are decided
+   ([macos-vm-guests.md](macos-vm-guests.md#4-networking)); a graphics device
+   (`VZMacGraphicsDeviceConfiguration`) with one display and no view on the host.
 3. **Boot.** Wait for the guest agent to report ready over the socket. Boot time is not
    charged to the action's timeout; the boot timeout is 120 s **[A]** until boot is
    measured (expected 20-60 s **[A]**).
@@ -438,7 +447,8 @@ Rules:
 - **Fencing:** every lease self-fences today; a VM with the network or a GUI always
   will.
 - **A risk to test first:** whether Virtualization.framework starts a macOS VM from a
-  launchd daemon with no user logged in on the host **[A]**. If the probe fails, the
+  launchd daemon with no user logged in on the host **[A]** (probe P5,
+  [macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)). If the probe fails, the
   fallback is an open decision: a session of a dedicated non-admin VM user, held while
   the node serves VM leases. That is an exception to "auto-login off at rest" and needs
   a ruling; [mac-node-provisioning.md](mac-node-provisioning.md)'s `autologin` check and `kbf-mac-session`'s user-id range rule
@@ -465,29 +475,37 @@ read as a reference for the steps. An image is built in a fixed order:
    ([vanilla-tahoe.pkr.hcl](https://github.com/cirruslabs/macos-image-templates/blob/main/templates/vanilla-tahoe.pkr.hcl))
    **[V]**.
 2. **Settings**: auto-login of a non-admin test user, sleep and screen lock off,
-   updates off, `kbf-guest` as a LaunchAgent of that user.
+   updates off, `kbf-guest` as a LaunchAgent of that user, set up by a first-boot
+   launch daemon inside the guest
+   ([macos-vm-guests.md](macos-vm-guests.md#2-guest-first-boot-setup)).
 3. **Xcode**: one pinned `.xip` by SHA-256, then `xcodebuild -runFirstLaunch`, then the
    pinned simulator runtimes (`xcodebuild -downloadPlatform iOS -buildVersion <v>`),
    checked against an expected list with `xcrun simctl list runtimes`
    ([xcode.pkr.hcl](https://github.com/cirruslabs/macos-image-templates/blob/main/templates/xcode.pkr.hcl))
    **[V]**.
-4. **Digest**: the SHA-256 of a manifest of the image's files names the image. It pins
-   the VM lease's whole toolchain; clients route on `vm.image`. Host-identity probes
+4. **Digests**: the SHA-256 of the recipe (the pinned inputs) names the image, and
+   clients route on it in `vm.image`; the SHA-256 of a manifest of the image's files is
+   the per-node content digest, which attests the disk but is not routed on, because
+   the installer's output is not byte-reproducible **[A]**
+   ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)). Host-identity probes
    ([mac-node-provisioning.md](mac-node-provisioning.md), §3.1) are for bare-metal Xcodes.
 
 Size: Cirrus's Xcode template uses a 140 GB disk **[V]**; plan 100-140 GB per golden
 image **[A]**. A node keeps at most two (Xcode N and N-1) **[A]**, 200-280 GB, plus up
 to 40 GiB per running clone (up to 80 GiB with both VMs running).
 
-Distribution, two options (a decision, [section 10](#10-open-decisions)):
+Distribution, two options (a decision, [section 10](#10-open-decisions); the
+licence position is set out in
+[macos-vm-guests.md](macos-vm-guests.md#54-distribution-and-the-licences)):
 
 - **Build once, ship by digest** through the CAS as a chunked blob, imported on each
   Mac by an operator command, then reported as `vm.image`. One build, identical bytes
   everywhere. Needs chunked upload, which `kbf-segments` has and the cache does not use
   yet. This copies an image holding macOS and Xcode from one Mac to another; whether
   the macOS and Xcode licences allow that has not been checked by a lawyer **[A]**.
-- **Build on each Mac** from the same pinned inputs. No large transfers; the bytes may
-  differ per Mac, so the digest is per node.
+- **Build on each Mac** from the same pinned inputs. No large transfers; the bytes
+  differ per Mac, so the content digest is per node and clients route on the recipe
+  digest.
 
 macOS 27 adds DiskImageKit with read-only base layers shared by several VMs plus
 copy-on-write overlays ([DiskImageKit](https://developer.apple.com/documentation/diskimagekit))
@@ -676,10 +694,13 @@ model, then layer 4.
 |---|---|---|
 | Default VM size | 4 vCPU / 12 GiB; **6 / 16**; 8 / 24 | a 6 vCPU / 16 GiB guest (6 cores / 17 GiB booked), per-action up to 12 vCPU / 32 GiB |
 | VM CPU booking | full vCPU count; half | full |
-| Image distribution | ship by digest through the CAS; build on each Mac | ship by digest, if copying an image holding macOS and Xcode between our Macs is allowed by their licences (not checked by a lawyer) |
+| Image distribution | ship by digest through the CAS; build on each Mac | build on each Mac and route on the recipe digest; shipping images waits for a legal review of the Xcode licence ([macos-vm-guests.md](macos-vm-guests.md#54-distribution-and-the-licences)) |
 | Images per node | one Xcode; two (N and N-1) | two (200-280 GB) |
 | `ibtool`/`actool` | VM; bare metal | bare metal if the probe passes |
 | If a VM cannot start from a launch daemon | a session of a dedicated non-admin VM user held while the node serves VM leases (an exception to auto-login off at rest); no VMs on that macOS | needs a ruling; a per-lease switch is impossible ([section 6](#6-the-vm-driver-one-vm-per-lease-never-reused)) |
+
+The open decisions about guest setup, network, signing and the control channel are in
+[macos-vm-guests.md](macos-vm-guests.md#10-open-decisions).
 
 Decided, not open: GPU work never runs in a VM; a GPU test takes the whole Mac on bare
 metal, one at a time ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
