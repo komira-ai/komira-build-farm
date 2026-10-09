@@ -149,6 +149,9 @@ impl Agent {
         };
         // A host that is already gone shows up as the end of the stream below.
         send(&mut stream, &ready);
+        // The Hello deadline is still set on the socket, and the reader below shares
+        // it: without this, a run that is silent for longer than the hello timeout
+        // would read as a host that is gone, and be killed.
         stream.set_read_timeout(None)?;
 
         let mut reader = stream.try_clone()?;

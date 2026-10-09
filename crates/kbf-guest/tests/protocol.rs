@@ -151,6 +151,21 @@ fn a_dripping_connection_is_dropped_after_the_hello_timeout() {
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
 }
 
+/// Catches the Hello deadline left on the socket after `Ready`: the reader would then
+/// time out once a run stays silent for longer than the hello timeout, take that as a
+/// host that is gone, and kill the run (every build over 10 s in production).
+#[test]
+fn a_run_longer_than_the_hello_timeout_still_completes() {
+    let shares = Shares::new("hello-outlast");
+    let mut config = shares.config();
+    config.hello_timeout = Duration::from_millis(200);
+    let served = Served::start(config);
+    let mut client = served.connect();
+    client.run(&sh("sleep 1; exit 0", &[])).expect("started");
+    let exit = client.wait().expect("the run was reported");
+    assert_eq!(exit.end, End::Exited(0));
+}
+
 /// Catches a second command on one boot: during the run, after it on the same
 /// connection, and on a new connection.
 #[test]
