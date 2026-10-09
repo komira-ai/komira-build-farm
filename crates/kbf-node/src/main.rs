@@ -161,8 +161,6 @@ fn native_with(
     config: NativeConfig,
     xcrun: &Path,
 ) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
-    // Before the first survey: it then reads no cache entry a lease wrote.
-    config.forget_xcrun_cache();
     let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
