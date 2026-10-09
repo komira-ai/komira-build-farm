@@ -353,6 +353,12 @@ jobs:
       - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked
+      # TEMPORARY (issue #163 investigation; removed before review): the file writes
+      # the sandbox refused during the tests, by operation and path.
+      - if: ${{ !cancelled() }}
+        run: |
+          sudo log show --last 60m --style compact --predicate 'eventMessage CONTAINS "deny(1) file-write"' \
+            | sed -E 's/^.*Sandbox: //; s/\([0-9]+\)//' | sort | uniq -c | sort -rn | head -300
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), and the fence across a suspend (issue #78).
       - run: cargo test -p kbf-daemon --lib --test suspend --locked

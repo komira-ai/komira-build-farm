@@ -268,3 +268,16 @@ pub fn no_leases(config: &NativeConfig) -> bool {
         .next()
         .is_none()
 }
+
+/// `getconf <name>` as the test's user (the driver's user) sees it, every link
+/// resolved: on macOS, `DARWIN_USER_TEMP_DIR` is the folder Foundation and `xcrun`
+/// write in whatever `TMPDIR` says.
+pub fn user_folder(name: &str) -> PathBuf {
+    let out = std::process::Command::new("/usr/bin/getconf")
+        .arg(name)
+        .output()
+        .expect("getconf");
+    assert!(out.status.success(), "getconf {name}");
+    let path = String::from_utf8(out.stdout).expect("UTF-8");
+    std::fs::canonicalize(path.trim()).expect("the folder exists")
+}
