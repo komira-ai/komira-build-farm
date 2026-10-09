@@ -277,9 +277,22 @@ impl<C: Cas> NativeRuntime<C> {
             .process_group(0)
             .kill_on_drop(true);
         let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
-        let (mut child, leader) = spawn(&mut command, exec, &record)
-            .await
-            .map_err(failed(&prepared.program))?;
+        let (mut child, leader) = if std::env::var_os("KBF_PROBE_OLD_SPAWN").is_some() {
+            drop(exec);
+            command
+                .args(&args)
+                .env_clear()
+                .envs(prepared.lease_env.iter().map(|(k, v)| (k, v)))
+                .envs(prepared.env.iter().map(|(k, v)| (k, v)))
+                .envs(prepared.developer_dir.iter().map(|d| (xcode::DEVELOPER_DIR, d)));
+            let child = command.spawn().map_err(failed(&prepared.program))?;
+            let pid = child.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+            (child, pid)
+        } else {
+            spawn(&mut command, exec, &record)
+                .await
+                .map_err(failed(&prepared.program))?
+        };
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
         let mut group = Group::new(Tracker::new(leader, me), record);
         let limit = self.config.memory.limit(work.resources.memory_bytes);

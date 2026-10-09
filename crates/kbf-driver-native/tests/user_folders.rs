@@ -249,6 +249,38 @@ perl -MTime::HiRes=time -e '
 ' "$direct"
 "#;
 
+const DIAG: &str = r#"T=$(getconf DARWIN_USER_TEMP_DIR)
+echo "T=$T TMPDIR=$TMPDIR HOME=$HOME DEVELOPER_DIR=${DEVELOPER_DIR-unset} umask=$(umask) pwd=$PWD ulimit=$(ulimit -n) id=$(id -u)"
+env | sort | tr '\n' ' '; echo
+ps -o pid,ppid,pgid,nice,pri,stat,command -p $$
+ls -la@ "$T" 2>&1 | grep -i xcrun
+t() { perl -MTime::HiRes=time -e '$s=time; system("@ARGV >/dev/null 2>&1"); printf "%.3f %s\n", time-$s, "@ARGV"' "$@"; }
+for i in 1 2 3 4; do t cc --version; done
+for i in 1 2; do t xcrun --find clang; done
+t xcrun -n --find clang
+t xcrun --show-sdk-path
+t /bin/echo
+t "$(xcrun --find clang)" --version
+xcrun_log=1 xcrun_verbose=1 cc --version 2>&1 | head -60
+xcrun --verbose --find clang 2>&1 | head -40
+ls -la@ "$T" 2>&1 | grep -i xcrun
+"#;
+
+fn all_denials() -> String {
+    let out = std::process::Command::new("/usr/bin/log")
+        .args(["show", "--last", "3m", "--style", "compact", "--predicate",
+            "eventMessage CONTAINS \"deny(\" OR sender == \"Sandbox\""])
+        .output();
+    let Ok(out) = out else { return "no log".to_owned() };
+    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once("deny(").map(|(_, r)| r.to_owned()))
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines.join("\n")
+}
+
 /// The output of [`SHIMS`] but its last line, and the two times on that line.
 fn shim_times(out: &str) -> (String, f64, f64) {
     let (rest, last) = out
@@ -297,11 +329,23 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
             spec = spec.property("xcode", build);
         }
         let seq = u64::try_from(seq).expect("small") + 1;
+        if std::env::var_os("KBF_PROBE_DIAG").is_some() {
+            let mut d = Spec::sh(DIAG).env("PATH", PATH);
+            if let Some(build) = build {
+                d = d.property("xcode", build);
+            }
+            let r = run_long(&rt, &cas, 100 + seq, &d).await;
+            eprintln!("PROBE sandboxed xcode={build:?}\n{}\nERR {}", stdout(&cas, &r), stderr(&cas, &r));
+            let r = run_long(&open, &cas, 100 + seq, &d).await;
+            eprintln!("PROBE open xcode={build:?}\n{}\nERR {}", stdout(&cas, &r), stderr(&cas, &r));
+            eprintln!("PROBE denials\n{}", all_denials());
+        }
         let result = run_long(&rt, &cas, seq, &spec).await;
         let (said, shim, direct) = shim_times(&stdout(&cas, &result));
         let control = run_long(&open, &cas, seq, &spec).await;
         let (_, open_shim, _) = shim_times(&stdout(&cas, &control));
         let times = format!("cc {shim}s, unsandboxed cc {open_shim}s, clang {direct}s");
+        eprintln!("PROBE TIMES xcode={build:?} {times}");
         assert_eq!(
             (said.as_str(), stderr(&cas, &result).as_str()),
             ("", ""),

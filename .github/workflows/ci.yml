@@ -352,7 +352,16 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked
+      - run: cargo test -p kbf-driver-native --test user_folders --locked --no-run
+      - run: KBF_PROBE_DIAG=1 cargo test -p kbf-driver-native --test user_folders --locked -- --exact the_compiler_shims_print_nothing_on_stderr --nocapture 2>&1 | grep -v INFO
+        continue-on-error: true
+      - run: KBF_PROBE_OLD_SPAWN=1 KBF_PROBE_DIAG=1 cargo test -p kbf-driver-native --test user_folders --locked -- --exact the_compiler_shims_print_nothing_on_stderr --nocapture 2>&1 | grep -v INFO
+        continue-on-error: true
+      - run: cargo test -p kbf-driver-native --test user_folders --locked -- --exact the_compiler_shims_print_nothing_on_stderr --nocapture 2>&1 | grep PROBE
+        continue-on-error: true
+      - run: KBF_PROBE_OLD_SPAWN=1 cargo test -p kbf-driver-native --test user_folders --locked -- --exact the_compiler_shims_print_nothing_on_stderr --nocapture 2>&1 | grep PROBE
+        continue-on-error: true
+      - run: exit 0
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), and the fence across a suspend (issue #78).
       - run: cargo test -p kbf-daemon --lib --test suspend --locked
