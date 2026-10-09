@@ -46,6 +46,8 @@ role (`--role=all`). The flags are:
 
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
+- `--reapi-tls-cert` and `--reapi-tls-key` to serve the REAPI listener over TLS (both,
+  or neither for plain text, which is meant for a loopback bind);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
   listener over mutual TLS (all three, or none for plain text), and
   `--worker-deny-list` for the certificates and nodes it refuses;
@@ -249,8 +251,17 @@ and a daemon protocol in which only the newest stream of a worker counts. See
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
-- The REAPI listener has no TLS and no authentication yet (**planned**: TLS and
-  bearer-token authentication, with the caller's identity deciding its role).
+- The REAPI listener serves TLS when given a certificate and key (`--reapi-tls-cert`,
+  `--reapi-tls-key`); clients present no certificate. A key that does not match its
+  certificate stops the server at start. Without the flags it serves plain text, which
+  is meant for a loopback bind; nothing refuses a plain-text bind elsewhere yet. A
+  daemon whose `--cas` is an `https://` URL of the REAPI listener checks its
+  certificate with the CA and `--tls-server-name` it uses for the worker listener (the
+  URL's host without that flag), so the REAPI certificate must chain to that CA and
+  carry that name; when the worker listener's certificate names
+  cover the address clients dial, the same certificate and key may be given to both
+  listeners. The REAPI listener has no client authentication yet (**planned**:
+  bearer tokens, with the caller's identity deciding its role).
 - Only the daemon path writes the action cache, and the metadata state machine itself
   refuses an action-cache write from any role but `Daemon`.
 - Actions run without network (`--network=none`) in rootless containers, as described

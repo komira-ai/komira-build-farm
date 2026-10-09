@@ -177,6 +177,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
     let listeners = Listeners {
         reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
         worker: SocketAddr::from(([127, 0, 0, 1], 0)),
+        reapi_tls: None,
         worker_tls: Some(WorkerTls {
             server: tls,
             deny_list: None,

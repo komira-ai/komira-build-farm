@@ -46,9 +46,22 @@ pub struct Args {
     /// Where blob bytes are stored.
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
-    /// The REAPI listener.
+    /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
+    /// plain text with no authentication: bind it to loopback only.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
+    /// PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves
+    /// TLS; clients present no certificate. A daemon whose `--cas` is an `https://` URL
+    /// of this listener checks it with its own CA and `--tls-server-name` (the URL's
+    /// host without it), so the certificate must chain to that CA and carry that name;
+    /// the worker listener's certificate and key may be given here when its names
+    /// cover the REAPI address clients dial.
+    #[arg(long, requires = "reapi_tls_key")]
+    pub reapi_tls_cert: Option<PathBuf>,
+    /// PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the
+    /// server refuses to start.
+    #[arg(long, requires = "reapi_tls_cert")]
+    pub reapi_tls_key: Option<PathBuf>,
     /// The `kbf.worker.v1` listener.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
@@ -173,8 +186,15 @@ impl Args {
             }),
             _ => None,
         };
+        let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
+            (Some(cert), Some(key)) => Some(
+                ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)),
+            ),
+            _ => None,
+        };
         Ok(Listeners {
             reapi: self.listen,
+            reapi_tls,
             worker: self.worker_listen,
             worker_tls,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),

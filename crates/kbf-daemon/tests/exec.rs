@@ -45,6 +45,7 @@ impl Farm {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
+            reapi_tls: None,
             worker_tls: Some(WorkerTls {
                 server: pki.server_tls(),
                 deny_list: None,

@@ -85,6 +85,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let listeners = Listeners {
         reapi: loopback(),
         worker: loopback(),
+        reapi_tls: None,
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
@@ -287,6 +288,7 @@ async fn an_api_address_in_use_is_refused() {
     let listeners = Listeners {
         reapi: loopback(),
         worker: loopback(),
+        reapi_tls: None,
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,

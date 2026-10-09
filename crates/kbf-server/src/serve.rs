@@ -23,6 +23,9 @@ use crate::worker::WorkerService;
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
+    /// TLS for the REAPI listener (a server certificate; clients present none). `None`
+    /// serves it in plain text, which is meant for a loopback bind.
+    pub reapi_tls: Option<ServerTlsConfig>,
     /// The `kbf.worker.v1` listener (daemons).
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
@@ -137,7 +140,8 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
 /// completes, or a listener fails.
 ///
 /// # Errors
-/// A listener cannot be bound, or the worker TLS configuration is refused.
+/// A listener cannot be bound, or a TLS configuration is refused (a key that does not
+/// match its certificate, say).
 pub fn bind_server<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -161,7 +165,8 @@ where
 /// worker listener is not drained: it stops when the future returns.
 ///
 /// # Errors
-/// A listener cannot be bound, or the worker TLS configuration is refused.
+/// A listener cannot be bound, or a TLS configuration is refused (a key that does not
+/// match its certificate, say).
 pub fn bind_server_with_api<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -184,6 +189,10 @@ where
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let api_routes = crate::api::router(Arc::clone(&farm), token);
 
+    let mut reapi_server = Server::builder();
+    if let Some(tls) = listeners.reapi_tls {
+        reapi_server = reapi_server.tls_config(tls)?;
+    }
     let mut worker_server = Server::builder();
     let peers = match listeners.worker_tls {
         Some(tls) => {
@@ -207,7 +216,7 @@ where
 
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
-        let reapi_serve = Server::builder()
+        let reapi_serve = reapi_server
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
