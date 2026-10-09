@@ -470,10 +470,12 @@ fn a_process_started_during_user_delete_stops_it() {
     std::fs::create_dir_all(rig.dir.join("tabs")).unwrap();
     std::fs::write(&tab, "* * * * * job").unwrap();
 
-    // A job starts while the crontab is removed: found at the second look, before the
-    // home folder is touched.
-    rig.host.state().live_script.extend([0, 1]);
+    // A job starts while the crontab is removed and does not exit: found at the
+    // second look, before the home folder is touched.
+    rig.host.state().live_script.push_back(0);
+    rig.host.state().procs.insert(uid, 1);
     let error = rig.helper.user_delete("11.1").unwrap_err();
+    rig.host.state().procs.clear();
     assert!(error.contains("1 processes of uid"), "{error}");
     assert!(!tab.exists(), "the schedules go first");
     assert!(home.exists(), "nothing else is swept while a process lives");
@@ -482,16 +484,20 @@ fn a_process_started_during_user_delete_stops_it() {
     // One starts during the rest of the sweep: found at the last look, and the user
     // record stays.
     log(&rig);
-    rig.host.state().live_script.extend([0, 0, 1]);
+    rig.host.state().live_script.extend([0, 0]);
+    rig.host.state().procs.insert(uid, 1);
     let error = rig.helper.user_delete("11.1").unwrap_err();
+    rig.host.state().procs.clear();
     assert!(error.contains("1 processes of uid"), "{error}");
     assert!(!home.exists());
     assert!(rig.host.state().users.contains_key("kbf-lease-11-1"));
+    let calls = log(&rig);
     assert_eq!(
-        log(&rig),
-        vec![format!("live_processes {uid}"); 3],
-        "three looks, and no delete_user"
+        calls.iter().filter(|c| c.starts_with("live_processes")).count(),
+        2 + EXIT_LOOKS,
+        "two looks, then the third waits its whole bound: {calls:?}"
     );
+    assert!(!calls.iter().any(|c| c.starts_with("delete_user")), "{calls:?}");
 
     // With none left the delete completes, after three looks.
     assert_eq!(rig.helper.user_delete("11.1"), Ok(true));
@@ -577,4 +583,75 @@ fn a_home_folder_is_new_private_and_the_users() {
     assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
     std::os::unix::fs::symlink(&dir, dir.join("linked")).unwrap();
     assert!(make_home(&dir.join("linked"), "x", me(), my_gid()).is_err());
+}
+
+/// Catches the race of issue #195: a process of the uid (a cron job) that starts after
+/// `kill-uid` and exits by itself a moment later. `user-delete` waits for it at each
+/// look instead of refusing at once. Red with a single listing per look (no wait).
+#[test]
+fn user_delete_waits_for_a_process_that_exits() {
+    let rig = rig("delete-wait", 2);
+    let uid = rig.helper.user_create("12.1", None).unwrap();
+    log(&rig);
+    // Alive at the first two listings of the first look, gone at the third.
+    rig.host.state().live_script.extend([1, 1]);
+    assert_eq!(rig.helper.user_delete("12.1"), Ok(true));
+    let look = format!("live_processes {uid}");
+    assert_eq!(
+        log(&rig),
+        [
+            look.clone(),
+            "pause".to_owned(),
+            look.clone(),
+            "pause".to_owned(),
+            look.clone(),
+            look.clone(),
+            look,
+            "delete_user kbf-lease-12-1".to_owned(),
+        ]
+    );
+
+    // One that exits during the last look, after the sweep: waited for too.
+    let uid = rig.helper.user_create("12.2", None).unwrap();
+    log(&rig);
+    let mut script = vec![0, 0];
+    script.extend(std::iter::repeat_n(3, EXIT_LOOKS - 1));
+    rig.host.state().live_script.extend(script);
+    assert_eq!(rig.helper.user_delete("12.2"), Ok(true));
+    let calls = log(&rig);
+    assert_eq!(
+        calls.iter().filter(|c| **c == "pause").count(),
+        EXIT_LOOKS - 1,
+        "{uid}: {calls:?}"
+    );
+    assert_eq!(calls.last().unwrap(), "delete_user kbf-lease-12-2");
+}
+
+/// Catches: a wait without a bound (the fake host panics past its pause limit), a
+/// bound other than [`EXIT_LOOKS`], or a refusal that does not say which processes
+/// are left. More than [`NAMED`] are counted, not listed.
+#[test]
+fn user_delete_gives_up_naming_what_is_left() {
+    let rig = rig("delete-give-up", 2);
+    let uid = rig.helper.user_create("13.1", None).unwrap();
+    log(&rig);
+    rig.host.state().procs.insert(uid, 2);
+    let error = rig.helper.user_delete("13.1").unwrap_err();
+    assert_eq!(
+        error,
+        format!(
+            "2 processes of uid {uid} remain after {EXIT_LOOKS} looks: \
+             1000 (proc0), 1001 (proc1); kill-uid first"
+        )
+    );
+    let calls = log(&rig);
+    let looks = calls.iter().filter(|c| c.starts_with("live_processes")).count();
+    let pauses = calls.iter().filter(|c| **c == "pause").count();
+    assert_eq!((looks, pauses), (EXIT_LOOKS, EXIT_LOOKS - 1));
+    assert!(rig.host.state().users.contains_key("kbf-lease-13-1"));
+
+    rig.host.state().procs.insert(uid, NAMED + 2);
+    let error = rig.helper.user_delete("13.1").unwrap_err();
+    assert!(error.contains("1007 (proc7), and 2 more; kill-uid first"), "{error}");
+    assert!(!error.contains("proc8"), "{error}");
 }

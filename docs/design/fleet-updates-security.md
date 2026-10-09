@@ -268,8 +268,11 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   folders. The crontab and `at` jobs go first, and `user-delete` looks for live
 >   processes of the uid three times: before anything is removed, once those are gone
 >   (a job that fired after `kill-uid` is found there), and after the whole sweep,
->   just before the record is deleted; any process refuses the delete. A process
->   whose state cannot be read counts as live. Background Task Management entries live
+>   just before the record is deleted. Each look lists the uid's processes up to 50
+>   times, 100 ms apart, so a cron job that started between `kill-uid` and the delete
+>   and ends by itself is waited for; a process still alive then refuses the delete,
+>   and the refusal names its pid and command. A process whose state cannot be read
+>   counts as live. Background Task Management entries live
 >   in one system-wide database; no per-uid removal is built, so they stay **[A]**, for
 >   the leak scan (P4).
 > - **Pending print jobs are not swept.** CUPS keeps a job's files in

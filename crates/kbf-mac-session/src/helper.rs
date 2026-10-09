@@ -13,7 +13,9 @@
 //! - `user-delete` refuses while any process of the uid remains, first removes what
 //!   can start one (crontab, `at` jobs), then looks again, sweeps the rest, looks a
 //!   last time, deletes the record, and records the deletion last: a crash part-way
-//!   leaves the lease live, and the delete is simply repeated.
+//!   leaves the lease live, and the delete is simply repeated. At each look it waits,
+//!   bounded, for processes of the uid to exit (a cron job that started after
+//!   `kill-uid`), and names those still alive when it refuses.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
 //! it while it starts the process, so no process starts for a lease being deleted.
@@ -37,6 +39,14 @@ use crate::sweep::{SweepPlan, sweep};
 
 /// How many times `kill-uid` kills and looks again before it gives up.
 pub const KILL_ROUNDS: usize = 10;
+
+/// How many times each of `user-delete`'s looks lists the uid's processes, a
+/// [`Host::pause`] apart, before it refuses: about five seconds on macOS, for a job
+/// that started after `kill-uid` to exit.
+pub const EXIT_LOOKS: usize = 50;
+
+/// How many processes a refusal names; it counts the rest.
+const NAMED: usize = 8;
 
 /// What the OS does for the helper. The macOS implementation is in `crate::macos`.
 pub trait Host: Send + Sync {
@@ -74,13 +84,38 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// The signal could not be sent.
     fn kill_all(&self, uid: u32) -> io::Result<()>;
-    /// How many live (not zombie) processes have `uid` as their real or effective uid.
+    /// The live (not zombie) processes that have `uid` as their real or effective uid.
     ///
     /// # Errors
     /// The process table could not be read.
-    fn live_processes(&self, uid: u32) -> io::Result<usize>;
-    /// Waits a moment between kill rounds.
+    fn live_processes(&self, uid: u32) -> io::Result<Vec<LiveProcess>>;
+    /// Waits a moment between kill rounds, and between the listings of a wait.
     fn pause(&self);
+}
+
+/// A live process of a lease uid, as a refusal names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveProcess {
+    pub pid: i32,
+    /// Its command name as the kernel keeps it (truncated), or `?` if unreadable.
+    pub command: String,
+}
+
+/// `<count> processes of uid <uid> remain <when>: <pid> (<command>), ...`.
+fn remain(uid: u32, when: &str, left: &[LiveProcess]) -> String {
+    let mut named: Vec<String> = left
+        .iter()
+        .take(NAMED)
+        .map(|p| format!("{} ({})", p.pid, p.command))
+        .collect();
+    if left.len() > NAMED {
+        named.push(format!("and {} more", left.len() - NAMED));
+    }
+    format!(
+        "{} processes of uid {uid} remain {when}: {}",
+        left.len(),
+        named.join(", ")
+    )
 }
 
 /// A user record to create.
@@ -224,14 +259,14 @@ impl Helper {
                 continue;
             }
             let taken = self.host.uid_taken(uid).map_err(|why| why.to_string())?;
-            if !taken && self.live(uid)? == 0 {
+            if !taken && self.live(uid)?.is_empty() {
                 return Ok(uid);
             }
         }
         Err(format!("no free uid in {range}"))
     }
 
-    fn live(&self, uid: u32) -> Result<usize, String> {
+    fn live(&self, uid: u32) -> Result<Vec<LiveProcess>, String> {
         self.host
             .live_processes(uid)
             .map_err(|why| format!("listing the processes of uid {uid}: {why}"))
@@ -307,21 +342,19 @@ impl Helper {
                 tracing::debug!(lease = %lease, "launchctl bootout {domain}: {why}");
             }
         }
-        let mut left = 0;
+        let mut left = Vec::new();
         for _ in 0..KILL_ROUNDS {
             self.host
                 .kill_all(uid)
                 .map_err(|why| format!("killing the processes of uid {uid}: {why}"))?;
             left = self.live(uid)?;
-            if left == 0 {
+            if left.is_empty() {
                 tracing::info!(lease = %lease, uid, "no process of the lease user is left");
                 return Ok(());
             }
             self.host.pause();
         }
-        Err(format!(
-            "{left} processes of uid {uid} remain after {KILL_ROUNDS} rounds"
-        ))
+        Err(remain(uid, &format!("after {KILL_ROUNDS} rounds"), &left))
     }
 
     /// `user-delete <lease>`: sweeps what the user leaves, deletes its record and
@@ -332,7 +365,10 @@ impl Helper {
     /// removed (so nothing of the user races the walk), once the crontab and `at` jobs
     /// are gone (a job that started after `kill-uid` is found here, and none can start
     /// later), and after the whole sweep, just before the record goes (so no process
-    /// outlives its user as an orphan uid that later leases' files are open to).
+    /// outlives its user as an orphan uid that later leases' files are open to). Each
+    /// look waits up to [`EXIT_LOOKS`] listings for the processes it finds to exit: a
+    /// cron job that started between `kill-uid` and this delete ends by itself, and
+    /// one that does not is named in the refusal.
     ///
     /// # Errors
     /// Why it was refused: a process of the uid remains, or the sweep or the deletion
@@ -364,14 +400,23 @@ impl Helper {
         Ok(existed)
     }
 
-    /// Refuses while any process of `uid` is alive.
+    /// Waits, for at most [`EXIT_LOOKS`] listings, until no process of `uid` is
+    /// alive; refuses, naming the processes, if some still are.
     fn none_left(&self, uid: u32) -> Result<(), String> {
-        match self.live(uid)? {
-            0 => Ok(()),
-            left => Err(format!(
-                "{left} processes of uid {uid} remain; kill-uid first"
-            )),
+        let mut left = self.live(uid)?;
+        let mut looks = 1;
+        while !left.is_empty() && looks < EXIT_LOOKS {
+            self.host.pause();
+            left = self.live(uid)?;
+            looks += 1;
         }
+        if left.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{}; kill-uid first",
+            remain(uid, &format!("after {EXIT_LOOKS} looks"), &left)
+        ))
     }
 
     /// Sweeps `plan` for the user; how many entries went, or why it is incomplete.

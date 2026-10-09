@@ -7,10 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::helper::{Host, NewUser};
+use crate::helper::{Host, LiveProcess, NewUser};
 
 /// The fake clock's time.
 pub(crate) const NOW: u64 = 1_800_000_000;
+
+/// More pauses than any bounded wait of the helper takes: past this a wait has no
+/// bound, and the test panics instead of hanging.
+const PAUSES: usize = 10_000;
 
 #[derive(Default)]
 pub(crate) struct State {
@@ -27,6 +31,8 @@ pub(crate) struct State {
     pub(crate) live_script: VecDeque<usize>,
     /// Per uid, how many more `kill_all` calls leave its processes alive.
     pub(crate) stubborn: BTreeMap<u32, usize>,
+    /// Every `pause` so far.
+    pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
     /// "delete_user", "bootout gui", "kill_all", "live_processes").
     pub(crate) fail: BTreeSet<&'static str>,
@@ -101,15 +107,25 @@ impl Host for FakeHost {
         Ok(())
     }
 
-    fn live_processes(&self, uid: u32) -> io::Result<usize> {
+    /// `n` live processes are pids 1000 to 999+n, commands `proc0` and on.
+    fn live_processes(&self, uid: u32) -> io::Result<Vec<LiveProcess>> {
         self.call("live_processes", format!("live_processes {uid}"))?;
         let mut state = self.state();
         let scripted = state.live_script.pop_front();
-        Ok(scripted.unwrap_or_else(|| state.procs.get(&uid).copied().unwrap_or(0)))
+        let n = scripted.unwrap_or_else(|| state.procs.get(&uid).copied().unwrap_or(0));
+        Ok((0..n)
+            .map(|i| LiveProcess {
+                pid: 1000 + i32::try_from(i).unwrap(),
+                command: format!("proc{i}"),
+            })
+            .collect())
     }
 
     fn pause(&self) {
-        self.state().log.push("pause".to_owned());
+        let mut state = self.state();
+        state.log.push("pause".to_owned());
+        state.pauses += 1;
+        assert!(state.pauses < PAUSES, "{PAUSES} pauses: a wait without a bound");
     }
 }
 
