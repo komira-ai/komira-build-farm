@@ -75,6 +75,77 @@ Today the daemon fences every lease this way. Letting hermetic work run on throu
 lost connection (`RUN_ON`) is **planned** for when `Start` carries a fence policy. At
 shutdown the daemon abandons running leases; the scheduler gives them up after G.
 
+## When the daemon is killed
+
+A daemon that stops on SIGTERM or SIGINT kills its leases' processes on the way out. One
+that is killed (SIGKILL, the kernel's OOM killer, a panic that aborts) cannot, and
+nothing the kernel does to the daemon reaches its actions: each leads a process group
+of its own (native driver) or runs in a container (container driver). The daemon
+re-adopts nothing (re-adopting is **planned**), so the next daemon on the node ends
+them before it says `Hello` (issue #155), as part of building its driver:
+
+- **Native driver.** Before an action's program runs, the daemon writes its run record,
+  `<scratch>/runs/lease-<term>-<seq>` (a new file, mode 0600, in a 0700 directory, never
+  through a symlink): the leader's pid (the process group id), its start time and the
+  boot. The child waits between fork and exec until the record is written; a child
+  whose daemon dies first exits without running the program. At start the driver kills
+  every recorded group (SIGKILL to the group and to every process found in it or below
+  it, again until none is alive), then removes the record, then the lease directories.
+  A record of an earlier boot, or whose pid now names a process with another start
+  time, names nothing that runs, so nothing is signalled. The daemon never signals its
+  own group, its parent or its parent's group, nor a group id of 1 or less: a record
+  naming either group is read and dropped, and that group is not walked. Processes of
+  its own user that survive SIGKILL for the kill wait stop the daemon from starting;
+  processes of another user, and those it never signals, found in or below a recorded
+  group are not its actions: they are left alone (the walk goes on below them), and
+  the record is dropped. An entry of `runs/` that is not a regular file of the daemon's
+  user that only that user may write (a FIFO, a directory, a symlink, a group- or
+  other-writable file), or a `runs` that is not such a directory, is moved aside into
+  `quarantine/` unread, and the start goes on. A `quarantine` that is not the daemon's
+  directory (a symlink, or a directory others may write) is removed, never emptied
+  through; the daemon's own is emptied after the kill, through the descriptor it
+  checked, and what the sweep moves aside goes in through that descriptor too.
+- **Container driver.** Every container is created with the label
+  `kbf.owner=<node id>`. At start the driver removes each lease it finds, among the
+  containers so labelled and the lease scratch directories, as a lease's clean does
+  (`cgroup.kill`, `podman rm --force`, the lease cgroup, the scratch directory). A
+  leftover that cannot be listed or removed stops the daemon from starting.
+
+So when a restarted daemon says `Hello`, nothing a previous daemon on the node started
+under the same scratch directory (and, for containers, the same node id and Podman
+store) still runs, and the leases its first heartbeat leaves out, which the scheduler
+requeues once the handover grace has passed, do not run twice. The grace alone would
+not do: it lets the older process fence, and a killed process fences nothing. Not
+guaranteed:
+
+- **A daemon that is not started again** (its service manager gave up, or the node id
+  or scratch directory changed): its runs go on, unfenced, until the machine stops,
+  while the scheduler requeues their leases after G. The service manager is the only
+  other line. Under systemd, a unit's default `KillMode=control-group` kills everything
+  left in the unit's cgroup when its main process dies, the native driver's actions
+  included, and the containers' processes too when their cgroups are in the unit's
+  delegated subtree; the repository ships no unit yet. launchd, when a job exits,
+  kills only the job's own process group (`AbandonProcessGroup` false, the default;
+  true stops even that), and has no setting that reaches an action leading a group of
+  its own, so on a Mac the shipped plist's `KeepAlive` restart is what ends them.
+- **Native: a process that left the group** (`setsid`) and whose parent exited before
+  the sweep: nothing links it to the record. A per-lease user or cgroup would close
+  this, as it would the same gap in a lease's own kill.
+- **Native: a group id the kernel reused** while no daemon ran, in the same boot, whose
+  new leader has exited while its group lives on: the record cannot tell that group
+  from the action's.
+- **Native: the run records.** They are trusted because only the daemon can write
+  `runs/`. On macOS the sandbox ensures it. On Linux there is no sandbox until each
+  lease runs as its own user, so an action, which runs as the daemon's user, can write
+  a well-formed record there naming a group of that user, with its pid and start time
+  (both readable in `/proc`), and the next start then SIGKILLs that group and every
+  process below it. A record may name a group the daemon may not signal, another
+  user's: that group is left alone, but the walk goes on below it, and the daemon's
+  user's processes there are SIGKILLed. Only the daemon's own group and its parent's
+  are not walked.
+- **Results.** A result the killed daemon had not had acknowledged is lost (results are
+  kept in memory only), and its lease is requeued.
+
 ## The runtime trait
 
 ```rust

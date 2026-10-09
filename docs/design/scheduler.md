@@ -60,6 +60,15 @@ Queued -> Leased -> Running -> Completed | Failed
 - `Refused`: a refusal was committed while the operation was queued (see
   [Placement](#placement)).
 
+**Retention.** A finished operation (`Completed`, `Failed` or `Refused`) is kept for
+the finished retention after its waiters are answered (`FINISHED_RETENTION` = 60 s,
+the server's `--finished-retention-secs`), then dropped at the first input at or
+after its end (issue #165). While it is kept, `kbf-server` keeps its callers too, and
+WaitExecution on its name streams the done operation; once it is dropped the name is
+NOT_FOUND. A late input naming a dropped operation (a stale record, report or start)
+is ignored, as for any unknown one, so the scheduler holds only the unfinished
+operations and those finished within the retention.
+
 **In-flight dedup.** Operations are keyed by `ActionKey`: the REAPI instance name and
 the action digest. A new request whose key matches an unfinished operation joins it
 as another waiter instead of queueing a second run, if the request is *joinable*:
@@ -168,9 +177,14 @@ instance id (a daemon that predates the field) is taken as another process's.
 
 This puts one duty on a daemon: it must list everything it holds in its first heartbeat
 on each new stream, or what it leaves out is requeued at once. Re-adopting work across a
-daemon restart is **planned**; today a restarted daemon has no running leases, and a
-restarted daemon is another process, so leases it would re-adopt and leave out are kept
-for the handover grace.
+daemon restart is **planned**. Today a restarted daemon lists nothing of its
+predecessor's, and before its `Hello` its driver ends every run that predecessor left on
+the node (issue #155), so what is requeued after the handover grace no longer runs there.
+The grace rests on the older process fencing T after it was last heard; a process that
+was killed fences nothing, so for its runs the restarted daemon's sweep is the guarantee,
+and it holds only when a daemon is started again on the same node with the same scratch
+directory. The runs of a killed daemon that is not are left running, unfenced (see
+[daemon.md](daemon.md#when-the-daemon-is-killed)).
 
 ## QoS
 

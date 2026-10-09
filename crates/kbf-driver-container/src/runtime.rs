@@ -18,9 +18,12 @@
 //! cleans up, blocking, before the future is gone. Either way the clean first makes
 //! sure `podman start` has exited and been reaped, so nothing the driver started is
 //! left running while it removes the lease. A clean that fails turns the lease into a
-//! failure: a dirty node must be loud.
+//! failure: a dirty node must be loud. The clean in `Drop` blocks the thread that drops
+//! the run, usually a runtime worker: at worst about five seconds for `podman start` to
+//! be reaped, five more for the lease cgroup to empty, then `podman rm` (and `podman
+//! unshare rm` for files the container still owns), which nothing here bounds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -35,7 +38,7 @@ use tokio::sync::oneshot;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
-use crate::podman::{CONTAINER_OWNER, ContainerSpec, DAEMON_OWNER, Podman};
+use crate::podman::{CONTAINER_OWNER, ContainerSpec, DAEMON_OWNER, LEASE_PREFIX, Podman};
 use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -65,14 +68,19 @@ pub struct PodmanConfig {
     pub kill_grace: Duration,
     /// How much output one action may leave; past it, the action fails.
     pub outputs: OutputLimits,
+    /// Whose containers these are: each is labelled `kbf.owner=<owner>`
+    /// ([`crate::podman::OWNER_LABEL`]), and at start the runtime removes every
+    /// container so labelled. The daemon passes its node id. Two runtimes that share a
+    /// Podman store need two owners, or each start removes the other's containers.
+    pub owner: String,
 }
 
 impl PodmanConfig {
-    /// A configuration with `podman` from `PATH`, cgroup v2 at `/sys/fs/cgroup`, a one
-    /// hour default timeout, the RFC's five second kill grace and the default
-    /// [`OutputLimits`].
+    /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
+    /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace and
+    /// the default [`OutputLimits`].
     #[must_use]
-    pub fn new(scratch: PathBuf, cgroup_parent: String) -> Self {
+    pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
         Self {
             podman: PathBuf::from("podman"),
             scratch,
@@ -81,7 +89,23 @@ impl PodmanConfig {
             default_timeout: Duration::from_secs(3600),
             kill_grace: Duration::from_secs(5),
             outputs: OutputLimits::DEFAULT,
+            owner,
         }
+    }
+
+    /// Whether this configuration can be used.
+    fn check(&self) -> Result<(), ConfigError> {
+        let scratch = self.scratch.to_string_lossy();
+        if !self.scratch.is_absolute() || scratch.contains([':', ',']) {
+            return Err(ConfigError::Scratch(self.scratch.clone()));
+        }
+        if !self.cgroup_parent.starts_with('/') {
+            return Err(ConfigError::CgroupParent(self.cgroup_parent.clone()));
+        }
+        if self.owner.is_empty() {
+            return Err(ConfigError::Owner);
+        }
+        Ok(())
     }
 }
 
@@ -93,6 +117,19 @@ pub enum ConfigError {
     Scratch(PathBuf),
     #[error("cgroup parent {0:?} must start with '/'")]
     CgroupParent(String),
+    #[error("the container owner must not be empty")]
+    Owner,
+}
+
+/// Why a [`PodmanRuntime`] does not start.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StartError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// What a previous daemon left could not be listed or removed. Starting anyway
+    /// could run a lease's work beside its leftover container.
+    #[error("removing what a previous daemon left: {0}")]
+    Sweep(String),
 }
 
 /// How long the clean waits for a `podman start` it has sent `SIGKILL` to exit, and how
@@ -122,22 +159,24 @@ pub struct PodmanRuntime<C> {
 }
 
 impl<C: Cas> PodmanRuntime<C> {
-    /// A runtime that reads and writes blobs through `cas`.
-    pub fn new(config: PodmanConfig, cas: Arc<C>) -> Result<Self, ConfigError> {
-        let scratch = config.scratch.to_string_lossy();
-        if !config.scratch.is_absolute() || scratch.contains([':', ',']) {
-            return Err(ConfigError::Scratch(config.scratch.clone()));
-        }
-        if !config.cgroup_parent.starts_with('/') {
-            return Err(ConfigError::CgroupParent(config.cgroup_parent.clone()));
-        }
-        Ok(Self {
+    /// A runtime that reads and writes blobs through `cas`. Before it returns, so
+    /// before the daemon says `Hello`, it removes what a previous daemon of the same
+    /// owner left: every container labelled as the owner's (killing what still runs in
+    /// it), and every lease scratch directory, each with its lease cgroup. Blocking.
+    ///
+    /// # Errors
+    /// The configuration is unusable, or a leftover could not be listed or removed.
+    pub fn new(config: PodmanConfig, cas: Arc<C>) -> Result<Self, StartError> {
+        config.check()?;
+        let runtime = Self {
             podman: Podman::new(config.podman.clone()),
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
             images: tokio::sync::OnceCell::new(),
-        })
+        };
+        sweep(&runtime.podman, &runtime.config).map_err(StartError::Sweep)?;
+        Ok(runtime)
     }
 
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
@@ -217,6 +256,7 @@ impl<C: Cas> PodmanRuntime<C> {
 
         let spec = ContainerSpec {
             name: lease.name.clone(),
+            owner: self.config.owner.clone(),
             image: image.to_string(),
             cgroup_parent: lease.cgroup.name().to_owned(),
             input_root: root,
@@ -466,6 +506,39 @@ impl<C> Drop for Registered<'_, C> {
     }
 }
 
+/// Removes every lease a previous daemon of `config`'s owner left: the union of the
+/// owner's containers and the lease scratch directories, each removed as a lease's
+/// clean removes it (`cgroup.kill`, `podman rm --force`, the lease cgroup, the scratch
+/// directory). Blocking.
+fn sweep(podman: &Podman, config: &PodmanConfig) -> Result<(), String> {
+    let mut names: BTreeSet<String> = podman.owned(&config.owner)?.into_iter().collect();
+    match std::fs::read_dir(&config.scratch) {
+        Ok(entries) => names.extend(
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(LEASE_PREFIX)),
+        ),
+        // Absent until the first lease.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", config.scratch.display())),
+    }
+    let mut errors = Vec::new();
+    for name in names {
+        tracing::warn!(lease = %name, "removing a lease a previous daemon left");
+        let mut lease = Lease::named(podman, config, name);
+        lease.created = true;
+        if let Err(why) = lease.clean_blocking() {
+            errors.push(why);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// What one lease leaves on the node, and how to remove it.
 #[derive(Debug)]
 struct Lease {
@@ -485,7 +558,15 @@ struct Lease {
 
 impl Lease {
     fn new(podman: &Podman, config: &PodmanConfig, id: LeaseId) -> Self {
-        let name = format!("kbf-lease-{}-{}", id.term, id.seq);
+        Self::named(
+            podman,
+            config,
+            format!("{LEASE_PREFIX}{}-{}", id.term, id.seq),
+        )
+    }
+
+    /// The lease named `name` (`kbf-lease-<term>-<seq>`), nothing of it created yet.
+    fn named(podman: &Podman, config: &PodmanConfig, name: String) -> Self {
         Self {
             podman: podman.clone(),
             dir: config.scratch.join(&name),
@@ -570,6 +651,9 @@ impl Drop for Lease {
 fn reap(child: &mut Child, limit: Duration, pause: Duration) -> Result<(), String> {
     // Killed only while `try_wait` says it is unreaped: until then its pid can name no
     // other process. `try_wait`, not the kill's result, then says when it is gone.
+    // PID reuse: once `try_wait` has reaped the child, tokio's `Child` is done and
+    // `start_kill` sends nothing, so no signal reaches a process that took the pid
+    // after. Keep this on `Child`; a raw pid (`kill(2)`, `waitpid`) loses that.
     if child.try_wait().map_err(wait_failed)?.is_none() {
         let _ = child.start_kill();
     }
@@ -716,27 +800,38 @@ mod tests {
         ));
     }
 
-    /// Catches a scratch path Podman's `--volume` syntax would split, and a cgroup parent
-    /// Podman would read relative to its own default.
+    /// Catches a scratch path Podman's `--volume` syntax would split, a cgroup parent
+    /// Podman would read relative to its own default, and an empty owner (whose sweep
+    /// would look for containers labelled `kbf.owner=`). A usable one starts, its sweep
+    /// asking a `podman` that knows no container (`true`).
     #[test]
     fn unusable_configurations_are_refused() {
         let cas = Arc::new(crate::cas::MemoryCas::new());
-        let ok = PodmanConfig::new(PathBuf::from("/scratch"), "/actions".to_owned());
+        let mut ok = PodmanConfig::new(
+            PathBuf::from("/nonexistent/scratch"),
+            "/actions".to_owned(),
+            "node-1".to_owned(),
+        );
+        ok.podman = PathBuf::from("/bin/true");
         assert!(PodmanRuntime::new(ok.clone(), Arc::clone(&cas)).is_ok());
+        let refused = |config: PodmanConfig| PodmanRuntime::new(config, Arc::clone(&cas)).err();
         for scratch in ["relative", "/a:b", "/a,b"] {
             let mut config = ok.clone();
             config.scratch = PathBuf::from(scratch);
             assert_eq!(
-                PodmanRuntime::new(config, Arc::clone(&cas)).err(),
-                Some(ConfigError::Scratch(PathBuf::from(scratch)))
+                refused(config),
+                Some(ConfigError::Scratch(PathBuf::from(scratch)).into())
             );
         }
-        let mut config = ok;
+        let mut config = ok.clone();
         config.cgroup_parent = "actions".to_owned();
         assert_eq!(
-            PodmanRuntime::new(config, cas).err(),
-            Some(ConfigError::CgroupParent("actions".to_owned()))
+            refused(config),
+            Some(ConfigError::CgroupParent("actions".to_owned()).into())
         );
+        let mut config = ok;
+        config.owner.clear();
+        assert_eq!(refused(config), Some(ConfigError::Owner.into()));
     }
 
     /// Catches a clean that removes the lease while `podman start` still runs (kbf
@@ -791,16 +886,44 @@ mod tests {
         let pid = rustix::process::Pid::from_raw(raw);
         rustix::process::waitpid(pid, rustix::process::WaitOptions::empty())
             .expect("reaped elsewhere");
+        let mut lease = lease_left_only(child);
+        let why = lease.clean_blocking().expect_err("the wait failed");
+        assert!(why.starts_with("wait for podman start: "), "{why}");
+    }
+
+    /// A lease that never got a container, cgroup or scratch directory (all its paths
+    /// are absent, so removing them succeeds), holding `start` as its `podman start`.
+    fn lease_left_only(start: Child) -> Lease {
         let mut config = PodmanConfig::new(
             PathBuf::from("/nonexistent-kbf-157/scratch"),
             "/actions".to_owned(),
+            "node-1".to_owned(),
         );
         config.cgroup_root = PathBuf::from("/nonexistent-kbf-157/cgroup");
         let id = LeaseId { term: 1, seq: 1 };
         let mut lease = Lease::new(&Podman::new(config.podman.clone()), &config, id);
-        lease.start = Some(child);
-        let why = lease.clean_blocking().expect_err("the wait failed");
-        assert!(why.starts_with("wait for podman start: "), "{why}");
+        lease.start = Some(start);
+        lease
+    }
+
+    /// Catches a clean that does not give a running `podman start` time to exit and be
+    /// reaped (`REAP_LIMIT` too short), or that only signals or drops it: either leaves
+    /// it running or a zombie while the lease is removed (kbf #157). This pins the
+    /// timing the fake Podman's `start-not-reaped-at-rm` check sees only when its test
+    /// runs alone (another test's runtime may reap a dropped child first).
+    #[tokio::test]
+    async fn the_clean_waits_until_podman_start_is_reaped() {
+        let start = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = start.id().expect("pid");
+        let mut lease = lease_left_only(start);
+        lease.clean_blocking().expect("cleaned");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "sleep {pid} still there (running or unreaped) after the clean"
+        );
     }
 
     /// Catches a clean step whose blocking task panicked being reported without saying

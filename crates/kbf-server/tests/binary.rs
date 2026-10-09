@@ -518,3 +518,27 @@ fn the_unservable_wait_comes_from_its_flag() {
         Duration::from_secs(3_600)
     );
 }
+
+/// Catches: `--finished-retention-secs` parsed but not handed to the scheduler, a
+/// default other than the scheduler's, and a zero refused (it keeps nothing).
+#[test]
+fn the_finished_retention_comes_from_its_flag() {
+    use clap::Parser;
+    use std::time::Duration;
+    let retention = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .finished_retention
+    };
+    assert_eq!(retention(&[]), kbf_sched::FINISHED_RETENTION);
+    assert_eq!(
+        retention(&["--finished-retention-secs", "0"]),
+        Duration::ZERO
+    );
+    assert_eq!(
+        retention(&["--finished-retention-secs", "600"]),
+        Duration::from_secs(600)
+    );
+}

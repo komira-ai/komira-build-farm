@@ -111,11 +111,12 @@ fn assert_reached(reach: &Reach, wanted: &[&str]) {
 }
 
 /// What every scenario reaches: grants, answers, refusals (stated and on time), dedup
-/// joins, twins that may not join, promotions of queued work, and servable work
-/// waiting for room.
-const EVERY: [&str; 7] = [
+/// joins, twins that may not join, promotions of queued work, servable work waiting
+/// for room, and finished operations dropped once their retention is up.
+const EVERY: [&str; 8] = [
     "granted",
     "answered",
+    "dropped after the retention",
     "refused",
     "join",
     "non-joinable twin",

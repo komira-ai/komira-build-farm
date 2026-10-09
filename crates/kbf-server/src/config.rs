@@ -93,6 +93,13 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// How long, in seconds, a finished operation is kept after its callers are
+    /// answered. Within it, WaitExecution on the operation's name streams its result
+    /// (a client whose Execute stream broke gets a result the action cache does not
+    /// keep, such as a failure); after it, the name is NOT_FOUND. Every operation
+    /// finished within it is held in memory.
+    #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
+    pub finished_retention_secs: u64,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
     /// disconnect after their open Execute and WaitExecution streams are ended
     /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
@@ -174,6 +181,7 @@ impl Args {
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
+            finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
         })
     }

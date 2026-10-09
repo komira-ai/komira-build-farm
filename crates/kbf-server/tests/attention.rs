@@ -87,7 +87,11 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
         MemoryStore::new(Capabilities::default()),
         KeyPrefix::default(),
     ));
-    let farm = Farm::new(cache, kbf_sched::UNSERVABLE_WAIT);
+    let farm = Farm::new(
+        cache,
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
     let node = WorkerId::new("mac-1");
     let (outbound, _responses) = mpsc::unbounded_channel();
     let stream = farm.register(

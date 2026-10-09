@@ -383,14 +383,17 @@ daemon restarts and server restarts:
    scheduler requeues at once any lease whose `Start` went to an earlier session of the
    same daemon process (`Hello.instance_id`) and that the new session's heartbeat
    leaves out. (Re-adopting running work across a daemon restart is **planned**; today
-   a restarted daemon runs nothing.)
+   a restarted daemon lists nothing, and ends what its predecessor left running
+   before its `Hello`: see [daemon.md](daemon.md#when-the-daemon-is-killed).)
 7. **Only a daemon process speaks for its own leases.** Two processes may register as
    one node: a restarted daemon, or two daemons holding the node's certificate (a
    cloned machine, a second daemon started, a node replaced while the old one runs).
    A lease whose `Start` went to another process than the current session's is
    requeued only once `HANDOVER_GRACE` (T + 5 s) has passed since the scheduler last
    heard the node before that process was replaced: by then the replaced process,
-   whose stream is no longer acknowledged, has fenced (issue #140).
+   whose stream is no longer acknowledged, has fenced (issue #140). A process that
+   was killed fences nothing: its runs are ended by the next daemon started on the
+   node, before that one's `Hello` (issue #155), and by nothing if none is.
 
 ## Planned
 

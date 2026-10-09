@@ -31,6 +31,9 @@ use super::check::{Checker, TERM};
 pub const GIB: u64 = 1 << 30;
 /// The unservable wait the scheduler is built with.
 pub const WAIT_S: u64 = 60;
+/// The finished retention the scheduler is built with: shorter than a run, so that
+/// operations are dropped while others still run and arrive (I16).
+const RETENTION_S: u64 = 30;
 const HEARTBEAT_S: u64 = 5;
 /// G, in seconds.
 const GRACE_S: u64 = 60;
@@ -359,9 +362,13 @@ impl World {
              --ignored --exact replay --nocapture  ({scenario:?}, {workers} workers)"
         );
         let wait = std::time::Duration::from_secs(WAIT_S);
+        let retention = std::time::Duration::from_secs(RETENTION_S);
         let check = Checker::new(
-            Scheduler::new(TERM).with_unservable_wait(wait),
+            Scheduler::new(TERM)
+                .with_unservable_wait(wait)
+                .with_finished_retention(retention),
             WAIT_S * 1_000,
+            RETENTION_S * 1_000,
             replay,
         );
         let mut w = Self {

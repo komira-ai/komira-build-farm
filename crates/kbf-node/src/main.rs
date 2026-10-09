@@ -246,7 +246,7 @@ mod container {
             .as_deref()
             .map_or_else(IdFiles::system, IdFiles::in_dir);
         kbf_driver_container::check_daemon_user(&files)?;
-        let mut config = PodmanConfig::new(scratch(cli)?, parent);
+        let mut config = PodmanConfig::new(scratch(cli)?, parent, cli.daemon.node_id.clone());
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,
             max_entries: cli.outputs.max_entries,

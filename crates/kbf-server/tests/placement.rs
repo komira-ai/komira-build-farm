@@ -7,12 +7,15 @@ mod support;
 
 use std::io::Write;
 use std::sync::{Mutex, Once, PoisonError};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use kbf_proto::reapi::ExecutedActionMetadata;
+use kbf_proto::google::longrunning::Operation;
+use kbf_proto::reapi::{ExecutedActionMetadata, WaitExecutionRequest};
 use kbf_proto::worker::LeaseId;
 use prost_types::Timestamp;
-use support::{Cell, Job, done, output, ran, stamped_response};
+use support::{Cell, Client, Job, done, output, ran, stamped_response};
+use tonic::Code;
+use tonic::codec::Streaming;
 
 /// Every line logged in this test binary. Each test names its own nodes, and reads
 /// only the lines that name them.
@@ -64,7 +67,7 @@ fn time(ts: Option<&Timestamp>) -> SystemTime {
     SystemTime::try_from(*ts.expect("a timestamp")).expect("a time")
 }
 
-fn metadata(op: &kbf_proto::google::longrunning::Operation) -> ExecutedActionMetadata {
+fn metadata(op: &Operation) -> ExecutedActionMetadata {
     let result = stamped_response(op).result.expect("a result");
     result.execution_metadata.expect("metadata")
 }
@@ -168,4 +171,110 @@ async fn a_requeue_is_logged_and_the_result_names_the_node_that_ran_it() {
         ]);
         assert_eq!(granted.len(), 1, "{node}: {:?}", lines_with(&["requeue-"]));
     }
+}
+
+/// Catches (issues #165 and #166 together): a requeued operation whose result,
+/// answered again by WaitExecution within the finished retention, loses the node that
+/// ran it or its queue time; a requeue line that no longer names the operation (its
+/// callers forgotten before the line is written); a requeued operation kept past the
+/// retention (WaitExecution still answers); and a late result under the given-up lease,
+/// after the operation is dropped, that the farm does not acknowledge or accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requeued_operation_is_answered_within_the_retention_then_forgotten() {
+    capture();
+    let retention = Duration::from_secs(1);
+    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, retention).await;
+    let mut first = cell.daemon("retain-a", 4, 8).await;
+    let job = Job::new("requeued, then retired", &[]);
+    cell.upload(&job.blobs()).await;
+
+    let mut ops = cell.execute(&job.action).await;
+    let name = ops
+        .message()
+        .await
+        .expect("a stream")
+        .expect("an update")
+        .name;
+    let lost = first.start().await;
+    let mut other = cell.daemon("retain-b", 4, 8).await;
+    let mut again = cell.daemon("retain-a", 0, 8).await;
+    assert!(again.heartbeat(&[]).await);
+    let current = other.start().await;
+    let result = output(&cell, "ran on retain-b", 0).await;
+    assert!(other.report(ran(current.lease_id, &result)).await.accepted);
+    let answered = metadata(&done(&mut ops).await);
+    assert_eq!(answered.worker, "retain-b");
+
+    let mut waited = wait(&cell, &name).await.expect("kept for the retention");
+    let kept = waited
+        .message()
+        .await
+        .expect("a stream")
+        .expect("the done operation");
+    assert_eq!(metadata(&kept), answered, "the retained answer differs");
+
+    let operation = format!("operation={name}");
+    let given_up = lines_with(&[
+        "lease given up; requeued",
+        &operation,
+        &lease_text(lost.lease_id),
+        "node=retain-a",
+    ]);
+    assert_eq!(given_up.len(), 1, "{:?}", lines_with(&["retain-"]));
+
+    // The server ticks every 50 ms, so the operation is dropped soon after this.
+    tokio::time::sleep(retention + Duration::from_millis(500)).await;
+    assert_eq!(wait(&cell, &name).await.err(), Some(Code::NotFound));
+    let late = again.report(ran(lost.lease_id, &result)).await;
+    assert!(!late.accepted, "a result for a dropped operation accepted");
+    assert_eq!(wait(&cell, &name).await.err(), Some(Code::NotFound));
+}
+
+/// Catches: a requeue line written after the operation it names was refused and,
+/// with a zero finished retention, dropped and its callers forgotten in the same
+/// input, so the line names no operation. Here the reconnected node has no room and
+/// no other node is up, so with a zero unservable wait the requeued operation is
+/// refused at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requeue_refused_and_dropped_at_once_is_logged_with_its_operation() {
+    capture();
+    let cell = Cell::start_with(Duration::ZERO, Duration::ZERO).await;
+    let mut first = cell.daemon("dropped-a", 4, 8).await;
+    let job = Job::new("requeued, refused, dropped", &[]);
+    cell.upload(&job.blobs()).await;
+
+    let mut ops = cell.execute(&job.action).await;
+    let name = ops
+        .message()
+        .await
+        .expect("a stream")
+        .expect("an update")
+        .name;
+    let lost = first.start().await;
+    let mut again = cell.daemon("dropped-a", 0, 8).await;
+    assert!(again.heartbeat(&[]).await);
+    let refused = stamped_response(&done(&mut ops).await);
+    let status = refused.status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+
+    let given_up = lines_with(&[
+        "lease given up; requeued",
+        &format!("operation={name} "),
+        &lease_text(lost.lease_id),
+        "node=dropped-a",
+    ]);
+    assert_eq!(given_up.len(), 1, "{:?}", lines_with(&["dropped-a"]));
+    assert_eq!(wait(&cell, &name).await.err(), Some(Code::NotFound));
+}
+
+/// WaitExecution on `name`: its stream, or the code.
+async fn wait(cell: &Client, name: &str) -> Result<Streaming<Operation>, Code> {
+    let ops = cell
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: name.to_owned(),
+        })
+        .await
+        .map_err(|s| s.code())?;
+    Ok(ops.into_inner())
 }

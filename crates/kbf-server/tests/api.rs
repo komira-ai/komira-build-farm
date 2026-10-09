@@ -90,6 +90,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -326,6 +327,7 @@ async fn an_api_address_in_use_is_refused() {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
     };
     let api = Api {
@@ -365,7 +367,11 @@ fn register(
 /// for a node that never registered creating a node.
 #[tokio::test]
 async fn a_status_from_a_replaced_stream_is_ignored() {
-    let farm = Farm::new(cache(), kbf_sched::UNSERVABLE_WAIT);
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
     let node = WorkerId::new("linux-1");
     let (old, _old_rx) = register(&farm, "linux-1");
     let (new, _new_rx) = register(&farm, "linux-1");
@@ -386,7 +392,11 @@ async fn a_status_from_a_replaced_stream_is_ignored() {
 /// (a node whose stream is gone listed as connected).
 #[tokio::test]
 async fn a_node_whose_stream_ended_is_listed_as_disconnected() {
-    let farm = Farm::new(cache(), kbf_sched::UNSERVABLE_WAIT);
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
     let (_, responses) = register(&farm, "linux-1");
     assert!(farm.nodes().nodes[0].connected);
     drop(responses);
@@ -720,7 +730,11 @@ async fn the_api_listener_also_speaks_h2c() {
 /// cleared; and an item compared against another node's status.
 #[tokio::test]
 async fn an_attention_item_is_logged_once_per_change() {
-    let farm = Farm::new(cache(), kbf_sched::UNSERVABLE_WAIT);
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
     let node = WorkerId::new("mac-1");
     let (first, _first_rx) = register(&farm, "mac-1");
     let raised = vec![(true, format!("node mac-1: {NOT_READY}"))];

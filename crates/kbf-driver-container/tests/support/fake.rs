@@ -4,10 +4,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
+use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime, StartError};
 use kbf_types::Resources;
 
 use super::{Spec, exists, store_action, work};
@@ -37,8 +37,11 @@ pub struct Fake {
     pub state: PathBuf,
     pub cgroup: PathBuf,
     pub scratch: PathBuf,
+    pub config: PodmanConfig,
     pub cas: Arc<MemoryCas>,
     pub runtime: Arc<PodmanRuntime<MemoryCas>>,
+    /// Written to `state/nonce`; the fake puts it in the action's `FAKE_LEASE`.
+    nonce: String,
 }
 
 impl Fake {
@@ -61,21 +64,35 @@ impl Fake {
         let program = dir.join("podman");
         std::os::unix::fs::symlink(&fixture, &program).expect("link podman");
         std::fs::write(state.join("image-id"), "img1\n").expect("image id");
-        let mut config = PodmanConfig::new(scratch.clone(), "/actions".to_owned());
+        // Unique to this Fake, so what a failed earlier run left in the same checkout
+        // is not taken for this run's action.
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after 1970");
+        let nonce = format!("{}-{}:", std::process::id(), since_epoch.as_nanos());
+        std::fs::write(state.join("nonce"), &nonce).expect("nonce");
+        let mut config =
+            PodmanConfig::new(scratch.clone(), "/actions".to_owned(), "node-1".to_owned());
         config.podman = program;
         config.cgroup_root = cgroup.clone();
         config.default_timeout = Duration::from_secs(60);
         config.kill_grace = Duration::from_millis(300);
         configure(&mut config);
         let cas = Arc::new(MemoryCas::new());
-        let runtime = Arc::new(PodmanRuntime::new(config, Arc::clone(&cas)).expect("runtime"));
+        let runtime =
+            Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
+        // The start's own sweep (`ps`) is not a lease's: `calls` records leases only.
+        // (`tests/restart.rs` checks the sweep.)
+        let _ = std::fs::remove_file(state.join("calls"));
         let fake = Self {
             dir,
             state,
             cgroup,
             scratch,
+            config,
             cas,
             runtime,
+            nonce,
         };
         fake.store_manifest(&sha256(MANIFEST), MANIFEST);
         fake
@@ -123,6 +140,49 @@ impl Fake {
         assert!(!exists(&self.lease_dir(seq)), "scratch directory left");
         assert!(!exists(&self.lease_cgroup(seq)), "lease cgroup left");
         self.assert_start_reaped_before_rm();
+        self.assert_action_gone(seq);
+    }
+
+    /// The environment entry the fake gives lease `seq`'s action.
+    fn marker(&self, seq: u64) -> String {
+        format!("FAKE_LEASE={}/actions/kbf-lease-1-{seq}", self.nonce)
+    }
+
+    /// Asserts lease `seq`'s action runs and carries the marker
+    /// [`Fake::assert_action_gone`] looks for: the positive control that keeps that
+    /// check from passing because nothing ever carried the marker. Waits up to five
+    /// seconds, since the pid file is written before the action has exec'd.
+    pub fn assert_action_running(&self, seq: u64) {
+        let marker = self.marker(seq);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while running_with_env(marker.as_bytes()).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "no process carries lease {seq}'s marker {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Asserts nothing the lease's action started still runs. The fake gives the action
+    /// `FAKE_LEASE=<this Fake's nonce><lease cgroup name>` and its children inherit it,
+    /// so that is the fake's stand-in for membership of the lease cgroup. Waits up to
+    /// five seconds, since a SIGKILL takes effect when its target next runs; a zombie
+    /// (no environment left) has ended.
+    pub fn assert_action_gone(&self, seq: u64) {
+        let marker = self.marker(seq);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = running_with_env(marker.as_bytes());
+            if left.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lease {seq}'s action still runs after the clean: pids {left:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Asserts no `podman rm` so far ran while a `podman start` the driver ran was
@@ -147,6 +207,11 @@ impl Fake {
             .await
     }
 
+    /// A second runtime on this fake's configuration, as a restarted daemon makes.
+    pub fn restart(&self) -> Result<PodmanRuntime<MemoryCas>, StartError> {
+        PodmanRuntime::new(self.config.clone(), Arc::clone(&self.cas))
+    }
+
     pub async fn wait_for_start(&self) {
         for _ in 0..500 {
             if self.state.join("pid").exists() {
@@ -156,6 +221,20 @@ impl Fake {
         }
         panic!("the action never started");
     }
+}
+
+/// The pids of this user's processes whose environment holds `entry` (`NAME=value`).
+/// A process that ends while it is read, or is not ours to read, is skipped; a `/proc`
+/// that cannot be listed fails the test rather than reading as "nothing runs".
+fn running_with_env(entry: &[u8]) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .filter_map(|p| p.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == entry))
+        })
+        .collect()
 }
 
 impl Drop for Fake {

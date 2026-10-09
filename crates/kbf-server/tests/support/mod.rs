@@ -154,27 +154,38 @@ pub struct Client {
 
 impl Cell {
     pub async fn start() -> Self {
-        Self::start_with_unservable_wait(kbf_sched::UNSERVABLE_WAIT).await
+        Self::start_with(kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION).await
     }
 
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`.
     pub async fn start_with_unservable_wait(wait: Duration) -> Self {
+        Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
+    }
+
+    /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
+    /// and keeps a finished operation for `retention`.
+    pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let cache = Arc::new(Cache::new(
             GateLog::new(),
             MemoryStore::new(Capabilities::default()),
             KeyPrefix::default(),
         ));
-        Self::serve(cache, wait).await
+        Self::serve(cache, wait, retention).await
     }
 
     /// A new server process over this cell's store and action cache, as after a
     /// restart: a fresh scheduler, no daemon registered, nothing queued. This one is
     /// left running; its daemons simply never reach the new one's state.
     pub async fn restart(&self) -> Self {
-        Self::serve(Arc::clone(&self.cache), kbf_sched::UNSERVABLE_WAIT).await
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(Arc::clone(&self.cache), wait, retention).await
     }
 
-    async fn serve(cache: Arc<Cache<GateLog, MemoryStore>>, wait: Duration) -> Self {
+    async fn serve(
+        cache: Arc<Cache<GateLog, MemoryStore>>,
+        wait: Duration,
+        retention: Duration,
+    ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -183,6 +194,7 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
