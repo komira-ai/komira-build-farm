@@ -341,53 +341,141 @@ async fn a_leftover_in_the_temporary_folder_is_swept_after_the_lease() {
     assert!(!left.exists(), "kept past the lease: {}", left.display());
 }
 
-/// What [`temporary_items_itself_cannot_be_removed_or_replaced`] runs: each way to take
-/// `$T/TemporaryItems` away or swap it for a link (to the lease's working directory),
-/// then a write below it, each with its exit status.
-const REPLACE_ITEMS: &str = r#"rmdir "$T/TemporaryItems" 2>/dev/null; echo "rmdir=$?"
-mv "$T/TemporaryItems" "$T/moved" 2>/dev/null; echo "mv=$?"
-ln -sfF "$PWD" "$T/TemporaryItems" 2>/dev/null; echo "ln=$?"
-mkdir "$T/TemporaryItems/inside"; echo "inside=$?"
-"#;
+/// Each way an action could take `$T/TemporaryItems` away, swap it for a link, or
+/// write outside it through a name below it: a name, and the command whose exit
+/// status says whether it worked. `$T/victim` holds `orig` before each.
+const ESCAPES: [(&str, &str); 8] = [
+    ("rmdir", r#"rmdir "$T/TemporaryItems""#),
+    ("rmdir-slash", r#"rmdir "$T/TemporaryItems/""#),
+    ("mv", r#"mv "$T/TemporaryItems" "$T/moved""#),
+    ("ln-over", r#"ln -sfF "$PWD" "$T/TemporaryItems""#),
+    ("dotdot", r#"echo x > "$T/TemporaryItems/../dotdot""#),
+    (
+        "symlink-through",
+        r#"ln -s "$T/escape" "$T/TemporaryItems/l" && echo x > "$T/TemporaryItems/l""#,
+    ),
+    (
+        "hardlink-through",
+        r#"ln "$T/victim" "$T/TemporaryItems/h" && echo changed > "$T/TemporaryItems/h""#,
+    ),
+    ("below", r#"mkdir "$T/TemporaryItems/inside""#),
+];
+
+/// Whether `T` (a stand-in after an attempt) is as it was, but for what an action may
+/// make below `TemporaryItems`: the folder a real directory, `victim` unchanged, and
+/// nothing new beside them.
+fn untouched(temp: &Path) -> bool {
+    let items = std::fs::symlink_metadata(temp.join("TemporaryItems"));
+    let victim = std::fs::read_to_string(temp.join("victim"));
+    let mut names: Vec<String> = std::fs::read_dir(temp)
+        .expect("T")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    items.is_ok_and(|m| m.file_type().is_dir())
+        && victim.is_ok_and(|v| v == "orig")
+        && names == ["TemporaryItems", "victim"]
+}
 
 /// Catches a profile that lets an action write `TemporaryItems` itself, not only what
-/// is below it (the review of issue #163): an action could remove it and put a
-/// symlink in its place, and the daemon's sweep, outside the sandbox, would follow it.
-/// The folders are stand-ins in the scratch directory, made by the daemon at start as
-/// it makes the real one. Control: the same action unsandboxed removes and replaces
-/// the folder, so the check can fail.
+/// is below it (the review of issue #163: an action could remove it and put a symlink
+/// in its place, and the daemon's sweep, outside the sandbox, would follow it), and one
+/// that lets a name below it reach outside: `..`, a symlink, a hard link to a file of
+/// the daemon's user. Each attempt runs on fresh stand-in folders in the scratch
+/// directory, made by the daemon at start as it makes the real one, sandboxed and,
+/// as the control that shows the attempt can work, unsandboxed. Only a write below the
+/// folder works sandboxed.
 #[tokio::test]
 async fn temporary_items_itself_cannot_be_removed_or_replaced() {
     let dir = std::fs::canonicalize(scratch("items-itself")).expect("real");
     let cas = Arc::new(MemoryCas::default());
-    let mut runs = Vec::new();
-    for sandboxed in [true, false] {
-        let base = dir.join(if sandboxed { "sandboxed" } else { "control" });
-        let (temp, cache) = (base.join("T"), base.join("C"));
-        std::fs::create_dir_all(&temp).expect("T");
-        std::fs::create_dir_all(&cache).expect("C");
-        let mut config: NativeConfig = config(&base);
-        config.user_folders = UserFolders::new(temp.clone(), cache);
-        if !sandboxed {
-            config.isolation = kbf_driver_native::network::Isolation::None;
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for (name, attempt) in ESCAPES {
+        let mut outcome = Vec::new();
+        for sandboxed in [true, false] {
+            let base = dir
+                .join(name)
+                .join(if sandboxed { "sandboxed" } else { "control" });
+            let (temp, cache) = (base.join("T"), base.join("C"));
+            std::fs::create_dir_all(&temp).expect("T");
+            std::fs::create_dir_all(&cache).expect("C");
+            std::fs::write(temp.join("victim"), "orig").expect("victim");
+            let mut config: NativeConfig = config(&base);
+            config.user_folders = UserFolders::new(temp.clone(), cache);
+            if !sandboxed {
+                config.isolation = kbf_driver_native::network::Isolation::None;
+            }
+            let rt = runtime(config, &cas);
+            assert!(untouched(&temp), "{name}: not as made at start");
+            let spec = Spec::sh(&format!("( {attempt} ) 2>/dev/null; echo $?"))
+                .env("PATH", PATH)
+                .env("T", &temp.display().to_string());
+            let result = run_long(&rt, &cas, 1, &spec).await;
+            let worked = stdout(&cas, &result).trim() == "0";
+            outcome.push((worked, untouched(&temp)));
         }
-        let rt = runtime(config, &cas);
-        let items = temp.join("TemporaryItems");
-        assert!(items.is_dir(), "not made at start: {}", items.display());
-        let spec = Spec::sh(REPLACE_ITEMS)
-            .env("PATH", PATH)
-            .env("T", &temp.display().to_string());
-        let result = run_long(&rt, &cas, 1, &spec).await;
-        let kind = std::fs::symlink_metadata(&items).map(|m| m.file_type().is_dir());
-        runs.push((stdout(&cas, &result), kind.ok()));
+        got.push((name, outcome));
+        // Sandboxed: refused and T as it was; unsandboxed: done, T changed. A write
+        // below the folder works both ways and leaves T as it was.
+        let below = name == "below";
+        want.push((name, vec![(below, true), (true, below)]));
     }
-    assert_eq!(
-        runs,
-        [
-            ("rmdir=1\nmv=1\nln=1\ninside=0\n".to_owned(), Some(true)),
-            ("rmdir=0\nmv=1\nln=0\ninside=0\n".to_owned(), Some(false)),
-        ],
-        "{}",
-        sandbox_denials()
-    );
+    assert_eq!(got, want, "{}", sandbox_denials());
+}
+
+/// Catches a sweep that takes a `TemporaryItems` the daemon's user does not own: here
+/// the stand-in folder is made root's (and writable by all, so a sweep that took it
+/// could remove the old leftover in it). Needs passwordless `sudo`, which the CI
+/// runners have; elsewhere it says so and checks nothing.
+#[tokio::test]
+async fn a_temporary_items_of_another_user_is_not_swept() {
+    if !std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "the CI runner has passwordless sudo"
+        );
+        eprintln!("no passwordless sudo: nothing to check");
+        return;
+    }
+    let dir = std::fs::canonicalize(scratch("items-owner")).expect("real");
+    let (temp, cache) = (dir.join("T"), dir.join("C"));
+    let items = temp.join("TemporaryItems");
+    let left = items.join("old");
+    std::fs::create_dir_all(&left).expect("left");
+    std::fs::create_dir_all(&cache).expect("C");
+    let old = std::process::Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&left)
+        .status()
+        .expect("touch");
+    assert!(old.success());
+    let sudo = |args: &[&str]| {
+        let status = std::process::Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .arg(&items)
+            .status()
+            .expect("sudo");
+        assert!(status.success(), "sudo {args:?}");
+    };
+    sudo(&["chown", "0:0"]);
+    sudo(&["chmod", "777"]);
+    let mut config: NativeConfig = config(&dir);
+    config.user_folders = UserFolders::new(temp, cache);
+    let cas = Arc::new(MemoryCas::default());
+    let _rt = runtime(config, &cas);
+    let kept = left.exists();
+    // The folder back to this user so the scratch can be removed.
+    let me = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("id");
+    let me = String::from_utf8(me.stdout).expect("uid");
+    sudo(&["chown", me.trim()]);
+    assert!(kept, "swept a TemporaryItems owned by root");
 }
