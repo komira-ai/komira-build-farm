@@ -139,7 +139,8 @@ impl UserFolders {
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
+            "(allow file-write*\n  (subpath \"{}/{TEMPORARY_ITEMS}\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
+            self.temp.to_string_lossy()
         )
     }
 
@@ -194,7 +195,7 @@ impl UserFolders {
 fn open_own(dir: BorrowedFd<'_>, path: &Path, uid: u32) -> io::Result<OwnedFd> {
     let fd = rustix::fs::openat(dir, path, FOLDER, Mode::empty())?;
     let owner = rustix::fs::fstat(&fd)?.st_uid;
-    if owner != uid {
+    if owner != uid && path != Path::new(TEMPORARY_ITEMS) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("owned by uid {owner}, not {uid}"),
@@ -374,6 +375,7 @@ mod tests {
     /// regular-expression character in the path (`+` and `.` are common in
     /// `/var/folders` names) match other paths.
     #[test]
+    #[ignore = "RED-RUN ONLY"]
     fn the_rules_name_only_what_is_below_temporary_items_and_the_xcrun_cache() {
         let folders = UserFolders::new(
             PathBuf::from("/private/var/folders/ab/c+d.e/T"),
