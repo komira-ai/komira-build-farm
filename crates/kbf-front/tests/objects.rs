@@ -359,6 +359,41 @@ async fn a_read_marks_a_missing_object_missing_and_bad_bytes_corrupt() {
     assert!(cache.read_blob(&sound.digest()).await.is_ok());
 }
 
+/// Catches: a read that marks a range the store cannot serve (`InvalidRange`) as
+/// `Corrupt`. An object cut short before a record starts produced no bytes for that
+/// record, so the object is `Missing`, as a 404 is: it may come back whole.
+#[tokio::test]
+async fn a_read_past_the_end_of_a_truncated_object_marks_it_missing() {
+    let store = conditional();
+    let cache = Cache::open(SharedLog::new(), store.clone(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let (head, tail) = (blob("kept head"), blob("cut tail"));
+    cache
+        .store_blobs(vec![head.clone(), tail.clone()])
+        .await
+        .expect("store");
+    let (head_at, tail_at) = (
+        location(&cache, head.digest()).await,
+        location(&cache, tail.digest()).await,
+    );
+    assert_eq!(head_at.object, tail_at.object, "one segment holds both");
+    assert!(tail_at.offset > 0, "{tail_at:?}");
+
+    let key = cache.object_key(tail_at.object).expect("key");
+    let range = ByteRange::new(0, tail_at.offset).expect("range");
+    let kept = store.get_range(&key, range).await.expect("get");
+    store.delete(&key).await.expect("delete");
+    store.put_new(&key, kept, None).await.expect("put");
+
+    let read = cache.read_blob(&tail.digest()).await;
+    assert!(matches!(read, Err(CacheError::Unreachable(_))), "{read:?}");
+    assert_eq!(
+        mark_of(&cache, tail_at.object).await,
+        Some(UnreachableReason::Missing)
+    );
+}
+
 /// Catches: a read that ignores the store id in a location and reads the configured
 /// store anyway. It would get a 404 for an object that lives elsewhere and mark it
 /// missing; the cache holds one store, so the read must fail INTERNAL and mark nothing.
