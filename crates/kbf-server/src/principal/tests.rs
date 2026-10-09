@@ -89,7 +89,9 @@ fn a_bad_line_is_refused_with_its_number() {
 }
 
 /// Catches: two principals sharing a token (which one a call is would depend on the
-/// order of lines), while one principal with two tokens (a rotation) stays allowed.
+/// order of lines), while one principal with two tokens (a rotation) stays allowed;
+/// and the duplicate error echoing the shared digest, in hex or as bytes, or the
+/// token (it would reach the server's log when the file is refused).
 #[test]
 fn a_digest_names_one_principal() {
     let twice = format!(
@@ -102,6 +104,16 @@ fn a_digest_names_one_principal() {
     };
     assert_eq!(at, 2);
     assert!(why.contains("entry 1"), "{why}");
+    let hex = hex_of(TOKEN_A);
+    let bytes = format!("{:?}", &Sha256::digest(TOKEN_A.as_bytes())[..4]);
+    assert!(
+        !why.contains(&hex[..16])
+            && !why.contains(&hex[48..])
+            && !why.contains(&hex[..16].to_ascii_uppercase())
+            && !why.contains(&bytes[1..bytes.len() - 1])
+            && !why.contains(&TOKEN_A[..16]),
+        "{why}"
+    );
     let rotating = format!(
         "{}\n{}\n",
         line("a", "ci", TOKEN_A),

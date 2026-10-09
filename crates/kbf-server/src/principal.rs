@@ -154,9 +154,10 @@ impl Principals {
     ///
     /// # Errors
     /// The 1-based number of the first bad line, and which field breaks which rule.
-    /// No field's value is echoed: a line whose fields are out of order, or with a
-    /// raw token pasted into a column, would otherwise put a digest or a token into
-    /// the error, and so into the server's log.
+    /// No field of the bad line is echoed: a line whose fields are out of order, or
+    /// with a raw token pasted into a column, would otherwise put a digest or a token
+    /// into the error, and so into the server's log. The one value shown is, for a
+    /// repeated digest, the earlier entry's principal name.
     pub fn parse(text: &str) -> Result<Self, (usize, String)> {
         let mut entries: Vec<Principal> = Vec::new();
         for (at, line) in text.lines().enumerate() {
