@@ -1,0 +1,12 @@
+diff --git a/crates/kbf-driver-native/tests/user_folders.rs b/crates/kbf-driver-native/tests/user_folders.rs
+index 50a44ba..ed5d809 100644
+--- a/crates/kbf-driver-native/tests/user_folders.rs
++++ b/crates/kbf-driver-native/tests/user_folders.rs
+@@ -319,6 +319,7 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
+         let control = run_long(&open, &cas, seq, &spec).await;
+         let (_, open_shim, _) = shim_times(&stdout(&cas, &control));
+         let times = format!("cc {shim}s, unsandboxed cc {open_shim}s, clang {direct}s");
++        eprintln!("TIMES xcode={build:?} {times}");
+         assert_eq!(
+             (said.as_str(), stderr(&cas, &result).as_str()),
+             ("", ""),
