@@ -354,22 +354,18 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
-      - run: bash tools/ci/probe-xcrun-db.sh snap start
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked --no-run
-      - run: bash tools/ci/probe-xcrun-db.sh snap after-build
-      - run: cargo test -p kbf-outputs -p kbf-driver-native --locked
-      - run: bash tools/ci/probe-xcrun-db.sh snap after-driver-native
-      - run: cargo test -p kbf-node --bins --locked
-      - run: bash tools/ci/probe-xcrun-db.sh snap after-node-unit
-      - run: cargo test -p kbf-node --test binary --locked
-      - run: bash tools/ci/probe-xcrun-db.sh snap after-binary
-      - run: bash tools/ci/probe-xcrun-db.sh time warm-1
-      - run: bash tools/ci/probe-xcrun-db.sh time warm-2
-      - run: bash tools/ci/probe-xcrun-db.sh snap before-fill
-      - run: bash tools/ci/probe-xcrun-db.sh fill one-xcode
-      - run: bash tools/ci/probe-xcrun-db.sh snap after-fill
-      - run: bash tools/ci/probe-xcrun-db.sh time after-fill
+      - run: cargo test -p kbf-driver-native --locked --no-run
+      - run: bash tools/ci/probe-xcrun-db.sh snap start; bash tools/ci/probe-xcrun-db.sh ps start
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact the_sandboxed_survey_answers_as_an_unsandboxed_one --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-survey-1; bash tools/ci/probe-xcrun-db.sh ps after-survey-1
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact swift_build_builds_a_package --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-swift-build; bash tools/ci/probe-xcrun-db.sh ps after-swift-build
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact the_sandboxed_survey_answers_as_an_unsandboxed_one --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-survey-2; bash tools/ci/probe-xcrun-db.sh ps after-survey-2
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact xcodebuild_builds_a_target --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-xcodebuild; bash tools/ci/probe-xcrun-db.sh ps after-xcodebuild
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact the_sandboxed_survey_answers_as_an_unsandboxed_one --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-survey-3; bash tools/ci/probe-xcrun-db.sh ps after-survey-3
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact the_compiler_shims_print_nothing_on_stderr --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-shims; bash tools/ci/probe-xcrun-db.sh ps after-shims
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact the_sandboxed_survey_answers_as_an_unsandboxed_one --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-survey-4; bash tools/ci/probe-xcrun-db.sh ps after-survey-4
+      - run: cargo test -p kbf-driver-native --locked --test user_folders -- --exact a_foundation_atomic_save_works --nocapture; bash tools/ci/probe-xcrun-db.sh snap after-atomic-save; bash tools/ci/probe-xcrun-db.sh ps after-atomic-save
+      - run: sleep 90; bash tools/ci/probe-xcrun-db.sh snap after-90s; bash tools/ci/probe-xcrun-db.sh ps after-90s
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

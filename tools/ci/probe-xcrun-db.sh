@@ -43,7 +43,12 @@ fill() {
   done
   echo "  filled under $app in $(( $(ms) - s )) ms"
 }
+procs() {
+  echo "== xcrun-probe ps $1"
+  ps -axo pid,ppid,etime,comm | grep -i -E 'xcb|swb|sourcekit|swift|xcode|clang|xcrun|ld$|build' | grep -v grep | sed 's/^/  /' || true
+}
 case "$1" in
+  ps) procs "$2" ;;
   snap) snap "$2" ;;
   time) timed "$2" ;;
   fill) fill "$2" ;;
