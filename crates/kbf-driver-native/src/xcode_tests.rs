@@ -735,6 +735,7 @@ fn a_long_reason_is_cut() {
         &["-c", script],
         Path::new("/"),
         WITHIN,
+        None,
     );
     let want = format!(
         "/bin/sh -c {script} exited with exit status: 3: {}...",
