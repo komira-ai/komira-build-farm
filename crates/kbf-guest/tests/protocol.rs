@@ -180,6 +180,9 @@ fn bad_requests_are_refused_without_using_the_run() {
         with(&|r| r.outputs = vec![String::new()]),
         with(&|r| r.outputs = vec!["/etc/passwd".into()]),
         with(&|r| r.outputs = vec!["a/../b".into()]),
+        with(&|r| r.outputs = vec!["a//b".into()]),
+        with(&|r| r.outputs = vec!["d/".into()]),
+        with(&|r| r.cwd = "in/".into()),
     ];
     for req in &bad {
         assert_eq!(refusal(client.run(req)), Refusal::BadRequest, "{req:?}");

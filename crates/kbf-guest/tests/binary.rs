@@ -36,15 +36,16 @@ fn serve(shares: &Shares, socket: &Path, token_file: &Path) -> Command {
     cmd
 }
 
-/// Catches the binary not wiring its flags to the agent: the token file's hex is the
-/// token, and a command runs over the socket it was told to create.
+/// Catches the binary not wiring its flags to the agent (the token file's hex is the
+/// token, and a command runs over the socket it was told to create), and an agent
+/// that keeps serving after its one command.
 #[test]
 fn serve_runs_one_command_over_its_socket() {
     let shares = Shares::new("bin-serve");
     let token_file = shares.inputs.join("kbf-guest.token");
     std::fs::write(&token_file, format!("{}\n", hex::encode(TOKEN))).expect("token");
     let socket = shares.outputs.with_file_name("s.sock");
-    let _guest = Killed(
+    let mut guest = Killed(
         serve(&shares, &socket, &token_file)
             .spawn()
             .expect("spawned"),
@@ -66,6 +67,10 @@ fn serve_runs_one_command_over_its_socket() {
     client.run(&sh("echo ran", &[])).expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
     assert_eq!(shares.out("stdout"), b"ran\n");
+    // The boot's one command has run: once its connection ends, the agent exits.
+    drop(client);
+    let status = guest.0.wait().expect("waited");
+    assert!(status.success(), "{status}");
 }
 
 /// Catches a token file that is not checked: short, not hex, or absent.
@@ -93,7 +98,7 @@ fn a_bad_token_file_stops_serve() {
 }
 
 /// Catches `session` printing something off macOS, where there is no launchd session
-/// to report (macOS is checked from launchd by tools/ci/guest-macos.sh).
+/// to report (macOS is checked from launchd by tools/ci/guest-tests.sh).
 #[test]
 fn session_prints_the_session_type() {
     let out = Command::new(BIN).arg("session").output().expect("ran");

@@ -291,3 +291,46 @@ fn frames_carry_their_length_and_bad_lengths_are_refused() {
     let max = vec![KILL; MAX_FRAME as usize];
     write_frame(&mut Vec::new(), &max).expect("a frame of exactly MAX_FRAME is allowed");
 }
+
+/// Hands out its bytes one at a time, after an interruption, then fails.
+struct Flaky {
+    bytes: Vec<u8>,
+    interrupted: bool,
+}
+
+impl Read for Flaky {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if self.bytes.is_empty() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        buf[0] = self.bytes.remove(0);
+        Ok(1)
+    }
+}
+
+/// Catches an interrupted read taken as an error, short reads of the length taken as
+/// the whole length, and an error inside a frame reported as a clean end.
+#[test]
+fn reads_retry_interruptions_and_report_errors_inside_a_frame() {
+    let mut whole = Flaky {
+        bytes: bytes("00000001 03"),
+        interrupted: false,
+    };
+    assert_eq!(read_frame(&mut whole).expect("read"), vec![KILL]);
+    let mut cut = Flaky {
+        bytes: bytes("00000002 03"),
+        interrupted: false,
+    };
+    assert!(
+        matches!(read_frame(&mut cut), Err(WireError::Io(e)) if e.kind() == io::ErrorKind::TimedOut)
+    );
+    let mut cut_length = Flaky {
+        bytes: bytes("0000"),
+        interrupted: true,
+    };
+    assert!(matches!(read_frame(&mut cut_length), Err(WireError::Io(_))));
+}

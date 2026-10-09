@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -74,20 +74,18 @@ pub fn check(req: &RunRequest, inputs: &Path) -> Result<PathBuf, RequestError> {
         return Err(RequestError::EnvName(k.clone()));
     }
     for o in &req.outputs {
-        match plain_relative(o) {
-            None | Some(None) => {
-                return Err(RequestError::NotRelative {
-                    what: "output",
-                    path: o.clone(),
-                });
-            }
-            Some(Some(first)) if first == STDOUT || first == STDERR => {
-                return Err(RequestError::Reserved(o.clone()));
-            }
-            Some(Some(_)) => {}
+        if !plain_relative(o) {
+            return Err(RequestError::NotRelative {
+                what: "output",
+                path: o.clone(),
+            });
+        }
+        if [STDOUT, STDERR].contains(&o.split('/').next().unwrap_or_default()) {
+            return Err(RequestError::Reserved(o.clone()));
         }
     }
-    if plain_relative(&req.cwd).is_none() {
+    // The empty path names the share itself.
+    if !req.cwd.is_empty() && !plain_relative(&req.cwd) {
         return Err(RequestError::NotRelative {
             what: "cwd",
             path: req.cwd.clone(),
@@ -102,23 +100,10 @@ pub fn check(req: &RunRequest, inputs: &Path) -> Result<PathBuf, RequestError> {
     Ok(cwd)
 }
 
-/// `Some(first component)` when `p` is made only of normal components (`Some(None)`
-/// for the empty path), `None` when it is absolute or holds `.` or `..`.
-fn plain_relative(p: &str) -> Option<Option<&str>> {
-    let mut first = None;
-    for c in Path::new(p).components() {
-        match c {
-            Component::Normal(n) => {
-                first = first.or(n.to_str());
-            }
-            _ => return None,
-        }
-    }
-    // `a/./b` loses its `.` in `components()`; refuse it from the text.
-    if p.split('/').any(|c| c == "." || c == "..") {
-        return None;
-    }
-    Some(first)
+/// Whether `p` is a non-empty relative path whose components are all names: not
+/// absolute, no empty component (`a//b`, a trailing `/`), no `.` or `..`.
+fn plain_relative(p: &str) -> bool {
+    p.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 /// A started command: the leader of its own process group, not yet reaped. Its pid,
@@ -191,12 +176,11 @@ impl Running {
     /// # Errors
     /// `wait4` failed.
     pub fn wait(&self) -> io::Result<Reaped> {
+        // Without WNOHANG, `wait4` returns only once the leader is reaped, or fails.
+        // This process installs no signal handler, so it is never interrupted.
         loop {
-            match self.reap(0) {
-                Ok(Some(r)) => return Ok(r),
-                Ok(None) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+            if let Some(reaped) = self.reap(0)? {
+                return Ok(reaped);
             }
         }
     }
@@ -280,14 +264,16 @@ fn micros(t: libc::timeval) -> u64 {
     u64::try_from(micros).unwrap_or(0)
 }
 
-/// `ru_maxrss` is in KiB on Linux and in bytes on macOS.
+/// `ru_maxrss` is in bytes on macOS.
+#[cfg(target_os = "macos")]
 fn rss_bytes(maxrss: libc::c_long) -> u64 {
-    let n = u64::try_from(maxrss).unwrap_or(0);
-    if cfg!(target_os = "macos") {
-        n
-    } else {
-        n * 1024
-    }
+    u64::try_from(maxrss).unwrap_or(0)
+}
+
+/// `ru_maxrss` is in KiB on Linux.
+#[cfg(not(target_os = "macos"))]
+fn rss_bytes(maxrss: libc::c_long) -> u64 {
+    u64::try_from(maxrss).unwrap_or(0) * 1024
 }
 
 /// What each of `paths` holds under `outputs`, looking at every component without
@@ -309,12 +295,10 @@ pub fn report_outputs(outputs: &Path, paths: &[String]) -> Vec<OutputEntry> {
 }
 
 fn examine(root: &Path, rel: &str) -> (OutputKind, u64) {
-    let parts: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
-    let Some((last, dirs)) = parts.split_last() else {
-        return (OutputKind::Missing, 0);
-    };
+    // `check` has made `rel` a plain relative path: names separated by single slashes.
+    let (dirs, last) = rel.rsplit_once('/').unwrap_or(("", rel));
     let mut at = root.to_path_buf();
-    for dir in dirs {
+    for dir in dirs.split('/').filter(|d| !d.is_empty()) {
         at.push(dir);
         if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_dir()) {
             return (OutputKind::Missing, 0);
@@ -333,5 +317,50 @@ fn examine(root: &Path, rel: &str) -> (OutputKind, u64) {
         (OutputKind::Directory, 0)
     } else {
         (OutputKind::Other, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a failed `wait4` read as "still running" (the agent would poll
+    /// forever) rather than reported.
+    #[test]
+    fn reaping_a_process_that_is_not_a_child_fails() {
+        let not_ours = Running {
+            pid: libc::pid_t::try_from(std::process::id()).expect("pid"),
+            started: Instant::now(),
+        };
+        let error = not_ours
+            .try_reap()
+            .expect_err("this process is not its own child");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+    }
+
+    /// Catches a drain that reports an empty group while a member is left (on Linux,
+    /// the leader killed but not yet reaped), and one that never notices the group
+    /// is gone.
+    #[test]
+    fn drain_waits_for_the_group_to_empty() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]).process_group(0);
+        let child = command.spawn().expect("spawned");
+        let running = Running {
+            pid: libc::pid_t::try_from(child.id()).expect("pid"),
+            started: Instant::now(),
+        };
+        // Linux counts a zombie as a member of its group; whether macOS does is not
+        // relied on, so there the drain only has to kill.
+        let drained = running.drain(Duration::from_millis(50));
+        if cfg!(target_os = "linux") {
+            assert!(!drained, "the unreaped leader is a member");
+        }
+        let reaped = running.wait().expect("reaped");
+        assert_eq!(reaped.status, Err(libc::SIGKILL));
+        assert!(
+            running.drain(DRAIN),
+            "the group is empty once the leader is reaped"
+        );
     }
 }

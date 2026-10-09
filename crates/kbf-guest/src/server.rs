@@ -10,8 +10,9 @@
 //! request's timeout end the group early. A connection that drops while the command
 //! runs kills the group, and nothing is reported. Every later `Run`, on this
 //! connection or another, is refused with [`Refusal::AlreadyRan`]: one boot runs one
-//! command. If the agent itself restarts, the stdout file it left in the outputs share
-//! makes the next start fail, so a restart cannot run a second command either.
+//! command. [`Agent::serve`] returns once the connection that ran it has ended. If the
+//! agent is started again, the stdout file left in the outputs share makes the next
+//! start fail, so a restart cannot run a second command either.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -85,12 +86,6 @@ pub struct Agent {
     ran: bool,
 }
 
-/// Whether the connection can still be used after a run.
-enum Flow {
-    Open,
-    Gone,
-}
-
 impl Agent {
     #[must_use]
     pub fn new(config: Config) -> Self {
@@ -103,17 +98,20 @@ impl Agent {
         self.ran
     }
 
-    /// Serves connections on `listener`, one at a time, until accepting fails.
+    /// Serves connections on `listener`, one at a time, and returns once the
+    /// connection that ran this boot's command has ended: the agent has nothing left
+    /// to do, and a restart is refused by the stdout file the command left.
     ///
     /// # Errors
     /// `accept` failed.
     pub fn serve(&mut self, listener: &UnixListener) -> io::Result<()> {
-        loop {
+        while !self.ran {
             let (stream, _) = listener.accept()?;
             if let Err(e) = self.serve_connection(stream) {
                 eprintln!("kbf-guest: connection ended: {e}");
             }
         }
+        Ok(())
     }
 
     /// Serves one connection until the host closes it, sends something unreadable,
@@ -137,7 +135,7 @@ impl Agent {
             Err(e) => Some((Refusal::NoHello, e.to_string())),
         };
         if let Some((reason, detail)) = refusal {
-            send(&mut stream, &GuestMsg::Refused { reason, detail });
+            send(&mut stream, &refused(reason, detail));
             // Best effort: the host may already be gone.
             let _ = stream.shutdown();
             return Ok(());
@@ -146,9 +144,8 @@ impl Agent {
             version: VERSION,
             session: self.config.session.clone(),
         };
-        if !send(&mut stream, &ready) {
-            return Ok(());
-        }
+        // A host that is already gone shows up as the end of the stream below.
+        send(&mut stream, &ready);
         stream.set_read_timeout(None)?;
 
         let mut reader = stream.try_clone()?;
@@ -170,34 +167,29 @@ impl Agent {
         result
     }
 
+    /// Answers the host's messages until the stream ends. A reply that cannot be
+    /// sent is not acted on here: the reader sees the same end of the stream and
+    /// reports it next.
     fn serve_messages<S: Stream>(
         &mut self,
         stream: &mut S,
         rx: &Receiver<Result<HostMsg, WireError>>,
     ) -> io::Result<()> {
         loop {
-            let msg = match rx.recv() {
-                Ok(Ok(msg)) => msg,
+            match rx.recv() {
+                Ok(Ok(HostMsg::Run(req))) => self.run(stream, rx, &req)?,
+                Ok(Ok(HostMsg::Kill)) => {}
+                Ok(Ok(HostMsg::Hello { .. })) => {
+                    send(
+                        stream,
+                        &refused(Refusal::BadRequest, "Hello was already sent".into()),
+                    );
+                }
                 Ok(Err(WireError::Closed)) | Err(_) => return Ok(()),
                 Ok(Err(e)) => {
-                    let detail = e.to_string();
-                    send(stream, &refused(Refusal::BadRequest, detail));
+                    send(stream, &refused(Refusal::BadRequest, e.to_string()));
                     return Ok(());
                 }
-            };
-            let ok = match msg {
-                HostMsg::Run(req) => match self.run(stream, rx, &req)? {
-                    Flow::Open => true,
-                    Flow::Gone => return Ok(()),
-                },
-                HostMsg::Kill => true,
-                HostMsg::Hello { .. } => send(
-                    stream,
-                    &refused(Refusal::BadRequest, "Hello was already sent".into()),
-                ),
-            };
-            if !ok {
-                return Ok(());
             }
         }
     }
@@ -207,41 +199,43 @@ impl Agent {
         stream: &mut S,
         rx: &Receiver<Result<HostMsg, WireError>>,
         req: &RunRequest,
-    ) -> io::Result<Flow> {
+    ) -> io::Result<()> {
         let refusal = if self.ran {
-            Some(refused(
+            refused(
                 Refusal::AlreadyRan,
                 "this boot already ran a command".into(),
-            ))
+            )
         } else {
             match run::check(req, &self.config.inputs) {
                 Ok(cwd) => {
                     self.ran = true;
                     match Running::start(req, &cwd, &self.config.outputs) {
                         Ok(running) => return self.supervise(stream, rx, req, &running),
-                        Err(e) => Some(refused(Refusal::StartFailed, e.to_string())),
+                        Err(e) => refused(Refusal::StartFailed, e.to_string()),
                     }
                 }
-                Err(e) => Some(refused(Refusal::BadRequest, e.to_string())),
+                Err(e) => refused(Refusal::BadRequest, e.to_string()),
             }
         };
-        let open = refusal.is_none_or(|msg| send(stream, &msg));
-        Ok(if open { Flow::Open } else { Flow::Gone })
+        send(stream, &refusal);
+        Ok(())
     }
 
-    /// Waits for the leader, ending the group on `Kill`, the timeout or a dropped
-    /// connection, then drains the group and reports the exit.
+    /// Waits for the leader, ending the group on `Kill`, the timeout or the end of
+    /// the stream, then drains the group and reports the exit (unless the host is
+    /// gone).
     fn supervise<S: Stream>(
         &self,
         stream: &mut S,
         rx: &Receiver<Result<HostMsg, WireError>>,
         req: &RunRequest,
         running: &Running,
-    ) -> io::Result<Flow> {
-        let mut gone = !send(stream, &GuestMsg::Started { pid: running.pid() });
+    ) -> io::Result<()> {
+        send(stream, &GuestMsg::Started { pid: running.pid() });
         let deadline =
             (req.timeout_ms > 0).then(|| running.started() + Duration::from_millis(req.timeout_ms));
-        let mut ended_by = gone.then_some(End::Killed);
+        let mut gone = false;
+        let mut ended_by = None;
         let reaped = loop {
             if ended_by.is_some() {
                 running.kill_group();
@@ -258,18 +252,16 @@ impl Agent {
                 Err(RecvTimeoutError::Timeout) => {}
                 Ok(Ok(HostMsg::Kill)) => ended_by = Some(End::Killed),
                 Ok(Ok(HostMsg::Run(_))) => {
-                    let msg = refused(Refusal::AlreadyRan, "a command is running".into());
-                    if !send(stream, &msg) {
-                        gone = true;
-                        ended_by = Some(End::Killed);
-                    }
+                    send(
+                        stream,
+                        &refused(Refusal::AlreadyRan, "a command is running".into()),
+                    );
                 }
                 Ok(Ok(HostMsg::Hello { .. })) => {
-                    let msg = refused(Refusal::BadRequest, "Hello was already sent".into());
-                    if !send(stream, &msg) {
-                        gone = true;
-                        ended_by = Some(End::Killed);
-                    }
+                    send(
+                        stream,
+                        &refused(Refusal::BadRequest, "Hello was already sent".into()),
+                    );
                 }
                 Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                     gone = true;
@@ -278,24 +270,20 @@ impl Agent {
             }
         };
         let drained = running.drain(DRAIN);
-        if gone {
-            return Ok(Flow::Gone);
+        if !gone {
+            let end = ended_by.unwrap_or(match reaped.status {
+                Ok(code) => End::Exited(code),
+                Err(signal) => End::Signaled(signal),
+            });
+            let exit = GuestMsg::Exited(Exit {
+                end,
+                usage: reaped.usage,
+                outputs: run::report_outputs(&self.config.outputs, &req.outputs),
+                stragglers: !drained,
+            });
+            send(stream, &exit);
         }
-        let end = ended_by.unwrap_or(match reaped.status {
-            Ok(code) => End::Exited(code),
-            Err(signal) => End::Signaled(signal),
-        });
-        let exit = GuestMsg::Exited(Exit {
-            end,
-            usage: reaped.usage,
-            outputs: run::report_outputs(&self.config.outputs, &req.outputs),
-            stragglers: !drained,
-        });
-        Ok(if send(stream, &exit) {
-            Flow::Open
-        } else {
-            Flow::Gone
-        })
+        Ok(())
     }
 }
 
@@ -303,7 +291,8 @@ fn refused(reason: Refusal, detail: String) -> GuestMsg {
     GuestMsg::Refused { reason, detail }
 }
 
-/// Sends `msg`; `false` when the host is gone.
-fn send(w: &mut impl Write, msg: &GuestMsg) -> bool {
-    write_frame(w, &msg.encode()).is_ok()
+/// Sends `msg`. A failure means the host is gone, which the reader reports as the end
+/// of the stream; there is no one to tell here.
+fn send(w: &mut impl Write, msg: &GuestMsg) {
+    let _ = write_frame(w, &msg.encode());
 }
