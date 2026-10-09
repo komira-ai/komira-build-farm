@@ -114,7 +114,11 @@ to the CAS.
   "Pins" for retention roots.
 - **Fetch list**: a named, versioned set of declared downloads, submitted by a client
   repository.
-- **Entry**: one digest named by at least one live list.
+- **Entry**: one digest named by at least one live list. An entry that was held or
+  `corrupt` when its last list stopped naming it stays an entry *in grace* for
+  `--mirror-grace` ([section 7](#7-retention-and-caps)): it is served, healed and
+  reported like a listed one, with the URLs and policy it last had. Any other entry
+  leaves the report, with its alerts, when its last list stops naming it.
 - **Held**: the entry's bytes are in the mirror store, verified, and indexed.
 - **Mirror store**: the stable key prefix that holds held entries.
 - **Adopt**: copy a client's upload of a listed digest into the mirror store.
@@ -124,16 +128,16 @@ to the CAS.
 | Failure | Without the cache | Mechanism | Report, alert, recover |
 |---|---|---|---|
 | Upstream down or slow | every cold client stalls through its HTTP retries, then fails | held entries are served from the mirror store; nothing on the read path contacts upstream | a fetch that stalls is cut off by the connect, idle and minimum-throughput limits of [section 5.6](#56-the-fetcher) and counts as failed; report `fetch_failed{host, error, since}` on entries not yet held; alert after N failed attempts, naming the host, the entries at risk and the fix; retry with backoff, clearing on success |
-| Upstream serves different bytes at the same URL (a regenerated archive, a moved tag, a compromised host) | builds fail everywhere until someone re-pins | bytes are accepted only if both SHA-256 and size match; a held copy is never replaced; new bytes are never accepted automatically | report `upstream_drift{url, observed_sha256, observed_size}` only for a complete 2xx body with other bytes (a cut or failed download is `fetch_failed`), or `drift_seen` on a held entry; alert "the farm still serves the held copy; re-pin to a stable asset or vendor it"; an entry not held is retried with backoff and becomes `held` when a candidate serves the right bytes or a client's upload is adopted; the alert clears when no live list names the digest ([section 5.6](#56-the-fetcher)) |
+| Upstream serves different bytes at the same URL (a regenerated archive, a moved tag, a compromised host) | builds fail everywhere until someone re-pins | bytes are accepted only if both SHA-256 and size match; a held copy is never replaced; new bytes are never accepted automatically | report `upstream_drift{url, observed_sha256, observed_size}` only for a complete 2xx body with other bytes (a cut or failed download is `fetch_failed`), or `drift_seen` on a held entry; alert "the farm still serves the held copy; re-pin to a stable asset or vendor it"; an entry not held is retried with backoff and becomes `held` when a candidate serves the right bytes or a client's upload is adopted; the alert clears when the drifted URL leaves the entry's lists (re-pinning does that) or no live list names the digest, and a drift note keeps it across a restart ([section 5.6](#56-the-fetcher)) |
 | A wrong pin in a change | that change's build fails | the same check: nothing is stored; the CI wait step fails the change naming the entry | reported on the entry; no alert, because the change's own check is the signal |
 | A pin bump hits many runners at once | N clients fetch upstream together | the list is submitted before the build; one copy writer per digest across fetch, adoption and healing ([section 5.2](#52-the-mirror-store-and-its-location)); a per-host concurrency cap; the first verified copy, fetched or adopted, serves everyone and later writers skip | in-flight count and queue depth per host; no alert unless a fetch fails |
 | Cache poisoning | not applicable | the digest is the only key; a URL is a hint; every byte is verified before commit and on every read; nothing is keyed by URL; the action cache is never written | counter `mirror_rejected_total{reason}` |
 | The fetcher used to reach internal addresses | not applicable | HTTPS only; a host allow-list by flag; no proxy; DNS resolved once per hop and the connection made to that address; every address that is not globally routable refused at every hop ([section 5.6](#56-the-fetcher)); the fetcher fetches only listed entries, never a URL given at miss time | refusal recorded on the entry; alert naming the refused URL and address and the fix, which is another URL: the filter has no override flag ([section 8](#8-report-alert-recover)) |
 | A source's licence forbids a private copy | not applicable | a per-host policy: `fetch`, `adopt` or `deny` ([section 5.5](#55-per-host-policy)) | the report shows each entry's policy; a `deny` entry is reported, not alerted |
 | Store pressure | not applicable | per-list caps, a total cap, and a separate cap for lists from unmerged changes inside the total, so those lists cannot crowd out the default branch ([section 7](#7-retention-and-caps)); over a cap, new entries are refused and held entries are never evicted | alert at 80% of a cap and on any refusal, naming the cap flag and the lists that hold the most; recover by raising it or retiring lists |
-| The store damages a copy as it is written, or a write or its read-back fails | not applicable | every copy is read back and re-hashed before it is committed, for fetch and adoption alike; nothing points at an unconfirmed copy, so a digest in a segment stays served from there ([section 5.2](#52-the-mirror-store-and-its-location)) | report `store_write_failed{copy, error}`, the copy recorded as damaged and prunable; alert as a mirror-store write failure with the store error and the steps it calls for; retry with backoff as the next copy, clearing on commit |
-| Server restart | cold CAS | held entries live under a stable prefix and are re-indexed at start, each reported present once its bytes are verified | re-index count, verified bytes and duration in the report; alert if the listing or a read fails, naming the store error; the re-index retries by itself |
-| A damaged object in the store | not applicable | every mirror object is read and hashed at start before it is reported present ([section 5.3](#53-re-index-at-start)), so a damaged object found then is never served; damage after that is caught by the re-hash on read, which fails the actions that already passed Execute's input check ([section 5.3](#53-re-index-at-start) says exactly which); a copy damaged as it is written is caught by the read-back before it is committed ([section 5.2](#52-the-mirror-store-and-its-location)) | report `corrupt`; alert with the fix; heal by writing a new copy under a new key, fetched under `fetch` or copied from a client's upload under `adopt` ([section 5.2](#52-the-mirror-store-and-its-location)) |
+| The store damages a copy as it is written, or a write or its read-back fails | not applicable | every copy is read back and re-hashed before it is committed, for fetch and adoption alike; nothing points at an unconfirmed copy, so a digest in a segment stays served from there ([section 5.2](#52-the-mirror-store-and-its-location)) | report `store_write_failed{copy, error}`, the copy recorded as damaged and prunable; alert as a mirror-store write failure with the store error and the steps it calls for; retry with backoff as the next copy, from the spool for a fetch and by the sweep from the CAS for an adoption, clearing on commit |
+| Server restart | cold CAS | held entries, the lists and the drift notes live under a stable prefix ([section 5.1](#51-fetch-lists), [section 5.2](#52-the-mirror-store-and-its-location)) and are read back at start, each copy reported present once its bytes are verified; every entry's state is derived again from the store, and the sweep then acts on every entry that is not held ([section 5.4](#54-adopt-on-upload)) | re-index count, verified bytes and duration in the report; alert if the listing or a read fails, naming the store error; the re-index retries by itself, and no copy is written until its listing has succeeded |
+| A damaged object in the store | not applicable | every mirror object is read and hashed at start before it is reported present ([section 5.3](#53-re-index-at-start)), so a damaged object found then is never served; damage after that is caught by the re-hash on read, which fails the actions that already passed Execute's input check ([section 5.3](#53-re-index-at-start) says exactly which); a copy damaged as it is written is caught by the read-back before it is committed ([section 5.2](#52-the-mirror-store-and-its-location)) | report `corrupt`; alert with the fix; heal by writing a new copy under a new key: the sweep copies the blob from the CAS if a segment holds it, or indexes an older copy of the store that still verifies, and otherwise the fetcher writes one under `fetch`; under `adopt` with neither, the alert names the one client build that heals it ([section 5.4](#54-adopt-on-upload), [appendix A](#appendix-a-entry-state-machine)) |
 
 ## 5. The mechanism
 
@@ -151,6 +155,25 @@ to the CAS.
   keeps and every new push to the change increases; a run that finishes after a newer
   one is refused, which is the right answer. `DELETE` retires a list. `GET /v1/mirror`
   is the report of [section 8](#8-report-alert-recover).
+- **Lists survive a restart.** The index is in memory ([section 2.4](#24-today-a-restart-empties-the-cas)),
+  so a list kept only there would be lost at every start, and with it every entry's
+  adoption, fetch, sweep and grace until CI next submitted. So an accepted submission is
+  written, before the `PUT` is answered, as one object
+  `<mirror-prefix>lists/<name>/<generation>/<record>` (the list's entries, its expiry
+  and the time it was accepted, followed by the SHA-256 of those bytes, so a start can
+  check the record), with `put_new` and read back like a copy
+  ([section 5.2](#52-the-mirror-store-and-its-location)); `DELETE` writes
+  `<mirror-prefix>retired/<name>/<generation>/<record>` with its time the same way.
+  `<record>` is numbered like a copy, so a damaged record is superseded, never
+  rewritten. A write that fails refuses the request with the store error, and CI's step
+  fails naming it ([section 6.1](#61-first-fetch-and-pin-bump)). At start, before the
+  re-index of [section 5.3](#53-re-index-at-start) ends, the server reads the newest
+  verified record of each list that is not retired, so expiry and grace are computed
+  from stored times. A record that does not verify is reported and alerted under
+  `unreadable_lists`, naming the list and the fix (resubmit it; a re-run of its CI job
+  does), and the next older generation is used meanwhile (if none verifies, the list's
+  entries are kept as entries in grace from the start); the resubmission is newer
+  than that one, so it is accepted and written as the next record.
 - Each entry must state a 64-hex-digit SHA-256 and a positive size. An entry without
   either, a size over the per-entry cap, or a URL that is not `https` is refused at
   submission with a reason, and the whole submission is refused, so a list is never
@@ -177,9 +200,13 @@ to the CAS.
   one says what happens then.) So a damaged copy is never repaired in place; it is
   *superseded* by a verified copy with a higher number.
 - **One copy writer per digest.** Every path that writes a copy (a fetch's commit, an
-  adoption queued by `store_blobs`, an adoption queued by the sweep, and healing after
+  adoption started by `store_blobs`, an adoption started by the sweep, and healing after
   `corrupt` or `store_write_failed`) first takes the digest's copy lock, one per digest
-  for the whole server, so two writers never run for the same digest at once. Under the
+  for the whole server, so two writers never run for the same digest at once. Every path
+  that indexes an existing copy (the re-index at start, a retried `unverified` read, and
+  the sweep's re-check of a `corrupt` entry's older copies, [section 5.3](#53-re-index-at-start))
+  takes the same lock, so an older copy is never indexed over a newer one that a writer
+  has just committed. Under the
   lock the writer looks again: if a copy of the digest is now committed and has not
   failed verification since (the entry is `held`, not `corrupt`), it writes nothing (a
   fetch removes its spool file, an adoption is dropped and counted as
@@ -187,14 +214,19 @@ to the CAS.
   commit (on read, at re-index or in the scrub) does not count: the writer goes on and
   heals the entry with the next copy. Otherwise it takes the next copy number under the
   lock; a number taken in this start is never taken again, even if its write failed.
-  Only a fetch waits for the lock, and while it waits it holds no fetcher slot and no
-  bytes in memory (its bytes are in the spool file, read into memory only under the
-  lock). An adoption, from `store_blobs` or from the sweep, already holds its blob in
-  memory, so it does not wait: if the lock is taken it drops its bytes, counts
+  Only a fetch and a verification wait for the lock, and while they wait they hold no
+  slot and no bytes in memory (a fetch's bytes are in the spool file, read into memory
+  only under the lock; a verifier takes its slot after the lock). An adoption never
+  waits: it takes an adopter slot, then tries the lock. From `store_blobs` it already
+  holds the upload's bytes; if the lock is taken it drops them, counts
   `mirror_adopt_deferred_total`, and leaves the entry to the next sweep, which writes
   nothing if the lock holder committed a verified copy and otherwise re-reads the blob
-  verified from the CAS. No bytes are lost, and only a writer
-  that holds both a slot and the lock holds an entry in memory.
+  verified from the CAS. The sweep's adoption tries the lock before it reads the blob,
+  so its deferral drops nothing. Nothing queues behind the adopter slots
+  ([section 5.4](#54-adopt-on-upload)), so no adoption that is waiting holds bytes. No
+  bytes are lost, and only a writer that holds both a slot and the lock holds an entry
+  in memory. Every path that waits takes the lock before its slot, and the adoption,
+  which takes its slot first, never waits, so there is no cycle.
 - **A committed copy is never touched by another writer.** A writer records "damaged" or
   "unconfirmed, prunable" only for the number it took itself, and only while no
   `PutBlob` names that number. A committed copy becomes damaged in the report only when
@@ -224,7 +256,7 @@ to the CAS.
   - The retry needs the bytes again. A fetch keeps its spool file until the copy is
     committed and re-hashes it before each retry (a spool file that no longer hashes is
     removed and the entry refetched). An adoption does not hold its bytes across the
-    backoff: the entry goes back to the adopt sweep ([section 5.4](#54-adopt-on-upload)),
+    backoff: the entry goes back to the sweep ([section 5.4](#54-adopt-on-upload)),
     which re-reads the blob verified from the CAS.
   - It clears by itself when a retry commits. `upstream_drift` is never recorded here:
     it means only that bytes fetched into the spool did not match the entry
@@ -259,9 +291,9 @@ to the CAS.
   the read-back after a write) reads the copy in `--mirror-read-chunk` pieces (lean
   8 MiB) and hashes as it goes. The memory bound is therefore the per-entry cap times the
   number of copies written at once (at most `--mirror-fetchers` fetches plus
-  `--mirror-adopters` adoptions; an adoption holds the blob it read from the CAS, and an
-  adoption that finds the copy lock taken drops it rather than wait, so lock waiters add
-  nothing), plus
+  `--mirror-adopters` adoptions; an adoption holds its blob only while it holds an
+  adopter slot, nothing queues behind the slots, and an adoption that finds the copy
+  lock taken drops it rather than wait, so lock waiters add nothing), plus
   one chunk per writer for its read-back, plus `--mirror-verifiers` times the chunk. A
   retry of a store write from the spool takes a fetcher slot like a fetch, and a retried
   adoption takes an adopter slot, so retries add nothing to the bound. With the lean
@@ -285,7 +317,7 @@ to the CAS.
   groups the keys by digest. A key that does not parse is left alone (nothing is deleted
   at start), listed in the report under `unparsed_keys`, and alerted, naming the key and
   the fix: remove it from the store, or correct `--mirror-prefix` if the prefix is shared
-  with something else. The adopt sweep ([section 5.4](#54-adopt-on-upload)) re-lists
+  with something else. The sweep ([section 5.4](#54-adopt-on-upload)) re-lists
   the mirror prefix for such keys, so the alert clears by itself within one sweep of the
   key's removal, with no restart.
 - **Nothing is reported present before its bytes are verified.** For each digest the
@@ -297,6 +329,14 @@ to the CAS.
   `FindMissingBlobs` answers "missing", the client uploads it, and the upload is
   adopted into a new copy ([section 5.4](#54-adopt-on-upload)), or the fetcher writes
   one under `fetch`. The entry is reported `corrupt` until that new copy is committed.
+  Each digest is verified under its copy lock
+  ([section 5.2](#52-the-mirror-store-and-its-location)). The same routine, run for one
+  digest, is what a retried `unverified` read and the sweep's re-check of a `corrupt`
+  entry run; they skip copies already recorded damaged in this start.
+- When the re-index of a digest ends, and once for all entries when the whole re-index
+  ends, the sweep of [section 5.4](#54-adopt-on-upload) runs for every entry that is not
+  held, so a fetch, an adoption or a heal that a restart interrupted starts again
+  without waiting for a client to ask.
 - The REAPI listener does not wait for the re-index. Until a digest is verified it is
   absent, which is today's answer after a restart, so a client that asks early goes
   upstream as it does today and its upload is adopted. Verification reads at most the
@@ -304,9 +344,16 @@ to the CAS.
   objects at a time (lean 8). The report shows its progress.
 - A read that fails with a store error (not a mismatch) leaves the digest absent and
   marks it `unverified{error}`; it is retried with backoff and alerted after N attempts.
+  Meanwhile the sweep adopts the blob if a client has uploaded it, and after N failed
+  reads it wakes the fetcher under `fetch`; either writes a newer copy, which supersedes
+  the unread one. Before N it does not fetch, so a short store fault costs no egress.
 - A failed listing fails the re-index: the server reports it, raises an alert naming
   the store error, starts without the mirror rather than serving a partial view as
-  complete, and retries the listing with backoff. A listing that succeeds but misses
+  complete, and retries the listing with backoff. Until a listing has succeeded every
+  entry is `verifying`, and until a digest's own check ends no copy of it is written by
+  any path (an upload is stored in a segment as today and left to the sweep that runs
+  when the check ends), so a copy number is always chosen after a listing and never
+  races the start-time check. A listing that succeeds but misses
   recent keys is not detectable as such; the missed copy is not indexed, so the entry
   is fetched or adopted again; on a `conditional_put` store that write meets
   `AlreadyExists`, which [section 5.2](#52-the-mirror-store-and-its-location) turns into
@@ -315,7 +362,12 @@ to the CAS.
 
 **Damage after verification.** Bytes can still go bad after the start-time check. The
 first read after that is `Cache::fetch`, which re-hashes, marks the object unreachable
-and returns `UNAVAILABLE` (`crates/kbf-front/src/cache.rs`). If that first read is a
+and returns `UNAVAILABLE` (`crates/kbf-front/src/cache.rs`); it does the same when the
+store answers `NotFound` or `InvalidRange` for the key (a copy removed from under kbf, or cut short). A read that fails
+with any other store error marks nothing (`Cache::fetch` returns the error): the entry
+stays `held`, that read fails, the next read tries again, and the failure is counted in
+`mirror_read_failed_total` and alerted as a mirror-store read failure after N in a row.
+If that first read is a
 worker fetching an action's input, the action fails: the daemon maps any CAS error but
 `NOT_FOUND` to `CasError::Unavailable` (`call_error` in `crates/kbf-daemon/src/cas.rs`),
 `tree_error` in `local.rs` makes that `RuntimeError::Failed`, and `lease.rs` reports it
@@ -336,8 +388,13 @@ could not read it" into "it does not exist"
   daemon that cached "present" in its `FindMissingBlobs` LRU
   ([section 2.3](#23-what-buck2-asks-the-cas)) is not consulted for that refusal; how
   buck2 handles a `MISSING` refusal is not verified here.
-- The mirror heals without a client: the mark wakes the fetcher under `fetch`, which
-  writes the next copy; under `adopt` the next upload is adopted into the next copy.
+- The mark runs the sweep for that digest at once ([section 5.4](#54-adopt-on-upload)).
+  It heals without a client when it can: it adopts the blob if a segment of the CAS
+  holds it, otherwise re-checks the entry's older copies still in the store (superseded,
+  not yet collected) and indexes the highest that verifies, otherwise wakes the fetcher
+  under `fetch`, which writes the next copy. Under `adopt` with none of those, the next
+  upload is adopted into the next copy; `FindMissingBlobs` answers "missing" for the
+  digest from the mark on, so a client that needs it uploads it.
 - The entry is reported `corrupt` and alerted, naming the digest and the fix
   ([section 8](#8-report-alert-recover)). The planned scrub
   ([section 12](#12-order-of-work)) re-reads held copies so that damage is found by the
@@ -355,34 +412,70 @@ which the daemon sees as `UNAVAILABLE`. Actions submitted after the mark are ref
 
 ### 5.4 Adopt on upload
 
-- When `Cache::store_blobs` commits a digest that a live list names and the mirror
-  store does not hold, the cache queues a copy of the verified bytes to the entry's next
-  mirror copy. The upload is acknowledged as today, after the segment commit; the copy
-  is a background write on a bounded queue, at most `--mirror-adopters` at once (lean
-  4). The copy is written, read back and re-hashed before `PutBlob` moves the digest to
-  `Location::Mirror`, exactly as [section 5.2](#52-the-mirror-store-and-its-location)
-  says for every copy, under the digest's copy lock. An adoption that races a fetch of
-  the same digest and finds the lock taken does not wait: it drops its bytes and leaves
-  the entry to the next sweep, which writes nothing if the fetch committed a verified
-  copy, or adopts it if the fetch failed. Until then, and if the write fails, the digest keeps its segment
+- When `Cache::store_blobs` commits a digest that a live entry names and the mirror
+  store does not hold, and the entry is not `verifying`, `denied` or
+  `refused{over_cap}`, the cache hands a copy of the verified bytes to a free adopter
+  slot, at most `--mirror-adopters` at once (lean 4), to be written as the entry's next
+  mirror copy. Nothing queues behind the slots: with every slot busy the adoption is
+  dropped at once, holding nothing. The upload is acknowledged as today, after the
+  segment commit; the copy is a background write. It is written, read back and
+  re-hashed before `PutBlob` moves the digest to `Location::Mirror`, exactly as
+  [section 5.2](#52-the-mirror-store-and-its-location) says for every copy, under the
+  digest's copy lock. An adoption that races another writer of the same digest and finds
+  the lock taken does not wait: it drops its bytes and leaves the entry to the next
+  sweep, which writes nothing if the lock holder committed a verified copy, or adopts it
+  if the holder failed. Until then, and if the write fails, the digest keeps its segment
   location and is served from there.
 - `store_blobs` commits only *fresh* blobs: a digest already present in the CAS is
-  touched, not stored (`crates/kbf-front/src/cache.rs`). Two cases therefore get no
-  upload to adopt: a list submitted after its blobs are already in the CAS (the common
-  case under `adopt`, the default policy), and an adoption dropped because the queue
-  was full, after which the blob is present in a segment, `FindMissingBlobs` says
-  "present", and no client uploads it again. Both are closed by the *adopt sweep*: on
-  every list submission, and every `--mirror-sweep-interval` (lean 10 minutes), the
-  server takes each listed entry that has no committed mirror copy (including one in
-  `store_write_failed` whose backoff has passed), and if the CAS holds it
-  (`Present`), reads it through `Cache::read_blob` (verified) and queues the copy.
-  Nothing waits for a client.
-  Each sweep also re-lists `<mirror-prefix>sha256/` (keys are few) only to refresh
-  the report's `unparsed_keys`; it indexes nothing from that listing.
-- A full queue drops the copy, counts `mirror_adopt_dropped_total`, and marks the
-  entry `adopt_pending`; the next sweep retries it. An entry that stays
-  `adopt_pending` for longer than T is alerted, naming the queue flag.
-- `waiting` therefore means what it says: listed, host `adopt`, and not in the CAS
+  touched, not stored (`crates/kbf-front/src/cache.rs`). So once a blob is in a segment,
+  `FindMissingBlobs` says "present" and no client uploads it again, and every adoption
+  that did not commit (none was started because the list came after the upload, which is
+  the common case under `adopt`, the default policy; the slots were busy; the lock was
+  taken; or the write failed) must be finished by the farm. That is the *sweep*. It runs
+  on every list submission and retirement, at the end of each digest's re-index and of
+  the whole re-index ([section 5.3](#53-re-index-at-start)), for one digest when a read
+  marks it damaged, and every `--mirror-sweep-interval` (lean 10 minutes). It takes
+  **every live entry that is not `held`**: `held` meaning a committed copy that has not
+  failed verification since, so a `corrupt` entry whose damaged copy is still named by
+  its `PutBlob` is taken, as is every other state. It passes over only an entry whose
+  copy lock is taken (the holder acts), `denied` and `refused{over_cap}` (no copy may
+  be kept), and every entry while the re-index listing has not yet succeeded. A backoff
+  holds back only the step it paces, so the sweep never retries anything faster than
+  its own backoff and never lets one backoff block a path that needs no egress: the
+  write backoff of `store_write_failed` holds back steps 1 and 3, the fetch backoff of
+  `fetch_failed` and `upstream_drift` holds back step 3 only (an adoption from the CAS
+  still runs), and the read backoff of `unverified` holds back step 2 only. For each
+  entry it takes, in this order, it runs the first step that applies and is not held
+  back:
+  1. If the CAS holds the digest (`Present`; never a mirror copy, since the entry is not
+     held), it takes an adopter slot, tries the copy lock, then reads the blob through
+     `Cache::read_blob` (verified) and writes the copy. No slot free or the lock taken:
+     the entry is `adopt_pending` and the next sweep tries again. A read that fails
+     (the segment was damaged or collected) moves on to step 2.
+  2. If the entry is `corrupt` or `unverified`, it re-runs the start-time verification
+     for that digest ([section 5.3](#53-re-index-at-start)) over the copies not already
+     recorded damaged in this start, highest first, and indexes the first that
+     verifies. An `unverified` entry past N failed reads goes on to step 3.
+  3. If the host policy is `fetch`, it wakes the fetcher (which retries from its spool
+     file if it still has one), except for an entry `refused` by the address filter,
+     the scheme or the host list: the same URLs would be refused again, so it is
+     fetched again only when a resubmitted list changes its URLs or a start changes
+     the flags.
+  4. Otherwise it records why nothing could act: `waiting` (host `adopt`, not in the
+     CAS), or the state it had (`corrupt`, `refused`, `unverified`, or a state whose
+     backoff has not passed), each with the alert of
+     [section 8](#8-report-alert-recover) that names the fix.
+
+  No step waits for a client's upload, which `FindMissingBlobs` would suppress once the
+  blob is present. Only an entry left at step 4 on an `adopt` host with no bytes on the
+  farm needs one, and then the digest is absent, so `FindMissingBlobs` answers
+  "missing" and a client that needs the file uploads it. Each sweep also re-lists `<mirror-prefix>sha256/`
+  (keys are few) only to refresh the report's `unparsed_keys`; it indexes nothing from
+  that listing.
+- A dropped adoption counts `mirror_adopt_dropped_total` and marks the entry
+  `adopt_pending`; the next sweep retries it. An entry that stays `adopt_pending` for
+  longer than T is alerted, naming `--mirror-adopters`.
+- `waiting` therefore means what it says: live, host `adopt`, and not in the CAS
   either.
 - Adoption needs no egress. On its own it keeps every listed file a client has uploaded
   once across eviction and restart.
@@ -481,22 +574,37 @@ remove it. The default is [D3](#d3-licence-default-for-a-host-not-named).
     at `size + 1`) and whose length is not the size or whose SHA-256 is not the entry's.
 - **Commit.** The spool check comes first: if it is drift, nothing is written to the
   store, the spool file is removed, and the observation is recorded against that URL
-  with what was observed; the remaining `urls[]` are still tried, and the entry is
-  `upstream_drift` only when no candidate gave the right bytes. That is the only place
-  `upstream_drift` is recorded. An entry in `upstream_drift` that is not held is
-  retried on the same capped backoff as `fetch_failed`, because a moved tag can move
-  back and a candidate can be fixed; a retry that matches commits the copy and the
-  entry is `held` with the drift kept as the annotation `drift_seen` (below), which a
-  match from the URL that drifted clears at once and a match from another URL leaves
-  in place. An upload of the right bytes by a client is adopted as usual
-  ([section 5.4](#54-adopt-on-upload)), and the entry becomes `held` with the drift kept
-  as the annotation `drift_seen{url, observed_sha256, observed_size, at}`, so the
-  re-pin alert stays until no live list names the digest or a later fetch of that URL
-  matches. When the spool matches, it is written as the
-  entry's next copy (read into memory for `put_new`), read back and re-hashed, and only
-  then committed, as [section 5.2](#52-the-mirror-store-and-its-location) says; a
-  read-back that does not match, or a store error, is `store_write_failed`, retried
-  from the spool, never `upstream_drift`.
+  with what was observed; the remaining `urls[]` are still tried. When every candidate
+  has been tried and none gave the right bytes, the entry is `upstream_drift` if any
+  candidate returned a complete body of other bytes, `refused` if every candidate was
+  refused, and `fetch_failed` otherwise, with each URL's own result in the report. That
+  is the only place `upstream_drift` is recorded. An entry in `upstream_drift` that is
+  not held is retried on the same capped backoff as `fetch_failed`, because a moved tag
+  can move back and a candidate can be fixed.
+- **Drift notes.** Each drift observation is also written, once, as a small object
+  `<mirror-prefix>drift/<hex>/<size>/<n>` (`{url, observed_sha256, observed_size, at}`,
+  numbered, write-once and checked like a list record), and read back at start with the lists
+  ([section 5.1](#51-fetch-lists)), so its alert survives a restart. A note whose write
+  fails is still reported and alerted in this start, marked "not stored", and its write
+  is retried with backoff. A note is *live* while the entry is live and some live
+  list's entry for the digest still names the note's URL, and no later note records a
+  match at that URL. When the entry becomes `held`
+  (a retry from another candidate matches, or a client's upload is adopted,
+  [section 5.4](#54-adopt-on-upload)), its live notes are shown as the annotation
+  `drift_seen{url, observed_sha256, observed_size, at}` with the re-pin alert. A held
+  entry is never fetched again, so the annotation does not wait for a fetch: it clears
+  when its URL leaves every live list's entry for the digest (the alert's own fix,
+  re-pinning to another URL with the same bytes, does that) or no live list names the
+  digest. A retry that matches *at the URL that drifted* shows that the URL serves the
+  right bytes again: the match is written as a note the same way, that URL's earlier
+  notes stop being live at once, and the entry is `held` with no annotation from them.
+- **Writing the copy.** When the spool matches, it is written as the entry's next copy
+  (read into memory for `put_new`), read back and re-hashed, and only then committed,
+  as [section 5.2](#52-the-mirror-store-and-its-location) says; a read-back that does
+  not match, or a store error, is `store_write_failed`, retried from the spool, never
+  `upstream_drift`. Under the copy lock the commit also checks that the entry is still
+  live: a fetch whose entry left every list while it ran writes nothing and removes its
+  spool file.
 - **Candidates.** `urls[]` are tried in order; each is verified the same way.
 - **Concurrency.** One fetch per digest at a time (later callers wait on it), and its
   commit takes the digest's copy lock shared with adoption and healing
@@ -531,10 +639,15 @@ remove it. The default is [D3](#d3-licence-default-for-a-host-not-named).
    change, with an expiry.
 2. The farm diffs the new generation against what it holds and fetches the new
    digests whose host has policy `fetch`.
-3. The CI step polls `GET /v1/mirror` until every entry of its list is held, for at most
-   a bounded time, and fails naming each entry that is not held, with its URL, state and
-   last error. A wrong pin therefore fails at submission time, not in whichever build
-   meets it first. If the farm cannot be reached, or refuses the submission for a reason
+3. The CI step polls `GET /v1/mirror` until every entry of its list whose host has
+   policy `fetch` is held, for at most a bounded time, and fails naming each such entry
+   that is not held, with its URL, state and last error. A wrong pin on a `fetch` host
+   therefore fails at submission time, not in whichever build meets it first. An entry
+   on an `adopt` or `deny` host is never fetched, so the step does not wait for it: it
+   prints each one with its state (`waiting`, `adopt_pending`, `denied`) and does not
+   fail on it; the build after the step downloads an `adopt` entry and its upload is
+   adopted, and a wrong pin there fails that build as it does today. If the farm
+   cannot be reached, or refuses the submission for a reason
    that is not the list's (a server error, a bad credential), the step fails, naming the
    farm error. It does not skip: the build after it runs on the same farm, so it could
    not pass either, and a skipped step would hide a lost bump window.
@@ -551,9 +664,13 @@ the merge submits it.
 
 Held entries are not evicted, and the re-index of [section 5.3](#53-re-index-at-start)
 brings them back after a restart, each once its bytes are verified; until then it is
-missing, as every blob is after a restart today. A listed digest that is still absent (its fetch
-failed, or its host is `adopt` and no client has uploaded it) is reported missing as
-today and the fetcher is woken.
+missing, as every blob is after a restart today. The lists come back from the store with
+them ([section 5.1](#51-fetch-lists)), and when the re-index ends the sweep acts on every
+entry that is not held ([section 5.4](#54-adopt-on-upload)): under `fetch` it wakes the
+fetcher, with no client involved. A live digest that is still absent (its fetch failed,
+or its host is `adopt` and no client has uploaded it) is reported missing as today; a
+`FindMissingBlobs` miss on it also wakes the fetcher, which is then already running or
+in its backoff.
 
 ### 6.3 Upstream outage
 
@@ -564,11 +681,14 @@ can reach the file uploads it and it is adopted.
 
 ### 6.4 Upstream drift
 
-A held entry is never refetched, so drift is seen only when a fetch runs: a new list, a
-retry, or the later scrub. Drift seen on a held entry, or on an entry later held by a
-fetch from another URL or by an adoption, leaves it `held` with the `drift_seen`
-annotation and the re-pin alert. Drift on an entry that is not held is retried with
-backoff ([section 5.6](#56-the-fetcher)); a cut or failed download is never drift. An entry that is only adopted is never compared with
+A held entry is never refetched, so drift is seen only when a fetch runs for an entry
+that is not held: its first fetch, a retry, or a heal after `corrupt`. The scrub reads
+the mirror store, not upstream, so it sees no drift. An entry held after drift, by a
+fetch from another URL or by an adoption, is `held` with the `drift_seen` annotation
+and the re-pin alert, which clear when the drifted URL leaves the entry's lists or no
+live list names the digest ([section 5.6](#56-the-fetcher)); the drift notes keep both
+across a restart. Drift on an entry that is not held is retried with backoff; a cut or
+failed download is never drift. An entry that is only adopted is never compared with
 upstream at all, so drift on an `adopt` host goes unseen; the report says so per entry.
 
 ### 6.5 A file written to the client's disk
@@ -581,14 +701,24 @@ downloads from the URL. Closing the case is a client decision
 
 ## 7. Retention and caps
 
-- An entry is kept while any live list names it, and for `--mirror-grace` after the last
-  list that named it is replaced, retired or expires (lean 90 days), so older commits
-  and bisects still build after upstream changes. Then it is reported as prunable and
+- An entry is kept while any live list names it, and, if it is held or `corrupt`, for
+  `--mirror-grace` after the last list that named it is replaced, retired or expires
+  (lean 90 days), so older commits and bisects still build after upstream changes. In
+  grace it is served, and healed after damage, like a listed entry
+  ([section 3](#3-terms)). The times come from the stored list records
+  ([section 5.1](#51-fetch-lists)), so a restart neither shortens nor restarts the
+  grace. Then it is reported as prunable and
   removed by the planned collector, never silently. Superseded and damaged copies
   ([section 5.2](#52-the-mirror-store-and-its-location)) are reported as prunable at
   once and removed the same way.
 - Caps: per entry, per list and in total, all flags. Over a cap new entries are refused
-  with a reason; a held entry is never evicted to make room.
+  with a reason; a held entry is never evicted to make room. Caps are evaluated again on
+  every submission, retirement and expiry and at every start, in the order the entries'
+  lists were accepted, so a held entry keeps its place; an entry `refused{over_cap}`
+  that now fits leaves that state and the sweep takes it.
+- A host whose policy becomes `deny` (a flag, so at a start) keeps no copy: the
+  re-index does not index that host's copies, the entries are `denied`, and their copies
+  are reported prunable, for the collector to remove after the report.
 - **Unmerged changes cannot crowd out the default branch.** With "never evict", many
   change lists (each living 14 days) could fill the total and leave the default
   branch's next bump refused. So the bytes of entries named *only* by lists with an
@@ -603,30 +733,36 @@ downloads from the URL. Closing the case is a client decision
 ## 8. Report, alert, recover
 
 **Report.** `GET /v1/mirror` lists, per entry: digest, labels, the lists and
-generations that name it, its host policy, its state and the last error. States:
+generations that name it (or, in grace, when its last list stopped naming it and when
+the grace ends), its host policy, its state, its copies (verified, superseded, damaged
+or unconfirmed) and the last error. An entry has one state, set by the latest event;
+every transition, and the automatic path from every state back to `held`, is in
+[appendix A](#appendix-a-entry-state-machine). States:
 
 | State | Meaning | Clears when |
 |---|---|---|
-| `held` | a verified copy is in the mirror store and indexed; it may carry the annotation `drift_seen{url, observed_sha256, observed_size, at}` | the annotation, with its alert, clears when no live list names the digest or a later fetch of that URL matches; so a drifted entry whose retry of the same URL matches is `held` with `drift_seen`, which clears at once, and one held by another URL or an adoption keeps it |
-| `verifying` | at start, its copies are not yet read and hashed ([section 5.3](#53-re-index-at-start)) | the check ends |
-| `unverified{error}` | a copy could not be read at start (a store error, not a mismatch) | a retried read succeeds |
+| `held` | a verified copy is in the mirror store and indexed, and has not failed verification since; it may carry the annotation `drift_seen{url, observed_sha256, observed_size, at}` | the annotation, with its alert, clears when its URL leaves every live list's entry for the digest or no live list names the digest ([section 5.6](#56-the-fetcher)); a retry that matches at the URL that drifted leaves no annotation from that URL |
+| `verifying` | at start, the re-index listing has not yet succeeded, or this digest's copies are not yet read and hashed ([section 5.3](#53-re-index-at-start)) | the check ends: `held`, `corrupt`, `unverified`, or, with no copy, whatever the sweep finds |
+| `unverified{error}` | a copy could not be read at start (a store error, not a mismatch) | a retried read succeeds, or the sweep writes a newer copy (adopted at once if the CAS holds the blob, fetched under `fetch` after N failed reads) |
 | `fetching` | a fetch is running | the fetch ends |
-| `waiting` | listed, host `adopt`, not in the CAS either | a client uploads it |
-| `adopt_pending` | the CAS holds it but the copy into the mirror has not been written yet (queue full, an adoption found the copy lock taken and the holder committed nothing, or the sweep has not run) | the next sweep writes it |
-| `fetch_failed{host, error, attempts, next_retry}` | the last fetch failed in transport, ended early, got a status other than 2xx, timed out or found the spool full; never a mismatch ([section 5.6](#56-the-fetcher)) | a retry succeeds |
-| `upstream_drift{url, observed_sha256, observed_size, attempts, next_retry}` | not held, and every candidate that returned a complete 2xx body returned other bytes | a retry from any candidate matches, or a client's upload is adopted (both make it `held` with the `drift_seen` annotation), or no live list names the digest |
-| `store_write_failed{copy, error, attempts, next_retry}` | a copy was written but its read-back did not match or could not be read, or the write failed; nothing was committed ([section 5.2](#52-the-mirror-store-and-its-location)) | a retried write of the next copy is read back verified and committed |
-| `refused{host_not_allowed, address_filtered, over_cap, not_https}` | the farm will not fetch it | `host_not_allowed`: the `--mirror-host` flag changes; `over_cap`: the cap flag or the lists change; `address_filtered` and `not_https`: the entry's URLs change in a resubmitted list |
+| `waiting` | live, host `adopt`, not in the CAS either | a client uploads it, or the sweep finds it in the CAS, and its adoption commits; or the policy becomes `fetch` |
+| `adopt_pending` | the CAS holds it but the copy into the mirror has not been written yet (every adopter slot was busy, an adoption found the copy lock taken and the holder committed nothing, or the sweep has not reached it) | the next sweep writes it; if the CAS lost the blob meanwhile, the sweep fetches it under `fetch` or marks it `waiting` |
+| `fetch_failed{host, error, attempts, next_retry}` | the last fetch failed in transport, ended early, got a status other than 2xx, timed out or found the spool full; never a mismatch ([section 5.6](#56-the-fetcher)) | a retry succeeds, or a client's upload is adopted |
+| `upstream_drift{url, observed_sha256, observed_size, attempts, next_retry}` | not held, and every candidate that returned a complete 2xx body returned other bytes | a retry from any candidate matches, or a client's upload is adopted (`held`, with `drift_seen` unless the match was at the URL that drifted), or no live list names the digest |
+| `store_write_failed{copy, error, attempts, next_retry}` | a copy was written but its read-back did not match or could not be read, or the write failed; nothing was committed ([section 5.2](#52-the-mirror-store-and-its-location)) | a retried write of the next copy is read back verified and committed: from the spool for a fetch, by the sweep from the CAS for an adoption |
+| `refused{host_not_allowed, address_filtered, over_cap, not_https}` | the farm will not fetch it (`not_https` arises only at a redirect: a list with an `http` URL is refused whole at submission) | `host_not_allowed`: the `--mirror-host` flag changes; `over_cap`: the cap flag or the lists change; `address_filtered` and `not_https`: the entry's URLs change in a resubmitted list. Except for `over_cap`, a client's upload is also adopted, which makes it `held`: adoption needs no fetch |
 | `denied` | host policy `deny` | the policy changes |
-| `corrupt{copy}` | a stored copy failed its digest, at start or on read, and no newer verified copy exists yet | a verified copy with a higher number is committed, fetched or adopted; this survives a restart, because re-index verifies before it indexes and skips the damaged copy |
+| `corrupt{copy}` | the copy the index named failed verification (on read, or in the scrub), or at start every copy did, and no verified copy is committed | a verified copy is committed: adopted from the CAS, an older copy of the store re-verified, fetched, or adopted from a client's upload; this survives a restart, because re-index verifies before it indexes and skips the damaged copy |
 
 Totals: held bytes, caps and their use, entries per state, re-index count, verified
-bytes and duration of this start, spool files removed at start, and the superseded and
-damaged copies awaiting removal.
+bytes and duration of this start, spool files removed at start, the superseded and
+damaged copies awaiting removal, `unreadable_lists`, drift notes not yet stored, and the
+time of the last sweep and the entries it acted on.
 
 **Metrics.** `mirror_fetch_total{host, result}`, `mirror_bytes_fetched_total`,
 `mirror_bytes_held`, `mirror_adopted_total`, `mirror_adopt_dropped_total`, `mirror_adopt_skipped_total`, `mirror_adopt_deferred_total`,
 `mirror_client_fetched_total`, `mirror_rejected_total{reason}`, `mirror_corrupt_total`,
+`mirror_read_failed_total`,
 `mirror_hits_total` (present answers for listed digests). `kbf-server` has no metrics
 endpoint today, so v0 puts these counters in the report.
 
@@ -634,17 +770,18 @@ endpoint today, so v0 puts these counters in the report.
 
 | Alert | Fix it names |
 |---|---|
-| an entry of a default-branch list not held after T | the URL and error; none needed if the host returns (the fetcher keeps retrying); if the URL is gone, add a working URL to the entry's `urls[]` in the client and resubmit the list, or vendor the file |
+| an entry of a default-branch list not held after T | under `fetch`: the URL and error; none needed if the host returns (the fetcher keeps retrying); if the URL is gone, add a working URL to the entry's `urls[]` in the client and resubmit the list, or vendor the file. `waiting` under `adopt`: one client build, with a fresh buck2 daemon, of the declaring target named by the entry's label ([section 9](#9-the-clients-side-komira)), whose upload is adopted; or `--mirror-host <host>=fetch`, if the host's terms allow a copy |
 | `upstream_drift`, or `drift_seen` on a held entry | do not accept the new bytes; re-pin to a stable asset or vendor the file; the farm keeps serving a held copy and keeps retrying an entry that is not held |
 | a host failing for longer than T | the host, the error and the entries at risk; the same fix as the row above: none if the host returns, otherwise another URL for those entries, or `--mirror-host <host>=adopt` and one client build that downloads them |
-| `refused{host_not_allowed}` | `--mirror-host <host>=fetch` (or `adopt`) and the flag's current value |
-| `refused{address_filtered}` or `refused{not_https}` | the URL and the address or scheme refused; no flag allows it (the filter has no override, by design); add an `https` URL on a public address to the entry's `urls[]` and resubmit the list, or vendor the file |
+| `refused{host_not_allowed}` | `--mirror-host <host>=fetch` (or `adopt`) and the flag's current value; meanwhile a client's upload is adopted |
+| `refused{address_filtered}` or `refused{not_https}` | the URL and the address or scheme refused; no flag allows it (the filter has no override, by design); add an `https` URL on a public address to the entry's `urls[]` and resubmit the list, or vendor the file; meanwhile a client's upload is adopted |
 | a cap at 80%, or any refusal over a cap | the cap flag and its value, and the lists holding the most bytes, to retire with `DELETE /v1/mirror/lists/{name}` |
 | re-index failed, a mirror-store read failed, or `store_write_failed` after N attempts | the store error, the key and the store flags (`--s3-endpoint`, `--s3-bucket`, `--s3-region`, `--s3-prefix`, `--s3-conditional-put`, `--mirror-prefix`, and the credential variables). The step to take follows the error: an authorization error, fix the credential the server runs with; a signature error that names the region, correct `--s3-region`; a store that refuses the conditional write, remove `--s3-conditional-put`; a missing bucket or a refused prefix, correct the flag; a store that is down or out of space, restore it. A read-back mismatch means the store returned other bytes than it was given: check the store's own health and disks, since no fix in kbf applies. Every retry is automatic and the state clears when one succeeds |
-| `unverified` after N attempts | the store error and the key, with the same steps as the row above; meanwhile the digest is absent, so the fetcher (under `fetch`) or a client's upload (under `adopt`) may write a newer copy, which supersedes the unread one |
+| `unverified` after N attempts | the store error and the key, with the same steps as the row above; meanwhile the digest is absent, and the sweep writes a newer copy, which supersedes the unread one: from the CAS if a client has uploaded it, or, under `fetch`, from the fetcher |
+| `unreadable_lists`, or a drift note not stored after N attempts | the list or note key and the store error, with the same steps as the store row; for a list, resubmit it (a re-run of its CI job does); a note's write is retried by itself |
 | `unparsed_keys` | the keys; remove them from the store, or set `--mirror-prefix` to a prefix used by nothing else |
-| `adopt_pending` for longer than T | `--mirror-adopters` and the queue's depth |
-| `corrupt` | the digest and the damaged key; under `fetch` none (the fetcher writes a new copy); under `adopt`, one client build, with a fresh buck2 daemon (`buck2 kill` first, since a running daemon may have cached "present"), of a target whose remote actions take the file as input; the alert names the declaring target from the entry's label ([section 9](#9-the-clients-side-komira)), and the build's upload is adopted. Or `--mirror-host <host>=fetch`, if the host's terms allow a copy |
+| `adopt_pending` for longer than T | `--mirror-adopters` (nothing queues behind its slots) |
+| `corrupt` | the digest and the damaged key; none if the CAS holds the blob or an older copy still verifies (the sweep heals it at once); under `fetch` none (the fetcher writes a new copy); under `adopt`, otherwise, one client build, with a fresh buck2 daemon (`buck2 kill` first, since a running daemon may have cached "present"), of a target whose remote actions take the file as input; the alert names the declaring target from the entry's label ([section 9](#9-the-clients-side-komira)), and the build's upload is adopted. Or `--mirror-host <host>=fetch`, if the host's terms allow a copy |
 | spool full | the spool directory, the bytes free and the bytes needed |
 
 `kbf-alert` has no code yet (`crates/kbf-alert/src/lib.rs` is a module comment), and
@@ -653,8 +790,19 @@ once when it appears and once when it clears; delivery to the operator is
 komira-ai/komira-build-farm#189 (native alerting, which covers "the other planned
 alerts" as well as node attention items), and these alerts go through the same path.
 
-**Recover.** Every state in the table clears by itself once its cause is fixed; none
-needs a restart or a command beyond the fix the alert names.
+**Recover.** The sweep ([section 5.4](#54-adopt-on-upload)) visits every live entry that
+is not held on every submission, at the end of the re-index, on a damage mark and every
+`--mirror-sweep-interval`, and moves it toward `held` by the first path that needs no
+person: the CAS's bytes, an older copy that still verifies, or the fetcher. So every
+state but four clears by itself once its cause clears, and none of those paths waits
+for a client upload, which `FindMissingBlobs` would suppress once the blob is present.
+The four are deliberate states for a person, each with an alert naming the fix:
+`waiting` and `corrupt` under `adopt` with no bytes on the farm (one client build;
+`FindMissingBlobs` answers "missing" for the digest, so that build uploads it),
+`refused` (a URL or a flag), and `denied` (a policy). A flag fix takes effect at the
+next start, after which the sweep acts; nothing else needs a restart or a command
+beyond the fix the alert names. [Appendix A](#appendix-a-entry-state-machine) checks
+this state by state and event by event.
 
 ## 9. The client's side (komira)
 
@@ -668,7 +816,10 @@ needs a restart or a command beyond the fix the alert names.
   through a new wrapper cannot be missed. It names no farm.
 - **One CI step** submits the list and waits ([section 6.1](#61-first-fetch-and-pin-bump)).
   The farm address and the credential come from CI secrets, never from source. No
-  client daemon and no new CLI: the step is an HTTP request and a poll.
+  client daemon and no new CLI: the step is an HTTP request and a poll. It waits only for
+  entries on `fetch` hosts. Its test: a list whose `fetch` entries are held and whose
+  `adopt` entry is `waiting` passes, and one with a `fetch` entry in `fetch_failed`
+  fails naming it. Mutant: wait for every entry (the first case times out).
 - **Bazel** clients could use the same cache through a Remote Asset front later
   ([D7](#d7-a-remote-asset-front)).
 
@@ -748,7 +899,39 @@ Each test names the defect it catches and the mutant planted to see it red.
   copy lock, do not skip, write copy 1, read it back and commit it; the entry is `held`
   and the state clears, and `mirror_adopt_skipped_total` does not move. Mutant: skip on
   any committed copy (the writer sees copy 0 committed and writes nothing, so `corrupt`
-  never clears and the state assertion goes red).
+  never clears and the state assertion goes red). Under `adopt`, extended: the client's
+  upload heals the index into a segment (the blob is `Present`), and the store damages
+  the heal write of copy 1, so the entry is `store_write_failed` and no client uploads
+  again. After the backoff the next sweep takes the entry, reads the blob from the CAS,
+  writes copy 2, reads it back and commits it, and the state clears. Mutant: the sweep
+  selects only entries with no committed copy (it passes over the entry, since copy 0
+  was committed, so the state never clears).
+- Sweep selection: one live entry in each state that is not `held`, each with the blob
+  in a segment of the CAS: every one but `denied`, `refused{over_cap}`, an entry whose
+  copy lock is held, and a `store_write_failed` entry before its retry time is adopted
+  by one sweep, a `fetch_failed` entry in its fetch backoff included; a
+  `corrupt` entry with no CAS copy and a good older copy in the store is healed by
+  indexing that copy, with no write and no upload. Mutants: skip `corrupt` (its case goes
+  red); let a fetch backoff hold back the adoption (the `fetch_failed` case stays
+  unheld); skip the older-copy step (under `fetch` a copy is fetched and written, so the
+  no-write assertion goes red; under `adopt` the entry stays `corrupt`).
+- Adopter slots: with every adopter slot held by a stalled write, 100 `store_blobs`
+  adoptions are dropped, each counted in `mirror_adopt_dropped_total`, and the bytes the
+  mirror holds stay at most `--mirror-adopters` blobs (the fake store records each body
+  it is handed, and the test counts the live `Bytes` the adoptions keep). Mutant: queue
+  adoptions with their bytes behind the slots (the live count exceeds the bound).
+- Lock with a retried read: a digest is `unverified` on copy 3, an upload's adoption
+  commits copy 4, and the retried read of copy 3 then succeeds; the index names copy 4
+  afterwards and copy 3 is superseded. Mutant: retry and index without the copy lock
+  (the index names copy 3). An upload during the start-time check of its digest, whose
+  copy 3 is good, starts no adoption, and the check indexes copy 3 with no write.
+  Mutant: adopt during the check (a copy is written that was not needed, so the no-write
+  assertion goes red).
+- Drift notes: an entry drifts at URL A and is held through URL B, so it is `held` with
+  `drift_seen`; a restart keeps the annotation; a resubmitted list whose entry names B
+  only clears it with no fetch. Mutants: keep the note only in memory (the restart
+  drops the alert); clear the annotation only on a fetch of A (it never clears, since a
+  held entry is never fetched).
 - Policy: an `adopt` host is never fetched; a `deny` host is never adopted. Mutant:
   `adopt` fetches.
 
@@ -763,8 +946,8 @@ Each test names the defect it catches and the mutant planted to see it red.
 3. Adopt on upload, restart, hit, with the fetcher off. Mutant: adopt only when the
    fetcher is on.
 4. A blob already in the CAS, then a list naming it: the sweep copies it into the
-   mirror with no upload. A full adopt queue: `adopt_pending`, then held after the next
-   sweep. Mutants: adopt only from `store_blobs`; clear the entry on a dropped copy.
+   mirror with no upload. Every adopter slot busy: `adopt_pending`, then held after the
+   next sweep. Mutants: adopt only from `store_blobs`; clear the entry on a dropped copy.
 5. Upstream serves other bytes: `upstream_drift`, nothing stored, the held copy
    unchanged, the action cache untouched.
 6. A mirror copy damaged in the store while the server is down, then a start: the
@@ -784,6 +967,13 @@ Each test names the defect it catches and the mutant planted to see it red.
 10. Upstream down, then up: `fetch_failed`, alert state set, then `held` with the state
    cleared. The same with an upstream that resets every response halfway: `fetch_failed`,
    never `upstream_drift`, and `held` once it serves whole bodies.
+11. A list naming one entry on a `fetch` host whose upstream is down, then a restart,
+   then the upstream up: with no client request, the entry is `held` within one sweep
+   interval, the list's generation is the one submitted, and an equal-generation
+   resubmission with other entries is still refused. Mutants: keep the lists only in
+   memory (after the restart nothing names the entry); run no sweep at the end of the
+   re-index and wake the fetcher only from `FindMissingBlobs` (the entry is not held
+   until a client asks).
 
 **Simulation** (a new family in `kbf-sim`, on the virtual clock, in the conventions of
 [simulation.md](simulation.md)): upstream up, down and drifting at random; list
@@ -799,8 +989,12 @@ copy is answered present before it is verified; at most one fetch per digest is 
 flight, and at most one copy writer per digest; no cut or error response is recorded as
 `upstream_drift`; no entry is
 lost while listed or in grace; every listed entry that is not `held` carries a reason;
-nothing outside the lists is fetched. At the end: every state whose cause healed has
-cleared. Mutants: drop single-flight; drop the re-index; let a failed fetch clear the
+after every sweep, every live entry that is not `held` and not in one of the person
+states of [section 8](#8-report-alert-recover) has a writer running, a backoff pending
+or an adoption due at the next sweep; nothing outside the lists is fetched. At the end:
+every state whose cause healed has cleared. Mutants: the sweep selects only entries with
+no committed copy; keep the lists only in memory (after a restart no entry is acted on,
+so the sweep check goes red); drop single-flight; drop the re-index; let a failed fetch clear the
 entry; index a copy before verifying it; commit a copy without reading it back; take
 the copy lock in the fetcher only (on the store without `conditional_put` an adoption
 overwrites a committed copy); skip on any committed copy (a copy damaged after its
@@ -814,8 +1008,9 @@ commit is never healed, so the end check goes red); record an early EOF as drift
 
 ## 12. Order of work
 
-**v0:** the list API with validation and caps; `Location::Mirror`, the mirror store
-with numbered copies and the verifying re-index; adopt on upload and the adopt sweep;
+**v0:** the list API with validation, caps and stored list records; `Location::Mirror`,
+the mirror store with numbered copies and the verifying re-index; adopt on upload and
+the sweep; drift notes;
 the fetcher with the host policy, address filter, time limits, spool checks,
 single-flight and backoff; the report and counters; the client's export and CI step.
 
@@ -925,3 +1120,241 @@ step submits on every merge.
 | A public registry blob GET may need an anonymous token | A | to be checked per registry |
 | The working set is about 1 GiB | A, a rough grep | section 2.5 |
 | Each source's terms allow a private copy | A, not checked | D3 |
+
+## Appendix A. Entry state machine
+
+This appendix checks the states of [section 8](#8-report-alert-recover) against every
+event, so that no state is left with no way back to `held`. Sections 4, 5 and 8 say the
+same in prose; where they and this table disagree, that is a defect in the document.
+
+**Events.**
+
+| Event | What it is |
+|---|---|
+| fetch ok / fail / drift / refused | a fetch of the entry ends: right bytes in the spool; a transient failure on every candidate; other bytes on some candidate and the right bytes on none; every candidate refused by the host list, the address filter or the scheme ([section 5.6](#56-the-fetcher)) |
+| upload | `store_blobs` commits the digest fresh into a segment ([section 5.4](#54-adopt-on-upload)) |
+| adopt ok / deferred / fail | an adoption, from `store_blobs` or the sweep, commits a verified copy; finds every adopter slot busy or the copy lock taken and drops its bytes; or its write or read-back fails |
+| read damage | `Cache::fetch` finds the mirror copy the index names wrong, missing or short, and marks it ([section 5.3](#53-re-index-at-start)) |
+| store error | the object store fails a write, a serving read, a verification read or the listing |
+| re-index | the start-time verification of this digest, or the same routine run for one digest by a retry or the sweep |
+| scrub | later work ([section 12](#12-order-of-work)): a re-read of a held copy by the farm, with the outcomes of a read |
+| list removed | no live list names the digest any more (replaced, retired or expired) |
+| pin bump | a newer generation of a list names the digest, maybe with other URLs or another label |
+| restart | the server stops and starts |
+
+**Rules every row follows.**
+
+- R1. Every write of a copy and every indexing of an existing copy runs under the
+  digest's copy lock and looks again under it ([section 5.2](#52-the-mirror-store-and-its-location)).
+- R2. An entry has one state, set by the latest event; its copies, damaged ones
+  included, are listed beside it.
+- R3. Restart: in-memory state (attempts, backoffs, locks, spool files) is gone. The
+  lists, the drift notes and the copies are read back from the store
+  ([section 5.1](#51-fetch-lists), [section 5.6](#56-the-fetcher),
+  [section 5.3](#53-re-index-at-start)); every entry is `verifying` until its digest is
+  verified, and then the sweep acts on it. So the row "restart" is the same for every
+  state: `verifying`, then whatever the store and the sweep find.
+- R4. List removed: an entry that is held or `corrupt` stays, in grace, served and
+  healed like a listed one; any other entry leaves the report with its alerts, and a
+  writer running for it writes nothing ([section 5.6](#56-the-fetcher)).
+- R5. Pin bump: the entry takes the new URLs and label. If its URLs changed, any backoff
+  is reset and the sweep acts on it at once, and a `drift_seen` whose URL is gone
+  clears.
+- R6. The sweep acts on every live entry that is not `held`, except `denied`,
+  `refused{over_cap}` and one whose lock is taken; in order: adopt from the CAS,
+  re-verify older copies (`corrupt`, `unverified`), wake the fetcher (`fetch` host),
+  otherwise record why nothing can act. A backoff holds back only the step it paces: a
+  write backoff the adoption and the fetch, a fetch backoff the fetch, a read backoff
+  the re-verification ([section 5.4](#54-adopt-on-upload)).
+
+**Transitions.** "Who" is the part of the server that acts. An alert in the alert
+column is the [section 8](#8-report-alert-recover) row of that name.
+
+`verifying`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| re-index: a copy verifies | `held` | verifier | none | not needed |
+| re-index: every copy damaged | `corrupt` | verifier | `corrupt` | the sweep (R6) |
+| re-index: no copy in the store | per the sweep: `adopt_pending`, `fetching` or `waiting` | sweep | the "not held after T" row, if it lasts | the sweep (R6) |
+| store error on a copy's read | `unverified` | verifier | `unverified` after N | read retried with backoff; the sweep adopts or, after N, fetches |
+| store error on the listing | `verifying` | start | re-index failed | listing retried with backoff; no copy written meanwhile |
+| upload | `verifying`; the blob is in a segment, and no adoption starts for a digest still being checked | `store_blobs` | none | the sweep at the end of the digest's check adopts it, unless the check found a good copy |
+| fetch, adopt, read damage, scrub | do not occur: nothing is fetched or written for a digest before the listing and that digest's check end, and nothing unindexed is read | | | |
+| list removed, pin bump, restart | R4, R5, R3 | | | |
+
+`held`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| upload | `held` (not fresh: touched, not stored) | `store_blobs` | none | not needed |
+| adopt or fetch commit arriving late | `held` (it looks again under the lock and writes nothing) | writer | none; `mirror_adopt_skipped_total` | not needed |
+| read damage | `corrupt{copy}` | serving read | `corrupt` | the mark runs the sweep for the digest at once (R6) |
+| scrub finds damage | `corrupt{copy}` | scrub | `corrupt` | the same |
+| store error on a serving or scrub read | `held` (nothing is marked); that read fails | serving read, scrub | mirror-store read failed, after N in a row | the next read; nothing to heal |
+| list removed | `held`, in grace; at the end of grace, prunable | list API | none | not needed |
+| pin bump | `held`; `drift_seen` clears if its URL is gone (R5) | list API | `drift_seen` clears | not needed |
+| policy becomes `deny` (at a start) | `denied`; copies prunable | re-index | none | a person's decision ([section 7](#7-retention-and-caps)) |
+| fetch, re-index | a held entry is never fetched; re-index only at a restart (R3) | | | |
+
+`fetching`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| fetch ok | copy written (R1): `held`, or `store_write_failed` | fetcher | `store_write_failed` after N | retry from the spool with backoff |
+| fetch fail | `fetch_failed` | fetcher | "not held after T", host failing after T | retry with backoff |
+| fetch drift | `upstream_drift` | fetcher | `upstream_drift` | retry with backoff; adoption of an upload |
+| fetch refused | `refused{...}` | fetcher | `refused` | adoption of an upload; otherwise the URL fix (a person) |
+| upload | adoption runs (the lock is free until the fetch commits): `held`, and the fetch's commit then writes nothing | adopter | none | not needed |
+| adopt deferred or fail | `fetching` (the fetch goes on) | adopter | none | the fetch, then the sweep |
+| list removed | the fetch's commit writes nothing; the entry leaves (R4) | fetcher | its alerts clear | not needed |
+| pin bump | `fetching`; the next attempt uses the new URLs | list API | none | not needed |
+| restart | R3: the fetch and its spool file are gone; the sweep fetches again | sweep | as before | the sweep |
+| read damage, scrub, re-index | do not occur: not indexed | | | |
+
+`waiting` (host `adopt`, the CAS does not hold it)
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| upload | adoption: `held`; deferred: `adopt_pending`; fail: `store_write_failed` | adopter | per the next state | the sweep for the last two |
+| the blob reaches the CAS some other way | the sweep finds it `Present`: as upload | sweep | none | the sweep |
+| policy becomes `fetch` (at a start) | R3, then `fetching` | sweep | none | the fetcher |
+| no event | `waiting` | | "not held after T" (default-branch list), naming one client build or `--mirror-host <host>=fetch` | none: a person state. `FindMissingBlobs` answers "missing", so the build the alert names uploads it |
+| fetch, read damage, scrub | do not occur: an `adopt` host is never fetched, and nothing is indexed | | | |
+| list removed, pin bump, restart | R4, R5, R3 | | | |
+
+`adopt_pending` (the CAS holds it in a segment)
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| sweep: adopt ok | `held` | sweep | none | not needed |
+| sweep: adopt deferred | `adopt_pending` | sweep | `adopt_pending` after T | the next sweep |
+| sweep: adopt fail | `store_write_failed` | sweep | `store_write_failed` after N | the sweep after the backoff |
+| sweep: the CAS read fails (segment damaged or collected) | `fetching` under `fetch`, `waiting` under `adopt` | sweep | per the next state | per the next state |
+| upload | `adopt_pending` (not fresh: touched; `store_blobs` starts no adoption) | `store_blobs` | none | the sweep |
+| restart | R3: the CAS is empty after a start ([section 2.4](#24-today-a-restart-empties-the-cas)), so `fetching` or `waiting` | sweep | per the next state | per the next state |
+| fetch | does not occur: the sweep adopts before it fetches | | | |
+| read damage, scrub | do not occur: not indexed | | | |
+| list removed, pin bump | R4, R5 | | | |
+
+`fetch_failed` and `upstream_drift`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| backoff passes | `fetching` | fetcher, or the sweep that wakes it | none | |
+| fetch ok, fail, drift, refused | as from `fetching`; a match at the URL that drifted leaves no `drift_seen` from that URL | fetcher | per the next state | per the next state |
+| upload | adoption: `held` (with `drift_seen` from `upstream_drift`) | adopter | `drift_seen` stays until R5 or R4 clears it | not needed |
+| adopt deferred or fail | unchanged, or `store_write_failed` | adopter | per the next state | the next sweep adopts from the CAS (a fetch backoff does not hold back an adoption; a write backoff does, until it passes), so a present blob is never left to a client |
+| pin bump with other URLs | `fetching` at once (R5) | sweep | the old alert clears if the new URL matches | the fetcher |
+| list removed | leaves (R4) | list API | clears | not needed |
+| read damage, scrub, re-index | do not occur: not indexed; re-index only at a restart (R3) | | | |
+
+`store_write_failed{copy}`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| backoff passes, the fetch's spool file still hashes | write of the next copy (R1): `held` or `store_write_failed` | fetcher | after N, mirror-store write failure with the store steps | the next retry |
+| backoff passes, spool file gone or damaged | `fetching` | fetcher | none | the fetch |
+| backoff passes, from an adoption | the sweep: adopt from the CAS; if the CAS lost it, fetch or `waiting` | sweep | per the next state | the sweep |
+| upload | not fresh if the CAS holds it (the sweep acts); fresh otherwise, and adopted | adopter | none | the sweep |
+| read damage, scrub | do not occur: nothing was committed for this attempt, and a healing entry's damaged copy is no longer served | | | |
+| list removed | leaves, or, if it was healing a held entry, stays in grace and keeps healing (R4) | | | |
+| pin bump, restart | R5; R3 (the unconfirmed copy is verified at start like any copy and may be the one that becomes `held`) | | | |
+
+`unverified{error}`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| backoff passes | the read is retried (R1): `held`, `corrupt` or `unverified` | verifier | `unverified` after N | the next retry |
+| upload, or the blob already in the CAS | adoption of a newer copy: `held`; the unread copy is superseded | adopter, sweep | none | not needed |
+| N failed reads, host `fetch` | `fetching`: a newer copy supersedes the unread one | sweep | `unverified` | the fetcher |
+| list removed, pin bump, restart | R4, R5, R3 | | | |
+| fetch before N, read damage, scrub | do not occur: no fetch for a short store fault; not indexed | | | |
+
+`refused{host_not_allowed, address_filtered, not_https}` and `refused{over_cap}`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| upload, or the blob in the CAS (not `over_cap`) | adoption: `held`; adoption needs no fetch | adopter, sweep | clears | not needed |
+| pin bump with other URLs (not `over_cap`) | `fetching` at once (R5) | sweep | clears when it holds | the fetcher |
+| a cap flag or the lists change (`over_cap`) | caps evaluated again ([section 7](#7-retention-and-caps)); if it fits, the sweep takes it | list API, start | clears | the sweep |
+| `--mirror-host` changes (at a start) | R3, re-evaluated | start | clears | the sweep |
+| no event | unchanged | | `refused`, naming the URL or flag fix | none: a person state |
+| fetch | does not occur: the same URLs would be refused again | | | |
+| read damage, scrub | do not occur: not indexed | | | |
+| list removed, restart | R4, R3 | | | |
+
+`denied`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| policy changes (at a start) | R3, then as any entry | start, sweep | none | the sweep |
+| every other event | `denied`: nothing is fetched, adopted or indexed | | none (a decision, not a failure) | none: a person state |
+
+`corrupt{copy}`
+
+| Event | Next state | Who | Alert | Automatic recovery |
+|---|---|---|---|---|
+| sweep: the CAS holds the blob | adoption of the next copy: `held`, `adopt_pending` or `store_write_failed` | sweep | per the next state | the sweep, which takes `store_write_failed` after its backoff (gap 1 below) |
+| sweep: an older copy still verifies | `held` on that copy (R1) | sweep | clears | not needed |
+| sweep: host `fetch` | `fetching`, then as from `fetching` | fetcher | `corrupt`, then per the next state | the fetcher |
+| upload (`FindMissingBlobs` answers "missing" from the mark on, and the copy is `Absent` after a start) | fresh: stored in a segment and adopted, as the first sweep row | adopter | per the next state | the sweep |
+| no event, host `adopt`, no bytes on the farm | `corrupt` | | `corrupt`, naming one client build with a fresh daemon, or `--mirror-host <host>=fetch` | none: a person state, and the build uploads because the digest is reported missing |
+| read damage, scrub | do not occur: the damaged copy is no longer served | | | |
+| list removed | stays in grace and keeps healing (R4) | | | |
+| pin bump, restart | R5; R3 (re-index skips the damaged copy, so `corrupt` or `held` on an older one) | | | |
+
+**Paths back to `held`.**
+
+| State | Automatic path | Waits for a client upload? | If no automatic path: the person's fix and its alert |
+|---|---|---|---|
+| `verifying` | the re-index, then the sweep | no | |
+| `unverified` | the retried read; the sweep's adoption or, after N, fetch | no | |
+| `fetching` | the fetch | no | |
+| `waiting` | the sweep, if the blob reaches the CAS; under `fetch`, the fetcher | yes, and the digest is absent, so `FindMissingBlobs` does not suppress it | "not held after T": one client build, or `--mirror-host <host>=fetch` |
+| `adopt_pending` | the next sweep | no | |
+| `fetch_failed` | the fetcher's retry; the sweep's adoption of a present blob | no | |
+| `upstream_drift` | the fetcher's retry; the sweep's adoption of a present blob | no | `upstream_drift`: re-pin (the entry is still retried) |
+| `store_write_failed` | the retry from the spool; the sweep's adoption from the CAS | no | after N, the store steps (the retries go on) |
+| `refused` (not `over_cap`) | the sweep's adoption of a present blob | no | `refused`: another URL, or `--mirror-host` |
+| `refused{over_cap}` | the sweep once caps are evaluated again | no | the cap flag, or retire lists |
+| `denied` | none | | a policy change, if wanted |
+| `corrupt` | the sweep: the CAS's bytes, an older copy that verifies, or the fetcher | only under `adopt` with no bytes on the farm, and then the digest is reported missing | `corrupt`: one client build, or `--mirror-host <host>=fetch` |
+
+**Gaps this audit closed** (each is now in the prose):
+
+1. The sweep took only entries with no committed copy, so a `corrupt` entry whose damaged
+   copy was still named, healed into a segment and then failed its write, was never
+   taken again, and no client re-uploads a present blob. The sweep now takes every live
+   entry that is not `held` ([section 5.4](#54-adopt-on-upload)).
+2. A queue behind the adopter slots could hold bytes beyond the memory bound. Nothing
+   queues behind the slots now ([section 5.2](#52-the-mirror-store-and-its-location)).
+3. Lists were kept only in memory, so a restart lost every entry's adoption, fetch, sweep
+   and grace until the next submission. Lists are stored ([section 5.1](#51-fetch-lists)).
+4. After a restart the fetcher was woken only by a client's `FindMissingBlobs` miss,
+   which a daemon with a cached answer never sends. The sweep runs at the end of the
+   re-index ([section 5.3](#53-re-index-at-start)).
+5. `drift_seen` was to clear on "a later fetch of that URL", but a held entry is never
+   fetched, so the alert's own fix (re-pin to another URL) never cleared it; and it was
+   lost at a restart. It now clears when the URL leaves the lists, and drift notes are
+   stored ([section 5.6](#56-the-fetcher)).
+6. The re-index and a retried `unverified` read indexed copies without the copy lock, so
+   an older copy could be indexed over a newer one just adopted. They take the lock
+   ([section 5.2](#52-the-mirror-store-and-its-location)).
+7. A copy could be written before the re-index listing succeeded, with a copy number
+   chosen blind. No copy is written until it has ([section 5.3](#53-re-index-at-start)).
+8. CI's wait step waited for every entry, so a new pin on an `adopt` host, never fetched,
+   failed every change. It waits only for `fetch` entries ([section 6.1](#61-first-fetch-and-pin-bump)).
+9. A `corrupt` entry under `adopt` needed a client build even when an older copy in the
+   store still verified. The sweep re-verifies older copies ([section 5.4](#54-adopt-on-upload)).
+10. A store error on a serving read had no stated outcome; `Cache::fetch` marks nothing
+    for it, so the entry stays `held` and the failure is counted and alerted
+    ([section 5.3](#53-re-index-at-start)).
+11. A `refused` entry had no path back but a person's fix; a client's upload is now
+    adopted, as for any other entry ([section 5.4](#54-adopt-on-upload)).
+12. A fetch whose entry left every list, an entry in grace that is damaged, an
+    `adopt_pending` entry whose CAS copy is gone, an `over_cap` entry after the caps
+    change, and a host that becomes `deny` had no stated outcome. Each has one now
+    (R4; [section 5.6](#56-the-fetcher); [section 5.4](#54-adopt-on-upload);
+    [section 7](#7-retention-and-caps)).
+13. Section 6.4 said the scrub sees drift; the scrub reads the mirror store, not upstream.
