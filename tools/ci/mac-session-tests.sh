@@ -218,5 +218,35 @@ uid=$("$client" create "$socket" 1.5)
 "$client" kill "$socket" 1.5
 "$client" delete "$socket" 1.5
 
+step "issue #195: user-delete waits for a cron job that kill-uid could not have seen"
+# Staged, not left to chance: kill-uid in the last seconds of a minute, so that cron
+# starts the lease user's job (a 3 s sleep) once the next minute begins; then delete
+# while the job runs. A delete that refuses at its first look turns this red. Each
+# round takes up to a minute; KBF_MAC_SESSION_RACE_ROUNDS sets how many (default 2).
+rounds=${KBF_MAC_SESSION_RACE_ROUNDS:-2}
+for round in $(seq "$rounds"); do
+  lease=1.$((5 + round))
+  uid=$("$client" create "$socket" "$lease")
+  "$client" run "$socket" "$lease" "$lease_dir" /bin/sh -c 'echo "* * * * * /bin/sleep 3" | crontab -' >/dev/null
+  # Out of the last seconds of this minute, then into those of the next ([ ] counts
+  # in decimal, so "08" is eight).
+  while [ "$(date +%S)" -ge 55 ]; do sleep 0.2; done
+  while [ "$(date +%S)" -lt 57 ]; do sleep 0.2; done
+  "$client" kill "$socket" "$lease"
+  if pgrep -U "$uid"; then fail "round $round: kill-uid left a process of $uid"; fi
+  job=""
+  for _ in $(seq 150); do
+    job=$(pgrep -U "$uid" sleep || true)
+    [ -n "$job" ] && break
+    sleep 0.1
+  done
+  [ -n "$job" ] || fail "round $round: cron started no job as uid $uid; the race was not staged"
+  echo "round $round: cron started pid $job as uid $uid after kill-uid at $(date +%T)"
+  out=$("$client" delete "$socket" "$lease" 2>&1) || true
+  [ "$out" = existed ] || fail "round $round: delete while cron job $job ran: $out"
+  if pgrep -U "$uid"; then fail "round $round: a process of $uid outlived its user"; fi
+  if id "kbf-lease-1-$((5 + round))" 2>/dev/null; then fail "round $round: the user record survived"; fi
+done
+
 echo
 echo "kbf-mac-session: every check passed"
