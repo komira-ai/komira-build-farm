@@ -41,7 +41,7 @@ pub enum StoreKind {
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "kbf-server",
-    version,
+    version = crate::SERVER_VERSION,
     about = "The kbf farm server",
     args_conflicts_with_subcommands = true
 )]

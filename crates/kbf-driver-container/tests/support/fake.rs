@@ -223,23 +223,85 @@ impl Fake {
     }
 }
 
+/// Finds what still runs of one [`Fake`], also once the Fake is gone.
+pub struct Probe {
+    /// The fake's `podman` path, as each run of it has it in its argv.
+    program: PathBuf,
+    /// `FAKE_LEASE=<nonce>`: the prefix of what the fake's actions carry.
+    marker: String,
+}
+
+impl Probe {
+    pub fn of(fake: &Fake) -> Self {
+        Self {
+            program: fake.dir.join("podman"),
+            marker: format!("FAKE_LEASE={}", fake.nonce),
+        }
+    }
+
+    /// The pids of what still runs of the fake: a `podman` it was run as (any verb),
+    /// or an action it started (one whose environment carries the fake's nonce). A
+    /// zombie has neither left, so it does not count: it runs nothing.
+    pub fn processes(&self) -> Vec<u32> {
+        let program = self.program.as_os_str().as_encoded_bytes();
+        let marker = self.marker.as_bytes();
+        pids_where(|pid| {
+            let in_argv = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|argv| argv.split(|b| *b == 0).any(|a| a == program));
+            in_argv || has_env(pid, |e| e.starts_with(marker))
+        })
+    }
+}
+
+impl Fake {
+    /// Waits, at most ten seconds, until nothing of this fake runs ([`Probe::processes`]).
+    /// Until then something may still write into `state` or the scratch directory, and
+    /// removing them races it ("Directory not empty"). A lease the driver cleaned has
+    /// nothing left; a killed daemon's `podman start` has no parent waiting for it and
+    /// writes its status and events once the restarted runtime's sweep has ended its
+    /// action (issues #157, #194).
+    fn wait_until_nothing_runs(&self) {
+        let probe = Probe::of(self);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = probe.processes();
+            if left.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: pids {left:?} still run ten seconds after the test",
+                self.dir.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 /// The pids of this user's processes whose environment holds `entry` (`NAME=value`).
-/// A process that ends while it is read, or is not ours to read, is skipped; a `/proc`
-/// that cannot be listed fails the test rather than reading as "nothing runs".
 fn running_with_env(entry: &[u8]) -> Vec<u32> {
+    pids_where(|pid| has_env(pid, |e| e == entry))
+}
+
+fn has_env(pid: u32, test: impl Fn(&[u8]) -> bool) -> bool {
+    std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| env.split(|b| *b == 0).any(test))
+}
+
+/// The pids in `/proc` that pass `test`. A process that ends while it is read, or is
+/// not ours to read, fails any test that reads it, so it is skipped; a `/proc` that
+/// cannot be listed fails the test rather than reading as "nothing runs".
+fn pids_where(test: impl Fn(u32) -> bool) -> Vec<u32> {
     std::fs::read_dir("/proc")
         .expect("list /proc")
         .filter_map(|p| p.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/environ"))
-                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == entry))
-        })
+        .filter(|pid| test(*pid))
         .collect()
 }
 
 impl Drop for Fake {
     fn drop(&mut self) {
         if !std::thread::panicking() {
+            self.wait_until_nothing_runs();
             super::force_remove(&self.dir);
         }
     }

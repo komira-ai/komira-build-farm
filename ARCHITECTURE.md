@@ -17,6 +17,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (**planned**) |
 | [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
+| [macos-vm-guests.md](docs/design/macos-vm-guests.md) | a VM guest's first-boot setup, capture inside the guest, guest networking, image identity (recipe and content digests), the VM helper's uid and signing, the probes a real Mac must run (**planned**) |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
 | [mdm-backend.md](docs/design/mdm-backend.md) | MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
 
@@ -69,10 +70,13 @@ role (`--role=all`). The flags are:
 **`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
 outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and
 runs the leases the server starts. It never listens on a port. Execution goes through
-a `Runtime` trait; the container driver (crate `kbf-driver-container`) implements it
-with rootless Podman. The `kbf-daemon` binary itself offers only a fake runtime today,
-because the driver crate depends on the daemon crate and Cargo refuses the cycle a
-binary naming it would create; wiring the driver into a shipped binary is **planned**.
+a `Runtime` trait, and the binary's `--driver` flag picks the implementation:
+`container` runs each action in a fresh rootless Podman container (crate
+`kbf-driver-container`, Linux only), `native` runs it as plain processes, for Macs
+(crate `kbf-driver-native`), and `fake` runs nothing, for bring-up. The binary is built
+from crate `kbf-node`, not from the `kbf-daemon` library crate, because the drivers
+depend on that library and a binary in it that named them would be a cycle Cargo
+refuses.
 
 ## Crates
 
@@ -96,6 +100,8 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
+| `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
+| `kbf-node` | no | the `kbf-daemon` binary: flags, and the driver `--driver` names |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)) |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user and admits an administrator only with the MDM gate's signed grant ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
