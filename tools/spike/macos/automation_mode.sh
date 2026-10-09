@@ -21,6 +21,9 @@
 #   new_user       adds a throwaway standard user, reads the status as that user,
 #                  deletes the user and reads it again: the setting must hold.
 #
+# Every command runs under the watchdog (SPIKE_WATCHDOG seconds, default 60), with
+# stdin closed: a first hosted run hung for 15 minutes in the user arm.
+#
 # The raw status text is recorded with every reading, so an unrecognised wording is
 # visible in the log (and parses as unknown, which never triggers enable).
 
@@ -54,7 +57,7 @@ am_parse() {
 am_read() {
     local label=$1 out parsed
     shift
-    out=$(run_cap "$@" "$AMT")
+    out=$(run_cap watchdog "$WATCHDOG" "$@" "$AMT")
     parsed=$(am_parse "$out")
     kv "$label.raw" "$out"
     kv "$label.enabled" "${parsed% *}"
@@ -92,14 +95,15 @@ a_enable() {
 }
 
 a_new_user() {
-    local pw
+    local pw add
     # A throwaway password for a throwaway user that is deleted below.
-    # (`|| true`: tr ends on SIGPIPE when head has its 24 bytes.)
-    pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24 || true)
-    kv new_user.add "$(run_cap sudo -n sysadminctl -addUser "$PROBE_USER" -password "$pw")"
+    pw=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+    add=$(run_cap watchdog "$WATCHDOG" sudo -n sysadminctl -addUser "$PROBE_USER" -password "$pw")
+    kv new_user.add "$add"
+    case "$add" in *"[rc=124]") st_set user timeout ;; esac
     if id "$PROBE_USER" >/dev/null 2>&1; then kv new_user.exists yes; else kv new_user.exists no; fi
     am_read as_new_user sudo -n -u "$PROBE_USER"
-    kv new_user.delete "$(run_cap sudo -n sysadminctl -deleteUser "$PROBE_USER")"
+    kv new_user.delete "$(run_cap watchdog "$WATCHDOG" sudo -n sysadminctl -deleteUser "$PROBE_USER")"
     if id "$PROBE_USER" >/dev/null 2>&1; then kv new_user.gone no; else kv new_user.gone yes; fi
     am_read after_user_delete
 }
@@ -122,6 +126,8 @@ decide() {
         verdict FAIL "enable did not run (enable=${enable:-unset})"
     elif [ "$after_enable" != not_required ]; then
         verdict FAIL "after enable auth=$after_enable"
+    elif [ "$(st_get user)" = timeout ]; then
+        verdict FAIL "adding the user hung past the ${WATCHDOG}s watchdog"
     elif [ "$as_user" != not_required ] || [ "$after_delete" != not_required ]; then
         verdict FAIL "the setting did not hold across a new user (as user: $as_user, after delete: $after_delete)"
     else

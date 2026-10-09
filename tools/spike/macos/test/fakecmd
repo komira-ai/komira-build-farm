@@ -2,8 +2,8 @@
 # A fake of each macOS program the macOS probes run, for the Linux selftest (run.sh).
 # run.sh links it into $FAKE_BIN under each program's name. Its state is files under
 # $FAKE_STATE, which the tests set; every call is logged to $FAKE_STATE/log. Output
-# formats follow what the probes parse; the automationmodetool wording is a guess
-# until the hosted run records the real one (docs/spikes/macos-p0.md).
+# formats follow what the probes parse; the automationmodetool wording is the one
+# hosted macOS 26 and 15 runners printed (docs/spikes/macos-p0.md).
 
 set -u
 S=$FAKE_STATE
@@ -54,7 +54,7 @@ case "$NAME" in
                 fi
                 echo 'Automation Mode is disabled.'
                 if [ "$auth" = not_required ]; then
-                    echo 'This device does not require user authentication to enable Automation Mode.'
+                    echo 'This device DOES NOT REQUIRE user authentication to enable Automation Mode.'
                 else
                     echo 'This device requires user authentication to enable Automation Mode.'
                 fi
@@ -73,7 +73,10 @@ case "$NAME" in
     sysadminctl)
         [ "${FAKE_UID:-501}" = 0 ] || exit 1
         case "$1" in
-            -addUser) : >"$S/user_$2" ;;
+            -addUser)
+                has hang_adduser && sleep 30
+                : >"$S/user_$2"
+                ;;
             -deleteUser)
                 rm -f "$S/user_$2"
                 if has delete_resets; then echo required >"$S/auth"; fi

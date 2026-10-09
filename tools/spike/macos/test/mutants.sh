@@ -41,6 +41,8 @@ mutant 'the key lacks the macos- prefix (collides with the Linux arm64 keys)' li
     's/^SPIKE_ARCH=macos-/SPIKE_ARCH=/'
 mutant 'the watchdog reports a hang as success' lib.sh t_watchdog \
     's/        return 124/        return 0/'
+mutant 'the watchdog leaves CMD on the caller pipe, so an orphaned child holds it open' lib.sh t_am_adduser_hang \
+    's/    "$@" <\/dev\/null >"$out" 2>&1 &/    "$@" <\/dev\/null \&/'
 mutant 'the auth parser loses its "does not require" case' \
     automation_mode.sh t_am_already \
     's/\*"does not require user authentication"\*) a=not_required/*"requires user authentication"*) a=required/'
@@ -56,6 +58,8 @@ mutant 'the verdict treats a hung enable as success' automation_mode.sh t_am_han
     's/    if \[ "$rc" -eq 124 \]; then/    if false; then/'
 mutant 'the verdict ignores the setting after the user is deleted' automation_mode.sh t_am_user_drops \
     's/ || \[ "$after_delete" != not_required \]//'
+mutant 'sysadminctl runs without the watchdog' automation_mode.sh t_am_adduser_hang \
+    's/add=$(run_cap watchdog "$WATCHDOG" sudo -n sysadminctl/add=$(run_cap sudo -n sysadminctl/'
 mutant 'the simctl verdict ignores the deny control' simctl.sh t_simctl_deny_ignored \
     's/elif \[ "$(st_get deny_boot)" = 0 \]; then/elif false; then/'
 mutant 'the screenshot is not checked to be a PNG' simctl.sh t_simctl_bad_png \

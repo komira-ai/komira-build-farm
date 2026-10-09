@@ -197,6 +197,19 @@ t_am_user_drops() {
     verdict_is FAIL
 }
 
+# A sysadminctl that hangs is cut by the watchdog; the probe ends with a FAIL.
+t_am_adduser_hang() {
+    echo required >"$T/state/auth"
+    : >"$T/state/hang_adduser"
+    PROBE_ENV=SPIKE_WATCHDOG=1
+    local t0=$SECONDS
+    probe automation_mode
+    want 'automation_mode.new_user.add= [rc=124]'
+    want 'automation_mode.after_control.auth=required'
+    verdict_is FAIL
+    [ $((SECONDS - t0)) -lt 20 ] || failt "the probe took $((SECONDS - t0))s"
+}
+
 # ---------------------------------------------------------------- simctl
 
 t_simctl_pass() {
@@ -281,7 +294,7 @@ t_verdicts() {
 # ---------------------------------------------------------------- run
 
 for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop t_am_hang \
-    t_am_unknown t_am_user_drops t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
+    t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
     t_tcc_pass t_tcc_control_empty t_verdicts; do
     t "$test"
 done

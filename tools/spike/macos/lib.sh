@@ -66,13 +66,17 @@ arm() {
 
 # watchdog SECONDS CMD...: runs CMD with stdin from /dev/null; kills it after SECONDS.
 # Returns CMD's status, or 124 when the watchdog fired (a hang is a result, not a
-# retry). The dog's output goes nowhere, so `$(watchdog ...)` never waits on its sleep.
+# retry). CMD's stdout and stderr go to a file, printed (merged, on stdout) once CMD
+# has ended: a child that outlives a killed CMD would otherwise hold the pipe of a
+# `$(watchdog ...)` open, and the caller would wait on it after all. The dog's own
+# output goes nowhere for the same reason.
 watchdog() {
-    local secs=$1 pid dog rc=0 fired
+    local secs=$1 pid dog rc=0 fired out
     shift
     fired=$(mktemp "$SPIKE_STATE/watchdog.XXXXXX")
+    out=$fired.out
     rm -f "$fired"
-    "$@" </dev/null &
+    "$@" </dev/null >"$out" 2>&1 &
     pid=$!
     (
         sleep "$secs"
@@ -80,11 +84,13 @@ watchdog() {
         kill -TERM "$pid"
         sleep 2
         kill -KILL "$pid"
-    ) >/dev/null 2>&1 &
+    ) </dev/null >/dev/null 2>&1 &
     dog=$!
     wait "$pid" || rc=$?
     kill "$dog" 2>/dev/null || true
     wait "$dog" 2>/dev/null || true
+    cat "$out"
+    rm -f "$out"
     if [ -e "$fired" ]; then
         rm -f "$fired"
         return 124
