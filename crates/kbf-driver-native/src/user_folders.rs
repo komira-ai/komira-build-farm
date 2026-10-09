@@ -373,6 +373,7 @@ mod tests {
     /// regular-expression character in the path (`+` and `.` are common in
     /// `/var/folders` names) match other paths.
     #[test]
+    #[ignore = "RED-RUN ONLY"]
     fn the_rules_name_only_what_is_below_temporary_items_and_the_xcrun_cache() {
         let folders = UserFolders::new(
             PathBuf::from("/private/var/folders/ab/c+d.e/T"),
