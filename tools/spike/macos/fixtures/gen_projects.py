@@ -10,8 +10,9 @@ a committed file differs, so the two cannot drift.
     python3 gen_projects.py --check   # exit 1 if a committed file differs
 
 Object identifiers are derived from names (md5), so the output is the same on every run.
-Nothing is signed with an identity: macOS builds sign to run locally (ad-hoc, "-") and
-iOS builds target the simulator only.
+Nothing is signed with an identity: macOS builds sign to run locally (ad-hoc, "-").
+The iOS project lists both iOS platforms (SUPPORTED_PLATFORMS), but only a simulator
+build runs without a team; run.sh tests it on a simulator destination only.
 """
 
 import hashlib

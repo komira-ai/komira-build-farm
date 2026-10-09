@@ -6,7 +6,7 @@ instrument: a UI test that is known to work, so a probe that runs it in a new co
 not about the test.
 
 - `MacFixture.xcodeproj`: a macOS app and `MacFixtureUITests`.
-- `IOSFixture.xcodeproj`: an iOS app and `IOSFixtureUITests`, built for the simulator.
+- `IOSFixture.xcodeproj`: an iOS app and `IOSFixtureUITests`; `run.sh` builds and tests it on a simulator.
 
 Both projects compile the same sources:
 
@@ -19,7 +19,9 @@ Both projects compile the same sources:
 | `selftest/main.swift` | selftest | the checker against synthetic images |
 
 Nothing is signed with an identity. macOS builds are signed to run locally (ad-hoc,
-`CODE_SIGN_IDENTITY = "-"`, no team); the iOS fixture is built for the simulator only.
+`CODE_SIGN_IDENTITY = "-"`, no team). The iOS project lists both iOS platforms
+(`SUPPORTED_PLATFORMS = "iphonesimulator iphoneos"`), but only a simulator build runs
+without a team, and `run.sh` asks only for a simulator destination.
 
 ## The tests
 
@@ -56,7 +58,11 @@ bash run.sh macos OUT_DIR      # build, test in this login session
 `xcresulttool export attachments`, plus its `manifest.json`, which names the test and
 attachment each file came from. Inside the bundle itself the attachments are
 content-addressed files under `Data/`. It prints `SPIKE` lines (see `../../lib.sh`)
-and exits 0 only if xcodebuild succeeded and exactly the three tests passed.
+and exits 0 only if xcodebuild succeeded, exactly the three tests passed and the
+exported attachments hold the three screenshots (`window` and `screen` from
+`testScreenshotShowsPattern`, `window-no-pattern` from `testPatternLeftOutIsNotFound`),
+each a non-empty file. A test that passes without `keepAlways` has its screenshots
+deleted from the bundle, so that run fails.
 
 The workflow `.github/workflows/spike-xcuitest.yml` runs all of this on a hosted macOS
 runner and uploads the bundles. A hosted runner's privacy grants may be seeded, so
