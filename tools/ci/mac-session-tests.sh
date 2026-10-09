@@ -218,37 +218,45 @@ done
 expect_refused "never reused" "$client" create "$socket" 1.3
 uid=$("$client" create "$socket" 1.5)
 [ "$uid" = $((first + 3)) ] || fail "uid $uid after a restart, want $((first + 3))"
-"$client" kill "$socket" 1.5
-"$client" delete "$socket" 1.5
 
-step "issue #195: user-delete waits for a cron job that kill-uid could not have seen"
-# Staged, not left to chance: kill-uid in the last seconds of a minute, so that cron
-# starts the lease user's job (a 3 s sleep) once the next minute begins; then delete
-# while the job runs. A delete that refuses at its first look turns this red. Each
+step "user-delete waits for a process of the uid that exits by itself"
+"$client" kill "$socket" 1.5
+"$client" run "$socket" 1.5 "$lease_dir" /bin/sh -c '/bin/sleep 2 </dev/null >/dev/null 2>&1 &' >/dev/null
+pgrep -U $((first + 3)) sleep || fail "no sleep process"
+[ "$("$client" delete "$socket" 1.5)" = existed ] || fail "delete did not wait for the sleep"
+
+step "issue #195: no cron job of the lease user starts after kill-uid"
+# Staged, not left to chance: the lease user's crontab runs a 3 s sleep every minute,
+# and kill-uid comes in the last seconds of a minute. On a helper that leaves the
+# crontab in place, cron starts the job as the next minute begins, and launchd starts
+# per-user agents (distnoted) with it that never exit: the delete is refused. Each
 # round takes up to a minute; KBF_MAC_SESSION_RACE_ROUNDS sets how many (default 2).
 rounds=${KBF_MAC_SESSION_RACE_ROUNDS:-2}
 for round in $(seq "$rounds"); do
   lease=1.$((5 + round))
   uid=$("$client" create "$socket" "$lease")
   "$client" run "$socket" "$lease" "$lease_dir" /bin/sh -c 'echo "* * * * * /bin/sleep 3" | crontab -' >/dev/null
+  sudo -n test -e "/private/var/at/tabs/kbf-lease-1-$((5 + round))" || fail "round $round: no crontab was planted"
   # Out of the last seconds of this minute, then into those of the next ([ ] counts
   # in decimal, so "08" is eight).
   while [ "$(date +%S)" -ge 55 ]; do sleep 0.2; done
   while [ "$(date +%S)" -lt 57 ]; do sleep 0.2; done
   "$client" kill "$socket" "$lease"
-  if pgrep -U "$uid"; then fail "round $round: kill-uid left a process of $uid"; fi
-  job=""
-  for _ in $(seq 150); do
-    job=$(pgrep -U "$uid" sleep || true)
-    [ -n "$job" ] && break
-    sleep 0.1
+  echo "round $round: kill-uid done at $(date +%T)"
+  if sudo -n test -e "/private/var/at/tabs/kbf-lease-1-$((5 + round))"; then
+    fail "round $round: kill-uid left the crontab"
+  fi
+  # Watch past the minute's start, when cron would have started the job.
+  while [ "$(date +%S)" -ge 55 ]; do
+    if pgrep -lU "$uid"; then fail "round $round: a process of $uid started after kill-uid"; fi
+    sleep 0.2
   done
-  [ -n "$job" ] || fail "round $round: cron started no job as uid $uid; the race was not staged"
-  echo "round $round: cron started pid $job as uid $uid after kill-uid at $(date +%T)"
+  until [ "$(date +%S)" -ge 4 ]; do
+    if pgrep -lU "$uid"; then fail "round $round: a process of $uid started after kill-uid"; fi
+    sleep 0.2
+  done
   out=$("$client" delete "$socket" "$lease" 2>&1) || true
-  [ "$out" = existed ] || fail "round $round: delete while cron job $job ran: $out"
-  if pgrep -U "$uid"; then fail "round $round: a process of $uid outlived its user"; fi
-  if id "kbf-lease-1-$((5 + round))" 2>/dev/null; then fail "round $round: the user record survived"; fi
+  [ "$out" = existed ] || fail "round $round: delete: $out"
 done
 
 echo

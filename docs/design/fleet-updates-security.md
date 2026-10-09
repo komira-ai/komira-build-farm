@@ -249,7 +249,11 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 > - `kill-uid` takes the lease, not a uid: the uid comes from the ledger, so the daemon
 >   cannot name another lease's uid, and a deleted lease (whose uid may be reused) is
 >   refused. The kill is `kill(-1, SIGKILL)` from a child that took the uid, repeated
->   until `libproc` lists no live process of it by real or effective uid.
+>   until `libproc` lists no live process of it by real or effective uid. Then
+>   `kill-uid` removes the user's crontab and `at` jobs and kills again, so no job of
+>   the user starts after it returns: such a job would start a process of the uid,
+>   and launchd per-user agents (`distnoted`) with it that do not exit, and
+>   `user-delete` would refuse.
 > - The grant is the gate's own, one format on both sides (`kbf-mdm`'s `grant`
 >   module defines it; S5.2 states it): the five-line text `kbf-grant-v1`, `serial`,
 >   `lease`, `issued`, `not-after` (UTC `YYYY-MM-DDTHH:MM:SSZ`, `not-after` exactly
@@ -265,15 +269,15 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   could write them could make administrators or replay a grant.
 > - The sweep covers the home folder, the crontab, `at` jobs, launchd's per-uid
 >   `disabled` and `loginitems` files, the shared user folder and the temporary
->   folders. The crontab and `at` jobs go first, and `user-delete` looks for live
->   processes of the uid three times: before anything is removed, once those are gone
->   (a job that fired after `kill-uid` is found there), and after the whole sweep,
->   just before the record is deleted. Each look lists the uid's processes up to 50
->   times, 100 ms apart, so a cron job that started between `kill-uid` and the delete
->   and ends by itself is waited for; a process still alive then refuses the delete,
->   and the refusal names its pid and command. A process whose state cannot be read
->   counts as live. Background Task Management entries live
->   in one system-wide database; no per-uid removal is built, so they stay **[A]**, for
+>   folders. The crontab and `at` jobs go first (`kill-uid` removed them already,
+>   unless something added them since), and `user-delete` looks for live processes of
+>   the uid three times: before anything is removed, once those are gone (a job that
+>   fired after `kill-uid` is found there), and after the whole sweep, just before
+>   the record is deleted. Each look lists the uid's processes up to 50 times, 100 ms
+>   apart, so a process that ends by itself is waited for; one still alive then
+>   refuses the delete, and the refusal names its pid and command. A process whose
+>   state cannot be read counts as live. Background Task Management entries live in
+>   one system-wide database; no per-uid removal is built, so they stay **[A]**, for
 >   the leak scan (P4).
 > - **Pending print jobs are not swept.** CUPS keeps a job's files in
 >   `/private/var/spool/cups` owned by root, not by the user, so a sweep by owner

@@ -225,6 +225,9 @@ fn kill_uid_boots_out_then_kills_until_none_is_left() {
             "pause".to_owned(),
             format!("kill_all {uid}"),
             format!("live_processes {uid}"),
+            // The second kill, after the crontab and `at` jobs are swept.
+            format!("kill_all {uid}"),
+            format!("live_processes {uid}"),
         ]
     );
 
@@ -666,4 +669,44 @@ fn user_delete_gives_up_naming_what_is_left() {
         "{error}"
     );
     assert!(!error.contains("proc8"), "{error}");
+}
+
+/// Catches the cause of issue #195: a crontab (or `at` job) left in place by
+/// `kill-uid`, whose job then starts a process of the uid that `user-delete` refuses,
+/// and a job that fired before the sweep left alive (no second kill). A schedule
+/// that cannot be removed is reported, after the processes are killed all the same.
+#[test]
+fn kill_uid_removes_the_schedules_between_two_kills() {
+    let rig = rig("kill-schedules", 2);
+    rig.helper.user_create("14.1", None).unwrap();
+    let tabs = rig.dir.join("tabs");
+    let tab = tabs.join("kbf-lease-14-1");
+    std::fs::create_dir_all(&tabs).unwrap();
+    std::fs::write(&tab, "* * * * * job").unwrap();
+    log(&rig);
+    // Nothing left after the first kill; a job fires before the sweep, so the
+    // second kill finds one and kills it.
+    rig.host.state().live_script.extend([0, 1]);
+    assert_eq!(rig.helper.kill_uid("14.1"), Ok(()));
+    assert!(!tab.exists(), "kill-uid left the crontab");
+    let kills = log(&rig)
+        .iter()
+        .filter(|c| c.starts_with("kill_all"))
+        .count();
+    assert_eq!(kills, 3, "one round, then two after the sweep");
+
+    if me() != 0 {
+        std::fs::write(&tab, "* * * * * job").unwrap();
+        std::fs::set_permissions(&tabs, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let error = rig.helper.kill_uid("14.1").unwrap_err();
+        std::fs::set_permissions(&tabs, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert!(error.contains("incomplete"), "{error}");
+        let kills = log(&rig)
+            .iter()
+            .filter(|c| c.starts_with("kill_all"))
+            .count();
+        assert_eq!(kills, 2, "killed before and after the failed sweep");
+    }
 }

@@ -10,6 +10,8 @@
 //!   and a grant is single-use) and makes an administrator only with a valid grant.
 //! - `run`, `kill-uid` and `user-delete` act only on a lease the ledger holds; `run`
 //!   and `kill-uid` refuse a deleted one (its uid may belong to a newer lease).
+//! - `kill-uid` kills, removes the user's crontab and `at` jobs, and kills again, so
+//!   no scheduled job of the user starts after it returns.
 //! - `user-delete` refuses while any process of the uid remains, first removes what
 //!   can start one (crontab, `at` jobs), then looks again, sweeps the rest, looks a
 //!   last time, deletes the record, and records the deletion last: a crash part-way
@@ -328,11 +330,15 @@ impl Helper {
     }
 
     /// `kill-uid <lease>`: boots out the uid's GUI and user launchd domains (so
-    /// launchd restarts none of its jobs), then kills every process of the uid until
-    /// none is left.
+    /// launchd restarts none of its jobs), kills every process of the uid until none
+    /// is left, removes the user's crontab and `at` jobs (so no job of the user starts
+    /// after kill-uid returns: one would start a process `user-delete` refuses, and
+    /// launchd per-user agents such as `distnoted` with it), then kills again, for a
+    /// job that fired before they went.
     ///
     /// # Errors
-    /// Why it was refused, or processes that survived [`KILL_ROUNDS`] rounds.
+    /// Why it was refused, processes that survived [`KILL_ROUNDS`] rounds, or a
+    /// crontab or `at` job that could not be removed (after the second kill).
     pub fn kill_uid(&self, lease: &str) -> Result<(), String> {
         let lease = parse_lease(lease)?;
         let ledger = self.lock();
@@ -342,6 +348,17 @@ impl Helper {
                 tracing::debug!(lease = %lease, "launchctl bootout {domain}: {why}");
             }
         }
+        self.kill_rounds(uid)?;
+        // Swept only once nothing of the user runs (the sweep's contract).
+        let schedules = Self::sweep_all(&self.settings.schedules, &user_name(lease), uid);
+        self.kill_rounds(uid)?;
+        let removed = schedules?;
+        tracing::info!(lease = %lease, uid, removed, "no process of the lease user is left");
+        Ok(())
+    }
+
+    /// Kills every process of `uid` until none is left, for at most [`KILL_ROUNDS`].
+    fn kill_rounds(&self, uid: u32) -> Result<(), String> {
         let mut left = Vec::new();
         for _ in 0..KILL_ROUNDS {
             self.host
@@ -349,7 +366,6 @@ impl Helper {
                 .map_err(|why| format!("killing the processes of uid {uid}: {why}"))?;
             left = self.live(uid)?;
             if left.is_empty() {
-                tracing::info!(lease = %lease, uid, "no process of the lease user is left");
                 return Ok(());
             }
             self.host.pause();
