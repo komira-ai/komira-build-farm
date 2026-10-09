@@ -23,6 +23,16 @@ use support::{
 /// The actions' `PATH`.
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
+/// Held to read by each test here that runs a developer tool (`swiftc`, `swift build`,
+/// `xcodebuild`), and to write by [`the_compiler_shims_print_nothing_on_stderr`], which
+/// times the compiler shims. Every `xcrun` call rewrites the user's whole `xcrun_db`
+/// (it writes `xcrun_db-<random>` and renames it over), so `xcrun` calls running at the
+/// same moment drop each other's entries. On the macOS runner, with `swift build`
+/// running beside it, `xcrun_db` was replaced 18 times and shrank 4 times during the
+/// timed run, and each of its `cc` calls missed the cache: 6.2 s for five, against
+/// 0.2 s alone (PR #172).
+static DEVELOPER_TOOLS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 /// Runs `spec` as lease `1.seq` with up to ten minutes: a cold `xcodebuild` is slow.
 async fn run_long(
     rt: &NativeRuntime<MemoryCas>,
@@ -64,6 +74,7 @@ do {
 /// that saves a file safely fails under the driver.
 #[tokio::test]
 async fn a_foundation_atomic_save_works() {
+    let _tools = DEVELOPER_TOOLS.read().await;
     let dir = scratch("atomic");
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config(&dir), &cas);
@@ -103,6 +114,7 @@ const LAYOUT: &str = "mkdir -p Sources/hello && mv main.swift Sources/hello/ && 
 /// files atomically, through the user's temporary folder.
 #[tokio::test]
 async fn swift_build_builds_a_package() {
+    let _tools = DEVELOPER_TOOLS.read().await;
     let dir = scratch("swiftpm");
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config(&dir), &cas);
@@ -191,6 +203,7 @@ const PBXPROJ: &str = r#"// !$*UTF8*$!
 /// temporary folder, and exits 74 when that fails (issue #163).
 #[tokio::test]
 async fn xcodebuild_builds_a_target() {
+    let _tools = DEVELOPER_TOOLS.read().await;
     let Some((build, developer_dir)) = newest_xcode() else {
         eprintln!("no Xcode on this runner: nothing to check");
         return;
@@ -271,8 +284,12 @@ fn shim_times(out: &str) -> (String, f64, f64) {
 /// at most twice as long as the same action's unsandboxed `cc`, run after it, plus a
 /// quarter second; with the node's own Xcode, also at most twice `clang` called
 /// directly plus a quarter second.
+/// It runs with no other developer tool running in this binary ([`DEVELOPER_TOOLS`]):
+/// with them, `xcrun`'s own cache is lost to their rewrites whatever the sandbox does.
 #[tokio::test]
 async fn the_compiler_shims_print_nothing_on_stderr() {
+    // Alone: no other test's `xcrun` calls drop this one's cache entries meanwhile.
+    let _tools = DEVELOPER_TOOLS.write().await;
     let dir = scratch("shims");
     let mut config: NativeConfig = config(&dir);
     let all = xcodes();
