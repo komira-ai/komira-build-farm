@@ -27,7 +27,7 @@ def _pause_impl(ctx):
         cmd_args(
             "/bin/sh",
             "-c",
-            'sleep "$2" && printf "%s\\n" "$3" > "$1"',
+            'sleep 0 && printf "%s\\n" "$3" > "$1"',
             "pause",
             out.as_output(),
             ctx.attrs.secs,
