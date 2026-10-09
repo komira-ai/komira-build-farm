@@ -9,6 +9,7 @@
 # made it. Exits 0 only if xcodebuild exited 0 and exactly the three expected tests
 # passed, so a run that tested nothing is a failure.
 . "$(dirname "$0")/../../lib.sh"
+# shellcheck disable=SC2034 # read by kv in lib.sh
 SPIKE_ARCH="macos-$(uname -m)"
 
 here=$(cd "$(dirname "$0")" && pwd)

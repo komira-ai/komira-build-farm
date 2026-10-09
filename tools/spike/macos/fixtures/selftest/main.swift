@@ -68,6 +68,15 @@ let grey: (UInt8, UInt8, UInt8) = (236, 236, 236)
 let cases: [(String, CGImage, Bool)] = [
     ("pattern on a light window", image(background: grey, quadrants(x: 200, y: 120, side: 320)), true),
     ("small pattern on a dark window", image(background: (30, 30, 30), quadrants(x: 20, y: 600, side: 40)), true),
+    // A screen: the pattern in a window, plus pattern colours elsewhere (icons, a
+    // wallpaper strip, a bigger red block). The hosted macOS screen screenshot looked
+    // like this, and a checker reading each colour's pixels as one block missed it.
+    ("pattern among other pattern-coloured pixels", image(background: grey, quadrants(x: 200, y: 120, side: 320) + [
+        (CGRect(x: 10, y: 10, width: 6, height: 6), (255, 0, 0)),
+        (CGRect(x: 560, y: 760, width: 30, height: 30), (255, 255, 0)),
+        (CGRect(x: 0, y: 780, width: 600, height: 4), (0, 0, 255)),
+        (CGRect(x: 20, y: 500, width: 170, height: 170), (255, 0, 0)),
+    ]), true),
     ("all black", image(background: (0, 0, 0), []), false),
     ("wallpaper only", wallpaper(), false),
     ("quadrants in the wrong order", image(background: grey, quadrants(x: 200, y: 120, side: 320, order: [3, 1, 2, 0])), false),
