@@ -156,7 +156,7 @@ fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
     let watched = Arc::clone(&runtime);
     let (probe, every) = xcode_watch_args(cli);
     let (driver, _) = xcode_watch::watch(
-        cli.xcode_apps.clone(),
+        PathBuf::from("/nonexistent"),
         probe,
         every,
         Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
