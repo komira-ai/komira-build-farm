@@ -187,9 +187,9 @@ impl Args {
             _ => None,
         };
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
-            (Some(cert), Some(key)) => Some(
-                ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)),
-            ),
+            (Some(cert), Some(key)) => {
+                Some(ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)))
+            }
             _ => None,
         };
         Ok(Listeners {

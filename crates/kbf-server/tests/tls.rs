@@ -300,7 +300,10 @@ async fn a_reapi_key_that_does_not_match_its_certificate_is_refused() {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             });
-        assert!(bound.is_err(), "--reapi-tls-cert {cert} --reapi-tls-key {key} accepted");
+        assert!(
+            bound.is_err(),
+            "--reapi-tls-cert {cert} --reapi-tls-key {key} accepted"
+        );
     }
 }
 
