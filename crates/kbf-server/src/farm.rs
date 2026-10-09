@@ -13,6 +13,11 @@
 //! ([`process_term`]), which it also names as its lease epoch in `Welcome` (issue
 //! #137). Operations die with it too, so the term is part of every operation name
 //! (issue #154).
+//!
+//! **Placement in the log** (issue #166): each grant at debug level, and each lease
+//! the scheduler gives up at info, with the operation, the lease, the node and why.
+//! An accepted result carries the node that ran it and when it was queued
+//! ([`crate::stamp`]).
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -30,7 +35,7 @@ use kbf_proto::worker::{
     self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
     Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -39,6 +44,7 @@ use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView};
+use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -133,6 +139,8 @@ struct Waiter {
     kind: String,
     do_not_cache: bool,
     stage: watch::Sender<Stage>,
+    /// When it was submitted, on the wall clock.
+    queued: SystemTime,
 }
 
 /// A worker's newest stream.
@@ -146,6 +154,16 @@ struct Link {
     /// `Start` names it, and the daemon acts on the `Start` only within
     /// [`START_VALIDITY`] of having sent that heartbeat (or, for 0, its `Hello`).
     newest_beat: u64,
+}
+
+/// A lease whose `Start` was sent.
+#[derive(Clone, Copy, Debug)]
+struct Sent {
+    operation: OperationId,
+    /// The action the `Start` named.
+    action: Digest,
+    /// When the operation was queued and the `Start` sent.
+    stamp: Stamp,
 }
 
 /// An OK result and its action-cache record, from the report to the answer.
@@ -173,9 +191,8 @@ struct State {
     /// [`operation_name`] of the term and its id, so a name is looked up by parsing it.
     waiters: BTreeMap<WaiterId, Waiter>,
     links: BTreeMap<WorkerId, Link>,
-    /// Leases whose `Start` was sent, with their operations and the action each
-    /// `Start` named.
-    started: BTreeMap<LeaseId, (OperationId, Digest)>,
+    /// Leases whose `Start` was sent.
+    started: BTreeMap<LeaseId, Sent>,
     /// Each node's newest `NodeStatus`, kept across its streams.
     software: BTreeMap<WorkerId, SoftwareView>,
     /// Nodes whose drain has paused, once logged.
@@ -203,7 +220,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             epoch: Instant::now(),
             epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
-                sched: Scheduler::new(term).with_unservable_wait(unservable_wait),
+                sched: Scheduler::new(term)
+                    .with_unservable_wait(unservable_wait)
+                    .recording_requeues(),
                 next_waiter: 0,
                 next_stream: 0,
                 waiters: BTreeMap::new(),
@@ -433,8 +452,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// current lease, which this process granted, and the `Result` names no action but
     /// the one that lease runs; an accepted OK result is written to the action cache
     /// (unless the action is `do_not_cache` or exited non-zero) before its callers are
-    /// answered. Returns the acknowledgement, or `None` for a `Result` without a lease
-    /// id.
+    /// answered. Before it is checked, its `ActionResult` gets the node id and the
+    /// server's times ([`Stamp::apply`]), so callers and the cache see them. Returns
+    /// the acknowledgement, or `None` for a `Result` without a lease id.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
         let wire_lease = result.lease_id?;
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);
@@ -443,7 +463,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             accepted: false,
         };
         let holding = self.lock().holder(lease, worker);
-        let Some((operation, action)) = holding else {
+        let Some((operation, action, stamp)) = holding else {
             tracing::warn!(%worker, %lease, "result refused: not the holder of the current lease");
             return Some(refused);
         };
@@ -456,7 +476,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             tracing::warn!(%worker, %lease, %action, "result refused: it names another action");
             return Some(refused);
         }
-        let (outcome, mut detail) = self.outcome(lease, result).await;
+        let ran_on = (worker, stamp);
+        let (outcome, mut detail) = self.outcome(lease, ran_on, result).await;
 
         let now = self.now();
         let (answers, accepted) = {
@@ -492,25 +513,35 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// The scheduler's outcome for a `Result`, with the cache record of an OK one or
     /// the reason for an INVALID_ARGUMENT one. An OK result whose outputs are not all
     /// stored is an infrastructure failure: accepting it would answer callers with files
-    /// nobody can fetch.
-    async fn outcome(&self, lease: LeaseId, result: worker::Result) -> (Outcome, Option<Detail>) {
+    /// nobody can fetch. An OK result gets the node it `ran_on` and the server's times
+    /// ([`Stamp::apply`]) before it is checked and its cache record made.
+    async fn outcome(
+        &self,
+        lease: LeaseId,
+        ran_on: (&WorkerId, Stamp),
+        result: worker::Result,
+    ) -> (Outcome, Option<Detail>) {
         let code = result.status.as_ref().map_or(Code::Ok as i32, |s| s.code);
         match (Code::from_i32(code), result.action_result) {
-            (Code::Ok, Some(result)) => match self.cache.prepare_action_result(&result).await {
-                Ok(record) => {
-                    let outcome = Outcome::Completed {
-                        action_result: record.result,
-                    };
-                    (
-                        outcome,
-                        Some(Detail::Ran(Box::new(Pending { result, record }))),
-                    )
+            (Code::Ok, Some(mut result)) => {
+                let (node, stamp) = ran_on;
+                stamp.apply(&mut result, node, SystemTime::now());
+                match self.cache.prepare_action_result(&result).await {
+                    Ok(record) => {
+                        let outcome = Outcome::Completed {
+                            action_result: record.result,
+                        };
+                        (
+                            outcome,
+                            Some(Detail::Ran(Box::new(Pending { result, record }))),
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(%lease, error = %e, "an OK result whose outputs are not stored");
+                        (Outcome::Failed(Failure::Infra), None)
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(%lease, error = %e, "an OK result whose outputs are not stored");
-                    (Outcome::Failed(Failure::Infra), None)
-                }
-            },
+            }
             (Code::DeadlineExceeded, _) => (Outcome::Failed(Failure::Timeout), None),
             (Code::InvalidArgument, _) => {
                 let why = result.status.map(|s| s.message).unwrap_or_default();
@@ -559,6 +590,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
                 kind: submission.kind,
                 do_not_cache: submission.request.do_not_cache,
                 stage,
+                queued: SystemTime::now(),
             },
         );
         state.feed_quiet(
@@ -569,10 +601,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             },
         );
         // A caller that joined a twin already started sees it executing.
-        let joined_started = state.started.values().any(|(op, _)| {
+        let joined_started = state.started.values().any(|sent| {
             state
                 .sched
-                .waiters(*op)
+                .waiters(sent.operation)
                 .is_some_and(|w| w.contains(&waiter))
         });
         if let Some(w) = state.waiters.get(&waiter).filter(|_| joined_started) {
@@ -602,11 +634,13 @@ impl State {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
     }
 
-    /// The operation whose current lease is `lease`, and the action its `Start` named,
-    /// if `worker` holds it. Only this process's leases are in `started`, so a lease
-    /// of an earlier process (another term) is never one.
-    fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<(OperationId, Digest)> {
-        let (operation, action) = *self.started.get(&lease)?;
+    /// The operation whose current lease is `lease`, the action its `Start` named,
+    /// and the server's times for the run, if `worker` holds it. Only this process's
+    /// leases are in `started`, so a lease of an earlier process (another term) is
+    /// never one.
+    fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<(OperationId, Digest, Stamp)> {
+        let sent = *self.started.get(&lease)?;
+        let operation = sent.operation;
         let current = match self.sched.state(operation)? {
             OpState::Leased {
                 lease: held,
@@ -619,7 +653,7 @@ impl State {
             } => *held == lease && holder == worker,
             _ => false,
         };
-        current.then_some((operation, action))
+        current.then_some((operation, sent.action, sent.stamp))
     }
 
     /// Feeds an input that cannot lead to an answer: only a `Report` proposes a result,
@@ -655,7 +689,23 @@ impl State {
                 Effect::Refuse(refusal) => self.refuse(&refusal),
             }
         }
+        for Requeue {
+            operation,
+            lease,
+            worker: node,
+            reason,
+        } in self.sched.take_requeues()
+        {
+            let operation = self.operation_name(operation);
+            // One line: the coverage of a logged field counts only where it is logged.
+            tracing::info!(%operation, %lease, %node, %reason, "lease given up; requeued");
+        }
         answers
+    }
+
+    /// The REAPI name of `operation`, its first waiter's, as the log names it.
+    fn operation_name(&self, operation: OperationId) -> &str {
+        self.first_waiter(operation).map_or("", |w| w.name.as_str())
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -686,6 +736,12 @@ impl State {
 
     /// Tells the worker a lease is placed on it, before the grant commits.
     fn offer(&self, grant: &LeaseGrant) {
+        let (operation, lease, node) = (
+            self.operation_name(grant.operation),
+            grant.lease,
+            &grant.worker,
+        );
+        tracing::debug!(%operation, %lease, %node, "lease granted");
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
@@ -715,8 +771,18 @@ impl State {
         for w in waiters.iter().filter_map(|id| self.waiters.get(id)) {
             w.stage.send_replace(Stage::Executing);
         }
-        self.started
-            .insert(start.lease, (start.operation, start.key.action));
+        let now = SystemTime::now();
+        // An operation with a `Start` has its first waiter (see `send_for`).
+        let queued = self.first_waiter(start.operation).map_or(now, |w| w.queued);
+        let sent = Sent {
+            operation: start.operation,
+            action: start.key.action,
+            stamp: Stamp {
+                queued,
+                started: now,
+            },
+        };
+        self.started.insert(start.lease, sent);
     }
 
     /// Tells an operation's callers why it waits, or that it no longer waits for a
@@ -749,7 +815,7 @@ impl State {
 
     /// Forgets every lease of a finished `operation` whose `Start` was sent.
     fn forget_leases(&mut self, operation: OperationId) {
-        self.started.retain(|_, (op, _)| *op != operation);
+        self.started.retain(|_, sent| sent.operation != operation);
     }
 
     /// Forgets an operation the scheduler refused and answers its callers

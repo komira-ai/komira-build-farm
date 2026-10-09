@@ -1435,6 +1435,7 @@ dependencies = [
  "kbf-types",
  "libc",
  "prost",
+ "prost-types",
  "rcgen",
  "rustix",
  "serde",
