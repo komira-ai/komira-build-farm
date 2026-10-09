@@ -16,7 +16,7 @@ Four questions this draft had left open were decided on 2026-10-09. They are rec
 as **decided**; every other decision in sections 6 and 11 is still an option with a
 lean. A decision covers only what it says below. The mechanisms this draft proposes
 to carry one out (which status code, what an action key is made of, the floor's decay
-numbers, the over-cap memo, node suspicion) are not decided: sections 6.1 to 6.3 list
+numbers, the over-cap memo, node suspicion, the memory ladder's step and cap) are not decided: sections 6.1 to 6.3 list
 them as **open within the decision**, each with its options, pros and cons, and a lean.
 
 1. **Out of memory is the farm's until no node is large enough** (6.1). Going over
@@ -408,8 +408,8 @@ more memory than the action used before, so the farm reruns it with a higher mem
 ask, bounded, and remembers the raised ask per action key so later runs start there; it
 is the action's, and the user is told it needs more memory than any node has, only when
 the largest node is not enough. The rest of this section is how this draft proposes to
-carry that out; the parts the decision does not settle are marked **open** (O1 to O5)
-with their options and a lean. The draft's "booking decides"
+carry that out; the parts the decision does not settle are marked **open** (O1 to O5,
+and O7 for the ladder's step, cap and bound) with their options and a lean. The draft's "booking decides"
 attribution is dropped: whether the run was over or under its booking, and who set the
 booking (the client's `kbf-book-mem-gib`, the default, a learned size), no longer
 change the class.
@@ -423,8 +423,12 @@ record of it) stays Ambiguous (1.1). The container driver sets no per-lease
 node's `actions/` limit or the kernel; a larger booking still helps, because placement
 then keeps that much more room free on the node.
 
-**The ladder.** The server reruns the operation with its memory booking doubled, in
-whole GiB, up to the **cap**: the largest memory of any node, live or cordoned at the
+**The ladder.** Decided: each out-of-memory rerun books more memory than the run before
+it, the raise is bounded, it stops at the largest node (the **cap**), and only a kill
+at the cap reaches the user. Open (O7): how much each rung adds, which nodes set the
+cap, and how the ladder counts against the 6.5 budget. The rest of this paragraph is
+the lean of O7. The server reruns the operation with its memory booking doubled, in
+whole GiB, up to the cap: the largest memory of any node, live or cordoned at the
 time of the kill, whose capabilities fit the action's platform. A doubling that would
 pass the cap books the cap; the run at the cap is the last rung.
 
@@ -489,8 +493,7 @@ help the next commit.
 - **C. `RequestMetadata` only.** Pro: simplest to explain. Con: a request without it has
   no key, so no floor.
 
-**Lean: B**, falling back to A when the metadata is absent. Settled by reading what the
-pinned buck2 and Bazel send.
+**Lean: B.** Settled by reading what the pinned buck2 and Bazel send.
 
 **O3, open: floor decay and reset.** A floor that never falls keeps over-booking after
 the code shrinks again.
@@ -535,6 +538,40 @@ booked means the node ran out, not the action.
   stays hidden.
 
 **Lean: A** where the peak is measured, B elsewhere.
+
+**O7, open: the ladder's step, cap and bound.** The decision fixes that the ask is
+raised, bounded, and stops at the largest node; not by how much each rung raises it,
+which nodes set the cap, or how the ladder counts.
+
+- **Step.**
+  - **A. Double, in whole GiB.** Pro: at most ceil(log2(c / b)) reruns; the whole
+    ladder books less than two runs at the cap. Con: a rung can book up to twice what
+    the action needs, and the floor keeps that until it decays (O3).
+  - **B. Add a fixed amount** (for example the first booking) per rung. Pro: the floor
+    lands close to the need. Con: linear in the gap: 511 reruns from 1 GiB to a
+    512 GiB node.
+  - **C. Go straight to the cap** after the first kill. Pro: one rerun. Con: every
+    memory kill books the largest node, and its floor keeps booking it, which crowds
+    placement on the largest nodes.
+- **Cap.**
+  - **A. The largest node, live or cordoned at the kill, whose capabilities fit the
+    platform.** Pro: a node cordoned for maintenance still counts, so the action is
+    not told "more than any node" while that node is away. Con: a rung that only a
+    cordoned node fits waits for it.
+  - **B. Live nodes only.** Pro: a rung never waits on a cordoned node. Con: while the
+    largest node is cordoned, a kill below its size reaches the user as the action's.
+  - **C. An operator-set cap per platform.** Pro: predictable. Con: drifts from the
+    nodes actually registered.
+- **Bound.**
+  - **A. Its own bound**, apart from the 3-run budget of 6.5 (as above). Pro: the user
+    is told only at the cap, as decided. Con: an operation can run 3 times plus the
+    ladder's length.
+  - **B. Count rungs in the 3-run budget.** Pro: one bound. Con: answers the action's
+    error at four times the first booking, below the largest node, against the
+    decision; listed only to record why it is not taken.
+
+**Lean: A, A, A** (doubling; the largest live or cordoned fit node; its own bound).
+Settled by pilot data on how far past their booking killed actions go.
 
 ### 6.2 Timeouts (DECIDED)
 
@@ -645,7 +682,7 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
   given up for silence, replacement, reconnection or not starting (`requeue.rs`) are
   not results and do not use the budget, as today; bounding those is a separate
   question (#22). Out-of-memory reruns have their own bound, the ladder of 6.1, and
-  do not use this budget either.
+  do not use this budget either (the lean of 6.1, O7).
 - **Excluded nodes.** The operation records the nodes whose runs ended Farm or
   Ambiguous and is not placed on them again. If no node outside that set can serve it,
   the answer is given at once, by the class of the last run, with no wait.
@@ -756,7 +793,11 @@ node:
 ## 10. Test plan
 
 Each test says what it proves and names the planted mutant that must turn it red.
-Tests 30 and 31 pin the leans of 6.1 (O1 to O4) and change if another option is chosen.
+Tests 19, 29, 30 and 31 and invariants I17 and I18 pin the leans of 6.1 (O1 to O4 and
+O7: the doubling rungs, the cap's nodes, the ladder's own bound, `ACTION_OUT_OF_MEMORY`)
+and change if another option is chosen. What they assert of the decision itself stands
+under any option: a kill below the cap is rerun with a larger booking, the booking
+never passes the cap, and only a kill at the cap is answered as the action's.
 
 ### 10.1 Simulation (`kbf-sim`)
 
@@ -767,10 +808,12 @@ New invariants beside [simulation.md](simulation.md#4-invariants) I1-I15:
   capabilities.
 - **I17. Farm runs are bounded and spread.** No operation runs more than 3 times after
   Farm or Ambiguous results, and no two of those runs are on the same node. Rungs of
-  the memory ladder are counted apart (I18).
+  the memory ladder are counted apart (I18; the lean of 6.1, O7).
 - **I18. The memory ladder climbs and stops.** Each out-of-memory rerun books more
-  memory than the run before it and never more than the cap (6.1); an
-  `ACTION_OUT_OF_MEMORY` answer follows only a kill at the cap.
+  memory than the run before it and never more than the cap (6.1, decided); the
+  action's out-of-memory answer follows only a kill at the cap (decided). Under the
+  leans, each rung doubles (O7) and that answer carries reason `ACTION_OUT_OF_MEMORY`
+  (O1).
 - **I5 and F2.6, unchanged, now carry 6.2**: a suspend never produces
   `DEADLINE_EXCEEDED`; past T it is a fence, past G a requeue.
 - **I10, amended** as in section 4.1.
@@ -789,7 +832,7 @@ recovery time. It joins F2 (as a worker fault) and F3 (as a capability routing c
 | 6 | F3, unfit node recovers at a random time on the virtual clock | after recovery the memo is cleared and a repeat runs | the memo ignores capability recovery |
 | 7 | F2, the unfit-node fault | I16 | the step after a run returns the `ActionResult` (OK, exit 69) even when the probe failed |
 | 8 | F2, the unfit-node fault | I16 | `farm.rs` `outcome()` returns `Completed` for a result the daemon marked Farm |
-| 29 | F2 with a memory fault: each action needs a random size from 1 GiB to above the largest node; nodes of mixed sizes, some cordoned | I18, I17 | count the ladder in the 3-run budget (answers at 4 GiB); no cap (a rung books more than any node and waits out the unservable bound) |
+| 29 | F2 with a memory fault: each action needs a random size from 1 GiB to above the largest node; nodes of mixed sizes, some cordoned (cordoned nodes set the cap: O7 lean) | I18, I17 | count the ladder in the 3-run budget (answers at 4 GiB); no cap (a rung books more than any node and waits out the unservable bound) |
 | 33 | F2.6 with an action timeout shorter than the suspend: a 10 s timeout, a suspend of 50 s (past T) 5 s into the run | `ABORTED` by the fence and requeued (needs the 6.5 reruns; today the fence between T and G is answered `INTERNAL` once, 6.2); never `DEADLINE_EXCEEDED`; no flake recorded | the daemon model's timeout counts suspended time |
 
 ### 10.2 Real processes
@@ -809,14 +852,14 @@ the daemon's clock seam driven by the test.
 | 16 | kbf's own timeout kill | `DEADLINE_EXCEEDED`, no rerun | as 15 |
 | 17 | The action calls `exit(137)` | Action, OK exit 137, no rerun | classify on the exit value instead of "ended by a signal" |
 | 18 | The action sends itself SIGKILL every time, 2 nodes | OK, exit 137, after exactly 2 runs | count the Ambiguous rerun outside the budget; answer `INTERNAL` |
-| 19 | Native: booking 1 GiB, cap (the test's node) 4 GiB, the action needs 1.5 GiB. Container: a child is OOM-killed under the test's `actions/` limit while its parent exits 1 | native: one rerun at 2 GiB, OK exit 0, the message names both runs. Container: classified out of memory, never OK exit 1 | rerun at the same booking; check `oom_kill` on 137 only |
+| 19 | Native: booking 1 GiB, cap (the test's node) 4 GiB, the action needs 1.5 GiB. Container: a child is OOM-killed under the test's `actions/` limit while its parent exits 1 | native: one rerun at 2 GiB (doubling, the O7 lean; under any step, one rerun above 1 GiB), OK exit 0, the message names both runs. Container: classified out of memory, never OK exit 1 | rerun at the same booking; check `oom_kill` on 137 only |
 | 20 | Scratch full during setup (a small filesystem as scratch); full during the run | setup: Farm with the scratch probe failing; run: signature matched and proven | treat setup errors as Action |
 | 21 | Every `RuntimeError` variant and every server-side failure, table-driven; the mapping is a `match` with no wildcard arm, so a new variant does not compile until it is classified | the class and code of section 5 | `Failed` mapped to `INVALID_ARGUMENT`; `MissingBlob` mapped to `INTERNAL` (today's defect) |
 | 22 | A `MISSING` answer, from the front and from the server's re-check | exactly one detail, the `PreconditionFailure` | add an ErrorInfo to it |
 | 23 | Missing blob: delete it from the CAS after the front's check; separately, break only the worker's fetch | `MISSING` to the client; a rerun elsewhere | the server answers `INTERNAL` for both |
 | 24 | Alerts: 5 faults on one node and capability; the probe passes twice; the probe flaps 4 times in an hour | 1 alert with count 5; resolved; one reopened alert, notified once | key alerts per fault; no flap rule |
 | 30 | Memory floor: digest A at key K is killed at 1 GiB and passes at 2 GiB; then digest B at K (a changed input); then 20 passes at K peaking under 1 GiB; then 30 days without a run, on the test clock | B books 2 GiB at its first run; the floor then halves to 1 GiB; then K is dropped | keep the floor per digest (B starts at 1 GiB); never lower it |
-| 31 | The action needs more than the cap (4 GiB) | ladder 1, 2, 4 GiB, then `FAILED_PRECONDITION` with `ACTION_OUT_OF_MEMORY` and the exact text of section 5; a repeat of the digest is answered without a run; with `skip_cache_lookup` it runs | answer OK exit 137; answer `RESOURCE_EXHAUSTED`; no memo, so a repeat climbs the ladder again |
+| 31 | The action needs more than the cap (4 GiB) | ladder 1, 2, 4 GiB (O7 lean), then `FAILED_PRECONDITION` with `ACTION_OUT_OF_MEMORY` (O1 lean) and the exact text of section 5; a repeat of the digest is answered without a run; with `skip_cache_lookup` it runs | answer OK exit 137; answer `RESOURCE_EXHAUSTED`; no memo, so a repeat climbs the ladder again |
 | 32 | Flakes: a digest fails, then a second request for it passes; separately, an operation's first run ends by a SIGKILL the test sends and the rerun passes; separately, a pass then a cache hit | the first digest is flaky, both runs recorded; the second is a possible flake with both runs in its history; the cache hit adds no run | record only the answered run; count a probe-proven Farm run as a failure |
 
 ### 10.3 End to end
@@ -848,12 +891,12 @@ people use. Bazel's exit 34 does not by itself tell Farm from Request (section 3
 **Decided** (2026-10-09):
 
 1. OOM: an out-of-memory kill is Farm. The server reruns with a higher memory ask,
-   bounded (this draft: doubled, up to the largest node that fits the platform, on a
-   ladder bounded apart from the 3-run budget), and remembers the raised ask per action
+   bounded and stopping at the largest node, and remembers the raised ask per action
    key (not per digest) so later runs start there. A kill at the largest node is the
    action's, reported as "needs more memory than any node offers" (6.1). The status
-   code, the key's composition, the floor's decay, the over-cap memo and a kill below
-   the booking are open (12 to 15 below).
+   code, the key's composition, the floor's decay, the over-cap memo, a kill below
+   the booking, and the ladder's step, cap and bound are open (12 to 15 and 17
+   below).
 2. Timeouts: an action's timeout is Action (the client set it), `DEADLINE_EXCEEDED`,
    never rerun. A paused or frozen node is not a timeout: it is a farm error and is
    requeued. Today that holds past G only; between T and G it needs the server reruns
@@ -903,3 +946,6 @@ people use. Bazel's exit 34 does not by itself tell Farm from Request (section 3
     below the run's own booking counts against the node where the peak is measured
     (6.1, O5).
 16. Node suspicion: a metric first, an alert once pilot data sets a threshold (6.3, O6).
+17. The memory ladder: each rung doubles the booking in whole GiB, the cap is the
+    largest live or cordoned node that fits the platform, and the ladder is bounded
+    apart from the 3-run budget (6.1, O7).
