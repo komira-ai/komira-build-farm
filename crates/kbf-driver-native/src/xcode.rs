@@ -22,7 +22,9 @@
 //! lease can write (`crate::user_folders`), so what a lease wrote there reaches only
 //! sandboxed lookups, never a tool the daemon runs outside the sandbox.
 //!
-//! Each question must exit 0 within [`ANSWER_WITHIN`]. The first that fails decides the
+//! The questions are asked at once, each on a thread of its own (`xcrun --find metal`
+//! only after `-showComponent`), and their answers read in this order. Each must exit
+//! 0 within [`ANSWER_WITHIN`]. The first that fails, in this order, decides the
 //! Xcode's [`State`], and a failed check that a human can fix carries the command that
 //! fixes it ([`Xcode::fix`]). Every installed Xcode is reported, ready or not, in the
 //! node's status ([`Xcode::status`]), so an operator sees what to do; only ready ones are
@@ -356,7 +358,30 @@ fn ask(xcode: &mut Xcode, probe: &Probe, sandbox: Option<&Sandbox>) -> Result<()
     let xcodebuild = dir.join(&probe.xcodebuild);
     let question =
         |program: &Path, args: &[&str]| answer(program, args, &dir, probe.within, sandbox);
-    let version = question(&xcodebuild, &["-version"]).map_err(Unanswered::into_failed)?;
+    // All at once (each takes about a second, most of it the tool starting), each
+    // answer then read in the order of the module documentation.
+    let mut asked: Vec<(&Path, &[&str])> = vec![
+        (xcodebuild.as_path(), &["-version"][..]),
+        (xcodebuild.as_path(), &["-license", "check"][..]),
+        (xcodebuild.as_path(), &["-checkFirstLaunchStatus"][..]),
+        (probe.xcrun.as_path(), &["--find", "clang"][..]),
+    ];
+    if probe.metal {
+        asked.push((xcodebuild.as_path(), &["-showComponent", "MetalToolchain"][..]));
+    }
+    let mut answers = std::thread::scope(|scope| {
+        let asking: Vec<_> = asked
+            .into_iter()
+            .map(|(program, args)| scope.spawn(move || question(program, args)))
+            .collect();
+        asking
+            .into_iter()
+            .map(|answer| answer.join().expect("asking a question does not panic"))
+            .collect::<Vec<_>>()
+            .into_iter()
+    });
+    let mut next = || answers.next().expect("an answer to each question");
+    let version = next().map_err(Unanswered::into_failed)?;
     let build = build_of(&version).ok_or_else(|| {
         failed(format!(
             "no build in xcodebuild -version: {:?}",
@@ -364,14 +389,12 @@ fn ask(xcode: &mut Xcode, probe: &Probe, sandbox: Option<&Sandbox>) -> Result<()
         ))
     })?;
     xcode.build = Some(build.to_owned());
-    question(&xcodebuild, &["-license", "check"])
-        .map_err(|e| e.into_state(State::LicenseNotAccepted))?;
-    question(&xcodebuild, &["-checkFirstLaunchStatus"])
-        .map_err(|e| e.into_state(State::FirstLaunchNotRun))?;
-    question(&probe.xcrun, &["--find", "clang"]).map_err(Unanswered::into_failed)?;
+    next().map_err(|e| e.into_state(State::LicenseNotAccepted))?;
+    next().map_err(|e| e.into_state(State::FirstLaunchNotRun))?;
+    next().map_err(Unanswered::into_failed)?;
     if probe.metal {
         let asked = "xcodebuild -showComponent MetalToolchain";
-        match question(&xcodebuild, &["-showComponent", "MetalToolchain"]) {
+        match next() {
             Ok(shown) => match component_status(&shown) {
                 Some("installed") => {}
                 status => {

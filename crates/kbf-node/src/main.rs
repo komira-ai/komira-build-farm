@@ -552,18 +552,20 @@ mod tests {
             .for_each(|_| std::thread::sleep(Duration::from_millis(20)));
         let ran = std::fs::read_to_string(&log).expect("ran");
         let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
-        let surveyed: Vec<String> = ran
+        // The survey's questions, asked at once, come before the warm-up's lookups.
+        let mut surveyed: Vec<String> = ran
             .lines()
             .filter(|l| l.starts_with("xcodebuild ") || l.ends_with(" --find clang"))
             .take(4)
             .map(str::to_owned)
             .collect();
+        surveyed.sort();
         assert_eq!(
             surveyed,
             [
-                format!("xcodebuild {}", at(&survey, "-version")),
-                format!("xcodebuild {}", at(&survey, "-license check")),
                 format!("xcodebuild {}", at(&survey, "-checkFirstLaunchStatus")),
+                format!("xcodebuild {}", at(&survey, "-license check")),
+                format!("xcodebuild {}", at(&survey, "-version")),
                 format!("xcrun {}", at(&survey, "--find clang")),
             ],
             "{ran}"

@@ -147,7 +147,8 @@ never share a cache entry.
 A Mac may have several Xcodes installed; it serves an action that names any of them
 that is **ready**. The daemon asks each `Xcode*.app` in `/Applications` (the
 `--xcode-apps` flag), under its own `DEVELOPER_DIR` and with its own `xcodebuild`
-(the one inside the app), in order: `xcodebuild -version` (which must print a build),
+(the one inside the app), these questions, all at once, and reads the answers in
+this order: `xcodebuild -version` (which must print a build),
 `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
 clang`, and, on a node started with `--require-metal-toolchain` (one meant for GPU
 work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installed` (an
@@ -179,10 +180,11 @@ A hung question is killed, so it cannot keep the node from starting. An answer c
 only once the program has exited and closed its output: one that exits but leaves a
 child holding its output open is not ready when the minute is up. Each Xcode is asked
 once (an app that links to another, such as `Xcode.app`, is listed with that one's
-answers), on a thread of its own, so a hung Xcode delays the daemon's start (it says nothing to
-the server until its first survey is done) by up to a minute per question it is asked
-(four; five or six with `--require-metal-toolchain`), and the other Xcodes add
-nothing to that. An action
+answers), on a thread of its own, and its questions at once, so a hung Xcode delays
+the daemon's start (it says nothing to the server until its first survey is done) by
+up to a minute (two with `--require-metal-toolchain`, whose `xcrun --find metal` is
+asked only after `-showComponent`), and the other Xcodes add nothing to that. An
+action
 that names no `xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
 `DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
 whatever its environment says.

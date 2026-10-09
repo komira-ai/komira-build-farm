@@ -268,8 +268,7 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     let apps = dir.join("Applications");
     let xcodebuild = fake_xcodebuild(&dir);
     link_xcodebuild(&xcodebuild, &apps.join("Xcode_good.app"));
-    std::os::unix::fs::symlink(apps.join("Xcode_good.app"), apps.join("Xcode.app"))
-        .expect("link");
+    std::os::unix::fs::symlink(apps.join("Xcode_good.app"), apps.join("Xcode.app")).expect("link");
     let log = dir.join("sandbox-log");
     let sandbox_exec = fake(
         &dir,
@@ -314,7 +313,8 @@ fn the_survey_asks_every_question_under_its_sandbox() {
         .join("scratch/lease-survey");
     let how = format!("KBF_LEASE={0} TMPDIR={0} net=off", real.display());
     let own = developer_dir.join(XCODEBUILD);
-    let want: Vec<String> = [
+    // In any order: an Xcode's questions are asked at once.
+    let want: BTreeSet<String> = [
         format!("{} -version", own.display()),
         format!("{} -license check", own.display()),
         format!("{} -checkFirstLaunchStatus", own.display()),
@@ -330,7 +330,9 @@ fn the_survey_asks_every_question_under_its_sandbox() {
             .map(str::to_owned)
             .collect()
     };
-    assert_eq!(read(), want);
+    let ran = read();
+    assert_eq!(ran.len(), want.len(), "a question asked twice: {ran:#?}");
+    assert_eq!(ran.into_iter().collect::<BTreeSet<_>>(), want);
     assert!(!real.exists(), "the survey's directory stays");
 
     std::fs::remove_file(&log).expect("log");
