@@ -37,7 +37,7 @@ use serde::Deserialize;
 
 use crate::expected::ExpectedNodes;
 use crate::farm::{Farm, NodeAction};
-use crate::fleet;
+use crate::fleet::{self, NodeView, NodesView};
 use crate::token::ApiToken;
 
 /// The media type of every body this API returns, and of every write it accepts.
@@ -83,12 +83,10 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let view = api.farm.nodes();
-    let view = match &api.expected {
-        Some(expected) => fleet::with_expected(view, &expected.current()),
-        None => view,
-    };
-    json(StatusCode::OK, &view)
+    json(
+        StatusCode::OK,
+        &listed(api.farm.nodes(), api.expected.as_deref()),
+    )
 }
 
 async fn act<M, O>(
@@ -110,16 +108,27 @@ where
     };
     match write_request(api.token.as_ref(), &request) {
         Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(mut view) => {
-                if let Some(expected) = &api.expected {
-                    fleet::mark(&mut view, &expected.current());
-                }
-                json(StatusCode::OK, &view)
-            }
+            Ok(view) => json(StatusCode::OK, &marked(view, api.expected.as_deref())),
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),
     }
+}
+
+/// `view` with the nodes `expected` lists applied ([`fleet::with_expected`]).
+fn listed(view: NodesView, expected: Option<&ExpectedNodes>) -> NodesView {
+    match expected {
+        Some(expected) => fleet::with_expected(view, &expected.current()),
+        None => view,
+    }
+}
+
+/// `view` marked `expected` if `expected` lists it.
+fn marked(mut view: NodeView, expected: Option<&ExpectedNodes>) -> NodeView {
+    if let Some(expected) = expected {
+        fleet::mark(&mut view, &expected.current());
+    }
+    view
 }
 
 /// A write as it arrived.
