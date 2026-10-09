@@ -37,7 +37,7 @@ fn a_wrong_token_is_refused_and_the_right_one_still_works() {
     wrong[TOKEN_LEN - 1] ^= 1;
     let mut host = served.connect_raw();
     let err = Client::connect(host.try_clone().expect("clone"), wrong).expect_err("refused");
-    assert_eq!(refusal::<()>(Err(err)), Refusal::Token);
+    assert_eq!(refusal(Err::<(), _>(err)), Refusal::Token);
     // Closed after the refusal: a Run on this connection gets nothing back.
     let _ = write_frame(&mut host, &HostMsg::Run(sh("true", &[])).encode());
     assert!(read_frame(&mut host).is_err(), "the connection stayed open");
