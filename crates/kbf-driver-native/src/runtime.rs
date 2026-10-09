@@ -104,7 +104,7 @@ impl<C: Cas> NativeRuntime<C> {
             stops: Mutex::new(BTreeMap::new()),
             rules,
         };
-        sweep_user_folders(&runtime.config, remove);
+        sweep_user_folders(&runtime.config);
         Ok(runtime)
     }
 
@@ -383,12 +383,16 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
     }
 }
 
-/// Removes, with `remove`, the leftovers in the user folders old enough to be no
-/// lease's work in progress ([`crate::user_folders`]). Not generic over the CAS, like
+/// Removes the leftovers in the user folders old enough to be no lease's work in
+/// progress ([`crate::user_folders`]), by descriptor. Not generic over the CAS, like
 /// [`sweep_user_folders_after_lease`], so every test binary runs the one copy.
-fn sweep_user_folders(config: &NativeConfig, remove: &dyn Fn(&Path) -> std::io::Result<()>) {
+fn sweep_user_folders(config: &NativeConfig) {
     if let Some(folders) = &config.user_folders {
-        folders.sweep(config.leftover_age, SystemTime::now(), remove);
+        folders.sweep(
+            config.leftover_age,
+            SystemTime::now(),
+            &kbf_outputs::remove_tree_at,
+        );
     }
 }
 
@@ -400,7 +404,7 @@ async fn sweep_user_folders_after_lease(config: &NativeConfig) {
     };
     let age = config.leftover_age;
     let _ = tokio::task::spawn_blocking(move || {
-        folders.sweep(age, SystemTime::now(), &kbf_outputs::remove_tree);
+        folders.sweep(age, SystemTime::now(), &kbf_outputs::remove_tree_at);
     })
     .await;
 }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_daemon::Runtime;
+use kbf_driver_native::user_folders::UserFolders;
 use kbf_driver_native::xcode;
 use kbf_driver_native::{NativeConfig, NativeRuntime};
 use support::{
@@ -315,4 +316,61 @@ async fn a_leftover_in_the_temporary_folder_is_swept_after_the_lease() {
         sandbox_denials()
     );
     assert!(!left.exists(), "kept past the lease: {}", left.display());
+}
+
+/// What [`temporary_items_itself_cannot_be_removed_or_replaced`] runs: each way to take
+/// `$T/TemporaryItems` away or swap it for a link (to the lease's working directory),
+/// then a write below it, each with its exit status.
+const REPLACE_ITEMS: &str = r#"rmdir "$T/TemporaryItems" 2>/dev/null; echo "rmdir=$?"
+mv "$T/TemporaryItems" "$T/moved" 2>/dev/null; echo "mv=$?"
+ln -sfF "$PWD" "$T/TemporaryItems" 2>/dev/null; echo "ln=$?"
+mkdir "$T/TemporaryItems/inside"; echo "inside=$?"
+"#;
+
+/// Catches a profile that lets an action write `TemporaryItems` itself, not only what
+/// is below it (the review of issue #163): an action could remove it and put a
+/// symlink in its place, and the daemon's sweep, outside the sandbox, would follow it.
+/// The folders are stand-ins in the scratch directory, made by the daemon at start as
+/// it makes the real one. Control: the same action unsandboxed removes and replaces
+/// the folder, so the check can fail.
+#[tokio::test]
+async fn temporary_items_itself_cannot_be_removed_or_replaced() {
+    let dir = std::fs::canonicalize(scratch("items-itself")).expect("real");
+    let cas = Arc::new(MemoryCas::default());
+    let mut runs = Vec::new();
+    for sandboxed in [true, false] {
+        let base = dir.join(if sandboxed { "sandboxed" } else { "control" });
+        let (temp, cache) = (base.join("T"), base.join("C"));
+        std::fs::create_dir_all(&temp).expect("T");
+        std::fs::create_dir_all(&cache).expect("C");
+        let mut config: NativeConfig = config(&base);
+        config.user_folders = UserFolders::new(temp.clone(), cache);
+        if !sandboxed {
+            config.isolation = kbf_driver_native::network::Isolation::None;
+        }
+        let rt = runtime(config, &cas);
+        let items = temp.join("TemporaryItems");
+        assert!(items.is_dir(), "not made at start: {}", items.display());
+        let spec = Spec::sh(REPLACE_ITEMS)
+            .env("PATH", PATH)
+            .env("T", &temp.display().to_string());
+        let result = run_long(&rt, &cas, 1, &spec).await;
+        let kind = std::fs::symlink_metadata(&items).map(|m| m.file_type().is_dir());
+        runs.push((stdout(&cas, &result), kind.ok()));
+    }
+    assert_eq!(
+        runs,
+        [
+            (
+                "rmdir=1\nmv=1\nln=1\ninside=0\n".to_owned(),
+                Some(true)
+            ),
+            (
+                "rmdir=0\nmv=1\nln=0\ninside=0\n".to_owned(),
+                Some(false)
+            ),
+        ],
+        "{}",
+        sandbox_denials()
+    );
 }
