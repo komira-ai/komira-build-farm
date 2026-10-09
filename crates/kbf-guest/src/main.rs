@@ -101,7 +101,6 @@ fn serve(
         session: session::manager_name(),
         hello_timeout: HELLO_TIMEOUT,
     });
-    agent
-        .serve(&listener)
-        .map_err(|e| format!("accepting: {e}"))
+    let served = agent.serve(&listener);
+    served.map_err(|e| format!("accepting: {e}"))
 }

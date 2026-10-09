@@ -123,6 +123,20 @@ fn a_second_run_is_refused() {
             ..
         }
     ));
+    // A second Hello while it runs is refused too, and does not end the run.
+    client
+        .send(&HostMsg::Hello {
+            version: VERSION,
+            token: TOKEN,
+        })
+        .expect("sent");
+    assert!(matches!(
+        client.recv().expect("reply"),
+        GuestMsg::Refused {
+            reason: Refusal::BadRequest,
+            ..
+        }
+    ));
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
     assert_eq!(refusal(client.run(&sh("true", &[]))), Refusal::AlreadyRan);
     drop(client);
