@@ -493,11 +493,17 @@ fn a_process_started_during_user_delete_stops_it() {
     assert!(rig.host.state().users.contains_key("kbf-lease-11-1"));
     let calls = log(&rig);
     assert_eq!(
-        calls.iter().filter(|c| c.starts_with("live_processes")).count(),
+        calls
+            .iter()
+            .filter(|c| c.starts_with("live_processes"))
+            .count(),
         2 + EXIT_LOOKS,
         "two looks, then the third waits its whole bound: {calls:?}"
     );
-    assert!(!calls.iter().any(|c| c.starts_with("delete_user")), "{calls:?}");
+    assert!(
+        !calls.iter().any(|c| c.starts_with("delete_user")),
+        "{calls:?}"
+    );
 
     // With none left the delete completes, after three looks.
     assert_eq!(rig.helper.user_delete("11.1"), Ok(true));
@@ -645,13 +651,19 @@ fn user_delete_gives_up_naming_what_is_left() {
         )
     );
     let calls = log(&rig);
-    let looks = calls.iter().filter(|c| c.starts_with("live_processes")).count();
+    let looks = calls
+        .iter()
+        .filter(|c| c.starts_with("live_processes"))
+        .count();
     let pauses = calls.iter().filter(|c| **c == "pause").count();
     assert_eq!((looks, pauses), (EXIT_LOOKS, EXIT_LOOKS - 1));
     assert!(rig.host.state().users.contains_key("kbf-lease-13-1"));
 
     rig.host.state().procs.insert(uid, NAMED + 2);
     let error = rig.helper.user_delete("13.1").unwrap_err();
-    assert!(error.contains("1007 (proc7), and 2 more; kill-uid first"), "{error}");
+    assert!(
+        error.contains("1007 (proc7), and 2 more; kill-uid first"),
+        "{error}"
+    );
     assert!(!error.contains("proc8"), "{error}");
 }

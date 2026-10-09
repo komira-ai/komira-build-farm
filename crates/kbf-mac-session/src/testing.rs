@@ -125,7 +125,10 @@ impl Host for FakeHost {
         let mut state = self.state();
         state.log.push("pause".to_owned());
         state.pauses += 1;
-        assert!(state.pauses < PAUSES, "{PAUSES} pauses: a wait without a bound");
+        assert!(
+            state.pauses < PAUSES,
+            "{PAUSES} pauses: a wait without a bound"
+        );
     }
 }
 
