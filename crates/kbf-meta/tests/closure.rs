@@ -2,8 +2,10 @@
 
 mod common;
 
-use common::{DAY, HOUR, cache_action, collect, commit_touch, meta, tick};
-use kbf_meta::{ActionAnswer, Command, Miss, ObjectId, Touch};
+use common::{
+    DAY, HOUR, cache_action, collect, commit_touch, mark_missing, mark_reachable, meta, tick,
+};
+use kbf_meta::{ActionAnswer, Command, Miss, Touch};
 
 /// Catches: a lookup that fails on a complete entry, or serves something other than
 /// the stored `ActionResult` digest.
@@ -58,12 +60,12 @@ fn unreachable_closure_blob_is_a_miss_until_reachable() {
     let mut m = meta();
     let c = cache_action(&mut m);
     // The child lives in segment 4 (see `cache_action`).
-    m.execute(Command::ObjectUnreachable(ObjectId::new(4)));
+    mark_missing(&mut m, 4);
     assert_eq!(
         m.action(&c.action),
         ActionAnswer::Miss(Miss::Unreachable(c.child))
     );
-    m.execute(Command::ObjectReachable(ObjectId::new(4)));
+    mark_reachable(&mut m, 4);
     assert!(matches!(m.action(&c.action), ActionAnswer::Hit { .. }));
 }
 

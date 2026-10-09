@@ -7,8 +7,8 @@ use std::time::Duration;
 use kbf_types::{Digest, Effect, FarmTime, StateMachine};
 
 use crate::model::{
-    ActionAnswer, ActionRecord, BlobAnswer, FindMissing, Location, Miss, ObjectId, Retention, Role,
-    Touch,
+    ActionAnswer, ActionRecord, BlobAnswer, Epoch, FindMissing, Location, Miss, ObjectId,
+    Retention, Role, Touch, UnreachableReason,
 };
 
 /// One committed change to the metadata state.
@@ -16,13 +16,21 @@ use crate::model::{
 pub enum Command {
     /// Advances farm time. Time never moves back: an earlier value is ignored.
     Tick(FarmTime),
+    /// Allocates a writer epoch, greater than every epoch allocated before
+    /// ([`Applied::Epoch`]). A writer takes one before it names any object.
+    AllocEpoch,
     /// Records that `digest`'s bytes are durable at `location`. Counts as a touch.
+    /// Refused if the location's object names an epoch never allocated.
     PutBlob {
         /// The blob.
         digest: Digest,
         /// Where its bytes are.
         location: Location,
     },
+    /// Records several blobs at once, as one [`Command::PutBlob`] each in order (a
+    /// digest listed twice is a duplicate of its first copy). All or nothing: if any
+    /// location names an epoch never allocated, none is recorded.
+    PutBlobs(Vec<(Digest, Location)>),
     /// Writes the action-cache entry for `action`, replacing any earlier one.
     PutAction {
         /// Who asks; only [`Role::Daemon`] is accepted.
@@ -34,9 +42,17 @@ pub enum Command {
     },
     /// Touches entries a reader is about to report or serve.
     Touch(Touch),
-    /// The store could not reach this object (a 404, or a store down past the hold).
-    ObjectUnreachable(ObjectId),
-    /// The object is reachable again.
+    /// A read could not use this object, for `reason`. An object already marked
+    /// [`UnreachableReason::Corrupt`] stays corrupt. Refused if the object names an
+    /// epoch never allocated.
+    ObjectUnreachable {
+        /// The object.
+        object: ObjectId,
+        /// What the read found.
+        reason: UnreachableReason,
+    },
+    /// The object is reachable again, whatever its mark said. Refused if the object
+    /// names an epoch never allocated.
     ObjectReachable(ObjectId),
     /// Removes every blob and action entry whose retention has run out.
     Collect,
@@ -47,8 +63,12 @@ pub enum Command {
 pub enum Applied {
     /// [`Command::Tick`]: the farm time after the tick.
     Ticked(FarmTime),
+    /// [`Command::AllocEpoch`]: the new epoch.
+    Epoch(Epoch),
     /// [`Command::PutBlob`].
-    Blob(BlobWrite),
+    Blob(Result<BlobWrite, UnallocatedEpoch>),
+    /// [`Command::PutBlobs`]: one outcome per blob, in order.
+    Blobs(Result<Vec<BlobWrite>, UnallocatedEpoch>),
     /// [`Command::PutAction`].
     Action(Result<(), ActionWriteError>),
     /// [`Command::Touch`]: the entries that were not held when the touch applied (a
@@ -59,7 +79,7 @@ pub enum Applied {
         lost: Touch,
     },
     /// [`Command::ObjectUnreachable`] or [`Command::ObjectReachable`].
-    Marked,
+    Marked(Result<(), UnallocatedEpoch>),
     /// [`Command::Collect`].
     Collected(Collected),
 }
@@ -91,6 +111,13 @@ pub struct Collected {
     /// Action-cache entries removed.
     pub actions: Vec<Digest>,
 }
+
+/// A command named an object whose epoch was never allocated: a writer that skipped
+/// [`Command::AllocEpoch`], or one whose epoch came from another log. The command
+/// changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("object {0} names an epoch that was never allocated")]
+pub struct UnallocatedEpoch(pub ObjectId);
 
 /// Why an action-cache write was refused. A refused write changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -124,8 +151,8 @@ struct ActionEntry {
     last_hit: FarmTime,
 }
 
-/// The metadata state: the CAS index, the action cache, unreachable objects and farm
-/// time.
+/// The metadata state: the CAS index, the action cache, unreachable objects, farm
+/// time and the next writer epoch.
 ///
 /// Every replica applies the same committed [`Command`]s and ends in the same state.
 /// Reads are `&self` queries on the leader. A read that reports or serves something
@@ -139,7 +166,8 @@ pub struct MetaState {
     now: FarmTime,
     blobs: BTreeMap<Digest, BlobEntry>,
     actions: BTreeMap<Digest, ActionEntry>,
-    unreachable: BTreeSet<ObjectId>,
+    unreachable: BTreeMap<ObjectId, UnreachableReason>,
+    next_epoch: u64,
 }
 
 impl MetaState {
@@ -151,7 +179,8 @@ impl MetaState {
             now: FarmTime::default(),
             blobs: BTreeMap::new(),
             actions: BTreeMap::new(),
-            unreachable: BTreeSet::new(),
+            unreachable: BTreeMap::new(),
+            next_epoch: 1,
         }
     }
 
@@ -179,6 +208,12 @@ impl MetaState {
         self.actions.len()
     }
 
+    /// Why `object` is marked unreachable, or `None` if it is not.
+    #[must_use]
+    pub fn unreachable(&self, object: ObjectId) -> Option<UnreachableReason> {
+        self.unreachable.get(&object).copied()
+    }
+
     /// Applies one command and reports what it did.
     pub fn execute(&mut self, command: Command) -> Applied {
         match command {
@@ -186,7 +221,16 @@ impl MetaState {
                 self.now = self.now.max(t);
                 Applied::Ticked(self.now)
             }
-            Command::PutBlob { digest, location } => Applied::Blob(self.put_blob(digest, location)),
+            Command::AllocEpoch => {
+                let epoch = Epoch::new(self.next_epoch);
+                self.next_epoch += 1;
+                Applied::Epoch(epoch)
+            }
+            Command::PutBlob { digest, location } => Applied::Blob(
+                self.allocated(location.object)
+                    .map(|()| self.put_blob(digest, location)),
+            ),
+            Command::PutBlobs(blobs) => Applied::Blobs(self.put_blobs(blobs)),
             Command::PutAction {
                 role,
                 action,
@@ -195,14 +239,15 @@ impl MetaState {
             Command::Touch(touch) => Applied::Touched {
                 lost: self.touch(touch),
             },
-            Command::ObjectUnreachable(object) => {
-                self.unreachable.insert(object);
-                Applied::Marked
+            Command::ObjectUnreachable { object, reason } => {
+                Applied::Marked(self.allocated(object).map(|()| {
+                    let mark = self.unreachable.entry(object).or_insert(reason);
+                    *mark = (*mark).max(reason);
+                }))
             }
-            Command::ObjectReachable(object) => {
+            Command::ObjectReachable(object) => Applied::Marked(self.allocated(object).map(|()| {
                 self.unreachable.remove(&object);
-                Applied::Marked
-            }
+            })),
             Command::Collect => Applied::Collected(self.collect()),
         }
     }
@@ -212,7 +257,7 @@ impl MetaState {
     pub fn blob(&self, digest: &Digest) -> BlobAnswer {
         match self.blobs.get(digest) {
             None => BlobAnswer::Absent,
-            Some(entry) if self.unreachable.contains(&entry.location.object()) => {
+            Some(entry) if self.unreachable.contains_key(&entry.location.object) => {
                 BlobAnswer::Unavailable
             }
             Some(entry) => BlobAnswer::Present(entry.location),
@@ -226,7 +271,7 @@ impl MetaState {
         let mut touch = Touch::default();
         for digest in digests {
             if let Some(entry) = self.blobs.get(digest)
-                && !self.unreachable.contains(&entry.location.object())
+                && !self.unreachable.contains_key(&entry.location.object)
                 && self.touch_due(entry.last_touch)
             {
                 touch.blobs.insert(*digest);
@@ -287,6 +332,28 @@ impl MetaState {
             }
         }
         Ok(())
+    }
+
+    /// Whether `object`'s epoch was allocated.
+    fn allocated(&self, object: ObjectId) -> Result<(), UnallocatedEpoch> {
+        let epoch = object.epoch().get();
+        if epoch == 0 || epoch >= self.next_epoch {
+            return Err(UnallocatedEpoch(object));
+        }
+        Ok(())
+    }
+
+    fn put_blobs(
+        &mut self,
+        blobs: Vec<(Digest, Location)>,
+    ) -> Result<Vec<BlobWrite>, UnallocatedEpoch> {
+        for (_, location) in &blobs {
+            self.allocated(location.object)?;
+        }
+        Ok(blobs
+            .into_iter()
+            .map(|(digest, location)| self.put_blob(digest, location))
+            .collect())
     }
 
     fn put_blob(&mut self, digest: Digest, location: Location) -> BlobWrite {

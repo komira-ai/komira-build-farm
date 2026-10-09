@@ -2,9 +2,11 @@
 
 mod common;
 
-use common::{cache_action, digest, in_segment, meta, put, put_action};
+use common::{
+    cache_action, digest, in_segment, mark_missing, mark_reachable, meta, put, put_action,
+};
 use kbf_meta::{
-    ActionAnswer, ActionRecord, ActionWriteError, Closure, Command, Miss, ObjectId, Role,
+    ActionAnswer, ActionRecord, ActionWriteError, Closure, Command, Miss, Role,
 };
 
 /// Catches: a client `UpdateActionResult` accepted. Only daemons, which ran the action,
@@ -66,13 +68,13 @@ fn writes_need_every_blob_held_and_reachable() {
         Err(ActionWriteError::Absent(output))
     );
     put(&mut m, output, in_segment(2, 0));
-    m.execute(Command::ObjectUnreachable(ObjectId::new(2)));
+    mark_missing(&mut m, 2);
     assert_eq!(
         put_action(&mut m, Role::Daemon, action, record.clone()),
         Err(ActionWriteError::Unreachable(output))
     );
     assert_eq!(m.action_count(), 0);
-    m.execute(Command::ObjectReachable(ObjectId::new(2)));
+    mark_reachable(&mut m, 2);
     assert_eq!(put_action(&mut m, Role::Daemon, action, record), Ok(()));
     assert_eq!(m.action_count(), 1);
 }

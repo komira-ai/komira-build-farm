@@ -3,10 +3,16 @@
 //!
 //! [`MetaState`] holds what the farm knows about stored content:
 //! - the **CAS index**: each blob digest maps to its [`Location`] (a record in a
-//!   segment, or a large blob stored whole) and the farm time of its last touch;
+//!   segment object of a store; a large blob is a segment of one record) and the farm
+//!   time of its last touch;
 //! - the **action cache**: each action digest maps to an [`ActionRecord`], the
 //!   `ActionResult` blob plus its [`Closure`];
-//! - the objects the store has reported unreachable, and the committed farm time.
+//! - the objects the store has reported unreachable, each with its
+//!   [`UnreachableReason`], the committed farm time, and the next writer [`Epoch`].
+//!
+//! Object ids are a writer epoch and a sequence number ([`ObjectId`]). Epochs come only
+//! from [`Command::AllocEpoch`], never twice, and a command naming an object of an epoch
+//! never allocated is refused ([`UnallocatedEpoch`]).
 //!
 //! It changes only by [`Command`]s, which every replica applies in log order; farm time
 //! arrives as [`Command::Tick`]. Reads are queries that answer from the state:
@@ -29,7 +35,9 @@ mod model;
 mod state;
 
 pub use crate::model::{
-    ActionAnswer, ActionRecord, BlobAnswer, Closure, FindMissing, Location, Miss, ObjectId,
-    Retention, Role, Touch,
+    ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Location, Miss, ObjectId,
+    Retention, Role, StoreId, Touch, UnreachableReason,
 };
-pub use crate::state::{ActionWriteError, Applied, BlobWrite, Collected, Command, MetaState};
+pub use crate::state::{
+    ActionWriteError, Applied, BlobWrite, Collected, Command, MetaState, UnallocatedEpoch,
+};
