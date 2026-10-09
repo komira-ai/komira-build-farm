@@ -23,7 +23,9 @@
 //! sandboxed lookups, never a tool the daemon runs outside the sandbox.
 //!
 //! The questions are asked at once, each on a thread of its own (`xcrun --find metal`
-//! only after `-showComponent`), and their answers read in this order. Each must exit
+//! only after `-showComponent`), and their answers read in this order; the `xcrun`
+//! lookups of all the Xcodes [`survey`] asks run one at a time (each rewrites
+//! `xcrun`'s whole cache, so two at once lose each other's entries). Each must exit
 //! 0 within [`ANSWER_WITHIN`]. The first that fails, in this order, decides the
 //! Xcode's [`State`], and a failed check that a human can fix carries the command that
 //! fixes it ([`Xcode::fix`]). Every installed Xcode is reported, ready or not, in the
@@ -44,6 +46,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
@@ -256,12 +259,16 @@ pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
     for (app, real) in found.iter().zip(&reals) {
         first.entry(real).or_insert(app);
     }
+    let lookups = &Mutex::new(());
     let answers: BTreeMap<&PathBuf, Xcode> = std::thread::scope(|scope| {
         let asking: Vec<_> = first
             .into_iter()
             .map(|(real, app)| {
                 let app = app.clone();
-                (real, scope.spawn(move || check(app, probe, sandbox)))
+                (
+                    real,
+                    scope.spawn(move || check(app, probe, sandbox, lookups)),
+                )
             })
             .collect();
         asking
@@ -320,8 +327,9 @@ pub fn discover(
     ready(&survey(apps, &probe))
 }
 
-/// The Xcode at `app`, asked as `probe` says, under `sandbox` (made) if any.
-fn check(app: PathBuf, probe: &Probe, sandbox: Option<&Sandbox>) -> Xcode {
+/// The Xcode at `app`, asked as `probe` says, under `sandbox` (made) if any, one
+/// `xcrun` lookup at a time (holding `lookups`).
+fn check(app: PathBuf, probe: &Probe, sandbox: Option<&Sandbox>, lookups: &Mutex<()>) -> Xcode {
     let mut xcode = Xcode {
         app,
         developer_dir: None,
@@ -329,7 +337,7 @@ fn check(app: PathBuf, probe: &Probe, sandbox: Option<&Sandbox>) -> Xcode {
         state: State::Ready,
         reason: String::new(),
     };
-    if let Err((state, reason)) = ask(&mut xcode, probe, sandbox) {
+    if let Err((state, reason)) = ask(&mut xcode, probe, sandbox, lookups) {
         xcode.state = state;
         xcode.reason = reason;
     }
@@ -338,7 +346,12 @@ fn check(app: PathBuf, probe: &Probe, sandbox: Option<&Sandbox>) -> Xcode {
 
 /// Asks `xcode` the questions in order, filling in its `DEVELOPER_DIR` and build as
 /// they are learnt; the first that fails decides the state it is not ready in, and why.
-fn ask(xcode: &mut Xcode, probe: &Probe, sandbox: Option<&Sandbox>) -> Result<(), (State, String)> {
+fn ask(
+    xcode: &mut Xcode,
+    probe: &Probe,
+    sandbox: Option<&Sandbox>,
+    lookups: &Mutex<()>,
+) -> Result<(), (State, String)> {
     let failed = |why: String| (State::Failed, why);
     let dir = std::fs::canonicalize(&xcode.app)
         .map_err(|e| failed(e.to_string()))?
@@ -356,8 +369,14 @@ fn ask(xcode: &mut Xcode, probe: &Probe, sandbox: Option<&Sandbox>) -> Result<()
         )));
     }
     let xcodebuild = dir.join(&probe.xcodebuild);
-    let question =
-        |program: &Path, args: &[&str]| answer(program, args, &dir, probe.within, sandbox);
+    let question = |program: &Path, args: &[&str]| {
+        // `xcrun` rewrites its whole cache with each lookup, so two at once drop each
+        // other's entries and the next lookups miss, each then taking seconds: the
+        // Xcodes' lookups run one after another (each about 0.1 s when cached).
+        let _one = (program == probe.xcrun)
+            .then(|| lookups.lock().unwrap_or_else(PoisonError::into_inner));
+        answer(program, args, &dir, probe.within, sandbox)
+    };
     // All at once (each takes about a second, most of it the tool starting), each
     // answer then read in the order of the module documentation.
     let mut asked: Vec<(&Path, &[&str])> = vec![

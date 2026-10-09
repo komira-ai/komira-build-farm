@@ -183,9 +183,12 @@ once (an app that links to another, such as `Xcode.app`, is listed with that one
 answers), on a thread of its own, and its questions at once, so a hung Xcode delays
 the daemon's start (it says nothing to the server until its first survey is done) by
 up to a minute (two with `--require-metal-toolchain`, whose `xcrun --find metal` is
-asked only after `-showComponent`), and the other Xcodes add nothing to that. An
-action
-that names no `xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
+asked only after `-showComponent`), and the other Xcodes add nothing to that but
+for their `xcrun` lookups, which run one at a time (each rewrites `xcrun`'s whole
+cache, so two at once lose each other's entries and the next lookups take seconds;
+one that hangs delays the others').
+An action that names no
+`xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
 `DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
 whatever its environment says.
 

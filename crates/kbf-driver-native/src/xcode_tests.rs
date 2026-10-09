@@ -357,6 +357,49 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
+/// Catches the survey's `xcrun` lookups run two at once: `xcrun` rewrites its whole
+/// cache with each, so two at once drop each other's entries and the next lookups
+/// miss, each then taking seconds (a native daemon on the macOS runner took 16.5 s to
+/// survey its Xcodes so). The fake `xcrun` refuses to answer while another runs.
+#[test]
+fn the_surveys_xcrun_lookups_run_one_at_a_time() {
+    let dir = scratch("one-lookup");
+    let apps = dir.join("Applications");
+    let xcodebuild = fake_xcodebuild(&dir);
+    let names = [
+        "Xcode_good.app",
+        "Xcode_new.app",
+        "Xcode_nometal.app",
+        "Xcode_old.app",
+    ];
+    for name in names {
+        link_xcodebuild(&xcodebuild, &apps.join(name));
+    }
+    let busy = dir.join("busy");
+    let xcrun = fake(
+        &dir,
+        "xcrun",
+        &format!(
+            "#!/bin/sh\n\
+             mkdir '{0}' 2>/dev/null || {{ echo 'two lookups at once' >&2; exit 75; }}\n\
+             sleep 0.3; rmdir '{0}'; echo /x/clang\n",
+            busy.display()
+        ),
+    );
+    let probe = Probe {
+        xcrun,
+        within: WITHIN,
+        ..Probe::system(false)
+    };
+    let surveyed = survey(&apps, &probe);
+    let states: Vec<(State, &str)> = surveyed
+        .iter()
+        .map(|x| (x.state, x.reason.as_str()))
+        .collect();
+    assert_eq!(states, vec![(State::Ready, ""); names.len()]);
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
 /// Links `program` into `app` as its own `xcodebuild`: [`XCODEBUILD`] inside its
 /// `DEVELOPER_DIR`, where [`survey`] runs it.
 pub(crate) fn link_xcodebuild(program: &Path, app: &Path) {

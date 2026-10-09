@@ -158,7 +158,10 @@ fn runs_until_sigterm_with_path(
     // How long the daemon took to try its first session (the native driver surveys its
     // Xcodes before, and logs how long that took), for the CI log: written to stderr,
     // which tests do not capture.
-    let survey = log.iter().find(|l| l.contains("Xcodes")).map_or("", |l| l.as_str());
+    let survey = log
+        .iter()
+        .find(|l| l.contains("Xcodes"))
+        .map_or("", |l| l.as_str());
     let _ = writeln!(
         std::io::stderr(),
         "binary.rs: the {name} daemon tried its first session {:.1?} after it started; {survey}",
