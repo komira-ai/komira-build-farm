@@ -73,7 +73,8 @@ booted in the default device set.
 
 All numbers come from run `37987149882` (commit `95505ed`). Every probe's verdict was
 PASS on both labels. Run `37988450842` (commit `51edbb0`, which changed only this
-document) gave the same verdicts and the same values.
+document) gave the same verdicts and the same values. Run `37995044432` (commit
+`8909f87`) gave the same verdicts; two `simctl` values differed, noted below.
 
 | | `macos-26` job | `macos-15` job |
 |---|---|---|
@@ -105,9 +106,12 @@ the add took about 4 s. What it waited on in that run was not recorded.
 
 **simctl.** The newest available iOS runtime (iOS 26.5 on `macos-26`, iOS 26.2 on
 `macos-15`) and an iPhone 17 Pro device type. In a private `--set` device set, create,
-boot, `bootstatus -b`, a PNG screenshot of about 2.9 MB, shutdown and delete all
-succeeded in the runner's session; `bootstatus` spent its time waiting on data
-migration. The control held: under the CoreSimulatorService deny, `simctl` reported
+boot, `bootstatus -b`, a PNG screenshot, shutdown and delete all succeeded in the
+runner's session. Two values vary from run to run. The screenshot was about 2.9 MB
+in runs `37987149882` and `37988450842` but 197564 bytes on `macos-26` in run
+`37995044432`. In the first two runs `bootstatus` spent its time waiting on data
+migration; in run `37995044432` on `macos-15` it printed `Device already booted,
+nothing to do.` The control held: under the CoreSimulatorService deny, `simctl` reported
 "CoreSimulatorService connection became invalid" and the boot failed, while the same
 boot under `(allow default)` succeeded. After the delete: 0 `launchd_sim` processes, 0
 entries left in the device set.
