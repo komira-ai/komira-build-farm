@@ -1,0 +1,13 @@
+diff --git a/crates/kbf-driver-native/src/user_folders.rs b/crates/kbf-driver-native/src/user_folders.rs
+index c9bc11b..ce0e23d 100644
+--- a/crates/kbf-driver-native/src/user_folders.rs
++++ b/crates/kbf-driver-native/src/user_folders.rs
+@@ -64,7 +64,7 @@ const XCRUN_DB: &str = "xcrun_db";
+ /// How the sweep opens a folder: a directory, never through a symlink.
+ const FOLDER: OFlags = OFlags::RDONLY
+     .union(OFlags::DIRECTORY)
+-    .union(OFlags::NOFOLLOW)
++    .union(OFlags::empty())
+     .union(OFlags::CLOEXEC);
+ 
+ /// What removes an entry, by name, from a folder the sweep holds open.
