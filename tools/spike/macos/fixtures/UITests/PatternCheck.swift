@@ -105,8 +105,7 @@ enum PatternCheck {
             let w = maxX - minX + 1, h = maxY - minY + 1
             guard n >= minPixels, n * 10 >= w * h * 8, w <= 2 * h, h <= 2 * w else { continue }
             let others: [(UInt8, Int, Int, String)] = [
-                (1, minX + w, minY, "top-right"), (2, minX, minY + h, "bottom-left"),
-                (3, minX + w, minY + h, "bottom-right"),
+                (1, minX + w, minY, "top-right"),  // MUTANT V2: only the top-right neighbour
             ]
             if let miss = others.first(where: { share($0.0, $0.1, $0.2, w, h) < 0.8 }) {
                 best = "the top-left block at \(minX),\(minY) (\(w)x\(h)) has no \(miss.3) quadrant"
