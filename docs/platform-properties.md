@@ -165,6 +165,24 @@ platform(
 )
 ```
 
+## `ios.device` (planned)
+
+**Planned, not on `main`:** today `ios.device` is a name kbf does not know, so it is not
+acted on and an action that sends it may run on any worker, Linux included. The design
+is in [ios-devices.md](design/ios-devices.md):
+
+| Property | Values | Effect (planned) |
+|---|---|---|
+| `ios.device` | `1` | Books one USB-attached iPhone or iPad on a Mac for the lease alone; the action finds its UDID in `KBF_IOS_DEVICE_ID`. |
+| `ios.device.class` | `iPhone`, `iPad` | Exact. |
+| `ios.device.product_type` | a model identifier (`iPhone17,3`) | Exact. |
+| `ios.device.os_version` | an iOS version | Exact. |
+| `ios.device.os_build` | an iOS build | Exact. |
+
+One device must satisfy every `ios.device.*` key. An attribute key without
+`ios.device=1` will be refused, as will `ios.device` with `kbf-lease=vm` or
+`whole_machine`.
+
 ## What an action on a Mac may write
 
 The native driver runs every action on a Mac under `sandbox-exec` with a profile that

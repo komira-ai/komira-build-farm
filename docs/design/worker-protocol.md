@@ -21,7 +21,9 @@ service Worker {
   [Node identity](#node-identity-and-the-deny-list)).
 - **No blob bytes on this stream.** A daemon reads inputs and writes outputs through the
   REAPI `ByteStream` service on separate connections. The session carries only small
-  control messages.
+  control messages. Moving blob transfer onto the mutual-TLS worker listener, so a
+  daemon needs no path to REAPI, is **planned** (see
+  [Security model](../../ARCHITECTURE.md#security-model)).
 - **Versions.** The server accepts protocol versions N-1 and N. Version 1 is the first,
   so today it accepts exactly 1. Fields and messages may be added within a version as
   long as a peer that ignores them keeps working.
@@ -395,7 +397,10 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
+- `Start.device_id` (field 8): the one iOS device booked for the lease, and
+  `NodeStatus.devices`: every iOS device the node knows, with its state and fix
+  ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
-- With many servers: the daemon dials the farm's one address and may learn the current
-  server list from the first server it reaches; the front relays the session to the
-  scheduler's leader.
+- With many servers: the daemon dials the worker listeners' one address and may learn
+  the current server list from the first server it reaches; that server relays the
+  session to the scheduler's leader.

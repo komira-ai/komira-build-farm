@@ -17,6 +17,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (**planned**) |
 | [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
+| [macos-vm-guests.md](docs/design/macos-vm-guests.md) | a VM guest's first-boot setup, capture inside the guest, guest networking, image identity (recipe and content digests), the VM helper's uid and signing, the probes a real Mac must run (**planned**) |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
 | [mdm-backend.md](docs/design/mdm-backend.md) | MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
 
@@ -69,10 +70,13 @@ role (`--role=all`). The flags are:
 **`kbf-daemon`** (crate `kbf-daemon`) runs on each worker machine. It opens one
 outbound mutual-TLS stream to a server, reports what the machine is, heartbeats, and
 runs the leases the server starts. It never listens on a port. Execution goes through
-a `Runtime` trait; the container driver (crate `kbf-driver-container`) implements it
-with rootless Podman. The `kbf-daemon` binary itself offers only a fake runtime today,
-because the driver crate depends on the daemon crate and Cargo refuses the cycle a
-binary naming it would create; wiring the driver into a shipped binary is **planned**.
+a `Runtime` trait, and the binary's `--driver` flag picks the implementation:
+`container` runs each action in a fresh rootless Podman container (crate
+`kbf-driver-container`, Linux only), `native` runs it as plain processes, for Macs
+(crate `kbf-driver-native`), and `fake` runs nothing, for bring-up. The binary is built
+from crate `kbf-node`, not from the `kbf-daemon` library crate, because the drivers
+depend on that library and a binary in it that named them would be a cycle Cargo
+refuses.
 
 ## Crates
 
@@ -96,6 +100,8 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
+| `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
+| `kbf-node` | no | the `kbf-daemon` binary: flags, and the driver `--driver` names |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)) |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user and admits an administrator only with the MDM gate's signed grant ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
@@ -216,8 +222,16 @@ keeps one rule: a client sees one address, whatever number of servers stand behi
 - **One name for the farm.** Bazel and Buck2 are configured with one remote address.
   Buck2 sends everything to that one address, so the farm must look like one
   endpoint. The deployment puts one virtual address (or one DNS name) in front of all
-  servers; a plain layer-4 balancer is enough, because every server can answer every
-  request.
+  servers. That front terminates the clients' TLS with a certificate for the farm's
+  name and passes requests on in plain text; it routes nothing by content, because
+  every server can answer every request (see [Security model](#security-model)).
+  Daemons' worker streams do not go through it: `kbf-daemon --server` names the
+  worker listener, which keeps its own mutual TLS end to end. With several servers,
+  the worker listeners sit behind their own address, and a plain layer-4 balancer is
+  enough there, because it passes the TLS through untouched and every server can
+  answer every daemon. Today a daemon's blob reads and writes still reach REAPI
+  through `--cas`, normally via the front; moving them onto the worker listener is
+  planned.
 - **Any server answers.** A server process holds no farm state of its own, only
   handles to shared state: the metadata state machine and the scheduler's control
   log, each replicated by Raft across a small set of voting servers. A server that is
@@ -231,15 +245,65 @@ keeps one rule: a client sees one address, whatever number of servers stand behi
 - **Locality comes from placement.** A balancer cannot see what a request is about, so
   kbf gets locality inside: daemons report which inputs they hold, and placement
   prefers a worker that already has an action's inputs.
-- **Daemons need one address too.** A daemon dials the farm's name, registers, and can
-  learn the current server list from committed state.
+- **Daemons need one address too.** A daemon dials the worker listeners' one address,
+  registers, and can learn the current server list from committed state.
 
 What already holds for this model in the single-node code: the seams above, lease ids
 that carry the leader's term, a scheduler that refuses results from stale leases,
 and a daemon protocol in which only the newest stream of a worker counts. See
 [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
-## Security model, today
+## Security model
+
+Build clients and daemons reach `kbf-server` by different paths, and each path has its
+own protection.
+
+**Build clients go through a front.** TLS for Bazel and Buck2 ends at a front that
+holds a real certificate for the farm's client-facing name: a load balancer, or a
+proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. `kbf-server`
+has no TLS of its own on the REAPI listener and none is planned. It serves REAPI as
+plain-text gRPC behind the front, bound to loopback (front on the same host) or to
+the mesh interface, whose traffic WireGuard already encrypts.
+
+- **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
+  text, checks no credential and accepts any bind address. Whoever reaches the port
+  can read action inputs and outputs, write the CAS and Execute actions.
+- **Planned:** bearer-token authentication, checked by `kbf-server` itself behind the
+  front; the front passes the `Authorization` header through and does not check it.
+  The caller's identity decides its role. A peer address does not identify a caller
+  here: a proxy on the same host connects from loopback, whoever its client is.
+- **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
+  bind that other machines could reach, and allows the front's hop: loopback, or an
+  address the operator names as the front's.
+- **A front that works: `tailscale serve` in HTTPS mode.** A probe with
+  `tailscale serve` 1.102.4 ran its HTTPS mode (`tailscale serve --https=<port>
+  http://127.0.0.1:<reapi>`) in front of a plain-text REAPI listener on loopback.
+  That version has no `h2c://` backend scheme; the `http://` backend carried gRPC.
+  Through it, over TLS, these all worked: GetCapabilities, FindMissingBlobs, a 64 MiB
+  ByteStream write and read back with a matching sha256, BatchUpdateBlobs and
+  BatchReadBlobs (up to 1 MiB each), Execute, and WaitExecution on a finished action.
+  A Buck2 remote-only build got through capabilities, uploads and Execute (the probe's
+  fake driver wrote no outputs, so the action itself failed on missing outputs).
+  Configuring `tailscale serve` needs root or a Tailscale operator on the host.
+  `kbf-server` sees every such connection as coming from loopback. The HTTPS mode can
+  add Tailscale identity headers (such as `Tailscale-User-Login`; not tested by the
+  probe); `kbf-server` does not read them.
+- **Not supported for REAPI: `tailscale serve`'s TLS-terminated TCP mode**
+  (`--tls-terminated-tcp`). Its certificate verifies, but it negotiates no ALPN, and
+  gRPC clients require `h2`. Buck2 fails with "HTTP/2 was not negotiated"; gRPC's C
+  core (for example Python `grpcio`) fails with "Cannot check peer: missing selected
+  ALPN property".
+- **Long silent streams.** Through the HTTPS front above, a queued Execute and a
+  WaitExecution stream for an action no node could run carried no messages for 300 s;
+  both then ended with `FAILED_PRECONDITION` when `--unservable-wait-secs=300` failed
+  the action. That front did not cut them. Another front whose idle timeout is shorter
+  than the longest queue wait would cut these streams.
+
+**Daemons' worker streams do not go through the front.** A daemon's `--server` (the
+flag's help calls it "the kbf-server front") is the worker listener's address, not the
+client front above. The worker listener keeps its own mutual TLS end to end, so with
+several servers only a layer-4 balancer that passes TLS through can stand in front of
+it. Blob traffic is different today; see the last point below.
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key
@@ -249,8 +313,14 @@ and a daemon protocol in which only the newest stream of a worker counts. See
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
-- The REAPI listener has no TLS and no authentication yet (**planned**: TLS and
-  bearer-token authentication, with the caller's identity deciding its role).
+- Blob bytes do not travel on the worker stream yet. Today a daemon's real drivers
+  read inputs and write outputs through the REAPI listener that `--cas` names
+  (`http://` or `https://`), normally through the front, so a daemon still needs a
+  path to REAPI. **Planned:** daemons fetch and upload blobs over the mutual-TLS
+  worker listener, so they need neither the front nor a REAPI token.
+
+**Inside the farm:**
+
 - Only the daemon path writes the action cache, and the metadata state machine itself
   refuses an action-cache write from any role but `Daemon`.
 - Actions run without network (`--network=none`) in rootless containers, as described
@@ -284,7 +354,9 @@ branches rise. How the code is tested:
   hosted runners, on x86-64 and arm64.
 - **End to end.** The `integration` workflow starts a cell (an S3 store, one
   `kbf-server`, one daemon) and builds sample projects with pinned Bazel and Buck2
-  versions, remote-only, twice; the second build must be all remote cache hits. Its
+  versions, remote-only, twice; the second build must be all remote cache hits. A
+  Buck2 action that sleeps then holds a lease in flight while the node is drained
+  through the operator API, which must list that lease. Its
   daemon uses a test-only runtime that runs actions as plain processes, so it proves
   the protocol and the cache path, not isolation.
 - **Repository lints.** Workflows may only use hosted runners and pinned actions from
