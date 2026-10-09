@@ -219,7 +219,13 @@ keeps one rule: a client sees one address, whatever number of servers stand behi
   servers. That front terminates the clients' TLS with a certificate for the farm's
   name and passes requests on in plain text; it routes nothing by content, because
   every server can answer every request (see [Security model](#security-model)).
-  Daemons do not go through it: the worker listener keeps its own mutual TLS.
+  Daemons' worker streams do not go through it: `kbf-daemon --server` names the
+  worker listener, which keeps its own mutual TLS end to end. With several servers,
+  the worker listeners sit behind their own address, and a plain layer-4 balancer is
+  enough there, because it passes the TLS through untouched and every server can
+  answer every daemon. Today a daemon's blob reads and writes still reach REAPI
+  through `--cas`, normally via the front; moving them onto the worker listener is
+  planned.
 - **Any server answers.** A server process holds no farm state of its own, only
   handles to shared state: the metadata state machine and the scheduler's control
   log, each replicated by Raft across a small set of voting servers. A server that is
@@ -233,8 +239,8 @@ keeps one rule: a client sees one address, whatever number of servers stand behi
 - **Locality comes from placement.** A balancer cannot see what a request is about, so
   kbf gets locality inside: daemons report which inputs they hold, and placement
   prefers a worker that already has an action's inputs.
-- **Daemons need one address too.** A daemon dials the farm's name, registers, and can
-  learn the current server list from committed state.
+- **Daemons need one address too.** A daemon dials the worker listeners' one address,
+  registers, and can learn the current server list from committed state.
 
 What already holds for this model in the single-node code: the seams above, lease ids
 that carry the leader's term, a scheduler that refuses results from stale leases,
@@ -274,8 +280,8 @@ the mesh interface, whose traffic WireGuard already encrypts.
   fake driver wrote no outputs, so the action itself failed on missing outputs).
   Configuring `tailscale serve` needs root or a Tailscale operator on the host.
   `kbf-server` sees every such connection as coming from loopback. The HTTPS mode can
-  add Tailscale identity headers (such as `Tailscale-User-Login`); `kbf-server` does
-  not read them.
+  add Tailscale identity headers (such as `Tailscale-User-Login`; not tested by the
+  probe); `kbf-server` does not read them.
 - **Not supported for REAPI: `tailscale serve`'s TLS-terminated TCP mode**
   (`--tls-terminated-tcp`). Its certificate verifies, but it negotiates no ALPN, and
   gRPC clients require `h2`. Buck2 fails with "HTTP/2 was not negotiated"; gRPC's C
@@ -287,8 +293,11 @@ the mesh interface, whose traffic WireGuard already encrypts.
   the action. That front did not cut them. Another front whose idle timeout is shorter
   than the longest queue wait would cut these streams.
 
-**Daemons do not go through the front.** The worker listener keeps its own mutual TLS
-end to end:
+**Daemons' worker streams do not go through the front.** A daemon's `--server` (the
+flag's help calls it "the kbf-server front") is the worker listener's address, not the
+client front above. The worker listener keeps its own mutual TLS end to end, so with
+several servers only a layer-4 balancer that passes TLS through can stand in front of
+it. Blob traffic is different today; see the last point below.
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key
@@ -300,9 +309,9 @@ end to end:
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
 - Blob bytes do not travel on the worker stream yet. Today a daemon's real drivers
   read inputs and write outputs through the REAPI listener that `--cas` names
-  (`http://` or `https://`), so a daemon still needs a path to REAPI. **Planned:**
-  daemons fetch and upload blobs over the mutual-TLS worker listener, so they need
-  neither the front nor a REAPI token.
+  (`http://` or `https://`), normally through the front, so a daemon still needs a
+  path to REAPI. **Planned:** daemons fetch and upload blobs over the mutual-TLS
+  worker listener, so they need neither the front nor a REAPI token.
 
 **Inside the farm:**
 

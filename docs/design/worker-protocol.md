@@ -401,6 +401,6 @@ daemon restarts and server restarts:
   `NodeStatus.devices`: every iOS device the node knows, with its state and fix
   ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
-- With many servers: the daemon dials the farm's one address and may learn the current
-  server list from the first server it reaches; the front relays the session to the
-  scheduler's leader.
+- With many servers: the daemon dials the worker listeners' one address and may learn
+  the current server list from the first server it reaches; that server relays the
+  session to the scheduler's leader.
