@@ -76,9 +76,11 @@
 //!   writes it: on macOS the sandbox keeps actions out of it. On Linux an action, which
 //!   runs as the daemon's user, can write a well-formed record there naming a group of
 //!   that user (its pid and start time are readable in `/proc`), and the next start
-//!   SIGKILLs that group. What is not a regular file of the daemon's user is set aside
-//!   unread, and another user's processes are never counted as the daemon's, so a
-//!   forged entry cannot stop or hang a start.
+//!   SIGKILLs that group and every process below it. What is not a regular file of the
+//!   daemon's user is set aside unread, a record naming the daemon's own group or its
+//!   parent's is dropped unread, and neither another user's processes nor those the
+//!   daemon never signals ([`procs::Guards`]) are counted as survivors, so a forged entry
+//!   cannot stop or hang a start.
 //! - **Network "off" is not airtight**: Unix sockets stay open, the system resolver's
 //!   among them, so DNS lookups still leave the node and can carry data ([`network`]).
 //!

@@ -11,7 +11,10 @@
 //! else's, so nothing is signalled. Processes of the daemon's own that survive SIGKILL
 //! for the kill wait stop the daemon from starting, with their pids: starting would let
 //! the scheduler run the same work beside them. Processes it may not signal (another
-//! user's) are not its actions: they are logged and their record dropped.
+//! user's) are not its actions: they are logged and their record dropped. So is a
+//! record naming the daemon's own group or its parent's, unread, and any process below
+//! a recorded group that the daemon never signals ([`procs::Guards`]: its parent, a
+//! member of either group).
 //!
 //! The records are trusted to be the daemon's: an entry of `runs/` that is not a
 //! regular file of the daemon's user (a FIFO, a directory, a symlink) is moved aside
@@ -41,7 +44,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::procs::{self, Proc, Tracker};
+use crate::procs::{self, Guards, Proc, Tracker};
 use crate::record::{MAX_RECORD_BYTES, RUNS, Record};
 use crate::runtime::KILL_PAUSE;
 
@@ -49,23 +52,27 @@ use crate::runtime::KILL_PAUSE;
 /// not remove.
 pub const QUARANTINE: &str = "quarantine";
 
-/// How the sweep reads the process table: a snapshot, and whether a pid is one this
-/// process may signal (`kill(pid, 0)`).
+/// How the sweep reads the process table: a snapshot, whether a pid is one this
+/// process may signal (`kill(pid, 0)`), and what the daemon never signals.
 pub(crate) struct Table<'a> {
     pub snapshot: &'a dyn Fn() -> io::Result<Vec<Proc>>,
     pub ours: &'a dyn Fn(i32) -> bool,
+    pub guards: &'a dyn Fn() -> Guards,
 }
 
 /// The process table as the kernel shows it.
 pub(crate) const SYSTEM: Table<'static> = Table {
     snapshot: &procs::snapshot,
     ours: &signalable,
+    guards: &Guards::now,
 };
 
-/// Whether this process may signal `pid` (`kill(pid, 0)` succeeds).
+/// Whether this process may signal `pid`: `kill(pid, 0)` is not refused (EPERM). A pid
+/// that is gone (ESRCH) is not another user's.
 fn signalable(pid: i32) -> bool {
     // SAFETY: kill(2) with signal 0 only checks; it takes plain integers.
-    unsafe { libc::kill(pid, 0) == 0 }
+    let checked = unsafe { libc::kill(pid, 0) };
+    checked == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
 }
 
 /// Ends every recorded action (waiting at most `wait` for each to die, reading the
@@ -142,6 +149,7 @@ fn end_recorded(scratch: &Path, wait: Duration, table: &Table<'_>) -> io::Result
         };
     let boot = crate::record::boot_id()?;
     let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+    let guards = (table.guards)();
     let mut survivors = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
         let record = match read_record(&path) {
@@ -152,20 +160,25 @@ fn end_recorded(scratch: &Path, wait: Duration, table: &Table<'_>) -> io::Result
             }
         };
         match record {
-            Some(record) if record.boot == boot => {
+            Some(record) if record.boot != boot => {
+                tracing::warn!(record = %path.display(), "removing a run record of an earlier boot")
+            }
+            // No action leads the daemon's own group or its parent's; the tree below
+            // either holds what the daemon never signals.
+            Some(record) if !guards.may_signal_group(record.pgid) => {
+                tracing::error!(record = %path.display(), pgid = record.pgid, "a run record names the daemon's own group or its parent's; not an action's, left alone")
+            }
+            Some(record) => {
                 tracing::warn!(record = %path.display(), pgid = record.pgid, "ending a run left behind");
                 let tracker = Tracker::resume(record.pgid, record.start, me);
-                let (left, foreign) = end_group(tracker, wait, table)?;
-                if !foreign.is_empty() {
-                    tracing::error!(record = %path.display(), ?foreign, "a run record names processes of another user; not the daemon's, left alone");
+                let (left, spared) = end_group(tracker, wait, table, guards)?;
+                if !spared.is_empty() {
+                    tracing::error!(record = %path.display(), ?spared, "a run record names processes the daemon may not signal (another user's, its parent, or in its own or its parent's group); not its actions, left alone");
                 }
                 if !left.is_empty() {
                     survivors.push(format!("{} ({left:?})", path.display()));
                     continue;
                 }
-            }
-            Some(_) => {
-                tracing::warn!(record = %path.display(), "removing a run record of an earlier boot")
             }
             None => tracing::warn!(record = %path.display(), "removing a torn run record"),
         }
@@ -242,28 +255,30 @@ fn set_aside(path: &Path, quarantine: &Path, why: &io::Error) {
     }
 }
 
-/// Kills every process of `tracker`'s action this process may signal until a snapshot
-/// shows none alive, or `wait` has passed. Returns the pids of its own still alive then,
-/// and of every process it found that it may not signal (another user's).
+/// Kills every process of `tracker`'s action this process may signal and `guards`
+/// allow until a snapshot shows none alive, or `wait` has passed. Returns the pids of
+/// those still alive then, and of every process it found and spared (another user's,
+/// or one the guards refuse).
 fn end_group(
     mut tracker: Tracker,
     wait: Duration,
     table: &Table<'_>,
+    guards: Guards,
 ) -> io::Result<(Vec<i32>, BTreeSet<i32>)> {
     let give_up = Instant::now() + wait;
-    let mut foreign = BTreeSet::new();
+    let mut spared = BTreeSet::new();
     loop {
         let (own, other): (Vec<Proc>, Vec<Proc>) = tracker
             .members(&(table.snapshot)()?)
             .into_iter()
-            .partition(|p| (table.ours)(p.pid));
-        foreign.extend(other.iter().map(|p| p.pid));
+            .partition(|p| guards.may_kill(p) && (table.ours)(p.pid));
+        spared.extend(other.iter().map(|p| p.pid));
         if own.is_empty() {
-            return Ok((Vec::new(), foreign));
+            return Ok((Vec::new(), spared));
         }
         procs::kill_all(&tracker, &own);
         if Instant::now() >= give_up {
-            return Ok((own.iter().map(|p| p.pid).collect(), foreign));
+            return Ok((own.iter().map(|p| p.pid).collect(), spared));
         }
         std::thread::sleep(KILL_PAUSE);
     }
@@ -520,6 +535,7 @@ mod tests {
         let ours = Table {
             snapshot: &snapshot,
             ours: &|_| true,
+            guards: &Guards::now,
         };
         let why = end_recorded(&dir, Duration::from_millis(30), &ours)
             .expect_err("survivors")
@@ -532,6 +548,7 @@ mod tests {
         let unreadable = Table {
             snapshot: &|| Err(io::Error::other("no process table")),
             ours: &|_| true,
+            guards: &Guards::now,
         };
         let why = end_recorded(&dir, WAIT, &unreadable).expect_err("no table");
         assert_eq!(why.to_string(), "no process table");
@@ -559,6 +576,7 @@ mod tests {
         let theirs = Table {
             snapshot: &snapshot,
             ours: &|_| false,
+            guards: &Guards::now,
         };
         end_recorded(&dir, WAIT, &theirs).expect("not the daemon's");
         assert_eq!(runs_left(&dir), 0, "the record is dropped");
@@ -642,5 +660,70 @@ mod tests {
     fn only_the_daemons_own_entries_are_read() {
         let why = ours(Path::new("/"), std::fs::FileType::is_dir).expect_err("root's");
         assert!(why.to_string().contains("owned by uid 0"), "{why}");
+    }
+
+    /// Catches a pid that exited between the snapshot and the check taken for another
+    /// user's (logged as foreign): only EPERM says a process is not the daemon's.
+    #[test]
+    fn a_pid_that_is_gone_is_not_another_users() {
+        assert!(signalable(2_000_000_041), "ESRCH");
+        let me = i32::try_from(std::process::id()).expect("pid");
+        assert!(signalable(me));
+    }
+
+    /// Catches a record naming the daemon's own group or its parent's (forged: on Linux
+    /// an action can read both in `/proc`) followed at all: walking that group's tree
+    /// reaches the parent's other children, and its members, which the daemon never
+    /// signals, would outlive the kill wait and stop the start ("the guarded group is
+    /// walked" mutant). Also a process below a recorded group that the daemon never
+    /// signals (its parent, a member of its own group) counted as a survivor ("guarded
+    /// processes are survivors" mutant). The pids are above any kernel's limit.
+    #[test]
+    fn what_the_daemon_never_signals_neither_stops_the_start_nor_is_walked() {
+        let dir = scratch("guarded");
+        let boot = crate::record::boot_id().expect("boot");
+        let guards = Guards {
+            own_group: 2_000_000_021,
+            parent: 2_000_000_030,
+            parent_group: 2_000_000_022,
+        };
+        let g = |pid, ppid, pgid, zombie| Proc {
+            pid,
+            ppid,
+            pgid,
+            start: 5,
+            zombie,
+        };
+        // Live members of both guarded groups, which a walk would find and not kill;
+        // and an action's group (its leader a zombie) with the daemon's parent and a
+        // member of the daemon's own group below it.
+        let reads = std::cell::Cell::new(0);
+        let snapshot = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![
+                g(2_000_000_021, 1, 2_000_000_021, false),
+                g(2_000_000_022, 1, 2_000_000_022, false),
+                g(2_000_000_031, 1, 2_000_000_031, true),
+                g(2_000_000_030, 2_000_000_031, 2_000_000_032, false),
+                g(2_000_000_033, 2_000_000_031, 2_000_000_021, false),
+            ])
+        };
+        let table = Table {
+            snapshot: &snapshot,
+            ours: &|_| true,
+            guards: &|| guards,
+        };
+        write_record(&dir, "lease-6-1", &format!("2000000021 5 {boot}\n"));
+        write_record(&dir, "lease-6-2", &format!("2000000022 5 {boot}\n"));
+        end_recorded(&dir, Duration::from_millis(30), &table).expect("the start goes on");
+        assert_eq!(reads.get(), 0, "a guarded group was walked");
+        assert_eq!(runs_left(&dir), 0, "the records are dropped");
+
+        // Below the action's group, neither the parent nor the member of the daemon's
+        // own group is killed or a survivor.
+        write_record(&dir, "lease-6-3", &format!("2000000031 5 {boot}\n"));
+        end_recorded(&dir, Duration::from_millis(30), &table).expect("not survivors");
+        assert_eq!(reads.get(), 1, "the action's group was walked once");
+        assert_eq!(runs_left(&dir), 0, "the record is dropped");
     }
 }

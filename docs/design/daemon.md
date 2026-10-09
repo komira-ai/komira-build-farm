@@ -93,9 +93,10 @@ them before it says `Hello` (issue #155), as part of building its driver:
   it, again until none is alive), then removes the record, then the lease directories.
   A record of an earlier boot, or whose pid now names a process with another start
   time, names nothing that runs, so nothing is signalled. The daemon never signals its
-  own group, its parent or its parent's group, nor a group id of 1 or less. Processes
-  of its own user that survive SIGKILL for the kill wait stop the daemon from starting;
-  processes of another user named by a record are not its actions, and the record is
+  own group, its parent or its parent's group, nor a group id of 1 or less: a record
+  naming either group is dropped unread. Processes of its own user that survive SIGKILL
+  for the kill wait stop the daemon from starting; processes of another user, and those
+  it never signals, found below a recorded group are not its actions, and the record is
   dropped. An entry of `runs/` that is not a regular file of the daemon's user (a FIFO,
   a directory, a symlink), or a `runs` that is not its directory, is moved aside into
   `quarantine/` unread, and the start goes on.
@@ -132,7 +133,8 @@ guaranteed:
   `runs/`. On macOS the sandbox ensures it. On Linux there is no sandbox until each
   lease runs as its own user, so an action, which runs as the daemon's user, can write
   a well-formed record there naming a group of that user, with its pid and start time
-  (both readable in `/proc`), and the next start then SIGKILLs that group.
+  (both readable in `/proc`), and the next start then SIGKILLs that group and every
+  process below it.
 - **Results.** A result the killed daemon had not had acknowledged is lost (results are
   kept in memory only), and its lease is requeued.
 
