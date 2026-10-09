@@ -11,7 +11,8 @@ use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-daemon");
 
 /// Catches: a binary that fails to start, exits non-zero on `--version`, or reports a
-/// name or version other than its own package's.
+/// name or version other than its own package's and the commit it was built from
+/// (issue #170).
 #[test]
 fn prints_name_and_version_and_exits_zero() {
     let out = Command::new(BIN).arg("--version").output().expect("spawn");
@@ -21,10 +22,13 @@ fn prints_name_and_version_and_exits_zero() {
         out.status
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout is UTF-8");
-    assert_eq!(
-        stdout,
-        format!("kbf-daemon {}\n", env!("CARGO_PKG_VERSION"))
-    );
+    let prefix = format!("kbf-daemon {}+", env!("CARGO_PKG_VERSION"));
+    let commit = stdout
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("{stdout:?} is not {prefix}<commit>"));
+    assert_eq!(commit.len(), 12, "{stdout:?}");
+    assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{stdout:?}");
 }
 
 /// Catches: a binary that runs without its required flags instead of refusing them,
@@ -92,9 +96,11 @@ fn base(dir: &Path) -> Vec<String> {
     ]
 }
 
-/// Starts the daemon with `extra` flags, waits until its session loop has failed to
-/// connect once (so detection, the driver and the TLS files all worked), then sends
-/// SIGTERM and returns its exit status.
+/// Starts the daemon with `extra` flags, its stderr a pipe, waits until its session
+/// loop has failed to connect once (so detection, the driver and the TLS files all
+/// worked), then sends SIGTERM and returns its exit status. Checks the log on the way
+/// (issue #170): no terminal escape codes, since stderr is not a terminal, and the
+/// failed connection's cause under tonic's bare `transport error`.
 fn runs_until_sigterm(name: &str, extra: &[String]) -> std::process::ExitStatus {
     let dir = tls(name);
     let mut child = Command::new(BIN)
@@ -129,6 +135,19 @@ fn runs_until_sigterm(name: &str, extra: &[String]) -> std::process::ExitStatus 
     assert!(
         rest.iter().any(|l| l.contains("SIGTERM: shutting down")),
         "{rest:#?}"
+    );
+    let all: Vec<&String> = log.iter().chain(&rest).collect();
+    assert!(
+        all.iter().all(|l| !l.contains('\u{1b}')),
+        "escape codes in a log that is not a terminal: {all:#?}"
+    );
+    let ended = log
+        .iter()
+        .find(|l| l.contains("session ended"))
+        .expect("seen");
+    assert!(
+        ended.contains("connect: transport error: ") && ended.contains("refused"),
+        "no cause: {ended}"
     );
     status
 }

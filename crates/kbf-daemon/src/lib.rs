@@ -42,6 +42,12 @@ pub mod tree;
 pub mod usage;
 mod window;
 
+/// The daemon's version as it reports it (`daemon_version` in `Hello` and
+/// `NodeStatus`, which `GET /v1/nodes` shows): the package version, `+`, and the
+/// commit it was built from (12 hex digits), or `unknown` when the build had no git
+/// checkout (issue #170). `build.rs` embeds the commit.
+pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
+
 pub use cas::{Cas, CasClient, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{Args, DaemonConfig, FENCE_AFTER, RECHECK_EVERY, TlsFiles};
@@ -51,3 +57,28 @@ pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use report::NodeReport;
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
 pub use status::DriverReport;
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::DAEMON_VERSION;
+
+    /// Catches (issue #170): a version that names the package version alone, so two
+    /// builds of it read the same in `/v1/nodes`; and a commit that is not this
+    /// checkout's (the build script fell back to `unknown`, or embedded another).
+    #[test]
+    fn the_version_names_the_commit_built() {
+        let (package, commit) = DAEMON_VERSION.split_once('+').expect("a + in the version");
+        assert_eq!(package, env!("CARGO_PKG_VERSION"));
+        let head = Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .expect("git runs");
+        assert!(head.status.success(), "the tests run in a git checkout");
+        let head = String::from_utf8(head.stdout).expect("UTF-8");
+        assert_eq!(commit, head.trim());
+        assert_eq!(commit.len(), 12, "{commit}");
+        assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{commit}");
+    }
+}

@@ -75,7 +75,7 @@ async fn node_status_follows_every_welcome() {
             panic!("expected one NodeStatus before the first Heartbeat: {seen:?}");
         };
         assert_eq!(*status, want);
-        assert_eq!(status.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(status.daemon_version, kbf_daemon::DAEMON_VERSION);
         assert!(
             status.xcode_builds.is_empty(),
             "the fake driver reports no Xcode"

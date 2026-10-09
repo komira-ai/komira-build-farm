@@ -61,7 +61,7 @@ impl Software {
             os_version: self.os_version.clone(),
             os_build: self.os_build.clone(),
             kernel: self.kernel.clone(),
-            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            daemon_version: crate::DAEMON_VERSION.to_owned(),
             xcode_builds: report
                 .capabilities()
                 .iter()
@@ -263,7 +263,7 @@ mod tests {
         let status = software.status(&report);
         assert_eq!(status.xcode_builds, ["15F31d", "16C5032a"]);
         assert_eq!(status.os_name, "macOS");
-        assert_eq!(status.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(status.daemon_version, crate::DAEMON_VERSION);
         assert_eq!(report, before);
     }
 

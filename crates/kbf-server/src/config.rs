@@ -93,6 +93,12 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
+    /// disconnect after their open Execute and WaitExecution streams are ended
+    /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
+    /// off when it runs out.
+    #[arg(long, default_value_t = 10)]
+    pub shutdown_timeout_secs: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -168,6 +174,7 @@ impl Args {
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
+            shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
         })
     }
 

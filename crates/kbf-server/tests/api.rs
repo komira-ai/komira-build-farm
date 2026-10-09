@@ -90,6 +90,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        shutdown_timeout: Duration::from_secs(10),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let shutdown = async move {
@@ -325,6 +326,7 @@ async fn an_api_address_in_use_is_refused() {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        shutdown_timeout: Duration::from_secs(10),
     };
     let api = Api {
         listen: addr,
@@ -781,7 +783,9 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     let (_, raised) = logged(|| farm.node_status(&node, stream, mac_status()));
     assert_eq!(
         raised,
-        [format!("WARN kbf_server::attention: node mac-1: {NOT_READY}")]
+        [format!(
+            "WARN kbf_server::attention: node mac-1: {NOT_READY}"
+        )]
     );
     let (_, repeated) = logged(|| farm.node_status(&node, stream, mac_status()));
     assert_eq!(repeated, Vec::<String>::new());
@@ -790,6 +794,8 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     let (_, cleared) = logged(|| farm.node_status(&node, stream, accepted));
     assert_eq!(
         cleared,
-        [format!("INFO kbf_server::attention: node mac-1: resolved: {NOT_READY}")]
+        [format!(
+            "INFO kbf_server::attention: node mac-1: resolved: {NOT_READY}"
+        )]
     );
 }

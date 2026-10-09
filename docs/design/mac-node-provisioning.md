@@ -705,8 +705,11 @@ server with `sntp` (read-only) and fails above an offset the profile names.
 
 ### 5.7 Logs (partly planned)
 
-Today `kbf-daemon` writes human-readable `tracing` lines to stderr, and launchd writes
-stderr to the file `StandardErrorPath` names.
+Today `kbf-daemon` writes human-readable `tracing` lines to stderr (without terminal
+color codes unless stderr is a terminal), and launchd writes stderr to the file
+`StandardErrorPath` names. The daemon does not rotate that file: it grows by about
+0.6 KB per lease, and the deployment job empties it at each restart and upgrade (below).
+On Linux under systemd, stderr goes to the journal, which rotates by its own limits.
 
 - **Planned:** `--log-format json` and `--log-dir DIR` (daily files, a kept count). The
   daemon then owns its own rotation.
