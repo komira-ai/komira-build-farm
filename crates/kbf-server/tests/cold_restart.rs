@@ -106,7 +106,8 @@ async fn a_cold_restart_forgets_cordons_and_drains_and_says_so() {
     let after = before.cold_restart().await;
 
     let api = after.api.expect("an API");
-    assert_eq!(get(api, "/v1/nodes").await, (200, json!({ "nodes": [] })));
+    let (code, nodes) = get(api, "/v1/nodes").await;
+    assert_eq!((code, &nodes["nodes"]), (200, &json!([])), "{nodes}");
     assert_eq!(get(api, "/v1/rollouts").await.0, 404);
 
     let mut a = after.daemon("node-a", 4, 8).await;
