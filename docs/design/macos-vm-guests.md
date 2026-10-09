@@ -139,9 +139,13 @@ The lean puts the action's execution root on the **read-write** share:
 - The **read-only** share carries only control files: the per-boot token the guest
   agent checks (section 6.2), the setup-done check's expected digest, and nothing an
   action writes.
-- `kbf-guest` writes stdout and stderr to files in the lease directory, outside the
-  execution root. After the run, the host side collects the declared outputs with
-  `kbf-outputs`, which follows no symlinks, exactly as for a bare-metal lease.
+- The guest cannot reach anything in the lease directory outside these two shares,
+  so stdout and stderr travel over the control channel (section 6.2): `kbf-guest`
+  sends them as framed chunks over the virtio socket, and `kbf-vmm` writes them to
+  two files in the lease directory, outside the execution root, stopping at the
+  stdout and stderr limits below and marking the stream as cut. A third share for
+  them is not needed. After the run, the host side collects the declared outputs
+  with `kbf-outputs`, which follows no symlinks, exactly as for a bare-metal lease.
 
 A shared directory is read-only to the guest when the host makes it so
 (`VZSharedDirectory`'s `readOnly`,
@@ -236,7 +240,7 @@ recipe digests.
 
 | Option | What moves between Macs | Licence position (no legal conclusion is drawn here) |
 |---|---|---|
-| **Build on each Mac (lean)** | nothing but the recipe; each Mac needs the `.xip` and the restore image locally | the `.xip` reaches each Mac the way [fleet-updates.md](fleet-updates.md#74-xcode-and-the-metal-toolchain) section 7.4 already plans for bare-metal Xcode, so it adds no new question about the `.xip`. A guest on the Mac's own disk is one of the two virtual copies the macOS licence allows per Mac (macos-vms.md section 2.2) **[V]** |
+| **Build on each Mac (lean)** | nothing but the recipe; each Mac needs the `.xip` and the restore image locally | the `.xip` reaches each Mac the way [fleet-updates.md](fleet-updates.md#74-xcode-and-the-metal-toolchain) section 7.4 already plans for bare-metal Xcode, so it adds no new question about the `.xip`. Whether golden images N and N-1 plus up to two running clones fit the macOS licence's limit on virtual copies per Mac is a question for the same legal review; macos-vms.md section 2.2 enforces a count of running guests **[A]** |
 | Build once, ship by digest | a built image (macOS, Xcode, runtimes) through the CAS or an object store | the Xcode licence says "You agree not to rent, lease, lend, upload to or host on any website or server ... the Apple Software", quoted in fleet-updates.md section 7.4 **[V]**. Holding an image with Xcode in it on a farm store sits against that sentence just as a `.xip` mirror does. Needs a legal review first |
 
 The lean is to build on each Mac, and so to route on the recipe digest. Whether images
@@ -262,17 +266,36 @@ restore image is newer than the host, and probe P7 checks that.
 lease's user. So each VM lease gets a lease user of its own:
 
 1. `user-create` for the lease; 2. `run` of `kbf-vmm` as that user, with the lease
-directory as its working directory; 3. at the end, `kill-uid` and `user-delete`, whose
-sweep removes what the user left.
+directory as its working directory; 3. at the end, `kill-uid`, then the driver
+deletes the lease directory (macos-vms.md section 6, step 6), then `user-delete`.
+
+On `main`, `user-delete`'s sweep covers the user's schedules (`crontab`, `at` jobs),
+the home folder and the places `SweepPlan::macos()` lists: `/Users/Shared`,
+`/private/tmp`, `/private/var/tmp`, `/private/var/folders` and two per-uid launchd
+plists (`crates/kbf-mac-session/src/sweep.rs`) **[V]**. It does not cover the daemon's lease
+directories, so it does not remove the clone; the driver must.
 
 Files:
 
 - Golden images live in a directory owned by root, files mode 0644 and directories
   0755, so every lease user can read them and none can change them.
-- `kbf-vmm` makes the clone itself, as the lease user, inside the lease directory, with
-  `clonefile` on each file. The clone is then the lease user's, on the same APFS volume
-  as the golden image (macos-vms.md section 4.3), and `user-delete`'s sweep removes it
-  with everything else the user owns.
+- The lease directory is the daemon's. Before `run`, the driver (its owner, so no
+  root is needed) adds two inherited ACL entries to it: the lease user may add files
+  and subdirectories, and the daemon's account may read and delete everything below,
+  the entry fleet-updates-security.md section S4.2 already plans for every Mac lease.
+  This is planned; nothing on `main` sets an ACL on a lease directory today.
+- `kbf-vmm` makes the clone itself, as the lease user, inside the lease directory:
+  `mkdir` for the bundle's directories (which inherit both entries) and `clonefile` on
+  each file. The clone is then the lease user's, on the same APFS volume as the golden
+  image (macos-vms.md section 4.3).
+- Removal: the driver deletes the lease directory, clone included, as the daemon's
+  account, through the inherited delete entry. Whether a `clonefile` result takes the
+  directory's inherited entry or copies the golden file's (empty) ACL is **[A]**; it
+  does not matter for deletion, which needs the delete-child right on the parent
+  directory, and the parents are directories `kbf-vmm` made. P5 checks it: after the
+  lease, the daemon's account removes the whole directory and nothing the lease user
+  made is left. If it cannot, the fallback is a change to the root helper:
+  `user-delete` also sweeps the lease directory it is given.
 - Disk: the driver checks free space for the clone's growth (about 40 GiB **[A]**)
   before `user-create`.
 
@@ -311,8 +334,9 @@ The plan:
   `com.apple.security.virtualization`; every other binary gets none, as today.
 - `sign-darwin.sh` signs with `--entitlements` only for a binary on the list, and its
   check compares the signature's entitlements to the list's set exactly: one more key,
-  one fewer, or any entitlement on an unlisted binary fails. `check-darwin-asset.sh`
-  makes the same comparison on the packaged bytes.
+  one fewer, or any entitlement on an unlisted binary fails. A new check in
+  `check-darwin-asset.sh` makes the same comparison on the packaged bytes; the script
+  compares no entitlements today.
 - Planted defects the later PR must show red: an allow list that lets any entitlement
   through; `kbf-daemon` signed with the virtualization entitlement; `kbf-vmm` with one
   extra key.
@@ -374,7 +398,8 @@ None of these can run on GitHub's hosted macOS runners, which cannot boot a macO
 probe, and is recorded with its command, its output and the host's macOS and Xcode
 builds. None needs a person at the console. Hosted runners do prove what needs no
 guest: `kbf-guest` as a LaunchAgent in the runner's own GUI session, the signing allow
-list, and `isSupported` being false inside a VM (a real negative).
+list, and, if a run shows it, `isSupported` being false inside a VM (a real negative)
+**[A]** until a hosted run prints it.
 
 | Probe | Question | Shape | Root on the host |
 |---|---|---|---|
@@ -383,7 +408,7 @@ list, and `isSupported` being false inside a VM (a real negative).
 | P2 | Does a third running guest fail with `VZErrorVirtualMachineLimitExceeded`, and does a `kbf-vmm` killed with `SIGKILL` free its slot? | boot two, try a third; kill one helper with -9, boot again within a bound | no |
 | P3 | Does a network-off guest have no interface but `lo0`, and what can a NAT guest reach? | `ifconfig -l` in each; a NAT guest's reach to the host and the farm network recorded | no |
 | P4 | Boot time, idle guest memory, clone growth over one XCUITest run, virtiofs throughput for a build step | timed boots, `vm_stat` in the guest, the clone's allocated size | no |
-| P5 | Does a VM start from a launch daemon's `kbf-mac-session run` child, as a lease user, with nobody logged in? | the production chain of section 8 | **yes**: `kbf-mac-session` installed as a launch daemon |
+| P5 | Does a VM start from a launch daemon's `kbf-mac-session run` child, as a lease user, with nobody logged in? | the production chain of section 8; after the lease, the daemon's account removes the lease directory, clone included, and nothing the lease user made is left (section 6.1) | **yes**: `kbf-mac-session` installed as a launch daemon |
 | P6 | Does macOS accept an ad hoc, hardened-runtime signature carrying the virtualization entitlement? | start a VM from a binary signed the way section 7 plans | no |
 | P7 | Is a guest newer than its host refused, and is that refusal what the builder checks? | the builder's check against the host's build; one attempted newer restore image | no |
 | P8 | Does a full image build with the first-boot daemon (section 2.3) pass its verification boot? | `kbf-vmm image build` of one recipe | only if P0 failed |
@@ -409,4 +434,7 @@ list, and `isSupported` being false inside a VM (a real negative).
 | Ad hoc signing with the entitlement works under the hardened runtime | A | P6 |
 | `sign-darwin.sh` refuses entitlements; `run` passes four descriptors; the `network` property exists | V | `tools/ci/sign-darwin.sh`, `crates/kbf-mac-session/src/helper.rs`, `crates/kbf-driver-native/src/network.rs` |
 | A guest cannot run a newer macOS than its host | A | P7 |
+| `user-delete`'s sweep does not cover the daemon's lease directories | V | `crates/kbf-mac-session/src/sweep.rs` (`SweepPlan::macos()`) |
+| The daemon's account can remove a lease directory holding the lease user's clone through inherited ACL entries | A | P5 |
+| Hosted macOS runners report `isSupported` false | A | a hosted run |
 | No USB passthrough of host devices to a guest | A | |

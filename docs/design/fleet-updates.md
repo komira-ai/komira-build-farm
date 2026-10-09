@@ -96,7 +96,7 @@ contains it. It is the comparison #85 defines for `vm.image`.
 | `xcode` (set) | Mac | every installed Xcode build | membership (changed from exact) | #85 phase 1 |
 | `vm.image` (set) | Mac | golden VM images on disk | membership on the digest only | #85 section 5.1 |
 | `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` | Mac | the VM driver | as #85 section 5.2 | #85 |
-| `drivers` gains `vm` | Mac | the VM driver's boot check | not a request key: placement maps the lease kind to it (exists, repeated) | #85 section 5.2 |
+| `drivers` gains `vm` | Mac | the VM driver's check, which boots nothing ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk) section 8) | not a request key: placement maps the lease kind to it (exists, repeated) | macos-vms.md section 5.2 |
 | `drivers` gains `native-whole-machine` | Mac | listed only when `kbf-mac-session` is present (10.1) | as `vm` | #85 section 5.2 |
 
 **Probes are reported, never requested.** A `probe.<name>` (6.1) is a status value,
