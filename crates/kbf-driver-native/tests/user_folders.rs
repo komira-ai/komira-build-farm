@@ -15,7 +15,7 @@ use std::time::Duration;
 use kbf_daemon::Runtime;
 use kbf_driver_native::xcode;
 use kbf_driver_native::{NativeConfig, NativeRuntime};
-use support::{MemoryCas, Spec, config, runtime, scratch, stderr, stdout, work};
+use support::{MemoryCas, Spec, config, runtime, sandbox_denials, scratch, stderr, stdout, work};
 
 /// The actions' `PATH`.
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -73,8 +73,9 @@ async fn a_foundation_atomic_save_works() {
     assert_eq!(
         stdout(&cas, &result).trim(),
         "atomic=ok\nreplacement=ok\nx",
-        "{}",
-        stderr(&cas, &result)
+        "{}\n{}",
+        stderr(&cas, &result),
+        sandbox_denials()
     );
     assert_eq!(result.exit_code, 0);
 }
@@ -113,8 +114,9 @@ async fn swift_build_builds_a_package() {
     assert_eq!(
         (result.exit_code, out.lines().last()),
         (0, Some("hello")),
-        "{out}{}",
-        stderr(&cas, &result)
+        "{out}{}\n{}",
+        stderr(&cas, &result),
+        sandbox_denials()
     );
 }
 
@@ -155,9 +157,10 @@ async fn xcodebuild_builds_a_package() {
     assert_eq!(
         (result.exit_code, out.lines().last()),
         (0, Some("built")),
-        "{}\n{}",
+        "{}\n{}\n{}",
         tail(&out),
-        tail(&stderr(&cas, &result))
+        tail(&stderr(&cas, &result)),
+        sandbox_denials()
     );
 }
 
@@ -206,7 +209,8 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
                 stderr(&cas, &result).as_str()
             ),
             ("", ""),
-            "xcode={build:?}"
+            "xcode={build:?}\n{}",
+            sandbox_denials()
         );
     }
 }
