@@ -28,7 +28,38 @@ fn ended(pid: &str) -> bool {
 /// of it is dropped, so nothing of it is cleaned.
 #[tokio::test]
 async fn a_restarted_runtime_removes_what_its_predecessor_left() {
-    let fake = Fake::new("restart");
+    let _ = kill_the_daemon_and_restart("restart").await;
+}
+
+/// Catches (issue #194) the test removing a Fake's directory while the killed
+/// daemon's `podman start` still runs: nobody waits for that process, and once the
+/// sweep has ended its action it writes its status and events into the state
+/// directory, which made the removal fail with "Directory not empty". 200 rounds
+/// with the CPUs busy ([`support::CpuHog`]); each drops its Fake, whose removal must
+/// fail on no write racing it, then checks nothing of that fake still runs (the
+/// removal waited for it). The mutant drops the wait in the Fake's `Drop`.
+#[tokio::test]
+async fn no_round_of_kill_and_restart_races_the_removal() {
+    let _hog = support::CpuHog::start();
+    for round in 0..200 {
+        let fake = kill_the_daemon_and_restart(&format!("restart-stress-{round}")).await;
+        let dir = fake.dir.clone();
+        // What the fake's checks need from it, taken before it is gone.
+        let probe = support::fake::Probe::of(&fake);
+        drop(fake);
+        let left = probe.processes();
+        assert!(
+            left.is_empty(),
+            "round {round}: pids {left:?} of {} run after its removal",
+            dir.display()
+        );
+    }
+}
+
+/// Starts a lease, kills the daemon mid-run (the run is forgotten), starts a new
+/// runtime on the same configuration and checks its sweep; returns the fake.
+async fn kill_the_daemon_and_restart(name: &str) -> Fake {
+    let fake = Fake::new(name);
     // `exec`: the pid the fake records is the sleep itself, not a shell around it.
     fake.knob("action.sh", "exec sleep 300");
     let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
@@ -73,6 +104,7 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
         ps.lines().any(|a| a == "--filter=label=kbf.owner=node-1"),
         "{ps}"
     );
+    fake
 }
 
 /// Catches a runtime that starts although what its predecessor left could not be

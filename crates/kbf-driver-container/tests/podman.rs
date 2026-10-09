@@ -461,11 +461,7 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     let runtime = Arc::clone(&cell.runtime);
     let run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
-    let container = wait_for_container_cgroup(&lease).await;
-    // The directory alone is not enough: the OCI runtime makes it first and writes the
-    // container's cgroup files (memory.oom.group among them) later in `create`. The
-    // action's own program running is the state the driver relies on (#88).
-    wait_for_program_in(&container, "sleep").await;
+    let container = set_up_container_cgroup(&lease, "sleep").await;
     let read = |dir: &Path, file: &str| {
         std::fs::read_to_string(dir.join(file))
             .expect(file)
@@ -485,8 +481,21 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     cell.assert_clean(1);
 }
 
+/// The container's cgroup under the lease cgroup `lease`, once the OCI runtime has set
+/// it up. The directory alone is not enough: the runtime makes it first and writes the
+/// container's cgroup files (memory.oom.group among them) later in `create`. The
+/// action's own program (`comm`) running in it is the state the driver relies on (#88).
+async fn set_up_container_cgroup(lease: &Path, comm: &str) -> PathBuf {
+    let container = wait_for_container_cgroup(lease).await;
+    wait_for_program_in(&container, comm).await;
+    container
+}
+
+/// The container's cgroup under `lease`, as soon as its directory exists. Polled every
+/// 5 ms: a read right after it appears is what `set_up_container_cgroup` must not do,
+/// and the stress test only shows that if this one is quick.
 async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
-    for _ in 0..600 {
+    for _ in 0..6000 {
         let found = std::fs::read_dir(lease)
             .into_iter()
             .flatten()
@@ -498,7 +507,7 @@ async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
         if let Some(entry) = found {
             return entry.path();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("no container cgroup under {}", lease.display());
 }
@@ -526,6 +535,100 @@ async fn wait_for_program_in(container: &Path, comm: &str) {
         container.display(),
         describe(container)
     );
+}
+
+/// Catches (issue #88) a container's cgroup files read before the OCI runtime wrote
+/// them: 100 leases, five at a time, each container's `memory.oom.group` read once
+/// `set_up_container_cgroup` returns, which must be 1 every time. The mutant drops
+/// that function's wait for the action's program: the read then follows the
+/// directory's creation by at most one 5 ms poll, inside the window #88 hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn every_container_is_one_oom_group_once_its_action_runs() {
+    let cell = Cell::new("oom-group-stress");
+    for batch in 0..20 {
+        let seqs: Vec<u64> = (1..=5).map(|i| batch * 5 + i).collect();
+        let runs: Vec<_> = seqs
+            .iter()
+            .map(|&seq| {
+                let action = store_action(&cell.cas, &sh("sleep 3"));
+                let work = cell.work(seq, action, Resources::default());
+                let runtime = Arc::clone(&cell.runtime);
+                tokio::spawn(async move { runtime.run(work).await })
+            })
+            .collect();
+        for &seq in &seqs {
+            let container = set_up_container_cgroup(&cell.cgroup.join(cell.name(seq)), "sleep").await;
+            let group = std::fs::read_to_string(container.join("memory.oom.group"))
+                .expect("memory.oom.group");
+            assert_eq!(group.trim(), "1", "lease {seq}");
+        }
+        for (run, seq) in runs.into_iter().zip(seqs) {
+            let result = run.await.expect("join").expect("ran");
+            assert_eq!(result.exit_code, 0, "lease {seq}");
+            cell.assert_clean(seq);
+        }
+    }
+}
+
+/// Catches (issue #105) the marker test's walk of Podman's store failing because a
+/// container was removed while it walked. 40 leases run, two at a time, while the walk
+/// goes over the whole store again and again; every walk must pass and find nothing.
+/// The mutant makes `find` treat no error as benign: a layer directory that vanishes
+/// mid-walk then fails a walk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn the_store_walk_passes_while_containers_come_and_go() {
+    let cell = Cell::new("walk-churn");
+    let pairs: Vec<Vec<Work>> = (0..20)
+        .map(|pair| {
+            (1..=2)
+                .map(|i| {
+                    let action = store_action(&cell.cas, &sh("echo churn > /tmp/churn"));
+                    cell.work(pair * 2 + i, action, Resources::new(1000, 256 << 20))
+                })
+                .collect()
+        })
+        .collect();
+    let runtime = Arc::clone(&cell.runtime);
+    let churn = tokio::spawn(async move {
+        let mut outcomes = Vec::new();
+        for pair in pairs {
+            let runs: Vec<_> = pair
+                .into_iter()
+                .map(|work| {
+                    let runtime = Arc::clone(&runtime);
+                    tokio::spawn(async move { runtime.run(work).await })
+                })
+                .collect();
+            for run in runs {
+                outcomes.push(run.await.expect("join"));
+            }
+        }
+        outcomes
+    });
+    let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
+    let graph_root = graph_root.trim().to_owned();
+    let name = format!("kbf-never-written-{}", std::process::id());
+    let mut walks = 0;
+    while !churn.is_finished() {
+        let (root, name) = (graph_root.clone(), name.clone());
+        let walk = tokio::task::spawn_blocking(move || {
+            find(&["podman", "unshare"], &[&root], &[&root], &["-name", &name])
+        })
+        .await
+        .expect("join");
+        let found = walk.unwrap_or_else(|why| panic!("walk {walks}: {why}"));
+        assert!(found.trim().is_empty(), "{found}");
+        walks += 1;
+    }
+    for (i, outcome) in churn.await.expect("join").into_iter().enumerate() {
+        let result = outcome.unwrap_or_else(|e| panic!("lease {}: {e:?}", i + 1));
+        assert_eq!(result.exit_code, 0, "lease {}", i + 1);
+        cell.assert_clean(i as u64 + 1);
+    }
+    assert!(walks > 1, "the store was walked {walks} times while leases ran");
+    println!("{walks} walks of the store while 40 leases came and went");
 }
 
 /// Catches a kernel OOM kill being reported as the action's own result (exit 137 would
@@ -673,8 +776,7 @@ async fn no_container_id_is_the_daemons_on_the_host() {
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let run = tokio::spawn(async move { runtime.run(work).await });
-    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
-    wait_for_program_in(&container, "sleep").await;
+    let container = set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let procs = std::fs::read_to_string(container.join("cgroup.procs")).expect("cgroup.procs");
     let seen: Vec<_> = procs.split_whitespace().flat_map(ids).collect();
@@ -717,8 +819,7 @@ async fn two_containers_run_at_once() {
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let first = tokio::spawn(async move { runtime.run(work).await });
-    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
-    wait_for_program_in(&container, "sleep").await;
+    set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let second = cell.run(2, &sh("echo second")).await;
     let still = podman(&["ps", "--format={{.Names}}"]);
