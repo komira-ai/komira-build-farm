@@ -287,6 +287,61 @@ async fn failures_and_abandoned_operations_end_the_stream() {
     assert_eq!(gone.code(), Code::Unavailable);
 }
 
+/// Catches (issue #168): a server going away that leaves open Execute and
+/// WaitExecution streams to die with the connection (UNKNOWN on the client) instead of
+/// ending them UNAVAILABLE, which clients retry; a stream opened after the close that
+/// stays open; and a done operation already there lost to the close (each of eight
+/// streams must get its done operation, so a close noticed first fails all but once in
+/// 256 runs).
+#[tokio::test]
+async fn closing_ends_open_streams_unavailable() {
+    let script = Arc::new(Script::default());
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
+    let job = job("closed", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    let mut open = start(&farm, &job.action).await.expect("Execute");
+    next(&mut open).await.expect("healthy").expect("queued");
+    let mut waited = farm
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: "operations/0".to_owned(),
+        })
+        .await
+        .expect("WaitExecution")
+        .into_inner();
+    next(&mut waited).await.expect("healthy").expect("queued");
+    let mut finished = Vec::new();
+    for n in 1..=8 {
+        let mut ops = start(&farm, &job.action).await.expect("Execute");
+        next(&mut ops).await.expect("healthy").expect("queued");
+        script.set(n, Stage::Done(Finished::Ran(Box::default())));
+        finished.push(ops);
+    }
+
+    closer.close();
+    for (what, ops) in [("Execute", &mut open), ("WaitExecution", &mut waited)] {
+        let gone = next(ops).await.expect_err(what);
+        assert_eq!(gone.code(), Code::Unavailable, "{what}: {gone:?}");
+        assert!(gone.message().contains("shutting down"), "{what}: {gone:?}");
+        assert!(gone.message().contains("operations/0"), "{what}: {gone:?}");
+    }
+    for ops in &mut finished {
+        let done = next(ops)
+            .await
+            .expect("healthy")
+            .expect("the done operation");
+        assert!(done.done, "{done:?}");
+        assert_eq!(next(ops).await.expect("healthy"), None);
+    }
+
+    let mut late = start(&farm, &job.action).await.expect("Execute");
+    next(&mut late).await.expect("healthy").expect("queued");
+    let gone = next(&mut late).await.expect_err("opened after the close");
+    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+}
+
 /// Catches: an Execute that submits an action whose result is cached, answers a hit
 /// without `cached_result`, or ignores `skip_cache_lookup`.
 #[tokio::test]

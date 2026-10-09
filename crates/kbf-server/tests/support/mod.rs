@@ -183,6 +183,7 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            shutdown_timeout: Duration::from_secs(10),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi, worker) = (bound.reapi, bound.worker);

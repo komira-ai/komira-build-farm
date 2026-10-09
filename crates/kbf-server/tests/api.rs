@@ -90,6 +90,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        shutdown_timeout: Duration::from_secs(10),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let shutdown = async move {
@@ -290,6 +291,7 @@ async fn an_api_address_in_use_is_refused() {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        shutdown_timeout: Duration::from_secs(10),
     };
     let api = Api {
         listen: addr,

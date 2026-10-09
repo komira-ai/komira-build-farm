@@ -3,10 +3,12 @@
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
-//! when the operator API listens. On Unix the SIGINT handler
-//! is installed before that line is printed, so a SIGINT any time after it stops the
-//! server with exit 0. If the handler cannot be installed it exits 2 without printing
-//! the start line.
+//! when the operator API listens. On Unix the SIGINT and SIGTERM handlers are installed
+//! before that line is printed, so either signal any time after it stops the server
+//! with exit 0: open Execute and WaitExecution streams end UNAVAILABLE, REAPI
+//! connections are sent GOAWAY, and the server exits once they close or
+//! `--shutdown-timeout-secs` runs out (issue #168). If a handler cannot be installed it
+//! exits 2 without printing the start line.
 
 use std::error::Error;
 use std::future::Future;
@@ -72,7 +74,8 @@ fn start_line(reapi: SocketAddr, worker: SocketAddr, api: Option<SocketAddr>) ->
     format!("kbf-server {version} reapi={reapi} worker={worker}{api}")
 }
 
-/// Installs the SIGINT handler now and returns a future that completes on SIGINT.
+/// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on
+/// either signal.
 ///
 /// `tokio::signal::ctrl_c()` installs its handler only when first polled, which is
 /// after the start line is printed; a SIGINT in between killed the process by the
@@ -85,8 +88,12 @@ fn start_line(reapi: SocketAddr, worker: SocketAddr, api: Option<SocketAddr>) ->
 fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
     Ok(async move {
-        sigint.recv().await;
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
     })
 }
 
