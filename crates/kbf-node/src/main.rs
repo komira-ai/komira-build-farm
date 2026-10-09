@@ -169,11 +169,7 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
-    config.xcodes = xcode::discover(
-        &cli.xcode_apps,
-        Path::new(xcode::XCODEBUILD),
-        xcode::ANSWER_WITHIN,
-    );
+    config.find_xcodes(&cli.xcode_apps, xcode::ANSWER_WITHIN);
     Ok(config)
 }
 
