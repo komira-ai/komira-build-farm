@@ -127,7 +127,7 @@ the following. "Live" means heard from within G; "grant" means a `Commit` of a
 | I3 | **One holding per operation.** An operation holds at most one lease at a time; every lease the scheduler holds belongs to an operation that is `Leased` or `Running`. | `state`, `leases_on` |
 | I4 | **Each operation is finished at most once, and each waiter answered at most once**, by an `Answer` or a `Refuse` for the operation it joined. | per-operation and per-waiter counters |
 | I5 | **A result is accepted only from the operation's newest committed grant.** An `Answer`'s lease is the newest grant of its operation before the result record in log order; a result from a given-up, fenced or superseded lease never answers. With a daemon model: the accepted outcome is one the run of that very lease produced (issue #137). | shadow log; outcomes tagged with their lease |
-| I6 | **Bookings never exceed capacity at a grant.** At every grant, what is booked on the worker plus the request fits its capacity on CPU, memory and GPUs. What is booked always equals the sum of the requests of the leases held there. A capacity that shrinks below the bookings is allowed (`Capacity` does not evict), and then no grant goes there until it fits again. | shadow bookings vs `booked` |
+| I6 | **Bookings never exceed capacity at a grant.** At every grant, on every axis the request uses (CPU, memory, GPUs: those it asks a non-zero amount of), what is booked on the worker plus the request fits its capacity. What is booked always equals the sum of the requests of the leases held there. A capacity that shrinks below the bookings is allowed (`Capacity` does not evict), and then no request that uses the overbooked axis is granted there until it fits again; a request that books nothing on that axis may still be (a CPU-only action may go to a node whose GPUs shrank below its GPU bookings: it makes nothing worse). | shadow bookings vs `booked` |
 | I7 | **Work goes only where its platform is satisfied.** Every grant goes to a worker whose capabilities, as last reported before the grant, satisfy the request (`kbf_caps::Request::matches`), and which was live. | shadow caps and last-heard |
 | I8 | **No grant to a cordoned worker,** in any cordon state, across its sessions. | shadow cordons |
 | I9 | **Drain never kills.** A lease on a cordoned worker that stays live and lists it is never given up. Drain states are true: `Drained` only with no lease held, `Draining` only before its deadline and with a lease, `Paused` only at or after its deadline and only an operator moves it on. | shadow, `cordon`, `leases_on` |
@@ -195,6 +195,8 @@ by the named scenario):
 | `release` forgets to subtract the booking | `scheduler.rs` | F1.9, I6, L1 |
 | a finished or refused operation stays in `in_flight` | `scheduler.rs` | F1.8, I4, L1 |
 | `PLACEMENT_ROUND` not enforced, or enforced as 255 | `scheduler.rs` (`place`) | F1.10 |
+| no unservable verdict for work behind a full round's cut | `scheduler.rs` (`place`) | F1.10 (I10) |
+| `Qos`'s order inverted | `kbf-types` | F1.4 and F1.6 to F1.10 (I14; the checker orders by `urgency()`, not by `Qos`'s `Ord`) |
 
 ### F2. Failures: workers, networks, clocks and servers
 
@@ -216,7 +218,7 @@ in `sim_cell` today.
 | F2.1 | A worker dies mid-lease and never returns | a worker stops at a random time | its leases are requeued at the first tick at or after G past the last time it was heard, not before; granted elsewhere; answered once |
 | F2.2 | Heartbeat gaps shorter than G | per-link drop bursts and partitions of 1 to 59 s | no lease is requeued while the worker is heard within G; a self-fenced run stops once T passes since its newest acknowledged send and reports `ABORTED`, as the daemon does; if the scheduler still holds the lease, that result is accepted and the operation fails as an infrastructure failure, answered once (retrying it is #22, planned) |
 | F2.3 | The G boundary | ticks at exactly G minus 1 ms, G, and G plus 1 ms after the last heartbeat | the lease is kept at the tick at G minus 1 ms and requeued at the tick at G (`alive` is `now < last_heard + G`) |
-| F2.4 | A late `Start` | one `Start` delayed beyond W, the rest on time | the daemon model drops it unrun; the scheduler requeues it once `START_GRACE` passes; no run beside the retry (I12) |
+| F2.4 | A late `Start` | one `Start` delayed beyond W, the rest on time; the worker's newest heartbeat taken again at `START_GRACE` minus 1 ms, `START_GRACE`, and plus 1 ms after the `Start` was sent | the daemon model drops it unrun; the scheduler keeps the lease at the heartbeat at `START_GRACE` minus 1 ms and requeues it at the one at `START_GRACE`; no run beside the retry (I12) |
 | F2.5 | A `Start` lost on a live session **exists** | (`sim_cell`) | L4 |
 | F2.6 | Suspend and resume of a worker | a worker freezes for a time below T, between T and G, and above G; its clock jumps on resume | on resume it fences first: no result from a fenced self-fenced run and no heartbeat that renews contact before the fence; below T nothing changes; above G its leases were requeued and its stale results lose (I5) |
 | F2.7 | A paused server clock | the leader's clock stops (its process suspended) while workers' clocks run | safety holds: workers fence after T; the leader requeues only G of its own time after resuming |
@@ -225,7 +227,7 @@ in `sim_cell` today.
 | F2.10 | Stale session messages | duplicated and reordered `Hello`s, a heartbeat of a replaced stream arriving after the new `Hello`, a `Hello` resent on one stream for a report change | only the first `Hello` of a stream opens a session; a replaced stream's heartbeat is not fed; a resent `Hello` requeues nothing |
 | F2.11 | Lost and repeated results and acks | drops and duplicates on `Report` and `ReportAck` | results resent until acknowledged; each proposed once per holding; each operation answered once |
 | F2.12 | Two daemons claim one node id | two worker nodes register as the same worker in turn | only the newest stream's heartbeats count; `Start`s go only to it; the other fences in T; no self-fenced work twice (I12) |
-| F2.13 | A lease of another term listed | a worker lists leases of an older and a newer term | `not_held` names neither; no `Cancel` for them |
+| F2.13 | A lease of another term, or of another worker, listed | a worker lists leases of an older and a newer term; a worker with no room lists leases of this term held on other workers | `not_held` names neither foreign lease, and no `Cancel` goes for them; it names each lease held on another worker |
 
 Planned, not simulated: the infra retry budget (#22), `RUN_ON` hermetic leases over a
 lost connection (the daemon self-fences every lease today; `sim_cell` already models
@@ -239,12 +241,14 @@ inheriting the queue.
 | `alive` uses `<=` (one millisecond late), or 2G | `scheduler.rs` | F2.3, F2.1 |
 | `reconcile` drops the earlier-session rule (waits G after a reboot) | `scheduler.rs` | F2.8 (L3) |
 | `reconcile` requeues an omitted lease at once on a live session | `scheduler.rs` | F2.4, F2.5 (two runs, I12) |
-| `reconcile` requeues a lease whose result was proposed | `scheduler.rs` | F2.11 (I4, I5) |
+| `reconcile` requeues a lease whose result was proposed | `scheduler.rs` | F2.11 (R: a lease given up against the rules) |
+| `reconcile` uses `>` for `START_GRACE` (one heartbeat late) | `scheduler.rs` | F2.4 (R) |
 | `Capacity` opens a session | `scheduler.rs` | F2.10 (I12) |
-| `result_committed` skips the newest-grant check | `scheduler.rs` | F2.1, F2.6 (I5) |
+| `result_committed` skips the newest-grant check | `scheduler.rs` | F2.1 with a log that commits out of order (I5), and possibly F2.9 (a server restart) once #137 is fixed. With one term and a log that commits in proposal order it cannot be reached: `report` proposes a result only from the current committed lease, so that result is in the log before any later grant of its operation. F2.6 and F4 do not catch it |
 | `report` proposes twice per holding | `scheduler.rs` | F2.11 |
 | `lease_committed` starts a superseded grant | `scheduler.rs` | F2.1 with a slow log (I2) |
 | `not_held` names leases of other terms | `scheduler.rs` | F2.13 |
+| `not_held` ignores which worker holds a lease | `scheduler.rs` | F2.13 (N) |
 | the daemon model's W check removed (the test of the sim itself) | the worker node | F2.4 (I12) |
 
 ### F3. Platform routing, cordon, drain and rollouts together
@@ -259,7 +263,7 @@ virtual time (the trait is public; `kbf-sim` becomes a dev-dependency of
 | # | Scenario | Generator | Checks beyond the invariants |
 |---|---|---|---|
 | F3.1 | The last worker of a platform cordoned | cordon the only arm64 worker, and the only Mac, for longer than the unservable wait | work for it waits with the cordon reason and is never refused (I10); other platforms run; it runs after the uncordon, placed by the uncordon itself, not the next tick |
-| F3.2 | Cordoned and then silent, and the reverse | the last arm64 worker cordoned, then silent past G; or silent, then back cordoned | the wait becomes refusable when the worker stops being live, and counts from then, not from the cordon; the refusal comes W after that |
+| F3.2 | Cordoned and then silent, and the reverse | the last arm64 worker cordoned, then silent past G; or silent, then back cordoned | the wait becomes refusable when the worker stops being live, and counts from then, not from the cordon; the refusal comes the unservable wait after that |
 | F3.3 | A worker dies while draining | drain, then silence past G | its leases are requeued for silence, not for the drain; the drain then reads `Drained`; the rollout driver keeps the node at `draining` while it is disconnected, and hands over the update once it is back, drained |
 | F3.4 | A paused drain whose leases end later | a deadline shorter than the leases | it stays `Paused`; a new drain with a new deadline goes to `Drained` at once |
 | F3.5 | A rollout over a mixed fleet, `max_unavailable` 1 to 3 | a rollout over 4 to 12 nodes with running work, driver steps at random times | at every step, at most `max_unavailable` nodes out of service by the record, and no more cordoned by the driver; each node goes `cordoned -> draining -> updating` in order; an `updating` node held no lease when handed over |
