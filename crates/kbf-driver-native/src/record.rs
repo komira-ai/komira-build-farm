@@ -94,15 +94,16 @@ pub fn boot_id() -> io::Result<String> {
 /// The kernel would not say.
 #[cfg(target_os = "macos")]
 pub fn boot_id() -> io::Result<String> {
-    // A UUID string and its NUL take 37 bytes.
-    let mut id = [0_u8; 64];
-    let mut size = id.len();
-    // SAFETY: a C string name, and a writable buffer of `size` bytes, which the call
-    // fills with a NUL-terminated string and whose length it writes back.
+    let mut boot = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: MUTANT: the boot time read back, as before the fix.
     let done = unsafe {
         libc::sysctlbyname(
-            c"kern.bootsessionuuid".as_ptr(),
-            id.as_mut_ptr().cast(),
+            c"kern.boottime".as_ptr(),
+            (&raw mut boot).cast(),
             &raw mut size,
             std::ptr::null_mut(),
             0,
@@ -111,7 +112,7 @@ pub fn boot_id() -> io::Result<String> {
     if done != 0 {
         return Err(io::Error::last_os_error());
     }
-    boot_text(id.get(..size).unwrap_or(&id))
+    Ok(format!("{}.{:06}", boot.tv_sec, boot.tv_usec))
 }
 
 /// The boot id the kernel wrote into `bytes`: up to the first NUL, trimmed.
