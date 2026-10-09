@@ -13,6 +13,20 @@ use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-daemon");
 
+/// Held by each test while it runs a native daemon, so one runs at a time, as on a
+/// node. Native daemons on one Mac share the user's `xcrun` cache, which each `xcrun`
+/// lookup rewrites whole: one daemon's lookups (its survey of the Xcodes, then its
+/// warm-up) make the other's miss, each then taking seconds, and on the macOS runner
+/// a survey took 27.5 s so, against about 4 s alone.
+static NATIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`NATIVE`], held until the guard is dropped.
+fn one_native_daemon() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Catches: a binary that fails to start, exits non-zero on `--version`, or reports a
 /// name or version other than its own package's and the commit it was built from
 /// (issue #170).
@@ -206,7 +220,9 @@ fn each_driver_starts_and_stops_on_sigterm() {
         "--cas=http://127.0.0.1:1".to_owned(),
         format!("--scratch={}", scratch.display()),
     ];
+    let one = one_native_daemon();
     let status = runs_until_sigterm("native", &native);
+    drop(one);
     assert!(status.success(), "{status}");
     assert!(
         scratch.is_dir(),
@@ -430,6 +446,7 @@ fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
 fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     use std::os::unix::process::ExitStatusExt as _;
 
+    let _one = one_native_daemon();
     let dir = tls("restart");
     let scratch = dir.join("leases");
     let front = front::Front::start(&dir);
