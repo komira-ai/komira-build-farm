@@ -171,6 +171,10 @@ mod tests {
         let mute = at("/A/Xcode_3.app", None, State::Failed, "no build");
         let before = [licence.clone(), good.clone(), mute.clone()];
         assert_eq!(changes(&before, &before), []);
+        // A survey that lost or swapped an Xcode is not the same one.
+        assert!(same(&before, &before));
+        assert!(!same(&before, &before[..2]));
+        assert!(!same(&before[..1], &before[1..2]));
         let fix = "sudo /A/Xcode_1.app/Contents/Developer/usr/bin/xcodebuild -license accept";
         assert_eq!(
             changes(&[], &before),
