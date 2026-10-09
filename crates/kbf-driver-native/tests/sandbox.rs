@@ -34,8 +34,11 @@ const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// settings, such as a tool's defaults, for the next. `{UTEMP}`, `{UCACHE}` and `{UDIR}`
 /// are files directly in the user's temporary folder, cache folder and the user
 /// folder that holds both (under `/var/folders`): the tools that must write in the
-/// first two get only the few names they use there (issue #163), never the folders.
-const OUTSIDE: [(&str, &str); 14] = [
+/// first get only the few names they use there (issue #163), never the folders.
+/// `{UXCRUN}` is a file inside a directory that has one of those names
+/// (`xcrun_db-<..>`, which `xcrun` uses for a file): only the name is open, not
+/// what is under it.
+const OUTSIDE: [(&str, &str); 15] = [
     ("create", "echo x > {OUT}/new"),
     ("append", "echo x >> {OUT}/victim"),
     ("unlink", "rm -f {OUT}/victim"),
@@ -50,6 +53,10 @@ const OUTSIDE: [(&str, &str); 14] = [
     ("user-temp", "echo x > {UTEMP}"),
     ("user-cache", "echo x > {UCACHE}"),
     ("user-dir", "echo x > {UDIR}"),
+    (
+        "user-temp-xcrun",
+        "mkdir -p \"$(dirname {UXCRUN})\" && echo x > {UXCRUN}",
+    ),
 ];
 
 /// Where the rows of [`OUTSIDE`] aim.
@@ -58,8 +65,9 @@ struct Targets {
     lease: PathBuf,
     tmp: PathBuf,
     domain: String,
-    /// The files in the user folders, in the order `{UTEMP}`, `{UCACHE}`, `{UDIR}`.
-    user: [PathBuf; 3],
+    /// The files in the user folders, in the order `{UTEMP}`, `{UCACHE}`, `{UDIR}`,
+    /// `{UXCRUN}`.
+    user: [PathBuf; 4],
 }
 
 impl Targets {
@@ -69,12 +77,13 @@ impl Targets {
         let _ = std::fs::remove_file(tmp);
         forget(domain);
         let name = format!("kbf-sandbox-test-{}", std::process::id());
+        let temp = user_folder("DARWIN_USER_TEMP_DIR");
         let user = [
-            "DARWIN_USER_TEMP_DIR",
-            "DARWIN_USER_CACHE_DIR",
-            "DARWIN_USER_DIR",
-        ]
-        .map(|folder| user_folder(folder).join(&name));
+            temp.join(&name),
+            user_folder("DARWIN_USER_CACHE_DIR").join(&name),
+            user_folder("DARWIN_USER_DIR").join(&name),
+            temp.join(format!("xcrun_db-{name}")).join("f"),
+        ];
         let targets = Self {
             out: victim_in(&dir.join("outside")),
             lease: victim_in(&dir.join("leases").join("lease-9-999").join("out")),
@@ -86,11 +95,13 @@ impl Targets {
         targets
     }
 
-    /// Removes the files the user-folder rows write.
+    /// Removes the files the user-folder rows write, and the directory `{UXCRUN}`'s
+    /// row makes.
     fn forget_user_files(&self) {
         for file in &self.user {
             let _ = std::fs::remove_file(file);
         }
+        let _ = std::fs::remove_dir(self.user[3].parent().expect("a parent"));
     }
 
     /// Puts a fresh `victim` back in both directories.
@@ -131,7 +142,8 @@ fn attempts(ways: &[(&str, &str)], to: &Targets) -> String {
                 .replace("{DOMAIN}", &to.domain)
                 .replace("{UTEMP}", &to.user[0].to_string_lossy())
                 .replace("{UCACHE}", &to.user[1].to_string_lossy())
-                .replace("{UDIR}", &to.user[2].to_string_lossy());
+                .replace("{UDIR}", &to.user[2].to_string_lossy())
+                .replace("{UXCRUN}", &to.user[3].to_string_lossy());
             format!("{command} 2>/dev/null; echo {name}=$?; ")
         })
         .collect()
@@ -293,11 +305,7 @@ async fn an_action_writes_inside_its_lease() {
         lease: PathBuf::from("/unused"),
         tmp: PathBuf::from("/unused"),
         domain: String::new(),
-        user: [
-            PathBuf::from("/unused"),
-            PathBuf::from("/unused"),
-            PathBuf::from("/unused"),
-        ],
+        user: [(); 4].map(|()| PathBuf::from("/unused")),
     };
     let script = attempts(&ways, &unused);
     for (seq, network) in [(1, "off"), (2, "on")] {

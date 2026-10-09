@@ -120,6 +120,53 @@ fn developer_dir_of(
     Ok((build.to_owned(), dir))
 }
 
+/// Where macOS keeps `xcrun`, behind every `/usr/bin` developer tool shim.
+pub const XCRUN: &str = "/usr/bin/xcrun";
+
+/// The tools [`warm`] has `xcrun` look up: the compilers and linker builds call most.
+pub const WARM_TOOLS: [&str; 6] = ["cc", "clang", "clang++", "swift", "swiftc", "ld"];
+
+/// On a thread of its own, has `xcrun` look up each of [`WARM_TOOLS`] for the node's
+/// own Xcode (no `DEVELOPER_DIR`) and for each of `developer_dirs`, each lookup given
+/// `within` to answer, so `xcrun`'s cache (`crate::user_folders`) holds them before
+/// the first action asks: a lookup it has not cached takes seconds. A lookup that
+/// fails is logged and the rest go on. `None`, and nothing run, where `xcrun` is not a
+/// file (off macOS).
+#[must_use]
+pub fn warm(
+    xcrun: &Path,
+    developer_dirs: Vec<PathBuf>,
+    within: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !xcrun.is_file() {
+        return None;
+    }
+    let xcrun = xcrun.to_owned();
+    Some(std::thread::spawn(move || {
+        let dirs = std::iter::once(None).chain(developer_dirs.into_iter().map(Some));
+        for dir in dirs {
+            for tool in WARM_TOOLS {
+                let mut command = std::process::Command::new(&xcrun);
+                command.args(["--find", tool]);
+                match &dir {
+                    Some(dir) => command.env(DEVELOPER_DIR, dir),
+                    None => command.env_remove(DEVELOPER_DIR),
+                };
+                let failed = match output_within(command, within) {
+                    Ok(out) if out.status.success() => continue,
+                    Ok(out) => format!(
+                        "{}: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                    Err(e) => e.to_string(),
+                };
+                tracing::info!(tool, developer_dir = ?dir, "xcrun --find: {failed}");
+            }
+        }
+    }))
+}
+
 /// How often [`output_within`] looks whether its process has exited.
 const POLL: Duration = Duration::from_millis(10);
 
@@ -274,6 +321,46 @@ mod tests {
         std::fs::write(&path, script).expect("script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         path
+    }
+
+    /// Catches: a lookup missed for the node's own Xcode or for one of the others, the
+    /// warm stopped by a lookup that fails or hangs, and `xcrun` run where there is
+    /// none.
+    #[test]
+    fn warm_looks_up_every_tool_for_every_xcode() {
+        let dir = scratch("warm");
+        let log = dir.join("log");
+        let xcrun = dir.join("xcrun");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"${{DEVELOPER_DIR-none}} $*\" >> {}\n\
+             case \"$2\" in\n\
+             ld) echo 'not found' >&2; exit 1 ;;\n\
+             swift) case \"$DEVELOPER_DIR\" in /hung) exec sleep 60 ;; esac ;;\n\
+             esac\n",
+            log.display()
+        );
+        std::fs::write(&xcrun, script).expect("script");
+        std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let thread = warm(
+            &xcrun,
+            vec![PathBuf::from("/x1"), PathBuf::from("/hung")],
+            Duration::from_millis(500),
+        )
+        .expect("a thread");
+        thread.join().expect("warmed");
+        let want: Vec<String> = ["none", "/x1", "/hung"]
+            .iter()
+            .flat_map(|dir| WARM_TOOLS.map(|tool| format!("{dir} --find {tool}")))
+            .collect();
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .expect("log")
+                .lines()
+                .collect::<Vec<_>>(),
+            want
+        );
+        assert!(warm(&dir.join("missing"), Vec::new(), WITHIN).is_none());
     }
 
     /// How long the fake Xcodes have to answer.

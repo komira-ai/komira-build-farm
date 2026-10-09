@@ -26,6 +26,7 @@ use crate::cas::CasStore;
 use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
+use crate::user_folders::UserFolders;
 use crate::xcode;
 
 /// The driver name in the node report.
@@ -47,6 +48,8 @@ pub struct NativeRuntime<C> {
     config: NativeConfig,
     cas: Arc<C>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
+    /// The sandbox rules for the user folders (empty without them).
+    rules: String,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -90,11 +93,27 @@ impl<C: Cas> NativeRuntime<C> {
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.scratch)?;
         crate::sweep::sweep(&config.scratch, remove)?;
-        Ok(Self {
+        let rules = config
+            .user_folders
+            .as_ref()
+            .map(UserFolders::rules)
+            .unwrap_or_default();
+        let runtime = Self {
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
-        })
+            rules,
+        };
+        runtime.sweep_user_folders(remove);
+        Ok(runtime)
+    }
+
+    /// Removes the leftovers in the user folders old enough to be no lease's work in
+    /// progress ([`crate::user_folders`]).
+    fn sweep_user_folders(&self, remove: &dyn Fn(&Path) -> std::io::Result<()>) {
+        if let Some(folders) = &self.config.user_folders {
+            folders.sweep(self.config.leftover_age, SystemTime::now(), remove);
+        }
     }
 
     /// The node report entries this driver adds: how it keeps the network off, and
@@ -204,6 +223,7 @@ impl<C: Cas> NativeRuntime<C> {
         let (program, args) = self.config.isolation.wrap(
             prepared.network,
             &prepared.lease,
+            &self.rules,
             prepared.program.clone(),
             &prepared.args,
         );
@@ -344,6 +364,15 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let mut killer = None;
         let outcome = self.attempt(&work, &dir.path, &mut stop, &mut killer).await;
         let cleaned = dir.clean().await;
+        if let Some(folders) = self.config.user_folders.clone() {
+            let age = self.config.leftover_age;
+            // Best effort, as at start: what fails is logged and tried after the next
+            // lease.
+            let _ = tokio::task::spawn_blocking(move || {
+                folders.sweep(age, SystemTime::now(), &kbf_outputs::remove_tree);
+            })
+            .await;
+        }
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
             let _ = by.send(());

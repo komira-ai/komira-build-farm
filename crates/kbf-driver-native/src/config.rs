@@ -7,6 +7,7 @@ use std::time::Duration;
 use kbf_outputs::OutputLimits;
 
 use crate::network::Isolation;
+use crate::user_folders::{LEFTOVER_AGE, UserFolders};
 
 /// How much memory one lease's processes may hold together before they are killed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,12 +65,19 @@ pub struct NativeConfig {
     /// `DEVELOPER_DIR` takes (`.../Xcode.app/Contents/Developer`); see
     /// [`crate::xcode::discover`].
     pub xcodes: BTreeMap<String, PathBuf>,
+    /// The daemon user's temporary and cache folders, where the sandbox lets an action
+    /// write the few names macOS tools use there whatever `TMPDIR` says
+    /// ([`crate::user_folders`]); `None` off macOS.
+    pub user_folders: Option<UserFolders>,
+    /// How old a leftover in [`Self::user_folders`] must be before a sweep removes it.
+    pub leftover_age: Duration,
 }
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits and
-    /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation, and no
-    /// Xcode (the daemon fills [`Self::xcodes`] from [`crate::xcode::discover`]).
+    /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation and user
+    /// folders, leftovers swept after [`LEFTOVER_AGE`], and no Xcode (the daemon fills
+    /// [`Self::xcodes`] from [`crate::xcode::discover`]).
     #[must_use]
     pub fn new(scratch: PathBuf) -> Self {
         Self {
@@ -81,6 +89,8 @@ impl NativeConfig {
             kill_wait: Duration::from_secs(5),
             isolation: Isolation::detect(),
             xcodes: BTreeMap::new(),
+            user_folders: UserFolders::detect(),
+            leftover_age: LEFTOVER_AGE,
         }
     }
 }

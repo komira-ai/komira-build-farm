@@ -15,7 +15,9 @@ use std::time::Duration;
 use kbf_daemon::Runtime;
 use kbf_driver_native::xcode;
 use kbf_driver_native::{NativeConfig, NativeRuntime};
-use support::{MemoryCas, Spec, config, runtime, sandbox_denials, scratch, stderr, stdout, work};
+use support::{
+    MemoryCas, Spec, config, runtime, sandbox_denials, scratch, stderr, stdout, user_folder, work,
+};
 
 /// The actions' `PATH`.
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -133,7 +135,10 @@ fn newest_xcode() -> Option<(String, PathBuf)> {
 
 /// Catches a sandbox under which `xcodebuild` (derived data in the lease) cannot
 /// build a one-file package: it saves its log store atomically, through the user's
-/// temporary folder, and exits 74 when that fails.
+/// temporary folder, and exits 74 when that fails. Its package cache goes into the
+/// lease (`-packageCachePath`): by default `xcodebuild` puts it in the user's real
+/// `~/Library/Caches` (it does not read `HOME`), outside the lease, which the sandbox
+/// refuses as it refuses every other write there.
 #[tokio::test]
 async fn xcodebuild_builds_a_package() {
     let Some((build, developer_dir)) = newest_xcode() else {
@@ -147,7 +152,8 @@ async fn xcodebuild_builds_a_package() {
     let rt = runtime(config, &cas);
     let mut spec = Spec::sh(&format!(
         "{LAYOUT}xcodebuild -scheme hello -destination platform=macOS \
-         -derivedDataPath \"$TMPDIR/dd\" build && echo built"
+         -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$XDG_CACHE_HOME/swiftpm\" \
+         build && echo built"
     ))
     .env("PATH", PATH)
     .property("xcode", &build);
@@ -213,4 +219,31 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
             sandbox_denials()
         );
     }
+}
+
+/// Catches the real temporary folder's leftovers kept past the lease that left them:
+/// the action makes one in `TemporaryItems`, as a save it was killed in the middle of
+/// would, old enough to sweep; the next lease must not find it.
+#[tokio::test]
+async fn a_leftover_in_the_temporary_folder_is_swept_after_the_lease() {
+    let dir = scratch("leftover");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let left = user_folder("DARWIN_USER_TEMP_DIR")
+        .join("TemporaryItems")
+        .join(format!("kbf-leftover-{}", std::process::id()));
+    let spec = Spec::sh(&format!(
+        "mkdir -p '{0}' && echo x > '{0}/f' && touch -t 200001010000 '{0}' && echo made",
+        left.display()
+    ))
+    .env("PATH", PATH);
+    let result = run_long(&rt, &cas, 1, &spec).await;
+    assert_eq!(
+        stdout(&cas, &result).trim(),
+        "made",
+        "{}\n{}",
+        stderr(&cas, &result),
+        sandbox_denials()
+    );
+    assert!(!left.exists(), "kept past the lease: {}", left.display());
 }
