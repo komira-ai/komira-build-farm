@@ -2,15 +2,15 @@
 // the selftest (selftest/main.swift), which feeds it synthetic images.
 //
 // The image is first drawn into an 8-bit sRGB bitmap, so a screenshot taken in another
-// colour space (Display P3) is converted back to the values the app painted. Then, for
-// each quadrant colour, the pixels within `tolerance` of it on every channel are
-// counted. The pattern is found only when:
-// - every colour has at least `minPixels` matching pixels;
-// - each colour's pixels fill at least 80% of their own bounding box (a solid block,
-//   not scattered pixels of a photo or gradient);
-// - the colours' centres sit in the pattern's order (top-left left of top-right and
-//   above bottom-left, and so on);
-// - the four boxes together fill at least 80% of their union, which is roughly square.
+// colour space (Display P3) is converted back to the values the app painted. A pixel
+// matches a quadrant colour when it is within `tolerance` of it on every channel.
+// Pattern colours may also occur elsewhere (icons, wallpaper), so the check anchors on
+// each connected block of the top-left colour and accepts the first one that:
+// - has at least `minPixels` pixels and fills at least 80% of its bounding box (a
+//   solid block, not scattered pixels of a photo or gradient);
+// - is roughly square (neither side more than twice the other);
+// - has each other quadrant beside it: the box of the same size to its right, below
+//   and diagonally below-right is at least 80% the matching colour.
 
 import CoreGraphics
 import Foundation
@@ -56,56 +56,65 @@ enum PatternCheck {
 
     /// `rgba` holds `height` rows of `width` RGBA pixels, top row first.
     static func check(rgba: [UInt8], width: Int, height: Int) -> PatternVerdict {
-        struct Box {
-            var n = 0, sumX = 0, sumY = 0
-            var minX = Int.max, minY = Int.max, maxX = -1, maxY = -1
-            var area: Int { n == 0 ? 0 : (maxX - minX + 1) * (maxY - minY + 1) }
-        }
+        let none = UInt8.max
         let colours = FixturePattern.quadrants.map { (Int($0.r), Int($0.g), Int($0.b)) }
-        var boxes = [Box](repeating: Box(), count: colours.count)
-        for y in 0..<height {
-            for x in 0..<width {
-                let i = (y * width + x) * 4
-                let r = Int(rgba[i]), g = Int(rgba[i + 1]), b = Int(rgba[i + 2])
-                for (k, c) in colours.enumerated()
-                where abs(r - c.0) <= tolerance && abs(g - c.1) <= tolerance
-                    && abs(b - c.2) <= tolerance
-                {
-                    boxes[k].n += 1
-                    boxes[k].sumX += x
-                    boxes[k].sumY += y
-                    boxes[k].minX = min(boxes[k].minX, x)
-                    boxes[k].maxX = max(boxes[k].maxX, x)
-                    boxes[k].minY = min(boxes[k].minY, y)
-                    boxes[k].maxY = max(boxes[k].maxY, y)
-                    break
+        // The quadrant index each pixel matches, or `none`.
+        var cls = [UInt8](repeating: none, count: width * height)
+        for p in 0..<(width * height) {
+            let r = Int(rgba[p * 4]), g = Int(rgba[p * 4 + 1]), b = Int(rgba[p * 4 + 2])
+            for (k, c) in colours.enumerated()
+            where abs(r - c.0) <= tolerance && abs(g - c.1) <= tolerance
+                && abs(b - c.2) <= tolerance
+            {
+                cls[p] = UInt8(k)
+                break
+            }
+        }
+        /// The share (0...1) of the w x h box at (x, y) whose pixels match quadrant k;
+        /// 0 if the box leaves the image.
+        func share(_ k: UInt8, _ x: Int, _ y: Int, _ w: Int, _ h: Int) -> Double {
+            guard x >= 0, y >= 0, x + w <= width, y + h <= height else { return 0 }
+            var n = 0
+            for yy in y..<(y + h) {
+                for xx in x..<(x + w) where cls[yy * width + xx] == k { n += 1 }
+            }
+            return Double(n) / Double(w * h)
+        }
+        var seen = [Bool](repeating: false, count: width * height)
+        var stack: [Int] = []
+        var best = "no solid top-left block of \(minPixels) pixels or more"
+        for start in 0..<(width * height) where cls[start] == 0 && !seen[start] {
+            // One 4-connected block of the top-left colour.
+            var n = 0, minX = Int.max, minY = Int.max, maxX = -1, maxY = -1
+            seen[start] = true
+            stack.append(start)
+            while let p = stack.popLast() {
+                let x = p % width, y = p / width
+                n += 1
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+                where nx >= 0 && ny >= 0 && nx < width && ny < height {
+                    let q = ny * width + nx
+                    if cls[q] == 0 && !seen[q] {
+                        seen[q] = true
+                        stack.append(q)
+                    }
                 }
             }
-        }
-        for (k, b) in boxes.enumerated() {
-            if b.n < minPixels {
-                return missing("quadrant \(k) has \(b.n) matching pixels (< \(minPixels))")
+            let w = maxX - minX + 1, h = maxY - minY + 1
+            guard n >= minPixels, n * 10 >= w * h * 8, w <= 2 * h, h <= 2 * w else { continue }
+            let others: [(UInt8, Int, Int, String)] = [
+                (1, minX + w, minY, "top-right"), (2, minX, minY + h, "bottom-left"),
+                (3, minX + w, minY + h, "bottom-right"),
+            ]
+            if let miss = others.first(where: { share($0.0, $0.1, $0.2, w, h) < 0.8 }) {
+                best = "the top-left block at \(minX),\(minY) (\(w)x\(h)) has no \(miss.3) quadrant"
+                continue
             }
-            if b.n * 10 < b.area * 8 {
-                return missing("quadrant \(k) fills \(b.n) of its \(b.area)-pixel box (< 80%)")
-            }
+            return PatternVerdict(found: true, reason: "found at \(minX),\(minY) size \(2 * w)x\(2 * h)")
         }
-        let cx = boxes.map { Double($0.sumX) / Double($0.n) }
-        let cy = boxes.map { Double($0.sumY) / Double($0.n) }
-        guard cx[0] < cx[1], cx[2] < cx[3], cy[0] < cy[2], cy[1] < cy[3] else {
-            return missing("the quadrants are out of order")
-        }
-        let minX = boxes.map(\.minX).min()!, maxX = boxes.map(\.maxX).max()!
-        let minY = boxes.map(\.minY).min()!, maxY = boxes.map(\.maxY).max()!
-        let uw = maxX - minX + 1, uh = maxY - minY + 1
-        let total = boxes.reduce(0) { $0 + $1.n }
-        guard total * 10 >= uw * uh * 8 else {
-            return missing("the quadrants fill \(total) of their \(uw * uh)-pixel union (< 80%)")
-        }
-        guard uw * 2 >= uh, uh * 2 >= uw else {
-            return missing("the union is \(uw)x\(uh), not roughly square")
-        }
-        return PatternVerdict(found: true, reason: "found at \(minX),\(minY) size \(uw)x\(uh)")
+        return missing(best)
     }
 
     private static func missing(_ reason: String) -> PatternVerdict {

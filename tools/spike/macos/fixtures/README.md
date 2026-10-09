@@ -32,12 +32,14 @@ Nothing is signed with an identity. macOS builds are signed to run locally (ad-h
 Each test prints a `KBF-FIXTURE <name>=PASS|FAIL <detail>` line and keeps every
 screenshot in the `.xcresult` (attachment lifetime `keepAlways`), whatever the outcome.
 
-`PatternCheck` draws the image into an 8-bit sRGB bitmap and finds the pattern only if
-each colour forms a solid block, the blocks sit in the pattern's order, and together
-they fill a roughly square box. `selftest.sh` checks it against a pattern on a light
-and on a dark background (found), and against an all-black image, a wallpaper of hue
-bands, the quadrants in the wrong order, three quadrants and the quadrants scattered
-apart (each missing).
+`PatternCheck` draws the image into an 8-bit sRGB bitmap. Pattern colours can occur
+elsewhere on a screen, so it anchors on each solid, roughly square block of the
+top-left colour and finds the pattern only where the three same-sized boxes beside it
+(right, below, below-right) hold the other three colours. `selftest.sh` checks it
+against a pattern on a light and on a dark background, and a pattern among other
+pattern-coloured pixels (each found), and against an all-black image, a wallpaper of
+hue bands, the quadrants in the wrong order, three quadrants and the quadrants
+scattered apart (each missing).
 
 ## Running
 
