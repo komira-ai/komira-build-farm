@@ -139,6 +139,8 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo test --workspace --locked
+      # kbf-guest started as root through sudo must refuse (tools/ci/guest-tests.sh).
+      - run: bash tools/ci/guest-tests.sh
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -361,6 +363,11 @@ jobs:
       # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
       - run: cargo test -p kbf-mac-session --locked
       - run: bash tools/ci/mac-session-tests.sh
+      # The guest agent's tests, then the agent under launchd: Aqua from a LaunchAgent
+      # in this runner's GUI session, System from a LaunchDaemon (the control), and
+      # its refusal to run as root (tools/ci/guest-tests.sh).
+      - run: cargo test -p kbf-guest --locked
+      - run: bash tools/ci/guest-tests.sh
       # kbf-mac-provision on this VM, as root, running the daemon built above: what a
       # hosted VM can prove (the script's header lists what it applies, asserts and
       # only reads). Last, because it changes this runner's settings.
