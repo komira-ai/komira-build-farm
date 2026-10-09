@@ -139,6 +139,9 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo test --workspace --locked
+      # kbf-server's --version names this commit, and the CI-only override stamps two
+      # other commits from the same checkout (crates/kbf-server/build.rs).
+      - run: bash tools/ci/check-build-commit.sh stamps "$GITHUB_SHA"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
