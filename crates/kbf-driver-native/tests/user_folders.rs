@@ -417,9 +417,12 @@ async fn temporary_items_itself_cannot_be_removed_or_replaced() {
         }
         got.push((name, outcome));
         // Sandboxed: refused and T as it was; unsandboxed: done, T changed. A write
-        // below the folder works both ways and leaves T as it was.
+        // below the folder works both ways and leaves T as it was. A folder the
+        // control removed is made again by the sweep after its lease, so T looks as
+        // it was; the control's exit status is the proof there.
         let below = name == "below";
-        want.push((name, vec![(below, true), (true, below)]));
+        let remade = name.starts_with("rmdir");
+        want.push((name, vec![(below, true), (true, below || remade)]));
     }
     assert_eq!(got, want, "{}", sandbox_denials());
 }

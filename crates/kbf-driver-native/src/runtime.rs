@@ -830,7 +830,7 @@ mod tests {
             &sandbox_exec,
             format!(
                 "#!/bin/sh\n\
-                 case \"$4\" in *TemporaryItems/*) rules=rules ;; *) rules=none ;; esac\n\
+                 case \"$4\" in *xcrun_db*) rules=rules ;; *) rules=none ;; esac\n\
                  echo \"$2 $rules ${{DEVELOPER_DIR-own}}\" >> '{}'\nshift 4\nexec \"$@\"\n",
                 log.display()
             ),
