@@ -97,6 +97,19 @@ The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will a
 A report-only entry is never a request key: an action cannot ask for `vm.slots`, and
 `vms` is booked only through `kbf-lease=vm`.
 
+### Planned device entries
+
+Physical iOS devices on a Mac node ([ios-devices.md](ios-devices.md#52-report-entries))
+will add, all **planned**:
+
+| Entry | Meaning | Kind |
+|---|---|---|
+| `ios.device` (repeated) | one per **ready** USB-attached iPhone or iPad: a sorted `k=v` list of `id` (the UDID), `class`, `product_type`, `os_version`, `os_build` | capability: one device is booked per lease, and one device must satisfy every `ios.device.*` key of a request |
+
+A device that is not ready is not a report entry; it is listed, with its state and the
+fix, in `NodeStatus` (planned `devices`). An older server skips the entry, as it skips
+every report entry it does not know.
+
 ## The node status
 
 Facts that route no work go in `NodeStatus`, not in the report, so they do not change
@@ -170,6 +183,7 @@ Each key has one typed comparison:
 | `xcode` | membership: the node reports one `xcode` entry per installed Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | **planned**: membership on the digest (see [Planned VM entries](#planned-vm-entries)) |
+| `ios.device` | **planned**: `1` books one specific device; `ios.device.class`, `ios.device.product_type`, `ios.device.os_version`, `ios.device.os_build` are exact, and one device must satisfy all of them (see [Planned device entries](#planned-device-entries)) |
 
 Every other key may appear once. A value that does not parse or a repeated key is
 refused. A Mac with two Xcodes installed serves an action that names either build, and
@@ -285,6 +299,11 @@ naming no `container-image`.
   microarchitecture), `nvme_gib`, `os_image` (on bootc Linux), the SDKs of each Xcode
   on macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)),
   and the VM driver's `drivers` value and `vm.*` entries (above).
+- **iOS devices:** `ios.device` report entries and request keys, a booking of one
+  device id per lease carried in `Start`, and `NodeStatus.devices` with an attention
+  item for each device that is not ready ([ios-devices.md](ios-devices.md)). Until the
+  server knows `ios.device`, a request for it is an unknown property and matches
+  every node (see [Unknown keys](#unknown-keys)).
 - **Client-defined probes** (`probe.<k>`) as `NodeStatus` values, never report entries
   or request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
 - **Re-detection:** the daemon re-detects its software keys after an update step and
