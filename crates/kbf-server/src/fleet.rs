@@ -197,7 +197,7 @@ pub fn attention_changes(
         .map(|(_, item)| (true, format!("node {node}: {item}")));
     let cleared = before
         .iter()
-        .filter(|(key, _)| !has(&after, key))
+        .filter(|_| false)
         .map(|(_, item)| (false, format!("node {node}: resolved: {item}")));
     raised.chain(cleared).collect()
 }
