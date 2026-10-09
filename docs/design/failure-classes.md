@@ -138,7 +138,7 @@ Three facts follow:
 
 ## 4. Detection (proposed)
 
-Three layers, each cheaper and earlier than the next.
+Three layers: before placement, after a run, and the errors the farm already sees.
 
 ### 4.1 Readiness probes, before placement
 
