@@ -30,7 +30,7 @@ use kbf_proto::worker::{
     ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, Listeners, bind_server_with_api};
+use kbf_server::{Api, Bound, Listeners, ServeError, bind_server, bind_server_with_api};
 use prost::Message;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
@@ -286,10 +286,17 @@ impl Cell {
                     let shutdown = async move {
                         let _ = stop_rx.await;
                     };
-                    let bound = bind_server_with_api(server_cache, listeners, server_api, shutdown)
-                        .expect("bind");
-                    let _ = bound_tx.send((bound.reapi, bound.worker, bound.api));
-                    bound.serving.await.expect("serve");
+                    match server_api {
+                        None => {
+                            let bound = bind_server(server_cache, listeners, shutdown);
+                            run(bound.expect("bind"), bound_tx).await;
+                        }
+                        Some(api) => {
+                            let bound =
+                                bind_server_with_api(server_cache, listeners, Some(api), shutdown);
+                            run(bound.expect("bind"), bound_tx).await;
+                        }
+                    }
                 });
                 drop(runtime);
                 let _ = stopped_tx.send(());
@@ -306,6 +313,15 @@ impl Cell {
             client: Client::connect(reapi, worker).await,
         }
     }
+}
+
+/// Says where `bound` listens on `addresses`, then serves it until it stops.
+async fn run(
+    bound: Bound<impl Future<Output = Result<(), ServeError>>>,
+    addresses: oneshot::Sender<(SocketAddr, SocketAddr, Option<SocketAddr>)>,
+) {
+    let _ = addresses.send((bound.reapi, bound.worker, bound.api));
+    bound.serving.await.expect("serve");
 }
 
 /// An operator API token holding [`API_TOKEN`], from a file of mode 0600 unique to
