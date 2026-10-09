@@ -268,8 +268,10 @@ impl<R: Runtime> Daemon<R> {
         changed
     }
 
-    /// The `NodeStatus` this node sends now.
-    fn node_status(&self) -> worker::NodeStatus {
+    /// The `NodeStatus` this node sends now: its software, and every Xcode the
+    /// driver's newest report names, ready or not.
+    #[must_use]
+    pub fn node_status(&self) -> worker::NodeStatus {
         worker::NodeStatus {
             xcodes: self.xcodes.clone(),
             ..self.software.status(&self.report)

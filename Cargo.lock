@@ -1334,6 +1334,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-outputs",
+ "kbf-proto",
  "libc",
  "rcgen",
  "tokio",

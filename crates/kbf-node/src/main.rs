@@ -131,19 +131,7 @@ fn start(cli: &Cli) -> Result<(), Error> {
             &tokio,
             daemon(cli, Arc::new(FakeRuntime::new(Duration::ZERO)))?,
         ),
-        Driver::Native => {
-            let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
-            let runtime = Arc::new(runtime);
-            let watched = Arc::clone(&runtime);
-            let (probe, every) = xcode_watch_args(cli);
-            let (driver, _) = xcode_watch::watch(
-                cli.xcode_apps.clone(),
-                probe,
-                every,
-                Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
-            );
-            serve(&tokio, daemon(cli, runtime)?.with_driver_report(driver))
-        }
+        Driver::Native => serve(&tokio, native(cli)?),
         Driver::Container => container::start(cli, &tokio),
     }
 }
@@ -157,6 +145,23 @@ fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
         runtime,
         report,
     )?)
+}
+
+/// The daemon with the native driver, which surveys the Xcodes in `--xcode-apps` now
+/// and again every `--xcode-recheck-secs` and hands each changed survey to the daemon
+/// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or not.
+fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
+    let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
+    let runtime = Arc::new(runtime);
+    let watched = Arc::clone(&runtime);
+    let (probe, every) = xcode_watch_args(cli);
+    let (driver, _) = xcode_watch::watch(
+        cli.xcode_apps.clone(),
+        probe,
+        every,
+        Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
+    );
+    Ok(daemon(cli, runtime)?.with_driver_report(driver))
 }
 
 /// Runs `daemon` until SIGTERM or SIGINT.
@@ -264,6 +269,10 @@ mod container {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use kbf_proto::worker::XcodeState;
+
     use super::*;
 
     fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
@@ -325,6 +334,72 @@ mod tests {
         assert!(native_config(&relative).is_err());
         let missing = parse(&["--driver=native"]).expect("flags");
         assert!(native_config(&missing).is_err());
+    }
+
+    /// A fresh directory for one test, under the test binary's directory.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-node-unit")
+            .join(format!("{name}-{}", std::process::id()));
+        // Absent unless a run with this pid left it.
+        let _ = kbf_outputs::remove_tree(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// A CA and a client certificate signed by it, written to `dir` as the flags name.
+    fn tls_files(dir: &Path) {
+        use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+        let key = KeyPair::generate().expect("key");
+        let cert = CertificateParams::new(Vec::new())
+            .expect("params")
+            .signed_by(&key, &ca)
+            .expect("sign");
+        std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
+        std::fs::write(dir.join("node.pem"), cert.pem()).expect("write");
+        std::fs::write(dir.join("node.key"), key.serialize_pem()).expect("write");
+    }
+
+    /// Catches: the native driver's Xcode survey not handed to the daemon (issue #164),
+    /// so the node's `NodeStatus` lists no Xcode at all, ready or not, and its Hello
+    /// advertises none: the silent removal an Xcode that is not ready must never get.
+    /// The Xcode here is an empty app, which no `xcodebuild` accepts (on Linux there is
+    /// none), so it is listed as not ready, with why.
+    #[tokio::test]
+    async fn the_native_daemon_reports_every_installed_xcode() {
+        let dir = scratch("native");
+        tls_files(&dir);
+        let apps = dir.join("Applications");
+        let app = apps.join("Xcode_1.app");
+        std::fs::create_dir_all(app.join("Contents/Developer")).expect("app");
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=http://127.0.0.1:1".to_owned(),
+            flag("scratch", &dir.join("leases")),
+            flag("xcode-apps", &apps),
+        ])
+        .expect("flags");
+        let daemon = native(&cli).expect("the native daemon");
+        let xcodes = daemon.node_status().xcodes;
+        assert_eq!(xcodes.len(), 1, "{xcodes:?}");
+        assert_eq!(xcodes[0].app, app.display().to_string());
+        assert_eq!(xcodes[0].state(), XcodeState::Failed);
+        assert!(!xcodes[0].reason.is_empty(), "{xcodes:?}");
+        drop(daemon);
+        kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
     /// Catches: a CAS URL of another scheme accepted, and `--cas` not required.
