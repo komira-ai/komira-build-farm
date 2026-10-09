@@ -385,7 +385,9 @@ fn every_xcode_that_answers_is_found() {
 /// that requires it, asked for on one that does not, a Metal question not answered in
 /// time taken as an Xcode before 26 or as missing Metal, an `Xcode` before 26 (no
 /// `-showComponent`) taken as missing Metal when `xcrun` finds it, or as having Metal
-/// when `xcrun` does not, and `xcrun` asked without `--no-cache` (it then reads a
+/// when `xcrun` does not, the Xcodes asked one after another (then the survey after
+/// the start, which removes `xcrun`'s cache, takes seconds per Xcode before the node
+/// says `Hello`), and `xcrun` asked without `--no-cache` (it then reads a
 /// cache leases can write, while the daemon runs it outside the sandbox).
 #[test]
 fn every_installed_xcode_is_reported_with_its_state() {
@@ -522,7 +524,15 @@ fn every_installed_xcode_is_reported_with_its_state() {
             ),
         ),
     ];
+    let started = Instant::now();
     assert_eq!(survey(&apps, &probe), want);
+    // Three Xcodes each hang for `WITHIN` on one question: one after the other would
+    // take three times that.
+    let took = started.elapsed();
+    assert!(
+        took < WITHIN * 2,
+        "the Xcodes were asked one by one: {took:?}"
+    );
     let developer = |app: &str| real.join(app).join("Contents/Developer");
     assert_eq!(
         ready(&want),

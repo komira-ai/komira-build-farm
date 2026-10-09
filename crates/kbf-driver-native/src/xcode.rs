@@ -204,8 +204,12 @@ impl Probe {
 
 /// Every `Xcode*.app` in `apps`, in name order, each asked the questions in the module
 /// documentation as `probe` says. A directory that cannot be read has none. A question
-/// not answered in time (exit and close its output) is killed if still running, so each
-/// Xcode delays the return by up to `probe.within` per question it is asked.
+/// not answered in time (exit and close its output) is killed if still running. Each
+/// Xcode is asked on a thread of its own, so the survey takes as long as its slowest
+/// Xcode, up to `probe.within` per question, not as long as all of them: an `xcrun`
+/// lookup it has not cached takes seconds, and right after the daemon starts (which
+/// removes the cache: [`crate::NativeConfig::forget_xcrun_cache`]) every one is, while
+/// the node says nothing to the server until its first survey is done.
 #[must_use]
 pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
     let Ok(entries) = std::fs::read_dir(apps) else {
@@ -220,10 +224,23 @@ pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
         })
         .collect();
     names.sort();
-    names
-        .into_iter()
-        .map(|name| check(apps.join(name), probe))
-        .collect()
+    std::thread::scope(|scope| {
+        let asking: Vec<_> = names
+            .into_iter()
+            .map(|name| {
+                let app = apps.join(name);
+                scope.spawn(move || check(app, probe))
+            })
+            .collect();
+        asking
+            .into_iter()
+            .map(|asked| {
+                asked
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            })
+            .collect()
+    })
 }
 
 /// The ready Xcodes of `xcodes`, by build, as their `DEVELOPER_DIR`s. Of two with one
