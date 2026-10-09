@@ -440,13 +440,26 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     let move_away = |root: &str, to: &str| -> Vec<String> {
         let top = format!("{root}/a");
         let to = scratch.join(to).to_string_lossy().into_owned();
-        ["-name", "trigger", "-exec", "mv", top.as_str(), to.as_str(), ";"]
-            .map(str::to_owned)
-            .to_vec()
+        [
+            "-name",
+            "trigger",
+            "-exec",
+            "mv",
+            top.as_str(),
+            to.as_str(),
+            ";",
+        ]
+        .map(str::to_owned)
+        .to_vec()
     };
     let root = deep_tree("gives-up");
-    let walk = find(&["env"], &[&root], &[&root], &strs(&move_away(&root, "moved")))
-        .unwrap_or_else(|why| panic!("a walk that fts gave up was not walked again: {why}"));
+    let walk = find(
+        &["env"],
+        &[&root],
+        &[&root],
+        &strs(&move_away(&root, "moved")),
+    )
+    .unwrap_or_else(|why| panic!("a walk that fts gave up was not walked again: {why}"));
     assert_eq!(walk.aborted, 1, "{walk:?}");
     assert!(exists(&scratch.join("moved")), "the walk moved the tree");
     // The same in a tree where nothing may vanish.
