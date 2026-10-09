@@ -464,9 +464,13 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         format!("--scratch={}", scratch.display()),
     ];
 
+    probe_snap("binary-before-first-daemon");
+    let spawned = Instant::now();
     let mut first = daemon(&flags, &dir.join("first.log"));
     let session = front.session(PROMPT);
     session.hello();
+    probe_hello("first", spawned, &dir.join("first.log"));
+    probe_snap("binary-after-first-hello");
     session.welcome();
     session.start(1, 1, action);
     let pid_file = scratch.join("lease-1-1/root/pid");
@@ -483,9 +487,11 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(!ended(pid), "the action outlived its daemon");
 
+    let spawned = Instant::now();
     let mut second = daemon(&flags, &dir.join("second.log"));
     let session = front.session(PROMPT);
     session.hello();
+    probe_hello("second", spawned, &dir.join("second.log"));
     // What holds as the new session begins.
     let action_ended = ended(pid);
     let lease_dir_left = scratch.join("lease-1-1").exists();
@@ -506,4 +512,19 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "the lease directory was still there at Hello:\n{log}"
     );
     assert!(status.success(), "{status}: {log}");
+}
+
+/// PROBE, do not merge: the xcrun cache as the probe script sees it.
+fn probe_snap(label: &str) {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ci/probe-xcrun-db.sh");
+    let out = Command::new("bash").arg(script).args(["snap", label]).output().expect("probe");
+    let _ = std::io::stderr().write_all(&out.stdout);
+}
+
+/// PROBE, do not merge: a restart-test daemon's spawn to Hello, and its survey line.
+fn probe_hello(name: &str, spawned: Instant, log: &Path) {
+    let took = spawned.elapsed();
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let survey = text.lines().find(|l| l.contains("Xcodes")).unwrap_or("");
+    let _ = writeln!(std::io::stderr(), "binary.rs PROBE: restart {name} daemon Hello {took:.2?} after spawn; {survey}");
 }
