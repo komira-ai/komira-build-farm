@@ -5,7 +5,7 @@ mod common;
 use common::{
     DAY, HOUR, cache_action, collect, commit_touch, mark_missing, mark_reachable, meta, tick,
 };
-use kbf_meta::{ActionAnswer, Command, Miss, Touch};
+use kbf_meta::{ActionAnswer, Miss, Touch};
 
 /// Catches: a lookup that fails on a complete entry, or serves something other than
 /// the stored `ActionResult` digest.

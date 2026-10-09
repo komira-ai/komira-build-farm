@@ -5,7 +5,7 @@ mod common;
 use common::{
     cache_action, digest, in_segment, mark_missing, mark_reachable, meta, put, put_action,
 };
-use kbf_meta::{ActionAnswer, ActionRecord, ActionWriteError, Closure, Command, Miss, Role};
+use kbf_meta::{ActionAnswer, ActionRecord, ActionWriteError, Closure, Miss, Role};
 
 /// Catches: a client `UpdateActionResult` accepted. Only daemons, which ran the action,
 /// write the action cache; a client write would let one client serve any result to
