@@ -10,7 +10,10 @@
 //! Checked: I1 (lease ids unique, increasing), I2 (`Start` only for the current,
 //! committed grant), I3 (one holding per operation; `leases_on` is the holdings), I4
 //! (finished once, each waiter answered once), I5 (an answer names the newest
-//! committed grant, and carries the outcome that lease's run produced), I6 (bookings
+//! committed grant, and carries the outcome that lease's run produced; F3's world
+//! never sends a stale or fenced result, because a worker that goes down drops its
+//! runs, so here I5 proves only that the outcome is passed through: a scheduler that
+//! accepts a fenced result is F2's to catch), I6 (bookings
 //! fit at a grant; `booked` is the sum of the holdings), I7 (grants go to a live worker
 //! whose last reported capabilities satisfy the platform), I8 (no grant to a cordoned
 //! worker, across sessions), I9 (a lease is given up only when its worker went down
@@ -643,7 +646,7 @@ impl Check {
 
     /// The scheduler's state against the shadow's: cordons, holdings, bookings, queue.
     fn compare(&mut self, sched: &Scheduler) {
-        for (name, w) in &self.workers {
+        for name in self.workers.keys() {
             let cordon = sched.cordon(name);
             let want = self.cordons.get(name);
             self.ensure(cordon == want, "I9", || {
@@ -682,7 +685,6 @@ impl Check {
                 }
                 Some(Cordon::Cordoned) | None => {}
             }
-            let _ = w;
         }
         for (id, h) in &self.holding {
             let state = holding(sched, *id);

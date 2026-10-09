@@ -345,10 +345,12 @@ fn reboot_while_cordoned(seed: u64) -> World {
         (up, Act::Up("arm")),
         (unc, Act::Uncordon("arm")),
     ];
-    let w = World::new("f3_7", seed, script, background(unc + 10)).run(unc + 400, &mut |w| {
+    let mut back_cordoned = false;
+    let mut w = World::new("f3_7", seed, script, background(unc + 10)).run(unc + 400, &mut |w| {
         if (up..unc).contains(&w.t) && w.sched.cordon(&arm()).is_none() {
             w.check.fail("F3.7", "arm registered again uncordoned");
         }
+        back_cordoned |= w.t == up && w.sched.cordon(&arm()).is_some();
     });
     let granted_on_arm_between = w
         .check
@@ -359,6 +361,13 @@ fn reboot_while_cordoned(seed: u64) -> World {
         .any(|(at, on, _)| *on == arm() && (c * MS..unc * MS).contains(at));
     if granted_on_arm_between {
         w.check.fail("F3.7", "a grant to arm while it was cordoned");
+    }
+    if back_cordoned {
+        w.check.reach(if up - down < GRACE {
+            "registered again cordoned after an outage shorter than G"
+        } else {
+            "registered again cordoned after an outage of G or longer"
+        });
     }
     w
 }
@@ -382,9 +391,10 @@ fn caps_change_while_cordoned(seed: u64) -> World {
         (x + 3, Act::Submit(XCODE_OLD, 0, 20)),
         (unc, Act::Uncordon("mac")),
     ];
-    let w = World::new("f3_8", seed, script, background(unc + 10)).run(unc + 400, &mut |_| {});
+    let mut w = World::new("f3_8", seed, script, background(unc + 10)).run(unc + 400, &mut |_| {});
     let seen = &w.check.seen;
     let mac = WorkerId::new("mac");
+    let (mut ran, mut refused_lost) = (0, 0);
     for (platform, xcode) in [(XCODE_NEW, NEW_XCODE), (XCODE_OLD, OLD_XCODE)] {
         for id in ops_of(&w, platform, x + 1, x + 4) {
             let has = set.contains(&xcode);
@@ -395,6 +405,8 @@ fn caps_change_while_cordoned(seed: u64) -> World {
                 && seen.answered.contains_key(&id);
             let refused = seen.refused.contains_key(&id);
             let ok = if has { ran_on_mac } else { refused };
+            ran += u64::from(has && ran_on_mac);
+            refused_lost += u64::from(!has && refused);
             if !ok {
                 w.check.fail(
                     "F3.8",
@@ -402,6 +414,20 @@ fn caps_change_while_cordoned(seed: u64) -> World {
                 );
             }
         }
+    }
+    if ran > 0 {
+        w.check
+            .reach("work for a build the Mac has ran there after the uncordon");
+    }
+    if refused_lost > 0 {
+        w.check.reach("work for a build the Mac lost refused");
+    }
+    if ran + refused_lost > 0 {
+        w.check.reach(match seed % 3 {
+            0 => "Xcode builds changed to old and new",
+            1 => "Xcode builds changed to new only",
+            _ => "Xcode builds changed to old only",
+        });
     }
     w
 }
@@ -498,14 +524,29 @@ fn f3_4_a_paused_drain_whose_leases_end_later() {
 /// Catches: a cordon tied to the session, lost when the node registers again.
 #[test]
 fn f3_7_a_node_reboots_while_cordoned() {
-    sweep(reboot_while_cordoned, 0..SEEDS);
+    let worlds = sweep(reboot_while_cordoned, 0..SEEDS);
+    for what in [
+        "registered again cordoned after an outage shorter than G",
+        "registered again cordoned after an outage of G or longer",
+    ] {
+        assert!(reached(&worlds, what) > 0, "F3.7 never reached {what:?}");
+    }
 }
 
 /// Catches: capabilities a resent `Hello` does not update; a matching memo that
 /// serves one platform's matches to another.
 #[test]
 fn f3_8_capabilities_change_while_cordoned() {
-    sweep(caps_change_while_cordoned, 0..SEEDS);
+    let worlds = sweep(caps_change_while_cordoned, 0..SEEDS);
+    for what in [
+        "Xcode builds changed to old and new",
+        "Xcode builds changed to new only",
+        "Xcode builds changed to old only",
+        "work for a build the Mac has ran there after the uncordon",
+        "work for a build the Mac lost refused",
+    ] {
+        assert!(reached(&worlds, what) > 0, "F3.8 never reached {what:?}");
+    }
 }
 
 /// The swarm reaches every situation the family is for.
@@ -540,13 +581,14 @@ fn swarm_long() {
     sweep(swarm, 0..2_000);
 }
 
-/// One seed replays to the same trace; another differs.
+/// One seed replays to the same trace; another differs. The swarm alone: it turns on
+/// every kind of act the scripted scenarios use, on the same world and checker, and
+/// replaying every scenario twice cost more than the rest of the file.
 #[test]
 fn a_seed_replays() {
-    for (name, scenario) in SCENARIOS {
-        assert_eq!(scenario(7).hash, scenario(7).hash, "{name}");
-    }
-    assert_ne!(swarm(7).hash, swarm(8).hash);
+    let seven = swarm(7).hash;
+    assert_eq!(seven, swarm(7).hash);
+    assert_ne!(seven, swarm(8).hash);
 }
 
 /// Replays one scenario and seed: `KBF_SIM_SCENARIO` and `KBF_SIM_SEED`.
