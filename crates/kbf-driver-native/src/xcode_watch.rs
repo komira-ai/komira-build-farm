@@ -77,7 +77,7 @@ fn key(xcode: &Xcode) -> (&PathBuf, Option<&PathBuf>, Option<&str>, State) {
         &xcode.app,
         xcode.developer_dir.as_ref(),
         xcode.build.as_deref(),
-        xcode.state,
+        State::Ready,
     )
 }
 
