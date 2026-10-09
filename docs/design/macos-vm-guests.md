@@ -270,7 +270,7 @@ directory as its working directory; 3. at the end, `kill-uid`, then the driver
 deletes the lease directory (macos-vms.md section 6, step 6), then `user-delete`.
 
 On `main`, `user-delete`'s sweep covers the user's schedules (`crontab`, `at` jobs),
-the home folder and the places `SweepPlan::macos()` lists: `/Users/Shared`,
+the home folder and the places `SweepPlan::macos()` lists: the shared user folder,
 `/private/tmp`, `/private/var/tmp`, `/private/var/folders` and two per-uid launchd
 plists (`crates/kbf-mac-session/src/sweep.rs`) **[V]**. It does not cover the daemon's lease
 directories, so it does not remove the clone; the driver must.
