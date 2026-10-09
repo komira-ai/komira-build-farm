@@ -348,7 +348,7 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
             .args(expr)
             .output()
             .expect("run find");
-        found = String::from_utf8_lossy(&output.stdout).into_owned(); // MUTANT C
+        found.clear(); found.push_str(&String::from_utf8_lossy(&output.stdout)); // MUTANT C
         stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let errors_ok = !stderr.trim().is_empty()
             && output.status.code() == Some(1)
