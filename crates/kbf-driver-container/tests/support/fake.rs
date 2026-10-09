@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
+use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime, StartError};
 use kbf_types::Resources;
 
 use super::{Spec, exists, store_action, work};
@@ -37,6 +37,7 @@ pub struct Fake {
     pub state: PathBuf,
     pub cgroup: PathBuf,
     pub scratch: PathBuf,
+    pub config: PodmanConfig,
     pub cas: Arc<MemoryCas>,
     pub runtime: Arc<PodmanRuntime<MemoryCas>>,
 }
@@ -61,19 +62,25 @@ impl Fake {
         let program = dir.join("podman");
         std::os::unix::fs::symlink(&fixture, &program).expect("link podman");
         std::fs::write(state.join("image-id"), "img1\n").expect("image id");
-        let mut config = PodmanConfig::new(scratch.clone(), "/actions".to_owned());
+        let mut config =
+            PodmanConfig::new(scratch.clone(), "/actions".to_owned(), "node-1".to_owned());
         config.podman = program;
         config.cgroup_root = cgroup.clone();
         config.default_timeout = Duration::from_secs(60);
         config.kill_grace = Duration::from_millis(300);
         configure(&mut config);
         let cas = Arc::new(MemoryCas::new());
-        let runtime = Arc::new(PodmanRuntime::new(config, Arc::clone(&cas)).expect("runtime"));
+        let runtime =
+            Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
+        // The start's own sweep (`ps`) is not a lease's: `calls` records leases only.
+        // (`tests/restart.rs` checks the sweep.)
+        let _ = std::fs::remove_file(state.join("calls"));
         let fake = Self {
             dir,
             state,
             cgroup,
             scratch,
+            config,
             cas,
             runtime,
         };
@@ -145,6 +152,11 @@ impl Fake {
         self.runtime
             .run(work(seq, action, Resources::new(2000, 1 << 30)))
             .await
+    }
+
+    /// A second runtime on this fake's configuration, as a restarted daemon makes.
+    pub fn restart(&self) -> Result<PodmanRuntime<MemoryCas>, StartError> {
+        PodmanRuntime::new(self.config.clone(), Arc::clone(&self.cas))
     }
 
     pub async fn wait_for_start(&self) {

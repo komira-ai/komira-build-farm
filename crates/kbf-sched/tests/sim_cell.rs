@@ -20,8 +20,10 @@
 //! Three more runs keep every worker talking, so the grace G never fires, and lose or
 //! hide a committed lease another way. Each must still answer every operation once,
 //! release every booking, and fence the result of the lost lease:
-//! - worker-1 reboots (its runs die) and worker-2's daemon restarts (its runs are
-//!   re-adopted), each registering again well inside G;
+//! - worker-1 reboots (its runs die) and worker-2's daemon restarts and re-adopts its
+//!   runs, each registering again well inside G. Re-adopting is the planned daemon's,
+//!   not `kbf-daemon`'s: a restarted `kbf-daemon` ends the runs it left before its
+//!   `Hello` (issue #155), which the scheduler sees as this run's reboot;
 //! - worker-1 never receives one `Start`, while its session stays up;
 //! - worker-1 runs one hermetic lease but leaves it out of every heartbeat's running
 //!   set, and reports it late.
@@ -195,10 +197,15 @@ struct Run {
 enum Fault {
     None,
     /// At this many milliseconds the machine reboots: every run dies and the self-fence
-    /// is lost; results already on disk are kept. The daemon registers again at once.
+    /// is lost, but results not yet acknowledged are kept and resent, as a daemon that
+    /// kept them on disk would. `kbf-daemon` keeps them in memory only, so it loses
+    /// them, and their leases are requeued as unheard (F2.14 models that). The daemon
+    /// registers again at once.
     Reboot(u64),
     /// At this many milliseconds the daemon restarts: its runs keep going and are
-    /// re-adopted. It registers again at once.
+    /// re-adopted, listed in its first heartbeat. This is the planned re-adopting
+    /// daemon, not `kbf-daemon`, which ends every run it left before its `Hello`
+    /// (issue #155; the F2.14 crash). It registers again at once.
     Restart(u64),
     /// Every copy of the first `Start` sent to this worker is lost.
     DropFirstStart,
@@ -828,7 +835,8 @@ fn a_seed_replays_exactly() {
 /// before letting them go, or for less (the scheduler cannot tell a rebooted daemon from
 /// a second one still running them, issue #140), and one that drops the leases a
 /// restarted daemon re-adopted and still runs (they would run twice), as a registration
-/// fed the running set the wire's `Hello` lacks would.
+/// fed the running set the wire's `Hello` lacks would. The re-adopting daemon is the
+/// planned one ([`Fault::Restart`]).
 #[test]
 fn a_worker_that_registers_again_keeps_only_what_it_still_runs() {
     let scenario = Scenario {

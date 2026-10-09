@@ -11,7 +11,8 @@
 //! - [`remove_tree`] removes a directory tree iteratively, by descriptor, restoring
 //!   the owner's permissions on any directory the action locked and, on macOS,
 //!   clearing the immutable and append-only user flags (`chflags uchg`, `uappnd`) it
-//!   set on any entry and every ACL, never following a symlink.
+//!   set on any entry and every ACL, never following a symlink; [`remove_tree_at`]
+//!   does the same for a name in a directory the caller holds open.
 //!
 //! The native driver (`kbf-driver-native`) uses both. The container driver
 //! (`kbf-driver-container`) keeps its own copy of the walk for now; moving it onto
@@ -29,5 +30,5 @@ mod store;
 
 pub use collect::{OutputsError, collect, store_file};
 pub use limits::{Exceeded, OutputLimits};
-pub use remove::remove_tree;
+pub use remove::{remove_tree, remove_tree_at};
 pub use store::{CHUNK_BYTES, Store, StoreError, digest_of};

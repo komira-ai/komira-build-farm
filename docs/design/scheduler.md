@@ -168,9 +168,14 @@ instance id (a daemon that predates the field) is taken as another process's.
 
 This puts one duty on a daemon: it must list everything it holds in its first heartbeat
 on each new stream, or what it leaves out is requeued at once. Re-adopting work across a
-daemon restart is **planned**; today a restarted daemon has no running leases, and a
-restarted daemon is another process, so leases it would re-adopt and leave out are kept
-for the handover grace.
+daemon restart is **planned**. Today a restarted daemon lists nothing of its
+predecessor's, and before its `Hello` its driver ends every run that predecessor left on
+the node (issue #155), so what is requeued after the handover grace no longer runs there.
+The grace rests on the older process fencing T after it was last heard; a process that
+was killed fences nothing, so for its runs the restarted daemon's sweep is the guarantee,
+and it holds only when a daemon is started again on the same node with the same scratch
+directory. The runs of a killed daemon that is not are left running, unfenced (see
+[daemon.md](daemon.md#when-the-daemon-is-killed)).
 
 ## QoS
 

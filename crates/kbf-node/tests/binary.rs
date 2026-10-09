@@ -1,5 +1,8 @@
 //! The `kbf-daemon` binary as a node runs it: its flags, each driver brought up far
-//! enough to detect the node and start the session loop, and a clean exit on SIGTERM.
+//! enough to detect the node and start the session loop, and a clean exit on SIGTERM;
+//! and, against a fake front ([`front`]), what a restarted daemon ends before `Hello`.
+
+mod front;
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -75,6 +78,14 @@ fn tls(name: &str) -> PathBuf {
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     std::fs::write(dir.join("node.pem"), cert.pem()).expect("write");
     std::fs::write(dir.join("node.key"), key.serialize_pem()).expect("write");
+    // The fake front's own certificate ([`front::Front`]), for `localhost`.
+    let server_key = KeyPair::generate().expect("key");
+    let server = CertificateParams::new(vec!["localhost".to_owned()])
+        .expect("params")
+        .signed_by(&server_key, &ca)
+        .expect("sign");
+    std::fs::write(dir.join("server.pem"), server.pem()).expect("write");
+    std::fs::write(dir.join("server.key"), server_key.serialize_pem()).expect("write");
     dir
 }
 
@@ -102,8 +113,25 @@ fn base(dir: &Path) -> Vec<String> {
 /// (issue #170): no terminal escape codes, since stderr is not a terminal, and the
 /// failed connection's cause under tonic's bare `transport error`.
 fn runs_until_sigterm(name: &str, extra: &[String]) -> std::process::ExitStatus {
+    runs_until_sigterm_with_path(name, extra, None)
+}
+
+/// [`runs_until_sigterm`], with `path` searched first for programs (`podman`).
+fn runs_until_sigterm_with_path(
+    name: &str,
+    extra: &[String],
+    path: Option<&Path>,
+) -> std::process::ExitStatus {
     let dir = tls(name);
-    let mut child = Command::new(BIN)
+    let mut command = Command::new(BIN);
+    if let Some(path) = path {
+        let system = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = path.as_os_str().to_owned();
+        joined.push(":");
+        joined.push(system);
+        command.env("PATH", joined);
+    }
+    let mut child = command
         .args(base(&dir))
         .args(extra)
         .stderr(Stdio::piped())
@@ -181,8 +209,24 @@ fn each_driver_starts_and_stops_on_sigterm() {
             "--cgroup-parent=/kbf.slice/actions".to_owned(),
             format!("--id-files={}", ids.display()),
         ];
-        let status = runs_until_sigterm("container", &container);
+        // A `podman` that lists no container and logs its arguments: the start-up
+        // sweep asks it for this node's leftovers before the daemon connects.
+        // A symlink, not a written script: exec'ing a file this process just wrote can
+        // fail with ETXTBSY while another test thread forks.
+        let bin = tls("container-bin");
+        let log = bin.join("podman.log");
+        let _ = std::fs::remove_file(bin.join("podman"));
+        let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/podman-stub.sh");
+        std::os::unix::fs::symlink(stub, bin.join("podman")).expect("link podman");
+        let status = runs_until_sigterm_with_path("container", &container, Some(&bin));
         assert!(status.success(), "{status}");
+        let asked = read(&log);
+        assert!(
+            asked
+                .lines()
+                .any(|a| a == "--filter=label=kbf.owner=node-1"),
+            "the sweep looks for this node's containers: {asked}"
+        );
     }
 }
 
@@ -311,4 +355,125 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
         let says = format!("kbf-daemon: {}/{says}", ids.display());
         assert!(stderr.contains(&says), "{name}: {stderr}");
     }
+}
+
+/// How long a step of the restart test may take.
+const PROMPT: Duration = Duration::from_secs(30);
+
+/// Starts the daemon with `flags`, its log written to `log`.
+fn daemon(flags: &[String], log: &Path) -> std::process::Child {
+    Command::new(BIN)
+        .args(flags)
+        .stderr(std::fs::File::create(log).expect("log file"))
+        .spawn()
+        .expect("spawn")
+}
+
+/// Sends `signal` to `child` and reaps it.
+fn stop(child: &mut std::process::Child, signal: libc::c_int) -> std::process::ExitStatus {
+    let pid = i32::try_from(child.id()).expect("pid");
+    // SAFETY: kill(2) on a child this test spawned and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    child.wait().expect("wait")
+}
+
+/// Whether process `pid` has ended: gone, or a zombie its new parent has yet to reap.
+fn ended(pid: i32) -> bool {
+    let stat = if cfg!(target_os = "linux") {
+        // The state is the first field after the command name, which ends at the last ')'.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| Some(s.rsplit_once(") ")?.1.to_owned()))
+            .unwrap_or_default()
+    } else {
+        let out = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    stat.is_empty() || stat.starts_with('Z')
+}
+
+/// Polls `read` until it returns a value, for at most [`PROMPT`].
+fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + PROMPT;
+    loop {
+        if let Some(value) = read() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Catches (issue #155) a daemon killed by SIGKILL (as the kernel's OOM killer, or a
+/// panic that aborts, ends it) whose action outlives it and still runs when the next
+/// daemon on the node says `Hello`: the scheduler requeues a lease the new session
+/// leaves out, so the action would run twice at once (I12). The action leads its own
+/// process group, so neither the dead daemon nor the service manager ends it; the
+/// restarted daemon must kill it, and remove its lease directory, before `Hello`.
+#[test]
+fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let dir = tls("restart");
+    let scratch = dir.join("leases");
+    let front = front::Front::start(&dir);
+    let action = front.sh("echo $$ > pid; exec sleep 300");
+    let flags = vec![
+        format!("--server=https://127.0.0.1:{}", front.worker.port()),
+        "--tls-server-name=localhost".to_owned(),
+        format!("--ca-cert={}", dir.join("ca.pem").display()),
+        format!("--cert={}", dir.join("node.pem").display()),
+        format!("--key={}", dir.join("node.key").display()),
+        "--node-id=node-1".to_owned(),
+        "--reconnect-ms=50".to_owned(),
+        "--driver=native".to_owned(),
+        format!("--cas=http://{}", front.cas),
+        format!("--scratch={}", scratch.display()),
+    ];
+
+    let mut first = daemon(&flags, &dir.join("first.log"));
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    session.start(1, 1, action);
+    let pid_file = scratch.join("lease-1-1/root/pid");
+    let pid: i32 = wait_for("the action's pid", || {
+        let text = std::fs::read_to_string(&pid_file).ok()?;
+        text.strip_suffix('\n')?.parse().ok()
+    });
+    assert!(!ended(pid), "the action runs");
+    assert_eq!(
+        stop(&mut first, libc::SIGKILL).signal(),
+        Some(libc::SIGKILL)
+    );
+    // The premise: nothing else ends the action once its daemon is gone.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!ended(pid), "the action outlived its daemon");
+
+    let mut second = daemon(&flags, &dir.join("second.log"));
+    let session = front.session(PROMPT);
+    session.hello();
+    // What holds as the new session begins.
+    let action_ended = ended(pid);
+    let lease_dir_left = scratch.join("lease-1-1").exists();
+    let status = stop(&mut second, libc::SIGTERM);
+    if !action_ended {
+        // A red run must not leave the sleep behind. It was alive a moment ago and is
+        // no child of anyone who reaps it early, so the pid is still the sleep's.
+        // SAFETY: kill(2) takes plain integers.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let log = read(&dir.join("second.log"));
+    assert!(
+        action_ended,
+        "the action (pid {pid}) still ran when the restarted daemon said Hello:\n{log}"
+    );
+    assert!(
+        !lease_dir_left,
+        "the lease directory was still there at Hello:\n{log}"
+    );
+    assert!(status.success(), "{status}: {log}");
 }

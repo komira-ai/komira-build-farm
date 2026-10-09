@@ -228,6 +228,7 @@ in `sim_cell` today.
 | F2.11 | Lost and repeated results and acks | drops and duplicates on `Report` and `ReportAck` | results resent until acknowledged; each proposed once per holding; each operation answered once |
 | F2.12 | Two daemons claim one node id | two worker nodes (two daemon processes) register as the same worker in turn; on half the seeds the first then dies | only the newest stream's heartbeats count; `Start`s go only to it; the other fences in T; a lease of the other process is kept for the handover grace, then given up (issue #140); no self-fenced work twice (I12) |
 | F2.13 | A lease of another term, or of another worker, listed | a worker lists leases of an older and a newer term; a worker with no room lists leases of this term held on other workers | `not_held` names neither foreign lease, and no `Cancel` goes for them; it names each lease held on another worker |
+| F2.14 | A daemon crash and its restart | a worker's daemon dies at a random time and starts again at once on a new stream, its leases, results and contact clock lost | the restarted daemon's sweep ends the runs it left before its `Hello`, so their retries, after the handover grace, never run beside them (I12, issue #155); with the sweep off in the daemon model, some seed fails I12 |
 
 Planned, not simulated: the infra retry budget (#22), `RUN_ON` hermetic leases over a
 lost connection (the daemon self-fences every lease today; `sim_cell` already models

@@ -13,6 +13,15 @@ use tokio::process::{Child, Command};
 /// Where the input root appears inside the container.
 pub const EXEC_ROOT: &str = "/kbf/root";
 
+/// The label naming the daemon a container belongs to: every container is created with
+/// `kbf.owner=<owner>` ([`crate::PodmanConfig::owner`]), so the next daemon on the
+/// node finds what its predecessor left.
+pub const OWNER_LABEL: &str = "kbf.owner";
+
+/// How every lease's container, lease cgroup and scratch directory are named:
+/// `kbf-lease-<term>-<seq>`.
+pub(crate) const LEASE_PREFIX: &str = "kbf-lease-";
+
 /// The owner, in Podman's rootless user namespace, of a lease's overlay directories
 /// while its container may run: id 1, the first subordinate id, which `--userns=nomap`
 /// maps the container's root to. The container cannot write under a directory whose
@@ -30,6 +39,8 @@ pub(crate) const DAEMON_OWNER: &str = "0:0";
 pub(crate) struct ContainerSpec {
     /// The container's name, `kbf-lease-<term>-<seq>`.
     pub name: String,
+    /// The value of its [`OWNER_LABEL`].
+    pub owner: String,
     /// `<repo>@sha256:<digest>`.
     pub image: String,
     /// The lease cgroup, as `--cgroup-parent` names it.
@@ -48,6 +59,8 @@ pub(crate) struct ContainerSpec {
 
 /// The `podman create` arguments for `spec`.
 ///
+/// - **Owner:** `--label=kbf.owner=<owner>`, which a restarted daemon's sweep looks
+///   for ([`OWNER_LABEL`]).
 /// - **Network:** `--network=none`, loopback only. No REAPI action gets a network.
 /// - **Image:** `--pull=never`; nodes never pull at action time (RFC 10.7).
 /// - **Entrypoint:** the action's argv as a JSON array, so the image's `ENTRYPOINT`
@@ -77,6 +90,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     .map(OsString::from)
     .collect();
     args.push(format!("--name={}", spec.name).into());
+    args.push(format!("--label={OWNER_LABEL}={}", spec.owner).into());
     args.push(format!("--cgroup-parent={}", spec.cgroup_parent).into());
     let entrypoint = serde_json::Value::from(spec.argv.clone());
     args.push(format!("--entrypoint={entrypoint}").into());
@@ -230,6 +244,21 @@ impl Podman {
         }
     }
 
+    /// The names of the lease containers labelled as `owner`'s, in any state. Blocking.
+    pub(crate) fn owned(&self, owner: &str) -> Result<Vec<String>, String> {
+        let filter = format!("--filter=label={OWNER_LABEL}={owner}");
+        let format = format!("--format={{{{index .Labels \"{OWNER_LABEL}\"}}}} {{{{.Names}}}}");
+        let output = self.blocking_output(&["ps", "--all", &filter, &format], "ps")?;
+        // The label is checked again, exactly: the filter's matching is Podman's.
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(text
+            .lines()
+            .filter_map(|line| line.rsplit_once(' '))
+            .filter(|(label, name)| *label == owner && name.starts_with(LEASE_PREFIX))
+            .map(|(_, name)| name.to_owned())
+            .collect())
+    }
+
     /// Removes the container, killing it first if it still runs; a container that does
     /// not exist is not an error. Blocking, so a dropped lease can clean up too.
     pub(crate) fn remove_blocking(&self, name: &str) -> Result<(), String> {
@@ -261,6 +290,11 @@ impl Podman {
     }
 
     fn blocking(&self, args: &[&str], verb: &str) -> Result<(), String> {
+        self.blocking_output(args, verb).map(drop)
+    }
+
+    /// Runs Podman with `args`, blocking; its output if it succeeded.
+    fn blocking_output(&self, args: &[&str], verb: &str) -> Result<std::process::Output, String> {
         let output = std::process::Command::new(&self.program)
             .arg("--cgroup-manager=cgroupfs")
             .args(args)
@@ -268,7 +302,7 @@ impl Podman {
             .output()
             .map_err(|e| format!("run {}: {e}", self.program.display()))?;
         if output.status.success() {
-            Ok(())
+            Ok(output)
         } else {
             Err(failure(verb, &output))
         }
@@ -282,6 +316,7 @@ mod tests {
     fn spec() -> ContainerSpec {
         ContainerSpec {
             name: "kbf-lease-1-2".to_owned(),
+            owner: "node-1".to_owned(),
             image: format!("docker.io/library/busybox@sha256:{}", "a".repeat(64)),
             cgroup_parent: "/kbf.slice/actions/kbf-lease-1-2".to_owned(),
             input_root: PathBuf::from("/scratch/kbf-lease-1-2/root"),
@@ -361,6 +396,8 @@ mod tests {
         assert!(args.contains(&"--workdir=/kbf/root/pkg".to_owned()));
         assert!(args.contains(&"--env=PATH=/bin".to_owned()));
         assert!(args.contains(&"--hostname=localhost".to_owned()));
+        // What a restarted daemon's sweep finds the container by.
+        assert!(args.contains(&"--label=kbf.owner=node-1".to_owned()));
         let mut at_root = spec();
         at_root.working_directory.clear();
         assert!(strings(&create_args(&at_root)).contains(&"--workdir=/kbf/root".to_owned()));
