@@ -442,6 +442,10 @@ mod tests {
         std::fs::write(&items, b"not a folder").expect("file");
         f.sweep(Duration::ZERO, SystemTime::now(), &remove);
         assert!(items.is_file());
+        // A folder that cannot be listed (here a file) is logged and left.
+        let not_listed = OwnedFd::from(File::open(&items).expect("open"));
+        sweep_in(&not_listed, b"", Duration::ZERO, SystemTime::now(), &remove);
+        assert!(items.is_file());
         kbf_outputs::remove_tree(&dir).expect("clean");
         f.sweep(Duration::ZERO, SystemTime::now(), &remove);
     }

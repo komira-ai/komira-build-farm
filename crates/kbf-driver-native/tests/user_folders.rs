@@ -123,15 +123,42 @@ async fn swift_build_builds_a_package() {
     );
 }
 
-/// The newest Xcode on this runner, if it has one.
-fn newest_xcode() -> Option<(String, PathBuf)> {
-    xcode::discover(
+/// The Xcodes on this runner that answer ([`xcode::discover`]). Fails when an Xcode is
+/// installed (an `/Applications/Xcode*.app` with its own `xcodebuild`) and none
+/// answers, so a `discover` that runs the wrong program cannot turn the tests that
+/// need an Xcode into tests that check nothing.
+fn xcodes() -> std::collections::BTreeMap<String, PathBuf> {
+    let all = xcode::discover(
         Path::new(xcode::APPLICATIONS),
         Path::new(xcode::XCODEBUILD),
         xcode::ANSWER_WITHIN,
-    )
-    .into_iter()
-    .last()
+    );
+    let installed: Vec<String> = std::fs::read_dir(xcode::APPLICATIONS)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|app| {
+            let name = app.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with("Xcode") && name.ends_with(".app")
+        })
+        .filter(|app| {
+            app.join("Contents/Developer")
+                .join(xcode::XCODEBUILD)
+                .is_file()
+        })
+        .map(|app| app.display().to_string())
+        .collect();
+    assert!(
+        !all.is_empty() || installed.is_empty(),
+        "installed: {installed:?}; none answers"
+    );
+    all
+}
+
+/// The newest Xcode on this runner, if it has one.
+fn newest_xcode() -> Option<(String, PathBuf)> {
+    xcodes().into_iter().last()
 }
 
 /// A project with one target, `hello`, a command-line tool built from `main.c`.
@@ -248,11 +275,7 @@ fn shim_times(out: &str) -> (String, f64, f64) {
 async fn the_compiler_shims_print_nothing_on_stderr() {
     let dir = scratch("shims");
     let mut config: NativeConfig = config(&dir);
-    let all = xcode::discover(
-        Path::new(xcode::APPLICATIONS),
-        Path::new(xcode::XCODEBUILD),
-        xcode::ANSWER_WITHIN,
-    );
+    let all = xcodes();
     let mut picked: Vec<String> = all.keys().next().into_iter().cloned().collect();
     picked.extend(
         all.keys()
@@ -361,14 +384,8 @@ async fn temporary_items_itself_cannot_be_removed_or_replaced() {
     assert_eq!(
         runs,
         [
-            (
-                "rmdir=1\nmv=1\nln=1\ninside=0\n".to_owned(),
-                Some(true)
-            ),
-            (
-                "rmdir=0\nmv=1\nln=0\ninside=0\n".to_owned(),
-                Some(false)
-            ),
+            ("rmdir=1\nmv=1\nln=1\ninside=0\n".to_owned(), Some(true)),
+            ("rmdir=0\nmv=1\nln=0\ninside=0\n".to_owned(), Some(false)),
         ],
         "{}",
         sandbox_denials()
