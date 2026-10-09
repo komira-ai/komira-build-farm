@@ -6,7 +6,7 @@
 # everywhere. The coverage job uploads the measured file as
 # `coverage-baseline.measured`; copy it here when a count changes or a crate is added.
 # crate lines-missed branches-missed
-kbf-alert                 -      -
+kbf-alert                 0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
 kbf-daemon               39     13
