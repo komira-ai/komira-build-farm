@@ -331,7 +331,7 @@ impl<C: Cas> NativeRuntime<C> {
         let (program, args) = self.config.isolation.wrap(
             prepared.network,
             &prepared.lease,
-            "",
+            &self.rules,
             prepared.program.clone(),
             &prepared.args,
         );

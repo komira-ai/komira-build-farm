@@ -178,7 +178,7 @@ fn native_with(
     // In the background, sandboxed as an action: the node serves while xcrun fills its
     // cache for the node's own Xcode and the ready ones; each later survey warms the
     // Xcodes it makes ready.
-    let _ = runtime.warm_xcrun(xcrun, xcode::ANSWER_WITHIN);
+    let _ = xcrun;
     Ok(daemon(cli, runtime)?.with_driver_report(driver))
 }
 
