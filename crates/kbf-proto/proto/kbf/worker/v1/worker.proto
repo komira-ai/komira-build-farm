@@ -103,8 +103,8 @@ message Hello {
 // against an action's platform, so it is kept out of the node report and its hash.
 // The daemon sends it right after each Welcome, and again when its Xcodes change. The
 // server keeps the newest one per node; a server that predates this message ignores
-// it, and a node that never sends one is listed without software. An empty string, or an empty list, means not known
-// on this node.
+// it, and a node that never sends one is listed without software. An empty string, or
+// an empty list, means not known on this node.
 message NodeStatus {
   // The operating system's name: `macOS` (`sw_vers -productName`), or the
   // `os-release` NAME on Linux (`Ubuntu`).

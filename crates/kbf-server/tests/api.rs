@@ -738,3 +738,58 @@ async fn an_attention_item_is_logged_once_per_change() {
     assert_eq!(listed.needs_attention, Vec::<String>::new());
     assert_eq!(farm.node_status(&node, second, mac_status()), raised);
 }
+
+/// What the subscriber `logged` installs writes: every line, without colour.
+#[derive(Clone, Default)]
+struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What `f` logs on this thread at `INFO` and above, one line each, trimmed.
+fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let out = Logged::default();
+    let writer = out.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8(out.0.lock().expect("log").clone()).expect("utf-8");
+    (value, text.lines().map(|l| l.trim().to_owned()).collect())
+}
+
+/// Catches (issue #164): the server's alert not written to its log (kbf has no alert
+/// delivery yet, issue #189, so the log line is the alert), written below `WARN` or
+/// under another target, without the node, the problem or the fix; a status that
+/// repeats it logged again; and its resolution not logged.
+#[tokio::test]
+async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
+    let farm = Farm::new(cache(), kbf_sched::UNSERVABLE_WAIT);
+    let node = WorkerId::new("mac-1");
+    let (stream, _rx) = register(&farm, "mac-1");
+    let (_, raised) = logged(|| farm.node_status(&node, stream, mac_status()));
+    assert_eq!(
+        raised,
+        [format!("WARN kbf_server::attention: node mac-1: {NOT_READY}")]
+    );
+    let (_, repeated) = logged(|| farm.node_status(&node, stream, mac_status()));
+    assert_eq!(repeated, Vec::<String>::new());
+    let mut accepted = mac_status();
+    accepted.xcodes[0].state = XcodeState::Ready.into();
+    let (_, cleared) = logged(|| farm.node_status(&node, stream, accepted));
+    assert_eq!(
+        cleared,
+        [format!("INFO kbf_server::attention: node mac-1: resolved: {NOT_READY}")]
+    );
+}

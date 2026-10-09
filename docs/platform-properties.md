@@ -172,7 +172,7 @@ A hung question is killed, so it cannot keep the node from starting. An answer c
 only once the program has exited and closed its output: one that exits but leaves a
 child holding its output open is not ready when the minute is up. The Xcodes are asked
 one after another, so each hung Xcode delays the daemon's start by up to a minute per
-question it is asked (five at most). An action
+question it is asked (four; five or six with `--require-metal-toolchain`). An action
 that names no `xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
 `DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
 whatever its environment says.
