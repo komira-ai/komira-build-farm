@@ -136,6 +136,7 @@ fn log(changes: &[Change]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -375,6 +376,74 @@ mod tests {
         std::thread::sleep(every * 10);
         assert!(!reports.has_changed().expect("the watch runs"));
         assert_eq!(*applied.lock().expect("applied"), 1);
+
+        drop(reports);
+        thread
+            .join()
+            .expect("the thread ends once the daemon is gone");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches: a survey whose only difference is an Xcode's `DEVELOPER_DIR` not
+    /// applied (the watch's key without it), so actions naming that build keep the
+    /// old directory, which may since have been deleted. Here `Xcode_16.app` is a link
+    /// retargeted from one copy of a build to another copy of the same build, ready in
+    /// both: app, build and state stay the same.
+    #[test]
+    fn a_moved_developer_dir_alone_is_applied() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let dir = scratch("moved");
+        let apps = dir.join("Applications");
+        std::fs::create_dir_all(&apps).expect("apps");
+        let copy = |name: &str| {
+            let app = dir.join(name).join("Xcode_16.app");
+            std::fs::create_dir_all(app.join("Contents/Developer")).expect("copy");
+            std::fs::canonicalize(&app).expect("real path")
+        };
+        let (one, two) = (copy("one"), copy("two"));
+        let link = apps.join("Xcode_16.app");
+        std::os::unix::fs::symlink(&one, &link).expect("link");
+        let xcodebuild = fake(
+            &dir,
+            "xcodebuild",
+            "#!/bin/sh\ncase \"$*\" in -version) echo 'Build version 16C5032a' ;; esac\n",
+        );
+        let probe = Probe {
+            xcodebuild,
+            xcrun: PathBuf::from("/bin/echo"),
+            within: Duration::from_secs(5),
+            metal: false,
+        };
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&applied);
+        let apply: Apply = Box::new(move |xcodes| {
+            seen.lock().expect("applied").push(xcode::ready(xcodes));
+            DriverReport {
+                entries: Vec::new(),
+                xcodes: xcodes.iter().map(Xcode::status).collect(),
+            }
+        });
+        let every = Duration::from_millis(50);
+        let (mut reports, thread) = watch(apps, probe, every, apply);
+        reports.borrow_and_update();
+        let retarget = dir.join("Applications/Xcode_16.app.new");
+        std::os::unix::fs::symlink(&two, &retarget).expect("new link");
+        std::fs::rename(&retarget, &link).expect("retarget");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !reports.has_changed().expect("the watch runs") {
+            assert!(
+                Instant::now() < deadline,
+                "the moved DEVELOPER_DIR was not applied"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready = |app: &PathBuf| {
+            BTreeMap::from([("16C5032a".to_owned(), app.join("Contents/Developer"))])
+        };
+        assert_eq!(
+            *applied.lock().expect("applied"),
+            [ready(&one), ready(&two)]
+        );
 
         drop(reports);
         thread
