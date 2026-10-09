@@ -234,11 +234,7 @@ pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
             .collect();
         asking
             .into_iter()
-            .map(|asked| {
-                asked
-                    .join()
-                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
-            })
+            .map(|asked| asked.join().expect("asking an Xcode does not panic"))
             .collect()
     })
 }
