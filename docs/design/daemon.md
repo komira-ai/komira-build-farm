@@ -118,10 +118,10 @@ guaranteed:
   other line. Under systemd, a unit's default `KillMode=control-group` kills everything
   left in the unit's cgroup when its main process dies, the native driver's actions
   included, and the containers' processes too when their cgroups are in the unit's
-  delegated subtree; the repository ships no unit yet. launchd, when a job exits, kills only the job's own process group
-  (`AbandonProcessGroup` false, the default; true stops even that), and has no setting
-  that reaches an action leading a group of its own, so on a Mac the shipped plist's
-  `KeepAlive` restart is what ends them.
+  delegated subtree; the repository ships no unit yet. launchd, when a job exits,
+  kills only the job's own process group (`AbandonProcessGroup` false, the default;
+  true stops even that), and has no setting that reaches an action leading a group of
+  its own, so on a Mac the shipped plist's `KeepAlive` restart is what ends them.
 - **Native: a process that left the group** (`setsid`) and whose parent exited before
   the sweep: nothing links it to the record. A per-lease user or cgroup would close
   this, as it would the same gap in a lease's own kill.
