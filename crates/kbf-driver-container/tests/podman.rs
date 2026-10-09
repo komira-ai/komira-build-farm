@@ -41,6 +41,7 @@ struct Cell {
     term: u64,
     cgroup: PathBuf,
     scratch: PathBuf,
+    config: PodmanConfig,
     cas: Arc<MemoryCas>,
     runtime: Arc<PodmanRuntime<MemoryCas>>,
 }
@@ -89,15 +90,19 @@ impl Cell {
         std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory +pids")
             .expect("enable controllers");
         let scratch = support::scratch(&format!("podman-{name}"));
-        let mut config = PodmanConfig::new(scratch.clone(), parent);
+        // Each test its own owner: they share one Podman store, and a runtime removes
+        // its owner's containers when it starts.
+        let mut config = PodmanConfig::new(scratch.clone(), parent, format!("kbf-test-{name}"));
         config.default_timeout = Duration::from_secs(120);
         config.kill_grace = Duration::from_secs(2);
         let cas = Arc::new(MemoryCas::new());
-        let runtime = Arc::new(PodmanRuntime::new(config, Arc::clone(&cas)).expect("runtime"));
+        let runtime =
+            Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
         Self {
             term,
             cgroup,
             scratch,
+            config,
             cas,
             runtime,
         }
@@ -581,6 +586,52 @@ async fn kill_and_cancel_remove_the_container() {
             cell.assert_clean(seq);
         }
     }
+}
+
+/// Catches (issue #155) a restarted daemon that leaves its killed predecessor's
+/// container running (the scheduler would run the lease again beside it), or its lease
+/// cgroup or scratch directory behind, and one that removes a container another owner
+/// labelled. The killed daemon is modelled by forgetting its run: nothing of it is
+/// dropped, so nothing of it is cleaned.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn a_restarted_runtime_removes_what_its_predecessor_left() {
+    let cell = Cell::new("restart");
+    let other = Cell::new("restart-other");
+    let run = |c: &Cell| {
+        let action = store_action(&c.cas, &sh("sleep 300"));
+        let work = c.work(1, action, Resources::default());
+        let runtime = Arc::clone(&c.runtime);
+        Box::pin(async move { runtime.run(work).await })
+    };
+    let (mut mine, mut theirs) = (run(&cell), run(&other));
+    tokio::select! {
+        _ = &mut mine => panic!("the run ended"),
+        _ = &mut theirs => panic!("the other run ended"),
+        () = async {
+            wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
+            wait_for_container_cgroup(&other.cgroup.join(other.name(1))).await;
+        } => {}
+    }
+    // Never polled or dropped again, as a daemon that was killed.
+    std::mem::forget(mine);
+    std::mem::forget(theirs);
+    let label = podman(&[
+        "inspect",
+        "--format={{index .Config.Labels \"kbf.owner\"}}",
+        &cell.name(1),
+    ]);
+    assert_eq!(label.trim(), "kbf-test-restart");
+
+    PodmanRuntime::new(cell.config.clone(), Arc::clone(&cell.cas)).expect("restart");
+    cell.assert_clean(1);
+    let names = podman(&["ps", "--all", "--format={{.Names}}"]);
+    assert!(
+        names.lines().any(|n| n == other.name(1)),
+        "another owner's container was removed: {names}"
+    );
+    PodmanRuntime::new(other.config.clone(), Arc::clone(&other.cas)).expect("restart");
+    other.assert_clean(1);
 }
 
 /// The ids on the `Uid:` and `Gid:` lines of process `pid`'s status (real, effective,

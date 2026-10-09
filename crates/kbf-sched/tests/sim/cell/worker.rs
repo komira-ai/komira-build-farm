@@ -1,6 +1,7 @@
 //! The daemon model: streams, heartbeats, the self-fence T, the `Start` window W,
-//! results kept until acknowledged, `Cancel`, the lease epoch of `Welcome`, and the
-//! faults a machine has (death, suspend, reconnects, a changed node report).
+//! results kept until acknowledged, `Cancel`, the lease epoch of `Welcome`, the
+//! start-up sweep of a restarted daemon, and the faults a machine has (death, suspend,
+//! reconnects, a changed node report, a daemon crash).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -26,6 +27,7 @@ const T_BOOT: u64 = 1;
 const T_DIE: u64 = 2;
 const T_FENCE: u64 = 3;
 const T_RECONNECT: u64 = 4;
+const T_CRASH: u64 = 5;
 const T_FREEZE: u64 = 10_000;
 const T_RESUME: u64 = 20_000;
 const T_SCRIPTED_RECONNECT: u64 = 30_000;
@@ -62,6 +64,13 @@ pub struct WorkerPlan {
     /// Whether the `Start` window W is enforced. Off only to show the sim catches its
     /// absence (a mutant of the model itself).
     pub start_window: bool,
+    /// When the daemon process dies and is started again at once (ms after boot): a
+    /// SIGKILL, an OOM kill or a panic that aborts, then the service manager's restart.
+    /// With the instance id the new process draws.
+    pub crash_at: Option<(u64, &'static str)>,
+    /// Whether the restarted daemon ends the runs its predecessor left before its
+    /// `Hello` (issue #155). Off only to show the sim catches its absence.
+    pub sweep_on_restart: bool,
 }
 
 impl WorkerPlan {
@@ -82,6 +91,8 @@ impl WorkerPlan {
             lose_acks: Chance::never(),
             repeat_reports: Chance::never(),
             start_window: true,
+            crash_at: None,
+            sweep_on_restart: true,
         }
     }
 }
@@ -95,6 +106,12 @@ pub enum End {
     Died,
     /// Killed on a `Welcome` of another lease epoch; nothing is reported.
     Superseded,
+    /// Killed by the start-up sweep of the daemon restarted after a crash; nothing is
+    /// reported.
+    Swept,
+    /// Ran to its end after its daemon crashed, unknown to the restarted one; nothing
+    /// is reported.
+    Orphaned,
 }
 
 /// One run of a lease on this worker.
@@ -162,6 +179,10 @@ pub struct WorkerStats {
     pub fenced_on_resume: u64,
     /// Leases of an earlier lease epoch dropped on a `Welcome` (killed or forgotten).
     pub superseded: u64,
+    /// Daemon crashes, and the runs each left: ended by the sweep, or left running.
+    pub crashes: u64,
+    pub swept: u64,
+    pub orphaned: u64,
 }
 
 pub struct Worker {
@@ -182,6 +203,10 @@ pub struct Worker {
     pub runs: Vec<Run>,
     /// Runs executing (or frozen) now, by lease.
     live: BTreeMap<LeaseId, usize>,
+    /// Runs a crashed daemon left that still execute, unknown to the daemon now.
+    orphans: BTreeSet<usize>,
+    /// The daemon process's instance id, sent in every `Hello`.
+    instance: &'static str,
     /// Results kept until acknowledged.
     pub unacked: BTreeMap<LeaseId, Outcome>,
     /// The lease epoch the newest `Welcome` named.
@@ -205,6 +230,7 @@ impl Worker {
         Self {
             node: WorkerId::new(plan.node),
             capacity: Resources::new(plan.cores * 1_000, plan.cores * 4 * GIB),
+            instance: plan.name,
             plan,
             stream: 0,
             welcomed: false,
@@ -215,6 +241,7 @@ impl Worker {
             confirmed: None,
             runs: Vec::new(),
             live: BTreeMap::new(),
+            orphans: BTreeSet::new(),
             unacked: BTreeMap::new(),
             epoch: None,
             granted: BTreeMap::new(),
@@ -270,6 +297,7 @@ impl Worker {
                 self.timer(HEARTBEAT, T_HEARTBEAT);
             }
             Event::Timer { tag: T_DIE } => self.die(now),
+            Event::Timer { tag: T_CRASH } => self.crash(now),
             Event::Timer { tag: T_FENCE } => {}
             Event::Timer { tag: T_RECONNECT } => self.connect(now),
             Event::Timer { tag } if (T_FREEZE..T_RESUME).contains(&tag) => {
@@ -292,7 +320,11 @@ impl Worker {
             }
             Event::Timer { tag } => {
                 let (i, generation) = self.timers.remove(&tag).expect("run timers name runs");
-                if self.runs[i].generation == generation && self.runs[i].open.is_some() {
+                if self.orphans.remove(&i) {
+                    let run = &mut self.runs[i];
+                    run.close(now);
+                    run.end = Some((now, End::Orphaned));
+                } else if self.runs[i].generation == generation && self.runs[i].open.is_some() {
                     self.finish(now, i, &mut rng);
                 }
             }
@@ -367,6 +399,9 @@ impl Worker {
         if let Some(at) = self.plan.die_at {
             self.timer(ms(at), T_DIE);
         }
+        if let Some((at, _)) = self.plan.crash_at {
+            self.timer(ms(at), T_CRASH);
+        }
         let freezes: Vec<u64> = self.plan.freezes.iter().map(|f| f.0).collect();
         for (i, at) in freezes.into_iter().enumerate() {
             self.timer(ms(at), T_FREEZE + i as u64);
@@ -398,8 +433,8 @@ impl Worker {
     fn hello(&mut self) {
         let msg = Msg::Hello {
             node: self.node.clone(),
-            // One daemon process per simulated node: its own name is its instance id.
-            instance: self.plan.name,
+            // The node's name is its first daemon process's instance id.
+            instance: self.instance,
             stream: self.stream,
             capacity: self.capacity,
         };
@@ -558,11 +593,17 @@ impl Worker {
             End::Finished => Outcome::Completed {
                 action_result: result_digest(&run.action, lease),
             },
-            End::Fenced | End::Cancelled | End::Died | End::Superseded => {
-                Outcome::Failed(Failure::Infra)
-            }
+            End::Fenced
+            | End::Cancelled
+            | End::Died
+            | End::Superseded
+            | End::Swept
+            | End::Orphaned => Outcome::Failed(Failure::Infra),
         };
-        if !matches!(end, End::Died | End::Superseded) {
+        if !matches!(
+            end,
+            End::Died | End::Superseded | End::Swept | End::Orphaned
+        ) {
             self.unacked.insert(lease, outcome);
             self.report(lease, outcome, rng);
         }
@@ -619,6 +660,36 @@ impl Worker {
         for i in live.into_values() {
             self.stop(now, i, End::Died, &mut rng);
         }
+    }
+
+    /// The daemon process dies and is started again at once, on a new stream. What it
+    /// held in memory is gone: which leases it runs, results not yet acknowledged, the
+    /// lease epoch and the contact clock. With the start-up sweep (as `kbf-daemon` does
+    /// since issue #155) every run it left ends before the new `Hello`; without it the
+    /// runs go on, listed, reported and fenced by no daemon.
+    fn crash(&mut self, now: FarmTime) {
+        self.stats.crashes += 1;
+        for i in std::mem::take(&mut self.live).into_values() {
+            if self.plan.sweep_on_restart {
+                self.stats.swept += 1;
+                let run = &mut self.runs[i];
+                run.close(now);
+                run.end = Some((now, End::Swept));
+            } else {
+                self.stats.orphaned += 1;
+                self.orphans.insert(i);
+            }
+        }
+        self.unacked.clear();
+        self.granted.clear();
+        self.epoch = None;
+        self.confirmed = None;
+        // A new process: the scheduler cannot tell it from a second daemon, so it keeps
+        // the old process's leases for the handover grace before requeueing them.
+        if let Some((_, instance)) = self.plan.crash_at {
+            self.instance = instance;
+        }
+        self.connect(now);
     }
 
     fn freeze(&mut self, now: FarmTime, i: usize) {

@@ -16,14 +16,24 @@
 //! loaded; otherwise runs until SIGTERM or SIGINT, then exits zero. Leases still
 //! running then are abandoned (their processes killed, their directories removed);
 //! the scheduler places them again.
+//!
+//! The log goes to stderr, in color only when stderr is a terminal: under launchd or
+//! systemd it is a file or a journal, where escape codes are noise (issue #170). The
+//! daemon does not rotate it; the service manager that owns stderr does. systemd's
+//! journal rotates by its own size limits; launchd's `StandardErrorPath` file is
+//! emptied by `kbf-mac-provision` at each restart and upgrade (see
+//! `docs/design/mac-node-provisioning.md`, section 5.7).
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use kbf_daemon::{Args, CasClient, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime};
+use kbf_daemon::{
+    Args, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime,
+};
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode};
 use kbf_outputs::OutputLimits;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -31,7 +41,7 @@ use tonic::transport::Endpoint;
 
 /// The `kbf-daemon` command line.
 #[derive(Clone, Debug, clap::Parser)]
-#[command(name = "kbf-daemon", version, about = "The kbf worker daemon.")]
+#[command(name = "kbf-daemon", version = DAEMON_VERSION, about = "The kbf worker daemon.")]
 struct Cli {
     #[command(flatten)]
     daemon: Args,
@@ -88,6 +98,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
     match start(&cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -205,7 +216,7 @@ mod container {
             .as_deref()
             .map_or_else(IdFiles::system, IdFiles::in_dir);
         kbf_driver_container::check_daemon_user(&files)?;
-        let mut config = PodmanConfig::new(scratch(cli)?, parent);
+        let mut config = PodmanConfig::new(scratch(cli)?, parent, cli.daemon.node_id.clone());
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,
             max_entries: cli.outputs.max_entries,

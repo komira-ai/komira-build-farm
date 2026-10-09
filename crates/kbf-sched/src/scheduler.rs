@@ -1,7 +1,7 @@
 //! The scheduler state machine.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
@@ -14,6 +14,7 @@ use kbf_types::{
 use crate::cordon::{Cordon, Cordons};
 use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
+use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
@@ -28,6 +29,19 @@ pub const PLACEMENT_ROUND: usize = 256;
 /// worker that can is often only a moment away: after a server restart daemons
 /// reconnect over a few seconds, and a Mac that reboots is gone for a few minutes.
 pub const UNSERVABLE_WAIT: Duration = Duration::from_secs(300);
+
+/// How long a finished operation is kept after its waiters are answered, so that a
+/// caller whose `Execute` stream broke can still `WaitExecution` on it and get its
+/// result; after that the operation is gone (issue #165). The default of
+/// [`Scheduler::new`]; see [`Scheduler::with_finished_retention`].
+///
+/// A client reconnects after a broken stream within seconds (its retries back off to
+/// a few seconds each), so a minute covers several attempts. The result it would
+/// miss is worth keeping that long: a failed or `do_not_cache` result is not in the
+/// action cache, so a client that finds the operation gone runs the action again. It
+/// is not longer because every operation finished in the last retention is held in
+/// memory: at the pilot's rate of about 4 operations a second, a minute is about 240.
+pub const FINISHED_RETENTION: Duration = Duration::from_secs(60);
 
 /// Where an operation is.
 ///
@@ -210,6 +224,14 @@ pub struct Scheduler {
     unservable_wait: Duration,
     /// Workers placement skips, and their drains.
     cordons: Cordons,
+    /// How long a finished operation is kept.
+    finished_retention: Duration,
+    /// Finished operations still kept, in the order they finished, with when they did
+    /// (so in time order: farm time never goes back).
+    finished: VecDeque<(FarmTime, OperationId)>,
+    /// Requeues not yet taken, while they are recorded at all
+    /// ([`Scheduler::recording_requeues`]).
+    requeues: Option<Vec<Requeue>>,
 }
 
 impl Scheduler {
@@ -228,7 +250,43 @@ impl Scheduler {
             held: BTreeMap::new(),
             unservable_wait: UNSERVABLE_WAIT,
             cordons: Cordons::default(),
+            finished_retention: FINISHED_RETENTION,
+            finished: VecDeque::new(),
+            requeues: None,
         }
+    }
+
+    /// This scheduler, keeping a finished operation for `retention` after its waiters
+    /// are answered (instead of [`FINISHED_RETENTION`]), then dropping it.
+    #[must_use]
+    pub const fn with_finished_retention(mut self, retention: Duration) -> Self {
+        self.finished_retention = retention;
+        self
+    }
+
+    /// How many operations it holds: every unfinished one, and each finished one for
+    /// the finished retention.
+    #[must_use]
+    pub fn operations(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// This scheduler, keeping a [`Requeue`] for each lease it gives up until
+    /// [`Scheduler::take_requeues`] takes it. Off by default, so a caller that never
+    /// takes them (a simulation) does not collect them without end.
+    #[must_use]
+    pub fn recording_requeues(mut self) -> Self {
+        self.requeues = Some(Vec::new());
+        self
+    }
+
+    /// The leases given up since the last call, oldest first; always empty unless
+    /// built with [`Scheduler::recording_requeues`].
+    pub fn take_requeues(&mut self) -> Vec<Requeue> {
+        self.requeues
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// This scheduler, refusing a queued operation once no live worker has been able to
@@ -246,7 +304,8 @@ impl Scheduler {
         op.unservable.as_ref().map(|u| u.reason.as_str())
     }
 
-    /// Where `operation` is, if it exists.
+    /// Where `operation` is, if it exists: it was submitted, and is unfinished or
+    /// finished less than the finished retention ago.
     #[must_use]
     pub fn state(&self, operation: OperationId) -> Option<&OpState> {
         self.ops.get(&operation).map(|op| &op.state)
@@ -320,6 +379,19 @@ impl Scheduler {
         })
     }
 
+    /// Drops every finished operation kept for the finished retention or longer. A
+    /// finished operation holds no lease and is in no queue or in-flight entry, so
+    /// nothing else names it; an input that does (a late report, a stale record) finds
+    /// no operation and is dropped, as for any unknown one.
+    fn retire(&mut self) {
+        while let Some(&(at, id)) = self.finished.front()
+            && self.now >= at.saturating_add(self.finished_retention)
+        {
+            self.finished.pop_front();
+            self.ops.remove(&id);
+        }
+    }
+
     /// Queues `request` for `waiter`, or attaches `waiter` to a running twin. A twin
     /// that waits for a worker that can run it tells its waiters why again, so the new
     /// one learns it too.
@@ -381,8 +453,20 @@ impl Scheduler {
         op.result_proposed = false;
     }
 
-    /// Releases `operation`'s holding and puts it back in the queue.
-    fn requeue(&mut self, id: OperationId) {
+    /// Releases `operation`'s holding and puts it back in the queue, recording why.
+    fn requeue(&mut self, id: OperationId, reason: RequeueReason) {
+        let given_up = self.ops[&id]
+            .state
+            .holding()
+            .map(|(lease, worker)| Requeue {
+                operation: id,
+                lease,
+                worker: worker.clone(),
+                reason,
+            });
+        if let Some(log) = &mut self.requeues {
+            log.extend(given_up);
+        }
         self.release(id);
         let op = self
             .ops
@@ -408,7 +492,7 @@ impl Scheduler {
             })
             .collect();
         for id in expired {
-            self.requeue(id);
+            self.requeue(id, RequeueReason::Silent);
         }
     }
 
@@ -426,32 +510,32 @@ impl Scheduler {
             });
         let running: BTreeSet<LeaseId> = running.iter().copied().collect();
         let now = self.now;
-        let lost: Vec<OperationId> = self
+        let lost: Vec<(OperationId, RequeueReason)> = self
             .held
             .iter()
-            .filter(|(lease, held)| {
-                let Some(sent) = held.start_sent else {
-                    return false;
-                };
-                let due = if sent.process != process {
+            .filter_map(|(lease, held)| {
+                let sent = held.start_sent?;
+                let (due, reason) = if sent.process != process {
                     // Another process may still run it: only its fence ends that.
-                    now >= handover_ends
+                    (now >= handover_ends, RequeueReason::Replaced)
                 } else if sent.session != session {
                     // A `Start` sent to an earlier session of this process reached it
                     // before it registered again, and then it lists it, or never will.
-                    true
+                    (true, RequeueReason::Reconnected)
                 } else {
-                    now >= sent.at.saturating_add(START_GRACE)
+                    let due = now >= sent.at.saturating_add(START_GRACE);
+                    (due, RequeueReason::NotStarted)
                 };
                 let op = &self.ops[&held.operation];
-                due && !running.contains(*lease)
+                let lost = due
+                    && !running.contains(lease)
                     && !op.result_proposed
-                    && op.state.holding().is_some_and(|(_, w)| w == worker)
+                    && op.state.holding().is_some_and(|(_, w)| w == worker);
+                lost.then_some((held.operation, reason))
             })
-            .map(|(_, held)| held.operation)
             .collect();
-        for id in lost {
-            self.requeue(id);
+        for (id, reason) in lost {
+            self.requeue(id, reason);
         }
     }
 
@@ -583,6 +667,7 @@ impl Scheduler {
         if self.in_flight.get(&op.request.key) == Some(&id) {
             self.in_flight.remove(&op.request.key);
         }
+        self.finished.push_back((self.now, id));
         vec![Effect::Refuse(Refusal {
             operation: id,
             waiters: op.waiters.clone(),
@@ -696,6 +781,7 @@ impl Scheduler {
         if self.in_flight.get(&op.request.key) == Some(&id) {
             self.in_flight.remove(&op.request.key);
         }
+        self.finished.push_back((self.now, id));
         vec![Effect::Answer(Answer {
             operation: id,
             lease: record.lease,
@@ -811,6 +897,7 @@ impl StateMachine for Scheduler {
                 effects
             }
         };
+        self.retire();
         let (now, held) = (self.now, &self.held);
         let ops = &self.ops;
         self.cordons.progress(now, |worker| {

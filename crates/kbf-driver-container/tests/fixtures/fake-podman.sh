@@ -21,11 +21,16 @@
 #   inspect-fails    `inspect` fails
 #   kill-fails       `kill` fails
 #   rm-fails         `rm` fails
+#   ps-fails         `ps` fails
+#   ps-extra         lines `ps` prints after the container's own (`<owner> <name>`)
 #   unshare-noop     `unshare rm` succeeds without removing anything
 #   unshare-fails    `unshare rm` fails
 #   chown-fails      `unshare chown` to the owner this knob holds (`1:1` or `0:0`) fails
 # Records: create.args (one argument per line), calls (one verb per line; `unshare`
-#   with its command, `unshare rm` or `unshare chown`), removed,
+#   with its command, `unshare rm` or `unshare chown`), ps.args, removed,
+#   name and owner-label (the container `create` made and its `kbf.owner` label; `rm`
+#   removes name, and `ps` lists the container while name exists and the filter
+#   names its label),
 #   killed-before-rm (`rm` found the lease cgroup's cgroup.kill already written),
 #   start-pid (the last `start`'s own pid), start-not-reaped-at-rm (`rm` found that
 #   `start` process still there, running or a zombie its parent had not reaped),
@@ -80,6 +85,8 @@ create)
     for arg in "$@"; do
         case $arg in
         --cgroup-parent=*) echo "${arg#--cgroup-parent=}" >"$STATE/cgroup" ;;
+        --label=kbf.owner=*) echo "${arg#--label=kbf.owner=}" >"$STATE/owner-label" ;;
+        --name=*) echo "${arg#--name=}" >"$STATE/name" ;;
         --volume=*)
             v=${arg#--volume=}
             echo "${v%%:*}" >"$STATE/root"
@@ -144,6 +151,18 @@ kill)
     [ -f "$STATE/pid" ] || { echo "Error: no such container" >&2; exit 125; }
     kill "-${1#--signal=}" "$(cat "$STATE/pid")"
     ;;
+ps)
+    printf '%s\n' "$@" >"$STATE/ps.args"
+    [ -f "$STATE/ps-fails" ] && { echo "Error: ps refused" >&2; exit 125; }
+    if [ -f "$STATE/name" ] && [ -f "$STATE/owner-label" ]; then
+        owner=$(cat "$STATE/owner-label")
+        for arg in "$@"; do
+            [ "$arg" = "--filter=label=kbf.owner=$owner" ] && echo "$owner $(cat "$STATE/name")"
+        done
+    fi
+    [ -f "$STATE/ps-extra" ] && cat "$STATE/ps-extra"
+    exit 0
+    ;;
 rm)
     # The driver must have waited for `podman start` before it removes the container:
     # what it started may otherwise still write into the lease after the clean.
@@ -158,6 +177,7 @@ rm)
     fi
     [ -f "$STATE/rm-fails" ] && { echo "Error: rm refused" >&2; exit 125; }
     touch "$STATE/removed"
+    rm -f -- "$STATE/name"
     echo rm >>"$STATE/events"
     if [ -f "$STATE/cgroup" ] && [ -e "$CGROOT$(cat "$STATE/cgroup")/cgroup.kill" ]; then
         touch "$STATE/killed-before-rm"

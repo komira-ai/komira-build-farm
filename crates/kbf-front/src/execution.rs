@@ -14,8 +14,16 @@
 //!   metadata key `why`) in `partial_execution_metadata.auxiliary_metadata`.
 //!
 //! WaitExecution streams the same updates for an operation name Execute returned, until
-//! it is done. A finished operation is forgotten: waiting on it is NOT_FOUND, and the
-//! client's next Execute is answered from the action cache.
+//! it is done. A finished operation is kept for a short retention the [`Dispatch`]
+//! sets, in which waiting on it streams the done operation; after that it is
+//! forgotten, waiting on it is NOT_FOUND, and the client's next Execute is answered
+//! from the action cache (or runs the action again, if its result was not cached).
+//!
+//! When the server is going away ([`Closer::close`]), every open Execute and
+//! WaitExecution stream that is not done ends UNAVAILABLE, which REAPI clients retry
+//! (issue #168); one opened after that ends UNAVAILABLE after its first operation. A
+//! WaitExecution on an operation kept finished is answered even then: its first
+//! operation is the done one, and the stream ends there.
 //!
 //! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
 //! not read yet), and every action is hermetic, so it may be joined (a `networked`
@@ -149,8 +157,42 @@ pub trait Dispatch: Send + Sync + 'static {
     /// The scheduler cannot take work (UNAVAILABLE).
     fn submit(&self, submission: Submission) -> Result<Ticket, Status>;
 
-    /// A new ticket on the unfinished operation called `name`, if there is one.
+    /// A new ticket on the operation called `name`, if it is unfinished or finished
+    /// within the dispatcher's retention (its ticket's stage is then already done).
     fn wait(&self, name: &str) -> Option<Ticket>;
+}
+
+/// Tells the `Execution` service the server is going away: see [`closing`].
+#[derive(Debug)]
+pub struct Closer(watch::Sender<bool>);
+
+impl Closer {
+    /// Ends every open Execute and WaitExecution stream that is not done UNAVAILABLE,
+    /// and every one opened from now on after its first operation.
+    pub fn close(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+/// The `Execution` service's side of a [`Closer`]. A stream ends when its closer
+/// closes; if the closer is dropped without closing, it never does.
+#[derive(Clone, Debug)]
+pub struct Closing(watch::Receiver<bool>);
+
+impl Closing {
+    /// Completes once the closer has closed; never, if it is dropped first.
+    async fn closed(&mut self) {
+        if self.0.wait_for(|closed| *closed).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// A [`Closer`] and the [`Closing`] to hand the `Execution` service.
+#[must_use]
+pub fn closing() -> (Closer, Closing) {
+    let (closer, closing) = watch::channel(false);
+    (Closer(closer), Closing(closing))
 }
 
 /// The `Execution` service over a [`Cache`] and a [`Dispatch`].
@@ -158,12 +200,17 @@ pub trait Dispatch: Send + Sync + 'static {
 pub struct ExecutionService<M, O, D> {
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
+    closing: Closing,
 }
 
 impl<M, O, D> ExecutionService<M, O, D> {
-    /// The service over `cache` and `dispatch`.
-    pub const fn new(cache: Arc<Cache<M, O>>, dispatch: Arc<D>) -> Self {
-        Self { cache, dispatch }
+    /// The service over `cache` and `dispatch`, whose streams end when `closing` does.
+    pub const fn new(cache: Arc<Cache<M, O>>, dispatch: Arc<D>, closing: Closing) -> Self {
+        Self {
+            cache,
+            dispatch,
+            closing,
+        }
     }
 }
 
@@ -205,7 +252,7 @@ where
         }
         let submission = self.submission(request.instance_name, action).await?;
         let ticket = self.dispatch.submit(submission)?;
-        Ok(Response::new(operations(ticket)))
+        Ok(Response::new(operations(ticket, self.closing.clone())))
     }
 
     async fn wait_execution(
@@ -214,10 +261,10 @@ where
     ) -> Result<Response<OperationStream>, Status> {
         let name = request.into_inner().name;
         match self.dispatch.wait(&name) {
-            Some(ticket) => Ok(Response::new(operations(ticket))),
+            Some(ticket) => Ok(Response::new(operations(ticket, self.closing.clone()))),
             None => Err(Status::not_found(format!(
-                "no unfinished operation {name:?}; a finished one is answered by Execute \
-                 from the action cache"
+                "no operation {name:?}: finished operations are kept only briefly; \
+                 Execute answers a finished one from the action cache"
             ))),
         }
     }
@@ -530,25 +577,36 @@ fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operat
 }
 
 /// The operation as its stage changes: the stage now, then each change, ending after
-/// the done operation. A stage that stops changing before it is done (the server is
-/// shutting down) ends the stream UNAVAILABLE.
-fn operations(ticket: Ticket) -> OperationStream {
+/// the done operation. A stage that stops changing before it is done (the operation was
+/// abandoned), or `closing` closing first (the server is going away), ends the stream
+/// UNAVAILABLE. A change already there is sent before a close is noticed.
+fn operations(ticket: Ticket, closing: Closing) -> OperationStream {
     let Ticket {
         name,
         action,
         stage,
     } = ticket;
-    let state = Some((stage, true));
+    let state = Some((stage, closing, true));
     Box::pin(stream::unfold(state, move |state| {
         let name = name.clone();
         async move {
-            let (mut stage, first) = state?;
-            if !first && stage.changed().await.is_err() {
-                let gone = Status::unavailable(format!("operation {name} was abandoned"));
-                return Some((Err(gone), None));
+            let (mut stage, mut closing, first) = state?;
+            if !first {
+                let gone = tokio::select! {
+                    biased;
+                    changed = stage.changed() => changed
+                        .is_err()
+                        .then(|| format!("operation {name} was abandoned")),
+                    () = closing.closed() => Some(format!(
+                        "the server is shutting down; operation {name} ends here, Execute it again"
+                    )),
+                };
+                if let Some(why) = gone {
+                    return Some((Err(Status::unavailable(why)), None));
+                }
             }
             let now = stage.borrow_and_update().clone();
-            let next = (!matches!(now, Stage::Done(_))).then_some((stage, false));
+            let next = (!matches!(now, Stage::Done(_))).then_some((stage, closing, false));
             Some((Ok(operation(&name, &action, &now, false)), next))
         }
     }))

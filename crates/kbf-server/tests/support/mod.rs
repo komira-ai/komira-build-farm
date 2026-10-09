@@ -154,27 +154,38 @@ pub struct Client {
 
 impl Cell {
     pub async fn start() -> Self {
-        Self::start_with_unservable_wait(kbf_sched::UNSERVABLE_WAIT).await
+        Self::start_with(kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION).await
     }
 
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`.
     pub async fn start_with_unservable_wait(wait: Duration) -> Self {
+        Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
+    }
+
+    /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
+    /// and keeps a finished operation for `retention`.
+    pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let cache = Arc::new(Cache::new(
             GateLog::new(),
             MemoryStore::new(Capabilities::default()),
             KeyPrefix::default(),
         ));
-        Self::serve(cache, wait).await
+        Self::serve(cache, wait, retention).await
     }
 
     /// A new server process over this cell's store and action cache, as after a
     /// restart: a fresh scheduler, no daemon registered, nothing queued. This one is
     /// left running; its daemons simply never reach the new one's state.
     pub async fn restart(&self) -> Self {
-        Self::serve(Arc::clone(&self.cache), kbf_sched::UNSERVABLE_WAIT).await
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(Arc::clone(&self.cache), wait, retention).await
     }
 
-    async fn serve(cache: Arc<Cache<GateLog, MemoryStore>>, wait: Duration) -> Self {
+    async fn serve(
+        cache: Arc<Cache<GateLog, MemoryStore>>,
+        wait: Duration,
+        retention: Duration,
+    ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -183,6 +194,8 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            finished_retention: retention,
+            shutdown_timeout: Duration::from_secs(10),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi, worker) = (bound.reapi, bound.worker);
@@ -279,8 +292,14 @@ impl Client {
             .map(tonic::Response::into_inner)
     }
 
-    /// GetActionResult: the result, or the error code.
+    /// GetActionResult: the result as the daemon reported it ([`unstamped`]), or the
+    /// error code.
     pub async fn cached(&self, action: &Blob) -> Result<ActionResult, Code> {
+        self.cached_stamped(action).await.map(unstamped)
+    }
+
+    /// GetActionResult: the result as the cache holds it, with the server's metadata.
+    pub async fn cached_stamped(&self, action: &Blob) -> Result<ActionResult, Code> {
         self.ac()
             .get_action_result(GetActionResultRequest {
                 action_digest: Some(action.proto.clone()),
@@ -693,8 +712,33 @@ pub async fn output(cell: &Client, text: &str, exit_code: i32) -> ActionResult {
     }
 }
 
-/// The ExecuteResponse of a done operation.
+/// The ExecuteResponse of a done operation, its result as the daemon reported it
+/// ([`unstamped`]).
 pub fn response(op: &Operation) -> ExecuteResponse {
+    let mut response = stamped_response(op);
+    response.result = response.result.map(unstamped);
+    response
+}
+
+/// `result` without the metadata the server adds to every accepted result (issue
+/// #166), which must be there: the node id in `worker` and a `queued_timestamp`. The
+/// fake daemons here report results without metadata, so what is left is what they
+/// reported. `tests/execute.rs` checks the metadata's values.
+pub fn unstamped(mut result: ActionResult) -> ActionResult {
+    let metadata = result
+        .execution_metadata
+        .take()
+        .unwrap_or_else(|| panic!("a result without the server's metadata: {result:?}"));
+    assert!(!metadata.worker.is_empty(), "no worker: {metadata:?}");
+    assert!(
+        metadata.queued_timestamp.is_some(),
+        "no queued_timestamp: {metadata:?}"
+    );
+    result
+}
+
+/// The ExecuteResponse of a done operation, as the server sent it.
+pub fn stamped_response(op: &Operation) -> ExecuteResponse {
     assert!(op.done, "{op:?} is not done");
     match &op.result {
         Some(operation::Result::Response(any)) => {

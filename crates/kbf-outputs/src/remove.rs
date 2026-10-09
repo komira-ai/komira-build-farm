@@ -262,12 +262,25 @@ pub fn remove_tree(path: &Path) -> std::io::Result<()> {
         DIRECTORY.difference(OFlags::NOFOLLOW),
         Mode::empty(),
     )?;
-    match prepare(&top, name)? {
+    remove_tree_at(&top, name)
+}
+
+/// Removes `name` in the directory `top` and everything below it, as [`remove_tree`]
+/// does, without a path: `name` (one path component, as a directory listing gives it)
+/// may be a file or a symlink (unlinked) or absent (nothing to do), and is looked up
+/// in `top` itself, so a caller that opened `top` with `O_NOFOLLOW` removes nothing
+/// through a symlink at any level.
+///
+/// # Errors
+/// As [`remove_tree`].
+pub fn remove_tree_at(top: &OwnedFd, name: &OsStr) -> std::io::Result<()> {
+    let path = Path::new(name);
+    match prepare(top, name)? {
         None => return Ok(()),
-        Some(false) => return Ok(rustix::fs::unlinkat(&top, name, AtFlags::empty())?),
+        Some(false) => return Ok(rustix::fs::unlinkat(top, name, AtFlags::empty())?),
         Some(true) => {}
     }
-    let mut here = rustix::fs::openat(&top, name, DIRECTORY, Mode::empty())?;
+    let mut here = rustix::fs::openat(top, name, DIRECTORY, Mode::empty())?;
     let mut stack = vec![Frame {
         id: identity(&here)?,
         name: Vec::new(),
@@ -297,7 +310,7 @@ pub fn remove_tree(path: &Path) -> std::io::Result<()> {
         }
     }
     drop(here);
-    rustix::fs::unlinkat(&top, name, AtFlags::REMOVEDIR)?;
+    rustix::fs::unlinkat(top, name, AtFlags::REMOVEDIR)?;
     Ok(())
 }
 

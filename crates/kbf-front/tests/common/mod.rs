@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_front::{Cache, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
+use kbf_front::{
+    Cache, Closing, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError,
+};
 use kbf_meta::{Applied, BlobAnswer, Command, Location, MetaState, Retention};
 use kbf_objstore::{ByteRange, Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -91,9 +93,17 @@ impl Farm {
         Self::serve(kbf_front::routes).await
     }
 
-    /// The cache services and `Execution` over `dispatch`.
+    /// The cache services and `Execution` over `dispatch`, whose streams are never
+    /// closed (the closer is dropped).
     pub async fn with_execution<D: Dispatch>(dispatch: Arc<D>) -> Self {
-        Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch)).await
+        let (_, closing) = kbf_front::closing();
+        Self::with_execution_until(dispatch, closing).await
+    }
+
+    /// The cache services and `Execution` over `dispatch`, whose streams end when
+    /// `closing`'s closer closes.
+    pub async fn with_execution_until<D: Dispatch>(dispatch: Arc<D>, closing: Closing) -> Self {
+        Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch, closing)).await
     }
 
     async fn serve(routes: impl FnOnce(Arc<TestCache>) -> Routes) -> Self {
