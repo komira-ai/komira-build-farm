@@ -2,7 +2,7 @@
 //! when the lease ends. See the crate documentation for what a lease gets.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -26,6 +26,7 @@ use crate::cas::CasStore;
 use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
+use crate::record::Exec;
 use crate::xcode;
 
 /// The driver name in the node report.
@@ -36,7 +37,7 @@ pub const KIND: &str = "action";
 /// How long a spawn retries a program file that is still open for writing.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// The pause between two rounds of SIGKILL while ending an action's processes.
-const KILL_PAUSE: Duration = Duration::from_millis(10);
+pub(crate) const KILL_PAUSE: Duration = Duration::from_millis(10);
 
 /// A killer waiting for a lease's work to stop and its directory to be removed.
 type Stop = oneshot::Sender<()>;
@@ -72,11 +73,14 @@ struct Prepared {
 
 impl<C: Cas> NativeRuntime<C> {
     /// A runtime that reads and writes blobs through `cas`. Makes the scratch
-    /// directory, and removes any lease directory a previous daemon left in it.
+    /// directory; kills every action a previous daemon recorded there and left running
+    /// ([`crate::record`]); and removes every lease directory it left. All of it is done
+    /// when this returns, so before the daemon says `Hello`.
     ///
     /// # Errors
-    /// The scratch directory cannot be made or read. A leftover that cannot be
-    /// removed is moved aside instead (see the crate documentation), not an error.
+    /// The scratch directory cannot be made or read, or a recorded action's processes
+    /// survived SIGKILL for the kill wait. A leftover directory that cannot be removed
+    /// is moved aside instead (see the crate documentation), not an error.
     pub fn new(config: NativeConfig, cas: Arc<C>) -> std::io::Result<Self> {
         Self::with_remover(config, cas, &kbf_outputs::remove_tree)
     }
@@ -88,8 +92,8 @@ impl<C: Cas> NativeRuntime<C> {
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&config.scratch)?;
-        crate::sweep::sweep(&config.scratch, remove)?;
+        std::fs::create_dir_all(config.scratch.join(crate::record::RUNS))?;
+        crate::sweep::sweep(&config.scratch, remove, config.kill_wait, &procs::snapshot)?;
         Ok(Self {
             config,
             cas,
@@ -207,29 +211,36 @@ impl<C: Cas> NativeRuntime<C> {
             prepared.program.clone(),
             &prepared.args,
         );
+        // The arguments and the whole environment, the lease's own directories first
+        // and the Command's variables winning over them; the child execs these itself.
+        let env = (prepared.lease_env.iter())
+            .map(|(k, v)| (OsStr::new(k), v.as_os_str()))
+            .chain(
+                prepared
+                    .env
+                    .iter()
+                    .map(|(k, v)| (OsStr::new(k), OsStr::new(v))),
+            )
+            .chain(
+                (prepared.developer_dir.iter())
+                    .map(|d| (OsStr::new(xcode::DEVELOPER_DIR), d.as_os_str())),
+            );
+        let exec = Exec::new(&program, args.iter().map(OsStr::new), env)
+            .map_err(failed(&prepared.program))?;
         let mut command = tokio::process::Command::new(&program);
         command
-            .args(&args)
             .current_dir(&prepared.work_dir)
-            .env_clear()
-            .envs(prepared.lease_env.iter().map(|(k, v)| (k, v)))
-            .envs(prepared.env.iter().map(|(k, v)| (k, v)))
-            .envs(
-                prepared
-                    .developer_dir
-                    .iter()
-                    .map(|d| (xcode::DEVELOPER_DIR, d)),
-            )
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
             .process_group(0)
             .kill_on_drop(true);
-        let (mut child, leader) = spawn(&mut command)
+        let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
+        let (mut child, leader) = spawn(&mut command, exec, &record)
             .await
             .map_err(failed(&prepared.program))?;
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
-        let mut group = Group::new(Tracker::new(leader, me));
+        let mut group = Group::new(Tracker::new(leader, me), record);
         let limit = self.config.memory.limit(work.resources.memory_bytes);
         let deadline = Instant::now() + prepared.timeout;
         let mut tick = tokio::time::interval(self.config.poll);
@@ -335,10 +346,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let (stop_tx, mut stop) = oneshot::channel();
         let _registered = Registered::new(self, work.lease_id, stop_tx);
         let dir = LeaseDir {
-            path: self.config.scratch.join(format!(
-                "lease-{}-{}",
-                work.lease_id.term, work.lease_id.seq
-            )),
+            path: self.config.scratch.join(lease_name(work.lease_id)),
             armed: true,
         };
         let mut killer = None;
@@ -378,17 +386,25 @@ enum Ended {
     OutOfMemory { used: u64, limit: u64 },
 }
 
-/// The processes of one running action. Dropped while armed (the daemon dropped the
-/// run), it kills them all, blocking.
+/// The name of a lease's directory, and of its run record.
+fn lease_name(id: LeaseId) -> String {
+    format!("lease-{}-{}", id.term, id.seq)
+}
+
+/// The processes of one running action, and their run record ([`crate::record`]), which
+/// goes once they have all ended. Dropped while armed (the daemon dropped the run), it
+/// kills them all, blocking.
 struct Group {
     tracker: Arc<Mutex<Tracker>>,
+    record: PathBuf,
     armed: bool,
 }
 
 impl Group {
-    fn new(tracker: Tracker) -> Self {
+    fn new(tracker: Tracker, record: PathBuf) -> Self {
         Self {
             tracker: Arc::new(Mutex::new(tracker)),
+            record,
             armed: true,
         }
     }
@@ -421,8 +437,8 @@ impl Group {
 
     /// Ends every process of the action: SIGKILL to the group and to each process
     /// known to be the action's, again every [`KILL_PAUSE`] until a snapshot shows
-    /// none alive, then reaps the leader. Processes still alive after `wait` fail the
-    /// lease.
+    /// none alive, then removes the run record and reaps the leader. Processes still
+    /// alive after `wait` fail the lease, and keep their record for the next sweep.
     async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
         let give_up = Instant::now() + wait;
         loop {
@@ -441,6 +457,7 @@ impl Group {
             tokio::time::sleep(KILL_PAUSE).await;
         }
         self.armed = false;
+        let _ = std::fs::remove_file(&self.record);
         // The leader is dead; reap it if it is not reaped yet.
         child
             .wait()
@@ -472,27 +489,29 @@ impl Drop for Group {
             std::thread::sleep(KILL_PAUSE);
             members.is_empty()
         });
+        // Survivors keep their record, for the next start's sweep.
+        let _ = ended.then(|| std::fs::remove_file(&self.record));
         tracing::warn!(ended, "run dropped; killed the action's processes");
     }
 }
 
-/// Spawns `command`, retrying while its program is busy: a just-written input file is
-/// briefly held open for writing by any child another thread forks before it execs
-/// (ETXTBSY). Returns the child and its pid.
-async fn spawn(command: &mut tokio::process::Command) -> std::io::Result<(Child, i32)> {
+/// Spawns `command` running `exec`, with its run record written to `record` before
+/// the program runs ([`crate::record::Gate`]), retrying while the program is busy: a
+/// just-written input file is briefly held open for writing by any child another thread
+/// forks before it execs (ETXTBSY). Returns the child and its pid.
+async fn spawn(
+    command: &mut tokio::process::Command,
+    exec: Exec,
+    record: &Path,
+) -> std::io::Result<(Child, i32)> {
+    let gate = crate::record::Gate::install(command, exec);
     let give_up = Instant::now() + BUSY_WAIT;
     loop {
-        match command.spawn() {
+        match gate.spawn(command, record) {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < give_up => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
-            spawned => {
-                let child = spawned?;
-                // A child that has not been waited for always has its pid.
-                let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
-                let pid = pid.ok_or(std::io::Error::other("the child has no pid"))?;
-                return Ok((child, pid));
-            }
+            spawned => return spawned,
         }
     }
 }
@@ -813,9 +832,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             drop(file);
         });
-        let mut command = tokio::process::Command::new(&program);
+        let command = || tokio::process::Command::new(&program);
+        let exec = || Exec::new(&program, [], []).expect("exec");
+        let record = dir.join(format!("busy-record-{}", std::process::id()));
         let started = Instant::now();
-        let (mut child, pid) = spawn(&mut command).await.expect("spawned once closed");
+        let (mut child, pid) = spawn(&mut command(), exec(), &record)
+            .await
+            .expect("spawned once closed");
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");
         assert!(pid > 0);
         assert_eq!(child.wait().await.expect("wait").code(), Some(7));
@@ -825,15 +848,20 @@ mod tests {
             .write(true)
             .open(&program)
             .expect("open");
-        let busy = spawn(&mut command).await.expect_err("still busy");
+        let busy = spawn(&mut command(), exec(), &record)
+            .await
+            .expect_err("still busy");
         assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
         drop(held);
         // Any other failure is not retried: a file that is no program at all.
         std::fs::write(&program, [0x7f, b'E', b'L', b'F', 0, 0]).expect("write");
         let started = Instant::now();
-        let error = spawn(&mut command).await.expect_err("not a program");
+        let error = spawn(&mut command(), exec(), &record)
+            .await
+            .expect_err("not a program");
         assert_ne!(error.raw_os_error(), Some(libc::ETXTBSY));
         assert!(started.elapsed() < BUSY_WAIT);
+        assert!(!record.exists(), "a failed spawn leaves no run record");
         std::fs::remove_file(&program).expect("remove");
     }
 }

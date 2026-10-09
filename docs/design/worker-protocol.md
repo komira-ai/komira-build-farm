@@ -365,7 +365,10 @@ daemon restarts and server restarts:
 6. **A restarted daemon lists everything it runs in its first heartbeat.** The
    scheduler requeues at once any lease whose `Start` went to an earlier session and
    that the new session's heartbeat leaves out. (Re-adopting running work across a
-   daemon restart is **planned**; today a restarted daemon runs nothing.)
+   daemon restart is **planned**. Today a restarted daemon lists nothing, and ends
+   what its predecessor left running before its `Hello`; a daemon that is never
+   started again on the node ends nothing: see
+   [daemon.md](daemon.md#when-the-daemon-is-killed).)
 
 ## Planned
 

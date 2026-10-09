@@ -59,6 +59,16 @@ impl Tracker {
         }
     }
 
+    /// A tracker for an action an earlier daemon started, known only by its run record:
+    /// the leader's pid and its start time ([`crate::record`]).
+    #[must_use]
+    pub fn resume(leader: i32, leader_start: u64, me: i32) -> Self {
+        Self {
+            leader_start: Some(leader_start),
+            ..Self::new(leader, me)
+        }
+    }
+
     /// The leader's pid and process group id.
     #[must_use]
     pub fn leader(&self) -> i32 {
@@ -75,6 +85,15 @@ impl Tracker {
                 .map(|p| p.start);
         }
         let floor = self.leader_start.unwrap_or(0);
+        // Another process under the leader's pid: the kernel hands out no pid that
+        // still names a process group, so the action's group emptied first, and any
+        // group of that id now is someone else's.
+        if snapshot
+            .iter()
+            .any(|p| p.pid == self.leader && p.start != floor)
+        {
+            self.group_gone = true;
+        }
         let mut children: BTreeMap<i32, Vec<&Proc>> = BTreeMap::new();
         for p in snapshot {
             children.entry(p.ppid).or_default().push(p);
@@ -143,7 +162,7 @@ pub fn parse_linux_status(text: &str) -> Option<u64> {
     Some(total * 1024)
 }
 
-pub use platform::{footprint, snapshot};
+pub use platform::{footprint, process, snapshot};
 
 #[cfg(target_os = "linux")]
 mod platform {
@@ -170,6 +189,15 @@ mod platform {
             }
         }
         Ok(procs)
+    }
+
+    /// Process `pid`, as a snapshot would show it; `None` once it is gone.
+    #[must_use]
+    pub fn process(pid: i32) -> Option<Proc> {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .as_deref()
+            .and_then(parse_linux_stat)
     }
 
     /// What `pid` holds, in bytes; `None` once it is gone.
@@ -207,10 +235,12 @@ mod platform {
             return Err(std::io::Error::last_os_error());
         }
         pids.truncate(n.unsigned_abs() as usize);
-        Ok(pids.into_iter().filter_map(bsd_info).collect())
+        Ok(pids.into_iter().filter_map(process).collect())
     }
 
-    fn bsd_info(pid: libc::pid_t) -> Option<Proc> {
+    /// Process `pid`, as a snapshot would show it; `None` once it is gone.
+    #[must_use]
+    pub fn process(pid: libc::pid_t) -> Option<Proc> {
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
         let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
         // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes; the call writes

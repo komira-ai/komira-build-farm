@@ -146,10 +146,14 @@ a new session. The server feeds heartbeats only from a worker's newest stream; a
 heartbeat that arrives on a replaced stream is dropped and not acknowledged, so a
 daemon still talking on an old stream fences on time.
 
-This puts one duty on a restarted daemon: it must finish re-adopting its running
-work and list all of it in its first heartbeat on the new stream, or that work is
-requeued at once. Re-adopting work across a daemon restart is **planned**; today a
-restarted daemon has no running leases.
+This puts one duty on a restarted daemon: any work it does not list in its first
+heartbeat on the new stream is requeued at once, so that work must have stopped.
+Re-adopting work across a daemon restart is **planned**. Today a restarted daemon
+lists nothing of its predecessor's, and before its `Hello` its driver ends every run
+that predecessor left on the node (issue #155). That holds only when a daemon is
+started again on the same node with the same scratch directory; the runs of a daemon
+that is not are left running, unfenced (see
+[daemon.md](daemon.md#when-the-daemon-is-killed)).
 
 ## QoS
 

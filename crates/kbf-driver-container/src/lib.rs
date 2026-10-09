@@ -23,7 +23,11 @@
 //! - cleanup on every path: the container, the lease cgroup and the scratch directory
 //!   are removed after success, failure, timeout, kill, and when the daemon drops the
 //!   run. The scratch directory is removed by a walk without recursion, so no depth of
-//!   tree the action leaves can overflow the clean step's stack.
+//!   tree the action leaves can overflow the clean step's stack;
+//! - the label `kbf.owner=<owner>` ([`OWNER_LABEL`]; the daemon passes its node id), by
+//!   which the next daemon on the node finds the container if this one is killed: at
+//!   start, [`PodmanRuntime::new`] removes every container so labelled and every lease
+//!   scratch directory, each with its lease cgroup, before the daemon says `Hello`.
 //!
 //! Modules:
 //! - [`image`]: the `container-image` property;
@@ -52,6 +56,6 @@ pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;
-pub use podman::EXEC_ROOT;
-pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime};
+pub use podman::{EXEC_ROOT, OWNER_LABEL};
+pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};
 pub use subids::{IdFiles, SubidError, check_daemon_user, check_subordinate_ids};

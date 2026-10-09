@@ -38,10 +38,14 @@
 //! The container driver's own output walk is public too, but does not build on macOS;
 //! moving it onto `kbf-outputs` is a follow-up.
 //!
-//! At start the runtime removes every lease directory a previous daemon left; one that
-//! cannot be removed is moved aside into `quarantine/` under the scratch root and
-//! logged, and the daemon starts anyway (an action decides what its directory holds,
-//! so refusing to start would let one build step take the node out of the farm).
+//! Before an action's program runs, its run record (the leader's pid and start time)
+//! is written under `runs/` in the scratch root (`record`): the child waits between
+//! fork and exec until it is. At start the runtime kills every action a previous
+//! daemon recorded and left running, the daemon having been killed (`sweep`; processes
+//! that survive SIGKILL stop the start), then removes every lease directory it left;
+//! one that cannot be removed is moved aside into `quarantine/` under the scratch root
+//! and logged, and the daemon starts anyway (an action decides what its directory
+//! holds, so refusing to start would let one build step take the node out of the farm).
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
@@ -78,6 +82,7 @@ mod config;
 mod home;
 pub mod network;
 pub mod procs;
+mod record;
 mod runtime;
 mod sweep;
 pub mod xcode;

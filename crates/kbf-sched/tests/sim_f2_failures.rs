@@ -17,6 +17,7 @@
 //! | F2.11 | lost and repeated results and acknowledgements | `f2_11_*` |
 //! | F2.12 | two daemons claiming one node id (ignored: issue #140) | `f2_12_*` |
 //! | F2.13 | leases of another term listed | `f2_13_*` |
+//! | F2.14 | a daemon crash and its restart (issue #155) | `f2_14_*` |
 //!
 //! F2.5 (a `Start` lost on a live session) and F2.8 (a reboot and a daemon restart inside
 //! G) are in `sim_cell.rs`.
@@ -64,8 +65,8 @@ const _: () = assert!(W_MS + SECOND < G_MS);
 type Spans = BTreeMap<(u64, OperationId), Vec<(u64, u64, String)>>;
 
 /// The scenarios the sweeps run.
-const SCENARIOS: [&str; 10] = [
-    "F2.1", "F2.2", "F2.3", "F2.4", "F2.6", "F2.7", "F2.9", "F2.10", "F2.11", "F2.13",
+const SCENARIOS: [&str; 11] = [
+    "F2.1", "F2.2", "F2.3", "F2.4", "F2.6", "F2.7", "F2.9", "F2.10", "F2.11", "F2.13", "F2.14",
 ];
 /// The scenarios that fail today on a known bug: F2.12 on issue #140.
 const KNOWN_BUGS: [&str; 1] = ["F2.12"];
@@ -187,6 +188,11 @@ fn plan(name: &'static str, seed: u64) -> Plan {
             twin.boot_at = twin_at;
             plan.workers.push(twin);
             plan.workers[0].reconnects = vec![twin_at + at(&mut rng, 20, 60)];
+        }
+        "F2.14" => {
+            // The daemon dies (SIGKILL, an OOM kill, an aborting panic) and its service
+            // manager starts it again at once, while it has runs.
+            plan.workers[0].crash_at = Some(at(&mut rng, 20, 150));
         }
         "F2.13" => {
             plan.workers[0].phantoms = vec![
@@ -647,6 +653,61 @@ fn f2_13_leases_of_other_terms_are_never_cancelled() {
         "a heartbeat listing a lease of another term",
         foreign,
     );
+}
+
+/// F2.14. Catches (issue #155): the work of a crashed daemon's runs running twice at
+/// once (I12). The restarted daemon's first heartbeat leaves those leases out, so the
+/// scheduler requeues them at once; the daemon's start-up sweep ends the runs before its
+/// `Hello`, so none of them still runs when its retry starts.
+#[test]
+fn f2_14_a_crashed_daemon_s_runs_end_before_its_work_is_retried() {
+    let (mut crashes, mut swept, mut retried) = (0, 0, 0);
+    for seed in 0..SEEDS {
+        let w = run("F2.14", seed);
+        let worker = w.worker("worker-1");
+        crashes += worker.stats.crashes;
+        swept += worker.stats.swept;
+        let check = &w.leader().check;
+        for run in worker
+            .runs
+            .iter()
+            .filter(|r| r.end.is_some_and(|(_, e)| e == End::Swept))
+        {
+            if check.answered[&run.operation].0 > run.lease {
+                retried += 1;
+            }
+        }
+    }
+    reached("F2.14", "a daemon crash", crashes);
+    reached(
+        "F2.14",
+        "a run ended by the restarted daemon's sweep",
+        swept,
+    );
+    reached(
+        "F2.14",
+        "a swept run's operation answered by its retry",
+        retried,
+    );
+}
+
+/// F2.14 without the start-up sweep (a mutant of the daemon model, as it was before
+/// issue #155): the crashed daemon's runs go on unlisted while their retries run. The
+/// end-of-run check must catch it on some seed as I12, or F2.14 proves nothing.
+#[test]
+fn f2_14_without_the_sweep_a_crash_runs_work_twice() {
+    let mut caught = 0;
+    for seed in 0..SEEDS {
+        let mut p = plan("F2.14", seed);
+        p.workers[0].sweep_on_restart = false;
+        let checked = std::panic::catch_unwind(|| check_world(&World::run(p)));
+        if let Err(panic) = checked {
+            let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(text.contains("I12 violated"), "seed {seed}: {text}");
+            caught += 1;
+        }
+    }
+    reached("F2.14 without the sweep", "a seed failing I12", caught);
 }
 
 /// Catches: anything in the scheduler or the cell that depends on more than the seed.

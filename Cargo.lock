@@ -1330,11 +1330,15 @@ name = "kbf-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-driver-native",
+ "kbf-front",
  "kbf-outputs",
+ "kbf-proto",
  "libc",
+ "prost",
  "rcgen",
  "tokio",
  "tonic",
