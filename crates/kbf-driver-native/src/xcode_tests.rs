@@ -1,6 +1,8 @@
 //! Tests of [`super`]: what each Xcode is asked, what decides its state, the fix
 //! named, and the Xcode an action names.
 
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt as _;
 
 use kbf_proto::reapi::platform::Property;
@@ -53,7 +55,9 @@ pub(crate) const NOT_AGREED: &str = "You have not agreed to the Xcode license ag
 /// What `-checkFirstLaunchStatus` prints when the first launch was not run.
 const FIRST_LAUNCH: &str = "Install additional required components? Run -runFirstLaunch.";
 
-/// A stand-in for `xcodebuild`, answering `-version`, `-license check`,
+/// A stand-in for `xcodebuild` (linked into each app by [`install`], where [`survey`]
+/// runs it), which writes the path it was run by (`$0`) to `argv0` in `dir`, answering
+/// `-version`, `-license check`,
 /// `-checkFirstLaunchStatus` and `-showComponent MetalToolchain` only (any other
 /// question exits 64, as a real one does for an option it does not know) and only for
 /// an app's `DEVELOPER_DIR` (none exits 70). `-version` prints a build and exits 0 for
@@ -71,6 +75,7 @@ fn fake_xcodebuild(dir: &Path) -> PathBuf {
         "xcodebuild",
         &format!(
             "#!/bin/sh\n\
+            echo \"$0\" >> '{argv0}'\n\
             licence=0 first=0 metal=installed\n\
             case \"$DEVELOPER_DIR\" in\n\
             */Xcode_good.app/Contents/Developer) build=16C5032a ;;\n\
@@ -98,13 +103,14 @@ fn fake_xcodebuild(dir: &Path) -> PathBuf {
               [ -n \"$metal\" ] || {{ echo 'invalid option' >&2; exit 64; }}\n\
               echo 'Build Version: 17C48'; echo \"Status: $metal\" ;;\n\
             *) echo \"unknown: $*\" >&2; exit 64 ;;\n\
-            esac\n"
+            esac\n",
+            argv0 = dir.join("argv0").display()
         ),
     )
 }
 
-/// A stand-in for `xcrun`, answering `--find clang` and `--find metal` only (any other
-/// question exits 64) and only for an app's `DEVELOPER_DIR` (none exits 70): it exits
+/// A stand-in for `xcrun`, answering `--no-cache --find clang` and `--no-cache --find
+/// metal` only (any other question, a lookup that may read the cache included, exits 64) and only for an app's `DEVELOPER_DIR` (none exits 70): it exits
 /// 69 for `broken`, as every tool of an Xcode whose licence is not accepted does, 72
 /// for `noclang`'s clang (licence accepted, compiler missing: only this question keeps
 /// it out) and for `oldnometal`'s metal, and prints the tool's path for the rest.
@@ -114,26 +120,153 @@ fn fake_xcrun(dir: &Path) -> PathBuf {
         "xcrun",
         &format!(
             "#!/bin/sh\n\
-            case \"$*\" in '--find clang'|'--find metal') ;; *) echo \"unknown: $*\" >&2; exit 64 ;; esac\n\
-            case \"$DEVELOPER_DIR:$2\" in\n\
+            case \"$*\" in '--no-cache --find clang'|'--no-cache --find metal') ;; \
+            *) echo \"unknown: $*\" >&2; exit 64 ;; esac\n\
+            case \"$DEVELOPER_DIR:$3\" in\n\
             */Xcode_broken.app/Contents/Developer:*) echo '{NOT_AGREED}' >&2; exit 69 ;;\n\
             */Xcode_noclang.app/Contents/Developer:clang|*/Xcode_oldnometal.app/Contents/Developer:metal)\n\
-              echo \"xcrun: error: unable to find utility \\\"$2\\\"\" >&2; exit 72 ;;\n\
-            */Contents/Developer:*) echo \"$DEVELOPER_DIR/usr/bin/$2\" ;;\n\
+              echo \"xcrun: error: unable to find utility \\\"$3\\\"\" >&2; exit 72 ;;\n\
+            */Contents/Developer:*) echo \"$DEVELOPER_DIR/usr/bin/$3\" ;;\n\
             *) echo 'no DEVELOPER_DIR' >&2; exit 70 ;;\n\
             esac\n"
         ),
     )
 }
 
+/// Catches a warm-up lookup run outside the sandbox (the review of issue #163:
+/// the `/usr/bin/xcrun` the warm-up runs reads a cache leases can write, while the
+/// node already serves), with the network on, without the user-folder rules that
+/// let `xcrun` write its cache, or with another lease directory or `TMPDIR`; the
+/// node's own Xcode looked up with a `DEVELOPER_DIR` the daemon was started with
+/// (the warm-up then fills another Xcode's entries), and a named Xcode looked up
+/// with any other.
+#[test]
+fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
+    let xcrun = Path::new("/x/xcrun");
+    let sandbox = WarmSandbox {
+        isolation: Isolation::Sandbox(PathBuf::from(crate::network::SANDBOX_EXEC)),
+        dir: PathBuf::from("/s/lease-warm-up"),
+        rules: "(allow file-write* (literal \"/c\"))\n".to_owned(),
+    };
+    let own = lookup(xcrun, None, "cc", &sandbox);
+    assert_eq!(own.get_program(), crate::network::SANDBOX_EXEC);
+    let profile = format!("{}{}", crate::network::NO_NETWORK_PROFILE, sandbox.rules);
+    assert_eq!(
+        own.get_args().collect::<Vec<_>>(),
+        [
+            "-D",
+            "KBF_LEASE=/s/lease-warm-up",
+            "-p",
+            &profile,
+            "/x/xcrun",
+            "--find",
+            "cc"
+        ]
+    );
+    let tmpdir = (OsStr::new("TMPDIR"), Some(sandbox.dir.as_os_str()));
+    assert_eq!(
+        own.get_envs().collect::<Vec<_>>(),
+        [(OsStr::new(DEVELOPER_DIR), None), tmpdir]
+    );
+    let dir = Path::new("/A/Xcode.app/Contents/Developer");
+    let named = lookup(xcrun, Some(dir), "swiftc", &sandbox);
+    assert_eq!(named.get_args().last(), Some(OsStr::new("swiftc")));
+    assert_eq!(
+        named.get_envs().collect::<Vec<_>>(),
+        [(OsStr::new(DEVELOPER_DIR), Some(dir.as_os_str())), tmpdir]
+    );
+}
+
+/// Catches: a lookup missed for the node's own Xcode or for one of the others, or
+/// run other than through the sandbox program in the warm-up's own directory
+/// (here a fake that logs its lease parameter and runs the rest), the warm stopped
+/// by a lookup that fails or hangs, the directory left behind, and `xcrun` run
+/// where there is none or where the directory cannot be made.
+#[test]
+fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
+    let dir = scratch("warm");
+    let log = dir.join("log");
+    let xcrun = dir.join("xcrun");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"${{DEVELOPER_DIR-none}} $*\" >> {}\n\
+         case \"$2\" in\n\
+         ld) echo 'not found' >&2; exit 1 ;;\n\
+         swift) case \"$DEVELOPER_DIR\" in /hung) exec sleep 60 ;; esac ;;\n\
+         esac\n",
+        log.display()
+    );
+    std::fs::write(&xcrun, script).expect("script");
+    std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let sandbox_log = dir.join("sandbox-log");
+    let sandbox_exec = dir.join("sandbox-exec");
+    let script = format!(
+        "#!/bin/sh\necho \"$2 TMPDIR=$TMPDIR\" >> {}\nshift 4\nexec \"$@\"\n",
+        sandbox_log.display()
+    );
+    std::fs::write(&sandbox_exec, script).expect("script");
+    std::fs::set_permissions(&sandbox_exec, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let sandbox = WarmSandbox {
+        isolation: Isolation::Sandbox(sandbox_exec),
+        dir: dir.join("scratch/lease-warm-up"),
+        rules: String::new(),
+    };
+    let real = std::fs::canonicalize(&dir)
+        .expect("real")
+        .join("scratch/lease-warm-up");
+    let thread = warm(
+        &xcrun,
+        vec![
+            None,
+            Some(PathBuf::from("/x1")),
+            Some(PathBuf::from("/hung")),
+        ],
+        Duration::from_millis(500),
+        sandbox.clone(),
+    )
+    .expect("a thread");
+    thread.join().expect("warmed");
+    let read = |path: &Path| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .expect("log")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let want: Vec<String> = ["none", "/x1", "/hung"]
+        .iter()
+        .flat_map(|dir| WARM_TOOLS.map(|tool| format!("{dir} --find {tool}")))
+        .collect();
+    assert_eq!(read(&log), want);
+    let lease = format!("KBF_LEASE={0} TMPDIR={0}", real.display());
+    assert_eq!(read(&sandbox_log), vec![lease; want.len()]);
+    assert!(!real.exists(), "the warm-up's directory stays");
+
+    assert!(warm(&dir.join("missing"), Vec::new(), WITHIN, sandbox.clone()).is_none());
+    let unmakeable = WarmSandbox {
+        dir: log.join("under-a-file"),
+        ..sandbox
+    };
+    assert!(warm(&xcrun, Vec::new(), WITHIN, unmakeable).is_none());
+}
+
 /// How long the fake Xcodes have to answer.
 const WITHIN: Duration = Duration::from_secs(2);
 
-/// Makes `apps` with each of `names` as an app holding `Contents/Developer`, plus a
-/// link `Xcode.app` to `Xcode_new.app` and a dangling link `Xcode_gone.app`.
-fn install(apps: &Path, names: &[&str]) {
+/// Links `program` into `app` as its own `xcodebuild`: [`XCODEBUILD`] inside its
+/// `DEVELOPER_DIR`, where [`survey`] runs it.
+pub(crate) fn link_xcodebuild(program: &Path, app: &Path) {
+    let at = app.join("Contents/Developer").join(XCODEBUILD);
+    std::fs::create_dir_all(at.parent().expect("usr/bin")).expect("usr/bin");
+    std::os::unix::fs::symlink(program, at).expect("link");
+}
+
+/// Makes `apps` with each of `names` as an app holding `Contents/Developer` and
+/// `xcodebuild` linked in ([`link_xcodebuild`]), plus a link `Xcode.app` to
+/// `Xcode_new.app` and a dangling link `Xcode_gone.app`.
+fn install(apps: &Path, names: &[&str], xcodebuild: &Path) {
     for app in names {
-        std::fs::create_dir_all(apps.join(app).join("Contents/Developer")).expect("app");
+        link_xcodebuild(xcodebuild, &apps.join(app));
     }
     std::os::unix::fs::symlink(apps.join("Xcode_new.app"), apps.join("Xcode.app")).expect("link");
     std::os::unix::fs::symlink(apps.join("nowhere"), apps.join("Xcode_gone.app"))
@@ -148,10 +281,14 @@ fn install(apps: &Path, names: &[&str]) {
 /// later twin replacing the first, a missing directory or program treated as anything
 /// but "no Xcode", the Metal toolchain asked for by `discover` (no node requires it
 /// there), and a hung Xcode waited for past its time (its fake sleeps for a minute).
+/// Catches too `xcodebuild` run other than from inside each Xcode (the review of
+/// issue #163: the `/usr/bin` shim may find it through `xcrun`'s cache, which leases
+/// can write), and a program path that leads out of the Xcode run at all.
 #[test]
 fn every_xcode_that_answers_is_found() {
     let dir = scratch("discover");
     let apps = dir.join("Applications");
+    let fake = fake_xcodebuild(&dir);
     install(
         &apps,
         &[
@@ -166,12 +303,13 @@ fn every_xcode_that_answers_is_found() {
             "Xcode_hung.app",
             "Safari.app",
         ],
+        &fake,
     );
-    let xcodebuild = fake_xcodebuild(&dir);
+    let xcodebuild = Path::new(XCODEBUILD);
     let xcrun = fake_xcrun(&dir);
     let real = std::fs::canonicalize(&apps).expect("real");
     let started = Instant::now();
-    let found = discover(&apps, &xcodebuild, &xcrun, WITHIN);
+    let found = discover(&apps, xcodebuild, &xcrun, WITHIN);
     let took = started.elapsed();
     assert!(
         took >= WITHIN,
@@ -188,9 +326,54 @@ fn every_xcode_that_answers_is_found() {
         ("26A1".to_owned(), developer("Xcode_nometal.app")),
     ]);
     assert_eq!(found, want);
+    // Each Xcode's own, by its real path (`Xcode.app` is the new one), never Safari's.
+    let ran = dir.join("argv0");
+    let read_ran = || -> BTreeSet<String> {
+        std::fs::read_to_string(&ran)
+            .expect("ran")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let want_ran: BTreeSet<String> = [
+        "Xcode_broken.app",
+        "Xcode_firstlaunch.app",
+        "Xcode_good.app",
+        "Xcode_hung.app",
+        "Xcode_mute.app",
+        "Xcode_new.app",
+        "Xcode_noclang.app",
+        "Xcode_nometal.app",
+        "Xcode_twin.app",
+    ]
+    .iter()
+    .map(|app| developer(app).join(XCODEBUILD).display().to_string())
+    .collect();
+    assert_eq!(read_ran(), want_ran);
 
-    assert!(discover(&dir.join("missing"), &xcodebuild, &xcrun, WITHIN).is_empty());
-    assert!(discover(&apps, &dir.join("no-xcodebuild"), &xcrun, WITHIN).is_empty());
+    assert!(discover(&dir.join("missing"), xcodebuild, &xcrun, WITHIN).is_empty());
+    assert!(discover(&apps, Path::new("usr/bin/missing"), &xcrun, WITHIN).is_empty());
+    // A program outside the Xcode (the fake itself, as a shim would be) is not run.
+    std::fs::remove_file(&ran).expect("ran");
+    assert!(discover(&apps, &fake, &xcrun, WITHIN).is_empty());
+    assert!(discover(&apps, Path::new("../../../../xcodebuild"), &xcrun, WITHIN).is_empty());
+    assert!(!ran.exists(), "a program outside the Xcode ran");
+    let outside = Probe {
+        xcodebuild: fake.clone(),
+        ..Probe::system(false)
+    };
+    let refused = survey(&apps, &outside);
+    let good = refused
+        .iter()
+        .find(|x| x.app.ends_with("Xcode_good.app"))
+        .expect("good");
+    assert_eq!(
+        (good.state, good.reason.clone()),
+        (
+            State::Failed,
+            format!("{} is not inside the Xcode", fake.display())
+        )
+    );
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
@@ -202,7 +385,8 @@ fn every_xcode_that_answers_is_found() {
 /// that requires it, asked for on one that does not, a Metal question not answered in
 /// time taken as an Xcode before 26 or as missing Metal, an `Xcode` before 26 (no
 /// `-showComponent`) taken as missing Metal when `xcrun` finds it, or as having Metal
-/// when `xcrun` does not.
+/// when `xcrun` does not, and `xcrun` asked without `--no-cache` (it then reads a
+/// cache leases can write, while the daemon runs it outside the sandbox).
 #[test]
 fn every_installed_xcode_is_reported_with_its_state() {
     let dir = scratch("survey");
@@ -223,15 +407,23 @@ fn every_installed_xcode_is_reported_with_its_state() {
             "Xcode_mute.app",
             "Xcode_hung.app",
         ],
+        &fake_xcodebuild(&dir),
     );
     let probe = Probe {
-        xcodebuild: fake_xcodebuild(&dir),
         xcrun: fake_xcrun(&dir),
         within: WITHIN,
-        metal: true,
+        ..Probe::system(true)
     };
     let real = std::fs::canonicalize(&apps).expect("real");
-    let (xcodebuild_at, xcrun_at) = (probe.xcodebuild.display(), probe.xcrun.display());
+    // Each Xcode's own `xcodebuild`, by its real path.
+    let own = |app: &str| {
+        real.join(app)
+            .join("Contents/Developer")
+            .join(XCODEBUILD)
+            .display()
+            .to_string()
+    };
+    let xcrun_at = probe.xcrun.display();
     let xcode = |name: &str, build: Option<&str>, state, reason: &str| Xcode {
         app: apps.join(name),
         developer_dir: Some(real.join(name).join("Contents/Developer")),
@@ -248,15 +440,18 @@ fn every_installed_xcode_is_reported_with_its_state() {
             "Xcode_broken.app",
             Some("16B40"),
             State::LicenseNotAccepted,
-            &format!("{xcodebuild_at} -license check exited with exit status: 69: {NOT_AGREED}"),
+            &format!(
+                "{} -license check exited with exit status: 69: {NOT_AGREED}",
+                own("Xcode_broken.app")
+            ),
         ),
         xcode(
             "Xcode_firstlaunch.app",
             Some("16G1"),
             State::FirstLaunchNotRun,
             &format!(
-                "{xcodebuild_at} -checkFirstLaunchStatus exited with exit status: 69: \
-                 {FIRST_LAUNCH}"
+                "{} -checkFirstLaunchStatus exited with exit status: 69: {FIRST_LAUNCH}",
+                own("Xcode_firstlaunch.app")
             ),
         ),
         Xcode {
@@ -271,7 +466,10 @@ fn every_installed_xcode_is_reported_with_its_state() {
             "Xcode_hung.app",
             None,
             State::Failed,
-            &format!("{xcodebuild_at} -version: no answer within 2s; killed"),
+            &format!(
+                "{} -version: no answer within 2s; killed",
+                own("Xcode_hung.app")
+            ),
         ),
         xcode(
             "Xcode_mute.app",
@@ -285,7 +483,7 @@ fn every_installed_xcode_is_reported_with_its_state() {
             Some("16F6"),
             State::Failed,
             &format!(
-                "{xcrun_at} --find clang exited with exit status: 72: \
+                "{xcrun_at} --no-cache --find clang exited with exit status: 72: \
                  xcrun: error: unable to find utility \"clang\""
             ),
         ),
@@ -301,7 +499,7 @@ fn every_installed_xcode_is_reported_with_its_state() {
             Some("15B1"),
             State::MetalToolchainMissing,
             &format!(
-                "{xcrun_at} --find metal exited with exit status: 72: \
+                "{xcrun_at} --no-cache --find metal exited with exit status: 72: \
                  xcrun: error: unable to find utility \"metal\""
             ),
         ),
@@ -309,13 +507,19 @@ fn every_installed_xcode_is_reported_with_its_state() {
             "Xcode_slowlicence.app",
             Some("16H1"),
             State::Failed,
-            &format!("{xcodebuild_at} -license check: no answer within 2s; killed"),
+            &format!(
+                "{} -license check: no answer within 2s; killed",
+                own("Xcode_slowlicence.app")
+            ),
         ),
         xcode(
             "Xcode_slowmetal.app",
             Some("26B1"),
             State::Failed,
-            &format!("{xcodebuild_at} -showComponent MetalToolchain: no answer within 2s; killed"),
+            &format!(
+                "{} -showComponent MetalToolchain: no answer within 2s; killed",
+                own("Xcode_slowmetal.app")
+            ),
         ),
     ];
     assert_eq!(survey(&apps, &probe), want);

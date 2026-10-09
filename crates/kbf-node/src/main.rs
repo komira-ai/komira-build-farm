@@ -25,7 +25,7 @@
 //! `docs/design/mac-node-provisioning.md`, section 5.7).
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,9 +70,9 @@ struct Cli {
     /// How often a lease's memory is measured, in milliseconds (native).
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
-    /// The directory searched for `Xcode*.app` (native). Each Xcode that answers
-    /// `xcodebuild -version`, `-license check` and `-checkFirstLaunchStatus` and `xcrun
-    /// --find clang` (each within a minute) is ready: it is reported as an `xcode`
+    /// The directory searched for `Xcode*.app` (native). Each Xcode whose own
+    /// `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`
+    /// and for which `xcrun --no-cache --find clang` does (each within a minute) is ready: it is reported as an `xcode`
     /// entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One
     /// that is not is listed in the node's status with why and the command that fixes
     /// it, and logged at WARN.
@@ -151,16 +151,34 @@ fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
 /// and again every `--xcode-recheck-secs` and hands each changed survey to the daemon
 /// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or not.
 fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
-    let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
+    native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))
+}
+
+/// [`native`] with `config` and the `xcrun` it warms (a test names its own user
+/// folders, and an `xcrun` that is not there, so no warm-up outlives it).
+fn native_with(
+    cli: &Cli,
+    config: NativeConfig,
+    xcrun: &Path,
+) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
+    // Before the first survey, which runs the Xcodes' tools outside the sandbox:
+    // leases can write xcrun's cache.
+    config.forget_xcrun_cache();
+    let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
     let (probe, every) = xcode_watch_args(cli);
+    // The first survey is applied before this returns.
     let (driver, _) = xcode_watch::watch(
         cli.xcode_apps.clone(),
         probe,
         every,
         Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
     );
+    // In the background, sandboxed as an action: the node serves while xcrun fills its
+    // cache for the node's own Xcode and the ready ones; each later survey warms the
+    // Xcodes it makes ready.
+    let _ = runtime.warm_xcrun(xcrun, xcode::ANSWER_WITHIN);
     Ok(daemon(cli, runtime)?.with_driver_report(driver))
 }
 
@@ -269,8 +287,6 @@ mod container {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use kbf_proto::worker::XcodeState;
 
     use super::*;
@@ -392,12 +408,67 @@ mod tests {
             flag("xcode-apps", &apps),
         ])
         .expect("flags");
-        let daemon = native(&cli).expect("the native daemon");
+        let mut config = native_config(&cli).expect("config");
+        // Not the runner's own (on macOS): the start removes xcrun's cache there.
+        config.user_folders = None;
+        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
         let xcodes = daemon.node_status().xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].app, app.display().to_string());
         assert_eq!(xcodes[0].state(), XcodeState::Failed);
         assert!(!xcodes[0].reason.is_empty(), "{xcodes:?}");
+        drop(daemon);
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches (the merge of issues #163 and #164): the native daemon's first survey of
+    /// its Xcodes, run outside the sandbox, asked while `xcrun`'s cache that a lease
+    /// could have written is still there. The Xcode's own `xcodebuild` is a fake that
+    /// answers a build saying whether it saw the cache.
+    #[tokio::test]
+    async fn the_first_survey_runs_after_the_xcrun_cache_is_gone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch("forget");
+        tls_files(&dir);
+        let (temp, cache) = (dir.join("T"), dir.join("C"));
+        std::fs::create_dir_all(&temp).expect("T");
+        std::fs::create_dir_all(&cache).expect("C");
+        std::fs::write(temp.join("xcrun_db"), b"a lease's").expect("cache");
+        let apps = dir.join("Applications");
+        let program = apps
+            .join("Xcode_1.app/Contents/Developer")
+            .join(xcode::XCODEBUILD);
+        std::fs::create_dir_all(program.parent().expect("bin")).expect("bin");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ -e '{}/xcrun_db' ]; then echo 'Build version CACHE'; \
+             else echo 'Build version 1A1'; fi\n",
+            temp.display()
+        );
+        std::fs::write(&program, script).expect("script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=http://127.0.0.1:1".to_owned(),
+            flag("scratch", &dir.join("leases")),
+            flag("xcode-apps", &apps),
+        ])
+        .expect("flags");
+        let mut config = native_config(&cli).expect("config");
+        config.user_folders =
+            kbf_driver_native::user_folders::UserFolders::new(temp.clone(), cache);
+        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
+        let xcodes = daemon.node_status().xcodes;
+        assert_eq!(xcodes.len(), 1, "{xcodes:?}");
+        assert_eq!(xcodes[0].build, "1A1", "{xcodes:?}");
         drop(daemon);
         kbf_outputs::remove_tree(&dir).expect("clean");
     }

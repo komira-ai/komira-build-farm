@@ -146,12 +146,13 @@ never share a cache entry.
 
 A Mac may have several Xcodes installed; it serves an action that names any of them
 that is **ready**. The daemon asks each `Xcode*.app` in `/Applications` (the
-`--xcode-apps` flag), under its own `DEVELOPER_DIR`, in order: `xcodebuild -version`
-(which must print a build), `xcodebuild -license check`, `xcodebuild
--checkFirstLaunchStatus`, `xcrun --find clang`, and, on a node started with
-`--require-metal-toolchain` (one meant for GPU work), whether `xcodebuild -showComponent
-MetalToolchain` says `Status: installed` (an Xcode before 26, which has no
-`-showComponent` and bundles Metal, passes when `xcrun --find metal` does). One for
+`--xcode-apps` flag), under its own `DEVELOPER_DIR` and with its own `xcodebuild`
+(the one inside the app), in order: `xcodebuild -version` (which must print a build),
+`xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --no-cache
+--find clang`, and, on a node started with `--require-metal-toolchain` (one meant for
+GPU work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installed`
+(an Xcode before 26, which has no `-showComponent` and bundles Metal, passes when
+`xcrun --no-cache --find metal` does). One for
 which every question exits 0, each within a minute, is ready and is reported as an
 `xcode` entry of its node report. An Xcode whose licence is not accepted still answers
 `-version` with exit 0, but `-license check` and every tool it runs (`xcrun`, `cc`,
@@ -195,9 +196,30 @@ denies every file write outside the action's lease directory and `/dev`. The lea
 directory holds the input root (the working directory and outputs), and the action's
 own home, temporary and cache directories, named by `HOME`, `TMPDIR`,
 `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the lease
-ends. A tool that writes elsewhere (`/tmp`, a path under the daemon user's real home,
-the per-user folders under `/var/folders`) fails, so a build rule points such a tool
-into the lease: `swiftc -module-cache-path`, `xcodebuild -derivedDataPath`. Apple's
+ends. Two kinds of write in the daemon user's temporary folder
+(`getconf DARWIN_USER_TEMP_DIR`, under `/var/folders`) are allowed too, because macOS
+tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
+`TemporaryItems`, which `swift build` and `xcodebuild` need; the daemon makes that
+folder, and an action cannot remove, rename or replace it) and `xcrun`'s cache
+(`xcrun_db`, behind `cc`, `clang` and `swiftc`). The daemon sweeps what leases leave
+there once its last change is an hour from now, before or after, never through a
+symlink. Until each lease runs as its own user, leases on one Mac share those names:
+one lease can see another's temporary files there and rewrite the `xcrun` cache the
+next lease reads. The daemon does not trust that cache itself: it removes it at
+start, before it first asks the Xcodes, and every time it asks them it runs each
+Xcode's own `xcodebuild` rather than the `/usr/bin` one, and `xcrun --no-cache`. It
+warms the cache under the actions' sandbox, at start for the node's own Xcode and the
+ready ones, and later for each Xcode that becomes ready. A tool that writes anywhere else (`/tmp`, a path
+under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule
+points such a tool into the lease: `swiftc -module-cache-path`,
+`xcodebuild -derivedDataPath`. `xcodebuild` and SwiftPM find `~` through the user
+database, not `HOME`: `swift build` only warns and goes on without its user-level
+caches, but `xcodebuild` resolving a Swift package fails, because it must write
+`~/Library/Caches/org.swift.swiftpm` (issue #179); `xcodebuild` on a project without
+packages works. Setting `CFFIXED_USER_HOME` to the lease's `HOME` is no way round it:
+`xcodebuild` then has a system service mount its Metal toolchain under that home,
+and the mount, owned by root, keeps the lease directory from being removed, which
+fails the lease (issue #178). Apple's
 tools that nest a sandbox of their own need it turned off, since macOS refuses a
 sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
 the outer profile still keeps their writes inside the lease.

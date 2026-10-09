@@ -27,12 +27,20 @@ use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::record::Exec;
+use crate::user_folders::UserFolders;
 use crate::xcode;
 
 /// The driver name in the node report.
 pub const DRIVER: &str = "native";
 /// The lease kind this driver runs.
 pub const KIND: &str = "action";
+
+/// The directory under the scratch root the `xcrun` warm-up runs in, as its lease
+/// directory ([`NativeRuntime::warm_xcrun`]): a `lease-` name, so the next start
+/// sweeps one a killed daemon left. The warm-up of each later survey's newly ready
+/// Xcodes ([`NativeRuntime::apply_xcodes`]) runs in `<this>-<n>` (`n` from 2), so two
+/// that overlap never share, or remove, each other's directory.
+pub const WARM_UP_DIR: &str = "lease-warm-up";
 
 /// How long a spawn retries a program file that is still open for writing.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
@@ -51,6 +59,11 @@ pub struct NativeRuntime<C> {
     /// The Xcodes an action may name: `config.xcodes` at first, then the ready ones of
     /// each survey ([`NativeRuntime::apply_xcodes`]).
     xcodes: RwLock<BTreeMap<String, PathBuf>>,
+    /// The sandbox rules for the user folders (empty without them).
+    rules: String,
+    /// How `xcrun` is warmed, once [`NativeRuntime::warm_xcrun`] was called: then each
+    /// survey that makes an Xcode ready warms it too. Locked before `xcodes`.
+    warm_up: Mutex<Option<WarmUp>>,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -106,12 +119,48 @@ impl<C: Cas> NativeRuntime<C> {
         let mut runs = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
             .create(config.scratch.join(crate::record::RUNS))?;
-        Ok(Self {
+        let rules = config
+            .user_folders
+            .as_ref()
+            .map(UserFolders::rules)
+            .unwrap_or_default();
+        let runtime = Self {
             xcodes: RwLock::new(config.xcodes.clone()),
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
-        })
+            rules,
+            warm_up: Mutex::new(None),
+        };
+        sweep_user_folders(&runtime.config);
+        Ok(runtime)
+    }
+
+    /// Starts the `xcrun` warm-up for the node's own Xcode and the Xcodes actions may
+    /// name now on a thread of its own ([`xcode::warm`]), each lookup given `within`,
+    /// run as an action is: under this node's isolation with the network off, the
+    /// user-folder rules and [`WARM_UP_DIR`] as its lease directory. From then on each
+    /// survey that makes an Xcode ready warms that one the same way
+    /// ([`Self::apply_xcodes`]). So the daemon runs no `xcrun` lookup outside the
+    /// sandbox but its survey's, which does not read the cache
+    /// ([`xcode::NO_CACHE`]), and `xcrun` still fills its cache. `None` where `xcrun`
+    /// is not a file or the directory cannot be made.
+    #[must_use]
+    pub fn warm_xcrun(
+        &self,
+        xcrun: &Path,
+        within: Duration,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let mut warm_up = self.warm_up();
+        let dirs = std::iter::once(None)
+            .chain(self.xcodes().values().cloned().map(Some))
+            .collect();
+        *warm_up = Some(WarmUp {
+            xcrun: xcrun.to_owned(),
+            within,
+            started: 1,
+        });
+        warm_xcrun(&self.config, &self.rules, WARM_UP_DIR, xcrun, dirs, within)
     }
 
     /// The node report entries this driver adds: how it keeps the network off, and
@@ -132,16 +181,60 @@ impl<C: Cas> NativeRuntime<C> {
 
     /// Makes the ready Xcodes of `installed` the ones actions may name, and returns
     /// what the daemon reports for them: [`Self::capabilities`] (one `xcode` entry per
-    /// ready build), and every installed Xcode with its state for `NodeStatus`.
+    /// ready build), and every installed Xcode with its state for `NodeStatus`. Once
+    /// [`Self::warm_xcrun`] was called, starts the warm-up of each Xcode this makes
+    /// ready (by `DEVELOPER_DIR`), so the first action to name it does not pay for an
+    /// uncached lookup per tool.
     #[must_use]
     pub fn apply_xcodes(&self, installed: &[xcode::Xcode]) -> DriverReport {
+        self.apply_and_warm(installed).0
+    }
+
+    /// [`Self::apply_xcodes`], and the warm-up it started, if any.
+    fn apply_and_warm(
+        &self,
+        installed: &[xcode::Xcode],
+    ) -> (DriverReport, Option<std::thread::JoinHandle<()>>) {
         let ready = xcode::ready(installed);
+        let mut warm_up = self.warm_up();
+        let newly: Vec<Option<PathBuf>> = {
+            let before = self.xcodes();
+            let was_ready = |dir: &PathBuf| before.values().any(|known| known == dir);
+            ready
+                .values()
+                .filter(|dir| !was_ready(dir))
+                .cloned()
+                .map(Some)
+                .collect()
+        };
         // The map is replaced whole, so it is consistent after a panic.
         *self.xcodes.write().unwrap_or_else(PoisonError::into_inner) = ready;
-        DriverReport {
+        let warming = match warm_up.as_mut() {
+            Some(warm) if !newly.is_empty() => {
+                warm.started += 1;
+                let dir = format!("{WARM_UP_DIR}-{}", warm.started);
+                warm_xcrun(
+                    &self.config,
+                    &self.rules,
+                    &dir,
+                    &warm.xcrun,
+                    newly,
+                    warm.within,
+                )
+            }
+            _ => None,
+        };
+        drop(warm_up);
+        let report = DriverReport {
             entries: self.capabilities(),
             xcodes: installed.iter().map(xcode::Xcode::status).collect(),
-        }
+        };
+        (report, warming)
+    }
+
+    fn warm_up(&self) -> MutexGuard<'_, Option<WarmUp>> {
+        // Each update is one assignment or one increment.
+        self.warm_up.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn xcodes(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, PathBuf>> {
@@ -238,6 +331,7 @@ impl<C: Cas> NativeRuntime<C> {
         let (program, args) = self.config.isolation.wrap(
             prepared.network,
             &prepared.lease,
+            &self.rules,
             prepared.program.clone(),
             &prepared.args,
         );
@@ -382,6 +476,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let mut killer = None;
         let outcome = self.attempt(&work, &dir.path, &mut stop, &mut killer).await;
         let cleaned = dir.clean().await;
+        sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
             let _ = by.send(());
@@ -406,6 +501,59 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let _ = stop.send(tx);
         let _ = rx.await;
     }
+}
+
+/// How [`NativeRuntime::warm_xcrun`] was asked to warm `xcrun`.
+#[derive(Debug)]
+struct WarmUp {
+    xcrun: PathBuf,
+    within: Duration,
+    /// How many warm-ups were started, which numbers the next one's directory.
+    started: u32,
+}
+
+/// A warm-up of `xcrun` for `developer_dirs` (`None` the node's own Xcode) in `dir`
+/// under the scratch root ([`NativeRuntime::warm_xcrun`]), not generic over the CAS.
+fn warm_xcrun(
+    config: &NativeConfig,
+    rules: &str,
+    dir: &str,
+    xcrun: &Path,
+    developer_dirs: Vec<Option<PathBuf>>,
+    within: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    let sandbox = xcode::WarmSandbox {
+        isolation: config.isolation.clone(),
+        dir: config.scratch.join(dir),
+        rules: rules.to_owned(),
+    };
+    xcode::warm(xcrun, developer_dirs, within, sandbox)
+}
+
+/// Removes the leftovers in the user folders old enough to be no lease's work in
+/// progress ([`crate::user_folders`]), by descriptor. Not generic over the CAS, like
+/// [`sweep_user_folders_after_lease`], so every test binary runs the one copy.
+fn sweep_user_folders(config: &NativeConfig) {
+    if let Some(folders) = &config.user_folders {
+        folders.sweep(
+            config.leftover_age,
+            SystemTime::now(),
+            &kbf_outputs::remove_tree_at,
+        );
+    }
+}
+
+/// [`sweep_user_folders`] after a lease, on the blocking pool. Best effort, as at
+/// start: what fails is logged and tried after the next lease.
+async fn sweep_user_folders_after_lease(config: &NativeConfig) {
+    let Some(folders) = config.user_folders.clone() else {
+        return;
+    };
+    let age = config.leftover_age;
+    let _ = tokio::task::spawn_blocking(move || {
+        folders.sweep(age, SystemTime::now(), &kbf_outputs::remove_tree_at);
+    })
+    .await;
 }
 
 /// How the watch over a running action ended.
@@ -846,6 +994,202 @@ mod tests {
         );
         assert!(select("1A").is_err(), "the earlier survey's Xcode");
         assert!(select("3C").is_err(), "a not-ready Xcode");
+        kbf_outputs::remove_tree(&scratch).expect("clean");
+    }
+
+    /// Catches a warm-up the runtime starts outside its own sandbox: not through this
+    /// node's isolation program, without the user-folder rules (then `xcrun` cannot
+    /// write its cache), in another directory than [`WARM_UP_DIR`] under the scratch
+    /// root, or for other Xcodes than the node's own and the configured ones. The
+    /// sandbox program is a fake that logs its lease parameter and whether the profile
+    /// carries the rules, then runs the rest.
+    #[test]
+    fn the_runtime_warms_xcrun_under_its_sandbox() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("warm-{}", std::process::id()));
+        let _ = kbf_outputs::remove_tree(&scratch);
+        std::fs::create_dir_all(scratch.join("T")).expect("T");
+        std::fs::create_dir_all(scratch.join("C")).expect("C");
+        let scratch = std::fs::canonicalize(&scratch).expect("real");
+        let script = |path: &Path, text: String| {
+            std::fs::write(path, text).expect("script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        let log = scratch.join("log");
+        let sandbox_exec = scratch.join("sandbox-exec");
+        script(
+            &sandbox_exec,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$4\" in *xcrun_db*) rules=rules ;; *) rules=none ;; esac\n\
+                 echo \"$2 $rules ${{DEVELOPER_DIR-own}}\" >> '{}'\nshift 4\nexec \"$@\"\n",
+                log.display()
+            ),
+        );
+        let xcrun = scratch.join("xcrun");
+        script(&xcrun, "#!/bin/sh\nexit 0\n".to_owned());
+        let mut config = NativeConfig::new(scratch.join("leases"));
+        config.isolation = network::Isolation::Sandbox(sandbox_exec);
+        config.user_folders = UserFolders::new(scratch.join("T"), scratch.join("C"));
+        config.xcodes = BTreeMap::from([("1A1".to_owned(), PathBuf::from("/x1"))]);
+        let rt = NativeRuntime::with_remover(config, Arc::new(NoCas), &kbf_outputs::remove_tree)
+            .expect("started");
+        rt.warm_xcrun(&xcrun, Duration::from_secs(5))
+            .expect("a thread")
+            .join()
+            .expect("warmed");
+        let lease = format!(
+            "KBF_LEASE={}",
+            scratch.join("leases").join(WARM_UP_DIR).display()
+        );
+        let want: Vec<String> = ["own", "/x1"]
+            .iter()
+            .flat_map(|dir| xcode::WARM_TOOLS.map(|_| format!("{lease} rules {dir}")))
+            .collect();
+        let got = std::fs::read_to_string(&log).expect("log");
+        assert_eq!(got.lines().collect::<Vec<_>>(), want);
+        kbf_outputs::remove_tree(&scratch).expect("clean");
+    }
+
+    /// Catches (the merge of issues #163 and #164): an Xcode a later survey makes ready
+    /// never warmed, so the first action to name it pays an uncached `xcrun` lookup
+    /// per tool; one that was ready already warmed again on every change; a warm-up
+    /// started before the daemon asked for one; one run outside the sandbox or
+    /// without the rules; and a later warm-up in the first one's directory (each
+    /// removes its own when it ends, so two that overlap would break each other).
+    #[test]
+    fn each_xcode_a_survey_makes_ready_is_warmed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("rewarm-{}", std::process::id()));
+        let _ = kbf_outputs::remove_tree(&scratch);
+        std::fs::create_dir_all(scratch.join("T")).expect("T");
+        std::fs::create_dir_all(scratch.join("C")).expect("C");
+        let scratch = std::fs::canonicalize(&scratch).expect("real");
+        let script = |path: &Path, text: String| {
+            std::fs::write(path, text).expect("script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        let log = scratch.join("log");
+        let sandbox_exec = scratch.join("sandbox-exec");
+        script(
+            &sandbox_exec,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$4\" in *xcrun_db*) rules=rules ;; *) rules=none ;; esac\n\
+                 echo \"$2 $rules ${{DEVELOPER_DIR-own}}\" >> '{}'\nshift 4\nexec \"$@\"\n",
+                log.display()
+            ),
+        );
+        let xcrun = scratch.join("xcrun");
+        script(&xcrun, "#!/bin/sh\nexit 0\n".to_owned());
+        let mut config = NativeConfig::new(scratch.join("leases"));
+        config.isolation = network::Isolation::Sandbox(sandbox_exec);
+        config.user_folders = UserFolders::new(scratch.join("T"), scratch.join("C"));
+        let rt = NativeRuntime::with_remover(config, Arc::new(NoCas), &kbf_outputs::remove_tree)
+            .expect("started");
+        let at = |app: &str, state| xcode::Xcode {
+            app: PathBuf::from(app),
+            developer_dir: Some(PathBuf::from(app).join("Contents/Developer")),
+            build: Some(app.trim_start_matches('/').to_owned()),
+            state,
+            reason: String::new(),
+        };
+        let (ready, licence) = (xcode::State::Ready, xcode::State::LicenseNotAccepted);
+        let read = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        let lookups = |dir: &str, developer_dir: &str| -> Vec<String> {
+            let lease = scratch.join("leases").join(dir);
+            xcode::WARM_TOOLS
+                .map(|_| format!("KBF_LEASE={} rules {developer_dir}", lease.display()))
+                .into()
+        };
+        // Before the daemon asks for a warm-up, a survey starts none.
+        let (_, none) = rt.apply_and_warm(&[at("/A", ready), at("/B", licence)]);
+        assert!(none.is_none(), "warmed before warm_xcrun");
+        rt.warm_xcrun(&xcrun, Duration::from_secs(5))
+            .expect("a thread")
+            .join()
+            .expect("warmed");
+        let mut want = lookups(WARM_UP_DIR, "own");
+        want.extend(lookups(WARM_UP_DIR, "/A/Contents/Developer"));
+        assert_eq!(read(), want);
+        // `B` fixed: only it is warmed, in a directory of its own.
+        let (_, fixed) = rt.apply_and_warm(&[at("/A", ready), at("/B", ready)]);
+        fixed.expect("a thread").join().expect("warmed");
+        want.extend(lookups(
+            &format!("{WARM_UP_DIR}-2"),
+            "/B/Contents/Developer",
+        ));
+        assert_eq!(read(), want);
+        // Nothing newly ready: nothing warmed.
+        let (_, same) = rt.apply_and_warm(&[at("/A", ready), at("/B", licence)]);
+        assert!(same.is_none(), "warmed an Xcode that was ready");
+        assert_eq!(read(), want);
+        for dir in [WARM_UP_DIR.to_owned(), format!("{WARM_UP_DIR}-2")] {
+            assert!(!scratch.join("leases").join(&dir).exists(), "{dir} stays");
+        }
+        kbf_outputs::remove_tree(&scratch).expect("clean");
+    }
+
+    /// Catches a start, or the end of a lease, that does not sweep the user folders'
+    /// old leftovers, and a runtime whose actions do not get the folders' sandbox rules.
+    /// This build's own copy of both sweeps: `tests/leftovers.rs` runs real leases.
+    #[tokio::test]
+    async fn the_user_folders_are_swept_at_start_and_after_a_lease() {
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("user-folders-{}", std::process::id()));
+        let _ = kbf_outputs::remove_tree(&scratch);
+        let left = scratch.join("T/TemporaryItems/left");
+        let leave = || {
+            std::fs::create_dir_all(&left).expect("mkdir");
+            std::fs::File::open(&left)
+                .expect("open")
+                .set_modified(SystemTime::UNIX_EPOCH)
+                .expect("mtime");
+        };
+        leave();
+        std::fs::create_dir_all(scratch.join("C")).expect("mkdir");
+        let folders = UserFolders::new(scratch.join("T"), scratch.join("C")).expect("fits");
+        let mut config = NativeConfig::new(scratch.join("leases"));
+        config.user_folders = Some(folders.clone());
+        let started =
+            NativeRuntime::with_remover(config, Arc::new(NoCas), &kbf_outputs::remove_tree)
+                .expect("started");
+        assert_eq!(started.rules, folders.rules());
+        assert!(!left.exists(), "kept past start");
+        leave();
+        sweep_user_folders_after_lease(&started.config).await;
+        assert!(!left.exists(), "kept past a lease");
+        // Without folders (off macOS) there is nothing to sweep.
+        leave();
+        let mut none = started.config.clone();
+        none.user_folders = None;
+        sweep_user_folders_after_lease(&none).await;
+        assert!(
+            left.exists(),
+            "swept folders the configuration does not name"
+        );
         kbf_outputs::remove_tree(&scratch).expect("clean");
     }
 

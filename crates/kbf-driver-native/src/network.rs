@@ -9,8 +9,10 @@
 //! and Unix sockets (the profile Bazel's macOS sandbox uses); one with the network gets
 //! [`BASE_PROFILE`]. Both keep the action from handing work to launchd, which would run
 //! it outside the sandbox and outside the action's process tree, and both deny every
-//! file write outside the lease directory and `/dev`, and every preference write
-//! through `cfprefsd` ([`BASE_PROFILE`]): the action's
+//! file write outside the lease directory, `/dev` and the few names in the daemon
+//! user's temporary folder that macOS tools write whatever `TMPDIR` says
+//! ([`crate::user_folders`]), and every preference write through `cfprefsd`
+//! ([`BASE_PROFILE`]): the action's
 //! home, temporary and cache directories are inside the lease (`crate::home`), so a
 //! tool that turns its own sandbox off (`swift build --disable-sandbox`) still writes
 //! nowhere else.
@@ -36,8 +38,13 @@
 //!   among it. Writes through a descriptor the action did not open itself (its stdout
 //!   and stderr files) are not checked by path.
 //! - A tool that insists on writing outside the lease (the per-user folders under
-//!   `/var/folders`, `~` of the daemon's user named by absolute path, `/tmp`) fails;
-//!   the action must point it into the lease (`HOME`, `TMPDIR`, a cache path flag).
+//!   `/var/folders` beyond the names [`crate::user_folders`] opens, `~` of the daemon's
+//!   user named by absolute path or found through the user database, as SwiftPM and
+//!   `xcodebuild` find `~/Library/Caches`, `/tmp`) fails; the action must point it
+//!   into the lease (`HOME`, `TMPDIR`, a cache path flag such as `swift build
+//!   --cache-path`). `xcodebuild` resolving a Swift package has no such flag for
+//!   SwiftPM's manifest cache in `~/Library/Caches`, so it fails
+//!   (`docs/platform-properties.md`).
 
 use std::path::{Path, PathBuf};
 
@@ -61,7 +68,9 @@ pub const LEASE_PARAM: &str = "KBF_LEASE";
 /// The sandbox profile every action runs under: everything allowed but handing work
 /// to launchd, which would run it outside the sandbox and outside the action's process
 /// tree, and writing a file outside the lease directory ([`LEASE_PARAM`]) and `/dev`
-/// (`/dev/null`, `/dev/tty`, `/dev/fd/<n>`). `lsopen` is opening an application or
+/// (`/dev/null`, `/dev/tty`, `/dev/fd/<n>`). The driver appends the rules for the user
+/// folders ([`crate::user_folders::UserFolders::rules`]) to this and to
+/// [`NO_NETWORK_PROFILE`]. `lsopen` is opening an application or
 /// document through Launch Services (`open`); `job-creation` is giving launchd a job
 /// (`launchctl submit`, `load`, `bootstrap`); `file-write*` is every write operation:
 /// create, write, unlink, rename, mode, flags, ACLs, extended attributes, times.
@@ -170,12 +179,15 @@ impl Isolation {
     }
 
     /// The program and arguments that run `program` with `args` under `network`,
-    /// writing only inside `lease` (the lease directory's real path) and `/dev`.
+    /// writing only inside `lease` (the lease directory's real path), `/dev`, and what
+    /// `rules` (appended to the profile) allows: the names in the user's folders the
+    /// tools need ([`crate::user_folders::UserFolders::rules`]).
     #[must_use]
     pub fn wrap(
         &self,
         network: Network,
         lease: &Path,
+        rules: &str,
         program: PathBuf,
         args: &[String],
     ) -> (PathBuf, Vec<String>) {
@@ -190,7 +202,7 @@ impl Isolation {
             "-D".to_owned(),
             format!("{LEASE_PARAM}={}", lease.to_string_lossy()),
             "-p".to_owned(),
-            profile.to_owned(),
+            format!("{profile}{rules}"),
             program.to_string_lossy().into_owned(),
         ];
         wrapped.extend(args.iter().cloned());
@@ -268,7 +280,9 @@ mod tests {
         let param = "KBF_LEASE=/private/var/kbf/lease-1-2";
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
         assert_eq!(sandbox.name(), "sandbox-exec");
-        let (wrapped, wrapped_args) = sandbox.wrap(Network::Off, lease, program.clone(), &args);
+        let rules = "(allow file-write* (literal \"/x\"))\n";
+        let (wrapped, wrapped_args) =
+            sandbox.wrap(Network::Off, lease, rules, program.clone(), &args);
         assert_eq!(wrapped, PathBuf::from(SANDBOX_EXEC));
         assert_eq!(
             wrapped_args,
@@ -276,13 +290,13 @@ mod tests {
                 "-D",
                 param,
                 "-p",
-                NO_NETWORK_PROFILE,
+                &format!("{NO_NETWORK_PROFILE}{rules}"),
                 "/bin/sh",
                 "-c",
                 "echo hi"
             ]
         );
-        let (wrapped, wrapped_args) = sandbox.wrap(Network::On, lease, program.clone(), &args);
+        let (wrapped, wrapped_args) = sandbox.wrap(Network::On, lease, "", program.clone(), &args);
         assert_eq!(wrapped, PathBuf::from(SANDBOX_EXEC));
         assert_eq!(
             wrapped_args,
@@ -292,7 +306,7 @@ mod tests {
         assert!(BASE_PROFILE.contains(&format!("(param \"{LEASE_PARAM}\")")));
         assert_eq!(Isolation::None.name(), "none");
         assert_eq!(
-            Isolation::None.wrap(Network::Off, lease, program.clone(), &args),
+            Isolation::None.wrap(Network::Off, lease, rules, program.clone(), &args),
             (program, args)
         );
         assert_eq!(

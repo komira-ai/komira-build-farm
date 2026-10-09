@@ -143,7 +143,7 @@ mod tests {
     use kbf_proto::worker::XcodeState;
 
     use super::*;
-    use crate::xcode::tests::{NOT_AGREED, fake, scratch};
+    use crate::xcode::tests::{NOT_AGREED, fake, link_xcodebuild, scratch};
 
     fn at(app: &str, build: Option<&str>, state: State, reason: &str) -> Xcode {
         Xcode {
@@ -254,11 +254,11 @@ mod tests {
                 accepted.display()
             ),
         );
+        link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
         let probe = Probe {
-            xcodebuild,
             xcrun: PathBuf::from("/bin/echo"),
             within: Duration::from_secs(5),
-            metal: false,
+            ..Probe::system(false)
         };
         let applied = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&applied);
@@ -346,11 +346,11 @@ mod tests {
                  esac\n"
             ),
         );
+        link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
         let probe = Probe {
-            xcodebuild,
             xcrun: PathBuf::from("/bin/echo"),
             within: Duration::from_secs(5),
-            metal: false,
+            ..Probe::system(false)
         };
         // The reasons do differ from survey to survey, by the pid at least.
         let (one, two) = (xcode::survey(&apps, &probe), xcode::survey(&apps, &probe));
@@ -408,11 +408,12 @@ mod tests {
             "xcodebuild",
             "#!/bin/sh\ncase \"$*\" in -version) echo 'Build version 16C5032a' ;; esac\n",
         );
+        link_xcodebuild(&xcodebuild, &one);
+        link_xcodebuild(&xcodebuild, &two);
         let probe = Probe {
-            xcodebuild,
             xcrun: PathBuf::from("/bin/echo"),
             within: Duration::from_secs(5),
-            metal: false,
+            ..Probe::system(false)
         };
         let applied = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&applied);

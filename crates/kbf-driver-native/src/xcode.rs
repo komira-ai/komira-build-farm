@@ -2,18 +2,21 @@
 //!
 //! A Mac may have several Xcodes installed side by side (`/Applications/Xcode.app`,
 //! `/Applications/Xcode_16.2.app`, ...). [`survey`] finds every `Xcode*.app` in a
-//! directory and asks each, under that Xcode's `DEVELOPER_DIR`, in this order:
+//! directory and asks each, under that Xcode's `DEVELOPER_DIR`, in this order (with
+//! its own `xcodebuild`, the one inside the app, never the `/usr/bin` shim, which may
+//! find it through `xcrun`'s cache, a file any lease can write: `crate::user_folders`;
+//! and with `xcrun --no-cache`, which does not read that cache):
 //!
 //! 1. `xcodebuild -version`, which must print a build;
 //! 2. `xcodebuild -license check` (an Xcode whose licence is not accepted still answers
 //!    `-version` with exit 0, while this, and `cc`, `swiftc` and `xcrun` in every
 //!    action, exit 69; issue #164);
 //! 3. `xcodebuild -checkFirstLaunchStatus` (its first launch was run);
-//! 4. `xcrun --find clang` (its compiler can be found);
+//! 4. `xcrun --no-cache --find clang` (its compiler can be found);
 //! 5. only on a node that requires it ([`Probe::metal`]): `xcodebuild -showComponent
 //!    MetalToolchain` reports `Status: installed`. An Xcode that does not know
-//!    `-showComponent` (before Xcode 26, which bundled Metal) passes when `xcrun --find
-//!    metal` does.
+//!    `-showComponent` (before Xcode 26, which bundled Metal) passes when `xcrun
+//!    --no-cache --find metal` does.
 //!
 //! Each question must exit 0 within [`ANSWER_WITHIN`]. The first that fails decides the
 //! Xcode's [`State`], and a failed check that a human can fix carries the command that
@@ -41,17 +44,28 @@ use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::{Action, Command, Platform};
 use kbf_proto::worker::{XcodeState, XcodeStatus};
 
+use crate::network::{Isolation, Network};
+
 /// The platform property, and the node report key, that names an Xcode build.
 pub const CAPABILITY: &str = "xcode";
 
 /// The variable that selects an Xcode for `xcrun` and the tools behind it.
 pub const DEVELOPER_DIR: &str = "DEVELOPER_DIR";
 
-/// Where macOS keeps `xcodebuild` (a shim that runs the `DEVELOPER_DIR` Xcode's).
-pub const XCODEBUILD: &str = "/usr/bin/xcodebuild";
+/// Where an Xcode keeps its `xcodebuild`, inside its `DEVELOPER_DIR`. The daemon runs
+/// it there, never through the `/usr/bin/xcodebuild` shim: the shim may look the tool
+/// up in `xcrun`'s cache, which leases can rewrite (`crate::user_folders`), and the
+/// daemon runs it outside the sandbox.
+pub const XCODEBUILD: &str = "usr/bin/xcodebuild";
 
-/// Where macOS keeps `xcrun` (a shim that finds tools in the `DEVELOPER_DIR` Xcode).
+/// Where macOS keeps `xcrun` (a shim that finds tools in the `DEVELOPER_DIR` Xcode),
+/// behind every `/usr/bin` developer tool shim.
 pub const XCRUN: &str = "/usr/bin/xcrun";
+
+/// The `xcrun` option that has it look a tool up afresh rather than in its cache
+/// (`crate::user_folders`), which leases can write: [`survey`] runs `xcrun` outside
+/// the sandbox, on every survey while the node serves ([`crate::xcode_watch`]).
+pub const NO_CACHE: &str = "--no-cache";
 
 /// The directory Xcodes are installed in.
 pub const APPLICATIONS: &str = "/Applications";
@@ -161,7 +175,9 @@ fn shell_quoted(path: &Path) -> String {
 /// How [`survey`] asks each Xcode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Probe {
-    /// The `xcodebuild` run ([`XCODEBUILD`]).
+    /// The `xcodebuild` run, as a path inside each Xcode's `DEVELOPER_DIR`
+    /// ([`XCODEBUILD`]). A path that leads out of it (absolute, or with `..`) is never
+    /// run: the Xcode is [`State::Failed`].
     pub xcodebuild: PathBuf,
     /// The `xcrun` run ([`XCRUN`]).
     pub xcrun: PathBuf,
@@ -173,7 +189,8 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// The system's `xcodebuild` and `xcrun`, each question given [`ANSWER_WITHIN`].
+    /// Each Xcode's own `xcodebuild` and the system's `xcrun`, each question given
+    /// [`ANSWER_WITHIN`].
     #[must_use]
     pub fn system(metal: bool) -> Self {
         Self {
@@ -268,8 +285,19 @@ fn ask(xcode: &mut Xcode, probe: &Probe) -> Result<(), (State, String)> {
         .join("Contents")
         .join("Developer");
     xcode.developer_dir = Some(dir.clone());
+    if !probe
+        .xcodebuild
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(failed(format!(
+            "{} is not inside the Xcode",
+            probe.xcodebuild.display()
+        )));
+    }
+    let xcodebuild = dir.join(&probe.xcodebuild);
     let question = |program: &Path, args: &[&str]| answer(program, args, &dir, probe.within);
-    let version = question(&probe.xcodebuild, &["-version"]).map_err(Unanswered::into_failed)?;
+    let version = question(&xcodebuild, &["-version"]).map_err(Unanswered::into_failed)?;
     let build = build_of(&version).ok_or_else(|| {
         failed(format!(
             "no build in xcodebuild -version: {:?}",
@@ -277,14 +305,14 @@ fn ask(xcode: &mut Xcode, probe: &Probe) -> Result<(), (State, String)> {
         ))
     })?;
     xcode.build = Some(build.to_owned());
-    question(&probe.xcodebuild, &["-license", "check"])
+    question(&xcodebuild, &["-license", "check"])
         .map_err(|e| e.into_state(State::LicenseNotAccepted))?;
-    question(&probe.xcodebuild, &["-checkFirstLaunchStatus"])
+    question(&xcodebuild, &["-checkFirstLaunchStatus"])
         .map_err(|e| e.into_state(State::FirstLaunchNotRun))?;
-    question(&probe.xcrun, &["--find", "clang"]).map_err(Unanswered::into_failed)?;
+    question(&probe.xcrun, &[NO_CACHE, "--find", "clang"]).map_err(Unanswered::into_failed)?;
     if probe.metal {
         let asked = "xcodebuild -showComponent MetalToolchain";
-        match question(&probe.xcodebuild, &["-showComponent", "MetalToolchain"]) {
+        match question(&xcodebuild, &["-showComponent", "MetalToolchain"]) {
             Ok(shown) => match component_status(&shown) {
                 Some("installed") => {}
                 status => {
@@ -296,7 +324,7 @@ fn ask(xcode: &mut Xcode, probe: &Probe) -> Result<(), (State, String)> {
             },
             // An Xcode before 26 has no -showComponent; its Metal is bundled.
             Err(Unanswered::Refused(_)) => {
-                question(&probe.xcrun, &["--find", "metal"])
+                question(&probe.xcrun, &[NO_CACHE, "--find", "metal"])
                     .map_err(|e| e.into_state(State::MetalToolchainMissing))?;
             }
             Err(e) => return Err(e.into_failed()),
@@ -367,6 +395,99 @@ fn cut(text: &str, bytes: usize) -> String {
         return text.to_owned();
     }
     format!("{}...", &text[..text.floor_char_boundary(bytes)])
+}
+
+/// The tools [`warm`] has `xcrun` look up: the compilers and linker builds call most.
+pub const WARM_TOOLS: [&str; 6] = ["cc", "clang", "clang++", "swift", "swiftc", "ld"];
+
+/// Where the warm-up's lookups run: under the actions' sandbox with the network off
+/// (`isolation`), with `dir` as their lease directory and `TMPDIR`, and the user-folder
+/// `rules` (`crate::user_folders::UserFolders::rules`), which let `xcrun` write its
+/// cache and nothing else outside `dir`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WarmSandbox {
+    pub isolation: Isolation,
+    pub dir: PathBuf,
+    pub rules: String,
+}
+
+/// On a thread of its own, has `xcrun` look up each of [`WARM_TOOLS`] for each of
+/// `developer_dirs` (`None`: the node's own Xcode, no `DEVELOPER_DIR`), each lookup given
+/// `within` to answer, so `xcrun`'s cache (`crate::user_folders`) holds them before
+/// the first action asks: a lookup it has not cached takes seconds. A lookup that
+/// fails is logged and the rest go on. `None`, and nothing run, where `xcrun` is not a
+/// file (off macOS) or `sandbox.dir` cannot be made.
+///
+/// `xcrun` is the `/usr/bin` one (the cache it fills is that one's, and no Xcode
+/// carries its own), and it reads a cache that leases can write. So every lookup runs
+/// as an action does, under `sandbox` ([`lookup`]): the warm-up goes on while the
+/// node serves. `sandbox.dir` is made first and removed when the warm-up ends.
+pub(crate) fn warm(
+    xcrun: &Path,
+    developer_dirs: Vec<Option<PathBuf>>,
+    within: Duration,
+    sandbox: WarmSandbox,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !xcrun.is_file() {
+        return None;
+    }
+    // The sandbox compares real paths.
+    let made =
+        std::fs::create_dir_all(&sandbox.dir).and_then(|()| std::fs::canonicalize(&sandbox.dir));
+    let sandbox = match made {
+        Ok(dir) => WarmSandbox { dir, ..sandbox },
+        Err(e) => {
+            tracing::warn!(dir = %sandbox.dir.display(), "no xcrun warm-up: {e}");
+            return None;
+        }
+    };
+    let xcrun = xcrun.to_owned();
+    Some(std::thread::spawn(move || {
+        for dir in developer_dirs {
+            for tool in WARM_TOOLS {
+                let command = lookup(&xcrun, dir.as_deref(), tool, &sandbox);
+                let failed = match output_within(command, within) {
+                    Ok(out) if out.status.success() => continue,
+                    Ok(out) => format!(
+                        "{}: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                    Err(e) => e.to_string(),
+                };
+                tracing::info!(tool, developer_dir = ?dir, "xcrun --find: {failed}");
+            }
+        }
+        // One left behind (a removal that failed) is a `lease-` name: the next start
+        // sweeps it.
+        let _ = kbf_outputs::remove_tree(&sandbox.dir);
+    }))
+}
+
+/// `xcrun --find <tool>` under `sandbox` with the network off, for the Xcode at
+/// `developer_dir`, or for the node's own Xcode (the one `xcode-select` names) with
+/// `DEVELOPER_DIR` removed from what the daemon was started with, which would
+/// otherwise pick the Xcode instead.
+fn lookup(
+    xcrun: &Path,
+    developer_dir: Option<&Path>,
+    tool: &str,
+    sandbox: &WarmSandbox,
+) -> std::process::Command {
+    let (program, args) = sandbox.isolation.wrap(
+        Network::Off,
+        &sandbox.dir,
+        &sandbox.rules,
+        xcrun.to_owned(),
+        &["--find".to_owned(), tool.to_owned()],
+    );
+    let mut command = std::process::Command::new(program);
+    command.args(args).env("TMPDIR", &sandbox.dir);
+    match developer_dir {
+        Some(dir) => command.env(DEVELOPER_DIR, dir),
+        None => command.env_remove(DEVELOPER_DIR),
+    };
+    command
 }
 
 /// How often [`output_within`] looks whether its process has exited.

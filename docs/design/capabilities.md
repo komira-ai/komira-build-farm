@@ -272,8 +272,8 @@ naming no `container-image`.
   it routes no work.
 - A Mac's native driver reports one `xcode` entry per ready `Xcode*.app` in
   `/Applications` (`--xcode-apps`): one that answers `xcodebuild -version` and whose
-  `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
-  clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0. It
+  `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --no-cache
+  --find clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0. It
   runs an action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. It asks
   again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
   sees it) and the `NodeStatus` (which lists every installed Xcode, ready or not, with
