@@ -281,34 +281,43 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
         &[graph_root],
         &["-name", &marker],
     );
-    let found = walk.unwrap_or_else(|why| panic!("{why}"));
+    let found = walk.unwrap_or_else(|why| panic!("{why}")).found;
     assert!(found.trim().is_empty(), "marker left behind:\n{found}");
     cell.assert_clean(1);
 }
 
-/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`, and
-/// returns its stdout. The walk passes when find exits 0, or when every error it
-/// reported is a directory below one of `racing` that vanished mid-walk: a directory
-/// that is gone holds no file, and find walks the rest of the tree past that error.
-/// Any other error, a vanished root among them, is an `Err` with find's stderr.
+/// A walk that passed: what find printed, over every attempt, and how many attempts
+/// fts gave up because a directory it was in vanished.
+#[derive(Debug)]
+struct Walk {
+    found: String,
+    aborted: usize,
+}
+
+/// How many times [`find`] walks again after fts gave up mid-walk.
+const WALK_ATTEMPTS: usize = 5;
+
+/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`. The walk
+/// passes when find exits 0, or when every error it reported is a directory below one
+/// of `racing` that vanished mid-walk: a directory that is gone holds no file, and find
+/// walks the rest of the tree past that error. Any other error, a vanished root among
+/// them, is an `Err` with find's stderr.
 ///
 /// `-ignore_readdir_race` is not enough: findutils applies it only to its own stat
 /// of an entry. A directory removed after it was listed is reported by fts (as an
 /// unreadable directory, or an entry that could not be stat'd) whatever that option
 /// says, and find then exits 1.
-fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<String, String> {
+///
+/// fts can also stop: going back up, it checks that ".." is the directory it came
+/// down from, and a directory moved while fts is deep inside it fails that check.
+/// find then reports "failed to read file names from file system at or below" the
+/// root (#105, seen in `the_store_walk_passes_while_containers_come_and_go`). The rest
+/// of that root was not walked, so such an attempt passes nothing: when that report
+/// names one of `racing` and every other error is a vanished directory, the walk runs
+/// again, up to [`WALK_ATTEMPTS`] times. What an aborted attempt printed is kept: a
+/// marker it found is still found.
+fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<Walk, String> {
     let (program, prefix) = prefix.split_first().expect("a program");
-    let output = Command::new(program)
-        .args(prefix)
-        // The C locale fixes the message text and the quotes find puts around a path.
-        .args(["env", "LC_ALL=C", "find"])
-        .args(roots)
-        .arg("-ignore_readdir_race")
-        .args(expr)
-        .output()
-        .expect("run find");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
     let vanished = |line: &str| {
         line.strip_prefix("find: '")
             .and_then(|l| l.strip_suffix("': No such file or directory"))
@@ -319,15 +328,44 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
                 })
             })
     };
-    let benign = !stderr.trim().is_empty() && stderr.lines().all(vanished);
-    if output.status.success() || (output.status.code() == Some(1) && benign) {
-        Ok(stdout)
-    } else {
-        Err(format!(
-            "find {roots:?} {expr:?}: {}:\n{stderr}",
-            output.status
-        ))
+    let gave_up = |line: &str| {
+        racing.iter().any(|root| {
+            line == format!(
+                "find: failed to read file names from file system at or below '{root}': \
+                 No such file or directory"
+            )
+        })
+    };
+    let mut found = String::new();
+    let mut stderr = String::new();
+    for aborted in 0..WALK_ATTEMPTS {
+        let output = Command::new(program)
+            .args(prefix)
+            // The C locale fixes the message text and the quotes find puts around a path.
+            .args(["env", "LC_ALL=C", "find"])
+            .args(roots)
+            .arg("-ignore_readdir_race")
+            .args(expr)
+            .output()
+            .expect("run find");
+        found.push_str(&String::from_utf8_lossy(&output.stdout));
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let errors_ok = !stderr.trim().is_empty()
+            && output.status.code() == Some(1)
+            && stderr.lines().all(|l| vanished(l) || gave_up(l));
+        if output.status.success() || (errors_ok && !stderr.lines().any(gave_up)) {
+            return Ok(Walk { found, aborted });
+        }
+        if !errors_ok {
+            return Err(format!(
+                "find {roots:?} {expr:?}: {}:\n{stderr}",
+                output.status
+            ));
+        }
     }
+    Err(format!(
+        "find {roots:?} {expr:?}: gave up mid-walk {WALK_ATTEMPTS} times; last:\n{stderr}"
+    ))
 }
 
 /// Catches the marker walk failing when another test removes its container mid-walk
@@ -335,8 +373,10 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
 /// reaches deletes every other directory of the tree, which find has already listed
 /// and not yet entered, so one directory vanishes mid-walk whichever order find takes.
 /// That walk must pass and still print the trigger it matched (a marker found during
-/// a race is still found); a vanished root, a vanished directory outside `racing`,
-/// and an unreadable directory must each still fail.
+/// a race is still found). A tree moved away while find is deep inside it makes fts
+/// stop; that walk must be walked again, once, and pass. A vanished root, a vanished
+/// directory outside `racing`, a give-up outside `racing` and an unreadable directory
+/// must each still fail.
 #[test]
 #[ignore = "needs GNU find: run by tools/ci/podman-tests.sh"]
 fn a_directory_vanishing_mid_walk_fails_nothing_else() {
@@ -373,7 +413,8 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     let root = tree("raced");
     let found = find(&["env"], &[&root], &[&root], &strs(&race(&root)))
         .unwrap_or_else(|why| panic!("a directory vanishing mid-walk failed the walk: {why}"));
-    let found: Vec<&str> = found.lines().collect();
+    assert_eq!(found.aborted, 0, "{found:?}");
+    let found: Vec<&str> = found.found.lines().collect();
     assert_eq!(
         found.len(),
         1,
@@ -385,6 +426,49 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     );
     let left: Vec<_> = std::fs::read_dir(&root).expect("read").flatten().collect();
     assert_eq!(left.len(), 1, "the other directory was removed mid-walk");
+
+    // A tree moved out of the root while find is ten levels inside it: going back up,
+    // ".." of its top is no longer the root, and fts stops. The first attempt walks
+    // into the tree and moves it away; the second walks what is left.
+    let deep_tree = |name: &str| {
+        let root = scratch.join(name);
+        let deep = (0..10).fold(root.join("a"), |d, i| d.join(format!("l{i}")));
+        std::fs::create_dir_all(&deep).expect("create");
+        std::fs::write(deep.join("trigger"), b"t").expect("write");
+        root.to_string_lossy().into_owned()
+    };
+    let move_away = |root: &str, to: &str| -> Vec<String> {
+        let top = format!("{root}/a");
+        let to = scratch.join(to).to_string_lossy().into_owned();
+        [
+            "-name",
+            "trigger",
+            "-exec",
+            "mv",
+            top.as_str(),
+            to.as_str(),
+            ";",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let root = deep_tree("gives-up");
+    let walk = find(
+        &["env"],
+        &[&root],
+        &[&root],
+        &strs(&move_away(&root, "moved")),
+    )
+    .unwrap_or_else(|why| panic!("a walk that fts gave up was not walked again: {why}"));
+    assert_eq!(walk.aborted, 1, "{walk:?}");
+    assert!(exists(&scratch.join("moved")), "the walk moved the tree");
+    // The same in a tree where nothing may vanish.
+    let root = deep_tree("gives-up-not-racing");
+    let outcome = find(&["env"], &[&root], &[], &strs(&move_away(&root, "moved-2")));
+    assert!(
+        matches!(outcome, Err(ref why) if why.contains("failed to read file names")),
+        "{outcome:?}"
+    );
 
     // The same race in a tree where nothing may vanish.
     let root = tree("not-racing");
@@ -461,11 +545,7 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     let runtime = Arc::clone(&cell.runtime);
     let run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
-    let container = wait_for_container_cgroup(&lease).await;
-    // The directory alone is not enough: the OCI runtime makes it first and writes the
-    // container's cgroup files (memory.oom.group among them) later in `create`. The
-    // action's own program running is the state the driver relies on (#88).
-    wait_for_program_in(&container, "sleep").await;
+    let container = set_up_container_cgroup(&lease, "sleep").await;
     let read = |dir: &Path, file: &str| {
         std::fs::read_to_string(dir.join(file))
             .expect(file)
@@ -485,8 +565,21 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     cell.assert_clean(1);
 }
 
+/// The container's cgroup under the lease cgroup `lease`, once the OCI runtime has set
+/// it up. The directory alone is not enough: the runtime makes it first and writes the
+/// container's cgroup files (memory.oom.group among them) later in `create`. The
+/// action's own program (`comm`) running in it is the state the driver relies on (#88).
+async fn set_up_container_cgroup(lease: &Path, comm: &str) -> PathBuf {
+    let container = wait_for_container_cgroup(lease).await;
+    wait_for_program_in(&container, comm).await;
+    container
+}
+
+/// The container's cgroup under `lease`, as soon as its directory exists. Polled every
+/// 5 ms: a read right after it appears is what `set_up_container_cgroup` must not do,
+/// and the stress test only shows that if this one is quick.
 async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
-    for _ in 0..600 {
+    for _ in 0..6000 {
         let found = std::fs::read_dir(lease)
             .into_iter()
             .flatten()
@@ -498,7 +591,7 @@ async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
         if let Some(entry) = found {
             return entry.path();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("no container cgroup under {}", lease.display());
 }
@@ -526,6 +619,111 @@ async fn wait_for_program_in(container: &Path, comm: &str) {
         container.display(),
         describe(container)
     );
+}
+
+/// Catches (issue #88) a container's cgroup files read before the OCI runtime wrote
+/// them: 100 leases, five at a time, each container's `memory.oom.group` read once
+/// `set_up_container_cgroup` returns, which must be 1 every time. The mutant drops
+/// that function's wait for the action's program: the read then follows the
+/// directory's creation by at most one 5 ms poll, inside the window #88 hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn every_container_is_one_oom_group_once_its_action_runs() {
+    let cell = Cell::new("oom-group-stress");
+    for batch in 0..20 {
+        let seqs: Vec<u64> = (1..=5).map(|i| batch * 5 + i).collect();
+        let runs: Vec<_> = seqs
+            .iter()
+            .map(|&seq| {
+                let action = store_action(&cell.cas, &sh("sleep 3"));
+                let work = cell.work(seq, action, Resources::default());
+                let runtime = Arc::clone(&cell.runtime);
+                tokio::spawn(async move { runtime.run(work).await })
+            })
+            .collect();
+        for &seq in &seqs {
+            let container =
+                set_up_container_cgroup(&cell.cgroup.join(cell.name(seq)), "sleep").await;
+            let group = std::fs::read_to_string(container.join("memory.oom.group"))
+                .expect("memory.oom.group");
+            assert_eq!(group.trim(), "1", "lease {seq}");
+        }
+        for (run, seq) in runs.into_iter().zip(seqs) {
+            let result = run.await.expect("join").expect("ran");
+            assert_eq!(result.exit_code, 0, "lease {seq}");
+            cell.assert_clean(seq);
+        }
+    }
+}
+
+/// Catches (issue #105) the marker test's walk of Podman's store failing because a
+/// container was removed while it walked. 40 leases run, two at a time, while the walk
+/// goes over the whole store again and again; every walk must pass and find nothing.
+/// Each of `find`'s two tolerances is a mutant this turns red: a layer directory that
+/// vanishes mid-walk (no error treated as benign), and fts stopping mid-walk (no walk
+/// again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn the_store_walk_passes_while_containers_come_and_go() {
+    let cell = Cell::new("walk-churn");
+    let pairs: Vec<Vec<Work>> = (0..20)
+        .map(|pair| {
+            (1..=2)
+                .map(|i| {
+                    let action = store_action(&cell.cas, &sh("echo churn > /tmp/churn"));
+                    cell.work(pair * 2 + i, action, Resources::new(1000, 256 << 20))
+                })
+                .collect()
+        })
+        .collect();
+    let runtime = Arc::clone(&cell.runtime);
+    let churn = tokio::spawn(async move {
+        let mut outcomes = Vec::new();
+        for pair in pairs {
+            let runs: Vec<_> = pair
+                .into_iter()
+                .map(|work| {
+                    let runtime = Arc::clone(&runtime);
+                    tokio::spawn(async move { runtime.run(work).await })
+                })
+                .collect();
+            for run in runs {
+                outcomes.push(run.await.expect("join"));
+            }
+        }
+        outcomes
+    });
+    let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
+    let graph_root = graph_root.trim().to_owned();
+    let name = format!("kbf-never-written-{}", std::process::id());
+    let (mut walks, mut gave_up) = (0, 0);
+    while !churn.is_finished() {
+        let (root, name) = (graph_root.clone(), name.clone());
+        let walk = tokio::task::spawn_blocking(move || {
+            find(
+                &["podman", "unshare"],
+                &[&root],
+                &[&root],
+                &["-name", &name],
+            )
+        })
+        .await
+        .expect("join");
+        let walk = walk.unwrap_or_else(|why| panic!("walk {walks}: {why}"));
+        assert!(walk.found.trim().is_empty(), "{}", walk.found);
+        walks += 1;
+        gave_up += walk.aborted;
+    }
+    for (i, outcome) in churn.await.expect("join").into_iter().enumerate() {
+        let result = outcome.unwrap_or_else(|e| panic!("lease {}: {e:?}", i + 1));
+        assert_eq!(result.exit_code, 0, "lease {}", i + 1);
+        cell.assert_clean(i as u64 + 1);
+    }
+    assert!(
+        walks > 1,
+        "the store was walked {walks} times while leases ran"
+    );
+    println!("{walks} walks of the store while 40 leases came and went; {gave_up} walked again");
 }
 
 /// Catches a kernel OOM kill being reported as the action's own result (exit 137 would
@@ -673,8 +871,7 @@ async fn no_container_id_is_the_daemons_on_the_host() {
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let run = tokio::spawn(async move { runtime.run(work).await });
-    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
-    wait_for_program_in(&container, "sleep").await;
+    let container = set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let procs = std::fs::read_to_string(container.join("cgroup.procs")).expect("cgroup.procs");
     let seen: Vec<_> = procs.split_whitespace().flat_map(ids).collect();
@@ -717,8 +914,7 @@ async fn two_containers_run_at_once() {
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let first = tokio::spawn(async move { runtime.run(work).await });
-    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
-    wait_for_program_in(&container, "sleep").await;
+    set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let second = cell.run(2, &sh("echo second")).await;
     let still = podman(&["ps", "--format={{.Names}}"]);

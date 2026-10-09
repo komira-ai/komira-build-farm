@@ -65,11 +65,12 @@ request turns writes off.
 
 ## `GET /v1/nodes`
 
-Every node registered since the server started, in node-id order, with its software
-and where it is in placement:
+The server that answers, then every node registered since it started, in node-id
+order, with its software and where it is in placement:
 
 ```json
-{ "nodes": [
+{ "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
+  "nodes": [
   { "node_id": "mac-1", "connected": true, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
@@ -83,6 +84,8 @@ and where it is in placement:
 
 | Field | Meaning |
 |---|---|
+| `server.version` | the `kbf-server` build that answers, as `--version` and the start line print it: the package version, `+`, and the commit |
+| `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |

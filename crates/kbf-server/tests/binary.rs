@@ -135,20 +135,41 @@ fn interrupt(mut child: Running) {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// Catches: a binary that reports another name or version.
+/// The version this binary must report, worked out here rather than taken from the
+/// library: the package version, `+`, and the commit built, which is
+/// `KBF_BUILD_COMMIT_OVERRIDE` when the build set it and the checkout's HEAD otherwise.
+fn built_version() -> String {
+    let commit = if let Some(stamp) = option_env!("KBF_BUILD_COMMIT_OVERRIDE") {
+        stamp.to_owned()
+    } else {
+        let head = Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .expect("git runs");
+        assert!(head.status.success(), "the tests run in a git checkout");
+        String::from_utf8(head.stdout)
+            .expect("UTF-8")
+            .trim()
+            .to_owned()
+    };
+    format!("{}+{commit}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Catches: a binary that reports another name or version, or a version without the
+/// commit it was built from (two builds of one package version would read the same).
 #[test]
 fn prints_name_and_version() {
     let out = server(&["--version"]).output().expect("spawn kbf-server");
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8(out.stdout).expect("UTF-8"),
-        format!("kbf-server {}\n", env!("CARGO_PKG_VERSION"))
+        format!("kbf-server {}\n", built_version())
     );
 }
 
 /// Catches: a server that does not serve REAPI with execution enabled in memory mode,
-/// that prints a start line without the addresses it bound, or that does not stop
-/// cleanly on SIGINT.
+/// that prints a start line without its version and commit or the addresses it bound,
+/// or that does not stop cleanly on SIGINT.
 #[cfg(unix)]
 #[test]
 fn memory_mode_serves_execution_and_stops_on_interrupt() {
@@ -156,7 +177,7 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
     c.args(ANY_PORT);
     let (child, line, reapi) = started(c);
     assert!(
-        line.starts_with(&format!("kbf-server {} reapi=", env!("CARGO_PKG_VERSION"))),
+        line.starts_with(&format!("kbf-server {} reapi=", built_version())),
         "{line}"
     );
     assert!(line.contains(" worker=127.0.0.1:"), "{line}");
@@ -182,7 +203,8 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
 }
 
 /// Catches: an `--api-listen` flag that binds nothing, a start line without the API's
-/// address, and an API listener that does not answer `GET /v1/nodes`.
+/// address, an API listener that does not answer `GET /v1/nodes`, and an answer
+/// without the `server` field naming this binary's version and commit.
 #[cfg(unix)]
 #[test]
 fn api_listen_serves_the_operator_api() {
@@ -202,7 +224,12 @@ fn api_listen_serves_the_operator_api() {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.ends_with("\r\n\r\n{\"nodes\":[]}"), "{response}");
+    let version = built_version();
+    let (_, commit) = version.split_once('+').expect("a + in the version");
+    let body = format!(
+        "{{\"server\":{{\"version\":\"{version}\",\"commit\":\"{commit}\"}},\"nodes\":[]}}"
+    );
+    assert!(response.ends_with(&format!("\r\n\r\n{body}")), "{response}");
     interrupt(child);
 }
 
