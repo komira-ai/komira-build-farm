@@ -137,7 +137,8 @@ impl UserFolders {
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
+            "(allow file-write*\n  (subpath \"{}/{TEMPORARY_ITEMS}\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
+            self.temp.to_string_lossy()
         )
     }
 

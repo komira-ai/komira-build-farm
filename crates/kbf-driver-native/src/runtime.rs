@@ -356,7 +356,8 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let mut killer = None;
         let outcome = self.attempt(&work, &dir.path, &mut stop, &mut killer).await;
         let cleaned = dir.clean().await;
-        sweep_user_folders_after_lease(&self.config).await;
+        // RED-RUN ONLY: no sweep after a lease.
+        let _ = sweep_user_folders_after_lease;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
             let _ = by.send(());
