@@ -42,8 +42,10 @@
 //! loudly rather than silently.
 
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -79,9 +81,9 @@ fn signalable(pid: i32) -> bool {
 }
 
 /// Ends every recorded action (waiting at most `wait` for each to die, reading the
-/// process table through `table`), then removes, with `remove`, every entry of
-/// [`QUARANTINE`] and every `lease-*` entry of `scratch`, moving a lease directory that
-/// will not go into [`QUARANTINE`].
+/// process table through `table`), then removes every entry [`QUARANTINE`] held before
+/// (through its descriptor), and, with `remove`, every `lease-*` entry of `scratch`,
+/// moving a lease directory that will not go into [`QUARANTINE`].
 ///
 /// # Errors
 /// The scratch root cannot be read, this boot or the process table cannot be read, or
@@ -94,31 +96,19 @@ pub(crate) fn sweep(
     table: &Table<'_>,
 ) -> io::Result<()> {
     let quarantine = scratch.join(QUARANTINE);
-    // Absent until a sweep first needs it. Emptied first, so what this sweep sets aside
-    // stays there until the next start. One that is not the daemon's directory (a
-    // symlink an action planted) is removed itself, never emptied through.
-    match ours(&quarantine, std::fs::FileType::is_dir) {
-        Ok(()) => {
-            for entry in std::fs::read_dir(&quarantine)
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let path = entry.path();
-                if let Err(why) = remove(&path) {
-                    tracing::error!(dir = %path.display(), "a quarantined entry still cannot be removed: {why}");
-                }
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(why) => {
-            tracing::error!(dir = %quarantine.display(), "the quarantine is not the daemon's directory ({why}); removing it");
-            if let Err(why) = remove(&quarantine) {
-                tracing::error!(dir = %quarantine.display(), "the quarantine cannot be removed: {why}");
+    // What the quarantine holds now is removed after the kill, when no action left
+    // behind is alive any more to swap the directory, and through the descriptor held
+    // from here, so a swap is never followed in any case. What this sweep sets aside
+    // stays until the next start.
+    let held = hold(&quarantine, remove);
+    end_recorded(scratch, wait, table)?;
+    if let Some((dir, names)) = held {
+        for name in names {
+            if let Err(why) = kbf_outputs::remove_tree_at(&dir, &name) {
+                tracing::error!(dir = %quarantine.display(), entry = ?name, "a quarantined entry still cannot be removed: {why}");
             }
         }
     }
-    end_recorded(scratch, wait, table)?;
     for entry in std::fs::read_dir(scratch)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -143,6 +133,43 @@ pub(crate) fn sweep(
         }
     }
     Ok(())
+}
+
+/// The quarantine, opened without following a link, and the names in it now, listed
+/// through that descriptor. `None` when it is absent. One that is not the daemon's
+/// directory (a symlink an action planted, a file, a directory others may write) is
+/// removed itself with `remove`, never emptied through, and is `None` too.
+fn hold(
+    quarantine: &Path,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
+) -> Option<(OwnedFd, Vec<OsString>)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(quarantine)
+        .and_then(|dir| {
+            owned(&dir.metadata()?, std::fs::FileType::is_dir)?;
+            let dir = OwnedFd::from(dir);
+            let mut names = Vec::new();
+            for entry in rustix::fs::Dir::read_from(&dir)? {
+                names.push(OsStr::from_bytes(entry?.file_name().to_bytes()).to_owned());
+            }
+            names.retain(|name| ![".", ".."].contains(&name.to_str().unwrap_or_default()));
+            Ok((dir, names))
+        });
+    match held {
+        Ok(held) => Some(held),
+        // Absent until a sweep first needs it.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(why) => {
+            tracing::error!(dir = %quarantine.display(), "the quarantine is not the daemon's directory ({why}); removing it");
+            if let Err(why) = remove(quarantine) {
+                tracing::error!(dir = %quarantine.display(), "the quarantine cannot be removed: {why}");
+            }
+            None
+        }
+    }
 }
 
 /// Ends the action of every run record under `scratch`'s `runs/` and removes the
@@ -392,11 +419,19 @@ mod tests {
         assert!(aside[0].starts_with("lease-stuck."), "{aside:?}");
         let kept = dir.join(QUARANTINE).join(&aside[0]).join("root/out");
         assert_eq!(std::fs::read(kept).expect("moved whole"), b"x");
+        // The daemon's alone, whatever the umask ("made 0755" mutant).
+        let mode = std::fs::symlink_metadata(dir.join(QUARANTINE)).expect("quarantine");
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+            0o700
+        );
 
-        // The next start tries again; what still fails stays in quarantine, and the
-        // start goes on.
-        let fail_all = |_: &Path| Err(io::Error::from_raw_os_error(libc::EPERM));
-        sweep(&dir, &fail_all, WAIT, &SYSTEM).expect("a stuck quarantine does not stop a start");
+        // The next start tries again; what still fails (an entry of a quarantine the
+        // daemon may not write) stays in quarantine, and the start goes on.
+        chmod(&dir.join(QUARANTINE), 0o500);
+        let swept = sweep(&dir, &kbf_outputs::remove_tree, WAIT, &SYSTEM);
+        chmod(&dir.join(QUARANTINE), 0o700);
+        swept.expect("a stuck quarantine does not stop a start");
         assert_eq!(quarantined(&dir), aside);
         sweep(&dir, &kbf_outputs::remove_tree, WAIT, &SYSTEM).expect("sweep");
         assert_eq!(
@@ -737,12 +772,15 @@ mod tests {
 
     /// Catches a quarantine that is a symlink emptied through the link: an action that
     /// points it at a directory of the user's would get that directory's entries
-    /// removed at the next start ("quarantine followed" mutant).
+    /// removed at the next start ("quarantine followed" mutant). The target is a
+    /// directory the daemon would take for its own (0700, whatever the umask), so only
+    /// the link check can refuse it.
     #[test]
     fn a_quarantine_that_is_a_link_is_removed_not_followed() {
         let dir = scratch("qlink");
         let elsewhere = dir.join("elsewhere");
         std::fs::create_dir(&elsewhere).expect("mkdir");
+        chmod(&elsewhere, 0o700);
         std::fs::write(elsewhere.join("keep"), b"the user's").expect("write");
         std::os::unix::fs::symlink(&elsewhere, dir.join(QUARANTINE)).expect("symlink");
         sweep_within(&dir).expect("the start goes on");
@@ -751,6 +789,57 @@ mod tests {
             std::fs::symlink_metadata(dir.join(QUARANTINE)).is_err(),
             "the link removed"
         );
+    }
+
+    /// Catches a quarantine emptied before the kill (an action left behind is still
+    /// alive then), and one emptied by path after the check: an action that swaps it
+    /// for a symlink to a directory of the user's while the sweep kills ("emptied by
+    /// path" mutant) would get that directory's entries removed. The swap is done from
+    /// the process table read, as the dying action would.
+    #[test]
+    fn the_quarantine_is_emptied_after_the_kill_through_what_was_checked() {
+        let dir = scratch("qswap");
+        let quarantine = dir.join(QUARANTINE);
+        let (moved, elsewhere) = (dir.join("moved"), dir.join("elsewhere"));
+        for held in [&quarantine, &elsewhere] {
+            std::fs::create_dir(held).expect("mkdir");
+            chmod(held, 0o700);
+            std::fs::write(held.join("old"), b"x").expect("write");
+        }
+        let boot = crate::record::boot_id().expect("boot");
+        write_record(&dir, "lease-8-1", &format!("2000000051 5 {boot}\n"));
+        let at_kill = std::cell::Cell::new(false);
+        let swap = || {
+            at_kill.set(quarantine.join("old").exists());
+            std::fs::rename(&quarantine, &moved).expect("rename");
+            std::os::unix::fs::symlink(&elsewhere, &quarantine).expect("symlink");
+            Ok(Vec::new())
+        };
+        let table = Table {
+            snapshot: &swap,
+            ours: &|_| true,
+            guards: &Guards::now,
+        };
+        sweep(&dir, &kbf_outputs::remove_tree, WAIT, &table).expect("sweep");
+        assert!(at_kill.get(), "emptied before the kill");
+        assert!(elsewhere.join("old").exists(), "emptied through the swap");
+        assert!(!moved.join("old").exists(), "the checked directory emptied");
+    }
+
+    /// Catches the macOS boot id read from anything but the boot session UUID (the boot
+    /// time, which can move within a boot): it has the UUID's shape.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_boot_id_is_the_session_uuid() {
+        let id = crate::record::boot_id().expect("boot id");
+        assert_eq!(id.len(), 36, "{id}");
+        for (i, c) in id.char_indices() {
+            if [8, 13, 18, 23].contains(&i) {
+                assert_eq!(c, '-', "{id}");
+            } else {
+                assert!(c.is_ascii_hexdigit(), "{id}");
+            }
+        }
     }
 
     /// Catches a pid that exited between the snapshot and the check taken for another

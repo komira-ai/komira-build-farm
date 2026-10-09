@@ -15,6 +15,7 @@ kbf-proto.workspace = true
 kbf-types.workspace = true
 libc.workspace = true
 prost-types.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 
