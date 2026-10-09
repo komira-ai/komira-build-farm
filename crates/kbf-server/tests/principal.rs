@@ -259,20 +259,22 @@ fn the_store_and_its_errors_show_no_digest() {
 }
 
 fn hash_token(args: &[&str], stdin: &[u8]) -> (Option<i32>, String, String) {
+    let mut all = vec!["hash-token"];
+    all.extend_from_slice(args);
+    run(&all, stdin)
+}
+
+/// Runs the binary with `args` and `stdin`; a write to a child that exited before
+/// reading stdin (a refusal by clap) is not an error of the test.
+fn run(args: &[&str], stdin: &[u8]) -> (Option<i32>, String, String) {
     let mut child = Command::new(BIN)
-        .arg("hash-token")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn kbf-server");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stdin)
-        .expect("write stdin");
+    let _ = child.stdin.take().expect("stdin").write_all(stdin);
     let out = child.wait_with_output().expect("wait");
     (
         out.status.code(),
@@ -317,14 +319,22 @@ fn hash_token_refuses_what_the_file_would_not_take() {
 }
 
 /// Catches: server flags accepted with the subcommand (they would be silently
-/// ignored, since hash-token serves nothing).
+/// ignored, since hash-token serves nothing). The token on stdin is valid, so the
+/// only reason left to refuse is the flag; the same run without the flag succeeds.
 #[test]
 fn hash_token_takes_no_server_flags() {
-    let out = Command::new(BIN)
-        .args(["--listen", "127.0.0.1:0", "hash-token", "dev"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("run kbf-server");
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
+    let stdin = format!("{TOKEN_A}\n");
+    let (code, out, err) = run(&["hash-token", "dev"], stdin.as_bytes());
+    assert_eq!(code, Some(0), "{err}");
+    let (code, out2, err) = run(
+        &["--listen", "127.0.0.1:0", "hash-token", "dev"],
+        stdin.as_bytes(),
+    );
+    assert_eq!(code, Some(2), "{out2} {err}");
+    assert!(out2.is_empty(), "{out2}");
+    assert!(
+        err.contains("cannot be used with") && err.contains("--listen"),
+        "{err}"
+    );
+    assert!(!out.is_empty());
 }
