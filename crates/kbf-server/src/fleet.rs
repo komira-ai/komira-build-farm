@@ -184,7 +184,7 @@ pub fn attention_changes(
     fn items(list: &[XcodeView]) -> Vec<(Key<'_>, String)> {
         list.iter()
             .filter_map(|x| {
-                let key = (x.app.as_str(), x.build.as_str(), x.state, x.fix.as_str());
+                let key = (x.app.as_str(), x.build.as_str(), x.state, x.reason.as_str());
                 Some((key, x.attention()?))
             })
             .collect()
