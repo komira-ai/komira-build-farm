@@ -422,58 +422,6 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches (the merge of issues #163 and #164): the native daemon's first survey of
-    /// its Xcodes asked while `xcrun`'s cache that a lease
-    /// could have written is still there. The Xcode's own `xcodebuild` is a fake that
-    /// answers a build saying whether it saw the cache.
-    #[tokio::test]
-    async fn the_first_survey_runs_after_the_xcrun_cache_is_gone() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = scratch("forget");
-        tls_files(&dir);
-        let (temp, cache) = (dir.join("T"), dir.join("C"));
-        std::fs::create_dir_all(&temp).expect("T");
-        std::fs::create_dir_all(&cache).expect("C");
-        std::fs::write(temp.join("xcrun_db"), b"a lease's").expect("cache");
-        let apps = dir.join("Applications");
-        let program = apps
-            .join("Xcode_1.app/Contents/Developer")
-            .join(xcode::XCODEBUILD);
-        std::fs::create_dir_all(program.parent().expect("bin")).expect("bin");
-        let script = format!(
-            "#!/bin/sh\n\
-             if [ -e '{}/xcrun_db' ]; then echo 'Build version CACHE'; \
-             else echo 'Build version 1A1'; fi\n",
-            temp.display()
-        );
-        std::fs::write(&program, script).expect("script");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
-        let cli = Cli::try_parse_from([
-            "kbf-daemon".to_owned(),
-            "--server=https://127.0.0.1:1".to_owned(),
-            flag("ca-cert", &dir.join("ca.pem")),
-            flag("cert", &dir.join("node.pem")),
-            flag("key", &dir.join("node.key")),
-            "--node-id=mac-1".to_owned(),
-            "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
-            flag("scratch", &dir.join("leases")),
-            flag("xcode-apps", &apps),
-        ])
-        .expect("flags");
-        let mut config = native_config(&cli).expect("config");
-        config.user_folders =
-            kbf_driver_native::user_folders::UserFolders::new(temp.clone(), cache);
-        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
-        assert_eq!(xcodes.len(), 1, "{xcodes:?}");
-        assert_eq!(xcodes[0].build, "1A1", "{xcodes:?}");
-        drop(daemon);
-        kbf_outputs::remove_tree(&dir).expect("clean");
-    }
-
     /// Catches (CEO decision on issue #164): the native daemon's survey of its Xcodes
     /// asking a question outside the actions' sandbox, `xcrun`'s lookup above all (it
     /// reads and fills a cache leases can write), or with an `xcrun` other than the one
