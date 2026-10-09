@@ -38,33 +38,80 @@ pub const RUNS: &str = "runs";
 /// daemon, is still alive, in milliseconds.
 const PARENT_CHECK_MS: libc::c_int = 100;
 
-/// One running action's process group: its leader's pid, which is the group id, and the
-/// leader's start time, which with the pid names the leader for its whole life.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The most a record file holds that the sweep reads: a whole record is far shorter.
+pub const MAX_RECORD_BYTES: u64 = 256;
+
+/// One running action's process group: its leader's pid, which is the group id, the
+/// leader's start time, which with the pid names the leader for its whole life, and the
+/// boot it ran in ([`boot_id`]): a pid and start time name nothing across a reboot.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub pgid: i32,
     pub start: u64,
+    pub boot: String,
 }
 
 impl Record {
     /// The record's file contents.
     #[must_use]
-    pub fn line(self) -> String {
-        format!("{} {}\n", self.pgid, self.start)
+    pub fn line(&self) -> String {
+        format!("{} {} {}\n", self.pgid, self.start, self.boot)
     }
 
     /// Reads a record's file contents; `None` unless it is one whole line of two
-    /// numbers, the group id above 1 (so never every process of the user, nor init's
-    /// group).
+    /// numbers and a boot id, the group id above 1 (so never every process of the user,
+    /// nor init's group).
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
-        let (pgid, start) = text.strip_suffix('\n')?.split_once(' ')?;
-        let pgid: i32 = pgid.parse().ok().filter(|&pgid| pgid > 1)?;
-        Some(Self {
-            pgid,
-            start: start.parse().ok()?,
-        })
+        let mut fields = text.strip_suffix('\n')?.split(' ');
+        let pgid: i32 = fields.next()?.parse().ok().filter(|&pgid| pgid > 1)?;
+        let start = fields.next()?.parse().ok()?;
+        let boot = fields.next().filter(|b| !b.is_empty())?.to_owned();
+        fields
+            .next()
+            .is_none()
+            .then_some(Self { pgid, start, boot })
     }
+}
+
+/// This boot of the machine: the kernel's boot id on Linux, the boot time on macOS. A
+/// record of another boot names a process that is gone.
+///
+/// # Errors
+/// The kernel would not say.
+#[cfg(target_os = "linux")]
+pub fn boot_id() -> io::Result<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    Ok(id.trim().to_owned())
+}
+
+/// This boot of the machine: the kernel's boot id on Linux, the boot time on macOS. A
+/// record of another boot names a process that is gone.
+///
+/// # Errors
+/// The kernel would not say.
+#[cfg(target_os = "macos")]
+pub fn boot_id() -> io::Result<String> {
+    let mut boot = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: a C string name, and a writable timeval of `size` bytes, which the call
+    // fills and whose size it writes back.
+    let done = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&raw mut boot).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if done != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(format!("{}.{:06}", boot.tv_sec, boot.tv_usec))
 }
 
 /// The record of the run whose lease directory is named `lease` (`lease-<term>-<seq>`).
@@ -211,13 +258,34 @@ impl Gate {
             // end-of-file when there was no fork.
             drop((pid_write, go_read));
             let recorded = recorder.join().map_err(recorder_panicked).and_then(|r| r);
-            let child = child?;
-            recorded?;
+            // A child refused for want of its record failed for the recorder's reason.
+            let (child, recorded) = recorder_first(child, recorded)?;
             // A child that has not been waited for always has its pid.
             let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
             let pid = pid.ok_or(io::Error::other("the child has no pid"))?;
+            same_child(recorded, pid)?;
             Ok((child, pid))
         })
+    }
+}
+
+/// The spawned child and the pid its record names; the recorder's error first when the
+/// child was refused (ECANCELED) for want of the record, as on a full disk.
+fn recorder_first(child: io::Result<Child>, recorded: io::Result<i32>) -> io::Result<(Child, i32)> {
+    match (child, recorded) {
+        (Err(e), Err(why)) if e.raw_os_error() == Some(libc::ECANCELED) => Err(why),
+        (child, recorded) => Ok((child?, recorded?)),
+    }
+}
+
+/// Fails unless the record names the child that was spawned.
+fn same_child(recorded: i32, spawned: i32) -> io::Result<()> {
+    if recorded == spawned {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "the run record names pid {recorded}, the spawned child is {spawned}"
+        )))
     }
 }
 
@@ -230,18 +298,21 @@ fn recorder_panicked(_: Box<dyn std::any::Any + Send>) -> io::Error {
 /// child the go byte, 1 if the record was written and 0 if not. A refusal is sent, not
 /// left to end-of-file: a sibling forked meanwhile can hold the pipe open until it
 /// execs, and two siblings refused at once would each wait on the other.
+/// Returns the pid the record names.
 fn write_record(
     pid_read: io::PipeReader,
     mut go_write: io::PipeWriter,
     record: &Path,
-) -> io::Result<()> {
+) -> io::Result<i32> {
     let recorded = record_child(pid_read, record);
     let sent = go_write.write_all(&[u8::from(recorded.is_ok())]);
-    recorded.and(sent)
+    sent.and(recorded)
 }
 
-/// Reads the child's pid and writes its record.
-fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<()> {
+/// Reads the child's pid and writes its record: a new file, mode 0600, never through a
+/// symlink (`O_NOFOLLOW` and `O_EXCL`). Returns the pid.
+fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<i32> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let mut pid = [0_u8; 4];
     pid_read.read_exact(&mut pid)?;
     let pid = i32::from_ne_bytes(pid);
@@ -250,9 +321,17 @@ fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<()> {
     let line = Record {
         pgid: pid,
         start: child.start,
+        boot: boot_id()?,
     }
     .line();
-    std::fs::write(record, line)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(record)?;
+    file.write_all(line.as_bytes())?;
+    Ok(pid)
 }
 
 /// The closure `pre_exec` runs in the child: [`in_child`].
@@ -302,21 +381,50 @@ fn wait_for_go(go: libc::c_int, parent: i32) -> io::Result<()> {
         };
         // SAFETY: one pollfd, which outlives the call.
         let ready = unsafe { libc::poll(&raw mut poll, 1, PARENT_CHECK_MS) };
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
         // SAFETY: getppid takes nothing and cannot fail.
-        if ready == 0 && unsafe { libc::getppid() } != parent {
-            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        let parent_now = unsafe { libc::getppid() };
+        match after_poll(ready, errno, parent_now, parent) {
+            Step::Wait => {}
+            Step::Fail(errno) => return Err(io::Error::from_raw_os_error(errno)),
+            Step::Read => {
+                let mut byte = 0_u8;
+                // SAFETY: reads at most one byte into `byte`, which outlives the call.
+                let read = unsafe { libc::read(go, (&raw mut byte).cast(), 1) };
+                return if read == 1 && byte == 1 {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::ECANCELED))
+                };
+            }
         }
-        if ready > 0 {
-            let mut byte = 0_u8;
-            // SAFETY: reads at most one byte into `byte`, which outlives the call.
-            let read = unsafe { libc::read(go, (&raw mut byte).cast(), 1) };
-            return if read == 1 && byte == 1 {
-                Ok(())
-            } else {
-                Err(io::Error::from_raw_os_error(libc::ECANCELED))
-            };
-        }
-        // A timeout with the parent still there, or a signal: poll again.
+    }
+}
+
+/// What the waiting child does after one `poll`.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Poll again.
+    Wait,
+    /// Read the byte that arrived (or the end of the pipe).
+    Read,
+    /// Give up, with this errno.
+    Fail(i32),
+}
+
+/// The step after a `poll` that returned `ready` (and set `errno`, if it failed) while
+/// the parent is `parent_now`: read once something arrived; give up once the parent is
+/// not `parent` (whatever poll said: a sibling may hold the pipe open), or on a poll
+/// error other than a signal; else wait again. Async-signal-safe.
+fn after_poll(ready: libc::c_int, errno: i32, parent_now: i32, parent: i32) -> Step {
+    if ready > 0 {
+        Step::Read
+    } else if parent_now != parent {
+        Step::Fail(libc::ECHILD)
+    } else if ready < 0 && errno != libc::EINTR {
+        Step::Fail(errno)
+    } else {
+        Step::Wait
     }
 }
 
@@ -353,18 +461,22 @@ mod tests {
         let record = Record {
             pgid: 4242,
             start: 987_654,
+            boot: "b00t".to_owned(),
         };
-        assert_eq!(record.line(), "4242 987654\n");
+        assert_eq!(record.line(), "4242 987654 b00t\n");
         assert_eq!(Record::parse(&record.line()), Some(record));
         for bad in [
             "",
-            "4242 987654",
+            "4242 987654 b00t",
+            "4242 987654\n",
+            "4242 987654 \n",
+            "4242 987654 b00t extra\n",
             "4242\n",
-            "x 1\n",
-            "4242 y\n",
-            "0 5\n",
-            "1 5\n",
-            "-7 5\n",
+            "x 1 b\n",
+            "4242 y b\n",
+            "0 5 b\n",
+            "1 5 b\n",
+            "-7 5 b\n",
         ] {
             assert_eq!(Record::parse(bad), None, "{bad:?}");
         }
@@ -400,8 +512,24 @@ mod tests {
             let start = procs::process(pid).expect("the child").start;
             let out = child.wait_with_output().await.expect("wait");
             assert!(out.status.success(), "{out:?}");
-            let expected = format!("{}a b clean\n", Record { pgid: pid, start }.line());
+            let boot = boot_id().expect("boot");
+            let expected = format!(
+                "{}a b clean\n",
+                Record {
+                    pgid: pid,
+                    start,
+                    boot
+                }
+                .line()
+            );
             assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&record)
+                .expect("record")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the record is the daemon's alone");
+            std::fs::remove_file(&record).expect("rm, as the lease's end does");
         }
         assert!(Exec::new(program, [OsStr::new("a\0b")], []).is_err());
         assert!(Exec::new(program, [], [(OsStr::new("A"), OsStr::new("\0"))]).is_err());
@@ -419,7 +547,21 @@ mod tests {
         let error = gate
             .spawn(&mut command, &unwritable)
             .expect_err("no record");
-        assert_eq!(error.raw_os_error(), Some(libc::ECANCELED), "{error}");
+        // The recorder's own error, not the child's "canceled".
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(!marker.exists(), "the program ran without its record");
+
+        // A symlink planted where the record goes is neither followed nor replaced.
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious\n").expect("write");
+        let planted = dir.join("lease-1-9");
+        std::os::unix::fs::symlink(&victim, &planted).expect("symlink");
+        let error = gate.spawn(&mut command, &planted).expect_err("planted");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "precious\n"
+        );
         assert!(!marker.exists(), "the program ran without its record");
 
         let record = dir.join("lease-1-2");
@@ -461,6 +603,37 @@ mod tests {
         assert_eq!(go, [0], "a refusal, not a go byte");
         let panicked = recorder_panicked(Box::new("boom"));
         assert_eq!(panicked.to_string(), "the run recorder panicked");
+        assert!(same_child(7, 7).is_ok());
+        // Only a refused child gives way to the recorder's error.
+        let errno = |e: io::Result<(Child, i32)>| e.err().and_then(|e| e.raw_os_error());
+        let canceled = || Err(io::Error::from_raw_os_error(libc::ECANCELED));
+        let full = || Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(
+            errno(recorder_first(canceled(), full())),
+            Some(libc::ENOSPC)
+        );
+        let missing = Err(io::Error::from_raw_os_error(libc::ENOENT));
+        assert_eq!(errno(recorder_first(missing, full())), Some(libc::ENOENT));
+        let other = same_child(7, 8).expect_err("another child");
+        assert!(other.to_string().contains("names pid 7"), "{other}");
+    }
+
+    /// Catches a waiting child that polls for ever on a poll error, one that gives up
+    /// on a signal, and one that reads before anything arrived or waits once its
+    /// parent changed, whatever poll said.
+    #[test]
+    fn after_each_poll_the_child_reads_waits_or_gives_up() {
+        let eintr = libc::EINTR;
+        assert_eq!(after_poll(1, 0, 10, 10), Step::Read);
+        assert_eq!(after_poll(1, 0, 1, 10), Step::Read);
+        assert_eq!(after_poll(0, 0, 10, 10), Step::Wait);
+        assert_eq!(after_poll(-1, eintr, 10, 10), Step::Wait);
+        assert_eq!(
+            after_poll(-1, libc::ENOMEM, 10, 10),
+            Step::Fail(libc::ENOMEM)
+        );
+        assert_eq!(after_poll(0, 0, 1, 10), Step::Fail(libc::ECHILD));
+        assert_eq!(after_poll(-1, eintr, 1, 10), Step::Fail(libc::ECHILD));
     }
 
     /// What the daemon does while a child waits at the gate.

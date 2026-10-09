@@ -721,9 +721,10 @@ fn f2_13_leases_of_other_terms_are_never_cancelled() {
 /// them still runs when its retry starts.
 #[test]
 fn f2_14_a_crashed_daemon_s_runs_end_before_its_work_is_retried() {
-    let (mut crashes, mut swept, mut retried) = (0, 0, 0);
+    let (mut crashes, mut swept, mut retried, mut handed_over) = (0, 0, 0, 0);
     for seed in 0..SEEDS {
         let w = run("F2.14", seed);
+        handed_over += stats(&w).requeued_after_handover;
         let worker = w.worker("worker-1");
         crashes += worker.stats.crashes;
         swept += worker.stats.swept;
@@ -739,6 +740,13 @@ fn f2_14_a_crashed_daemon_s_runs_end_before_its_work_is_retried() {
         }
     }
     reached("F2.14", "a daemon crash", crashes);
+    // The restarted daemon is a new process: what the old one held is given up only
+    // after the handover grace, as for kbf-daemon, whose instance id is new each start.
+    reached(
+        "F2.14",
+        "a crashed process's lease given up after the handover grace",
+        handed_over,
+    );
     reached(
         "F2.14",
         "a run ended by the restarted daemon's sweep",

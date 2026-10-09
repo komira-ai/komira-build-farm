@@ -295,19 +295,70 @@ mod platform {
 /// handle that cannot be recycled (`pidfd_send_signal` on Linux; macOS has none for
 /// arbitrary processes) or a per-lease user whose every process may be killed. The
 /// window is the time between the snapshot and the signal.
+///
+/// Whatever a tracker or a run record claims, the daemon never signals a group id of 1
+/// or less (every process of its user, or init's group), its own group or its parent's
+/// group, nor its parent ([`Guards`]).
 pub fn kill_all(tracker: &Tracker, members: &[Proc]) {
-    if !tracker.group_gone {
+    let guards = Guards::now();
+    if guards.may_signal_group_of(tracker) {
         // SAFETY: kill(2) takes plain integers. The group id is the leader's pid, and
         // the last snapshot showed the group still had members.
         unsafe {
             libc::kill(-tracker.leader(), libc::SIGKILL);
         }
     }
-    for p in members {
+    for p in members.iter().filter(|p| guards.may_kill(p)) {
         // SAFETY: as above; `p` was in the snapshot just taken, pid and start time.
         unsafe {
             libc::kill(p.pid, libc::SIGKILL);
         }
+    }
+}
+
+/// What the daemon never signals: its own process group, its parent and its parent's
+/// group.
+#[derive(Clone, Copy, Debug)]
+pub struct Guards {
+    pub own_group: i32,
+    pub parent: i32,
+    pub parent_group: i32,
+}
+
+impl Guards {
+    /// This process's.
+    #[must_use]
+    pub fn now() -> Self {
+        // SAFETY: getpgrp and getppid take nothing; getpgid takes a plain integer and
+        // fails (-1) for a parent that is gone, which no group id equals.
+        unsafe {
+            let parent = libc::getppid();
+            Self {
+                own_group: libc::getpgrp(),
+                parent,
+                parent_group: libc::getpgid(parent),
+            }
+        }
+    }
+
+    /// Whether group `pgid` may be signalled as an action's.
+    #[must_use]
+    pub fn may_signal_group(self, pgid: i32) -> bool {
+        pgid > 1 && pgid != self.own_group && pgid != self.parent_group
+    }
+
+    /// Whether `tracker`'s group may be signalled by its id: not once a snapshot has
+    /// shown it empty (the id may be someone else's by then), and not a refused group.
+    #[must_use]
+    pub fn may_signal_group_of(self, tracker: &Tracker) -> bool {
+        !tracker.group_gone && self.may_signal_group(tracker.leader())
+    }
+
+    /// Whether process `p` may be signalled as an action's: not the parent, and not in a
+    /// group [`Guards::may_signal_group`] refuses.
+    #[must_use]
+    pub fn may_kill(self, p: &Proc) -> bool {
+        p.pid != self.parent && self.may_signal_group(p.pgid)
     }
 }
 
@@ -415,6 +466,56 @@ mod tests {
         assert_eq!(parse_linux_status(status), Some(123 * 1024));
         assert_eq!(parse_linux_status("RssAnon:\t5 kB\n"), Some(5 * 1024));
         assert_eq!(parse_linux_status("Name:\tkthreadd\n"), None);
+    }
+
+    /// Catches a record or tracker that gets the daemon to signal every process of its
+    /// user (group id 0, -1 and the like), init's group, its own group, its parent or its
+    /// parent's group.
+    #[test]
+    fn the_daemon_never_signals_itself_its_parent_or_everyone() {
+        let g = Guards {
+            own_group: 50,
+            parent: 40,
+            parent_group: 30,
+        };
+        for refused in [-7, 0, 1, 50, 30] {
+            assert!(!g.may_signal_group(refused), "{refused}");
+        }
+        assert!(g.may_signal_group(60));
+        assert!(g.may_signal_group_of(&Tracker::new(60, 2)));
+        assert!(
+            !g.may_signal_group_of(&Tracker::new(50, 2)),
+            "its own group"
+        );
+        assert!(!g.may_kill(&p(40, 1, 60, 1)), "the parent");
+        assert!(!g.may_kill(&p(61, 40, 50, 1)), "in the daemon's own group");
+        assert!(g.may_kill(&p(61, 40, 60, 1)));
+        let now = Guards::now();
+        // SAFETY: getpgrp and getppid take nothing and cannot fail.
+        assert_eq!(now.own_group, unsafe { libc::getpgrp() });
+        assert_eq!(now.parent, unsafe { libc::getppid() });
+    }
+
+    /// Catches a group signalled by its id once a snapshot showed it empty (the id may
+    /// be someone else's by then): the "ignore `group_gone`" mutant.
+    #[test]
+    fn a_group_seen_empty_is_not_signalled_by_its_id() {
+        use std::os::unix::process::CommandExt as _;
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pid = i32::try_from(other.id()).expect("pid");
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let mut t = Tracker::new(pid, me);
+        assert!(t.members(&[]).is_empty(), "seen empty");
+        kill_all(&t, &[]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let alive = other.try_wait().expect("try_wait").is_none();
+        other.kill().expect("kill");
+        other.wait().expect("reap");
+        assert!(alive, "the group was signalled by its id");
     }
 
     /// Catches: a snapshot that misses this very process or reads its parent wrong,

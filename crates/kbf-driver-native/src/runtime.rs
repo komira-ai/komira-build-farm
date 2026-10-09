@@ -92,8 +92,17 @@ impl<C: Cas> NativeRuntime<C> {
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(config.scratch.join(crate::record::RUNS))?;
-        crate::sweep::sweep(&config.scratch, remove, config.kill_wait, &procs::snapshot)?;
+        std::fs::create_dir_all(&config.scratch)?;
+        crate::sweep::sweep(
+            &config.scratch,
+            remove,
+            config.kill_wait,
+            &crate::sweep::SYSTEM,
+        )?;
+        // After the sweep, which sets aside a `runs` that is not the daemon's directory.
+        let mut runs = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
+            .create(config.scratch.join(crate::record::RUNS))?;
         Ok(Self {
             config,
             cas,
@@ -397,24 +406,35 @@ fn lease_name(id: LeaseId) -> String {
 struct Group {
     tracker: Arc<Mutex<Tracker>>,
     record: PathBuf,
+    /// How the process table is read: [`procs::snapshot`], but for tests.
+    snapshot: Snapshot,
     armed: bool,
 }
 
+/// A way to read the process table.
+type Snapshot = fn() -> std::io::Result<Vec<Proc>>;
+
 impl Group {
     fn new(tracker: Tracker, record: PathBuf) -> Self {
+        Self::reading(tracker, record, procs::snapshot)
+    }
+
+    /// [`Group::new`], reading the process table with `snapshot`.
+    fn reading(tracker: Tracker, record: PathBuf, snapshot: Snapshot) -> Self {
         Self {
             tracker: Arc::new(Mutex::new(tracker)),
             record,
+            snapshot,
             armed: true,
         }
     }
 
     /// The live processes of the action now, on the blocking pool.
     async fn members(&self) -> Result<Vec<Proc>, RuntimeError> {
-        let tracker = Arc::clone(&self.tracker);
+        let (tracker, snapshot) = (Arc::clone(&self.tracker), self.snapshot);
         // A task that did not finish (a panic, a runtime shutting down) is an I/O
         // failure like the call's own.
-        let members = tokio::task::spawn_blocking(move || members_now(&tracker)).await;
+        let members = tokio::task::spawn_blocking(move || members_now(&tracker, snapshot)).await;
         members
             .map_err(std::io::Error::other)
             .and_then(|found| found)
@@ -473,8 +493,8 @@ fn lock(tracker: &Mutex<Tracker>) -> MutexGuard<'_, Tracker> {
     tracker.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn members_now(tracker: &Mutex<Tracker>) -> std::io::Result<Vec<Proc>> {
-    let snapshot = procs::snapshot()?;
+fn members_now(tracker: &Mutex<Tracker>, snapshot: Snapshot) -> std::io::Result<Vec<Proc>> {
+    let snapshot = snapshot()?;
     Ok(lock(tracker).members(&snapshot))
 }
 
@@ -484,7 +504,7 @@ impl Drop for Group {
             return;
         }
         let ended = (0..100).any(|_| {
-            let members = members_now(&self.tracker).unwrap_or_default();
+            let members = members_now(&self.tracker, self.snapshot).unwrap_or_default();
             procs::kill_all(&lock(&self.tracker), &members);
             std::thread::sleep(KILL_PAUSE);
             members.is_empty()
@@ -740,6 +760,43 @@ mod tests {
         kbf_outputs::remove_tree(&scratch).expect("clean");
     }
 
+    /// A process table with one process, above any kernel's pid limit, that never dies.
+    fn undying() -> std::io::Result<Vec<Proc>> {
+        Ok(vec![Proc {
+            pid: 2_000_000_005,
+            ppid: 1,
+            pgid: 2_000_000_005,
+            start: 5,
+            zombie: false,
+        }])
+    }
+
+    fn nothing() -> std::io::Result<Vec<Proc>> {
+        Ok(Vec::new())
+    }
+
+    /// Catches a dropped run that removes its run record although processes of it
+    /// survived SIGKILL (the next start could not find them), and one that keeps the
+    /// record once they have all ended.
+    #[test]
+    fn a_dropped_run_keeps_its_record_only_while_processes_survive() {
+        let dir = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let record = dir.join("lease-5-5");
+        std::fs::write(&record, "x").expect("write");
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let tracker = || Tracker::new(2_000_000_005, me);
+        drop(Group::reading(tracker(), record.clone(), undying));
+        assert!(record.exists(), "kept for the next start's sweep");
+        drop(Group::reading(tracker(), record.clone(), nothing));
+        assert!(!record.exists(), "removed once nothing survives");
+    }
+
     /// Catches a signal death reported as exit 0 or as the raw status.
     #[test]
     fn a_signal_is_128_plus_its_number() {
@@ -842,6 +899,8 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");
         assert!(pid > 0);
         assert_eq!(child.wait().await.expect("wait").code(), Some(7));
+        // As the lease's end does: a record is written only where none is.
+        std::fs::remove_file(&record).expect("the run record");
         closer.await.expect("closer");
         // Held open for writing past the wait: the spawn gives up with ETXTBSY.
         let held = std::fs::OpenOptions::new()

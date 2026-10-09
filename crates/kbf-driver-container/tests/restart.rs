@@ -29,7 +29,8 @@ fn ended(pid: &str) -> bool {
 #[tokio::test]
 async fn a_restarted_runtime_removes_what_its_predecessor_left() {
     let fake = Fake::new("restart");
-    fake.knob("action.sh", "sleep 300");
+    // `exec`: the pid the fake records is the sleep itself, not a shell around it.
+    fake.knob("action.sh", "exec sleep 300");
     let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
     let runtime = Arc::clone(&fake.runtime);
     let mut run = Box::pin(async move { runtime.run(work(1, action, Resources::default())).await });

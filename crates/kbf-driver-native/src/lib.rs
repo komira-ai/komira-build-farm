@@ -38,11 +38,13 @@
 //! The container driver's own output walk is public too, but does not build on macOS;
 //! moving it onto `kbf-outputs` is a follow-up.
 //!
-//! Before an action's program runs, its run record (the leader's pid and start time)
-//! is written under `runs/` in the scratch root (`record`): the child waits between
-//! fork and exec until it is. At start the runtime kills every action a previous
-//! daemon recorded and left running, the daemon having been killed (`sweep`; processes
-//! that survive SIGKILL stop the start), then removes every lease directory it left;
+//! Before an action's program runs, its run record (the leader's pid, start time and
+//! boot) is written under `runs/` in the scratch root (`record`): the child waits
+//! between fork and exec until it is. At start the runtime kills every action a
+//! previous daemon recorded and left running, the daemon having been killed (`sweep`;
+//! processes of the daemon's user that survive SIGKILL stop the start; anything in
+//! `runs/` that is not a record of the daemon's is moved aside into `quarantine/`, and
+//! another user's processes are left alone), then removes every lease directory it left;
 //! one that cannot be removed is moved aside into `quarantine/` under the scratch root
 //! and logged, and the daemon starts anyway (an action decides what its directory
 //! holds, so refusing to start would let one build step take the node out of the farm).
@@ -70,6 +72,13 @@
 //!   fail until an operator unlocks it.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.
+//! - **The run records.** The start-up sweep trusts `runs/` because only the daemon
+//!   writes it: on macOS the sandbox keeps actions out of it. On Linux an action, which
+//!   runs as the daemon's user, can write a well-formed record there naming a group of
+//!   that user (its pid and start time are readable in `/proc`), and the next start
+//!   SIGKILLs that group. What is not a regular file of the daemon's user is set aside
+//!   unread, and another user's processes are never counted as the daemon's, so a
+//!   forged entry cannot stop or hang a start.
 //! - **Network "off" is not airtight**: Unix sockets stay open, the system resolver's
 //!   among them, so DNS lookups still leave the node and can carry data ([`network`]).
 //!
