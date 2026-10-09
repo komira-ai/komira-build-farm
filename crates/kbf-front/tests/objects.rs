@@ -22,11 +22,11 @@ use kbf_types::Digest;
 
 /// A bucket that refuses to replace a key, as `--s3-conditional-put` does, so a key
 /// named twice fails the second write instead of hiding it.
-fn conditional() -> MemoryStore {
-    MemoryStore::new(Capabilities {
+fn conditional() -> SharedStore {
+    SharedStore(Arc::new(MemoryStore::new(Capabilities {
         conditional_put: true,
         object_lock: false,
-    })
+    })))
 }
 
 /// One [`MetaLog`] shared by several caches, as two servers over one replicated log.
@@ -176,8 +176,7 @@ async fn mark_of<M: MetaLog, O: ObjectStore>(
 #[tokio::test]
 async fn object_keys_are_the_epoch_and_sequence_in_sixteen_hex_digits() {
     let prefix = KeyPrefix::new("farm-a/").expect("prefix");
-    let meta = MemoryMetaLog::new(Retention::default());
-    let cache = Cache::new(meta, conditional(), prefix, Epoch::new(0x2a));
+    let cache = Cache::new(SharedLog::new(), conditional(), prefix, Epoch::new(0x2a));
     let key = cache
         .object_key(ObjectId::new(Epoch::new(0x2a), 0xbeef))
         .expect("key");
@@ -196,14 +195,14 @@ async fn object_keys_are_the_epoch_and_sequence_in_sixteen_hex_digits() {
 #[tokio::test]
 async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
     let log = SharedLog::new();
-    let store = SharedStore(Arc::new(conditional()));
+    let store = conditional();
     let a = Cache::open(log.clone(), store.clone(), KeyPrefix::default())
         .await
         .expect("open a");
     let b = Cache::open(log.clone(), store.clone(), KeyPrefix::default())
         .await
         .expect("open b");
-    assert!(b.epoch() > a.epoch(), "{} then {}", a.epoch(), b.epoch());
+    assert!(b.epoch() > a.epoch(), "{:?} then {:?}", a.epoch(), b.epoch());
 
     let mut digests = Vec::new();
     for n in 0..3 {
@@ -279,7 +278,7 @@ async fn each_written_segment_is_one_put_blobs_commit() {
 /// record, and read back.
 #[tokio::test]
 async fn a_blob_too_large_to_share_a_segment_is_a_segment_of_one_record() {
-    let store = SharedStore(Arc::new(conditional()));
+    let store = conditional();
     let cache = Cache::open(SharedLog::new(), store.clone(), KeyPrefix::default())
         .await
         .expect("open")
@@ -315,7 +314,7 @@ async fn a_blob_too_large_to_share_a_segment_is_a_segment_of_one_record() {
 /// a mark on the wrong object: the neighbour in its own segment stays unmarked.
 #[tokio::test]
 async fn a_read_marks_a_missing_object_missing_and_bad_bytes_corrupt() {
-    let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+    let store = conditional();
     let cache = Cache::open(SharedLog::new(), store.clone(), KeyPrefix::default())
         .await
         .expect("open");
@@ -393,8 +392,12 @@ async fn a_location_in_another_store_is_internal_and_marks_nothing() {
 /// present, and the store call fails INTERNAL (a wiring bug, never the client's).
 #[tokio::test]
 async fn a_cache_whose_epoch_was_never_allocated_reports_nothing_present() {
-    let meta = MemoryMetaLog::new(Retention::default());
-    let cache = Cache::new(meta, conditional(), KeyPrefix::default(), Epoch::new(1));
+    let cache = Cache::new(
+        SharedLog::new(),
+        conditional(),
+        KeyPrefix::default(),
+        Epoch::new(1),
+    );
     let b = blob("never committed");
     let stored = cache.store_blobs(vec![b.clone()]).await;
     assert!(matches!(stored, Err(CacheError::Internal(_))), "{stored:?}");

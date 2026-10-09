@@ -29,12 +29,6 @@ impl Epoch {
     }
 }
 
-impl fmt::Display for Epoch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// An object in the object store that holds blob bytes: a segment of one or more
 /// records.
 ///

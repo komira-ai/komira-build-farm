@@ -33,7 +33,7 @@ fn alloc_epoch_strictly_increases_and_collect_does_not_reset_it() {
     let mut last = Epoch::new(0);
     for n in 0..1000u32 {
         let e = alloc(&mut m);
-        assert!(e > last, "allocation {n}: {e} after {last}");
+        assert!(e > last, "allocation {n}: {e:?} after {last:?}");
         last = e;
         if n % 10 == 0 {
             tick(&mut m, DAY * (n / 10 + 1));
