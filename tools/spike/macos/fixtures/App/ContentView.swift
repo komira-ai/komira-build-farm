@@ -19,7 +19,7 @@ struct ContentView: View {
             }
             Text(taps == 0 ? "ready" : "tapped \(taps)")
                 .accessibilityIdentifier("label")
-            Button("Tap") { taps += 2  // MUTANT: wrong label after one tap }
+            Button("Tap") { taps += 2 }  // MUTANT: wrong label after one tap
                 .accessibilityIdentifier("button")
         }
         .padding(32)
