@@ -46,8 +46,12 @@ impl World {
         }
         if self.scenario == Scenario::MassReconnect && self.mass_at.contains(&t) {
             self.check.hit("mass reconnect");
-            // Every node comes back in the same second: most of them rebooted.
-            let until = t + self.rng.between(1, 4);
+            // Every node comes back in the same second: most of them rebooted. Each is
+            // another daemon process, so the scheduler gives up the leases they lost
+            // only once the handover grace has passed (issue #140); they come back just
+            // after it, so that all of those are requeued at once.
+            let handover_s = HANDOVER_GRACE.as_secs();
+            let until = t + handover_s + self.rng.between(1, 4);
             let restarts = Chance::percent(u32::try_from(self.rng.below(50)).expect("small"));
             for i in 0..self.nodes.len() {
                 if self.nodes[i].link == Link::Up {

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
-use kbf_sched::{Event as SchedEvent, Input, OpState, Request, Scheduler};
+use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_sim::{Chance, Event, NodeId, NodeInput, Output, SimRng};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources,
@@ -321,9 +321,10 @@ impl Leader {
             }
             Msg::Hello {
                 node,
+                instance,
                 stream,
                 capacity,
-            } => self.hello(from, node, stream, capacity),
+            } => self.hello(from, node, DaemonInstance::new(instance), stream, capacity),
             Msg::Heartbeat {
                 stream,
                 seq,
@@ -394,7 +395,14 @@ impl Leader {
     /// Only the first `Hello` of a stream registers; one resent on the stream changes
     /// the node's capacity; a `Hello` of a stream older than the daemon's newest is
     /// ignored (that stream was closed before the newer one opened).
-    fn hello(&mut self, from: NodeId, node: WorkerId, stream: u64, capacity: Resources) {
+    fn hello(
+        &mut self,
+        from: NodeId,
+        node: WorkerId,
+        instance: DaemonInstance,
+        stream: u64,
+        capacity: Resources,
+    ) {
         let caps = || kbf_caps::NodeCaps::from_report([("arch", "x86_64")]).expect("valid");
         if let Some(claimed) = self.streams.get(&(from.clone(), stream)) {
             let current = self
@@ -429,6 +437,7 @@ impl Leader {
         self.send(from, Msg::Welcome { stream, epoch });
         self.feed(SchedEvent::WorkerUp {
             worker: node,
+            instance,
             capacity,
             caps: caps(),
         });

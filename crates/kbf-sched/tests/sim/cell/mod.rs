@@ -89,6 +89,8 @@ pub enum Msg {
     /// The first message of a stream, and resent on it when the node report changes.
     Hello {
         node: WorkerId,
+        /// The daemon process's instance id, the same on each of its streams.
+        instance: &'static str,
         stream: u64,
         capacity: Resources,
     },

@@ -15,7 +15,7 @@
 //! | F2.9 | a server restart (issue #137) | `f2_9_*` |
 //! | F2.10 | stale, duplicated and reordered session messages | `f2_10_*` |
 //! | F2.11 | lost and repeated results and acknowledgements | `f2_11_*` |
-//! | F2.12 | two daemons claiming one node id (ignored: issue #140) | `f2_12_*` |
+//! | F2.12 | two daemons claiming one node id (issue #140) | `f2_12_*` |
 //! | F2.13 | leases of another term, and of other workers, listed | `f2_13_*` |
 //!
 //! F2.5 (a `Start` lost on a live session) and F2.8 (a reboot and a daemon restart inside
@@ -65,11 +65,9 @@ const _: () = assert!(W_MS + SECOND < G_MS);
 type Spans = BTreeMap<(u64, OperationId), Vec<(u64, u64, String)>>;
 
 /// The scenarios the sweeps run.
-const SCENARIOS: [&str; 10] = [
-    "F2.1", "F2.2", "F2.3", "F2.4", "F2.6", "F2.7", "F2.9", "F2.10", "F2.11", "F2.13",
+const SCENARIOS: [&str; 11] = [
+    "F2.1", "F2.2", "F2.3", "F2.4", "F2.6", "F2.7", "F2.9", "F2.10", "F2.11", "F2.12", "F2.13",
 ];
-/// The scenarios that fail today on a known bug: F2.12 on issue #140.
-const KNOWN_BUGS: [&str; 1] = ["F2.12"];
 
 fn workers() -> Vec<WorkerPlan> {
     vec![
@@ -188,7 +186,16 @@ fn plan(name: &'static str, seed: u64) -> Plan {
             twin.node = "worker-1";
             twin.boot_at = twin_at;
             plan.workers.push(twin);
-            plan.workers[0].reconnects = vec![twin_at + at(&mut rng, 20, 60)];
+            // Half the seeds: the first daemon opens a new stream later and takes the
+            // node back. The other half: it dies soon after the twin took over (a node
+            // replaced while the old one still ran, then switched off), so the leases
+            // it ran are given up only once the twin's heartbeats outlast the handover
+            // grace (no silence for G: the node keeps being heard).
+            if seed.is_multiple_of(2) {
+                plan.workers[0].reconnects = vec![twin_at + at(&mut rng, 20, 60)];
+            } else {
+                plan.workers[0].die_at = Some(twin_at + at(&mut rng, 1, 20));
+            }
         }
         "F2.13" => {
             plan.workers[0].phantoms = vec![
@@ -313,6 +320,8 @@ fn stats(w: &World) -> CheckStats {
         s.kept_before_g += t.kept_before_g;
         s.requeued_earlier_session += t.requeued_earlier_session;
         s.requeued_after_grace += t.requeued_after_grace;
+        s.requeued_after_handover += t.requeued_after_handover;
+        s.kept_for_handover += t.kept_for_handover;
         s.kept_omitted += t.kept_omitted;
         s.kept_proposed += t.kept_proposed;
         s.answered += t.answered;
@@ -647,17 +656,31 @@ fn f2_11_lost_and_repeated_results_are_proposed_once() {
 }
 
 /// F2.12. Catches: `Start`s or acknowledgements going to a replaced stream, and the
-/// replaced daemon's work running beside its retry. Every seed fails I12 today: the new
-/// daemon's first heartbeat requeues the old one's leases at once (issue #140).
+/// replaced daemon's work running beside its retry (issue #140): a lease whose `Start`
+/// went to the other daemon requeued on the newer daemon's first heartbeat that leaves
+/// it out, while the older one, no longer acknowledged, runs it until its fence (I12),
+/// or kept past the handover grace (R).
 #[test]
-#[ignore = "issue #140"]
 fn f2_12_two_daemons_claiming_one_node_id() {
-    let mut replaced = 0;
+    let (mut replaced, mut kept, mut handed_over) = (0, 0, 0);
     for seed in 0..SEEDS {
         let w = run("F2.12", seed);
         replaced += w.leader().stats.replaced_beats;
+        let s = stats(&w);
+        kept += s.kept_for_handover;
+        handed_over += s.requeued_after_handover;
     }
     reached("F2.12", "a replaced daemon's heartbeat dropped", replaced);
+    reached(
+        "F2.12",
+        "a replaced daemon's lease left out and kept inside the handover grace",
+        kept,
+    );
+    reached(
+        "F2.12",
+        "a replaced daemon's lease given up after the handover grace",
+        handed_over,
+    );
 }
 
 /// F2.13. Catches: `not_held` naming a lease of another term, or one of this term this
@@ -705,7 +728,6 @@ fn replay() {
     let name = std::env::var("KBF_SIM_SCENARIO").expect("KBF_SIM_SCENARIO");
     let name = SCENARIOS
         .into_iter()
-        .chain(KNOWN_BUGS)
         .find(|s| *s == name)
         .expect("a scenario of this file");
     run(name, seed);

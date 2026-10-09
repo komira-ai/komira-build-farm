@@ -111,6 +111,7 @@ fn worker_messages_round_trip() {
                 },
             ],
             report_hash: vec![7; 32],
+            instance_id: "3f9c0a7d5e1b4c2a8d6f0e9b7a5c3d1e".to_owned(),
         })),
     };
     let back = DaemonMessage::decode(hello.encode_to_vec().as_slice()).expect("decode");

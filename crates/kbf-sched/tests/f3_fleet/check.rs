@@ -218,6 +218,7 @@ impl Check {
                 worker,
                 capacity,
                 caps,
+                ..
             } => {
                 let w = self
                     .workers

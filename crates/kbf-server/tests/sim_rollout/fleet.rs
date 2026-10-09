@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Cordon, Event, Input, OpState, Request, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::PlacementView;
 use kbf_server::rollout::{
@@ -240,8 +240,12 @@ impl Cell {
     pub fn register(&mut self, i: usize) {
         let worker = self.nodes[i].clone();
         let capacity = Resources::new(4_000, 8 * GIB);
+        // Each time a node comes back (its daemon updated and restarted) it is another
+        // daemon process.
+        let instance = DaemonInstance::new(format!("{}#{}", worker.as_str(), self.downs[&worker]));
         self.feed(Event::WorkerUp {
             worker,
+            instance,
             capacity,
             caps: node_caps(i),
         });

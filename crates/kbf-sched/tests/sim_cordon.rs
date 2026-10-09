@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Cordon, Event, Input, Request, Scheduler, UNSERVABLE_WAIT};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, Request, Scheduler, UNSERVABLE_WAIT};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
@@ -78,6 +78,7 @@ impl World {
             let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap();
             w.feed(Event::WorkerUp {
                 worker: WorkerId::new(name),
+                instance: DaemonInstance::new(name),
                 capacity: Resources::new(4_000, 8 * GIB),
                 caps,
             });

@@ -44,6 +44,17 @@ pub const LEADER_LEASE_MARGIN: Duration = Duration::from_secs(5);
 const _: () =
     assert!(SELF_FENCE.as_millis() + LEADER_LEASE_MARGIN.as_millis() < LEASE_GRACE.as_millis());
 
+/// How long the scheduler keeps the leases of a node's replaced daemon process, counted
+/// from when it last heard the node before another process registered as it (issue
+/// #140). Two processes may hold one node's certificate (a cloned machine, a second
+/// daemon started, a node replaced while the old one runs), and the newer one cannot say
+/// what the older runs. The older one's stream is not acknowledged once it is replaced,
+/// so it stops self-fenced work at most T after the scheduler last heard it; the margin
+/// is the one G keeps over T.
+pub const HANDOVER_GRACE: Duration = SELF_FENCE.saturating_add(LEADER_LEASE_MARGIN);
+
+const _: () = assert!(HANDOVER_GRACE.as_millis() < LEASE_GRACE.as_millis());
+
 /// W: how late a worker may act on a `Start`, counted from when it sent the newest
 /// heartbeat the scheduler had heard when the `Start` went out. The `Start` left after
 /// that heartbeat arrived, so a `Start` acted on inside W was in flight for less than W,

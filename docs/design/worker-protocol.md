@@ -87,6 +87,16 @@ else; a resent report that fails the other checks is ignored. A newer stream fro
 same node replaces the older one: messages still arriving on the old stream are ignored
 from then on.
 
+`Hello.instance_id` names the daemon process: the daemon draws 128 random bits when it
+starts and sends them, as 32 hex digits, in every `Hello` on every stream. It is never
+written down, so a restarted daemon, a second daemon started with the same certificate
+and a daemon on a cloned machine each send their own. The scheduler uses it to decide
+which leases a new session's first heartbeat may give up at once (invariants 6 and 7
+[below](#invariants)), and the server logs a warning whenever a node's stream comes
+from another process than its earlier stream's. An empty `instance_id` (a daemon that
+predates the field) matches no process, so every registration it makes counts as
+another process's.
+
 The daemon refuses a `Welcome` whose interval is zero or whose double is not shorter
 than its fence time T, since a gap of two intervals must be noticed well before it
 fences.
@@ -362,10 +372,18 @@ daemon restarts and server restarts:
 5. **Only the newest stream counts.** A replaced stream's heartbeats are neither fed to
    the scheduler nor acknowledged, and every `Start` goes to the newest stream.
    Under mutual TLS, only a stream whose certificate names the node can become it.
-6. **A restarted daemon lists everything it runs in its first heartbeat.** The
-   scheduler requeues at once any lease whose `Start` went to an earlier session and
-   that the new session's heartbeat leaves out. (Re-adopting running work across a
-   daemon restart is **planned**; today a restarted daemon runs nothing.)
+6. **A daemon lists everything it holds in its first heartbeat on a new stream.** The
+   scheduler requeues at once any lease whose `Start` went to an earlier session of the
+   same daemon process (`Hello.instance_id`) and that the new session's heartbeat
+   leaves out. (Re-adopting running work across a daemon restart is **planned**; today
+   a restarted daemon runs nothing.)
+7. **Only a daemon process speaks for its own leases.** Two processes may register as
+   one node: a restarted daemon, or two daemons holding the node's certificate (a
+   cloned machine, a second daemon started, a node replaced while the old one runs).
+   A lease whose `Start` went to another process than the current session's is
+   requeued only once `HANDOVER_GRACE` (T + 5 s) has passed since the scheduler last
+   heard the node before that process was replaced: by then the replaced process,
+   whose stream is no longer acknowledged, has fenced (issue #140).
 
 ## Planned
 

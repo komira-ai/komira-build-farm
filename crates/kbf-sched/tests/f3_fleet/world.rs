@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, Request, Scheduler};
+use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
     ActionKey, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome, Qos,
@@ -239,6 +239,7 @@ impl World {
         self.heard.insert(name, self.t);
         self.feed(Event::WorkerUp {
             worker: worker(name),
+            instance: DaemonInstance::new(format!("{name}@{}", self.t)),
             capacity: capacity(name),
             caps,
         });

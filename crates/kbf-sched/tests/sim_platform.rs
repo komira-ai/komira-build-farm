@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, OpState, Request, Scheduler};
+use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_sim::SimRng;
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId,
@@ -259,6 +259,7 @@ impl World {
             if silent_too_long || (t > 0 && !self.up(&name, t - 1)) {
                 let event = Event::WorkerUp {
                     worker: WorkerId::new(name.as_str()),
+                    instance: DaemonInstance::new(name.as_str()),
                     capacity: capacity(&name),
                     caps: self.caps[&name].clone(),
                 };

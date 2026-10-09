@@ -44,6 +44,31 @@ impl Request {
     }
 }
 
+/// Which daemon process registered a worker: the `instance_id` of its `Hello`. A daemon
+/// draws one at random when it starts and sends it on every stream it opens, so two
+/// registrations name the same instance only if one process made both. A restarted
+/// daemon, a second daemon started with the same certificate and a cloned machine each
+/// name another.
+///
+/// The empty id (a daemon that predates the field) is the same as no other, itself
+/// included: every registration without one is taken as another process's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DaemonInstance(String);
+
+impl DaemonInstance {
+    /// The instance named `id`.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Whether this and `other` are known to be one daemon process.
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        !self.0.is_empty() && self.0 == other.0
+    }
+}
+
 /// One input: what happened, and the farm time at which it did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Input {
@@ -79,12 +104,16 @@ pub enum Event {
     /// `Hello` becomes [`Event::Capacity`], and a stream replaced by a newer one has its
     /// heartbeats dropped (issue #25).
     ///
-    /// Because the new session's first heartbeat decides at once, a restarted daemon
-    /// must finish re-adopting its leases before it sends that heartbeat; see
+    /// A registration names the daemon process that made it (`instance`). The new
+    /// session's first heartbeat decides at once only about leases whose `Start` went
+    /// to an earlier session of the same process; leases whose `Start` went to another
+    /// process are kept until that process has fenced (issue #140). See
     /// [`Event::Heartbeat`].
     WorkerUp {
         /// The worker.
         worker: WorkerId,
+        /// The daemon process that registered it.
+        instance: DaemonInstance,
         /// What placement may book on it.
         capacity: Resources,
         /// What it offers, from its node report: placement gives it only work whose
@@ -107,22 +136,33 @@ pub enum Event {
     /// A worker's heartbeat arrived on its newest stream, with the leases it holds.
     ///
     /// A committed lease the scheduler holds on the worker that `running` leaves out goes
-    /// back to the queue if its `Start` was sent to an earlier session (the worker either
-    /// received it before registering again, and then lists it, or never will), or once
-    /// its `Start` has been out for [`START_GRACE`] (the `Start` was lost, or the worker
-    /// no longer runs it). A lease whose `Start` is not yet sent, or whose result has
-    /// already been reported, is kept whether listed or not.
+    /// back to the queue:
     ///
-    /// Worker contract: a lease whose `Start` went to an earlier session is requeued on
-    /// the first heartbeat that leaves it out, with no grace. So a restarted daemon must
-    /// finish re-adopting its lease units before it sends its first heartbeat on the new
-    /// stream, and list every unit it re-adopted. Otherwise a unit still running inside
-    /// its [`SELF_FENCE`] window is requeued at once and the operation runs twice. The
-    /// set must also include leases that ended with a result not yet acknowledged
-    /// (issue #26); the server side of the session boundary is issue #25.
+    /// - at once if its `Start` was sent to an earlier session of the daemon process
+    ///   that holds this one (the daemon either received it before registering again,
+    ///   and then lists it, or never will);
+    /// - if its `Start` was sent to a session of another daemon process, once
+    ///   [`HANDOVER_GRACE`] has passed since the scheduler last heard the worker before
+    ///   the newest change of process (issue #140). Only the process that ran a lease
+    ///   can say it no longer runs it. The other one may still be running (two daemons
+    ///   share the node's certificate), but its stream has not been acknowledged since
+    ///   then, so it has fenced by the end of that grace;
+    /// - if its `Start` went to this session, once it has been out for [`START_GRACE`]
+    ///   (the `Start` was lost, or the worker no longer runs it).
+    ///
+    /// A lease whose `Start` is not yet sent, or whose result has already been reported,
+    /// is kept whether listed or not.
+    ///
+    /// Worker contract: a lease whose `Start` went to an earlier session of the same
+    /// process is requeued on the first heartbeat that leaves it out, with no grace. So
+    /// a daemon must list every lease it holds in its first heartbeat on a new stream.
+    /// A restarted daemon is another process: a lease it does not list is given up
+    /// after the handover grace, not at once. The set must also include leases that
+    /// ended with a result not yet acknowledged (issue #26); the server side of the
+    /// session boundary is issue #25.
     ///
     /// [`START_GRACE`]: crate::fence::START_GRACE
-    /// [`SELF_FENCE`]: crate::fence::SELF_FENCE
+    /// [`HANDOVER_GRACE`]: crate::fence::HANDOVER_GRACE
     Heartbeat {
         /// The worker.
         worker: WorkerId,

@@ -1,7 +1,8 @@
 //! The scheduler's rules, one scenario each, driven through its public inputs.
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Event, Input, OpState, Request, Scheduler};
+use kbf_sched::fence::HANDOVER_GRACE;
+use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime,
     FencePolicy, LeaseGrant, LeaseId, OperationId, Outcome, Qos, Resources, ResultRecord,
@@ -74,13 +75,19 @@ impl Harness {
         self.s.apply(Input::new(self.now, event))
     }
 
-    /// Registers `name` (again).
+    /// Registers `name` (again), by one daemon process named after it.
     fn worker(&mut self, name: &str, cpu_millis: u64, memory: u64) {
+        self.worker_by(name, name, cpu_millis, memory);
+    }
+
+    /// Registers `name` (again), by the daemon process `instance`.
+    fn worker_by(&mut self, name: &str, instance: &str, cpu_millis: u64, memory: u64) {
         let capacity = Resources::new(cpu_millis, memory);
         let worker = w(name);
         assert!(
             self.feed(Event::WorkerUp {
                 worker,
+                instance: DaemonInstance::new(instance),
                 capacity,
                 caps: caps(),
             })
@@ -529,12 +536,12 @@ fn a_lease_whose_result_was_reported_is_kept_when_left_out() {
     assert_eq!(h.s.booked(&w("a")), Some(Resources::default()));
 }
 
-/// Catches: a worker that registers again keeping, until a grace or G, a committed lease
-/// its heartbeats leave out (its `Start` went to the old session, so its run is gone or
-/// never began); a registration that requeues by itself, though `Hello` carries no
-/// running set (the leases the daemon re-adopted would run twice); one that drops a
-/// lease the worker lists as re-adopted; and one that gives up, before the Start grace,
-/// a grant whose `Start` went to the new session (it may still be on its way).
+/// Catches: a daemon that registers again on a new stream keeping, until a grace or G, a
+/// committed lease its heartbeats leave out (its `Start` went to the old session, so its
+/// run is gone or never began); a registration that requeues by itself, though `Hello`
+/// carries no running set (the leases the daemon still runs would run twice); one that
+/// drops a lease the daemon lists; and one that gives up, before the Start grace, a
+/// grant whose `Start` went to the new session (it may still be on its way).
 #[test]
 fn a_heartbeat_after_registering_again_requeues_at_once_only_what_the_worker_lost() {
     let mut h = Harness::new();
@@ -546,7 +553,8 @@ fn a_heartbeat_after_registering_again_requeues_at_once_only_what_the_worker_los
     h.commit_and_start(&kept);
     h.commit_and_start(&lost);
 
-    // The daemon restarts 10 s later and re-adopts `kept`. Its Hello lists nothing.
+    // The daemon opens a new stream 10 s later; it still runs `kept`. Its Hello lists
+    // nothing.
     h.at_secs(10).worker("a", 3_000, 3 * GIB);
     assert!(h.running(&kept) && h.running(&lost), "requeued on Hello");
     // `pending` is committed after the registration: its Start goes to the new session.
@@ -573,6 +581,73 @@ fn a_heartbeat_after_registering_again_requeues_at_once_only_what_the_worker_los
     assert_eq!(again.operation, lost.operation);
     h.commit_and_start(&again);
     assert!(h.report(&lost, ok(2)).is_empty(), "late result proposed");
+}
+
+/// Catches (issue #140): a lease whose `Start` went to a replaced daemon process requeued
+/// on the first heartbeat of another process registered as the same node (the replaced
+/// one, when two daemons hold one certificate, runs it until it fences: twice at once),
+/// or kept past the handover grace; the grace counted from the new registration instead
+/// of from when the node was last heard before it, or restarted by a reconnect of the
+/// same process; a process that comes back after another taken for the one its earlier
+/// leases went to; and registrations without an instance id taken for one process.
+#[test]
+fn a_lease_of_a_replaced_daemon_process_is_kept_until_that_process_has_fenced() {
+    let mut h = Harness::new();
+    h.worker_by("a", "one", 4_000, 4 * GIB);
+    for n in 1..=4 {
+        let networked = Request {
+            hermetic: false,
+            ..request(n)
+        };
+        h.submit(u64::from(n), networked);
+    }
+    let [first, second, third, fourth] = h.tick().try_into().unwrap();
+    h.commit_and_start(&first);
+
+    // Process `one` is last heard at 20 s; process `two` registers as `a` at 30 s and
+    // lists nothing.
+    h.at_secs(20).heartbeat_running("a", &[first.lease]);
+    h.at_secs(30).worker_by("a", "two", 4_000, 4 * GIB);
+    h.at_secs(31).heartbeat("a");
+    assert!(h.running(&first), "requeued on another process's heartbeat");
+    // `second` goes to process `two`, which then reconnects without it.
+    h.commit_and_start(&second);
+    let handover = FarmTime::from_millis(20_000).saturating_add(HANDOVER_GRACE);
+    let just_before = handover.as_millis() - 1;
+    h.at_millis(just_before).heartbeat("a");
+    assert!(
+        h.running(&first),
+        "requeued before the replaced process fenced"
+    );
+    h.worker_by("a", "two", 4_000, 4 * GIB);
+    h.heartbeat("a");
+    assert_eq!(
+        h.s.state(second.operation),
+        Some(&OpState::Queued),
+        "a lease the same process lost kept"
+    );
+    assert!(h.running(&first), "a reconnect ended the handover grace");
+    h.at_millis(handover.as_millis()).heartbeat("a");
+    assert_eq!(h.s.state(first.operation), Some(&OpState::Queued));
+
+    // Process `one` comes back. `third`, started on process `two`, is kept although
+    // `one` registered before `two` did.
+    h.commit_and_start(&third);
+    h.at_secs(80).worker_by("a", "one", 4_000, 4 * GIB);
+    h.at_secs(81).heartbeat("a");
+    assert!(
+        h.running(&third),
+        "process two's lease requeued by process one"
+    );
+
+    // Without an instance id, each registration is another process's.
+    h.at_secs(140).worker_by("a", "", 4_000, 4 * GIB);
+    h.commit_and_start(&fourth);
+    h.at_secs(141)
+        .heartbeat_running("a", &[third.lease, fourth.lease]);
+    h.at_secs(142).worker_by("a", "", 4_000, 4 * GIB);
+    h.at_secs(143).heartbeat_running("a", &[third.lease]);
+    assert!(h.running(&fourth), "two unnamed processes taken for one");
 }
 
 /// Catches (issue #25): a resent `Hello` treated as a registration, which would count
