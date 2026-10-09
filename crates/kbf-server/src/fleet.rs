@@ -202,12 +202,45 @@ pub fn attention_changes(
     raised.chain(cleared).collect()
 }
 
-/// The body of `GET /v1/nodes`: every node registered since the server started, in
-/// node-id order.
+/// The body of `GET /v1/nodes`: the server that answers, and every node registered
+/// since it started, in node-id order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NodesView {
+    /// The server process that answers.
+    pub server: ServerView,
     /// The nodes.
     pub nodes: Vec<NodeView>,
+}
+
+impl NodesView {
+    /// `nodes`, as this server build lists them.
+    #[must_use]
+    pub fn of_this_build(nodes: Vec<NodeView>) -> Self {
+        Self {
+            server: ServerView::this_build(),
+            nodes,
+        }
+    }
+}
+
+/// The `kbf-server` build that answers, so a deploy can check which commit runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ServerView {
+    /// As `--version` and the start line print it: [`crate::SERVER_VERSION`].
+    pub version: String,
+    /// The commit alone: [`crate::BUILD_COMMIT`].
+    pub commit: String,
+}
+
+impl ServerView {
+    /// This build.
+    #[must_use]
+    pub fn this_build() -> Self {
+        Self {
+            version: crate::SERVER_VERSION.to_owned(),
+            commit: crate::BUILD_COMMIT.to_owned(),
+        }
+    }
 }
 
 #[cfg(test)]

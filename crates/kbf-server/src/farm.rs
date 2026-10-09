@@ -387,7 +387,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         changes
     }
 
-    /// Every node registered since this farm started, in node-id order.
+    /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
         let state = self.lock();
         let nodes = state
@@ -395,7 +395,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             .keys()
             .map(|worker| self.node(&state, worker))
             .collect();
-        NodesView { nodes }
+        NodesView::of_this_build(nodes)
     }
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.

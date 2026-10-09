@@ -79,7 +79,7 @@ driver does not serve.
 | `container` | `action` | exists (Linux, rootless Podman) |
 | `native` | `action` | exists (Macs, plain processes) |
 | `fake` | `action` | exists, for bring-up only: runs nothing |
-| `vm` | `vm` | **planned**: listed only when a boot check of a tiny VM passes at daemon start ([macos-vms.md](macos-vms.md#52-node-report-planned)) |
+| `vm` | `vm` | **planned**: listed only when a check that boots no VM passes, at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
 | `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
 
 On `main` no driver serves `whole_machine`.
@@ -93,10 +93,23 @@ The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will a
 |---|---|---|
 | `vm.slots` | how many VMs may run at once; fills a `vms` booking dimension | report-only |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only |
-| `vm.image` (repeated) | the golden images on the node's disk, by digest | capability: a request names one, matched by membership on the digest |
+| `vm.image` (repeated) | the golden images on the node's disk whose file manifest re-verifies, by recipe digest ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)) | capability: a request names one, matched by membership on the digest |
 
 A report-only entry is never a request key: an action cannot ask for `vm.slots`, and
 `vms` is booked only through `kbf-lease=vm`.
+
+### Planned device entries
+
+Physical iOS devices on a Mac node ([ios-devices.md](ios-devices.md#52-report-entries))
+will add, all **planned**:
+
+| Entry | Meaning | Kind |
+|---|---|---|
+| `ios.device` (repeated) | one per **ready** USB-attached iPhone or iPad: a sorted `k=v` list of `id` (the UDID), `class`, `product_type`, `os_version`, `os_build` | capability: one device is booked per lease, and one device must satisfy every `ios.device.*` key of a request |
+
+A device that is not ready is not a report entry; it is listed, with its state and the
+fix, in `NodeStatus` (planned `devices`). An older server skips the entry, as it skips
+every report entry it does not know.
 
 ## The node status
 
@@ -172,6 +185,7 @@ Each key has one typed comparison:
 | `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | **planned**: membership on the digest (see [Planned VM entries](#planned-vm-entries)) |
+| `ios.device` | **planned**: `1` books one specific device; `ios.device.class`, `ios.device.product_type`, `ios.device.os_version`, `ios.device.os_build` are exact, and one device must satisfy all of them (see [Planned device entries](#planned-device-entries)) |
 
 Every other key may appear once. A value that does not parse or a repeated key is
 refused. A Mac with two Xcodes installed serves an action that names either build, and
@@ -294,6 +308,11 @@ naming no `container-image`.
   microarchitecture), `nvme_gib`, `os_image` (on bootc Linux), the SDKs of each Xcode
   on macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)),
   and the VM driver's `drivers` value and `vm.*` entries (above).
+- **iOS devices:** `ios.device` report entries and request keys, a booking of one
+  device id per lease carried in `Start`, and `NodeStatus.devices` with an attention
+  item for each device that is not ready ([ios-devices.md](ios-devices.md)). Until the
+  server knows `ios.device`, a request for it is an unknown property and matches
+  every node (see [Unknown keys](#unknown-keys)).
 - **Client-defined probes** (`probe.<k>`) as `NodeStatus` values, never report entries
   or request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
 - **Re-detection:** the daemon re-detects its software keys after an update step and
