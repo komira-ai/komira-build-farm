@@ -111,11 +111,15 @@ pub struct Location {
 /// Ordered by how sure the mark is: `Corrupt` is never downgraded to `Missing`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnreachableReason {
-    /// The store did not produce the object or the range (a 404, a short object). It
-    /// may come back: a misrouted request or a store that recovers.
+    /// The store did not produce the object or the range: a 404, or an object that
+    /// ends before the record starts. It may come back: a misrouted request or a store
+    /// that recovers.
     Missing,
-    /// The store produced bytes that fail their digest. A later read of the same
-    /// object cannot be trusted; only a re-upload heals the blobs in it.
+    /// The store produced bytes that fail their digest, including an object that ends
+    /// inside the record. A later read of the same object cannot be trusted: no read
+    /// clears this mark, and a re-upload heals the blobs in it by moving them to a new
+    /// object. [`Command::ObjectReachable`](crate::Command::ObjectReachable) clears any
+    /// mark, so whoever issues it vouches for the bytes.
     Corrupt,
 }
 
