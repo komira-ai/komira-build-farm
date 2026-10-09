@@ -18,7 +18,7 @@ use kbf_daemon::Runtime;
 use kbf_driver_native::network::Isolation;
 use kbf_driver_native::xcode;
 use kbf_driver_native::{NativeConfig, NativeRuntime};
-use support::{MemoryCas, Spec, config, run, runtime, scratch, stderr, stdout, work};
+use support::{MemoryCas, Spec, config, run, runtime, scratch, stderr, stdout, user_folder, work};
 
 /// The actions' `PATH`.
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -31,8 +31,14 @@ const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// (`file-link` is not one of `file-write*`). `defaults write` asks `cfprefsd`, which
 /// writes the user's `~/Library/Preferences` on the action's behalf
 /// (`user-preference-write`, also not one of `file-write*`), so one action could leave
-/// settings, such as a tool's defaults, for the next.
-const OUTSIDE: [(&str, &str); 11] = [
+/// settings, such as a tool's defaults, for the next. `{UTEMP}`, `{UCACHE}` and `{UDIR}`
+/// are files directly in the user's temporary folder, cache folder and the user
+/// folder that holds both (under `/var/folders`): the tools that must write in the
+/// first get only the few names they use there (issue #163), never the folders.
+/// `{UXCRUN}` is a file inside a directory that has one of those names
+/// (`xcrun_db-<..>`, which `xcrun` uses for a file): only the name is open, not
+/// what is under it.
+const OUTSIDE: [(&str, &str); 15] = [
     ("create", "echo x > {OUT}/new"),
     ("append", "echo x >> {OUT}/victim"),
     ("unlink", "rm -f {OUT}/victim"),
@@ -44,6 +50,13 @@ const OUTSIDE: [(&str, &str); 11] = [
     ("link", "ln {OUT}/victim ./h && echo x >> ./h"),
     ("link-lease", "ln {LEASE}/victim ./l && echo x >> ./l"),
     ("defaults", "defaults write {DOMAIN} k v"),
+    ("user-temp", "echo x > {UTEMP}"),
+    ("user-cache", "echo x > {UCACHE}"),
+    ("user-dir", "echo x > {UDIR}"),
+    (
+        "user-temp-xcrun",
+        "mkdir -p \"$(dirname {UXCRUN})\" && echo x > {UXCRUN}",
+    ),
 ];
 
 /// Where the rows of [`OUTSIDE`] aim.
@@ -52,6 +65,9 @@ struct Targets {
     lease: PathBuf,
     tmp: PathBuf,
     domain: String,
+    /// The files in the user folders, in the order `{UTEMP}`, `{UCACHE}`, `{UDIR}`,
+    /// `{UXCRUN}`.
+    user: [PathBuf; 4],
 }
 
 impl Targets {
@@ -60,12 +76,32 @@ impl Targets {
     fn fresh(dir: &Path, tmp: &Path, domain: &str) -> Self {
         let _ = std::fs::remove_file(tmp);
         forget(domain);
-        Self {
+        let name = format!("kbf-sandbox-test-{}", std::process::id());
+        let temp = user_folder("DARWIN_USER_TEMP_DIR");
+        let user = [
+            temp.join(&name),
+            user_folder("DARWIN_USER_CACHE_DIR").join(&name),
+            user_folder("DARWIN_USER_DIR").join(&name),
+            temp.join(format!("xcrun_db-{name}")).join("f"),
+        ];
+        let targets = Self {
             out: victim_in(&dir.join("outside")),
             lease: victim_in(&dir.join("leases").join("lease-9-999").join("out")),
             tmp: tmp.to_owned(),
             domain: domain.to_owned(),
+            user,
+        };
+        targets.forget_user_files();
+        targets
+    }
+
+    /// Removes the files the user-folder rows write, and the directory `{UXCRUN}`'s
+    /// row makes.
+    fn forget_user_files(&self) {
+        for file in &self.user {
+            let _ = std::fs::remove_file(file);
         }
+        let _ = std::fs::remove_dir(self.user[3].parent().expect("a parent"));
     }
 
     /// Puts a fresh `victim` back in both directories.
@@ -103,7 +139,11 @@ fn attempts(ways: &[(&str, &str)], to: &Targets) -> String {
                 .replace("{OUT}", &to.out.to_string_lossy())
                 .replace("{LEASE}", &to.lease.to_string_lossy())
                 .replace("{TMP}", &to.tmp.to_string_lossy())
-                .replace("{DOMAIN}", &to.domain);
+                .replace("{DOMAIN}", &to.domain)
+                .replace("{UTEMP}", &to.user[0].to_string_lossy())
+                .replace("{UCACHE}", &to.user[1].to_string_lossy())
+                .replace("{UDIR}", &to.user[2].to_string_lossy())
+                .replace("{UXCRUN}", &to.user[3].to_string_lossy());
             format!("{command} 2>/dev/null; echo {name}=$?; ")
         })
         .collect()
@@ -136,7 +176,8 @@ fn names(dir: &Path) -> Vec<std::ffi::OsString> {
 }
 
 /// Catches an action, with or without the network, that can create, append to,
-/// remove, rename, chmod or tag a file outside its lease directory, write in `/tmp`,
+/// remove, rename, chmod or tag a file outside its lease directory, write in `/tmp` or
+/// in the user's own folders under `/var/folders` (beyond what issue #163 opens),
 /// change a file outside it (another lease's output included) through a hard link
 /// made inside it, or write the user's preferences: a tool that turned its own sandbox
 /// off (`swift build --disable-sandbox`) could then change other leases, the daemon's
@@ -180,6 +221,9 @@ async fn no_action_writes_outside_its_lease() {
             );
         }
         assert!(!tmp.exists(), "network={network} wrote {}", tmp.display());
+        for file in &to.user {
+            assert!(!file.exists(), "network={network} wrote {}", file.display());
+        }
         assert_eq!(
             preference(&domain),
             None,
@@ -221,7 +265,11 @@ async fn no_action_writes_outside_its_lease() {
         Some("v"),
         "control: {domain}"
     );
+    for file in &to.user {
+        assert!(file.exists(), "control: {}", file.display());
+    }
     forget(&domain);
+    to.forget_user_files();
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -257,6 +305,7 @@ async fn an_action_writes_inside_its_lease() {
         lease: PathBuf::from("/unused"),
         tmp: PathBuf::from("/unused"),
         domain: String::new(),
+        user: [(); 4].map(|()| PathBuf::from("/unused")),
     };
     let script = attempts(&ways, &unused);
     for (seq, network) in [(1, "off"), (2, "on")] {

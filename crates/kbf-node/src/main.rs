@@ -118,7 +118,11 @@ fn start(cli: &Cli) -> Result<(), Error> {
     match cli.driver {
         Driver::Fake => serve(cli, &tokio, Arc::new(FakeRuntime::new(Duration::ZERO)), []),
         Driver::Native => {
+            // `native_config` removes xcrun's cache before it asks the Xcodes.
             let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
+            // In the background, sandboxed as an action: the node serves while xcrun
+            // fills its cache.
+            let _ = runtime.warm_xcrun(Path::new(xcode::XCRUN), xcode::ANSWER_WITHIN);
             let capabilities = runtime.capabilities();
             serve(cli, &tokio, Arc::new(runtime), capabilities)
         }
@@ -173,11 +177,7 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
-    config.xcodes = xcode::discover(
-        &cli.xcode_apps,
-        Path::new(xcode::XCODEBUILD),
-        xcode::ANSWER_WITHIN,
-    );
+    config.find_xcodes(&cli.xcode_apps, xcode::ANSWER_WITHIN);
     Ok(config)
 }
 

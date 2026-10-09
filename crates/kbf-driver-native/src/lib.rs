@@ -12,7 +12,10 @@
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
 //! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no file
-//!   written outside the lease directory and `/dev`, no user preference written through
+//!   written outside the lease directory and `/dev` but the few names macOS tools
+//!   write in the daemon user's temporary folder whatever `TMPDIR` says (Foundation's
+//!   temporary items, `xcrun`'s cache: [`user_folders`], whose leftovers are swept),
+//!   no user preference written through
 //!   `cfprefsd` (`defaults write`), no work handed to launchd
 //!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network unless the
 //!   action's `network` platform property allows it; elsewhere nothing is enforced,
@@ -70,6 +73,10 @@
 //!   they can, and an action that locks the
 //!   scratch root or `quarantine/` (`chmod 555`) makes every later lease on the node
 //!   fail until an operator unlocks it.
+//! - **The user's temporary folder.** The names there the sandbox opens to every lease
+//!   ([`user_folders`]) are shared: a lease can see and change the temporary files
+//!   another lease has open there, and rewrite `xcrun`'s cache, which the next lease's
+//!   compiler shims read to find their tools.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.
 //! - **The run records.** The start-up sweep trusts `runs/` because only the daemon
@@ -99,6 +106,7 @@ pub mod procs;
 mod record;
 mod runtime;
 mod sweep;
+pub mod user_folders;
 pub mod xcode;
 
 pub use config::{MemoryPolicy, NativeConfig};

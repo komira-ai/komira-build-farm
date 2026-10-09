@@ -277,3 +277,45 @@ pub fn no_leases(config: &NativeConfig) -> bool {
         .count();
     others == 0 && empty(&runs)
 }
+
+/// `getconf <name>` as the test's user (the driver's user) sees it, every link
+/// resolved: on macOS, `DARWIN_USER_TEMP_DIR` is the folder Foundation and `xcrun`
+/// write in whatever `TMPDIR` says.
+pub fn user_folder(name: &str) -> PathBuf {
+    let out = std::process::Command::new("/usr/bin/getconf")
+        .arg(name)
+        .output()
+        .expect("getconf");
+    assert!(out.status.success(), "getconf {name}");
+    let path = String::from_utf8(out.stdout).expect("UTF-8");
+    std::fs::canonicalize(path.trim()).expect("the folder exists")
+}
+
+/// The file writes the macOS sandbox refused in the last ten minutes, one line per
+/// operation and path, from the unified log: what a sandboxed tool that failed
+/// wanted to write. For failure messages only; a note instead where the log cannot
+/// be read.
+pub fn sandbox_denials() -> String {
+    let out = std::process::Command::new("/usr/bin/log")
+        .args([
+            "show",
+            "--last",
+            "10m",
+            "--style",
+            "compact",
+            "--predicate",
+            "eventMessage CONTAINS \"deny(1) file-write\"",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return "sandbox denials: the log cannot be read".to_owned();
+    };
+    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once("deny(1) "))
+        .map(|(_, rest)| rest.to_owned())
+        .collect();
+    lines.sort();
+    lines.dedup();
+    format!("sandbox denials:\n{}", lines.join("\n"))
+}
