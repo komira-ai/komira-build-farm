@@ -237,3 +237,43 @@ fn a_token_line_round_trips() {
     assert!(token_line("a b", ClientRole::Client, &qos, TOKEN_A.as_bytes()).is_err());
     assert!(token_line("", ClientRole::Client, &qos, TOKEN_A.as_bytes()).is_err());
 }
+
+struct Broken;
+
+impl std::io::Read for Broken {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+/// Catches: a token input of any size read whole (hash-token reads stdin), the limit
+/// off by one, and a read error taken as an empty token.
+#[test]
+fn a_token_input_is_bounded_and_its_errors_reported() {
+    let max = crate::token::MAX_TOKEN_FILE_BYTES;
+    let padded = format!("{TOKEN_A}{}", "\n".repeat(max - TOKEN_A.len()));
+    let made = token_line_from("dev", ClientRole::Client, &Qos::Ci, padded.as_bytes());
+    assert_eq!(made, Ok(line("dev", "ci", TOKEN_A)));
+    let over = format!("{padded}\n");
+    let refused = token_line_from("dev", ClientRole::Client, &Qos::Ci, over.as_bytes());
+    assert!(refused.is_err_and(|e| e.contains("more than 4096 bytes")));
+    let refused = token_line_from("dev", ClientRole::Client, &Qos::Ci, Broken);
+    assert!(refused.is_err_and(|e| e.contains("read the token")));
+}
+
+/// Catches: `is_empty` and `len` disagreeing with the entries (an empty file admits no
+/// one).
+#[test]
+fn an_empty_file_has_no_entries() {
+    let empty = Principals::parse("# nobody yet\n\n").expect("parses");
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
+    assert!(
+        empty
+            .admit(format!("Bearer {TOKEN_A}").as_bytes())
+            .is_none()
+    );
+    let one = Principals::parse(&line("ci", "ci", TOKEN_A)).expect("parses");
+    assert!(!one.is_empty());
+    assert_eq!(one.len(), 1);
+}

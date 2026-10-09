@@ -51,6 +51,7 @@
 //! and QoS levels, never a digest.
 
 use std::fmt;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -260,6 +261,29 @@ pub fn token_line(
     ))
 }
 
+/// [`token_line`] for the token `input` holds, read to its end; at most
+/// [`crate::token::MAX_TOKEN_FILE_BYTES`] bytes are taken.
+///
+/// # Errors
+/// `input` cannot be read or holds more, or [`token_line`] refuses.
+pub fn token_line_from(
+    principal: &str,
+    role: ClientRole,
+    qos: &Qos,
+    input: impl std::io::Read,
+) -> Result<String, String> {
+    let max = crate::token::MAX_TOKEN_FILE_BYTES;
+    let mut token = Vec::new();
+    input
+        .take(u64::try_from(max + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut token)
+        .map_err(|e| format!("read the token: {e}"))?;
+    if token.len() > max {
+        return Err(format!("the token input has more than {max} bytes"));
+    }
+    token_line(principal, role, qos, &token)
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_PRINCIPAL_BYTES
@@ -384,12 +408,6 @@ impl TokenStore {
         })
     }
 
-    /// The file's path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// The principals the file gives now: looks at its metadata if the interval has
     /// passed since the last look, and reads it again if that changed. Blocks on file
     /// I/O only then.
@@ -405,7 +423,7 @@ impl TokenStore {
         }
         state.looked = now;
         let key = match std::fs::metadata(&self.path) {
-            Ok(meta) => Some(file_key(&meta)),
+            Ok(meta) => file_key(&meta),
             Err(source) => {
                 state.key = None;
                 state.loaded = Err(Arc::new(TokenStoreError::File(TokenFileError::Read {
@@ -415,7 +433,7 @@ impl TokenStore {
                 return state.loaded.clone();
             }
         };
-        if key.is_some() && key == state.key {
+        if state.key == Some(key) {
             return state.loaded.clone();
         }
         match load(&self.path) {
@@ -424,7 +442,7 @@ impl TokenStore {
                 state.loaded = Ok(Arc::new(principals));
             }
             Err(e) => {
-                state.key = key;
+                state.key = Some(key);
                 state.loaded = Err(Arc::new(e));
             }
         }

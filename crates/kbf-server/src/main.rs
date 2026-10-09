@@ -16,7 +16,7 @@
 
 use std::error::Error;
 use std::future::Future;
-use std::io::{self, Read};
+use std::io;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -25,8 +25,7 @@ use clap::Parser;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
-use kbf_server::principal::{ClientRole, token_line};
-use kbf_server::token::MAX_TOKEN_FILE_BYTES;
+use kbf_server::principal::{ClientRole, token_line_from};
 use kbf_server::{Args, Command, StoreKind, bind_server_with_api};
 
 #[tokio::main]
@@ -36,7 +35,7 @@ async fn main() -> ExitCode {
         .init();
     let args = Args::parse();
     if let Some(Command::HashToken { principal, qos }) = &args.command {
-        return match hash_token(principal, qos, io::stdin().lock()) {
+        return match token_line_from(principal, ClientRole::Client, qos, io::stdin().lock()) {
             Ok(line) => {
                 println!("{line}");
                 ExitCode::SUCCESS
@@ -83,21 +82,6 @@ async fn run<O: ObjectStore + 'static>(
     println!("{}", start_line(bound.reapi, bound.worker, bound.api));
     bound.serving.await?;
     Ok(())
-}
-
-/// The token file line for the token `input` holds (at most
-/// [`MAX_TOKEN_FILE_BYTES`] bytes).
-fn hash_token(principal: &str, qos: &kbf_types::Qos, input: impl Read) -> Result<String, String> {
-    let mut token = Vec::new();
-    let limit = u64::try_from(MAX_TOKEN_FILE_BYTES + 1).unwrap_or(u64::MAX);
-    input
-        .take(limit)
-        .read_to_end(&mut token)
-        .map_err(|e| format!("read stdin: {e}"))?;
-    if token.len() > MAX_TOKEN_FILE_BYTES {
-        return Err(format!("stdin has more than {MAX_TOKEN_FILE_BYTES} bytes"));
-    }
-    token_line(principal, ClientRole::Client, qos, &token)
 }
 
 /// The start line: the version and the addresses bound.
