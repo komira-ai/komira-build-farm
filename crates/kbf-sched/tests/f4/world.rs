@@ -353,7 +353,7 @@ impl World {
         let maintenance = (drain_at, drain_at + rng.between(10, 20));
         let replay = format!(
             "KBF_SIM_SEED={seed} KBF_SIM_OPS={ops} cargo test -p kbf-sched --test f4_fleet -- \
-             --ignored --exact replay  ({scenario:?}, {workers} workers)"
+             --ignored --exact replay --nocapture  ({scenario:?}, {workers} workers)"
         );
         let wait = std::time::Duration::from_secs(WAIT_S);
         let check = Checker::new(

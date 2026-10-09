@@ -16,8 +16,10 @@
 //! changes (capacity and Xcode builds), and operator actions.
 //!
 //! The checker (`f4/check.rs`) runs after every input the scheduler is fed and checks
-//! its effects and its state against a reference model: I1 to I14 of the catalog, and
-//! L2 and L3; and that the accepted result is one the very lease's run produced (I5
+//! its effects, and the state that input touched, against a reference model: I1 to
+//! I14 of the catalog, and L2 and L3 (every operation and worker, untouched ones
+//! included, is compared every simulated half minute; its header says which checks
+//! run when); and that the accepted result is one the very lease's run produced (I5
 //! with a worker model), and that no self-fenced operation runs twice at once (I12).
 //! Once arrivals stop, no new fault starts, every dead node returns and every cordon
 //! ends, and L1 is checked: every operation finishes within a bound computed from the
@@ -41,11 +43,13 @@
 //! promotion, a lease requeued on a new session, a paused drain, ...), so a check that
 //! never fires is noticed.
 //!
-//! CI runs 16 seeds of 2,000 operations. A failing check prints its seed and a replay
-//! command:
+//! CI runs 16 seeds of 2,000 operations: about 5 s of test time in a debug build on
+//! the dev box, under a minute on a CI runner. A failing check prints its seed and a
+//! replay command (`--nocapture` so a replay that passes still prints what it
+//! reached):
 //!
 //! ```text
-//! KBF_SIM_SEED=<n> KBF_SIM_OPS=<ops> cargo test -p kbf-sched --test f4_fleet -- --ignored --exact replay
+//! KBF_SIM_SEED=<n> KBF_SIM_OPS=<ops> cargo test -p kbf-sched --test f4_fleet -- --ignored --exact replay --nocapture
 //! ```
 //!
 //! The long sweep, 1,000 seeds of 10,000 operations (run it in a release build):
