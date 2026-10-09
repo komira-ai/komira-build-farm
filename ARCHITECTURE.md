@@ -248,10 +248,10 @@ own protection.
 
 **Build clients go through a front.** TLS for Bazel and Buck2 ends at a front that
 holds a real certificate for the farm's client-facing name: a load balancer, or a
-proxy on a WireGuard mesh such as `tailscale serve`. `kbf-server` has no TLS of its
-own on the REAPI listener and none is planned. It serves REAPI as plain-text gRPC
-behind the front, bound to loopback (front on the same host) or to the mesh
-interface, whose traffic WireGuard already encrypts.
+proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. `kbf-server`
+has no TLS of its own on the REAPI listener and none is planned. It serves REAPI as
+plain-text gRPC behind the front, bound to loopback (front on the same host) or to
+the mesh interface, whose traffic WireGuard already encrypts.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
   text, checks no credential and accepts any bind address. Whoever reaches the port
@@ -263,17 +263,29 @@ interface, whose traffic WireGuard already encrypts.
 - **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
   bind that other machines could reach, and allows the front's hop: loopback, or an
   address the operator names as the front's.
-- **Not yet shown:** that a front carries kbf's gRPC intact. One probe so far
-  established only these facts. `tailscale serve` 1.102.4 has no `h2c://` backend in
-  its HTTPS mode, so that mode could reach a plain-text server only through an
-  `http://` backend, and whether that forwards gRPC (HTTP/2 in clear, with trailers)
-  was not tested. Its TLS-terminated TCP mode was not tried. On loopback, with no
-  front, GetCapabilities, FindMissingBlobs, a 64 MiB ByteStream write and read,
-  BatchUpdateBlobs and BatchReadBlobs (up to 1 MiB each) and Execute all worked.
-- **Long silent streams.** On loopback, an Execute and a WaitExecution stream for an
-  action no node could run each got one `QUEUED` message and then nothing for 300 s,
-  until `--unservable-wait-secs` failed the action. A front
-  whose idle timeout is shorter than the longest queue wait cuts these streams.
+- **A front that works: `tailscale serve` in HTTPS mode.** A probe with
+  `tailscale serve` 1.102.4 ran its HTTPS mode (`tailscale serve --https=<port>
+  http://127.0.0.1:<reapi>`) in front of a plain-text REAPI listener on loopback.
+  That version has no `h2c://` backend scheme; the `http://` backend carried gRPC.
+  Through it, over TLS, these all worked: GetCapabilities, FindMissingBlobs, a 64 MiB
+  ByteStream write and read back with a matching sha256, BatchUpdateBlobs and
+  BatchReadBlobs (up to 1 MiB each), Execute, and WaitExecution on a finished action.
+  A Buck2 remote-only build got through capabilities, uploads and Execute (the probe's
+  fake driver wrote no outputs, so the action itself failed on missing outputs).
+  Configuring `tailscale serve` needs root or a Tailscale operator on the host.
+  `kbf-server` sees every such connection as coming from loopback. The HTTPS mode can
+  add Tailscale identity headers (such as `Tailscale-User-Login`); `kbf-server` does
+  not read them.
+- **Not supported for REAPI: `tailscale serve`'s TLS-terminated TCP mode**
+  (`--tls-terminated-tcp`). Its certificate verifies, but it negotiates no ALPN, and
+  gRPC clients require `h2`. Buck2 fails with "HTTP/2 was not negotiated"; gRPC's C
+  core (for example Python `grpcio`) fails with "Cannot check peer: missing selected
+  ALPN property".
+- **Long silent streams.** Through the HTTPS front above, a queued Execute and a
+  WaitExecution stream for an action no node could run carried no messages for 300 s;
+  both then ended with `FAILED_PRECONDITION` when `--unservable-wait-secs=300` failed
+  the action. That front did not cut them. Another front whose idle timeout is shorter
+  than the longest queue wait would cut these streams.
 
 **Daemons do not go through the front.** The worker listener keeps its own mutual TLS
 end to end:
