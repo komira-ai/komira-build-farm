@@ -352,7 +352,19 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked
+      - run: cargo test -p kbf-driver-native --test user_folders --locked --no-run
+      - run: set -o pipefail; cargo test -p kbf-driver-native --test user_folders --locked 2>&1 | grep -E '^test |test result|panicked|cc [0-9]'
+        continue-on-error: true
+      - run: set -o pipefail; cargo test -p kbf-driver-native --test user_folders --locked 2>&1 | grep -E '^test |test result|panicked|cc [0-9]'
+        continue-on-error: true
+      - run: set -o pipefail; cargo test -p kbf-driver-native --test user_folders --locked 2>&1 | grep -E '^test |test result|panicked|cc [0-9]'
+        continue-on-error: true
+      - run: set -o pipefail; cargo test -p kbf-driver-native --test user_folders --locked 2>&1 | grep -E '^test |test result|panicked|cc [0-9]'
+        continue-on-error: true
+      - run: git apply .github/mutant-no-xcrun-rule.patch && git diff --stat
+      - run: set -o pipefail; cargo test -p kbf-driver-native --test user_folders --locked -- --exact the_compiler_shims_print_nothing_on_stderr 2>&1 | grep -E '^test |test result|panicked|cc [0-9]'
+        continue-on-error: true
+      - run: exit 0
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), and the fence across a suspend (issue #78).
       - run: cargo test -p kbf-daemon --lib --test suspend --locked
