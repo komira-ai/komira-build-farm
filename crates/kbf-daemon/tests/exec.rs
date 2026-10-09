@@ -53,6 +53,7 @@ impl Farm {
             hello_wait: Duration::from_secs(2),
             tick: Duration::from_millis(50),
             unservable_wait: Duration::from_secs(300),
+            finished_retention: Duration::from_secs(60),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

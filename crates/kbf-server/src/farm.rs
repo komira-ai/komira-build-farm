@@ -169,9 +169,14 @@ struct State {
     sched: Scheduler,
     next_waiter: u64,
     next_stream: u64,
-    /// Unfinished operations' callers. A caller's operation name is
-    /// [`operation_name`] of the term and its id, so a name is looked up by parsing it.
+    /// The callers of operations the scheduler holds: unfinished ones, and finished
+    /// ones for the scheduler's finished retention, so that a WaitExecution on one
+    /// gets its result (issue #165). A caller's operation name is [`operation_name`]
+    /// of the term and its id, so a name is looked up by parsing it.
     waiters: BTreeMap<WaiterId, Waiter>,
+    /// Finished operations whose callers are still kept, in the order they finished,
+    /// with those callers. Each leaves once the scheduler has dropped its operation.
+    finished: VecDeque<(OperationId, Vec<WaiterId>)>,
     links: BTreeMap<WorkerId, Link>,
     /// Leases whose `Start` was sent, with their operations and the action each
     /// `Start` named.
@@ -193,20 +198,29 @@ struct Settled {
 impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// A farm over `cache`, with an empty scheduler of a new term ([`process_term`])
     /// that refuses queued work once no live worker has been able to run it for
-    /// `unservable_wait`.
+    /// `unservable_wait`, and keeps a finished operation, which WaitExecution still
+    /// answers, for `finished_retention`.
     #[must_use]
-    pub fn new(cache: Arc<Cache<M, O>>, unservable_wait: Duration) -> Self {
+    pub fn new(
+        cache: Arc<Cache<M, O>>,
+        unservable_wait: Duration,
+        finished_retention: Duration,
+    ) -> Self {
         let term = process_term();
+        let sched = Scheduler::new(term)
+            .with_unservable_wait(unservable_wait)
+            .with_finished_retention(finished_retention);
         Self {
             cache,
             term,
             epoch: Instant::now(),
             epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
-                sched: Scheduler::new(term).with_unservable_wait(unservable_wait),
+                sched,
                 next_waiter: 0,
                 next_stream: 0,
                 waiters: BTreeMap::new(),
+                finished: VecDeque::new(),
                 links: BTreeMap::new(),
                 started: BTreeMap::new(),
                 software: BTreeMap::new(),
@@ -655,7 +669,31 @@ impl State {
                 Effect::Refuse(refusal) => self.refuse(&refusal),
             }
         }
+        self.forget_dropped();
         answers
+    }
+
+    /// Keeps the callers of `operation`, which has just finished, until the scheduler
+    /// drops it.
+    fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
+        self.finished.push_back((operation, waiters));
+        self.forget_dropped();
+    }
+
+    /// Forgets the callers of every finished operation the scheduler has dropped: a
+    /// WaitExecution on one is NOT_FOUND from now on. The scheduler drops them in the
+    /// order they finished, and only those that finished at one farm time can be kept
+    /// here in another order, so stopping at the first it still holds leaves none
+    /// behind for longer than the input that drops it.
+    fn forget_dropped(&mut self) {
+        while let Some((operation, _)) = self.finished.front()
+            && self.sched.state(*operation).is_none()
+        {
+            let (_, waiters) = self.finished.pop_front().expect("checked above");
+            for id in waiters {
+                self.waiters.remove(&id);
+            }
+        }
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -752,31 +790,31 @@ impl State {
         self.started.retain(|_, (op, _)| *op != operation);
     }
 
-    /// Forgets an operation the scheduler refused and answers its callers
-    /// FAILED_PRECONDITION with the reason. Nothing is cached, so nothing is awaited.
+    /// Answers the callers of an operation the scheduler refused FAILED_PRECONDITION
+    /// with the reason, and keeps them for the finished retention. Nothing is cached,
+    /// so nothing is awaited.
     fn refuse(&mut self, refusal: &Refusal) {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
         let finished = failed(Code::FailedPrecondition, &refusal.reason);
         // A lease given up before the operation was refused may still be listed.
         self.forget_leases(refusal.operation);
-        for w in refusal
-            .waiters
-            .iter()
-            .filter_map(|id| self.waiters.remove(id))
-        {
+        for w in refusal.waiters.iter().filter_map(|id| self.waiters.get(id)) {
             w.stage.send_replace(Stage::Done(finished.clone()));
         }
+        self.keep_finished(refusal.operation, refusal.waiters.clone());
     }
 
-    /// Forgets a finished operation and works out what its callers get. `detail` is
-    /// what the accepted report carried beyond its outcome, if anything.
+    /// Works out what the callers of a finished operation get, and keeps them for the
+    /// finished retention. `detail` is what the accepted report carried beyond its
+    /// outcome, if anything.
     fn settle(&mut self, answer: &Answer, detail: Option<Detail>) -> Settled {
         self.forget_leases(answer.operation);
-        let waiters: Vec<Waiter> = answer
+        let waiters: Vec<&Waiter> = answer
             .waiters
             .iter()
-            .filter_map(|id| self.waiters.remove(id))
+            .filter_map(|id| self.waiters.get(id))
             .collect();
+        let stages = waiters.iter().map(|w| w.stage.clone()).collect();
         let (finished, write) = match (detail, answer.outcome) {
             (Some(Detail::Ran(pending)), _) => {
                 let Pending { result, record } = *pending;
@@ -797,10 +835,11 @@ impl State {
                 None,
             ),
         };
+        self.keep_finished(answer.operation, answer.waiters.clone());
         Settled {
             finished,
             write,
-            stages: waiters.into_iter().map(|w| w.stage).collect(),
+            stages,
         }
     }
 }

@@ -185,6 +185,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         hello_wait: Duration::from_secs(5),
         tick: Duration::from_millis(50),
         unservable_wait: Duration::from_secs(300),
+        finished_retention: Duration::from_secs(60),
     };
     let bound = bind_server(cache, listeners, pending()).expect("bind");
     let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

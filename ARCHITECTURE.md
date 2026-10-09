@@ -54,6 +54,8 @@ role (`--role=all`). The flags are:
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
+- `--finished-retention-secs` (default 60), how long a finished operation is kept
+  for WaitExecution before its name is `NOT_FOUND`;
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
   ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
   reach it; writes need the token in `--api-token-file` (owner-only file), come from
@@ -165,8 +167,10 @@ client                      kbf-server                               kbf-daemon
    written to the action cache *before* the callers are answered.
 
 `WaitExecution` streams the same stages for an operation name that Execute returned.
-A finished operation is forgotten; the next Execute for it is answered from the
-action cache. An operation name is `operations/{term}-{n}`: the server process's term
+A finished operation is kept for `--finished-retention-secs` (60 by default), in which
+WaitExecution streams its done operation, so a client whose Execute stream broke still
+gets a result the action cache does not keep; then it is forgotten, and the next
+Execute for it is answered from the action cache. An operation name is `operations/{term}-{n}`: the server process's term
 (the one its leases carry) and a count that starts at 0 in each process. A name from
 an earlier process, or any other name, is `NOT_FOUND`, so a client still holding one
 after a restart is never attached to another action's operation.

@@ -39,6 +39,9 @@ pub struct Listeners {
     /// platform, or none that does is large enough) before it is refused
     /// FAILED_PRECONDITION.
     pub unservable_wait: Duration,
+    /// How long a finished operation is kept after its callers are answered, in which
+    /// WaitExecution on it still streams its result; then it is NOT_FOUND.
+    pub finished_retention: Duration,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -158,7 +161,11 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let farm = Arc::new(Farm::new(Arc::clone(&cache), listeners.unservable_wait));
+    let farm = Arc::new(Farm::new(
+        Arc::clone(&cache),
+        listeners.unservable_wait,
+        listeners.finished_retention,
+    ));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));

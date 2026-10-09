@@ -60,6 +60,15 @@ Queued -> Leased -> Running -> Completed | Failed
 - `Refused`: a refusal was committed while the operation was queued (see
   [Placement](#placement)).
 
+**Retention.** A finished operation (`Completed`, `Failed` or `Refused`) is kept for
+the finished retention after its waiters are answered (`FINISHED_RETENTION` = 60 s,
+the server's `--finished-retention-secs`), then dropped at the first input at or
+after its end (issue #165). While it is kept, `kbf-server` keeps its callers too, and
+WaitExecution on its name streams the done operation; once it is dropped the name is
+NOT_FOUND. A late input naming a dropped operation (a stale record, report or start)
+is ignored, as for any unknown one, so the scheduler holds only the unfinished
+operations and those finished within the retention.
+
 **In-flight dedup.** Operations are keyed by `ActionKey`: the REAPI instance name and
 the action digest. A new request whose key matches an unfinished operation joins it
 as another waiter instead of queueing a second run, if the request is *joinable*:
