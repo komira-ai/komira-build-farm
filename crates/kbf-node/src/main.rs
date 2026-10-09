@@ -32,13 +32,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use kbf_daemon::{
-    Args, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, DriverReport, FakeRuntime, NodeReport,
-    Runtime,
+    Args, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime,
 };
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::watch;
 use tonic::transport::Endpoint;
 
 /// The `kbf-daemon` command line.
@@ -130,10 +128,8 @@ fn start(cli: &Cli) -> Result<(), Error> {
     let _context = tokio.enter();
     match cli.driver {
         Driver::Fake => serve(
-            cli,
             &tokio,
-            Arc::new(FakeRuntime::new(Duration::ZERO)),
-            None,
+            daemon(cli, Arc::new(FakeRuntime::new(Duration::ZERO)))?,
         ),
         Driver::Native => {
             let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
@@ -146,25 +142,25 @@ fn start(cli: &Cli) -> Result<(), Error> {
                 every,
                 Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
             );
-            serve(cli, &tokio, runtime, Some(driver))
+            serve(&tokio, daemon(cli, runtime)?.with_driver_report(driver))
         }
         Driver::Container => container::start(cli, &tokio),
     }
 }
 
-/// Runs the daemon with `runtime` until SIGTERM or SIGINT. The node report is the
-/// detected entries and the labels, plus the newest entries `driver` sends, if any.
-fn serve<R: Runtime>(
-    cli: &Cli,
-    tokio: &tokio::runtime::Runtime,
-    runtime: Arc<R>,
-    driver: Option<watch::Receiver<DriverReport>>,
-) -> Result<(), Error> {
+/// The daemon with `runtime`. Its node report is the detected entries and the labels;
+/// the native driver adds its own with `Daemon::with_driver_report`.
+fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
     let report = NodeReport::detect(&[runtime.driver()])?.with_entries(cli.daemon.label_entries());
-    let mut daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtime, report)?;
-    if let Some(driver) = driver {
-        daemon = daemon.with_driver_report(driver);
-    }
+    Ok(Daemon::new(
+        DaemonConfig::from_args(&cli.daemon),
+        runtime,
+        report,
+    )?)
+}
+
+/// Runs `daemon` until SIGTERM or SIGINT.
+fn serve<R: Runtime>(tokio: &tokio::runtime::Runtime, daemon: Daemon<R>) -> Result<(), Error> {
     let term = signal(SignalKind::terminate())?;
     let int = signal(SignalKind::interrupt())?;
     tokio.block_on(daemon.run(shutdown(term, int)));
@@ -231,7 +227,7 @@ mod container {
 
     use kbf_driver_container::{IdFiles, OutputLimits, PodmanConfig, PodmanRuntime};
 
-    use super::{Cli, Error, cas_client, scratch, serve};
+    use super::{Cli, Error, cas_client, daemon, scratch, serve};
 
     /// Builds the container driver, over the daemon's CAS client, and serves with it.
     pub(super) fn start(cli: &Cli, tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
@@ -253,7 +249,7 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         let runtime = PodmanRuntime::new(config, Arc::new(cas_client(cli)?))?;
-        serve(cli, tokio, Arc::new(runtime), None)
+        serve(tokio, daemon(cli, Arc::new(runtime))?)
     }
 }
 

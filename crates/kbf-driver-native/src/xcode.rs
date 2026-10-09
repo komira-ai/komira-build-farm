@@ -374,17 +374,26 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// What `command` prints and how it exits (stdin `/dev/null`), if it exits and closes
 /// its output within `within`; otherwise this is a `TimedOut` error, and the process is
-/// killed if it has not exited. Its stdout and stderr are read on two threads while it
-/// runs, so a full pipe cannot stall it. A process it started and left holding the
-/// pipes keeps those threads reading; they are waited for only until `within` is up
+/// killed if it has not exited. A program that is busy (ETXTBSY: a file just written
+/// is held open for writing by any child another thread forks before it execs) is
+/// started again until `within` is up. Its stdout and stderr are read on two threads
+/// while it runs, so a full pipe cannot stall it. A process it started and left holding
+/// the pipes keeps those threads reading; they are waited for only until `within` is up
 /// and are left behind after that (each ends when the pipe it reads closes).
 fn output_within(mut command: std::process::Command, within: Duration) -> io::Result<Output> {
-    let mut child = command
+    let deadline = Instant::now() + within;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let deadline = Instant::now() + within;
+        .stderr(Stdio::piped());
+    let mut child = loop {
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                std::thread::sleep(POLL);
+            }
+            spawned => break spawned?,
+        }
+    };
     let stdout = read_all(child.stdout.take().expect("stdout is piped"));
     let stderr = read_all(child.stderr.take().expect("stderr is piped"));
     let status = loop {

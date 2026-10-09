@@ -62,7 +62,7 @@ const FIRST_LAUNCH: &str = "Install additional required components? Run -runFirs
 /// prints one and then hangs for `hung` (so only the timeout keeps it out). The rest
 /// answer 0, except: `-license check` exits 69 for `broken`, whose licence is not
 /// accepted, and hangs for `slowlicence`; `-checkFirstLaunchStatus` exits 69 for
-/// `firstlaunch`; `-showComponent`
+/// `firstlaunch`; `-showComponent` hangs for `slowmetal`,
 /// says `Status: uninstalled` for `nometal` and is an unknown option (64) for `old` and
 /// `oldnometal` (Xcodes before 26, whose Metal is bundled).
 fn fake_xcodebuild(dir: &Path) -> PathBuf {
@@ -83,6 +83,7 @@ fn fake_xcodebuild(dir: &Path) -> PathBuf {
             */Xcode_old.app/Contents/Developer) build=15A1; metal= ;;\n\
             */Xcode_oldnometal.app/Contents/Developer) build=15B1; metal= ;;\n\
             */Xcode_slowlicence.app/Contents/Developer) build=16H1; licence=hang ;;\n\
+            */Xcode_slowmetal.app/Contents/Developer) build=26B1; metal=hang ;;\n\
             */Xcode_mute.app/Contents/Developer) build= ;;\n\
             */Xcode_hung.app/Contents/Developer) echo 'Build version 16A242d'; exec sleep 60 ;;\n\
             */Contents/Developer) build=99Z999 ;;\n\
@@ -93,7 +94,8 @@ fn fake_xcodebuild(dir: &Path) -> PathBuf {
             '-license check') [ \"$licence\" = hang ] && exec sleep 60\n\
               [ \"$licence\" = 0 ] || {{ echo '{NOT_AGREED}' >&2; exit \"$licence\"; }} ;;\n\
             -checkFirstLaunchStatus) [ \"$first\" = 0 ] || {{ echo '{FIRST_LAUNCH}' >&2; exit \"$first\"; }} ;;\n\
-            '-showComponent MetalToolchain') [ -n \"$metal\" ] || {{ echo 'invalid option' >&2; exit 64; }}\n\
+            '-showComponent MetalToolchain') [ \"$metal\" = hang ] && exec sleep 60\n\
+              [ -n \"$metal\" ] || {{ echo 'invalid option' >&2; exit 64; }}\n\
               echo 'Build Version: 17C48'; echo \"Status: $metal\" ;;\n\
             *) echo \"unknown: $*\" >&2; exit 64 ;;\n\
             esac\n"
@@ -197,7 +199,8 @@ fn every_xcode_that_answers_is_found() {
 /// a first launch as a licence), a check that times out reported as one a human can
 /// fix, the reason not naming the question and its answer, a build or
 /// `DEVELOPER_DIR` not kept once learnt, the Metal toolchain not asked for on a node
-/// that requires it, asked for on one that does not, an `Xcode` before 26 (no
+/// that requires it, asked for on one that does not, a Metal question not answered in
+/// time taken as an Xcode before 26 or as missing Metal, an `Xcode` before 26 (no
 /// `-showComponent`) taken as missing Metal when `xcrun` finds it, or as having Metal
 /// when `xcrun` does not.
 #[test]
@@ -216,6 +219,7 @@ fn every_installed_xcode_is_reported_with_its_state() {
             "Xcode_old.app",
             "Xcode_oldnometal.app",
             "Xcode_slowlicence.app",
+            "Xcode_slowmetal.app",
             "Xcode_mute.app",
             "Xcode_hung.app",
         ],
@@ -306,6 +310,12 @@ fn every_installed_xcode_is_reported_with_its_state() {
             Some("16H1"),
             State::Failed,
             &format!("{xcodebuild_at} -license check: no answer within 2s; killed"),
+        ),
+        xcode(
+            "Xcode_slowmetal.app",
+            Some("26B1"),
+            State::Failed,
+            &format!("{xcodebuild_at} -showComponent MetalToolchain: no answer within 2s; killed"),
         ),
     ];
     assert_eq!(survey(&apps, &probe), want);
@@ -454,6 +464,38 @@ fn output_held_open_past_the_limit_is_not_waited_for() {
         err.to_string(),
         "exited, but its output was still open after 2s"
     );
+}
+
+/// Catches a question asked once only when its program is busy (ETXTBSY), so an
+/// Xcode is reported as failed because another thread forked while its tool was being
+/// written; and a program that stays busy waited for past the limit.
+#[test]
+fn a_busy_program_is_started_again_within_the_limit() {
+    let dir = scratch("busy");
+    let program = dir.join("busy");
+    // Held open for writing, as a child forked before it execs holds a file just
+    // written: starting it fails with ETXTBSY until the handle is closed.
+    let writer = std::fs::File::create(&program).expect("create");
+    std::fs::write(&program, "#!/bin/sh\necho 'Build version 1A1'\n").expect("script");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let held = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(writer);
+    });
+    let out = output_within(std::process::Command::new(&program), WITHIN).expect("answers");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Build version 1A1\n");
+    held.join().expect("closed");
+
+    let _writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&program)
+        .expect("open");
+    let started = Instant::now();
+    let limit = Duration::from_millis(300);
+    let busy = output_within(std::process::Command::new(&program), limit).expect_err("busy");
+    assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
+    assert!(started.elapsed() < WITHIN, "waited past the limit");
+    kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
 fn platform(name: &str, value: &str) -> Option<Platform> {
