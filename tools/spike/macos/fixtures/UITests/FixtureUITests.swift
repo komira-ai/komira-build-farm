@@ -81,7 +81,6 @@ final class FixtureUITests: XCTestCase {
     private func keep(_ shot: XCUIScreenshot, _ name: String) {
         let attachment = XCTAttachment(screenshot: shot)
         attachment.name = name
-        attachment.lifetime = .keepAlways
         add(attachment)
     }
 
