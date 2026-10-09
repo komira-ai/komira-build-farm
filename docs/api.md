@@ -120,8 +120,8 @@ refusing would fail builds. An uncordon places it at once. The scheduler's unser
 wait (`--unservable-wait-secs`) still refuses work that no connected node, cordoned
 or not, could run, and the time spent waiting for a cordon does not count toward it.
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
-state. The protocol has no drain message yet:
-the daemon is not told, and the server simply sends it no new `Start`.
+state, and every start logs a warning that says so. The protocol has no drain
+message yet: the daemon is not told, and the server simply sends it no new `Start`.
 
 ## Planned
 

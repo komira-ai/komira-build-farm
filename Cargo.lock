@@ -1426,6 +1426,7 @@ name = "kbf-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "futures",
  "kbf-caps",
