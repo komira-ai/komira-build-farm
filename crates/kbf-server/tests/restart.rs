@@ -11,6 +11,8 @@
 
 mod support;
 
+use std::time::Duration;
+
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::reapi::{ExecuteOperationMetadata, WaitExecutionRequest};
 use prost::Message;
@@ -187,13 +189,14 @@ async fn a_restarted_server_does_not_answer_its_predecessor_s_operation_names() 
 }
 
 /// Catches issue #154 for an operation that finished before the restart (its waiter
-/// is gone from the old process, as most names a client still holds are): X's name is
-/// NOT_FOUND on the old process once X is done, and stays NOT_FOUND on the new one
-/// while Y runs under the same number. Also catches a parser that checks a stale
-/// process-wide term: the first lookup is on the old process.
+/// is gone from the old process, as most names a client still holds are: the old
+/// process here keeps no finished operation): X's name is NOT_FOUND on the old process
+/// once X is done, and stays NOT_FOUND on the new one while Y runs under the same
+/// number. Also catches a parser that checks a stale process-wide term: the first
+/// lookup is on the old process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finished_operation_s_name_stays_unknown_after_a_restart() {
-    let before = Cell::start().await;
+    let before = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, Duration::ZERO).await;
     let mut old = before.daemon("node-a", 4, 8).await;
     let x = Job::new("x, finished before the restart", &[]);
     before.upload(&x.blobs()).await;

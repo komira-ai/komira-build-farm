@@ -137,6 +137,7 @@ the following. "Live" means heard from within G; "grant" means a `Commit` of a
 | I13 | **Dedup.** A joinable request with an unfinished twin of the same instance and digest joins it; a non-joinable one never joins; a join never lowers QoS and a promoted operation is placed in its new order. | shadow in-flight map |
 | I14 | **The queue is the set of queued operations.** Each `Queued` operation not awaiting a refusal is queued once, at its current QoS; nothing else is. | `queued()` vs `state` |
 | I15 | **A seed replays.** Two runs of a seed give the same trace hash. | one test per file |
+| I16 | **A finished operation is kept for the retention, then dropped.** Its `state` is its finished state until the finished retention after it finished, and none from the first input at or after that; the scheduler holds exactly the unfinished operations and those finished within the retention (issue #165). F4 checks it. | `state`, `waiters`, `operations()` vs shadow |
 
 ### Liveness, at the end of a run
 

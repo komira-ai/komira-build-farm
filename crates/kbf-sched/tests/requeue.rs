@@ -10,8 +10,8 @@ use kbf_sched::{
     DaemonInstance, Event, Input, OpState, Request, Requeue, RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, Qos, Resources,
-    StateMachine, WaiterId, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -149,5 +149,97 @@ fn requeues_are_not_recorded_unless_asked_for() {
     let (mut s, grant) = running(Scheduler::new(1));
     feed(&mut s, LEASE_GRACE, Event::Tick);
     assert_eq!(s.state(grant.operation), Some(&OpState::Queued));
+    assert!(s.take_requeues().is_empty());
+}
+
+/// Runs `grant` to a committed result at `now`: Start, report, commit, answer.
+fn finish(s: &mut Scheduler, now: Duration, grant: &LeaseGrant) {
+    let committed = Event::Committed(ControlRecord::Lease(grant.clone()));
+    assert!(matches!(
+        feed(s, now, committed).as_slice(),
+        [Effect::Start(_)]
+    ));
+    let started = Event::Started {
+        operation: grant.operation,
+        lease: grant.lease,
+    };
+    assert!(feed(s, now, started).is_empty());
+    let effects = feed(s, now, report(grant));
+    let [Effect::Commit(record)] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    let effects = feed(s, now, Event::Committed(record.clone()));
+    assert!(
+        matches!(effects.as_slice(), [Effect::Answer(_)]),
+        "{effects:?}"
+    );
+}
+
+/// A successful report under `grant`'s lease.
+fn report(grant: &LeaseGrant) -> Event {
+    Event::Report {
+        operation: grant.operation,
+        lease: grant.lease,
+        outcome: Outcome::Completed {
+            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9),
+        },
+    }
+}
+
+/// Catches (issues #165 and #166 together): a requeue record that keeps its
+/// operation alive past the finished retention (memory then grows with every requeued
+/// operation), a record dropped or changed when its operation is, and a late report
+/// under the given-up lease (or the one that finished) that brings the dropped
+/// operation back. The record is a value: it outlives the operation, which is dropped
+/// on time; taking it afterwards finds the operation gone, and nothing panics.
+#[test]
+fn a_requeued_operation_is_dropped_after_the_retention_and_its_record_kept() {
+    let retention = Duration::from_secs(5);
+    let s = Scheduler::new(1)
+        .recording_requeues()
+        .with_finished_retention(retention);
+    let (mut s, given_up) = running(s);
+    up(&mut s, Duration::from_secs(10), "one");
+    heartbeat(&mut s, Duration::from_secs(11));
+    assert_eq!(s.state(given_up.operation), Some(&OpState::Queued));
+
+    let done_at = Duration::from_secs(12);
+    let effects = feed(&mut s, done_at, Event::Tick);
+    let [Effect::Commit(ControlRecord::Lease(again))] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    let again = again.clone();
+    assert_eq!(again.operation, given_up.operation);
+    assert_ne!(again.lease, given_up.lease);
+    finish(&mut s, done_at, &again);
+    assert!(s.state(given_up.operation).is_some_and(OpState::is_done));
+    assert_eq!(s.operations(), 1);
+
+    // Just before the retention ends it is still there; at its end it is dropped,
+    // though the requeue record naming it has not been taken.
+    heartbeat(&mut s, done_at + retention - Duration::from_millis(1));
+    assert_eq!(s.operations(), 1, "dropped within the retention");
+    heartbeat(&mut s, done_at + retention);
+    assert_eq!(s.operations(), 0, "kept alive by its requeue record");
+    assert_eq!(s.state(given_up.operation), None);
+    assert_eq!(s.waiters(given_up.operation), None);
+
+    // The record is intact, handed out once, and names an operation now gone.
+    assert_eq!(
+        s.take_requeues(),
+        vec![Requeue {
+            operation: given_up.operation,
+            lease: given_up.lease,
+            worker: WorkerId::new("node-a"),
+            reason: RequeueReason::Reconnected,
+        }]
+    );
+    assert!(s.take_requeues().is_empty(), "a requeue taken twice");
+
+    // Late reports under either lease are dropped, as for any unknown operation.
+    let later = done_at + retention + Duration::from_secs(1);
+    assert!(feed(&mut s, later, report(&given_up)).is_empty());
+    assert!(feed(&mut s, later, report(&again)).is_empty());
+    assert_eq!(s.operations(), 0, "brought back by a late report");
     assert!(s.take_requeues().is_empty());
 }

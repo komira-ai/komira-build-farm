@@ -29,7 +29,9 @@
 //! - cordon and drain ([`Cordon`]): placement skips a cordoned worker, whose leases run
 //!   on; a drain waits for them until a deadline, then pauses, and never kills. Work
 //!   only cordoned workers could run waits, naming them, and is not refused for it; an
-//!   uncordon places queued work at once.
+//!   uncordon places queued work at once;
+//! - a finished operation is kept for [`FINISHED_RETENTION`] after its waiters are
+//!   answered, then dropped (issue #165).
 //!
 //! Not yet: placement scoring (alignment, best fit), reclaimed
 //! room and preemption, the infra retry budget, and committing submissions so that a
@@ -51,4 +53,4 @@ pub use cordon::Cordon;
 pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
 pub use requeue::{Requeue, RequeueReason};
-pub use scheduler::{OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};
+pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

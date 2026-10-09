@@ -694,7 +694,11 @@ async fn the_driver_runs_against_the_farm() {
         MemoryStore::new(Capabilities::default()),
         KeyPrefix::default(),
     ));
-    let farm = Farm::new(cache, kbf_sched::UNSERVABLE_WAIT);
+    let farm = Farm::new(
+        cache,
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
     let (outbound, _responses) = tokio::sync::mpsc::unbounded_channel();
     let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
     farm.register(

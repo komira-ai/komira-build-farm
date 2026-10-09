@@ -14,12 +14,16 @@
 //!   metadata key `why`) in `partial_execution_metadata.auxiliary_metadata`.
 //!
 //! WaitExecution streams the same updates for an operation name Execute returned, until
-//! it is done. A finished operation is forgotten: waiting on it is NOT_FOUND, and the
-//! client's next Execute is answered from the action cache.
+//! it is done. A finished operation is kept for a short retention the [`Dispatch`]
+//! sets, in which waiting on it streams the done operation; after that it is
+//! forgotten, waiting on it is NOT_FOUND, and the client's next Execute is answered
+//! from the action cache (or runs the action again, if its result was not cached).
 //!
 //! When the server is going away ([`Closer::close`]), every open Execute and
 //! WaitExecution stream that is not done ends UNAVAILABLE, which REAPI clients retry
-//! (issue #168); one opened after that ends UNAVAILABLE after its first operation.
+//! (issue #168); one opened after that ends UNAVAILABLE after its first operation. A
+//! WaitExecution on an operation kept finished is answered even then: its first
+//! operation is the done one, and the stream ends there.
 //!
 //! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
 //! not read yet), and every action is hermetic, so it may be joined (a `networked`
@@ -153,7 +157,8 @@ pub trait Dispatch: Send + Sync + 'static {
     /// The scheduler cannot take work (UNAVAILABLE).
     fn submit(&self, submission: Submission) -> Result<Ticket, Status>;
 
-    /// A new ticket on the unfinished operation called `name`, if there is one.
+    /// A new ticket on the operation called `name`, if it is unfinished or finished
+    /// within the dispatcher's retention (its ticket's stage is then already done).
     fn wait(&self, name: &str) -> Option<Ticket>;
 }
 
@@ -258,8 +263,8 @@ where
         match self.dispatch.wait(&name) {
             Some(ticket) => Ok(Response::new(operations(ticket, self.closing.clone()))),
             None => Err(Status::not_found(format!(
-                "no unfinished operation {name:?}; a finished one is answered by Execute \
-                 from the action cache"
+                "no operation {name:?}: finished operations are kept only briefly; \
+                 Execute answers a finished one from the action cache"
             ))),
         }
     }

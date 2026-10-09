@@ -465,25 +465,63 @@ async fn wait_execution_follows_a_running_operation() {
     let last = done(&mut waited).await;
     assert_eq!(last.name, name);
     assert_eq!(response(&last).result, Some(result));
-
-    let gone = cell
-        .exec()
-        .wait_execution(WaitExecutionRequest { name })
-        .await
-        .expect_err("a finished operation is forgotten");
-    assert_eq!(gone.code(), Code::NotFound);
 }
 
-/// WaitExecution on `name`: the name of the first operation it streams, or the code.
-async fn wait_name(cell: &support::Client, name: &str) -> Result<String, Code> {
-    let mut ops = cell
+/// Catches (issue #165): a finished operation forgotten as soon as it is answered,
+/// so a client whose Execute stream broke just before the answer cannot get it by
+/// WaitExecution, and runs again an action whose result the cache does not keep (a
+/// non-zero exit); and one kept past the retention (the farm's memory then grows with
+/// every operation). Within the retention WaitExecution streams the done operation
+/// with its result, once; after it the name is NOT_FOUND.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_operation_is_waited_on_within_the_retention_then_not_found() {
+    let retention = Duration::from_secs(1);
+    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, retention).await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("exits 1", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&cell, "not cached", 1).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    let name = done(&mut ops).await.name;
+    assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+
+    let mut waited = wait_stream(&cell, &name).await.expect("kept");
+    let first = waited
+        .message()
+        .await
+        .expect("a stream")
+        .expect("an update");
+    assert_eq!(first.name, name);
+    assert_eq!(response(&first).result, Some(result));
+    assert!(
+        waited.message().await.expect("a stream").is_none(),
+        "more after done"
+    );
+
+    tokio::time::sleep(retention + Duration::from_millis(500)).await;
+    assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
+}
+
+/// WaitExecution on `name`: its stream, or the code.
+async fn wait_stream(
+    cell: &support::Client,
+    name: &str,
+) -> Result<tonic::Streaming<kbf_proto::google::longrunning::Operation>, Code> {
+    let ops = cell
         .exec()
         .wait_execution(WaitExecutionRequest {
             name: name.to_owned(),
         })
         .await
-        .map_err(|s| s.code())?
-        .into_inner();
+        .map_err(|s| s.code())?;
+    Ok(ops.into_inner())
+}
+
+/// WaitExecution on `name`: the name of the first operation it streams, or the code.
+async fn wait_name(cell: &support::Client, name: &str) -> Result<String, Code> {
+    let mut ops = wait_stream(cell, name).await?;
     Ok(ops
         .message()
         .await
@@ -517,12 +555,15 @@ async fn wait_execution_refuses_the_name_spelling_without_a_term() {
     assert_eq!(wait_name(&cell, &name).await, Ok(name));
 }
 
-/// Catches: a refused operation whose caller is not forgotten. WaitExecution on its
-/// name would then replay the refusal (or follow a waiter nothing will ever answer
-/// again) instead of answering NOT_FOUND, as for every other finished operation.
+/// Catches: a refused operation whose caller is never forgotten (WaitExecution on its
+/// name would replay the refusal forever, and the farm keep it), or forgotten at once
+/// (a caller that reconnects within the retention loses the reason). Within the
+/// retention WaitExecution streams the refusal; after it, NOT_FOUND, as for every
+/// other finished operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_operation_is_forgotten() {
-    let cell = Cell::start_with_unservable_wait(Duration::from_millis(300)).await;
+async fn a_refused_operation_is_forgotten_after_the_retention() {
+    let retention = Duration::from_secs(1);
+    let cell = Cell::start_with(Duration::from_millis(300), retention).await;
     let mut linux = cell.daemon("node-b", 4, 8).await;
     let job = Job::new("mac only", &[("OSFamily", "macos")]);
     cell.upload(&job.blobs()).await;
@@ -541,8 +582,18 @@ async fn a_refused_operation_is_forgotten() {
 
     let status = response(&done(&mut ops).await).status.expect("a status");
     assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
-    assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
+    let mut waited = wait_stream(&cell, &name).await.expect("kept");
+    let first = waited
+        .message()
+        .await
+        .expect("a stream")
+        .expect("an update");
+    let again = response(&first).status.expect("a status");
+    assert_eq!(again, status, "the refusal is not the one answered");
     linux.no_work().await;
+
+    tokio::time::sleep(retention + Duration::from_millis(500)).await;
+    assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
 }
 
 /// Catches: a `kbf-lease` kind dropped on the way to the `Start` (a whole-machine

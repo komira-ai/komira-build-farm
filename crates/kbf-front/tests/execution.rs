@@ -292,7 +292,8 @@ async fn failures_and_abandoned_operations_end_the_stream() {
 /// ending them UNAVAILABLE, which clients retry; a stream opened after the close that
 /// stays open; and a done operation already there lost to the close (each of eight
 /// streams must get its done operation, so a close noticed first fails all but once in
-/// 256 runs).
+/// 256 runs); and a WaitExecution after the close on an operation kept finished (issue
+/// #165) ended UNAVAILABLE or left open instead of answered.
 #[tokio::test]
 async fn closing_ends_open_streams_unavailable() {
     let script = Arc::new(Script::default());
@@ -335,6 +336,20 @@ async fn closing_ends_open_streams_unavailable() {
         assert!(done.done, "{done:?}");
         assert_eq!(next(ops).await.expect("healthy"), None);
     }
+
+    // A WaitExecution after the close on an operation kept finished (issue #165) is
+    // answered with its done operation, not UNAVAILABLE, and the stream ends.
+    let mut kept = farm
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: "operations/1".to_owned(),
+        })
+        .await
+        .expect("WaitExecution after the close")
+        .into_inner();
+    let done = next(&mut kept).await.expect("healthy").expect("done");
+    assert!(done.done, "{done:?}");
+    assert_eq!(next(&mut kept).await.expect("healthy"), None);
 
     let mut late = start(&farm, &job.action).await.expect("Execute");
     next(&mut late).await.expect("healthy").expect("queued");
