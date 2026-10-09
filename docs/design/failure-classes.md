@@ -10,13 +10,32 @@ retries in [scheduler.md](scheduler.md#outcomes), node reports in
 Line numbers are on `main` at the merge of #177; paths are under `crates/`. "Proposed"
 means no code yet.
 
+## CEO rulings (2026-10-09)
+
+Four questions this draft had left open were ruled on 2026-10-09. They are recorded as
+**decided**; every other decision in sections 6 and 11 is still an option with a lean.
+
+1. **Out of memory is the farm's until no node is large enough** (6.1). "If an action
+   goes over memory it could be a code update requires more memory than it previously
+   used. That's not always an action fault." An out-of-memory kill is Farm: the server
+   reruns at a larger memory booking and remembers it; the action's error only when the
+   largest node is not enough.
+2. **A timeout is the action's** (6.2). The client set the limit. A paused or frozen
+   node is not a timeout: the fence and lease rules handle it, as Farm.
+3. **Flakes are tracked** (6.3): the same action digest observed both passing and
+   failing, recorded per digest and shown, never rerun until green.
+4. **#173 is extended, not merged start-only** (section 11, decision 4): "I would
+   rather be alerted if I need to do something than just remove a box from the build
+   farm." An Xcode left out is reported with its reason and fix, re-checked, and
+   alerted.
+
 ## 1. The classes
 
 | Class | Meaning | Whose to fix | Example |
 |---|---|---|---|
-| **Farm** | The farm could not run the action, or ran it on a node unfit to run it. | the operator | Xcode licence not accepted; scratch disk full; lost contact; a blob the CAS lost |
+| **Farm** | The farm could not run the action, or ran it on a node unfit to run it, or with too little memory booked. | the operator, or the farm itself | Xcode licence not accepted; scratch disk full; lost contact; a blob the CAS lost; an out-of-memory kill below the largest node (6.1) |
 | **Request** | The action cannot run as written, on any node. | the client | a Command with no arguments; an output over the size limit; a blob never uploaded |
-| **Action** | The action ran on a fit node and exited non-zero, or ran past its timeout. | the action's author | a compile error; a failed assertion; a crashed test harness |
+| **Action** | The action ran on a fit node and exited non-zero, ran past the timeout its client set, or needs more memory than any node offers. | the action's author | a compile error; a failed assertion; a crashed test harness; a timeout (6.2) |
 | **Ambiguous** | It ran and failed in a way the farm cannot yet attribute. Resolved by one rerun on another node (section 1.1); never the final answer. | resolved to Farm or Action | a SIGKILL or SIGTERM kbf did not send |
 
 **Test failure vs test error** is a split inside Action, and it belongs to the client.
@@ -48,7 +67,9 @@ second run decides:
 
 The Ambiguous rerun is one of the operation's 2 extra runs (6.5). An action that kills
 itself with SIGKILL every time therefore ends OK with exit 137 after exactly 2 runs; it
-is never answered `INTERNAL`.
+is never answered `INTERNAL`. Both runs are kept in the digest's outcome history, so an
+Ambiguous run followed by a pass is visible as a possible flake (6.3), not erased by the
+answer.
 
 ## 2. What the code does today
 
@@ -102,10 +123,12 @@ buck2 exit 3, a user error.
    Only exit 137 with a counted `oom_kill` is caught
    (`kbf-driver-container/src/runtime.rs:300-311`).
 5. Scratch disk full while the action runs.
-6. A slow or paused node pushing an action past its timeout (arrives as
-   `DEADLINE_EXCEEDED`, blamed on the action).
-7. Environment drift: a missing tool on `PATH`, the wrong `DEVELOPER_DIR`, leftovers
+6. Environment drift: a missing tool on `PATH`, the wrong `DEVELOPER_DIR`, leftovers
    of another lease.
+
+A paused or suspended node is not on this list: it does not turn into a timeout
+(6.2). Its gap is a different one, #167: a daemon frozen while the machine runs cannot
+kill its action, which keeps running beside the requeued copy.
 
 ### And the other way round
 
@@ -124,8 +147,9 @@ buck2 exit 3, a user error.
 ### What the open pull requests change
 
 - **#173** runs `xcodebuild -license check` and `xcrun --find clang` at daemon start and
-  leaves out an Xcode that fails. It checks once, logs, and raises no alert: actions
-  then wait for the unservable bound and are refused, or capacity quietly shrinks. It
+  leaves out an Xcode that fails. As first written it checks once, logs, and raises no
+  alert: actions then wait for the unservable bound and are refused, or capacity
+  quietly shrinks. It is being extended before it merges (section 11, decision 4). It
   touches `discover`, as #172 does; expect a conflict.
 - **#172** fixes the sandbox denials for temp items and the `xcrun` cache. #161
   (orphaned runs) and #174 (retention) change nothing a client sees.
@@ -295,7 +319,7 @@ These need no guessing, only keeping the reason the daemon already writes:
   "exited with N" and "ended by signal S" as different values; 128+N is computed only
   when the `ActionResult` is written. `exit(137)` is Action, never rerun.
 - **Who sent the signal.** The daemon knows each kill it makes (timeout, cancel, fence,
-  over-booking). Any other SIGKILL or SIGTERM is Ambiguous (section 1.1). A signal the
+  the memory watch). Any other SIGKILL or SIGTERM is Ambiguous (section 1.1). A signal the
   kernel raises on the program's own fault (SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE) is
   Action. A SIGSEGV someone else sent with `kill` cannot be told apart, and is accepted
   as Action.
@@ -329,7 +353,8 @@ The rule from section 3: on a non-OK answer every word a person needs is in
 | Action | OK | the action's | `ExecuteResponse.message` names the node. On a failure both clients print it; on a success buck2 keeps it in the event log and Bazel prints it only with `--remote_print_execution_messages=success` | exit 0 only, as today |
 | Ambiguous, resolved | OK | the deciding run's (section 1.1) | `ExecuteResponse.message`: "ran twice: ended by <signal> on A, then <outcome> on B". Visible as for Action | as Action |
 | Action, timeout | `DEADLINE_EXCEEDED`, with the partial result (#45) | none | `status.message`: node and timeout. buck2 shows it as ENVIRONMENT and drops the partial result; Bazel shows it and the partial outputs | no |
-| Farm, rerun succeeded | OK | the action's | `ExecuteResponse.message`: "ran on B after a farm fault on A: <reason>". Visible as for Action | as Action |
+| Action, needs more memory than any node offers (6.1) | `FAILED_PRECONDITION` | none | `status.message`: "kbf: the action needs more memory than any node offers: killed at <used> GiB with <booked> GiB booked on <node>, the largest node for its platform. Runs: n (<bookings>)." buck2 USER, exit 3, as for a failed action; Bazel exit 34, not retried | no |
+| Farm, rerun succeeded | OK | the action's | `ExecuteResponse.message`: "ran on B after a farm fault on A: <reason>", or "ran with <N> GiB booked after an out-of-memory kill at <M> GiB on A". Visible as for Action | as Action |
 | Farm, runs used up, or the capability withdrawn everywhere | `INTERNAL` | none | `status.message`: "kbf farm fault on <node>: <reason>. Operator fix: <fix>. Runs: n." Both clients show it | no |
 | Request | `FAILED_PRECONDITION`, or `INVALID_ARGUMENT` for a malformed action (6.7) | none | `status.message`: the limit or field at fault | no |
 | Missing blob | `FAILED_PRECONDITION` + `MISSING`, nothing else | none | `status.message`: the blobs | no |
@@ -338,7 +363,8 @@ The rule from section 3: on a non-OK answer every word a person needs is in
 **Details.** A non-OK answer other than a `MISSING` one also carries a
 `google.rpc.ErrorInfo` with domain `kbf` (the front already uses it for
 `NO_WORKER_CAN_RUN`, `kbf-front/src/execution.rs:92`), reason `FARM_FAULT`,
-`REQUEST_ERROR` or `ACTION_TIMEOUT`, and metadata `node`, `signature`, `probe`, `runs`.
+`REQUEST_ERROR`, `ACTION_TIMEOUT` or `ACTION_OUT_OF_MEMORY`, and metadata `node`,
+`signature`, `probe`, `runs`.
 A `MISSING` answer carries the `PreconditionFailure` and nothing else (section 3, fact
 5). No client reads the ErrorInfo today; it is for our UI, our CLI and any client that
 learns to.
@@ -353,59 +379,168 @@ running Bazel builds. buck2 builds fail the open actions as INFRA either way.
 **Deliberate departures from the spec's wording**, recorded so no one "fixes" them:
 
 - Withdrawn-everywhere is `INTERNAL`, not `FAILED_PRECONDITION` (4.1).
-- Over-booking after its rerun is `FAILED_PRECONDITION`, not `RESOURCE_EXHAUSTED` (6.1):
-  the spec's quota wording fits the latter, but Bazel would retry it five times at the
-  same size.
+- Needing more memory than any node offers is `FAILED_PRECONDITION`, not
+  `RESOURCE_EXHAUSTED` (6.1): the spec's quota wording fits the latter, but Bazel would
+  retry it five times at the same size, and buck2 would exit 2 instead of a failed
+  action's 3.
 - Program not found inside the input root is answered as an `ActionResult` with exit
   127 that the program never produced (6.7). It is safe only because a non-zero exit is
   never cached.
 
-## 6. Open decisions, with options
+## 6. Decisions: ruled and open
 
-### 6.1 Out-of-memory attribution
+6.1 to 6.3 are **decided** (CEO rulings of 2026-10-09). 6.4 to 6.7 are open, with leans.
 
-- **A. Booking decides.** Used more than the lease booked: the action's. Killed below
-  its booking: Farm (the node overcommitted).
-- **B. Always Farm, rerun with a larger booking** (double, up to the largest node);
-  only past the largest node is it the action's.
-- **C. Always the action's** (today's native behaviour, without the retry).
+### 6.1 Out of memory (DECIDED)
 
-A blames correctly but needs the cgroup count on every exit and, on macOS, a way to
-see a memory-pressure kill (UNVERIFIED that `kern.memorystatus` or the unified log
-gives it cheaply). B is simple and self-healing but hides a real leak behind reruns. C
-is wrong for node pressure. **Lean: A with B's retry.** Over-booking is rerun once with
-twice the booking, whoever set the booking. If it fails again, answer
-`FAILED_PRECONDITION` "used X, booked Y". Who set the booking changes the text and the
-accounting only: when the estimator set it, the message says so and both runs are
-charged to the farm. Killed below its booking: Farm. A SIGKILL kbf did not send and
-cannot attribute: Ambiguous.
+**Ruling.** An out-of-memory kill is Farm. A change to the code can legitimately need
+more memory than the action used before, so the farm reruns it with more; it is the
+action's only when the largest node is not enough. The draft's "booking decides"
+attribution is dropped: whether the run was over or under its booking, and who set the
+booking (the client's `kbf-book-mem-gib`, the default, a learned size), no longer
+change the class.
 
-### 6.2 Timeouts on slow or paused nodes
+**What counts as an out-of-memory kill.** The native driver's memory watch killing the
+tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), or a kernel
+OOM kill counted in the lease cgroup's `oom_kill`, read on every exit code (4.3). A
+SIGKILL kbf did not send and cannot tie to memory (a macOS memory-pressure kill with no
+record of it) stays Ambiguous (1.1). The container driver sets no per-lease
+`memory.max` ([daemon.md](daemon.md), "Cgroups and limits"), so its kills come from the
+node's `actions/` limit or the kernel; a larger booking still helps, because placement
+then keeps that much more room free on the node.
 
-- **A. Always the action's** (today).
-- **B. Measure the node.** The daemon records, per lease, time the machine was
-  suspended (monotonic clock against boot clock on Linux, continuous against absolute
-  time on macOS), time the daemon or child was stopped, and node pressure (Linux PSI
-  `full` on CPU, memory, IO). Above a threshold the timeout is Farm and reruns
-  elsewhere with the same timeout.
-- **C. Rerun every timeout once** elsewhere.
+**The ladder.** The server reruns the operation with its memory booking doubled, in
+whole GiB, up to the **cap**: the largest memory of any node, live or cordoned at the
+time of the kill, whose capabilities fit the action's platform. A doubling that would
+pass the cap books the cap; the run at the cap is the last rung.
 
-C doubles the cost of every real hang. A blames the action for a sleeping node. **Lean:
-B**, with thresholds set from pilot data, and F2.6 (suspend and resume) extended to
-expect a Farm verdict above them. #45 makes an Action timeout show its partial output
-in Bazel; buck2 drops the result on any non-OK status, so buck2 users never see it.
+- **Its own bound, not the 6.5 budget.** Counting the ladder toward the 3-run budget
+  would answer the action's error at four times the first booking, far below the
+  largest node, which is what the ruling rejects. The ladder is bounded by itself: from
+  booking `b` to cap `c` it is at most ceil(log2(c / b)) reruns, 9 from the 1 GiB
+  default to a 512 GiB node. The bookings double, so the whole ladder books less
+  memory than two runs at the cap, and a killed run usually ends early.
+- Farm and Ambiguous results during the ladder use the 6.5 budget as usual, so an
+  operation runs at most 3 times plus the ladder's length.
+- A rung may run on the same node: a memory kill says nothing against the node. A kill
+  below the run's own booking does (the node ran out, not the action), and counts as a
+  farm fault on that node (section 8).
+- A rung waits for room like any request. The cap is taken from live and cordoned
+  nodes, so a rung never books more than a node the scheduler knows of could give it.
 
-### 6.3 Flaky detection
+**The remembered booking.** The booking of the rung that passed is kept as a **memory
+floor** for the action's key, and later requests at that key book at least the floor
+(never less than they ask).
 
-- **A. None in the farm**: clients have `--flaky_test_attempts` and their own reruns.
-- **B. Record, do not act.** Keep outcome history per action digest and per node; a
-  digest that fails on one node and passes on another is flagged; a node whose
-  failures pass elsewhere more often than its peers' raises a node-suspicion alert.
-- **C. Rerun every Action failure** once to detect flakes.
+- **The key is not the digest.** The case the ruling describes, a code change, makes a
+  new digest, so a floor kept per digest would never help the next commit. The key is
+  what a code change keeps: the platform properties, the Command's output paths and its
+  first argument. Where the request carries REAPI `RequestMetadata`
+  (`action_mnemonic`, `target_id`, `configuration_id`), those join the key. Which of
+  these buck2 sends is UNVERIFIED; the output-path key needs nothing from the client.
+- **Where it is kept.** In the scheduler's sizing state, as the first piece of the
+  planned learned sizes ([scheduler.md](scheduler.md), "Learned sizes": "raised quickly
+  after an overshoot and lowered slowly"). Today the scheduler's state lives only in the
+  server process, so a server restart forgets the floors; that costs one more
+  out-of-memory run per key, never a wrong answer. With the replicated control log
+  (scheduler.md, "More than one server") floors are committed records like any other.
+- **Decay and reset.** A floor halves (never below the default booking) after 20
+  consecutive passing runs at the key whose measured peak stayed under half of it, and
+  is dropped after 30 days with no run at the key. An operator can clear one key or all
+  through the server's API (planned). The numbers are a start, to be set from pilot
+  data. Decay needs each driver to report the action's whole-tree peak: the native
+  watch measures it, the container driver can read the lease cgroup's `memory.peak`;
+  today's `ResourceUsage` holds one process's peak only.
 
-C doubles the cost of every real failure and hides flakes from their authors. **Lean:
-B.** The farm reruns only Farm and Ambiguous results; the node-suspicion alert is how
-an undetected farm fault (one with no signature yet) gets found.
+**When the cap is not enough.** A kill at the cap is the action's. It is answered
+`FAILED_PRECONDITION` with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` and the text
+of section 5: buck2 shows it as USER, exit 3, the same exit as a failed action; Bazel
+does not retry it and exits 34; both show `status.message`. The last run's stderr tail
+goes into `server_logs`. Not the alternatives:
+
+- not OK with exit 137: the program produced no exit code; a made-up 128+9 reads in a
+  test runner as a crash, not as "needs a bigger node", and breaks the invariant that
+  OK means the run went to its end;
+- not `RESOURCE_EXHAUSTED`: Bazel retries it 5 times at the same size, and buck2 exits
+  2 (section 3).
+
+The key's floor then records "over the cap of <c> GiB". A repeat of the same digest is
+answered at once, without a run, while the cap is unchanged (a larger node registering
+clears it; `skip_cache_lookup` bypasses it), so a Bazel retry or a rebuild does not
+climb the ladder again. A new digest at the key starts at the cap and runs once.
+
+### 6.2 Timeouts (DECIDED)
+
+**Ruling.** An action's timeout is Action: the client set it (`Action.timeout`, from
+the buck2 rule or Bazel's test size). It is answered `DEADLINE_EXCEEDED` with the
+partial result (#45) and `ACTION_TIMEOUT`, and never rerun. buck2 tags every
+`DEADLINE_EXCEEDED` ENVIRONMENT and drops the partial result (section 3, fact 6); that
+is the client's tiering, and `status.message` says the action's own timeout was reached.
+
+**A paused or frozen node is not a timeout.** The fence and lease rules handle it, and
+the operation is requeued, as Farm:
+
+- **The machine suspended.** The drivers' timeout timers run on tokio's monotonic
+  `Instant`, which does not advance while the machine sleeps, while the fence clock
+  counts suspension (`CLOCK_BOOTTIME`, `mach_continuous_time`; [daemon.md](daemon.md)).
+  A suspend past T = 40 s therefore ends in the fence: the run is killed and reported
+  `ABORTED`, Farm. Past G = 60 s the server has already given the lease up and
+  requeued the operation (`kbf-sched/src/requeue.rs`), outside the rerun budget, and
+  the late result loses (simulation I5). On resume the fence is checked first
+  (simulation F2.6).
+- **The daemon stopped, the machine running** (SIGSTOP, a debugger, swap thrash). A
+  native action runs on in its own process group, so a timeout it reaches is its own
+  wall time. Past G the server requeues. The frozen daemon cannot kill its run, which
+  keeps running beside the requeued copy until the daemon resumes and fences it:
+  **#167** (open). That is a duplicate-run gap, not a misattributed timeout.
+
+Attributing timeouts by node pressure is dropped: placement never books more than a
+node's capacity, so a slow action on a fit node is the action's. Per-lease suspended
+and stopped time and Linux PSI may come back as metrics (section 9), never as a verdict.
+
+### 6.3 Flakes (DECIDED)
+
+**Ruling.** Flaky actions are tracked. **A flaky action is an action digest observed
+both succeeding (exit 0) and failing (an Action-class non-zero exit or timeout).**
+
+- **Recorded per digest**: each run's node, class, exit code or signal, time and
+  operation, and per digest the counts of passes and failures and when each was first
+  and last seen. A bounded table on the server today; a query over the planned usage
+  records ([scheduler.md](scheduler.md), "Accounting") once each record carries its
+  run's class and outcome.
+- **Shown** in the API (`GET /v1/flakes`, planned: digest, counts, nodes, last seen,
+  and the target when `RequestMetadata` names it) and in the UI.
+- **Never acted on.** No rerun until green, and no rerun of an Action failure to look
+  for a flake; the client gets the run's own result. Rerunning Action failures would
+  double the cost of every real failure and hide flakes from their authors.
+
+**When a flake is observed.** A pass is cached, so after it the same digest normally
+never runs again. A flake is seen when:
+
+1. a failed run (not cached) is followed by a later request for the same digest, which
+   runs and passes (typically the next build after a failure);
+2. a request bypasses the cache (`skip_cache_lookup`, `do_not_cache`; for example
+   Bazel's `--runs_per_test` or `--nocache_test_results`) and runs a digest that passed
+   before;
+3. within one operation, a farm rerun (6.5) follows a run whose ending looked like the
+   action's own.
+
+A pass followed by a failure is seen only in case 2. The record is a lower bound, and
+the API and UI say so.
+
+**Farm reruns must not hide a flake.** Every run of an operation is recorded with its
+own outcome, not only the run that was answered:
+
+- An Ambiguous run (a signal kbf did not send) followed by a pass is answered OK, and
+  its first run counts as a farm fault on its node (1.1). The digest is recorded with
+  both runs and marked a **possible flake**; any later Action-class failure of it makes
+  it flaky.
+- A run a probe proved Farm (4.2) does not count toward flakiness: the probe proved the
+  node. Neither does a rung of the memory ladder (6.1).
+
+**Node suspicion**, kept from the draft: a node whose Action failures pass elsewhere
+more often than its peers' raises an alert (section 8). It is how a farm fault with no
+signature yet gets found.
 
 ### 6.4 Known signatures: allowlist or heuristics
 
@@ -429,7 +564,8 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
   Farm or Ambiguous results. The operation keeps its place and its queue time. Leases
   given up for silence, replacement, reconnection or not starting (`requeue.rs`) are
   not results and do not use the budget, as today; bounding those is a separate
-  question (#22).
+  question (#22). Out-of-memory reruns have their own bound, the ladder of 6.1, and
+  do not use this budget either.
 - **Excluded nodes.** The operation records the nodes whose runs ended Farm or
   Ambiguous and is not placed on them again. If no node outside that set can serve it,
   the answer is given at once, by the class of the last run, with no wait.
@@ -466,7 +602,9 @@ when a client can use it.
 `INVALID_ARGUMENT` is what REAPI names for a malformed action, but buck2 tags it INFRA.
 `FAILED_PRECONDITION` gives buck2 USER and Bazel no retry. **Lean:** keep
 `INVALID_ARGUMENT` for a malformed action (rare, and spec-named); use
-`FAILED_PRECONDITION` for output over the size limit and over-booking. Program not
+`FAILED_PRECONDITION` for output over the size limit (and, decided in 6.1, for an
+action that needs more memory than any node offers, which is Action, not Request,
+and says so in its `ErrorInfo`). Program not
 found: a path inside the input root is Action (exit 127 with kbf's message on stderr,
 as a shell and podman would; a spec departure, section 5); an absolute path outside it,
 missing on this node while peers of the same platform have it, is environment drift,
@@ -483,7 +621,9 @@ so Farm.
 - **`server_logs`**: a run history blob per operation (each run's node, class, reason,
   stderr tail). Bazel fetches it on failure; the UI reads it.
 - **`/v1/nodes`**: per node, each capability's probe state (ready, withdrawn with
-  reason and fix, since when) and the last farm faults.
+  reason and fix, since when) and the last farm faults. The extended #173 starts this
+  with the Xcodes it leaves out (section 11, decision 4).
+- **`/v1/flakes`** (planned): the flake record of 6.3.
 - **Usage records** (planned in scheduler.md, "Accounting"): the class of each lease, so
   farm reruns are charged to the farm.
 
@@ -497,7 +637,7 @@ to resume serving.** An alert may wait for a person; service does not. This need
 | Alert | Fires when | Says | Resolves when |
 |---|---|---|---|
 | Capability withdrawn | a probe fails | node, capability, probe output, fix command | the capability returns (4.1 hysteresis) |
-| Farm fault without a probe | a driver or control fault | node, reason, count in the last 15 minutes | 15 minutes pass with no such fault on that node |
+| Farm fault without a probe | a driver or control fault, or an out-of-memory kill below the run's own booking (6.1) | node, reason, count in the last 15 minutes | 15 minutes pass with no such fault on that node |
 | Node suspicion | section 6.3's ratio over a threshold | node, digests that passed elsewhere | the ratio drops below the threshold |
 | Farm verdict memoised | section 6.5's memo used | action, nodes tried, reasons | the memo expires or is cleared |
 | Lost blob | section 4.3 | digest, when it was uploaded | the operator acknowledges it (service never waited: the client re-uploaded) |
@@ -522,6 +662,11 @@ node:
 - `kbf_capability_ready{capability}` (gauge) and `kbf_probe_runs_total{probe, result}`
 - `kbf_signature_matches_total{signature, proven}`
 - `kbf_ambiguous_reruns_total{second}` (`same`, `passed`, `other`)
+- `kbf_oom_reruns_total{rung}`, `kbf_oom_over_cap_total`, and the number of memory
+  floors held (6.1)
+- `kbf_flaky_digests` and `kbf_possible_flaky_digests` (gauges, 6.3)
+- possibly later, as metrics only and never as a verdict (6.2): per-lease time the
+  machine was suspended or the daemon stopped, and Linux PSI
 - time from withdrawal to recovery
 - **the leak canary**: OK results with exit 69, 126 or 127, or ended by a signal kbf
   did not send and the kernel did not raise for the program's own fault, per node,
@@ -541,7 +686,13 @@ New invariants beside [simulation.md](simulation.md#4-invariants) I1-I15:
   lease whose run the daemon model marked as on a node fit for the action's
   capabilities.
 - **I17. Farm runs are bounded and spread.** No operation runs more than 3 times after
-  Farm or Ambiguous results, and no two of those runs are on the same node.
+  Farm or Ambiguous results, and no two of those runs are on the same node. Rungs of
+  the memory ladder are counted apart (I18).
+- **I18. The memory ladder climbs and stops.** Each out-of-memory rerun books more
+  memory than the run before it and never more than the cap (6.1); an
+  `ACTION_OUT_OF_MEMORY` answer follows only a kill at the cap.
+- **I5 and F2.6, unchanged, now carry 6.2**: a suspend never produces
+  `DEADLINE_EXCEEDED`; past T it is a fence, past G a requeue.
 - **I10, amended** as in section 4.1.
 
 The daemon model gains a fault: **an unfit node** that exits 69 with the licence text
@@ -558,6 +709,8 @@ recovery time. It joins F2 (as a worker fault) and F3 (as a capability routing c
 | 6 | F3, unfit node recovers at a random time on the virtual clock | after recovery the memo is cleared and a repeat runs | the memo ignores capability recovery |
 | 7 | F2, the unfit-node fault | I16 | the step after a run returns the `ActionResult` (OK, exit 69) even when the probe failed |
 | 8 | F2, the unfit-node fault | I16 | `farm.rs` `outcome()` returns `Completed` for a result the daemon marked Farm |
+| 29 | F2 with a memory fault: each action needs a random size from 1 GiB to above the largest node; nodes of mixed sizes, some cordoned | I18, I17 | count the ladder in the 3-run budget (answers at 4 GiB); no cap (a rung books more than any node and waits out the unservable bound) |
+| 33 | F2.6 with an action timeout shorter than the suspend: a 10 s timeout, a suspend of 50 s (past T) 5 s into the run | `ABORTED` by the fence and requeued; never `DEADLINE_EXCEEDED`; no flake recorded | the daemon model's timeout counts suspended time |
 
 ### 10.2 Real processes
 
@@ -566,7 +719,7 @@ the daemon's clock seam driven by the test.
 
 | # | Setup | Expect | Mutant |
 |---|---|---|---|
-| 9 | Licence lapses after start: the fake answers `-license check` with 0, then 69; the action exits 69 with the licence text | the probe reruns, the Xcode is withdrawn, the Result is Farm with the exact fix string pinned; flip the fake back, trigger 2 probes 60 s apart on the test clock: the Xcode returns | trust the signature without the probe; check only at start (#173 as written fails this) |
+| 9 | Licence lapses after start: the fake answers `-license check` with 0, then 69; the action exits 69 with the licence text | the probe reruns, the Xcode is withdrawn, the Result is Farm with the exact fix string pinned; flip the fake back, trigger 2 probes 60 s apart on the test clock: the Xcode returns | trust the signature without the probe; check only at start (#173 as first written fails this); recover on a single pass |
 | 10 | The action prints the licence text while the licence is fine | OK, exit 69, no withdrawal | drop the proving probe |
 | 11 | The licence text placed in stderr just past the last 64 KiB, and just inside it | past: Action; inside: probe runs | search all of stderr, or none of it |
 | 12 | A sandbox profile that denies the `xcrun` cache; the action prints `unable to find utility` | Farm (the probe, run in the sandbox, fails too) | run the probe outside the sandbox |
@@ -576,12 +729,15 @@ the daemon's clock seam driven by the test.
 | 16 | kbf's own timeout kill | `DEADLINE_EXCEEDED`, no rerun | as 15 |
 | 17 | The action calls `exit(137)` | Action, OK exit 137, no rerun | classify on the exit value instead of "ended by a signal" |
 | 18 | The action sends itself SIGKILL every time, 2 nodes | OK, exit 137, after exactly 2 runs | count the Ambiguous rerun outside the budget; answer `INTERNAL` |
-| 19 | Container child OOM, parent exits 1: client booking 64 MiB, child allocates 128 MiB | over-booking: one rerun at 128 MiB; the child then allocates 256 MiB, so `FAILED_PRECONDITION` "used X, booked Y"; never OK exit 1 | check `oom_kill` on 137 only |
+| 19 | Native: booking 1 GiB, cap (the test's node) 4 GiB, the action needs 1.5 GiB. Container: a child is OOM-killed under the test's `actions/` limit while its parent exits 1 | native: one rerun at 2 GiB, OK exit 0, the message names both runs. Container: classified out of memory, never OK exit 1 | rerun at the same booking; check `oom_kill` on 137 only |
 | 20 | Scratch full during setup (a small filesystem as scratch); full during the run | setup: Farm with the scratch probe failing; run: signature matched and proven | treat setup errors as Action |
 | 21 | Every `RuntimeError` variant and every server-side failure, table-driven; the mapping is a `match` with no wildcard arm, so a new variant does not compile until it is classified | the class and code of section 5 | `Failed` mapped to `INVALID_ARGUMENT`; `MissingBlob` mapped to `INTERNAL` (today's defect) |
 | 22 | A `MISSING` answer, from the front and from the server's re-check | exactly one detail, the `PreconditionFailure` | add an ErrorInfo to it |
 | 23 | Missing blob: delete it from the CAS after the front's check; separately, break only the worker's fetch | `MISSING` to the client; a rerun elsewhere | the server answers `INTERNAL` for both |
 | 24 | Alerts: 5 faults on one node and capability; the probe passes twice; the probe flaps 4 times in an hour | 1 alert with count 5; resolved; one reopened alert, notified once | key alerts per fault; no flap rule |
+| 30 | Memory floor: digest A at key K is killed at 1 GiB and passes at 2 GiB; then digest B at K (a changed input); then 20 passes at K peaking under 1 GiB; then 30 days without a run, on the test clock | B books 2 GiB at its first run; the floor then halves to 1 GiB; then K is dropped | keep the floor per digest (B starts at 1 GiB); never lower it |
+| 31 | The action needs more than the cap (4 GiB) | ladder 1, 2, 4 GiB, then `FAILED_PRECONDITION` with `ACTION_OUT_OF_MEMORY` and the exact text of section 5; a repeat of the digest is answered without a run; with `skip_cache_lookup` it runs | answer OK exit 137; answer `RESOURCE_EXHAUSTED`; no memo, so a repeat climbs the ladder again |
+| 32 | Flakes: a digest fails, then a second request for it passes; separately, an operation's first run ends by a SIGKILL the test sends and the rerun passes; separately, a pass then a cache hit | the first digest is flaky, both runs recorded; the second is a possible flake with both runs in its history; the cache hit adds no run | record only the answered run; count a probe-proven Farm run as a failure |
 
 ### 10.3 End to end
 
@@ -608,25 +764,49 @@ people use. Bazel's exit 34 does not by itself tell Farm from Request (section 3
 
 ## 11. Decisions for the project
 
-1. Adopt the four classes, the Ambiguous rule of 1.1, and the invariant of section 1.
-2. Signatures are a reviewed allowlist, every Farm verdict proven by a probe run in the
+**Decided** (CEO rulings, 2026-10-09):
+
+1. OOM: an out-of-memory kill is Farm. The server reruns with the memory booking
+   doubled, up to the largest node that fits the platform, on a ladder bounded apart
+   from the 3-run budget; it keeps the passing booking as a floor per action key (not
+   per digest), lowered after 20 runs under half of it and dropped after 30 idle days.
+   A kill at the largest node is the action's: `FAILED_PRECONDITION`,
+   `ACTION_OUT_OF_MEMORY`, "needs more memory than any node offers" (6.1).
+2. Timeouts: an action's timeout is Action (the client set it), `DEADLINE_EXCEEDED`,
+   never rerun. A paused or frozen node is not a timeout: the fence and lease rules
+   requeue it as Farm; the frozen-daemon gap is #167. No pressure attribution (6.2).
+3. Flakes: a digest observed both passing and failing is flaky; every run is recorded
+   per digest, farm reruns included, and shown in the API and UI; never rerun until
+   green (6.3).
+4. #173 is extended before it merges: it reports each Xcode it leaves out, with the
+   reason and the fix, in `/v1/nodes`; re-checks periodically and restores an Xcode
+   that passes; and alerts, or until `kbf-alert` exists logs at WARN, with an issue
+   for alert delivery. In the probe model this is 4.1's licence and `xcrun --find
+   clang` probe with its start and periodic triggers, section 7's probe state, and
+   section 8's alert in an interim form. What remains for the probe loop afterwards:
+   running probes in the action's context (sandbox profile, user, environment), since a
+   check from the daemon's own context passes on #172's case; the triggers after a
+   farm fault, after a signature match (4.2) and on an operator's request; one probe
+   at a time, shared; the 4.1 hysteresis; the Metal, SDK, sandbox-canary and scratch
+   probes; withdrawing a capability through a mid-session report change, unless #173's
+   re-check already sends one; the withdrawn-everywhere answer and its memo; alert
+   delivery.
+
+**Open, with leans:**
+
+5. Adopt the four classes, the Ambiguous rule of 1.1, and the invariant of section 1.
+6. Signatures are a reviewed allowlist, every Farm verdict proven by a probe run in the
    action's context, bounded and shared (4.2, 6.4 C).
-3. Probes run continuously and withdraw one capability with an alert; recovery is
+7. Probes run continuously and withdraw one capability with an alert; recovery is
    automatic, with the 4.1 hysteresis. Re-detection and mid-session report changes come
    first.
-4. A capability withdrawn on every node that could serve is answered `INTERNAL` at
+8. A capability withdrawn on every node that could serve is answered `INTERNAL` at
    once, not `FAILED_PRECONDITION` after the wait, departing from REAPI's wording;
    I10 is amended to match (4.1).
-5. The server reruns Farm and Ambiguous results on other nodes, at most 3 runs per
+9. The server reruns Farm and Ambiguous results on other nodes, at most 3 runs per
    operation, then `INTERNAL` with the fix in `status.message`; a 60 s verdict memo,
    cleared on recovery (6.5).
-6. OOM: booking decides, one rerun at double the booking (6.1, A with B's retry).
-7. Timeouts: measure suspension and pressure; a node-caused timeout is Farm (6.2 B).
-8. Flakes: record and alert on node suspicion; never rerun Action failures (6.3 B).
-9. Request errors: `FAILED_PRECONDITION` except a malformed action (6.7).
-10. Should #173 merge as is (start-only, log-only) and be extended, or be reworked to
-    the probe model first? Lean: merge it, since it fixes the pilot's failure today,
-    with its description saying test 9 is expected to fail until the probe loop lands;
-    build the probe loop and alert next.
-11. Order: keep the reason and node (7); then server reruns (#22); then probes and
-    signatures; then alerts; then timeout and OOM attribution.
+10. Request errors: `FAILED_PRECONDITION` except a malformed action (6.7).
+11. Order: keep the reason and node (7); the extended #173; then server reruns (#22)
+    with the memory ladder; then the rest of the probe loop and signatures; then
+    alerts; then the flake record and memory floors.
