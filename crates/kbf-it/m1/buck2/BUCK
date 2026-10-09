@@ -1,6 +1,8 @@
 # Three commands in a chain, as in the Bazel sample. `shout` runs an executable input
 # file, so the farm must keep its mode; `digest` reads two outputs of earlier commands.
-load(":defs.bzl", "step")
+# A fourth, `pause`, stands alone: a command that sleeps, so a test can hold a lease in
+# flight (run.sh's drain check).
+load(":defs.bzl", "pause", "step")
 
 step(
     name = "words",
@@ -24,4 +26,13 @@ step(
         ":shout",
     ],
     script = 'cat "$2" "$3" | sha256sum > "$1"',
+)
+
+# Sleeps `-c kbf_m1.sleep_secs=N` seconds (0 by default, so `//...` stays quick and its
+# second build is a cache hit) and writes `-c kbf_m1.salt=S` (empty by default). A
+# fresh salt makes it a new action, so it runs instead of being answered from the cache.
+pause(
+    name = "pause",
+    salt = read_config("kbf_m1", "salt", ""),
+    secs = read_config("kbf_m1", "sleep_secs", "0"),
 )

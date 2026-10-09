@@ -431,11 +431,14 @@ Per lease:
    `kbf-guest`, a small self-contained Rust binary (dynamically linked only to
    libSystem, since macOS does not support fully static executables) baked into the
    image, running in the guest's
-   auto-logged-in user session. It runs the command, writes stdout and stderr into the
-   output share, and returns the exit code and usage. Not SSH: no keys, no `sshd`, no
-   network needed.
-5. **Collect.** Read outputs from the host side of the output share with
-   `kbf-outputs`, which follows no symlinks.
+   auto-logged-in user session. It runs the command in the execution root on the
+   read-write share, sends stdout and stderr as framed chunks over the socket, and
+   returns the exit code and usage; `kbf-vmm` writes stdout and stderr to two files in
+   the lease directory, outside the execution root
+   ([macos-vm-guests.md](macos-vm-guests.md#33-how-outputs-leave-the-guest)). Not SSH:
+   no keys, no `sshd`, no network needed.
+5. **Collect.** Read the declared outputs from the host side of the read-write share
+   with `kbf-outputs`, which follows no symlinks.
 6. **Destroy.** `stop` the VM (immediate, no clean shutdown), end the helper, delete the
    clone and the lease directory, and check nothing is left. Kill, timeout, cancel and
    fence all end here.
