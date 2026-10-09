@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for the macOS P0 probes (sourced, not run). Findings:
 # docs/spikes/macos-p0.md.
 #

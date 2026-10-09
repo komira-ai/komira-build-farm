@@ -44,7 +44,6 @@ probe() {
         SPIKE_RESULTS="$T/results" SPIKE_TCC_SYSTEM_DB="$T/state/system.db" \
         SPIKE_TCC_USER_DB="$T/state/user.db" ${PROBE_ENV-} \
         bash "$DIR/$1.sh" >"$OUT" 2>&1
-    STATUS=$?
 }
 
 want() {
