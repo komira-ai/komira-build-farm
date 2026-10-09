@@ -11,7 +11,7 @@ mod support;
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -97,24 +97,32 @@ async fn a_cold_restart_forgets_the_action_cache_and_the_cas_index() {
 async fn a_cold_restart_forgets_cordons_and_drains_and_says_so() {
     let before = Cell::start_with_api().await;
     let api = before.api.expect("an API");
+    capture();
     let _a = before.daemon("node-a", 4, 8).await;
     let _b = before.daemon("node-b", 4, 8).await;
     assert_eq!(placement(&post(api, "node-a:cordon").await), "cordoned");
     assert_eq!(placement(&post(api, "node-b:drain").await), "drained");
 
-    let (after, log) = logged(before.cold_restart()).await;
+    let after = before.cold_restart().await;
 
-    assert!(
-        log.contains("WARN")
-            && log.contains("no cordon, drain, lease or operation")
-            && log.contains("keeps no rollout record"),
-        "no startup warning about the state lost: {log:?}"
-    );
     let api = after.api.expect("an API");
     assert_eq!(get(api, "/v1/nodes").await, (200, json!({ "nodes": [] })));
     assert_eq!(get(api, "/v1/rollouts").await.0, 404);
 
     let mut a = after.daemon("node-a", 4, 8).await;
+    // `Welcome` names the new process's term, which its startup warning carries.
+    let warned = lines_with(&[
+        "WARN",
+        "no cordon, drain, lease or operation",
+        "keeps no rollout record",
+        &format!("term={}", a.epoch),
+    ]);
+    assert_eq!(
+        warned.len(),
+        1,
+        "startup warnings: {:?}",
+        lines_with(&["WARN"])
+    );
     let job = Job::new("on the node cordoned before the restart", &[]);
     after.upload(&job.blobs()).await;
     let _ops = after.execute(&job.action).await;
@@ -145,30 +153,36 @@ fn placement(node: &Value) -> String {
         .to_owned()
 }
 
-/// Log lines written on this thread, at info and above, while `f` runs to completion
-/// on it. The server logs its startup warning on the thread that binds it.
-async fn logged<T>(f: impl Future<Output = T>) -> (T, String) {
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&buffer);
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || Sink(Arc::clone(&sink)))
-        .with_ansi(false)
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    let out = f.await;
-    drop(guard);
-    let bytes = buffer
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    (out, String::from_utf8(bytes).expect("a UTF-8 log"))
+/// Every line logged in this test binary, at info and above.
+static LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Installs the subscriber that writes to [`LOG`], once.
+fn capture() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| Sink)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+    });
 }
 
-struct Sink(Arc<Mutex<Vec<u8>>>);
+/// The logged lines that contain every one of `parts`.
+fn lines_with(parts: &[&str]) -> Vec<String> {
+    let log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
+    String::from_utf8_lossy(&log)
+        .lines()
+        .filter(|line| parts.iter().all(|p| line.contains(p)))
+        .map(str::to_owned)
+        .collect()
+}
+
+struct Sink;
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
         log.extend_from_slice(buf);
         Ok(buf.len())
     }

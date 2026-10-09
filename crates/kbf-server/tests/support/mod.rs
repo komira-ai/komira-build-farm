@@ -271,8 +271,6 @@ impl Cell {
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
         let (bound_tx, bound_rx) = oneshot::channel();
-        // The caller's subscriber, so that a test sees what the server logs.
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let (server_cache, server_api) = (Arc::clone(&cache), api_config.clone());
         // The server runs on a runtime of its own, as a process apart: once it stops,
         // the runtime is dropped and every task of it (each connection, each stream)
@@ -280,23 +278,20 @@ impl Cell {
         std::thread::Builder::new()
             .name("kbf-server-cell".to_owned())
             .spawn(move || {
-                tracing::dispatcher::with_default(&dispatch, || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("a runtime");
-                    runtime.block_on(async move {
-                        let shutdown = async move {
-                            let _ = stop_rx.await;
-                        };
-                        let bound =
-                            bind_server_with_api(server_cache, listeners, server_api, shutdown)
-                                .expect("bind");
-                        let _ = bound_tx.send((bound.reapi, bound.worker, bound.api));
-                        bound.serving.await.expect("serve");
-                    });
-                    drop(runtime);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                runtime.block_on(async move {
+                    let shutdown = async move {
+                        let _ = stop_rx.await;
+                    };
+                    let bound = bind_server_with_api(server_cache, listeners, server_api, shutdown)
+                        .expect("bind");
+                    let _ = bound_tx.send((bound.reapi, bound.worker, bound.api));
+                    bound.serving.await.expect("serve");
                 });
+                drop(runtime);
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
