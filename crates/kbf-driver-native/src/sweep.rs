@@ -99,13 +99,17 @@ pub(crate) fn sweep(
     // What the quarantine holds now is removed after the kill, when no action left
     // behind is alive any more to swap the directory, and through the descriptor held
     // from here, so a swap is never followed in any case. What this sweep sets aside
-    // stays until the next start.
-    let held = hold(&quarantine, remove);
-    end_recorded(scratch, wait, table)?;
-    if let Some((dir, names)) = held {
-        for name in names {
-            if let Err(why) = kbf_outputs::remove_tree_at(&dir, &name) {
-                tracing::error!(dir = %quarantine.display(), entry = ?name, "a quarantined entry still cannot be removed: {why}");
+    // goes in through that descriptor too, and stays until the next start.
+    let (held, names) = hold(&quarantine, remove).unzip();
+    let mut aside = Aside {
+        path: quarantine,
+        dir: held,
+    };
+    end_recorded(scratch, wait, table, &mut aside)?;
+    if let Some(dir) = &aside.dir {
+        for name in names.unwrap_or_default() {
+            if let Err(why) = kbf_outputs::remove_tree_at(dir, &name) {
+                tracing::error!(dir = %aside.path.display(), entry = ?name, "a quarantined entry still cannot be removed: {why}");
             }
         }
     }
@@ -120,7 +124,7 @@ pub(crate) fn sweep(
         let Err(why) = remove(&path) else {
             continue;
         };
-        match move_aside(&path, &quarantine, &name) {
+        match aside.take(&path, &name) {
             Ok(to) => tracing::error!(
                 dir = %path.display(),
                 to = %to.display(),
@@ -178,16 +182,20 @@ fn hold(
 /// ([`crate::record`]), so its action never ran. Anything that is not a record the
 /// daemon could have written, `runs/` itself included, is moved aside into
 /// [`QUARANTINE`].
-fn end_recorded(scratch: &Path, wait: Duration, table: &Table<'_>) -> io::Result<()> {
+fn end_recorded(
+    scratch: &Path,
+    wait: Duration,
+    table: &Table<'_>,
+    aside: &mut Aside,
+) -> io::Result<()> {
     let runs = scratch.join(RUNS);
-    let quarantine = scratch.join(QUARANTINE);
     let entries =
         match ours(&runs, std::fs::FileType::is_dir).and_then(|()| std::fs::read_dir(&runs)) {
             Ok(entries) => entries,
             // Absent until a runtime first starts on this scratch root.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(why) => {
-                set_aside(&runs, &quarantine, &why);
+                set_aside(&runs, aside, &why);
                 return Ok(());
             }
         };
@@ -199,7 +207,7 @@ fn end_recorded(scratch: &Path, wait: Duration, table: &Table<'_>) -> io::Result
         let record = match read_record(&path) {
             Ok(record) => record,
             Err(why) => {
-                set_aside(&path, &quarantine, &why);
+                set_aside(&path, aside, &why);
                 continue;
             }
         };
@@ -291,12 +299,12 @@ fn read_record(path: &Path) -> io::Result<Option<Record>> {
     Ok(std::str::from_utf8(&bytes).ok().and_then(Record::parse))
 }
 
-/// Moves `path`, which is not a run record the daemon wrote (`why`), into `quarantine`,
-/// logged; one that cannot be moved stays, also logged.
-fn set_aside(path: &Path, quarantine: &Path, why: &io::Error) {
+/// Moves `path`, which is not a run record the daemon wrote (`why`), into the
+/// quarantine through `aside`, logged; one that cannot be moved stays, also logged.
+fn set_aside(path: &Path, aside: &mut Aside, why: &io::Error) {
     let mut name = std::ffi::OsString::from("runs.");
     name.push(path.file_name().unwrap_or_default());
-    match move_aside(path, quarantine, &name) {
+    match aside.take(path, &name) {
         Ok(to) => {
             tracing::error!(entry = %path.display(), to = %to.display(), "not a run record the daemon wrote ({why}); moved aside")
         }
@@ -335,20 +343,49 @@ fn end_group(
     }
 }
 
-/// Moves `path` into `quarantine` under its `name` and a suffix no earlier start used.
-fn move_aside(path: &Path, quarantine: &Path, name: &OsStr) -> io::Result<PathBuf> {
-    // The daemon's alone, as `runs/` is.
-    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
-        .create(quarantine)?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut aside = name.to_owned();
-    aside.push(format!(".{nanos}"));
-    let to = quarantine.join(aside);
-    std::fs::rename(path, &to)?;
-    Ok(to)
+/// Where the sweep moves what it sets aside: [`QUARANTINE`] at `path`, and the
+/// descriptor of the directory found there, opened without following a link and
+/// checked as the daemon's ([`owned`]), once. Everything moves in through that
+/// descriptor, so a quarantine an action swaps for a symlink, or plants as one, after
+/// it was opened is never moved into: what is moved lands in the directory that was
+/// checked, wherever the swap put it.
+struct Aside {
+    path: PathBuf,
+    dir: Option<OwnedFd>,
+}
+
+impl Aside {
+    /// The quarantine's descriptor: the one held, or else the directory at `path`,
+    /// made (mode 0700, the daemon's alone, as `runs/` is) when absent.
+    fn dir(&mut self) -> io::Result<&OwnedFd> {
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        if let Some(dir) = self.dir.take() {
+            return Ok(self.dir.insert(dir));
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(&self.path) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)?;
+        owned(&dir.metadata()?, std::fs::FileType::is_dir)?;
+        Ok(self.dir.insert(OwnedFd::from(dir)))
+    }
+
+    /// Moves `path` into the quarantine under its `name` and a suffix no earlier start
+    /// used; returns where, as a path for the log.
+    fn take(&mut self, path: &Path, name: &OsStr) -> io::Result<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut aside = name.to_owned();
+        aside.push(format!(".{nanos}"));
+        rustix::fs::renameat(rustix::fs::CWD, path, self.dir()?, &aside)?;
+        Ok(self.path.join(aside))
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +532,14 @@ mod tests {
             .expect("write");
     }
 
+    /// The quarantine of `dir`, not opened yet, as [`sweep`] starts with it when absent.
+    fn aside(dir: &Path) -> Aside {
+        Aside {
+            path: dir.join(QUARANTINE),
+            dir: None,
+        }
+    }
+
     fn chmod(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
@@ -620,7 +665,7 @@ mod tests {
             ours: &|_| true,
             guards: &Guards::now,
         };
-        let why = end_recorded(&dir, Duration::from_millis(30), &ours)
+        let why = end_recorded(&dir, Duration::from_millis(30), &ours, &mut aside(&dir))
             .expect_err("survivors")
             .to_string();
         assert!(why.contains("lease-1-1 ([2000000001])"), "{why}");
@@ -633,7 +678,7 @@ mod tests {
             ours: &|_| true,
             guards: &Guards::now,
         };
-        let why = end_recorded(&dir, WAIT, &unreadable).expect_err("no table");
+        let why = end_recorded(&dir, WAIT, &unreadable, &mut aside(&dir)).expect_err("no table");
         assert_eq!(why.to_string(), "no process table");
     }
 
@@ -663,7 +708,7 @@ mod tests {
             ours: &|_| false,
             guards: &Guards::now,
         };
-        end_recorded(&dir, WAIT, &theirs).expect("not the daemon's");
+        end_recorded(&dir, WAIT, &theirs, &mut aside(&dir)).expect("not the daemon's");
         assert_eq!(runs_left(&dir), 0, "the record is dropped");
 
         // SAFETY: geteuid takes nothing and cannot fail.
@@ -826,6 +871,131 @@ mod tests {
         assert!(!moved.join("old").exists(), "the checked directory emptied");
     }
 
+    /// Catches what the sweep moves aside after the kill moved into the quarantine by
+    /// path: an action that swaps the quarantine for a symlink to a directory of the
+    /// user's while the sweep kills ("moved aside by path" mutant) would get its lease
+    /// directory, a tree it shaped, written into that directory and left there. The stuck lease goes into the directory that was
+    /// checked, through its descriptor, wherever the swap put it. An entry of `runs/`
+    /// that is not a record is set aside the same way, whether before the kill or
+    /// after it. The swap is done from the process table read, as the dying action
+    /// would.
+    #[test]
+    fn what_is_moved_aside_after_the_kill_goes_into_what_was_checked() {
+        let dir = scratch("qswapaside");
+        let quarantine = dir.join(QUARANTINE);
+        let (moved, elsewhere) = (dir.join("moved"), dir.join("elsewhere"));
+        for held in [&quarantine, &elsewhere] {
+            std::fs::create_dir(held).expect("mkdir");
+            chmod(held, 0o700);
+        }
+        std::fs::create_dir_all(dir.join("lease-stuck/root")).expect("mkdir");
+        let boot = crate::record::boot_id().expect("boot");
+        write_record(&dir, "lease-9-1", &format!("2000000061 5 {boot}\n"));
+        for bad in 2..6 {
+            std::fs::create_dir(dir.join(RUNS).join(format!("lease-9-{bad}"))).expect("mkdir");
+        }
+        let swapped = std::cell::Cell::new(false);
+        let swap = || {
+            if !swapped.replace(true) {
+                std::fs::rename(&quarantine, &moved).expect("rename");
+                std::os::unix::fs::symlink(&elsewhere, &quarantine).expect("symlink");
+            }
+            Ok(Vec::new())
+        };
+        let table = Table {
+            snapshot: &swap,
+            ours: &|_| true,
+            guards: &Guards::now,
+        };
+        sweep(&dir, &stuck, WAIT, &table).expect("sweep");
+        assert!(swapped.get(), "the kill read the table");
+        let landed: Vec<_> = std::fs::read_dir(&elsewhere)
+            .expect("elsewhere")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert!(
+            landed.is_empty(),
+            "moved aside through the swap: {landed:?}"
+        );
+        let mut kept: Vec<String> = std::fs::read_dir(&moved)
+            .expect("moved")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert!(kept[0].starts_with("lease-stuck."), "{kept:?}");
+        assert!(!dir.join("lease-stuck").exists(), "moved out of the way");
+    }
+
+    /// Catches a quarantine the sweep makes after the kill followed when it is a link:
+    /// absent at the start, an action can plant a symlink under its name while the
+    /// sweep kills ("made by path" mutant). Nothing is moved through the link; the
+    /// stuck lease stays where it is, logged.
+    #[test]
+    fn a_quarantine_planted_during_the_kill_is_not_moved_into() {
+        let dir = scratch("qplant");
+        let quarantine = dir.join(QUARANTINE);
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("mkdir");
+        chmod(&elsewhere, 0o700);
+        std::fs::create_dir_all(dir.join("lease-stuck/root")).expect("mkdir");
+        let boot = crate::record::boot_id().expect("boot");
+        write_record(&dir, "lease-9-7", &format!("2000000062 5 {boot}\n"));
+        let plant = || {
+            if std::fs::symlink_metadata(&quarantine).is_err() {
+                std::os::unix::fs::symlink(&elsewhere, &quarantine).expect("symlink");
+            }
+            Ok(Vec::new())
+        };
+        let table = Table {
+            snapshot: &plant,
+            ours: &|_| true,
+            guards: &Guards::now,
+        };
+        sweep(&dir, &stuck, WAIT, &table).expect("sweep");
+        let landed = std::fs::read_dir(&elsewhere).expect("elsewhere").count();
+        assert_eq!(landed, 0, "moved aside through the planted link");
+        assert!(dir.join("lease-stuck/root").is_dir(), "left in place");
+    }
+
+    /// Catches a quarantine that another user could write
+    /// (group- or other-writable) emptied and kept ("owner and mode unchecked" mutant):
+    /// what the sweep later moves aside would sit where others can reach it. It is
+    /// removed itself, never emptied through.
+    #[test]
+    fn a_quarantine_others_may_write_is_removed_itself() {
+        for (mode, name) in [(0o770, "qgroup"), (0o703, "qother")] {
+            let dir = scratch(name);
+            let quarantine = dir.join(QUARANTINE);
+            std::fs::create_dir(&quarantine).expect("mkdir");
+            std::fs::write(quarantine.join("old"), b"x").expect("write");
+            chmod(&quarantine, mode);
+            sweep_within(&dir).expect("the start goes on");
+            assert!(
+                std::fs::symlink_metadata(&quarantine).is_err(),
+                "a quarantine of mode {mode:o} emptied through, not removed"
+            );
+        }
+    }
+
+    /// Catches a quarantine of another user's held as the daemon's ("owner unchecked"
+    /// mutant): `/` (root's, for a test run as anyone else) stands in for it. It is
+    /// handed to `remove` (a fake one here, which removes nothing), never listed.
+    #[test]
+    fn a_quarantine_of_another_user_is_not_held() {
+        // SAFETY: geteuid takes nothing and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let asked = std::cell::RefCell::new(Vec::new());
+        let remove = |path: &Path| {
+            asked.borrow_mut().push(path.to_owned());
+            Ok(())
+        };
+        assert!(hold(Path::new("/"), &remove).is_none(), "root's held");
+        assert_eq!(*asked.borrow(), [PathBuf::from("/")]);
+    }
+
     /// Catches the macOS boot id read from anything but the boot session UUID (the boot
     /// time, which can move within a boot): it has the UUID's shape.
     #[cfg(target_os = "macos")]
@@ -895,14 +1065,16 @@ mod tests {
         };
         write_record(&dir, "lease-6-1", &format!("2000000021 5 {boot}\n"));
         write_record(&dir, "lease-6-2", &format!("2000000022 5 {boot}\n"));
-        end_recorded(&dir, Duration::from_millis(30), &table).expect("the start goes on");
+        end_recorded(&dir, Duration::from_millis(30), &table, &mut aside(&dir))
+            .expect("the start goes on");
         assert_eq!(reads.get(), 0, "a guarded group was walked");
         assert_eq!(runs_left(&dir), 0, "the records are dropped");
 
         // Below the action's group, neither the parent nor the member of the daemon's
         // own group is killed or a survivor.
         write_record(&dir, "lease-6-3", &format!("2000000031 5 {boot}\n"));
-        end_recorded(&dir, Duration::from_millis(30), &table).expect("not survivors");
+        end_recorded(&dir, Duration::from_millis(30), &table, &mut aside(&dir))
+            .expect("not survivors");
         assert_eq!(reads.get(), 1, "the action's group was walked once");
         assert_eq!(runs_left(&dir), 0, "the record is dropped");
     }

@@ -102,8 +102,9 @@ them before it says `Hello` (issue #155), as part of building its driver:
   user that only that user may write (a FIFO, a directory, a symlink, a group- or
   other-writable file), or a `runs` that is not such a directory, is moved aside into
   `quarantine/` unread, and the start goes on. A `quarantine` that is not the daemon's
-  directory (a symlink) is removed, never emptied through; the daemon's own is emptied
-  after the kill, through the descriptor it checked.
+  directory (a symlink, or a directory others may write) is removed, never emptied
+  through; the daemon's own is emptied after the kill, through the descriptor it
+  checked, and what the sweep moves aside goes in through that descriptor too.
 - **Container driver.** Every container is created with the label
   `kbf.owner=<node id>`. At start the driver removes each lease it finds, among the
   containers so labelled and the lease scratch directories, as a lease's clean does

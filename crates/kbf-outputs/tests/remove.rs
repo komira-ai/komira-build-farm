@@ -128,6 +128,44 @@ fn the_path_itself_may_be_a_link_a_file_or_absent() {
     assert!(remove_tree(&base.join("absent/child")).is_err());
 }
 
+/// Catches `remove_tree_at` resolving its directory again by path (it must work in the
+/// directory it was given: one swapped for a symlink since it was opened keeps the link
+/// target's entries), following a link given as the name, failing on an absent name,
+/// leaving a locked tree behind, or touching the directory's other entries.
+#[test]
+fn remove_tree_at_works_in_the_directory_it_was_given() {
+    use rustix::fs::{Mode, OFlags};
+    let base = scratch("at");
+    let (top, moved, host) = (base.join("top"), base.join("moved"), base.join("host"));
+    std::fs::create_dir_all(top.join("tree/a/b")).expect("mkdir");
+    std::fs::write(top.join("tree/a/b/f"), b"x").expect("write");
+    std::fs::write(top.join("file"), b"x").expect("write");
+    std::fs::write(top.join("other"), b"kept").expect("write");
+    std::fs::create_dir_all(host.join("tree/inner")).expect("mkdir");
+    std::fs::write(host.join("keep"), b"keep").expect("write");
+    symlink(&host, top.join("tree/a/to-host")).expect("symlink");
+    symlink(&host, top.join("link")).expect("symlink");
+    chmod(&top.join("tree/a/b"), 0o000);
+    chmod(&top.join("tree/a"), 0o500);
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let dir = rustix::fs::openat(rustix::fs::CWD, &top, flags, Mode::empty()).expect("open");
+    // The directory is swapped for a link to one with the same names.
+    std::fs::rename(&top, &moved).expect("rename");
+    symlink(&host, &top).expect("symlink");
+
+    for name in ["tree", "file", "link", "absent"] {
+        kbf_outputs::remove_tree_at(&dir, std::ffi::OsStr::new(name))
+            .unwrap_or_else(|e| panic!("remove {name}: {e}"));
+        assert!(
+            std::fs::symlink_metadata(moved.join(name)).is_err(),
+            "{name} left in the directory given"
+        );
+    }
+    assert_eq!(std::fs::read(moved.join("other")).expect("other"), b"kept");
+    assert_eq!(std::fs::read(host.join("keep")).expect("host"), b"keep");
+    assert!(host.join("tree/inner").is_dir(), "removed through the swap");
+}
+
 /// Catches an entry that cannot be examined (its directory may be read but not
 /// searched) skipped as if absent: the removal fails and says so.
 #[test]
