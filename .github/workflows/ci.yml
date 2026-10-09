@@ -351,6 +351,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - run: bash tools/ci/probe-xcrun-db.sh
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked
       # The daemon's unit tests, which read its suspend-counting clock on macOS

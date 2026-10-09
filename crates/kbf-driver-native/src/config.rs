@@ -98,9 +98,9 @@ impl NativeConfig {
     /// Removes `xcrun`'s cache from the user folders
     /// ([`UserFolders::forget_xcrun_cache`]); nothing without them (off macOS). The
     /// daemon does this before its first survey of the Xcodes
-    /// ([`crate::xcode_watch::watch`]): the survey runs their tools outside the sandbox,
-    /// leases can write that cache, and the `xcrun` warm-up
-    /// ([`crate::NativeRuntime::warm_xcrun`]) then fills it afresh.
+    /// ([`crate::xcode_watch::watch`]), which then finds no entry a lease wrote; the
+    /// survey and the `xcrun` warm-up ([`crate::NativeRuntime::warm_xcrun`]) fill it
+    /// afresh.
     pub fn forget_xcrun_cache(&self) {
         if let Some(folders) = &self.user_folders {
             folders.forget_xcrun_cache();
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(MemoryPolicy::default(), policy);
     }
 
-    /// Catches Xcodes surveyed (outside the sandbox) while `xcrun`'s cache a lease
+    /// Catches Xcodes surveyed while `xcrun`'s cache a lease
     /// could have written is still there: the fake `xcodebuild` answers a build that
     /// says which it saw, and the survey is asked as the daemon asks its first one,
     /// after [`NativeConfig::forget_xcrun_cache`].

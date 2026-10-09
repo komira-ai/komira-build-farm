@@ -4,7 +4,7 @@
 
 mod front;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -123,6 +123,7 @@ fn runs_until_sigterm_with_path(
     path: Option<&Path>,
 ) -> std::process::ExitStatus {
     let dir = tls(name);
+    let started = Instant::now();
     let mut command = Command::new(BIN);
     if let Some(path) = path {
         let system = std::env::var_os("PATH").unwrap_or_default();
@@ -154,6 +155,13 @@ fn runs_until_sigterm_with_path(
             Err(e) => panic!("no session attempt ({e}): {log:#?}"),
         }
     }
+    // How long the daemon took to try its first session (the native driver surveys its
+    // Xcodes before), for the CI log: written to stderr, which tests do not capture.
+    let _ = writeln!(
+        std::io::stderr(),
+        "binary.rs: the {name} daemon tried its first session {:.1?} after it started",
+        started.elapsed()
+    );
     let pid = i32::try_from(child.id()).expect("pid");
     // SAFETY: kill(2) on the child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);

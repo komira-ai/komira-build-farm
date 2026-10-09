@@ -169,6 +169,61 @@ fn xcodes() -> std::collections::BTreeMap<String, PathBuf> {
     all
 }
 
+/// Catches a sandbox under which the daemon's survey (every question asked as an
+/// action runs: `xcodebuild -version`, `-license check`, `-checkFirstLaunchStatus`
+/// and `xcrun --find clang`, the network off, the user-folder rules) answers otherwise
+/// than the same survey run without it: an Xcode the sandbox makes look not ready, or
+/// another build. Fails when no Xcode is ready, so it cannot pass by comparing nothing.
+/// Writes how long each survey took to stderr (not captured) for the CI log.
+#[tokio::test]
+async fn the_sandboxed_survey_answers_as_an_unsandboxed_one() {
+    use std::io::Write as _;
+
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let dir = scratch("survey");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let apps = Path::new(xcode::APPLICATIONS);
+    let key = |x: &xcode::Xcode| {
+        (
+            x.app.clone(),
+            x.developer_dir.clone(),
+            x.build.clone(),
+            x.state,
+        )
+    };
+    let started = std::time::Instant::now();
+    let plain = xcode::survey(apps, &xcode::Probe::system(false));
+    let plain_took = started.elapsed();
+    let probe = xcode::Probe {
+        sandbox: Some(rt.sandbox(kbf_driver_native::SURVEY_DIR)),
+        ..xcode::Probe::system(false)
+    };
+    let started = std::time::Instant::now();
+    let sandboxed = xcode::survey(apps, &probe);
+    let sandboxed_took = started.elapsed();
+    let _ = writeln!(
+        std::io::stderr(),
+        "user_folders.rs: {} Xcodes surveyed in {plain_took:.1?} unsandboxed, \
+         {sandboxed_took:.1?} sandboxed",
+        sandboxed.len()
+    );
+    assert!(
+        plain.iter().any(|x| x.state == xcode::State::Ready),
+        "no Xcode is ready: {plain:#?}"
+    );
+    assert_eq!(
+        sandboxed.iter().map(key).collect::<Vec<_>>(),
+        plain.iter().map(key).collect::<Vec<_>>(),
+        "{sandboxed:#?}\n{}",
+        sandbox_denials()
+    );
+    assert!(
+        !dir.join("leases").join(kbf_driver_native::SURVEY_DIR).exists(),
+        "the survey's directory stays"
+    );
+}
+
 /// The newest Xcode on this runner, if it has one.
 fn newest_xcode() -> Option<(String, PathBuf)> {
     xcodes().into_iter().last()

@@ -25,14 +25,16 @@
 //! each lease its own `/var/folders` entry): leases of the daemon's user share these
 //! names, so a lease can see, change or remove the temporary files another lease has
 //! open there, and can rewrite `xcrun_db`, which the next lease's compiler shims read
-//! to find their tools. The daemon itself trusts nothing there: it removes `xcrun_db`
-//! ([`UserFolders::forget_xcrun_cache`]) before its first survey of the Xcodes; every
-//! survey, the first and those it repeats while the node serves
-//! ([`crate::xcode_watch`]), runs `xcodebuild` from inside the Xcode rather than
-//! through its `/usr/bin` shim, and `xcrun --no-cache` ([`crate::xcode::survey`]); its
-//! `xcrun` warm-ups, at start and for each Xcode a later survey makes ready, which go
-//! on while the node serves, run under the actions' sandbox
-//! (`NativeRuntime::warm_xcrun`); and it sweeps by descriptor.
+//! to find their tools. The daemon runs no developer tool outside the sandbox while it
+//! serves, so what a lease wrote there reaches only sandboxed tools: every survey of
+//! the Xcodes, the first and those it repeats while the node serves
+//! ([`crate::xcode_watch`]), asks each question under the actions' sandbox, where
+//! `xcrun` reads and fills `xcrun_db` as an action's would (`crate::xcode::Probe::sandbox`),
+//! and runs `xcodebuild` from inside the Xcode rather than through its `/usr/bin` shim;
+//! its `xcrun` warm-ups, at start and for each Xcode a later survey makes ready, run
+//! under the actions' sandbox too (`NativeRuntime::warm_xcrun`). It removes
+//! `xcrun_db` ([`UserFolders::forget_xcrun_cache`]) before its first survey, and it
+//! sweeps by descriptor.
 //!
 //! What a lease leaves there (a save it was killed in the middle of, a temporary
 //! `xcrun_db-*`) is swept ([`UserFolders::sweep`]) at daemon start and after every
@@ -146,10 +148,9 @@ impl UserFolders {
     }
 
     /// Removes `xcrun`'s cache, `T/xcrun_db`, which any lease can rewrite: the daemon
-    /// calls this before its first survey of the Xcodes, so the tools it runs outside
-    /// the sandbox at start find nothing a lease wrote, and its warm-up fills the cache
-    /// afresh. Later surveys do not remove it (the warm-up would be lost); they run
-    /// only each Xcode's own `xcodebuild` and `xcrun --no-cache`. Logged when it fails.
+    /// calls this before its first survey of the Xcodes, so that survey finds no entry
+    /// a lease wrote, and the survey and the warm-up fill the cache afresh. Later
+    /// surveys do not remove it (the warm-up would be lost). Logged when it fails.
     pub fn forget_xcrun_cache(&self) {
         self.forget_xcrun_cache_as(rustix::process::geteuid().as_raw());
     }
