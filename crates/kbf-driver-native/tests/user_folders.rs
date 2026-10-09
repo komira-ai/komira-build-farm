@@ -135,10 +135,11 @@ fn newest_xcode() -> Option<(String, PathBuf)> {
 
 /// Catches a sandbox under which `xcodebuild` (derived data in the lease) cannot
 /// build a one-file package: it saves its log store atomically, through the user's
-/// temporary folder, and exits 74 when that fails. Its package cache goes into the
-/// lease (`-packageCachePath`): by default `xcodebuild` puts it in the user's real
-/// `~/Library/Caches` (it does not read `HOME`), outside the lease, which the sandbox
-/// refuses as it refuses every other write there.
+/// temporary folder, and exits 74 when that fails. The action points Foundation's
+/// home into the lease (`CFFIXED_USER_HOME`): `xcodebuild` resolves a package with
+/// SwiftPM's caches in `~/Library/Caches`, and finds `~` through the user database,
+/// not `HOME`, so by default it writes outside the lease, which the sandbox refuses as
+/// it refuses every other write there.
 #[tokio::test]
 async fn xcodebuild_builds_a_package() {
     let Some((build, developer_dir)) = newest_xcode() else {
@@ -151,9 +152,8 @@ async fn xcodebuild_builds_a_package() {
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
     let mut spec = Spec::sh(&format!(
-        "{LAYOUT}xcodebuild -scheme hello -destination platform=macOS \
-         -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$XDG_CACHE_HOME/swiftpm\" \
-         build && echo built"
+        "{LAYOUT}CFFIXED_USER_HOME=\"$HOME\" xcodebuild -scheme hello \
+         -destination platform=macOS -derivedDataPath \"$TMPDIR/dd\" build && echo built"
     ))
     .env("PATH", PATH)
     .property("xcode", &build);
@@ -175,6 +175,23 @@ fn tail(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(40)..].join("\n")
 }
+
+/// What [`the_compiler_shims_print_nothing_on_stderr`] runs: each shim's `--version`
+/// with its stderr (but the version line `swiftc` always prints there) copied to
+/// stdout, then five `cc --version` against five of the `clang` it runs, called
+/// directly, printing the times when the shim takes more than twice as long and a
+/// quarter second (an uncached lookup took 0.31 s a call against 0.065 s).
+const SHIMS: &str = r#"for tool in cc clang swiftc; do
+  $tool --version > /dev/null 2> "err-$tool" || echo "$tool failed"
+done
+cat err-cc err-clang; grep -v '^swift-driver version' err-swiftc
+direct=$(xcrun --find clang) || exit 1
+perl -MTime::HiRes=time -e '
+  sub t { my $s = time; for (1..5) { system("$_[0] --version > /dev/null 2>&1") == 0 or die "$_[0]" } time - $s }
+  my ($shim, $direct) = (t("cc"), t($ARGV[0]));
+  printf "slow: cc %.3fs, clang %.3fs\n", $shim, $direct if $shim > 2 * $direct + 0.25;
+' "$direct"
+"#;
 
 /// Catches the `/usr/bin` compiler shims failing to write `xcrun`'s cache in the
 /// user's temporary folder: every `cc`, `clang` or `swiftc` call then prints
@@ -200,11 +217,10 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
     config.xcodes = all;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
-    let script = "for tool in cc clang swiftc; do $tool --version > /dev/null || echo \"$tool failed\"; done";
     let mut cases: Vec<Option<String>> = vec![None];
     cases.extend(picked.into_iter().map(Some));
     for (seq, build) in cases.iter().enumerate() {
-        let mut spec = Spec::sh(script).env("PATH", PATH);
+        let mut spec = Spec::sh(SHIMS).env("PATH", PATH);
         if let Some(build) = build {
             spec = spec.property("xcode", build);
         }

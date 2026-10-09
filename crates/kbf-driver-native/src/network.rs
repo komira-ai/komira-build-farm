@@ -41,8 +41,8 @@
 //!   `/var/folders` beyond the names [`crate::user_folders`] opens, `~` of the daemon's
 //!   user named by absolute path or found through the user database, as SwiftPM and
 //!   `xcodebuild` find `~/Library/Caches`, `/tmp`) fails; the action must point it
-//!   into the lease (`HOME`, `TMPDIR`, a cache path flag such as `xcodebuild
-//!   -packageCachePath` or `swift build --cache-path`).
+//!   into the lease (`HOME`, `TMPDIR`, `CFFIXED_USER_HOME` for Foundation's `~`, a
+//!   cache path flag such as `swift build --cache-path`).
 
 use std::path::{Path, PathBuf};
 
