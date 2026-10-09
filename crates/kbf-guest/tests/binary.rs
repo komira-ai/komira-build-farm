@@ -4,7 +4,7 @@ mod common;
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{Shares, TOKEN, sh};
@@ -38,7 +38,8 @@ fn serve(shares: &Shares, socket: &Path, token_file: &Path) -> Command {
 
 /// Catches the binary not wiring its flags to the agent (the token file's hex is the
 /// token, and a command runs over the socket it was told to create), and an agent
-/// that keeps serving after its one command.
+/// that keeps serving after its one command. The binary's own stdin is a pipe, so a
+/// command that inherits stdin instead of getting /dev/null (a character device) fails.
 #[test]
 fn serve_runs_one_command_over_its_socket() {
     let shares = Shares::new("bin-serve");
@@ -47,6 +48,7 @@ fn serve_runs_one_command_over_its_socket() {
     let socket = shares.outputs.with_file_name("s.sock");
     let mut guest = Killed(
         serve(&shares, &socket, &token_file)
+            .stdin(Stdio::piped())
             .spawn()
             .expect("spawned"),
     );
@@ -64,7 +66,9 @@ fn serve_runs_one_command_over_its_socket() {
     } else {
         assert_eq!(client.session(), "");
     }
-    client.run(&sh("echo ran", &[])).expect("started");
+    client
+        .run(&sh("[ -c /dev/stdin ] && echo ran", &[]))
+        .expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
     assert_eq!(shares.out("stdout"), b"ran\n");
     // The boot's one command has run: once its connection ends, the agent exits.
