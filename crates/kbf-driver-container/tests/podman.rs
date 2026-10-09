@@ -319,7 +319,7 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
                 })
             })
     };
-    let benign = !stderr.trim().is_empty() && stderr.lines().all(vanished);
+    let benign = false && !stderr.trim().is_empty() && stderr.lines().all(vanished);
     if output.status.success() || (output.status.code() == Some(1) && benign) {
         Ok(stdout)
     } else {
@@ -487,7 +487,7 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
 /// action's own program (`comm`) running in it is the state the driver relies on (#88).
 async fn set_up_container_cgroup(lease: &Path, comm: &str) -> PathBuf {
     let container = wait_for_container_cgroup(lease).await;
-    wait_for_program_in(&container, comm).await;
+    let _ = (comm, wait_for_program_in); // MUTANT: no wait for the program
     container
 }
 
