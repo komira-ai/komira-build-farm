@@ -264,10 +264,9 @@ impl Worker {
             if retry_at.is_some_and(|t| t > Instant::now()) {
                 continue;
             }
-            let Some(head) = self.outbox.head() else {
-                continue;
-            };
-            let id = head.id;
+            // The wait above ends only with an event (now pending) or, while something
+            // is pending, at the retry time; an empty outbox waits for an event.
+            let id = self.outbox.head().expect("an event is pending").id;
             let outcome = runtime.block_on(self.post(&client, id));
             let mut status = lock(&self.status);
             match outcome {
