@@ -56,6 +56,10 @@ role (`--role=all`). The flags are:
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
   for WaitExecution before its name is `NOT_FOUND`;
+- `--shutdown-timeout-secs` (default 10), how long a stop (SIGINT or SIGTERM) waits
+  for REAPI clients to disconnect after their open Execute and WaitExecution streams
+  that are not done are ended `UNAVAILABLE` (a finished operation a stream is waiting
+  on is still sent first);
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
   ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
   reach it; writes need the token in `--api-token-file` (owner-only file), come from

@@ -14,6 +14,7 @@ use kbf_types::{
 use crate::cordon::{Cordon, Cordons};
 use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
+use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
@@ -228,6 +229,9 @@ pub struct Scheduler {
     /// Finished operations still kept, in the order they finished, with when they did
     /// (so in time order: farm time never goes back).
     finished: VecDeque<(FarmTime, OperationId)>,
+    /// Requeues not yet taken, while they are recorded at all
+    /// ([`Scheduler::recording_requeues`]).
+    requeues: Option<Vec<Requeue>>,
 }
 
 impl Scheduler {
@@ -248,6 +252,7 @@ impl Scheduler {
             cordons: Cordons::default(),
             finished_retention: FINISHED_RETENTION,
             finished: VecDeque::new(),
+            requeues: None,
         }
     }
 
@@ -264,6 +269,24 @@ impl Scheduler {
     #[must_use]
     pub fn operations(&self) -> usize {
         self.ops.len()
+    }
+
+    /// This scheduler, keeping a [`Requeue`] for each lease it gives up until
+    /// [`Scheduler::take_requeues`] takes it. Off by default, so a caller that never
+    /// takes them (a simulation) does not collect them without end.
+    #[must_use]
+    pub fn recording_requeues(mut self) -> Self {
+        self.requeues = Some(Vec::new());
+        self
+    }
+
+    /// The leases given up since the last call, oldest first; always empty unless
+    /// built with [`Scheduler::recording_requeues`].
+    pub fn take_requeues(&mut self) -> Vec<Requeue> {
+        self.requeues
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// This scheduler, refusing a queued operation once no live worker has been able to
@@ -430,8 +453,20 @@ impl Scheduler {
         op.result_proposed = false;
     }
 
-    /// Releases `operation`'s holding and puts it back in the queue.
-    fn requeue(&mut self, id: OperationId) {
+    /// Releases `operation`'s holding and puts it back in the queue, recording why.
+    fn requeue(&mut self, id: OperationId, reason: RequeueReason) {
+        let given_up = self.ops[&id]
+            .state
+            .holding()
+            .map(|(lease, worker)| Requeue {
+                operation: id,
+                lease,
+                worker: worker.clone(),
+                reason,
+            });
+        if let Some(log) = &mut self.requeues {
+            log.extend(given_up);
+        }
         self.release(id);
         let op = self
             .ops
@@ -457,7 +492,7 @@ impl Scheduler {
             })
             .collect();
         for id in expired {
-            self.requeue(id);
+            self.requeue(id, RequeueReason::Silent);
         }
     }
 
@@ -475,32 +510,32 @@ impl Scheduler {
             });
         let running: BTreeSet<LeaseId> = running.iter().copied().collect();
         let now = self.now;
-        let lost: Vec<OperationId> = self
+        let lost: Vec<(OperationId, RequeueReason)> = self
             .held
             .iter()
-            .filter(|(lease, held)| {
-                let Some(sent) = held.start_sent else {
-                    return false;
-                };
-                let due = if sent.process != process {
+            .filter_map(|(lease, held)| {
+                let sent = held.start_sent?;
+                let (due, reason) = if sent.process != process {
                     // Another process may still run it: only its fence ends that.
-                    now >= handover_ends
+                    (now >= handover_ends, RequeueReason::Replaced)
                 } else if sent.session != session {
                     // A `Start` sent to an earlier session of this process reached it
                     // before it registered again, and then it lists it, or never will.
-                    true
+                    (true, RequeueReason::Reconnected)
                 } else {
-                    now >= sent.at.saturating_add(START_GRACE)
+                    let due = now >= sent.at.saturating_add(START_GRACE);
+                    (due, RequeueReason::NotStarted)
                 };
                 let op = &self.ops[&held.operation];
-                due && !running.contains(*lease)
+                let lost = due
+                    && !running.contains(lease)
                     && !op.result_proposed
-                    && op.state.holding().is_some_and(|(_, w)| w == worker)
+                    && op.state.holding().is_some_and(|(_, w)| w == worker);
+                lost.then_some((held.operation, reason))
             })
-            .map(|(_, held)| held.operation)
             .collect();
-        for id in lost {
-            self.requeue(id);
+        for (id, reason) in lost {
+            self.requeue(id, reason);
         }
     }
 

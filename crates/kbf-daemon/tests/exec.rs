@@ -54,6 +54,7 @@ impl Farm {
             tick: Duration::from_millis(50),
             unservable_wait: Duration::from_secs(300),
             finished_retention: Duration::from_secs(60),
+            shutdown_timeout: Duration::from_secs(10),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);
@@ -185,6 +186,21 @@ async fn an_action_runs_on_the_daemon_and_its_outputs_are_in_the_cas() {
     assert!(usage.cpu_user_micros > 0, "{usage:?}");
     assert!(usage.peak_memory_bytes > 0, "{usage:?}");
     assert!(usage.wall_micros >= usage.cpu_user_micros, "{usage:?}");
+
+    // The server names the node and when the action was queued; the daemon's own
+    // times stay, in order after it (issue #166).
+    let metadata = result.execution_metadata.as_ref().expect("metadata");
+    assert_eq!(metadata.worker, "node-1");
+    let time = |t: Option<&prost_types::Timestamp>| {
+        std::time::SystemTime::try_from(*t.expect("a timestamp")).expect("a time")
+    };
+    let queued = time(metadata.queued_timestamp.as_ref());
+    let worker_start = time(metadata.worker_start_timestamp.as_ref());
+    let worker_completed = time(metadata.worker_completed_timestamp.as_ref());
+    assert!(
+        queued <= worker_start && worker_start <= worker_completed,
+        "{metadata:?}"
+    );
 
     let cached = kbf_proto::reapi::action_cache_client::ActionCacheClient::new(farm.reapi.clone())
         .get_action_result(kbf_proto::reapi::GetActionResultRequest {

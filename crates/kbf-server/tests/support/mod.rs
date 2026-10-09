@@ -195,6 +195,7 @@ impl Cell {
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             finished_retention: retention,
+            shutdown_timeout: Duration::from_secs(10),
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi, worker) = (bound.reapi, bound.worker);
@@ -291,8 +292,14 @@ impl Client {
             .map(tonic::Response::into_inner)
     }
 
-    /// GetActionResult: the result, or the error code.
+    /// GetActionResult: the result as the daemon reported it ([`unstamped`]), or the
+    /// error code.
     pub async fn cached(&self, action: &Blob) -> Result<ActionResult, Code> {
+        self.cached_stamped(action).await.map(unstamped)
+    }
+
+    /// GetActionResult: the result as the cache holds it, with the server's metadata.
+    pub async fn cached_stamped(&self, action: &Blob) -> Result<ActionResult, Code> {
         self.ac()
             .get_action_result(GetActionResultRequest {
                 action_digest: Some(action.proto.clone()),
@@ -705,8 +712,33 @@ pub async fn output(cell: &Client, text: &str, exit_code: i32) -> ActionResult {
     }
 }
 
-/// The ExecuteResponse of a done operation.
+/// The ExecuteResponse of a done operation, its result as the daemon reported it
+/// ([`unstamped`]).
 pub fn response(op: &Operation) -> ExecuteResponse {
+    let mut response = stamped_response(op);
+    response.result = response.result.map(unstamped);
+    response
+}
+
+/// `result` without the metadata the server adds to every accepted result (issue
+/// #166), which must be there: the node id in `worker` and a `queued_timestamp`. The
+/// fake daemons here report results without metadata, so what is left is what they
+/// reported. `tests/execute.rs` checks the metadata's values.
+pub fn unstamped(mut result: ActionResult) -> ActionResult {
+    let metadata = result
+        .execution_metadata
+        .take()
+        .unwrap_or_else(|| panic!("a result without the server's metadata: {result:?}"));
+    assert!(!metadata.worker.is_empty(), "no worker: {metadata:?}");
+    assert!(
+        metadata.queued_timestamp.is_some(),
+        "no queued_timestamp: {metadata:?}"
+    );
+    result
+}
+
+/// The ExecuteResponse of a done operation, as the server sent it.
+pub fn stamped_response(op: &Operation) -> ExecuteResponse {
     assert!(op.done, "{op:?} is not done");
     match &op.result {
         Some(operation::Result::Response(any)) => {

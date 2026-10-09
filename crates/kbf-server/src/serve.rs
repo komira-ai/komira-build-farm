@@ -42,6 +42,9 @@ pub struct Listeners {
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
+    /// How long shutdown waits for the REAPI listener to drain (see
+    /// [`bind_server_with_api`]) before it stops anyway.
+    pub shutdown_timeout: Duration,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -149,6 +152,14 @@ where
 
 /// [`bind_server`], and the operator API ([`crate::api`]) if `api` is given.
 ///
+/// When `shutdown` completes, the REAPI listener stops accepting, every connection on
+/// it is sent GOAWAY, and every open Execute and WaitExecution stream that is not done
+/// ends UNAVAILABLE, which clients retry (issue #168). The serving future returns once
+/// the REAPI connections have closed, or after `listeners.shutdown_timeout` if one
+/// stays open (a client still uploading, say); until then the worker listener, the
+/// operator API and the tick go on. Daemon streams never end on their own, so the
+/// worker listener is not drained: it stops when the future returns.
+///
 /// # Errors
 /// A listener cannot be bound, or the worker TLS configuration is refused.
 pub fn bind_server_with_api<M, O>(
@@ -191,14 +202,16 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm));
+    let (closer, closing) = kbf_front::closing();
+    let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm), closing);
 
-    // Shutdown stops accepting and returns at once: daemon streams never end on their
-    // own, so a graceful drain would wait forever. The process exits after it.
     let serving = async move {
+        let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         let reapi_serve = Server::builder()
             .add_routes(reapi_routes)
-            .serve_with_incoming(reapi_incoming);
+            .serve_with_incoming_shutdown(reapi_incoming, async {
+                let _ = draining.await;
+            });
         let worker_serve = worker_server
             .add_service(worker_service)
             .serve_with_incoming(worker_incoming);
@@ -211,12 +224,24 @@ where
                 farm.tick();
             }
         };
+        // Completes when the drain has run out of time: the REAPI listener, drained
+        // in time, completes first.
+        let stopping = async {
+            shutdown.await;
+            closer.close();
+            let _ = drain.send(());
+            tokio::time::sleep(listeners.shutdown_timeout).await;
+            tracing::warn!(
+                timeout = ?listeners.shutdown_timeout,
+                "REAPI connections still open at the shutdown timeout; stopping anyway"
+            );
+        };
         tokio::select! {
             served = reapi_serve => served.map_err(ServeError::from),
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
-            () = shutdown => Ok(()),
+            () = stopping => Ok(()),
         }
     };
     Ok(Bound {

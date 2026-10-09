@@ -45,10 +45,12 @@
 mod cordon;
 pub mod fence;
 mod input;
+mod requeue;
 mod scheduler;
 mod servable;
 
 pub use cordon::Cordon;
 pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
+pub use requeue::{Requeue, RequeueReason};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};
