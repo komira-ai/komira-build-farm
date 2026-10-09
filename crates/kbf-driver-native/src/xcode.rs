@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::{Action, Command, Platform};
 
+use crate::network::{Isolation, Network};
+
 /// The platform property, and the node report key, that names an Xcode build.
 pub const CAPABILITY: &str = "xcode";
 
@@ -140,33 +142,55 @@ pub const XCRUN: &str = "/usr/bin/xcrun";
 /// The tools [`warm`] has `xcrun` look up: the compilers and linker builds call most.
 pub const WARM_TOOLS: [&str; 6] = ["cc", "clang", "clang++", "swift", "swiftc", "ld"];
 
+/// Where the warm-up's lookups run: under the actions' sandbox with the network off
+/// (`isolation`), with `dir` as their lease directory and `TMPDIR`, and the user-folder
+/// `rules` (`crate::user_folders::UserFolders::rules`), which let `xcrun` write its
+/// cache and nothing else outside `dir`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WarmSandbox {
+    pub isolation: Isolation,
+    pub dir: PathBuf,
+    pub rules: String,
+}
+
 /// On a thread of its own, has `xcrun` look up each of [`WARM_TOOLS`] for the node's
 /// own Xcode (no `DEVELOPER_DIR`) and for each of `developer_dirs`, each lookup given
 /// `within` to answer, so `xcrun`'s cache (`crate::user_folders`) holds them before
 /// the first action asks: a lookup it has not cached takes seconds. A lookup that
 /// fails is logged and the rest go on. `None`, and nothing run, where `xcrun` is not a
-/// file (off macOS).
+/// file (off macOS) or `sandbox.dir` cannot be made.
 ///
-/// `xcrun` here is the `/usr/bin` one, outside the sandbox: the cache it fills is
-/// that one's, and no Xcode carries its own. `--find` only prints a path, which is
-/// dropped, and runs nothing it finds, so a cache a lease rewrote during the warm-up
-/// misleads no program of the daemon's; the daemon also removes the cache before it
-/// starts ([`crate::user_folders::UserFolders::forget_xcrun_cache`]).
-#[must_use]
-pub fn warm(
+/// `xcrun` is the `/usr/bin` one (the cache it fills is that one's, and no Xcode
+/// carries its own), and it reads a cache that leases can write. So every lookup runs
+/// as an action does, under `sandbox` ([`lookup`]): the warm-up goes on while the
+/// node serves, and the daemon runs no developer tool outside the sandbox once it
+/// serves. `sandbox.dir` is made first and removed when the warm-up ends.
+pub(crate) fn warm(
     xcrun: &Path,
     developer_dirs: Vec<PathBuf>,
     within: Duration,
+    sandbox: WarmSandbox,
 ) -> Option<std::thread::JoinHandle<()>> {
     if !xcrun.is_file() {
         return None;
     }
+    // The sandbox compares real paths.
+    let made =
+        std::fs::create_dir_all(&sandbox.dir).and_then(|()| std::fs::canonicalize(&sandbox.dir));
+    let sandbox = match made {
+        Ok(dir) => WarmSandbox { dir, ..sandbox },
+        Err(e) => {
+            tracing::warn!(dir = %sandbox.dir.display(), "no xcrun warm-up: {e}");
+            return None;
+        }
+    };
     let xcrun = xcrun.to_owned();
     Some(std::thread::spawn(move || {
         let dirs = std::iter::once(None).chain(developer_dirs.into_iter().map(Some));
         for dir in dirs {
             for tool in WARM_TOOLS {
-                let failed = match output_within(lookup(&xcrun, dir.as_deref(), tool), within) {
+                let command = lookup(&xcrun, dir.as_deref(), tool, &sandbox);
+                let failed = match output_within(command, within) {
                     Ok(out) if out.status.success() => continue,
                     Ok(out) => format!(
                         "{}: {}",
@@ -178,15 +202,31 @@ pub fn warm(
                 tracing::info!(tool, developer_dir = ?dir, "xcrun --find: {failed}");
             }
         }
+        // One left behind (a removal that failed) is a `lease-` name: the next start
+        // sweeps it.
+        let _ = kbf_outputs::remove_tree(&sandbox.dir);
     }))
 }
 
-/// `xcrun --find <tool>` for the Xcode at `developer_dir`, or for the node's own Xcode
-/// (the one `xcode-select` names) with `DEVELOPER_DIR` removed from what the daemon was
-/// started with, which would otherwise pick the Xcode instead.
-fn lookup(xcrun: &Path, developer_dir: Option<&Path>, tool: &str) -> std::process::Command {
-    let mut command = std::process::Command::new(xcrun);
-    command.args(["--find", tool]);
+/// `xcrun --find <tool>` under `sandbox` with the network off, for the Xcode at
+/// `developer_dir`, or for the node's own Xcode (the one `xcode-select` names) with
+/// `DEVELOPER_DIR` removed from what the daemon was started with, which would
+/// otherwise pick the Xcode instead.
+fn lookup(
+    xcrun: &Path,
+    developer_dir: Option<&Path>,
+    tool: &str,
+    sandbox: &WarmSandbox,
+) -> std::process::Command {
+    let (program, args) = sandbox.isolation.wrap(
+        Network::Off,
+        &sandbox.dir,
+        &sandbox.rules,
+        xcrun.to_owned(),
+        &["--find".to_owned(), tool.to_owned()],
+    );
+    let mut command = std::process::Command::new(program);
+    command.args(args).env("TMPDIR", &sandbox.dir);
     match developer_dir {
         Some(dir) => command.env(DEVELOPER_DIR, dir),
         None => command.env_remove(DEVELOPER_DIR),
@@ -291,6 +331,7 @@ pub fn developer_dir(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt as _;
 
     use kbf_proto::reapi::platform::Property;
@@ -362,33 +403,57 @@ mod tests {
         log
     }
 
-    /// Catches the node's own Xcode looked up with a `DEVELOPER_DIR` the daemon was
-    /// started with (the warm-up then fills another Xcode's entries), and a named
-    /// Xcode looked up with any other.
+    /// Catches a warm-up lookup run outside the sandbox (the review of issue #163:
+    /// the `/usr/bin/xcrun` the warm-up runs reads a cache leases can write, while the
+    /// node already serves), with the network on, without the user-folder rules that
+    /// let `xcrun` write its cache, or with another lease directory or `TMPDIR`; the
+    /// node's own Xcode looked up with a `DEVELOPER_DIR` the daemon was started with
+    /// (the warm-up then fills another Xcode's entries), and a named Xcode looked up
+    /// with any other.
     #[test]
-    fn a_lookup_sets_or_removes_developer_dir() {
+    fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
         let xcrun = Path::new("/x/xcrun");
-        let own = lookup(xcrun, None, "cc");
-        assert_eq!(own.get_program(), xcrun);
-        assert_eq!(own.get_args().collect::<Vec<_>>(), ["--find", "cc"]);
+        let sandbox = WarmSandbox {
+            isolation: Isolation::Sandbox(PathBuf::from(crate::network::SANDBOX_EXEC)),
+            dir: PathBuf::from("/s/lease-warm-up"),
+            rules: "(allow file-write* (literal \"/c\"))\n".to_owned(),
+        };
+        let own = lookup(xcrun, None, "cc", &sandbox);
+        assert_eq!(own.get_program(), crate::network::SANDBOX_EXEC);
+        let profile = format!("{}{}", crate::network::NO_NETWORK_PROFILE, sandbox.rules);
+        assert_eq!(
+            own.get_args().collect::<Vec<_>>(),
+            [
+                "-D",
+                "KBF_LEASE=/s/lease-warm-up",
+                "-p",
+                &profile,
+                "/x/xcrun",
+                "--find",
+                "cc"
+            ]
+        );
+        let tmpdir = (OsStr::new("TMPDIR"), Some(sandbox.dir.as_os_str()));
         assert_eq!(
             own.get_envs().collect::<Vec<_>>(),
-            [(std::ffi::OsStr::new(DEVELOPER_DIR), None)]
+            [(OsStr::new(DEVELOPER_DIR), None), tmpdir]
         );
         let dir = Path::new("/A/Xcode.app/Contents/Developer");
-        let named = lookup(xcrun, Some(dir), "swiftc");
-        assert_eq!(named.get_args().collect::<Vec<_>>(), ["--find", "swiftc"]);
+        let named = lookup(xcrun, Some(dir), "swiftc", &sandbox);
+        assert_eq!(named.get_args().last(), Some(OsStr::new("swiftc")));
         assert_eq!(
             named.get_envs().collect::<Vec<_>>(),
-            [(std::ffi::OsStr::new(DEVELOPER_DIR), Some(dir.as_os_str()))]
+            [(OsStr::new(DEVELOPER_DIR), Some(dir.as_os_str())), tmpdir]
         );
     }
 
-    /// Catches: a lookup missed for the node's own Xcode or for one of the others, the
-    /// warm stopped by a lookup that fails or hangs, and `xcrun` run where there is
-    /// none.
+    /// Catches: a lookup missed for the node's own Xcode or for one of the others, or
+    /// run other than through the sandbox program in the warm-up's own directory
+    /// (here a fake that logs its lease parameter and runs the rest), the warm stopped
+    /// by a lookup that fails or hangs, the directory left behind, and `xcrun` run
+    /// where there is none or where the directory cannot be made.
     #[test]
-    fn warm_looks_up_every_tool_for_every_xcode() {
+    fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
         let dir = scratch("warm");
         let log = dir.join("log");
         let xcrun = dir.join("xcrun");
@@ -403,25 +468,53 @@ mod tests {
         );
         std::fs::write(&xcrun, script).expect("script");
         std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let sandbox_log = dir.join("sandbox-log");
+        let sandbox_exec = dir.join("sandbox-exec");
+        let script = format!(
+            "#!/bin/sh\necho \"$2 TMPDIR=$TMPDIR\" >> {}\nshift 4\nexec \"$@\"\n",
+            sandbox_log.display()
+        );
+        std::fs::write(&sandbox_exec, script).expect("script");
+        std::fs::set_permissions(&sandbox_exec, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let sandbox = WarmSandbox {
+            isolation: Isolation::Sandbox(sandbox_exec),
+            dir: dir.join("scratch/lease-warm-up"),
+            rules: String::new(),
+        };
+        let real = std::fs::canonicalize(&dir)
+            .expect("real")
+            .join("scratch/lease-warm-up");
         let thread = warm(
             &xcrun,
             vec![PathBuf::from("/x1"), PathBuf::from("/hung")],
             Duration::from_millis(500),
+            sandbox.clone(),
         )
         .expect("a thread");
         thread.join().expect("warmed");
+        let read = |path: &Path| -> Vec<String> {
+            std::fs::read_to_string(path)
+                .expect("log")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
         let want: Vec<String> = ["none", "/x1", "/hung"]
             .iter()
             .flat_map(|dir| WARM_TOOLS.map(|tool| format!("{dir} --find {tool}")))
             .collect();
-        assert_eq!(
-            std::fs::read_to_string(&log)
-                .expect("log")
-                .lines()
-                .collect::<Vec<_>>(),
-            want
-        );
-        assert!(warm(&dir.join("missing"), Vec::new(), WITHIN).is_none());
+        assert_eq!(read(&log), want);
+        let lease = format!("KBF_LEASE={0} TMPDIR={0}", real.display());
+        assert_eq!(read(&sandbox_log), vec![lease; want.len()]);
+        assert!(!real.exists(), "the warm-up's directory stays");
+
+        assert!(warm(&dir.join("missing"), Vec::new(), WITHIN, sandbox.clone()).is_none());
+        let unmakeable = WarmSandbox {
+            dir: log.join("under-a-file"),
+            ..sandbox
+        };
+        assert!(warm(&xcrun, Vec::new(), WITHIN, unmakeable).is_none());
     }
 
     /// How long the fake Xcodes have to answer.

@@ -28,7 +28,9 @@
 //! to find their tools. The daemon itself trusts nothing there: it removes `xcrun_db`
 //! ([`UserFolders::forget_xcrun_cache`]) before it runs any developer tool at start,
 //! runs `xcodebuild` from inside the Xcode rather than through its `/usr/bin` shim
-//! ([`crate::xcode::discover`]), and sweeps by descriptor.
+//! ([`crate::xcode::discover`]), runs its `xcrun` warm-up, which goes on while the
+//! node serves, under the actions' sandbox (`NativeRuntime::warm_xcrun`), and sweeps
+//! by descriptor.
 //!
 //! What a lease leaves there (a save it was killed in the middle of, a temporary
 //! `xcrun_db-*`) is swept ([`UserFolders::sweep`]) at daemon start and after every

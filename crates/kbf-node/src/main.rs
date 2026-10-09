@@ -107,14 +107,11 @@ fn start(cli: &Cli) -> Result<(), Error> {
     match cli.driver {
         Driver::Fake => serve(cli, &tokio, Arc::new(FakeRuntime::new(Duration::ZERO)), []),
         Driver::Native => {
-            let config = native_config(cli)?;
-            // In the background: the node serves while xcrun fills its cache.
-            let _ = xcode::warm(
-                Path::new(xcode::XCRUN),
-                config.xcodes.values().cloned().collect(),
-                xcode::ANSWER_WITHIN,
-            );
-            let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
+            // `native_config` removes xcrun's cache before it asks the Xcodes.
+            let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
+            // In the background, sandboxed as an action: the node serves while xcrun
+            // fills its cache.
+            let _ = runtime.warm_xcrun(Path::new(xcode::XCRUN), xcode::ANSWER_WITHIN);
             let capabilities = runtime.capabilities();
             serve(cli, &tokio, Arc::new(runtime), capabilities)
         }
