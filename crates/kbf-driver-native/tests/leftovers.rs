@@ -29,7 +29,6 @@ fn leftover(path: &Path, old: bool) {
 /// past its lease (the next lease sees it), and a young one (another lease's save in
 /// progress) removed by either sweep.
 #[tokio::test]
-#[ignore = "mutant run"]
 async fn old_leftovers_are_swept_at_start_and_after_each_lease() {
     let dir = scratch("leftovers");
     let (temp, cache) = (dir.join("T"), dir.join("C"));
