@@ -58,6 +58,9 @@ pub enum WebhookError {
         /// Why it is refused.
         reason: String,
     },
+    /// The backoff's longest wait does not fit on the clock.
+    #[error("webhook backoff max {0:?} is too long")]
+    Backoff(Duration),
 }
 
 /// What the notifier has done, for a status page or a "notifier failing" alert.
@@ -78,9 +81,12 @@ pub struct Status {
 /// [`Webhook::notify`] hands an event to the notifier's thread and returns at once; it
 /// never waits on the network or the disk. The thread appends the event to the
 /// outbox, writes the outbox file, then POSTs the oldest pending event until the
-/// receiver answers 2xx, waiting [`Backoff`] between failures. Delivery is in order
-/// and at least once: the body carries the outbox id, which a receiver can use to drop
-/// a repeat.
+/// receiver answers 2xx, waiting [`Backoff`] between failures. A redirect is not
+/// followed: a 3xx answer is a failed attempt. Delivery is in order and at least once:
+/// the body carries the outbox id, which a receiver can use to drop a repeat.
+///
+/// An event the receiver refuses for good (a 4xx on every attempt) stays the head and
+/// every later event waits behind it; [`Webhook::status`] is the only sign of that.
 ///
 /// An event handed over but not yet written when the process dies is lost; one that is
 /// written stays in the file until it is delivered, across any number of restarts.
@@ -105,10 +111,14 @@ impl Webhook {
     /// the outbox already holds.
     ///
     /// # Errors
-    /// The URL is not plain `http`, or the outbox cannot be read, parsed or written.
-    /// A file that does not parse is an error, never an empty outbox.
+    /// The URL is not plain `http`, the backoff's `max` is too long to add to the
+    /// clock, or the outbox cannot be read, parsed or written. A file that does not
+    /// parse or cannot be read is an error, never an empty outbox.
     pub fn start(state_dir: &Path, config: WebhookConfig) -> Result<Self, WebhookError> {
         let url = parse_url(&config.url)?;
+        if Instant::now().checked_add(config.backoff.max).is_none() {
+            return Err(WebhookError::Backoff(config.backoff.max));
+        }
         let file = OutboxFile(state_dir.join(OUTBOX_FILE));
         let outbox = file.load()?;
         file.save(&outbox).map_err(|source| WebhookError::Io {
@@ -141,7 +151,8 @@ impl Webhook {
 
     /// Queues `event` for delivery and returns without waiting.
     pub fn notify(&self, event: Event) {
-        // The thread ends only once this sender is gone, so the send cannot fail.
+        // The thread returns only once this sender is gone, so the send fails only
+        // after the thread panicked; the event is then dropped.
         let _ = self.events.send(event);
     }
 
@@ -226,8 +237,8 @@ struct Worker {
 impl Worker {
     fn run(mut self) {
         // A runtime of this thread's own, so the caller's (if any) never runs an
-        // attempt. The client ignores proxy variables from the environment, so where it
-        // connects is only what the URL says.
+        // attempt. The client ignores proxy variables from the environment and follows
+        // no redirect, so where it connects and POSTs is only what the URL says.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -235,6 +246,7 @@ impl Worker {
         let client = reqwest::Client::builder()
             .timeout(self.config.timeout)
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("a plain-HTTP client builds");
         let mut retry_at: Option<Instant> = None;

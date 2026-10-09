@@ -33,6 +33,14 @@ pub enum OutboxError {
     /// The bytes are an outbox of another version.
     #[error("outbox version {0} is not {VERSION}")]
     Version(u32),
+    /// A pending id is not below the next id, so a new event could reuse it.
+    #[error("outbox id {id} is not below next_id {next_id}")]
+    Id {
+        /// The pending id.
+        id: u64,
+        /// The id the next event would get.
+        next_id: u64,
+    },
 }
 
 /// Events waiting for delivery, oldest first.
@@ -118,12 +126,19 @@ impl Outbox {
     /// An outbox from [`Outbox::encode`]'s bytes.
     ///
     /// # Errors
-    /// The bytes do not parse, or are another version. Neither is read as empty: that
-    /// would drop undelivered alerts without a word.
+    /// The bytes do not parse, are another version, or hold a pending id at or above
+    /// `next_id` (a new event would reuse it). None is read as empty: that would drop
+    /// undelivered alerts without a word.
     pub fn decode(bytes: &[u8]) -> Result<Self, OutboxError> {
         let outbox: Self = serde_json::from_slice(bytes)?;
         if outbox.version != VERSION {
             return Err(OutboxError::Version(outbox.version));
+        }
+        if let Some(d) = outbox.pending.iter().find(|d| d.id >= outbox.next_id) {
+            return Err(OutboxError::Id {
+                id: d.id,
+                next_id: outbox.next_id,
+            });
         }
         Ok(outbox)
     }
@@ -196,8 +211,9 @@ mod tests {
     }
 
     /// Catches: an encoding that drops pending events, attempts or the id counter (a
-    /// restart would then reuse an id a receiver has already seen), and a corrupt or
-    /// foreign-version file read as an empty outbox.
+    /// restart would then reuse an id a receiver has already seen), a corrupt or
+    /// foreign-version file read as an empty outbox, and a counter at or below a
+    /// pending id accepted.
     #[test]
     fn encoding_round_trips_and_refuses_what_it_cannot_read() {
         let mut outbox = Outbox::new();
@@ -217,6 +233,13 @@ mod tests {
         let other = br#"{"version":2,"next_id":1,"pending":[]}"#;
         let err = Outbox::decode(other).expect_err("version");
         assert_eq!(err.to_string(), "outbox version 2 is not 1");
+
+        // A hand-edited file whose counter is behind a pending id.
+        let mut bytes: serde_json::Value = serde_json::from_slice(&outbox.encode()).expect("json");
+        bytes["next_id"] = 2.into();
+        let bytes = serde_json::to_vec(&bytes).expect("json");
+        let err = Outbox::decode(&bytes).expect_err("id reuse");
+        assert_eq!(err.to_string(), "outbox id 2 is not below next_id 2");
     }
 
     /// Catches: no backoff (a constant wait), a wait that does not double, or one that

@@ -18,6 +18,8 @@ use serde_json::Value;
 #[derive(Clone, Copy)]
 enum Reply {
     Status(u16),
+    /// `302 Found` to this path on the same receiver.
+    Redirect(&'static str),
     /// Read the request and never answer.
     Hang,
 }
@@ -55,7 +57,10 @@ impl Receiver {
                     seen.len() - 1
                 };
                 match script(index) {
-                    Reply::Status(code) => answer(stream, code),
+                    Reply::Status(code) => answer(stream, code, ""),
+                    Reply::Redirect(path) => {
+                        answer(stream, 302, &format!("location: {path}\r\n"));
+                    }
                     Reply::Hang => held.push(stream),
                 }
             }
@@ -98,17 +103,23 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         .unwrap_or(0);
     let mut body = vec![0; length];
     reader.read_exact(&mut body).ok()?;
+    // No body (a followed redirect sends none) is recorded as null.
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).ok()?
+    };
     Some(Request {
         headers,
-        body: serde_json::from_slice(&body).ok()?,
+        body,
         at: Instant::now(),
     })
 }
 
-fn answer(mut stream: TcpStream, code: u16) {
+fn answer(mut stream: TcpStream, code: u16, extra_headers: &str) {
     let _ = write!(
         stream,
-        "HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        "HTTP/1.1 {code} X\r\n{extra_headers}content-length: 0\r\nconnection: close\r\n\r\n"
     );
 }
 
@@ -309,8 +320,9 @@ fn the_state_directory_must_take_the_outbox() {
     webhook.stop();
 }
 
-/// Catches: a corrupt or unreadable outbox read as empty (undelivered alerts dropped),
-/// and a URL the client cannot use accepted at start instead of failing every attempt.
+/// Catches: a corrupt outbox read as empty (undelivered alerts dropped), a path that
+/// cannot take the file (a directory there) accepted, and a URL the client cannot use
+/// accepted at start instead of failing every attempt.
 #[test]
 fn start_refuses_a_bad_outbox_or_url() {
     let receiver = Receiver::start(|_| Reply::Status(200));
@@ -336,4 +348,122 @@ fn start_refuses_a_bad_outbox_or_url() {
         err.to_string().contains("scheme https is not supported"),
         "{err}"
     );
+}
+
+/// Catches: a client that follows a redirect. reqwest's default policy turns a 302
+/// to a POST into a GET with no body, and its 2xx would count as delivered: the event
+/// would leave the outbox and no receiver would ever get it. The receiver answers the
+/// first POST with a 302 to another path, then 200: the 302 must be a failed attempt,
+/// and the event must arrive a second time by POST to the configured path, with its
+/// body.
+#[test]
+fn a_redirect_is_a_failed_attempt_not_a_delivery() {
+    let receiver = Receiver::start(|i| {
+        if i == 0 {
+            Reply::Redirect("/elsewhere")
+        } else {
+            Reply::Status(200)
+        }
+    });
+    let dir = scratch("redirect");
+    let webhook = Webhook::start(&dir, config(&receiver.url)).expect("starts");
+    webhook.notify(event("a"));
+    wait_until(|| webhook.status().delivered == 1);
+    let requests = receiver.requests();
+    let lines: Vec<&str> = requests.iter().map(|r| r.headers[0].as_str()).collect();
+    assert_eq!(lines, ["POST /hook HTTP/1.1", "POST /hook HTTP/1.1"]);
+    assert_eq!(ids(&requests), [1, 1]);
+    let status = webhook.status();
+    assert_eq!(status.pending, 0);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("webhook answered 302 Found")
+    );
+    webhook.stop();
+}
+
+/// Catches: an attempt made whenever an event arrives, ignoring the backoff. In an
+/// outage alerts keep coming, so that would hammer a failing receiver at the rate
+/// alerts are raised. The receiver fails the first attempt; the backoff is 1 s; 10
+/// events are handed over during it. The second attempt comes no earlier than the
+/// backoff allows, and then all 11 are delivered in order.
+#[test]
+fn events_during_a_backoff_wait_for_it() {
+    let receiver = Receiver::start(|i| Reply::Status(if i == 0 { 503 } else { 200 }));
+    let dir = scratch("backoff-events");
+    let mut config = config(&receiver.url);
+    config.backoff = Backoff {
+        initial: Duration::from_secs(1),
+        max: Duration::from_secs(1),
+    };
+    let webhook = Webhook::start(&dir, config).expect("starts");
+    webhook.notify(event("first"));
+    receiver.wait_for(1);
+    wait_until(|| webhook.status().failures_in_a_row == 1);
+    for n in 0..10 {
+        webhook.notify(event(&format!("n{n}")));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let requests = receiver.wait_for(12);
+    wait_until(|| webhook.status().delivered == 11);
+    let gap = requests[1].at - requests[0].at;
+    assert!(gap >= Duration::from_millis(950), "retried after {gap:?}");
+    assert_eq!(
+        ids(&requests),
+        [1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "in order, one attempt each after the retry"
+    );
+    webhook.stop();
+}
+
+/// Catches: an outbox file that exists but cannot be read taken as an empty outbox.
+/// `start` would then write an empty outbox over it and the undelivered alert would be
+/// gone without a word. The file holds one event and has mode 000: `start` must fail
+/// with an I/O error and leave the file as it was. Skipped where mode 000 does not
+/// stop a read (running as root).
+#[cfg(unix)]
+#[test]
+fn start_refuses_an_outbox_it_cannot_read_and_keeps_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let receiver = Receiver::start(|_| Reply::Status(200));
+    let dir = scratch("mode-000");
+    let path = dir.join(OUTBOX_FILE);
+    let mut outbox = Outbox::new();
+    outbox.push(event("a"));
+    let bytes = outbox.encode();
+    std::fs::write(&path, &bytes).expect("write");
+    let mode = |m: u32| {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).expect("chmod");
+    };
+    mode(0o000);
+    if std::fs::read(&path).is_ok() {
+        mode(0o644);
+        eprintln!("skipped: mode 000 does not stop this process reading the file");
+        return;
+    }
+    let result = Webhook::start(&dir, config(&receiver.url));
+    mode(0o644);
+    let err = result.expect_err("an unreadable outbox");
+    assert!(matches!(err, WebhookError::Io { .. }), "{err}");
+    assert!(err.to_string().contains(OUTBOX_FILE), "{err}");
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        bytes,
+        "the file is untouched"
+    );
+    assert!(receiver.requests().is_empty());
+}
+
+/// Catches: a backoff whose wait cannot be added to the clock accepted at start. A
+/// failure whose wait reached it would then panic the thread on the addition, and
+/// every later event would be dropped with nothing in the status.
+#[test]
+fn start_refuses_a_backoff_too_long_for_the_clock() {
+    let dir = scratch("backoff-max");
+    let mut config = config("http://127.0.0.1:9/hook");
+    config.backoff.max = Duration::MAX;
+    let err = Webhook::start(&dir, config).expect_err("backoff");
+    assert!(matches!(err, WebhookError::Backoff(_)), "{err}");
+    assert!(!dir.join(OUTBOX_FILE).exists(), "refused before any write");
 }
