@@ -57,7 +57,7 @@ pub fn watch(
                 return;
             }
             let now = xcode::survey(&apps, &probe);
-            if !same(&last, &now) {
+            if !same(&last, &now) || now != last {
                 log(&changes(&last, &now));
                 send.send_replace(apply(&now));
                 last = now;
