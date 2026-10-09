@@ -43,9 +43,13 @@ action sandbox is in [daemon.md](daemon.md).
   actions on a Linux server host share the host and its network with `kbf-server`, and
   with the fetcher this design adds to it. Section 5.6 says what that means for the
   fetcher.
-- `kbf-server` has no HTTP client for upstream hosts. Its only outbound HTTPS today is
-  to the object store: it depends on `kbf-objstore`, whose `S3Store` uses `reqwest`
-  (`kbf-mdm` uses `reqwest` too). kbf has no Remote Asset API: the vendored protos
+- `kbf-server` has no HTTP client for upstream hosts. The binary's only outbound
+  connection today is to the object store: it depends on `kbf-objstore`, whose
+  `S3Store` uses `reqwest` (`kbf-mdm` uses `reqwest` too). The crate also contains
+  `GateClient`, a mutual-TLS gRPC client to `kbf-mdm-gate`
+  (`crates/kbf-server/src/mdm/client.rs`), which nothing in the binary configures yet;
+  its only callers are tests. Neither reaches an upstream host, which is the claim this
+  design rests on. kbf has no Remote Asset API: the vendored protos
   under `crates/kbf-proto/proto/third_party` are REAPI v2, ByteStream and their
   dependencies.
 - `crates/kbf-server/src/farm.rs` caches a result when the exit code is 0 and the
@@ -124,11 +128,12 @@ to the CAS.
 | A wrong pin in a change | that change's build fails | the same check: nothing is stored; the CI wait step fails the change naming the entry | reported on the entry; no alert, because the change's own check is the signal |
 | A pin bump hits many runners at once | N clients fetch upstream together | the list is submitted before the build; one fetch per digest; a per-host concurrency cap; the first verified copy, fetched or adopted, serves everyone | in-flight count and queue depth per host; no alert unless a fetch fails |
 | Cache poisoning | not applicable | the digest is the only key; a URL is a hint; every byte is verified before commit and on every read; nothing is keyed by URL; the action cache is never written | counter `mirror_rejected_total{reason}` |
-| The fetcher used to reach internal addresses | not applicable | HTTPS only; a host allow-list by flag; no proxy; DNS resolved once per hop and the connection made to that address; every address that is not globally routable refused at every hop ([section 5.6](#56-the-fetcher)); the fetcher fetches only listed entries, never a URL given at miss time | refusal recorded on the entry; alert naming the flag to change |
+| The fetcher used to reach internal addresses | not applicable | HTTPS only; a host allow-list by flag; no proxy; DNS resolved once per hop and the connection made to that address; every address that is not globally routable refused at every hop ([section 5.6](#56-the-fetcher)); the fetcher fetches only listed entries, never a URL given at miss time | refusal recorded on the entry; alert naming the refused URL and address and the fix, which is another URL: the filter has no override flag ([section 8](#8-report-alert-recover)) |
 | A source's licence forbids a private copy | not applicable | a per-host policy: `fetch`, `adopt` or `deny` ([section 5.5](#55-per-host-policy)) | the report shows each entry's policy; a `deny` entry is reported, not alerted |
 | Store pressure | not applicable | per-list caps, a total cap, and a separate cap for lists from unmerged changes inside the total, so those lists cannot crowd out the default branch ([section 7](#7-retention-and-caps)); over a cap, new entries are refused and held entries are never evicted | alert at 80% of a cap and on any refusal, naming the cap flag and the lists that hold the most; recover by raising it or retiring lists |
+| The store damages a copy as it is written, or a write or its read-back fails | not applicable | every copy is read back and re-hashed before it is committed, for fetch and adoption alike; nothing points at an unconfirmed copy, so a digest in a segment stays served from there ([section 5.2](#52-the-mirror-store-and-its-location)) | report `store_write_failed{copy, error}`, the copy recorded as damaged and prunable; alert as a mirror-store write failure with the store error and the steps it calls for; retry with backoff as the next copy, clearing on commit |
 | Server restart | cold CAS | held entries live under a stable prefix and are re-indexed at start, each reported present once its bytes are verified | re-index count, verified bytes and duration in the report; alert if the listing or a read fails, naming the store error; the re-index retries by itself |
-| A damaged object in the store | not applicable | every mirror object is read and hashed at start before it is reported present ([section 5.3](#53-re-index-at-start)), so a damaged object found then is never served; damage after that is caught by the re-hash on read, and that read fails the one action that made it ([section 5.3](#53-re-index-at-start) says exactly how) | report `corrupt`; alert with the fix; heal by writing a new copy under a new key, fetched under `fetch` or copied from a client's upload under `adopt` ([section 5.2](#52-the-mirror-store-and-its-location)) |
+| A damaged object in the store | not applicable | every mirror object is read and hashed at start before it is reported present ([section 5.3](#53-re-index-at-start)), so a damaged object found then is never served; damage after that is caught by the re-hash on read, which fails the actions that already passed Execute's input check ([section 5.3](#53-re-index-at-start) says exactly which); a copy damaged as it is written is caught by the read-back before it is committed ([section 5.2](#52-the-mirror-store-and-its-location)) | report `corrupt`; alert with the fix; heal by writing a new copy under a new key, fetched under `fetch` or copied from a client's upload under `adopt` ([section 5.2](#52-the-mirror-store-and-its-location)) |
 
 ## 5. The mechanism
 
@@ -171,6 +176,30 @@ to the CAS.
   number. (A listing that missed a key can make kbf write it again; the next bullet but
   one says what happens then.) So a damaged copy is never repaired in place; it is
   *superseded* by a verified copy with a higher number.
+- **Writing a copy, for fetch, adoption and healing alike.** The bytes going in are
+  already verified (the spool's hash, or a `VerifiedBlob`). kbf writes copy N with
+  `put_new`, then reads copy N back from the store by range and re-hashes it, size
+  included. Only when that matches is `PutBlob { Location::Mirror { copy: N } }`
+  committed; nothing points at copy N before then, so a digest held in a segment keeps
+  its segment location until a verified mirror copy replaces it. What can go wrong
+  after the write, and what happens:
+  - The read-back does not match. Copy N is damaged by the store, not by upstream (the
+    bytes were verified before the write). It is recorded as a damaged copy, prunable
+    ([section 7](#7-retention-and-caps)); the entry is `store_write_failed{copy, error}`
+    and alerted as a mirror-store write failure; the write is retried with capped
+    exponential backoff as copy N+1.
+  - The read-back or the write itself fails with a store error. The same: nothing is
+    committed, the entry is `store_write_failed{copy, error}`, and the retry writes the
+    next number. Copy N, if it was written at all, is recorded as unconfirmed and
+    prunable; a re-index that meets it verifies it like any copy before using it.
+  - The retry needs the bytes again. A fetch keeps its spool file until the copy is
+    committed and re-hashes it before each retry (a spool file that no longer hashes is
+    removed and the entry refetched). An adoption does not hold its bytes across the
+    backoff: the entry goes back to the adopt sweep ([section 5.4](#54-adopt-on-upload)),
+    which re-reads the blob verified from the CAS.
+  - It clears by itself when a retry commits. `upstream_drift` is never recorded here:
+    it means only that bytes fetched into the spool did not match the entry
+    ([section 5.6](#56-the-fetcher)).
 - Why numbered copies: `put_new` on a store that claims `conditional_put` refuses an
   existing key (`AlreadyExists`), so a fixed key per digest could never be rewritten
   after damage; on a store without it, `put_new` replaces the key
@@ -196,12 +225,18 @@ to the CAS.
   its own. Entries are few (hundreds), so this costs little.
 - `put_new` takes the whole body as `Bytes` (`crates/kbf-objstore/src/lib.rs`), so
   writing a copy holds the whole entry in memory, though the fetch itself is spooled to
-  disk ([section 5.6](#56-the-fetcher)). The memory bound is the per-entry cap times the
+  disk ([section 5.6](#56-the-fetcher)). Reads need not be whole: `get_range` takes a
+  `ByteRange`, so every mirror read this design adds (the re-index's verification and
+  the read-back after a write) reads the copy in `--mirror-read-chunk` pieces (lean
+  8 MiB) and hashes as it goes. The memory bound is therefore the per-entry cap times the
   number of copies written at once (at most `--mirror-fetchers` fetches plus
-  `--mirror-adopters` adoptions); with the lean per-entry cap of 512 MiB and 4 of each
-  that is 4 GiB in the worst case, and about 110 MiB per write for the largest entry
-  today. A streaming put (multipart upload) is later work
-  ([section 12](#12-order-of-work)); until then the per-entry cap is also a memory cap.
+  `--mirror-adopters` adoptions; an adoption holds the blob it read from the CAS), plus
+  `--mirror-verifiers` times the chunk. With the lean per-entry cap of 512 MiB, 4
+  fetchers, 4 adopters and 8 verifiers that is 4 GiB plus 64 MiB in the worst case,
+  and about 110 MiB per write for the largest entry today. A verifier that read whole
+  copies would add 8 copies of 512 MiB, 4 GiB more, which is why it reads by range. A
+  streaming put (multipart upload) is later work ([section 12](#12-order-of-work));
+  until then the per-entry cap is also a memory cap for writes.
 - Today's `Location::Object(ObjectId)` (`crates/kbf-meta/src/model.rs`) names an object
   by a counter under the per-start prefix, so it cannot name a key that survives a
   restart. The cache adds one variant, `Location::Mirror { copy }`, whose key is
@@ -213,10 +248,15 @@ to the CAS.
 ### 5.3 Re-index at start
 
 - At start `kbf-server` lists `<mirror-prefix>sha256/` (`ObjectStore::list`, paged) and
-  groups the keys by digest. A key that does not parse is reported and left alone;
-  nothing is deleted at start.
+  groups the keys by digest. A key that does not parse is left alone (nothing is deleted
+  at start), listed in the report under `unparsed_keys`, and alerted, naming the key and
+  the fix: remove it from the store, or correct `--mirror-prefix` if the prefix is shared
+  with something else. The adopt sweep ([section 5.4](#54-adopt-on-upload)) re-lists
+  the mirror prefix for such keys, so the alert clears by itself within one sweep of the
+  key's removal, with no restart.
 - **Nothing is reported present before its bytes are verified.** For each digest the
-  re-index reads its highest-numbered copy whole, hashes it, and only if it matches
+  re-index reads its highest-numbered copy by range to the end, hashes it, and only if
+  it matches
   commits a `PutBlob` with `Location::Mirror { copy }`. A copy that does not match, or
   is shorter than its key says, is recorded as damaged and the next lower copy is tried.
   A digest with no matching copy is not committed: it is `Absent`, so
@@ -251,9 +291,14 @@ could not read it" into "it does not exist"
 ([storage.md](storage.md#three-answers-not-two)). What heals afterwards:
 
 - The entry is `Unavailable` in the index from that read on. Execute's input check
-  answers from the index (`Cache::find_missing`, `crates/kbf-front/src/execution.rs`),
-  so the client's next Execute of any action that needs the blob is refused with a
-  `MISSING` violation, which REAPI asks the client to answer by uploading. A buck2
+  answers a *file* input from the index (`missing_inputs` calls `Cache::find_missing`
+  for files, `crates/kbf-front/src/execution.rs`), so the client's next Execute of any
+  action that takes the blob as a file input is refused with a `MISSING` violation,
+  which REAPI asks the client to answer by uploading. A directory input is different:
+  `read_input` reads it through `Cache::read_blob`, and an unreachable directory fails
+  the Execute `UNAVAILABLE` ("the input exists, so it is not MISSING"). Mirror entries
+  are downloaded files, never directories, so the `MISSING` path is the one that
+  applies. A buck2
   daemon that cached "present" in its `FindMissingBlobs` LRU
   ([section 2.3](#23-what-buck2-asks-the-cas)) is not consulted for that refusal; how
   buck2 handles a `MISSING` refusal is not verified here.
@@ -264,9 +309,15 @@ could not read it" into "it does not exist"
   ([section 12](#12-order-of-work)) re-reads held copies so that damage is found by the
   farm rather than by a build.
 
-So a damaged copy found at start never fails a build; damage that happens while the
-server runs fails the actions that read it before the index marks it (those reading
-it at that moment), and is reported, alerted and healed.
+So a damaged copy found at start is never served. That it then fails no build rests on
+one assumption (section 14, not verified): a buck2 daemon whose `FindMissingBlobs` LRU
+still says "present" from before the restart answers Execute's `MISSING` refusal by
+uploading the file. Damage that happens while the server runs fails every action that
+passed Execute's input check before the index marked the blob: queued, already
+dispatched, or joined as an in-flight twin of one of those. Each fails `INTERNAL` when
+its lease reads the blob, because from the mark on `read_blob` answers unreachable,
+which the daemon sees as `UNAVAILABLE`. Actions submitted after the mark are refused
+`MISSING` instead. The damage is reported, alerted and healed.
 
 ### 5.4 Adopt on upload
 
@@ -274,7 +325,10 @@ it at that moment), and is reported, alerted and healed.
   store does not hold, the cache queues a copy of the verified bytes to the entry's next
   mirror copy. The upload is acknowledged as today, after the segment commit; the copy
   is a background write on a bounded queue, at most `--mirror-adopters` at once (lean
-  4).
+  4). The copy is written, read back and re-hashed before `PutBlob` moves the digest to
+  `Location::Mirror`, exactly as [section 5.2](#52-the-mirror-store-and-its-location)
+  says for every copy; until then, and if the write fails, the digest keeps its segment
+  location and is served from there.
 - `store_blobs` commits only *fresh* blobs: a digest already present in the CAS is
   touched, not stored (`crates/kbf-front/src/cache.rs`). Two cases therefore get no
   upload to adopt: a list submitted after its blobs are already in the CAS (the common
@@ -282,9 +336,12 @@ it at that moment), and is reported, alerted and healed.
   was full, after which the blob is present in a segment, `FindMissingBlobs` says
   "present", and no client uploads it again. Both are closed by the *adopt sweep*: on
   every list submission, and every `--mirror-sweep-interval` (lean 10 minutes), the
-  server takes each listed entry that has no mirror copy, and if the CAS holds it
+  server takes each listed entry that has no committed mirror copy (including one in
+  `store_write_failed` whose backoff has passed), and if the CAS holds it
   (`Present`), reads it through `Cache::read_blob` (verified) and queues the copy.
   Nothing waits for a client.
+  Each sweep also re-lists `<mirror-prefix>sha256/` (keys are few) only to refresh
+  the report's `unparsed_keys`; it indexes nothing from that listing.
 - A full queue drops the copy, counts `mirror_adopt_dropped_total`, and marks the
   entry `adopt_pending`; the next sweep retries it. An entry that stays
   `adopt_pending` for longer than T is alerted, naming the queue flag.
@@ -339,8 +396,9 @@ remove it. The default is [D3](#d3-licence-default-for-a-host-not-named).
   only global unicast (2000::/3) is accepted, which already excludes `::`, `::1`,
   IPv4-mapped (`::ffff:0:0/96`) and IPv4-compatible (`::/96`) addresses, NAT64
   (64:ff9b::/96 and 64:ff9b:1::/48), 100::/64, fc00::/7, fe80::/10 and ff00::/8; inside
-  it 2001::/23, 2001:db8::/32 and 2002::/16 (6to4, which embeds an IPv4 address) are
-  refused too. The table follows IANA's special-purpose address registries, with a
+  it 2001::/23, 2001:db8::/32, 2002::/16 (6to4, which embeds an IPv4 address),
+  3fff::/20 (documentation, RFC 9637) and 5f00::/16 (SRv6 segment identifiers, RFC 9602)
+  are refused too. The table follows IANA's special-purpose address registries, with a
   test per row.
   Redirects are followed up to `--mirror-max-redirects` (lean 5), each hop checked again
   against the host list and the address filter. The fetcher sends no credentials and no
@@ -364,11 +422,14 @@ remove it. The default is [D3](#d3-licence-default-for-a-host-not-named).
   `fetch_failed{error: spool full}`, the spool file is removed, and an alert names the
   directory, the bytes free and the bytes needed. The retry succeeds once space is
   freed.
-- **Commit.** Only when the length equals the size and the hash equals the SHA-256 is
-  spool written to the entry's next copy with `put_new` (read into memory for it:
-  [section 5.2](#52-the-mirror-store-and-its-location)), read back by range and
-  re-hashed, and then committed as `PutBlob` with `Location::Mirror { copy }`. Any mismatch stores nothing
-  and records `upstream_drift` with what was observed.
+- **Commit.** The spool check comes first: if the length is not the size or the hash
+  is not the SHA-256, nothing is written to the store, the spool file is removed, and
+  the entry records `upstream_drift` with the URL and what was observed. That is the
+  only place `upstream_drift` is recorded. When the spool matches, it is written as the
+  entry's next copy (read into memory for `put_new`), read back and re-hashed, and only
+  then committed, as [section 5.2](#52-the-mirror-store-and-its-location) says; a
+  read-back that does not match, or a store error, is `store_write_failed`, retried
+  from the spool, never `upstream_drift`.
 - **Candidates.** `urls[]` are tried in order; each is verified the same way.
 - **Concurrency.** One fetch per digest at a time (later callers wait on it), at most
   `--mirror-host-concurrency` per host, at most `--mirror-fetchers` in all. A failure
@@ -482,7 +543,8 @@ generations that name it, its host policy, its state and the last error. States:
 | `adopt_pending` | the CAS holds it but the copy into the mirror has not been written yet (queue full, or the sweep has not run) | the next sweep writes it |
 | `fetch_failed{host, error, attempts, next_retry}` | the last fetch failed | a retry succeeds |
 | `upstream_drift{url, observed_sha256, observed_size}` | upstream served other bytes | no live list names the digest |
-| `refused{host_not_allowed, address_filtered, over_cap, not_https}` | the farm will not fetch it | the flag or the list changes |
+| `store_write_failed{copy, error, attempts, next_retry}` | a copy was written but its read-back did not match or could not be read, or the write failed; nothing was committed ([section 5.2](#52-the-mirror-store-and-its-location)) | a retried write of the next copy is read back verified and committed |
+| `refused{host_not_allowed, address_filtered, over_cap, not_https}` | the farm will not fetch it | `host_not_allowed`: the `--mirror-host` flag changes; `over_cap`: the cap flag or the lists change; `address_filtered` and `not_https`: the entry's URLs change in a resubmitted list |
 | `denied` | host policy `deny` | the policy changes |
 | `corrupt{copy}` | a stored copy failed its digest, at start or on read, and no newer verified copy exists yet | a verified copy with a higher number is committed, fetched or adopted; this survives a restart, because re-index verifies before it indexes and skips the damaged copy |
 
@@ -503,10 +565,12 @@ endpoint today, so v0 puts these counters in the report.
 | an entry of a default-branch list not held after T | the URL and error; none needed if the host returns (the fetcher keeps retrying); if the URL is gone, add a working URL to the entry's `urls[]` in the client and resubmit the list, or vendor the file |
 | `upstream_drift` | do not accept the new bytes; re-pin to a stable asset or vendor the file |
 | a host failing for longer than T | the host, the error and the entries at risk; the same fix as the row above: none if the host returns, otherwise another URL for those entries, or `--mirror-host <host>=adopt` and one client build that downloads them |
-| a refusal | the flag to change (`--mirror-host`, a cap) and its current value |
+| `refused{host_not_allowed}` | `--mirror-host <host>=fetch` (or `adopt`) and the flag's current value |
+| `refused{address_filtered}` or `refused{not_https}` | the URL and the address or scheme refused; no flag allows it (the filter has no override, by design); add an `https` URL on a public address to the entry's `urls[]` and resubmit the list, or vendor the file |
 | a cap at 80%, or any refusal over a cap | the cap flag and its value, and the lists holding the most bytes, to retire with `DELETE /v1/mirror/lists/{name}` |
-| re-index failed, or a mirror-store write or read failed | the store error and the store flags; the re-index retries by itself |
-| `unverified` after N attempts | the store error and the key |
+| re-index failed, a mirror-store read failed, or `store_write_failed` after N attempts | the store error, the key and the store flags (`--s3-endpoint`, `--s3-bucket`, `--s3-prefix`, `--mirror-prefix`, and the credential variables). The step to take follows the error: an authorization error, fix the credential the server runs with; a missing bucket or a refused prefix, correct the flag; a store that is down or out of space, restore it. A read-back mismatch means the store returned other bytes than it was given: check the store's own health and disks, since no fix in kbf applies. Every retry is automatic and the state clears when one succeeds |
+| `unverified` after N attempts | the store error and the key, with the same steps as the row above; meanwhile the digest is absent, so the fetcher (under `fetch`) or a client's upload (under `adopt`) may write a newer copy, which supersedes the unread one |
+| `unparsed_keys` | the keys; remove them from the store, or set `--mirror-prefix` to a prefix used by nothing else |
 | `adopt_pending` for longer than T | `--mirror-adopters` and the queue's depth |
 | `corrupt` | the digest and the damaged key; under `fetch` none (the fetcher writes a new copy); under `adopt`, one client build, with a fresh buck2 daemon (`buck2 kill` first, since a running daemon may have cached "present"), of a target whose remote actions take the file as input; the alert names the declaring target from the entry's label ([section 9](#9-the-clients-side-komira)), and the build's upload is adopted. Or `--mirror-host <host>=fetch`, if the host's terms allow a copy |
 | spool full | the spool directory, the bytes free and the bytes needed |
@@ -577,6 +641,16 @@ Each test names the defect it catches and the mutant planted to see it red.
 - Copies: a `put_new` meeting `AlreadyExists` on a good object adopts it and writes
   nothing; on a damaged object it writes the next copy. Mutant: treat `AlreadyExists`
   as success without reading.
+- Read-back: a fake store that flips one byte of copy N as it stores it, and one whose
+  `get_range` on copy N fails once. For a fetch and for an adoption, each: no `PutBlob`
+  names copy N; the entry is `store_write_failed` (never `upstream_drift`) with the
+  alert state set; copy N is listed as damaged or unconfirmed and prunable; after the
+  backoff copy N+1 is written, read back, committed, and the state clears; an adopted
+  digest is served from its segment throughout. Mutants: commit without read-back (a
+  `PutBlob` names the flipped copy N, and the test's read through `Cache::read_blob`
+  after it fails, so both assertions go red); record a read-back mismatch as
+  `upstream_drift` (the state assertion goes red); drop the retry (the state never
+  clears).
 - Policy: an `adopt` host is never fetched; a `deny` host is never adopted. Mutant:
   `adopt` fetches.
 
@@ -615,13 +689,14 @@ Each test names the defect it catches and the mutant planted to see it red.
 **Simulation** (a new family in `kbf-sim`, on the virtual clock, in the conventions of
 [simulation.md](simulation.md)): upstream up, down and drifting at random; list
 generations and client uploads interleaved; restarts; mirror copies damaged in the
-store and listings that miss recent keys. After every step: a committed mirror copy
+store, copies damaged as they are written, and listings that miss recent keys. After
+every step: a committed mirror copy
 hashes to its key unless it was damaged after its last verification; after a restart no
 copy is answered present before it is verified; at most one fetch per digest is in flight; no entry is
 lost while listed or in grace; every listed entry that is not `held` carries a reason;
 nothing outside the lists is fetched. At the end: every state whose cause healed has
 cleared. Mutants: drop single-flight; drop the re-index; let a failed fetch clear the
-entry; index a copy before verifying it.
+entry; index a copy before verifying it; commit a copy without reading it back.
 
 **End to end**, on a deployed farm, in the shape of komira#563's proof:
 1. A cold farm and a client whose upstream for one pin is unreachable: the build fails.
@@ -722,17 +797,18 @@ step submits on every merge.
 | Claim | Status | Source |
 |---|---|---|
 | Container actions run with `--network=none` | V | `crates/kbf-driver-container/src/podman.rs` |
-| `kbf-server` has no HTTP client for upstream hosts (its only outbound HTTPS is `kbf-objstore`'s `S3Store`); no Remote Asset protos are vendored | V | `crates/kbf-server/Cargo.toml`, `crates/kbf-objstore/src/s3/mod.rs`, `crates/kbf-proto/proto/third_party` |
+| `kbf-server` has no HTTP client for upstream hosts (the binary's only outbound connection is `kbf-objstore`'s `S3Store`; the crate's `GateClient` to `kbf-mdm-gate` is not configured by the binary, only by tests); no Remote Asset protos are vendored | V | `crates/kbf-server/Cargo.toml`, `crates/kbf-objstore/src/s3/mod.rs`, `crates/kbf-server/src/mdm/client.rs`, `crates/kbf-server/tests/mdm_gate.rs`, `crates/kbf-proto/proto/third_party` |
 | Native actions on Linux, and on a Mac without `sandbox-exec`, have the node's network whatever they ask | V | `crates/kbf-driver-native/src/network.rs` (module comment, `Isolation::None`) |
 | A daemon input read that fails other than `NOT_FOUND` fails the action `INTERNAL`, not `MISSING` | V | `crates/kbf-daemon/src/cas.rs` (`call_error`), `local.rs` (`tree_error`), `lease.rs` |
-| Execute's input check answers from the index, so an unreachable blob is `MISSING` there | V | `crates/kbf-front/src/execution.rs`, `Cache::find_missing` |
+| Execute's input check answers a *file* input from the index, so an unreachable file is `MISSING` there; an unreachable *directory* input fails the Execute `UNAVAILABLE` | V | `crates/kbf-front/src/execution.rs` (`missing_inputs`, `read_input`), `Cache::find_missing` |
+| `get_range` reads any `ByteRange`, so a copy can be verified in chunks | V | `crates/kbf-objstore/src/lib.rs`, `types.rs` (`ByteRange`) |
 | `put_new` takes the whole body as `Bytes`; without `conditional_put` it replaces an existing key | V | `crates/kbf-objstore/src/lib.rs`, `types.rs` (`Capabilities`) |
 | A restart empties the CAS; nothing expires while the server runs | V | `crates/kbf-server/src/config.rs`, [storage.md](storage.md) |
 | `Location::Object` names an object under the per-start prefix | V | `crates/kbf-meta/src/model.rs`, `Cache::object_key` |
 | `Unavailable` is reported missing by `FindMissingBlobs`, so an upload heals the index; a worker's read of it fails the action `INTERNAL` | V | [storage.md](storage.md#three-answers-not-two), `crates/kbf-front/src/cache.rs`, `crates/kbf-daemon/src/cas.rs` |
 | `store_blobs` writes only blobs not already present | V | `crates/kbf-front/src/cache.rs` |
 | `reqwest` honours proxy environment variables unless built with `no_proxy()` | V, `reqwest` documentation | `reqwest::ClientBuilder` |
-| How buck2 answers a `MISSING` refusal of Execute | A, not read | facebook/buck2 |
+| How buck2 answers a `MISSING` refusal of Execute, including a daemon whose `FindMissingBlobs` LRU cached "present" before a restart; "a damaged copy found at start fails no build" ([section 5.3](#53-re-index-at-start)) rests on it | A, not read | facebook/buck2 |
 | buck2 has no Remote Asset client | V on buck2 `main`, by search | facebook/buck2 |
 | `download_file` probes the CAS and needs 2 hours of remaining life | V on buck2 `main` | `download_file.rs` |
 | The open-source client gives a present blob `cas_ttl_secs` (3 hours default) and caches answers for up to 12 hours | V on buck2 `main` | `remote_execution/oss/re_grpc/src/client.rs` |
