@@ -4,7 +4,8 @@
 # on x86 and arm. Findings: docs/spikes/hosted-runners.md. Each step prints
 # `SPIKE <arch>.<key>=<value>` lines; read them with
 #   gh run view <run id> --log | grep ' SPIKE '
-# Run by hand, or on a pull request that changes this file or tools/spike/.
+# Run by hand, or on a pull request that changes this file or tools/spike/ outside
+# tools/spike/macos/ (the macOS probes have their own workflow, spike-macos.yml).
 name: spike-hosted
 
 on:
@@ -13,6 +14,7 @@ on:
     paths:
       - .github/workflows/spike-hosted.yml
       - tools/spike/**
+      - '!tools/spike/macos/**'
 
 permissions: {}
 
