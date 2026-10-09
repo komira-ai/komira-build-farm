@@ -329,7 +329,7 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
             })
     };
     let gave_up = |line: &str| {
-        racing.iter().any(|root| {
+        let _ = racing; roots.iter().any(|root| { // MUTANT D
             line == format!(
                 "find: failed to read file names from file system at or below '{root}': \
                  No such file or directory"
@@ -348,7 +348,7 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
             .args(expr)
             .output()
             .expect("run find");
-        found.push_str(&String::from_utf8_lossy(&output.stdout));
+        found = String::from_utf8_lossy(&output.stdout).into_owned(); // MUTANT C
         stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let errors_ok = !stderr.trim().is_empty()
             && output.status.code() == Some(1)
@@ -571,7 +571,7 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
 /// action's own program (`comm`) running in it is the state the driver relies on (#88).
 async fn set_up_container_cgroup(lease: &Path, comm: &str) -> PathBuf {
     let container = wait_for_container_cgroup(lease).await;
-    wait_for_program_in(&container, comm).await;
+    if container.as_os_str().is_empty() { wait_for_program_in(&container, comm).await; } // MUTANT F
     container
 }
 

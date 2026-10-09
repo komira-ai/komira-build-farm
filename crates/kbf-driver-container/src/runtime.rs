@@ -593,17 +593,15 @@ impl Lease {
         let mut errors = Vec::new();
         // First, `podman start`: a dropped run has not waited for it, and until it has
         // exited it may still start the container's processes or write into the lease.
-        if let Some(mut start) = self.start.take() {
-            errors.extend(reap(&mut start, REAP_LIMIT, REAP_PAUSE).err());
-        }
         if self.created {
-            // Kill whatever runs in the lease first: a run dropped mid-start leaves
-            // `crun create` in the container's cgroup, and `podman rm --force` returns
-            // without waiting for it, so the cgroup stays busy.
             let _ = self.cgroup.kill();
             if let Err(e) = self.podman.remove_blocking(&self.name) {
                 errors.push(e);
             }
+        }
+        // MUTANT E: reap after rm
+        if let Some(mut start) = self.start.take() {
+            errors.extend(reap(&mut start, REAP_LIMIT, REAP_PAUSE).err());
         }
         if let Err(e) = self.cgroup.remove() {
             errors.push(e.to_string());

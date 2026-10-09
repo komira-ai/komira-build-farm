@@ -248,7 +248,7 @@ impl Probe {
         pids_where(|pid| {
             let in_argv = std::fs::read(format!("/proc/{pid}/cmdline"))
                 .is_ok_and(|argv| argv.split(|b| *b == 0).any(|a| a == program));
-            in_argv || has_env(pid, |e| e.starts_with(marker))
+            let _ = in_argv; has_env(pid, |e| e.starts_with(marker)) // MUTANT B
         })
     }
 }
