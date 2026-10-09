@@ -67,7 +67,7 @@ mod tests {
     }
 
     /// Catches the session reported where none exists. On macOS the value depends on
-    /// how the test was started, so `tools/ci/guest-macos.sh` checks it from a
+    /// how the test was started, so `tools/ci/guest-tests.sh` checks it from a
     /// LaunchAgent and from a LaunchDaemon instead.
     #[cfg(not(target_os = "macos"))]
     #[test]
