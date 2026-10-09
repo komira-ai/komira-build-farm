@@ -71,11 +71,11 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode whose own
-    /// `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`
-    /// and for which `xcrun --no-cache --find clang` does (each within a minute) is ready: it is reported as an `xcode`
-    /// entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One
-    /// that is not is listed in the node's status with why and the command that fixes
-    /// it, and logged at WARN.
+    /// `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`,
+    /// and for which `xcrun --find clang` does (each within a minute, under the
+    /// actions' sandbox), is ready: it is reported as an `xcode` entry, and an action
+    /// that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed
+    /// in the node's status with why and the command that fixes it, and logged at WARN.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
     /// How often, in seconds, the Xcodes are asked again (native), so one fixed while
@@ -154,20 +154,21 @@ fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
     native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))
 }
 
-/// [`native`] with `config` and the `xcrun` it warms (a test names its own user
-/// folders, and an `xcrun` that is not there, so no warm-up outlives it).
+/// [`native`] with `config` and the `xcrun` it surveys with and warms (a test names
+/// its own user folders and sandbox, and an `xcrun` of its own).
 fn native_with(
     cli: &Cli,
     config: NativeConfig,
     xcrun: &Path,
 ) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
-    // Before the first survey, which runs the Xcodes' tools outside the sandbox:
-    // leases can write xcrun's cache.
-    config.forget_xcrun_cache();
     let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
-    let (probe, every) = xcode_watch_args(cli);
+    let (mut probe, every) = xcode_watch_args(cli);
+    probe.xcrun = xcrun.to_owned();
+    // Every question runs as an action does: xcrun reads and fills its cache, which
+    // leases can write, only under the sandbox.
+    probe.sandbox = Some(runtime.sandbox(kbf_driver_native::SURVEY_DIR));
     // The first survey is applied before this returns.
     let (driver, _) = xcode_watch::watch(
         cli.xcode_apps.clone(),
@@ -409,7 +410,7 @@ mod tests {
         ])
         .expect("flags");
         let mut config = native_config(&cli).expect("config");
-        // Not the runner's own (on macOS): the start removes xcrun's cache there.
+        // Not the runner's own (on macOS): the start sweeps them.
         config.user_folders = None;
         let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
         let xcodes = daemon.node_status().xcodes;
@@ -421,12 +422,15 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches (the merge of issues #163 and #164): the native daemon's first survey of
-    /// its Xcodes, run outside the sandbox, asked while `xcrun`'s cache that a lease
-    /// could have written is still there. The Xcode's own `xcodebuild` is a fake that
-    /// answers a build saying whether it saw the cache.
+    /// Catches (CEO decision on issue #164): the native daemon removing `xcrun`'s cache
+    /// before its first survey. Every `xcrun` lookup of the survey then has nothing
+    /// cached and takes seconds, while the node says nothing to the server: on the
+    /// macOS runner (15 `Xcode*.app`) that start took over the 30 s binary.rs allows,
+    /// against about 7 s with the cache kept. The survey runs under the sandbox, so
+    /// what a lease wrote there reaches only sandboxed tools. The Xcode's own
+    /// `xcodebuild` is a fake that answers a build saying whether it saw the cache.
     #[tokio::test]
-    async fn the_first_survey_runs_after_the_xcrun_cache_is_gone() {
+    async fn the_first_survey_finds_the_xcrun_cache_kept() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = scratch("forget");
@@ -468,7 +472,110 @@ mod tests {
         let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
         let xcodes = daemon.node_status().xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
-        assert_eq!(xcodes[0].build, "1A1", "{xcodes:?}");
+        assert_eq!(xcodes[0].build, "CACHE", "{xcodes:?}");
+        assert!(temp.join("xcrun_db").exists(), "the start removed the cache");
+        drop(daemon);
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches (CEO decision on issue #164): the native daemon's survey of its Xcodes
+    /// asking a question outside the actions' sandbox, `xcrun`'s lookup above all (it
+    /// reads and fills a cache leases can write), or with an `xcrun` other than the one
+    /// the daemon warms. The sandbox program is a fake that marks what it runs; the
+    /// Xcode's `xcodebuild` and the `xcrun` are fakes that log each run and whether it
+    /// was marked. The warm-up of the Xcode the survey finds ready runs too, also
+    /// sandboxed; the test waits for it to end.
+    #[tokio::test]
+    async fn the_daemons_survey_runs_under_the_sandbox() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch("sandboxed");
+        tls_files(&dir);
+        let log = dir.join("ran");
+        let write = |path: &Path, script: &str| {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, script).expect("script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        };
+        let sandbox_exec = dir.join("sandbox-exec");
+        write(
+            &sandbox_exec,
+            "#!/bin/sh\nlease=\"${2#KBF_LEASE=}\"; shift 4\nKBF_FAKE_SANDBOX=\"$lease\" exec \"$@\"\n",
+        );
+        let logged = format!(
+            "echo \"$(basename \"$0\") ${{KBF_FAKE_SANDBOX:-unsandboxed}} $*\" >> '{}'\n",
+            log.display()
+        );
+        let apps = dir.join("Applications");
+        let xcodebuild = apps
+            .join("Xcode_1.app/Contents/Developer")
+            .join(xcode::XCODEBUILD);
+        write(
+            &xcodebuild,
+            &format!("#!/bin/sh\n{logged}echo 'Build version 1A1'\n"),
+        );
+        let xcrun = dir.join("bin/xcrun");
+        write(&xcrun, &format!("#!/bin/sh\n{logged}echo /x/clang\n"));
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=http://127.0.0.1:1".to_owned(),
+            flag("scratch", &dir.join("leases")),
+            flag("xcode-apps", &apps),
+        ])
+        .expect("flags");
+        let mut config = native_config(&cli).expect("config");
+        // Not the runner's own (on macOS): the start sweeps them.
+        config.user_folders = None;
+        config.isolation = kbf_driver_native::network::Isolation::Sandbox(sandbox_exec);
+        let daemon = native_with(&cli, config, &xcrun).expect("the native daemon");
+        let xcodes = daemon.node_status().xcodes;
+        assert_eq!(xcodes.len(), 1, "{xcodes:?}");
+        assert_eq!(xcodes[0].state(), XcodeState::Ready, "{xcodes:?}");
+        let leases = std::fs::canonicalize(dir.join("leases")).expect("real");
+        let survey = leases.join(kbf_driver_native::SURVEY_DIR);
+        assert!(!survey.exists(), "the survey's directory stays");
+        // The warm-up removes its directory when it ends.
+        let warm = leases.join("lease-warm-up");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while warm.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ran = std::fs::read_to_string(&log).expect("ran");
+        let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
+        let surveyed: Vec<String> = ran
+            .lines()
+            .filter(|l| l.starts_with("xcodebuild ") || l.ends_with(" --find clang"))
+            .take(4)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            surveyed,
+            [
+                format!("xcodebuild {}", at(&survey, "-version")),
+                format!("xcodebuild {}", at(&survey, "-license check")),
+                format!("xcodebuild {}", at(&survey, "-checkFirstLaunchStatus")),
+                format!("xcrun {}", at(&survey, "--find clang")),
+            ],
+            "{ran}"
+        );
+        assert!(
+            ran.lines()
+                .all(|l| l.starts_with("xcodebuild ") || l.starts_with("xcrun ")),
+            "{ran}"
+        );
+        let unsandboxed: Vec<&str> = ran
+            .lines()
+            .filter(|l| !l.contains(&*leases.to_string_lossy()))
+            .collect();
+        assert_eq!(unsandboxed, Vec::<&str>::new(), "{ran}");
         drop(daemon);
         kbf_outputs::remove_tree(&dir).expect("clean");
     }

@@ -94,24 +94,11 @@ impl NativeConfig {
             leftover_age: LEFTOVER_AGE,
         }
     }
-
-    /// Removes `xcrun`'s cache from the user folders
-    /// ([`UserFolders::forget_xcrun_cache`]); nothing without them (off macOS). The
-    /// daemon does this before its first survey of the Xcodes
-    /// ([`crate::xcode_watch::watch`]): the survey runs their tools outside the sandbox,
-    /// leases can write that cache, and the `xcrun` warm-up
-    /// ([`crate::NativeRuntime::warm_xcrun`]) then fills it afresh.
-    pub fn forget_xcrun_cache(&self) {
-        if let Some(folders) = &self.user_folders {
-            folders.forget_xcrun_cache();
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::xcode;
 
     /// Catches: a limit for an unbooked lease (which would kill everything that books
     /// nothing at the headroom), a percentage applied twice or not at all, and an
@@ -128,63 +115,5 @@ mod tests {
         };
         assert_eq!(tight.limit(64 << 20), Some(64 << 20));
         assert_eq!(MemoryPolicy::default(), policy);
-    }
-
-    /// Catches Xcodes surveyed (outside the sandbox) while `xcrun`'s cache a lease
-    /// could have written is still there: the fake `xcodebuild` answers a build that
-    /// says which it saw, and the survey is asked as the daemon asks its first one,
-    /// after [`NativeConfig::forget_xcrun_cache`].
-    #[test]
-    fn xcodes_are_surveyed_after_the_xcrun_cache_is_gone() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("config-xcodes-{}", std::process::id()));
-        let _ = kbf_outputs::remove_tree(&dir);
-        let (temp, cache) = (dir.join("T"), dir.join("C"));
-        std::fs::create_dir_all(&temp).expect("T");
-        std::fs::create_dir_all(&cache).expect("C");
-        let apps = dir.join("Applications");
-        let program = apps
-            .join("Xcode.app/Contents/Developer")
-            .join(xcode::XCODEBUILD);
-        std::fs::create_dir_all(program.parent().expect("bin")).expect("bin");
-        let script = format!(
-            "#!/bin/sh\n\
-             if [ -e '{}/xcrun_db' ]; then echo 'Build version CACHE'; \
-             else echo 'Build version 1A1'; fi\n",
-            temp.display()
-        );
-        std::fs::write(&program, script).expect("script");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let probe = xcode::Probe {
-            xcrun: PathBuf::from("/usr/bin/true"),
-            within: Duration::from_secs(5),
-            ..xcode::Probe::system(false)
-        };
-        let builds = || -> Vec<String> {
-            let surveyed = xcode::survey(&apps, &probe);
-            xcode::ready(&surveyed).into_keys().collect()
-        };
-        std::fs::write(temp.join("xcrun_db"), b"a lease's").expect("cache");
-        let mut config = NativeConfig::new(dir.join("leases"));
-        config.user_folders = UserFolders::new(temp.clone(), cache);
-        assert_eq!(builds(), ["CACHE"], "the fake sees the cache");
-        config.forget_xcrun_cache();
-        assert!(!temp.join("xcrun_db").exists(), "the cache stays");
-        assert_eq!(builds(), ["1A1"]);
-        // Without user folders (off macOS) there is nothing to remove.
-        std::fs::write(temp.join("xcrun_db"), b"a lease's").expect("cache");
-        config.user_folders = None;
-        config.forget_xcrun_cache();
-        assert!(
-            temp.join("xcrun_db").exists(),
-            "removed what the config does not name"
-        );
-        kbf_outputs::remove_tree(&dir).expect("clean");
     }
 }

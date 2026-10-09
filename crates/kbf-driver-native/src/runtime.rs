@@ -42,6 +42,11 @@ pub const KIND: &str = "action";
 /// that overlap never share, or remove, each other's directory.
 pub const WARM_UP_DIR: &str = "lease-warm-up";
 
+/// The directory under the scratch root the daemon's Xcode surveys run in, as their
+/// lease directory ([`NativeRuntime::sandbox`]): a `lease-` name, like
+/// [`WARM_UP_DIR`]. Surveys run one after another, so they share it.
+pub const SURVEY_DIR: &str = "lease-survey";
+
 /// How long a spawn retries a program file that is still open for writing.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// The pause between two rounds of SIGKILL while ending an action's processes.
@@ -141,10 +146,8 @@ impl<C: Cas> NativeRuntime<C> {
     /// run as an action is: under this node's isolation with the network off, the
     /// user-folder rules and [`WARM_UP_DIR`] as its lease directory. From then on each
     /// survey that makes an Xcode ready warms that one the same way
-    /// ([`Self::apply_xcodes`]). So the daemon runs no `xcrun` lookup outside the
-    /// sandbox but its survey's, which does not read the cache
-    /// ([`xcode::NO_CACHE`]), and `xcrun` still fills its cache. `None` where `xcrun`
-    /// is not a file or the directory cannot be made.
+    /// ([`Self::apply_xcodes`]). `None` where `xcrun` is not a file or the directory
+    /// cannot be made.
     #[must_use]
     pub fn warm_xcrun(
         &self,
@@ -161,6 +164,15 @@ impl<C: Cas> NativeRuntime<C> {
             started: 1,
         });
         warm_xcrun(&self.config, &self.rules, WARM_UP_DIR, xcrun, dirs, within)
+    }
+
+    /// Where a question to the Xcodes runs as an action does ([`xcode::Sandbox`]):
+    /// under this node's isolation with the network off, the user-folder rules, and
+    /// `dir` under the scratch root as its lease directory. The daemon's survey runs
+    /// in [`SURVEY_DIR`] ([`xcode::Probe::sandbox`]).
+    #[must_use]
+    pub fn sandbox(&self, dir: &str) -> xcode::Sandbox {
+        sandbox(&self.config, &self.rules, dir)
     }
 
     /// The node report entries this driver adds: how it keeps the network off, and
@@ -522,12 +534,16 @@ fn warm_xcrun(
     developer_dirs: Vec<Option<PathBuf>>,
     within: Duration,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let sandbox = xcode::WarmSandbox {
+    xcode::warm(xcrun, developer_dirs, within, &sandbox(config, rules, dir))
+}
+
+/// [`NativeRuntime::sandbox`], not generic over the CAS.
+fn sandbox(config: &NativeConfig, rules: &str, dir: &str) -> xcode::Sandbox {
+    xcode::Sandbox {
         isolation: config.isolation.clone(),
         dir: config.scratch.join(dir),
         rules: rules.to_owned(),
-    };
-    xcode::warm(xcrun, developer_dirs, within, sandbox)
+    }
 }
 
 /// Removes the leftovers in the user folders old enough to be no lease's work in
