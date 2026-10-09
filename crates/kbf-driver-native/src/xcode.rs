@@ -2,8 +2,9 @@
 //!
 //! A Mac may have several Xcodes installed side by side (`/Applications/Xcode.app`,
 //! `/Applications/Xcode_16.2.app`, ...). [`survey`] finds every `Xcode*.app` in a
-//! directory and asks each, under that Xcode's `DEVELOPER_DIR`, in this order (with
-//! its own `xcodebuild`, the one inside the app, never the `/usr/bin` shim):
+//! directory and asks each, under that Xcode's `DEVELOPER_DIR`, these questions (with
+//! its own `xcodebuild`, the one inside the app, never the `/usr/bin` shim), whose
+//! answers it reads in this order:
 //!
 //! 1. `xcodebuild -version`, which must print a build;
 //! 2. `xcodebuild -license check` (an Xcode whose licence is not accepted still answers
@@ -214,10 +215,10 @@ impl Probe {
 /// documentation as `probe` says. A directory that cannot be read has none. A question
 /// not answered in time (exit and close its output) is killed if still running. Each
 /// Xcode is asked once (an app that is a link to another is reported with that one's
-/// answers) and on a thread of its own, so the survey takes as long as its slowest
-/// Xcode, up to `probe.within` per question, not as long as all of them: an `xcrun`
-/// lookup it has not cached takes seconds, and the node says nothing to the server
-/// until its first survey is done. With [`Probe::sandbox`], its directory is made
+/// answers), on a thread of its own and its questions at once, so the survey takes
+/// about as long as its slowest Xcode, not as long as all of them, but for the
+/// `xcrun` lookups, which run one at a time (see the module documentation): the node
+/// says nothing to the server until its first survey is done. With [`Probe::sandbox`], its directory is made
 /// first (every Xcode is [`State::Failed`], and nothing is run, when it cannot be)
 /// and removed when every Xcode has answered.
 #[must_use]

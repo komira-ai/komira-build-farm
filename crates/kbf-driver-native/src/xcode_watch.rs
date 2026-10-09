@@ -28,8 +28,7 @@ use crate::xcode::{self, Probe, State, Xcode};
 
 /// How often the Xcodes are asked again by default: often enough that a fix shows
 /// within minutes, rarely enough that the questions (a few process starts per Xcode,
-/// one of them an `xcrun` lookup that does not use its cache and takes seconds) cost
-/// little.
+/// each under the sandbox) cost little.
 pub const EVERY: Duration = Duration::from_secs(180);
 
 /// What [`watch`] calls with each survey that differs from the last: makes its ready

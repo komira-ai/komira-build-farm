@@ -532,8 +532,8 @@ fn every_xcode_that_answers_is_found() {
 /// that requires it, asked for on one that does not, a Metal question not answered in
 /// time taken as an Xcode before 26 or as missing Metal, an `Xcode` before 26 (no
 /// `-showComponent`) taken as missing Metal when `xcrun` finds it, or as having Metal
-/// when `xcrun` does not, the Xcodes asked one after another (then an uncached lookup,
-/// which takes seconds, is paid once per Xcode before the node says `Hello`), and
+/// when `xcrun` does not, the Xcodes asked one after another (then each Xcode's
+/// questions are paid in turn before the node says `Hello`), and
 /// `xcrun` asked with `--no-cache` (the survey's lookups use the cache, under the
 /// sandbox: without it each takes seconds).
 #[test]
