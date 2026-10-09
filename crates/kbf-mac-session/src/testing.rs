@@ -31,6 +31,9 @@ pub(crate) struct State {
     pub(crate) live_script: VecDeque<usize>,
     /// Per uid, how many more `kill_all` calls leave its processes alive.
     pub(crate) stubborn: BTreeMap<u32, usize>,
+    /// A file each `kill_all` looks at, logging whether it is there: shows where the
+    /// helper removes it among the kills.
+    pub(crate) watch: Option<PathBuf>,
     /// Every `pause` so far.
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
@@ -96,7 +99,12 @@ impl Host for FakeHost {
     }
 
     fn kill_all(&self, uid: u32) -> io::Result<()> {
-        self.call("kill_all", format!("kill_all {uid}"))?;
+        let watched = match &self.state().watch {
+            Some(file) if file.exists() => " (watched file present)",
+            Some(_) => " (watched file absent)",
+            None => "",
+        };
+        self.call("kill_all", format!("kill_all {uid}{watched}"))?;
         let mut state = self.state();
         let stubborn = state.stubborn.get(&uid).copied().unwrap_or(0);
         if stubborn > 0 {

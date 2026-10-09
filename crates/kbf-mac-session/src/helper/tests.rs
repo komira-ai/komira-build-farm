@@ -673,7 +673,8 @@ fn user_delete_gives_up_naming_what_is_left() {
 
 /// Catches the cause of issue #195: a crontab (or `at` job) left in place by
 /// `kill-uid`, whose job then starts a process of the uid that `user-delete` refuses,
-/// and a job that fired before the sweep left alive (no second kill). A schedule
+/// a job that fired before the sweep left alive (no second kill), and a sweep after
+/// both kills (the fake host logs at each kill whether the crontab is there). A schedule
 /// that cannot be removed is reported, after the processes are killed all the same.
 #[test]
 fn kill_uid_removes_the_schedules_between_two_kills() {
@@ -687,13 +688,25 @@ fn kill_uid_removes_the_schedules_between_two_kills() {
     // Nothing left after the first kill; a job fires before the sweep, so the
     // second kill finds one and kills it.
     rig.host.state().live_script.extend([0, 1]);
+    rig.host.state().watch = Some(tab.clone());
     assert_eq!(rig.helper.kill_uid("14.1"), Ok(()));
     assert!(!tab.exists(), "kill-uid left the crontab");
-    let kills = log(&rig)
-        .iter()
+    let kills: Vec<String> = log(&rig)
+        .into_iter()
         .filter(|c| c.starts_with("kill_all"))
-        .count();
-    assert_eq!(kills, 3, "one round, then two after the sweep");
+        .collect();
+    // The crontab goes after the first kill and before the second: a sweep after
+    // both kills leaves a window in which its job starts a process nothing kills.
+    let uid = rig.host.state().users["kbf-lease-14-1"].uid;
+    assert_eq!(
+        kills,
+        [
+            format!("kill_all {uid} (watched file present)"),
+            format!("kill_all {uid} (watched file absent)"),
+            format!("kill_all {uid} (watched file absent)"),
+        ],
+        "one round, the sweep, then two rounds"
+    );
 
     if me() != 0 {
         std::fs::write(&tab, "* * * * * job").unwrap();

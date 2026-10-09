@@ -242,7 +242,13 @@ for round in $(seq "$rounds"); do
   while [ "$(date +%S)" -ge 55 ]; do sleep 0.2; done
   while [ "$(date +%S)" -lt 57 ]; do sleep 0.2; done
   "$client" kill "$socket" "$lease"
-  echo "round $round: kill-uid done at $(date +%T)"
+  done_at=$(date +%T)
+  echo "round $round: kill-uid done at $done_at"
+  # Ended past :04, the watch below would look at nothing: the round was not staged.
+  done_s=${done_at##*:}
+  if [ "$done_s" -ge 4 ] && [ "$done_s" -lt 55 ]; then
+    fail "round $round: kill-uid ended at $done_at, too late to stage the race"
+  fi
   if sudo -n test -e "/private/var/at/tabs/kbf-lease-1-$((5 + round))"; then
     fail "round $round: kill-uid left the crontab"
   fi

@@ -384,7 +384,9 @@ impl Helper {
     /// outlives its user as an orphan uid that later leases' files are open to). Each
     /// look waits up to [`EXIT_LOOKS`] listings for the processes it finds to exit: a
     /// cron job that started between `kill-uid` and this delete ends by itself, and
-    /// one that does not is named in the refusal.
+    /// one that does not is named in the refusal. The ledger lock is held throughout,
+    /// so a refused delete holds back the other verbs for up to about five seconds
+    /// per look.
     ///
     /// # Errors
     /// Why it was refused: a process of the uid remains, or the sweep or the deletion
