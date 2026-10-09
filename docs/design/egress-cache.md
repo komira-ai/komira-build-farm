@@ -330,12 +330,12 @@ remove it. The default is [D3](#d3-licence-default-for-a-host-not-named).
   refuses the answer if *any* address is not globally routable, and connects to the
   address it checked, so a second lookup cannot return something else. "Not globally
   routable" is a deny list that names every special-purpose range rather than relying
-  on `Ipv4Addr::is_private`, which omits most of them: for IPv4, 0.0.0.0/8, 10.0.0.0/8,
-  100.64.0.0/10 (shared address space, used by carrier NAT and overlay VPNs),
-  127.0.0.0/8, 169.254.0.0/16 (which covers cloud metadata services), 172.16.0.0/12,
-  192.0.0.0/24, the documentation ranges 192.0.2.0/24, 198.51.100.0/24 and
-  203.0.113.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15,
-  224.0.0.0/4 (multicast) and 240.0.0.0/4 with 255.255.255.255 (broadcast). For IPv6,
+  on `Ipv4Addr::is_private`, which omits most of them. For IPv4 (prefixes written
+  short, trailing zero octets left out): 0/8, 10/8, 100.64/10 (shared address space,
+  used by carrier NAT and overlay VPNs), 127/8, 169.254/16 (which covers cloud metadata
+  services), 172.16/12, 192.0.0/24, the documentation ranges 192.0.2.0/24,
+  198.51.100.0/24 and 203.0.113.0/24, 192.88.99/24, 192.168/16, 198.18/15, 224/4
+  (multicast), and 240/4, which includes the limited broadcast address. For IPv6,
   only global unicast (2000::/3) is accepted, which already excludes `::`, `::1`,
   IPv4-mapped (`::ffff:0:0/96`) and IPv4-compatible (`::/96`) addresses, NAT64
   (64:ff9b::/96 and 64:ff9b:1::/48), 100::/64, fc00::/7, fe80::/10 and ff00::/8; inside
@@ -555,8 +555,8 @@ Each test names the defect it catches and the mutant planted to see it red.
   different hash; no `Content-Length`; a lying `Content-Length`. Mutants: drop the size
   cap; skip the hash compare; trust `Content-Length`.
 - Address filter: one case per row of the table in [section 5.6](#56-the-fetcher),
-  including 100.64.0.0/10, an IPv4-mapped IPv6 address of a private host
-  (`::ffff:10.0.0.1`), a NAT64 address and a 6to4 address; a DNS answer with one public
+  including an address in 100.64/10, an IPv4-mapped IPv6 address of a 10/8 host
+  (`::ffff:` followed by it), a NAT64 address and a 6to4 address; a DNS answer with one public
   and one private address; an `http://` URL; a redirect into a private range; a DNS
   answer that changes between two lookups; `HTTPS_PROXY` set in the environment pointing
   at a fake proxy that must see no connection. Mutants: use `is_private` alone (the
