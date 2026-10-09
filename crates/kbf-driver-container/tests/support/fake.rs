@@ -301,7 +301,7 @@ fn pids_where(test: impl Fn(u32) -> bool) -> Vec<u32> {
 impl Drop for Fake {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            self.wait_until_nothing_runs();
+            if self.dir.as_os_str().is_empty() { self.wait_until_nothing_runs(); } // MUTANT A: main's Drop
             super::force_remove(&self.dir);
         }
     }
