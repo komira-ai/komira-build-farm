@@ -594,7 +594,7 @@ impl Lease {
         // First, `podman start`: a dropped run has not waited for it, and until it has
         // exited it may still start the container's processes or write into the lease.
         if let Some(mut start) = self.start.take() {
-            let _ = (&mut start, reap); // MUTANT: no reap
+            let _ = (&mut start, reap, REAP_LIMIT, REAP_PAUSE); // MUTANT: no reap
         }
         if self.created {
             // Kill whatever runs in the lease first: a run dropped mid-start leaves

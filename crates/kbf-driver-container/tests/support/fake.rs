@@ -284,8 +284,7 @@ fn running_with_env(entry: &[u8]) -> Vec<u32> {
 }
 
 fn has_env(pid: u32, test: impl Fn(&[u8]) -> bool) -> bool {
-    std::fs::read(format!("/proc/{pid}/environ"))
-        .is_ok_and(|env| env.split(|b| *b == 0).any(test))
+    std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| env.split(|b| *b == 0).any(test))
 }
 
 /// The pids in `/proc` that pass `test`. A process that ends while it is read, or is
