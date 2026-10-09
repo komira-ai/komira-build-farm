@@ -75,7 +75,7 @@ pub struct Config {
     pub outputs: PathBuf,
     /// What `Ready` reports as the session ([`crate::session::manager_name`]).
     pub session: String,
-    /// How long a new connection may take to send `Hello`.
+    /// How long a new connection may take to send all of `Hello`.
     pub hello_timeout: Duration,
 }
 
@@ -120,8 +120,11 @@ impl Agent {
     /// # Errors
     /// The stream could not be set up, or the command could not be reaped.
     pub fn serve_connection<S: Stream>(&mut self, mut stream: S) -> io::Result<()> {
-        stream.set_read_timeout(Some(self.config.hello_timeout))?;
-        let refusal = match read_frame(&mut stream).and_then(|f| HostMsg::decode(&f)) {
+        let hello = read_frame(&mut ReadBy {
+            stream: &mut stream,
+            by: Instant::now() + self.config.hello_timeout,
+        });
+        let refusal = match hello.and_then(|f| HostMsg::decode(&f)) {
             Ok(HostMsg::Hello { version, .. }) if version != VERSION => Some((
                 Refusal::Version,
                 format!("this guest speaks version {VERSION}, the host sent {version}"),
@@ -287,6 +290,28 @@ impl Agent {
     }
 }
 
+/// Reads from `stream` until `by` and no later: each read is bounded by the time left,
+/// so a peer that sends a byte now and then cannot stretch the whole read past `by`.
+struct ReadBy<'a, S: Stream> {
+    stream: &'a mut S,
+    by: Instant,
+}
+
+impl<S: Stream> Read for ReadBy<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.by.saturating_duration_since(Instant::now());
+        // A zero timeout is refused by `set_read_timeout`, and means "none" to the OS.
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no Hello within the hello timeout",
+            ));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
 fn refused(reason: Refusal, detail: String) -> GuestMsg {
     GuestMsg::Refused { reason, detail }
 }
@@ -295,4 +320,24 @@ fn refused(reason: Refusal, detail: String) -> GuestMsg {
 /// of the stream; there is no one to tell here.
 fn send(w: &mut impl Write, msg: &GuestMsg) {
     let _ = write_frame(w, &msg.encode());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a deadline that has passed handed to the OS as a zero timeout, which
+    /// `set_read_timeout` refuses (and which would mean no bound at all): the read
+    /// ends with `TimedOut` and reads nothing.
+    #[test]
+    fn a_read_after_the_deadline_times_out() {
+        let (mut stream, mut peer) = UnixStream::pair().expect("socket pair");
+        peer.write_all(b"x").expect("written");
+        let mut late = ReadBy {
+            stream: &mut stream,
+            by: Instant::now(),
+        };
+        let err = late.read(&mut [0u8; 1]).expect_err("timed out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
 }

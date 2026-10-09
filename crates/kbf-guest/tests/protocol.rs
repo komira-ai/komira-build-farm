@@ -2,13 +2,15 @@
 
 mod common;
 
+use std::io::Write as _;
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Served, Shares, TOKEN, sh};
 use kbf_guest::client::{Client, ClientError};
 use kbf_guest::wire::{
-    End, GuestMsg, HostMsg, Refusal, RunRequest, TOKEN_LEN, VERSION, read_frame, write_frame,
+    End, GuestMsg, HostMsg, MAX_FRAME, Refusal, RunRequest, TOKEN_LEN, VERSION, read_frame,
+    write_frame,
 };
 
 fn send(stream: &mut UnixStream, msg: &HostMsg) {
@@ -102,6 +104,48 @@ fn a_silent_connection_is_dropped_after_the_hello_timeout() {
             ..
         }
     ));
+    let mut client = served.connect();
+    client.run(&sh("exit 0", &[])).expect("started");
+    assert_eq!(client.wait().expect("exited").end, End::Exited(0));
+}
+
+/// Catches a hello timeout that bounds each read rather than the whole Hello: a
+/// connection that announces a large frame and then sends a byte every half timeout
+/// would otherwise hold the agent for as long as it keeps dripping.
+#[test]
+fn a_dripping_connection_is_dropped_after_the_hello_timeout() {
+    let shares = Shares::new("hello-drip");
+    let mut config = shares.config();
+    config.hello_timeout = Duration::from_millis(200);
+    let served = Served::start(config);
+    let mut host = served.connect_raw();
+    // A reply that never comes fails the read below instead of hanging the test.
+    host.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    let mut drip = host.try_clone().expect("clone");
+    let dripping = std::thread::spawn(move || {
+        drip.write_all(&MAX_FRAME.to_be_bytes()).expect("length");
+        let give_up = Instant::now() + Duration::from_secs(5);
+        // Ends once the agent shuts the connection.
+        while Instant::now() < give_up && drip.write_all(&[0]).is_ok() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let start = Instant::now();
+    let reply = read_frame(&mut host).expect("the agent replied before the test gave up");
+    assert!(matches!(
+        GuestMsg::decode(&reply).expect("decodes"),
+        GuestMsg::Refused {
+            reason: Refusal::NoHello,
+            ..
+        }
+    ));
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "refused only after {:?}",
+        start.elapsed()
+    );
+    dripping.join().expect("drip thread");
     let mut client = served.connect();
     client.run(&sh("exit 0", &[])).expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
