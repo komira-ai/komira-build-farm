@@ -202,7 +202,8 @@ async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
     let b = Cache::open(log.clone(), store.clone(), KeyPrefix::default())
         .await
         .expect("open b");
-    assert!(b.epoch() > a.epoch(), "{:?} then {:?}", a.epoch(), b.epoch());
+    let (first, second) = (a.epoch(), b.epoch());
+    assert!(second > first, "{first:?} then {second:?}");
 
     let mut digests = Vec::new();
     for n in 0..3 {
