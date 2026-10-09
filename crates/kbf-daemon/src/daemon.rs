@@ -17,6 +17,14 @@
 //! before the first Heartbeat, each stream sends the node's software status
 //! (`NodeStatus`, see [`crate::status`]).
 //!
+//! A driver whose report changes while the daemon runs (the native driver re-checks its
+//! Xcodes, issue #164) hands the daemon a [`DriverReport`] channel
+//! ([`Daemon::with_driver_report`]). Its entries join the report the daemon was started
+//! with, and its Xcodes go into `NodeStatus`. Each change is taken when it arrives: when
+//! the report changed, the Hello is resent on the stream (the server then places by the
+//! new report, issue #25), and `NodeStatus` is sent again either way. A change while no
+//! stream is up is taken by the next stream's Hello.
+//!
 //! Each lease is remembered with the server's lease epoch at its Start and the action
 //! the Start named (issue #137). Every Result echoes that action, so the server can
 //! refuse one that answers another operation. A Welcome that names another epoch
@@ -55,7 +63,7 @@ use kbf_proto::worker::{
     worker_client::WorkerClient,
 };
 use kbf_types::LeaseId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 
@@ -65,7 +73,7 @@ use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::report::NodeReport;
 use crate::runtime::Runtime;
-use crate::status::Software;
+use crate::status::{DriverReport, Software};
 use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -119,9 +127,16 @@ pub enum SessionError {
 pub struct Daemon<R> {
     config: DaemonConfig,
     endpoint: Endpoint,
+    /// The report the daemon was started with.
+    base: NodeReport,
+    /// What Hello carries and heartbeats hash: `base` plus the driver's newest entries.
     report: NodeReport,
     /// What `NodeStatus` says about the operating system.
     software: Software,
+    /// The driver's newest report, if it sends any; see [`Self::with_driver_report`].
+    driver: Option<watch::Receiver<DriverReport>>,
+    /// Every Xcode the driver's newest report names, ready or not.
+    xcodes: Vec<worker::XcodeStatus>,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases<R>,
     done: mpsc::UnboundedReceiver<Done>,
@@ -156,6 +171,7 @@ enum Wake {
     Beat,
     Done(Box<Done>),
     Recheck,
+    Driver,
 }
 
 impl<R: Runtime> Daemon<R> {
@@ -182,8 +198,11 @@ impl<R: Runtime> Daemon<R> {
         Ok(Self {
             config,
             endpoint,
+            base: report.clone(),
             report,
             software: Software::detect(),
+            driver: None,
+            xcodes: Vec::new(),
             events: None,
             leases: Leases::new(runtime, done_tx),
             done,
@@ -202,6 +221,37 @@ impl<R: Runtime> Daemon<R> {
     pub fn with_events(mut self, events: mpsc::UnboundedSender<Event>) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// Adds `driver`'s entries to the report and its Xcodes to `NodeStatus`, now and
+    /// each time it changes (see the module documentation).
+    #[must_use]
+    pub fn with_driver_report(mut self, driver: watch::Receiver<DriverReport>) -> Self {
+        self.driver = Some(driver);
+        self.take_driver_report();
+        self
+    }
+
+    /// Takes the driver's newest report, if it sends any; returns whether the node
+    /// report changed.
+    fn take_driver_report(&mut self) -> bool {
+        let Some(driver) = &mut self.driver else {
+            return false;
+        };
+        let newest = driver.borrow_and_update().clone();
+        let report = self.base.clone().with_entries(newest.entries);
+        self.xcodes = newest.xcodes;
+        let changed = report != self.report;
+        self.report = report;
+        changed
+    }
+
+    /// The `NodeStatus` this node sends now.
+    fn node_status(&self) -> worker::NodeStatus {
+        worker::NodeStatus {
+            xcodes: self.xcodes.clone(),
+            ..self.software.status(&self.report)
+        }
     }
 
     /// Reads `clock` for the fence and the Start window instead of [`SystemClock`]. A
@@ -240,6 +290,8 @@ impl<R: Runtime> Daemon<R> {
         let channel = self.offline(endpoint.connect()).await?;
         let mut client = WorkerClient::new(channel);
         let (tx, rx) = unbounded();
+        // A change that arrived while no stream was up.
+        self.take_driver_report();
         let hello_sent = self.clock.now();
         send(&tx, daemon_message::Message::Hello(self.hello()));
         self.emit(Event::HelloSent);
@@ -274,8 +326,7 @@ impl<R: Runtime> Daemon<R> {
         for result in self.unacked.values() {
             send(&tx, daemon_message::Message::Result(result.clone()));
         }
-        let status = self.software.status(&self.report);
-        send(&tx, daemon_message::Message::NodeStatus(status));
+        send(&tx, daemon_message::Message::NodeStatus(self.node_status()));
 
         let mut seq = 0u64;
         let mut beat = tokio::time::interval(interval);
@@ -290,6 +341,7 @@ impl<R: Runtime> Daemon<R> {
                 _ = beat.tick() => Wake::Beat,
                 Some(done) = self.done.recv() => Wake::Done(Box::new(done)),
                 () = sleep(wait) => Wake::Recheck,
+                Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck(Some(&tx)).await;
@@ -309,6 +361,12 @@ impl<R: Runtime> Daemon<R> {
                 }
                 Wake::Done(done) => self.finished(Some(&tx), *done),
                 Wake::Recheck => {}
+                Wake::Driver => {
+                    if self.take_driver_report() {
+                        send(&tx, daemon_message::Message::Hello(self.hello()));
+                    }
+                    send(&tx, daemon_message::Message::NodeStatus(self.node_status()));
+                }
             }
         }
     }
@@ -599,6 +657,12 @@ impl<R: Runtime> Daemon<R> {
 fn instance_id() -> String {
     let half = || RandomState::new().hash_one(std::process::id());
     format!("{:016x}{:016x}", half(), half())
+}
+
+/// Completes when `driver` has a report the daemon has not taken; never when there is
+/// no driver channel, or its sender is gone (`None` then disables the select arm).
+async fn driver_changed(driver: Option<&mut watch::Receiver<DriverReport>>) -> Option<()> {
+    driver?.changed().await.ok()
 }
 
 /// Queues a message on the stream. A message for a stream that is gone is dropped: a

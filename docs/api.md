@@ -73,10 +73,21 @@ and where it is in placement:
   { "node_id": "mac-1", "connected": true, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
+      "xcodes": [
+        { "app": "/Applications/Xcode_15.4.app", "build": "15F31d", "state": "ready",
+          "reason": "", "fix": "" },
+        { "app": "/Applications/Xcode_16.1.app", "build": "16B40",
+          "state": "license_not_accepted",
+          "reason": "/usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.",
+          "fix": "sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" },
+        { "app": "/Applications/Xcode_16.2.app", "build": "16C5032a", "state": "ready",
+          "reason": "", "fix": "" } ],
       "received_at_unix_ms": 1791370000000 },
+    "needs_attention": [
+      "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: /usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.; fix: sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" ],
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
                    "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "software": null,
+  { "node_id": "old-1", "connected": false, "software": null, "needs_attention": [],
     "placement": { "state": "serving" } }
 ] }
 ```
@@ -87,6 +98,9 @@ and where it is in placement:
 | `connected` | whether its newest stream is still open |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
+| `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
+| `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, or `unknown` for a state this server does not know), `reason` (the check that failed and its answer) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
+| `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when it is resolved; kbf has no alert delivery yet (issue #189) |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 

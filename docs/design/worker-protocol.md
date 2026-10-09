@@ -328,12 +328,13 @@ action cache with the result.
 ### `NodeStatus`
 
 What software the node runs, for operators: the OS name, version and build, the
-kernel release (Linux), the `kbf-daemon` version, and the installed Xcode builds
-(Mac). It routes no work, so it is not part of the node report and does not change
+kernel release (Linux), the `kbf-daemon` version, the ready Xcode builds (Mac), and
+every installed Xcode with its state, why it is not ready and the command that fixes
+it (`xcodes`, Mac; issue #164). It routes no work, so it is not part of the node report and does not change
 `report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
 `sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
-are the node report's `xcode` entries, from the driver that discovers them. A field
-it cannot read is empty.
+are the node report's `xcode` entries, from the driver that discovers them, and
+`xcodes` comes from the same driver. A field it cannot read is empty.
 
 The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
 the first `Heartbeat`. The server keeps the newest one per node, from the node's
@@ -341,8 +342,14 @@ current stream only (one from a replaced stream is ignored, and one the deny lis
 refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
 in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
 the message ignores it as an empty message; a daemon that predates it is listed
-without software. Sending it again when the software changes mid-session is
-**planned** (fleet-updates.md section 3.1, re-detection).
+without software, and a server that predates `xcodes` ignores it.
+
+When the driver's report changes mid-session (today: the native driver re-checks its
+Xcodes every few minutes, and one became ready or stopped being so), the daemon resends
+its `Hello` on the stream if the node report changed (the server takes a resent
+`Hello` as the node's new report, so placement sees the new `xcode` entries), and then
+sends `NodeStatus` again. Re-detecting the other software mid-session is **planned**
+(fleet-updates.md section 3.1, re-detection).
 
 ### `Offer`
 

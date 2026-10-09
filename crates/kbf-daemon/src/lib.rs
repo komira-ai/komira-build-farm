@@ -50,3 +50,4 @@ pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError};
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use report::NodeReport;
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
+pub use status::DriverReport;

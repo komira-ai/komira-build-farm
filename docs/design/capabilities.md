@@ -66,8 +66,9 @@ both architectures.
 ### Driver entries
 
 The driver adds its own entries. The native driver (Macs) reports `network_isolation`
-(`sandbox-exec` or `none`; reported, not matched) and one `xcode` entry per Xcode build
-it can select (see [Matching](#matching)).
+(`sandbox-exec` or `none`; reported, not matched) and one `xcode` entry per ready Xcode
+build it can select (see [Matching](#matching)); an installed Xcode that is not ready is
+in the node status instead (`xcodes`, below).
 
 A daemon runs one driver today, so `drivers` has one value. The scheduler does not read
 it yet (see [Planned](#planned)); the daemon refuses a `Start` for a lease kind its
@@ -110,7 +111,8 @@ module), and the server shows it in `GET /v1/nodes` ([api.md](../api.md#get-v1no
 | `os_build` | `sw_vers -buildVersion` | `os-release` `BUILD_ID`, where set |
 | `kernel` | empty | `/proc/sys/kernel/osrelease` |
 | `daemon_version` | the `kbf-daemon` version | the same |
-| `xcode_builds` | the report's `xcode` entries, sorted | empty |
+| `xcode_builds` | the report's `xcode` entries (the ready Xcodes), sorted | empty |
+| `xcodes` | every installed Xcode: app, build, state (`ready` or why not), reason, fix command | empty |
 
 A field that cannot be read is empty; status never stops a node from joining.
 
@@ -167,7 +169,7 @@ Each key has one typed comparison:
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | the node has at least this amount (`gpu` is also booked, below) |
 | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
-| `xcode` | membership: the node reports one `xcode` entry per installed Xcode build, and the request names one of them |
+| `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | **planned**: membership on the digest (see [Planned VM entries](#planned-vm-entries)) |
 
@@ -266,11 +268,16 @@ naming no `container-image`.
 - The container driver reads `container-image` itself, by that exact name (see
   [daemon.md](daemon.md#the-container-driver)).
 - Unknown platform properties are ignored, not refused (see [Unknown keys](#unknown-keys)).
-- Each daemon sends its `NodeStatus` after `Welcome`; it routes no work.
-- A Mac's native driver reports one `xcode` entry per `Xcode*.app` in `/Applications`
-  (`--xcode-apps`) that answers `xcodebuild -version` and whose `xcodebuild -license
-  check` and `xcrun --find clang` exit 0, and runs an action that names
-  an `xcode` build with that Xcode's `DEVELOPER_DIR`.
+- Each daemon sends its `NodeStatus` after `Welcome`, and again when its Xcodes change;
+  it routes no work.
+- A Mac's native driver reports one `xcode` entry per ready `Xcode*.app` in
+  `/Applications` (`--xcode-apps`): one that answers `xcodebuild -version` and whose
+  `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
+  clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0. It
+  runs an action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. It asks
+  again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
+  sees it) and the `NodeStatus` (which lists every installed Xcode, ready or not, with
+  the fix).
 
 ## Planned
 

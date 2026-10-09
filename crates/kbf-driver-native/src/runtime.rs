@@ -6,14 +6,14 @@ use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::tree::{
     TreeError, check_relative, fetch_message, materialize, output_paths, real_dirs,
 };
-use kbf_daemon::{Runtime, RuntimeError, Work};
+use kbf_daemon::{DriverReport, Runtime, RuntimeError, Work};
 use kbf_outputs::OutputsError;
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
 use kbf_types::LeaseId;
@@ -47,6 +47,9 @@ pub struct NativeRuntime<C> {
     config: NativeConfig,
     cas: Arc<C>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
+    /// The Xcodes an action may name: `config.xcodes` at first, then the ready ones of
+    /// each survey ([`NativeRuntime::apply_xcodes`]).
+    xcodes: RwLock<BTreeMap<String, PathBuf>>,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -91,6 +94,7 @@ impl<C: Cas> NativeRuntime<C> {
         std::fs::create_dir_all(&config.scratch)?;
         crate::sweep::sweep(&config.scratch, remove)?;
         Ok(Self {
+            xcodes: RwLock::new(config.xcodes.clone()),
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
@@ -106,12 +110,29 @@ impl<C: Cas> NativeRuntime<C> {
             self.config.isolation.name().to_owned(),
         )];
         entries.extend(
-            self.config
-                .xcodes
+            self.xcodes()
                 .keys()
                 .map(|build| (xcode::CAPABILITY.to_owned(), build.clone())),
         );
         entries
+    }
+
+    /// Makes the ready Xcodes of `installed` the ones actions may name, and returns
+    /// what the daemon reports for them: [`Self::capabilities`] (one `xcode` entry per
+    /// ready build), and every installed Xcode with its state for `NodeStatus`.
+    #[must_use]
+    pub fn apply_xcodes(&self, installed: &[xcode::Xcode]) -> DriverReport {
+        let ready = xcode::ready(installed);
+        // The map is replaced whole, so it is consistent after a panic.
+        *self.xcodes.write().unwrap_or_else(PoisonError::into_inner) = ready;
+        DriverReport {
+            entries: self.capabilities(),
+            xcodes: installed.iter().map(xcode::Xcode::status).collect(),
+        }
+    }
+
+    fn xcodes(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, PathBuf>> {
+        self.xcodes.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
@@ -145,7 +166,7 @@ impl<C: Cas> NativeRuntime<C> {
         let outputs = output_paths(&command).map_err(tree_error)?;
         let timeout = timeout_of(&action, self.config.default_timeout)?;
         let network = network_of(&action, &command)?;
-        let developer_dir = xcode::developer_dir(&self.config.xcodes, &action, &command)?;
+        let developer_dir = xcode::developer_dir(&self.xcodes(), &action, &command)?;
 
         tokio::fs::create_dir(dir).await.map_err(failed(dir))?;
         let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
@@ -718,6 +739,74 @@ mod tests {
             .expect("quarantine")
             .count();
         assert_eq!(aside, 1);
+        kbf_outputs::remove_tree(&scratch).expect("clean");
+    }
+
+    /// Catches (issue #164): a survey that leaves the runtime selecting the Xcodes of
+    /// the one before (a fixed Xcode refused to the actions placed for it, or a broken
+    /// one still run), a not-ready Xcode advertised, the network entry dropped from the
+    /// report, and an installed Xcode missing from the status.
+    #[test]
+    fn a_survey_changes_the_xcodes_actions_may_name() {
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("apply-{}", std::process::id()));
+        let _ = kbf_outputs::remove_tree(&scratch);
+        let mut config = NativeConfig::new(scratch.clone());
+        config.xcodes = BTreeMap::from([("1A".to_owned(), PathBuf::from("/A/Contents/Developer"))]);
+        let runtime = NativeRuntime::new(config, Arc::new(NoCas)).expect("runtime");
+        let network = (
+            network::CAPABILITY.to_owned(),
+            runtime.config.isolation.name().to_owned(),
+        );
+        let xcode_entry = |build: &str| (xcode::CAPABILITY.to_owned(), build.to_owned());
+        assert_eq!(runtime.capabilities(), [network.clone(), xcode_entry("1A")]);
+        let at = |app: &str, build: &str, state| xcode::Xcode {
+            app: PathBuf::from(app),
+            developer_dir: Some(PathBuf::from(app).join("Contents/Developer")),
+            build: Some(build.to_owned()),
+            state,
+            reason: String::new(),
+        };
+        let installed = [
+            at("/B", "2B", xcode::State::Ready),
+            at("/C", "3C", xcode::State::LicenseNotAccepted),
+        ];
+        let report = runtime.apply_xcodes(&installed);
+        assert_eq!(report.entries, [network, xcode_entry("2B")]);
+        assert_eq!(report.entries, runtime.capabilities());
+        let states: Vec<_> = report
+            .xcodes
+            .iter()
+            .map(|x| (x.app.as_str(), x.state()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("/B", kbf_proto::worker::XcodeState::Ready),
+                ("/C", kbf_proto::worker::XcodeState::LicenseNotAccepted)
+            ]
+        );
+        let named = |build: &str| Action {
+            platform: Some(kbf_proto::reapi::Platform {
+                properties: vec![kbf_proto::reapi::platform::Property {
+                    name: "xcode".to_owned(),
+                    value: build.to_owned(),
+                }],
+            }),
+            ..Action::default()
+        };
+        let select =
+            |build| xcode::developer_dir(&runtime.xcodes(), &named(build), &Command::default());
+        assert_eq!(
+            select("2B").ok(),
+            Some(Some(PathBuf::from("/B/Contents/Developer")))
+        );
+        assert!(select("1A").is_err(), "the earlier survey's Xcode");
+        assert!(select("3C").is_err(), "a not-ready Xcode");
         kbf_outputs::remove_tree(&scratch).expect("clean");
     }
 

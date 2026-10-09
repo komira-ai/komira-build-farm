@@ -18,7 +18,9 @@
 //!   action's `network` platform property allows it; elsewhere nothing is enforced,
 //!   and the node reports which in its `network_isolation` capability;
 //! - the Xcode its `xcode` platform property names, as `DEVELOPER_DIR` ([`xcode`]: the
-//!   driver reports every Xcode build the daemon found);
+//!   driver advertises every ready Xcode build, reports every installed Xcode with why
+//!   one is not ready and how to fix it, and asks again every few minutes,
+//!   [`xcode_watch`]);
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
@@ -81,6 +83,7 @@ pub mod procs;
 mod runtime;
 mod sweep;
 pub mod xcode;
+pub mod xcode_watch;
 
 pub use config::{MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime};

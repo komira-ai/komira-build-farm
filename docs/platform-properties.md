@@ -144,20 +144,35 @@ build is what `xcodebuild -version` prints after `Build version` (`16C5032a`), n
 marketing version (`16.2`), so two Xcodes that share a version but differ in build
 never share a cache entry.
 
-A Mac may have several Xcodes installed; it serves an action that names any of them.
-The daemon finds them at start: each `Xcode*.app` in `/Applications` (the
-`--xcode-apps` flag) is asked three questions under its own `DEVELOPER_DIR`:
-`xcodebuild -version` (which must print a build), `xcodebuild -license check` and
-`xcrun --find clang`. One for which all three exit 0, each within a minute, is reported
-as an `xcode` entry of its node report. Any other is left out, and the log names the
-question it failed and why: an Xcode whose licence is not accepted still answers
+A Mac may have several Xcodes installed; it serves an action that names any of them
+that is **ready**. The daemon asks each `Xcode*.app` in `/Applications` (the
+`--xcode-apps` flag), under its own `DEVELOPER_DIR`, in order: `xcodebuild -version`
+(which must print a build), `xcodebuild -license check`, `xcodebuild
+-checkFirstLaunchStatus`, `xcrun --find clang`, and, on a node started with
+`--require-metal-toolchain` (one meant for GPU work), whether `xcodebuild -showComponent
+MetalToolchain` says `Status: installed` (an Xcode before 26, which has no
+`-showComponent` and bundles Metal, passes when `xcrun --find metal` does). One for
+which every question exits 0, each within a minute, is ready and is reported as an
+`xcode` entry of its node report. An Xcode whose licence is not accepted still answers
 `-version` with exit 0, but `-license check` and every tool it runs (`xcrun`, `cc`,
-`swiftc`) exit 69, so it would fail every action placed on it. A hung question is
-killed, so it cannot keep the node from starting. An answer counts only once the
-program has exited and closed its output: one that exits but leaves a child holding its
-output open is left out when the minute is up. The Xcodes are asked one after another,
-so each hung Xcode delays the daemon's start by up to a minute per question it is
-asked (three at most). An action
+`swiftc`) exit 69, so it would fail every action placed on it.
+
+An Xcode that is not ready is **not hidden**: the node's status lists every installed
+Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
+`metal_toolchain_missing`, `failed`), the question it failed with its answer, and the
+command that fixes it (for example `sudo
+/Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license accept`),
+and `GET /v1/nodes` lists it under the node's `needs_attention`
+([api.md](api.md#get-v1nodes)). The daemon and the server each log it once at `WARN`.
+The daemon asks again every three minutes (`--xcode-recheck-secs`), so an Xcode fixed
+while the daemon runs is advertised within minutes, without a restart, and one that
+stops being ready (an update whose new licence is not accepted) stops being advertised.
+
+A hung question is killed, so it cannot keep the node from starting. An answer counts
+only once the program has exited and closed its output: one that exits but leaves a
+child holding its output open is not ready when the minute is up. The Xcodes are asked
+one after another, so each hung Xcode delays the daemon's start by up to a minute per
+question it is asked (five at most). An action
 that names no `xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
 `DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
 whatever its environment says.

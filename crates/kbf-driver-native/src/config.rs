@@ -60,16 +60,17 @@ pub struct NativeConfig {
     pub kill_wait: Duration,
     /// How the network is kept off.
     pub isolation: Isolation,
-    /// The Xcodes an action may name, by build (`16C5032a`), each as the path its
-    /// `DEVELOPER_DIR` takes (`.../Xcode.app/Contents/Developer`); see
-    /// [`crate::xcode::discover`].
+    /// The Xcodes an action may name when the runtime starts, by build (`16C5032a`),
+    /// each as the path its `DEVELOPER_DIR` takes (`.../Xcode.app/Contents/Developer`).
+    /// The daemon leaves it empty and sets the ready ones of each survey with
+    /// [`crate::NativeRuntime::apply_xcodes`] ([`crate::xcode_watch`]).
     pub xcodes: BTreeMap<String, PathBuf>,
 }
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits and
     /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation, and no
-    /// Xcode (the daemon fills [`Self::xcodes`] from [`crate::xcode::discover`]).
+    /// Xcode (see [`Self::xcodes`]).
     #[must_use]
     pub fn new(scratch: PathBuf) -> Self {
         Self {

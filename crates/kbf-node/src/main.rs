@@ -17,16 +17,19 @@
 //! running then are abandoned (their processes killed, their directories removed);
 //! the scheduler places them again.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use kbf_daemon::{Args, CasClient, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime};
-use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode};
+use kbf_daemon::{
+    Args, CasClient, Daemon, DaemonConfig, DriverReport, FakeRuntime, NodeReport, Runtime,
+};
+use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::watch;
 use tonic::transport::Endpoint;
 
 /// The `kbf-daemon` command line.
@@ -61,11 +64,21 @@ struct Cli {
     #[arg(long, default_value_t = 250)]
     memory_poll_ms: u64,
     /// The directory searched for `Xcode*.app` (native). Each Xcode that answers
-    /// `xcodebuild -version`, `xcodebuild -license check` and `xcrun --find clang`
-    /// (each within a minute) is reported as an `xcode` entry, and an action that names
-    /// its build runs with it as `DEVELOPER_DIR`.
+    /// `xcodebuild -version`, `-license check` and `-checkFirstLaunchStatus` and `xcrun
+    /// --find clang` (each within a minute) is ready: it is reported as an `xcode`
+    /// entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One
+    /// that is not is listed in the node's status with why and the command that fixes
+    /// it, and logged at WARN.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
+    /// How often, in seconds, the Xcodes are asked again (native), so one fixed while
+    /// the daemon runs becomes ready without a restart.
+    #[arg(long, default_value_t = xcode_watch::EVERY.as_secs())]
+    xcode_recheck_secs: u64,
+    /// This node's actions use Metal (native): an Xcode whose Metal toolchain is not
+    /// installed (`xcodebuild -showComponent MetalToolchain`) is not ready.
+    #[arg(long)]
+    require_metal_toolchain: bool,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
@@ -106,28 +119,42 @@ fn start(cli: &Cli) -> Result<(), Error> {
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     match cli.driver {
-        Driver::Fake => serve(cli, &tokio, Arc::new(FakeRuntime::new(Duration::ZERO)), []),
+        Driver::Fake => serve(
+            cli,
+            &tokio,
+            Arc::new(FakeRuntime::new(Duration::ZERO)),
+            None,
+        ),
         Driver::Native => {
             let runtime = NativeRuntime::new(native_config(cli)?, Arc::new(cas_client(cli)?))?;
-            let capabilities = runtime.capabilities();
-            serve(cli, &tokio, Arc::new(runtime), capabilities)
+            let runtime = Arc::new(runtime);
+            let watched = Arc::clone(&runtime);
+            let (probe, every) = xcode_watch_args(cli);
+            let (driver, _) = xcode_watch::watch(
+                cli.xcode_apps.clone(),
+                probe,
+                every,
+                Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
+            );
+            serve(cli, &tokio, runtime, Some(driver))
         }
         Driver::Container => container::start(cli, &tokio),
     }
 }
 
-/// Runs the daemon with `runtime` until SIGTERM or SIGINT. `extra` joins the node
-/// report, after the detected entries and the labels.
+/// Runs the daemon with `runtime` until SIGTERM or SIGINT. The node report is the
+/// detected entries and the labels, plus the newest entries `driver` sends, if any.
 fn serve<R: Runtime>(
     cli: &Cli,
     tokio: &tokio::runtime::Runtime,
     runtime: Arc<R>,
-    extra: impl IntoIterator<Item = (String, String)>,
+    driver: Option<watch::Receiver<DriverReport>>,
 ) -> Result<(), Error> {
-    let report = NodeReport::detect(&[runtime.driver()])?
-        .with_entries(cli.daemon.label_entries())
-        .with_entries(extra);
-    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtime, report)?;
+    let report = NodeReport::detect(&[runtime.driver()])?.with_entries(cli.daemon.label_entries());
+    let mut daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtime, report)?;
+    if let Some(driver) = driver {
+        daemon = daemon.with_driver_report(driver);
+    }
     let term = signal(SignalKind::terminate())?;
     let int = signal(SignalKind::interrupt())?;
     tokio.block_on(daemon.run(shutdown(term, int)));
@@ -163,13 +190,14 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
-    config.xcodes = xcode::discover(
-        &cli.xcode_apps,
-        Path::new(xcode::XCODEBUILD),
-        Path::new(xcode::XCRUN),
-        xcode::ANSWER_WITHIN,
-    );
     Ok(config)
+}
+
+/// How the native driver asks its Xcodes (the system's tools, and the Metal toolchain
+/// if required), and how often it asks again (at least every second).
+fn xcode_watch_args(cli: &Cli) -> (xcode::Probe, Duration) {
+    let probe = xcode::Probe::system(cli.require_metal_toolchain);
+    (probe, Duration::from_secs(cli.xcode_recheck_secs.max(1)))
 }
 
 /// A client of the CAS `--cas` names. Connects on first use.
@@ -215,7 +243,7 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         let runtime = PodmanRuntime::new(config, Arc::new(cas_client(cli)?))?;
-        serve(cli, tokio, Arc::new(runtime), [])
+        serve(cli, tokio, Arc::new(runtime), None)
     }
 }
 
@@ -245,8 +273,9 @@ mod tests {
     }
 
     /// Catches: native flags that do not reach the driver's configuration (the
-    /// memory limit, poll and output limits, where Xcodes are looked for), and a
-    /// relative or missing scratch directory accepted.
+    /// memory limit, poll and output limits, where Xcodes are looked for, how often
+    /// they are asked again, whether the Metal toolchain is required), a re-check
+    /// every 0 s (a busy loop), and a relative or missing scratch directory accepted.
     #[test]
     fn native_flags_reach_the_configuration() {
         let cli = parse(&[
@@ -266,7 +295,20 @@ mod tests {
         assert_eq!(config.poll, Duration::from_millis(1));
         assert_eq!(config.outputs.max_bytes, 99);
         assert_eq!(cli.xcode_apps, PathBuf::from("/var/kbf/apps"));
-        assert!(config.xcodes.is_empty(), "no Xcode under /var/kbf/apps");
+        assert_eq!(
+            xcode_watch_args(&cli),
+            (xcode::Probe::system(false), xcode_watch::EVERY)
+        );
+        let metal = parse(&[
+            "--driver=native",
+            "--require-metal-toolchain",
+            "--xcode-recheck-secs=0",
+        ])
+        .expect("flags");
+        assert_eq!(
+            xcode_watch_args(&metal),
+            (xcode::Probe::system(true), Duration::from_secs(1))
+        );
         let defaults = parse(&["--driver=native", "--scratch=/s"]).expect("flags");
         assert_eq!(
             native_config(&defaults).expect("config").memory,

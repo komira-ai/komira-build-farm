@@ -13,7 +13,7 @@ use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
-use kbf_proto::worker::{NodeStatus, ServerMessage, daemon_message};
+use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daemon_message};
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
@@ -191,14 +191,47 @@ fn linux_status(kernel: &str) -> NodeStatus {
         os_build: String::new(),
         kernel: kernel.to_owned(),
         daemon_version: "0.1.0".to_owned(),
-        xcode_builds: Vec::new(),
+        ..NodeStatus::default()
     }
 }
+
+/// A Mac with Xcode 16.2 ready and 16.1 installed but its licence not accepted.
+fn mac_status() -> NodeStatus {
+    NodeStatus {
+        os_name: "macOS".to_owned(),
+        os_version: "15.1".to_owned(),
+        os_build: "24B83".to_owned(),
+        kernel: String::new(),
+        daemon_version: "0.1.0".to_owned(),
+        xcode_builds: vec!["16C5032a".to_owned()],
+        xcodes: vec![
+            XcodeStatus {
+                app: "/Applications/Xcode_16.1.app".to_owned(),
+                build: "16B40".to_owned(),
+                state: XcodeState::LicenseNotAccepted.into(),
+                reason: "not agreed".to_owned(),
+                fix: "sudo x -license accept".to_owned(),
+            },
+            XcodeStatus {
+                app: "/Applications/Xcode_16.2.app".to_owned(),
+                build: "16C5032a".to_owned(),
+                state: XcodeState::Ready.into(),
+                reason: String::new(),
+                fix: String::new(),
+            },
+        ],
+    }
+}
+
+/// What `/v1/nodes` and the log say of `mac_status`'s Xcode 16.1.
+const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not \
+    ready: not agreed; fix: sudo x -license accept";
 
 /// Catches: a `NodeStatus` the server drops (the worker stream ignores it), fields
 /// mapped to the wrong JSON keys, a node without status left out of the list or
 /// listed with an empty object instead of `null`, an older status kept over a newer
-/// one, and a node still listed as connected after its stream ended.
+/// one, a node still listed as connected after its stream ended, and an installed
+/// Xcode that is not ready missing from `xcodes` or from `needs_attention` (issue #164).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
@@ -215,14 +248,7 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     let mac = FakeDaemon::connect_without_status(worker, hello("mac-1", 8, 16))
         .await
         .expect("registered");
-    mac.send(daemon_message::Message::NodeStatus(NodeStatus {
-        os_name: "macOS".to_owned(),
-        os_version: "15.1".to_owned(),
-        os_build: "24B83".to_owned(),
-        kernel: String::new(),
-        daemon_version: "0.1.0".to_owned(),
-        xcode_builds: vec!["15F31d".to_owned(), "16C5032a".to_owned()],
-    }));
+    mac.send(daemon_message::Message::NodeStatus(mac_status()));
     // A daemon that predates NodeStatus.
     let old = FakeDaemon::connect_without_status(worker, hello("old-1", 8, 16))
         .await
@@ -251,14 +277,23 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             { "node_id": "linux-1", "connected": true, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
-                "xcode_builds": [] },
+                "xcode_builds": [], "xcodes": [] },
+              "needs_attention": [],
               "placement": { "state": "serving" } },
             { "node_id": "mac-1", "connected": true, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
-                "xcode_builds": ["15F31d", "16C5032a"] },
+                "xcode_builds": ["16C5032a"],
+                "xcodes": [
+                    { "app": "/Applications/Xcode_16.1.app", "build": "16B40",
+                      "state": "license_not_accepted", "reason": "not agreed",
+                      "fix": "sudo x -license accept" },
+                    { "app": "/Applications/Xcode_16.2.app", "build": "16C5032a",
+                      "state": "ready", "reason": "", "fix": "" } ] },
+              "needs_attention": [NOT_READY],
               "placement": { "state": "serving" } },
             { "node_id": "old-1", "connected": true, "software": null,
+              "needs_attention": [],
               "placement": { "state": "serving" } },
         ] })
     );
@@ -332,9 +367,10 @@ async fn a_status_from_a_replaced_stream_is_ignored() {
     let node = WorkerId::new("linux-1");
     let (old, _old_rx) = register(&farm, "linux-1");
     let (new, _new_rx) = register(&farm, "linux-1");
-    farm.node_status(&node, new, linux_status("new"));
-    farm.node_status(&node, old, linux_status("old"));
-    farm.node_status(&WorkerId::new("ghost"), new, linux_status("ghost"));
+    assert_eq!(farm.node_status(&node, new, linux_status("new")), []);
+    assert_eq!(farm.node_status(&node, old, mac_status()), [], "not kept");
+    let ghost = farm.node_status(&WorkerId::new("ghost"), new, mac_status());
+    assert_eq!(ghost, []);
     let nodes = farm.nodes().nodes;
     assert_eq!(nodes.len(), 1);
     let software = nodes[0].software.clone().expect("a status");
@@ -675,4 +711,30 @@ async fn the_api_listener_also_speaks_h2c() {
     assert_eq!(head[3], 4, "the server's first frame is SETTINGS: {head:?}");
     drop(stream);
     server.stop().await;
+}
+
+/// Catches (issue #164): an Xcode that is not ready raised on every status that repeats
+/// it (each new stream sends one), or never raised; one that became ready never
+/// cleared; and an item compared against another node's status.
+#[tokio::test]
+async fn an_attention_item_is_logged_once_per_change() {
+    let farm = Farm::new(cache(), kbf_sched::UNSERVABLE_WAIT);
+    let node = WorkerId::new("mac-1");
+    let (first, _first_rx) = register(&farm, "mac-1");
+    let raised = vec![(true, format!("node mac-1: {NOT_READY}"))];
+    assert_eq!(farm.node_status(&node, first, mac_status()), raised);
+    assert_eq!(farm.node_status(&node, first, mac_status()), []);
+    let (other, _other_rx) = register(&farm, "mac-2");
+    let other_raised = farm.node_status(&WorkerId::new("mac-2"), other, mac_status());
+    assert_eq!(other_raised, [(true, format!("node mac-2: {NOT_READY}"))]);
+    // A new stream sends its status again: nothing new.
+    let (second, _second_rx) = register(&farm, "mac-1");
+    assert_eq!(farm.node_status(&node, second, mac_status()), []);
+    let mut accepted = mac_status();
+    accepted.xcodes[0].state = XcodeState::Ready.into();
+    let cleared = vec![(false, format!("node mac-1: resolved: {NOT_READY}"))];
+    assert_eq!(farm.node_status(&node, second, accepted), cleared);
+    let listed = farm.node_view(&node).expect("listed");
+    assert_eq!(listed.needs_attention, Vec::<String>::new());
+    assert_eq!(farm.node_status(&node, second, mac_status()), raised);
 }

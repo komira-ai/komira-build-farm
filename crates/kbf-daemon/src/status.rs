@@ -8,16 +8,29 @@
 //! for the kernel release. A Mac asks `sw_vers` for its product name, version and
 //! build. The Xcode builds are the node report's `xcode` entries: whatever discovered
 //! them (the native driver) is the one source, so status and placement never disagree.
-//! A field that cannot be read is left empty; status never stops a node from joining.
+//! Every installed Xcode, ready or not, with why one is not and how to fix it, comes
+//! from the driver too ([`DriverReport`], issue #164). A field that cannot be read is
+//! left empty; status never stops a node from joining.
 
 use std::path::Path;
 
-use kbf_proto::worker::NodeStatus;
+use kbf_proto::worker::{NodeStatus, XcodeStatus};
 
 use crate::report::NodeReport;
 
 /// The node report key whose values are the installed Xcode builds.
 pub const XCODE_KEY: &str = "xcode";
+
+/// What a driver reports that may change while the daemon runs: the node report
+/// entries it adds (each ready Xcode's `xcode` entry among them) and every Xcode it
+/// found, ready or not, for `NodeStatus.xcodes`. See `Daemon::with_driver_report`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DriverReport {
+    /// Entries added to the report the daemon was started with.
+    pub entries: Vec<(String, String)>,
+    /// Every installed Xcode, in the order the driver found them.
+    pub xcodes: Vec<XcodeStatus>,
+}
 
 /// What the operating system says about itself. An empty field is not known.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -55,6 +68,8 @@ impl Software {
                 .filter(|c| c.key == XCODE_KEY)
                 .map(|c| c.value.clone())
                 .collect(),
+            // The driver's, which the daemon adds (`DriverReport`).
+            xcodes: Vec::new(),
         }
     }
 }
