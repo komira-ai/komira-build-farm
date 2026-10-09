@@ -12,8 +12,8 @@
 pub const OVERRIDE: &str = "KBF_BUILD_COMMIT_OVERRIDE";
 
 /// The commit to embed. `override_value` is [`OVERRIDE`] as the build environment holds
-/// it (`None` when unset); `git_head` reads the checkout's commit and is called only
-/// without an override.
+/// it (`None` when unset); `git_head` is what `git rev-parse --short=12 HEAD` gave
+/// (`None` when it failed), used only without an override.
 ///
 /// # Errors
 /// The override is set but is not exactly 12 lowercase hex digits, the form git gives.
@@ -21,7 +21,7 @@ pub const OVERRIDE: &str = "KBF_BUILD_COMMIT_OVERRIDE";
 /// fail, not quietly build from the checkout's commit.
 pub fn choose(
     override_value: Option<&std::ffi::OsStr>,
-    git_head: impl FnOnce() -> Option<String>,
+    git_head: Option<String>,
 ) -> Result<String, String> {
     match override_value {
         Some(value) => {
@@ -35,7 +35,7 @@ pub fn choose(
                 ))
             }
         }
-        None => Ok(git_head()
+        None => Ok(git_head
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| "unknown".to_owned())),
     }
@@ -48,13 +48,10 @@ mod tests {
     use super::choose;
 
     fn from(value: &str) -> Result<String, String> {
-        choose(Some(OsStr::new(value)), || {
-            panic!("git read despite an override")
-        })
+        choose(Some(OsStr::new(value)), Some("fedcba987654".to_owned()))
     }
 
-    /// Catches: an override that is ignored (git's commit embedded instead), or git
-    /// read although an override is set.
+    /// Catches: an override that is ignored (git's commit embedded instead).
     #[test]
     fn an_override_replaces_the_git_commit() {
         assert_eq!(from("0123456789ab"), Ok("0123456789ab".to_owned()));
@@ -81,13 +78,11 @@ mod tests {
     #[test]
     fn without_an_override_git_decides() {
         assert_eq!(
-            choose(None, || Some("fedcba987654".to_owned())),
+            choose(None, Some("fedcba987654".to_owned())),
             Ok("fedcba987654".to_owned())
         );
-        assert_eq!(choose(None, || None), Ok("unknown".to_owned()));
-        assert_eq!(
-            choose(None, || Some(String::new())),
-            Ok("unknown".to_owned())
-        );
+        let unknown = Ok("unknown".to_owned());
+        assert_eq!(choose(None, None), unknown);
+        assert_eq!(choose(None, Some(String::new())), unknown);
     }
 }

@@ -61,6 +61,19 @@ mod tests {
 
     use super::{BUILD_COMMIT, SERVER_VERSION};
 
+    /// `git rev-parse --short=12 HEAD` in this crate's checkout.
+    fn git_head() -> String {
+        let head = Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .expect("git runs");
+        assert!(head.status.success(), "the tests run in a git checkout");
+        String::from_utf8(head.stdout)
+            .expect("UTF-8")
+            .trim()
+            .to_owned()
+    }
+
     /// Catches: a version that names the package version alone, so two builds of it
     /// read the same in `--version`, the start line and `/v1/nodes`; and a commit that
     /// is not the one built (the build script fell back to `unknown`, embedded another,
@@ -70,19 +83,8 @@ mod tests {
         let (package, commit) = SERVER_VERSION.split_once('+').expect("a + in the version");
         assert_eq!(package, env!("CARGO_PKG_VERSION"));
         assert_eq!(commit, BUILD_COMMIT);
-        let expected = if let Some(stamp) = option_env!("KBF_BUILD_COMMIT_OVERRIDE") {
-            stamp.to_owned()
-        } else {
-            let head = Command::new("git")
-                .args(["rev-parse", "--short=12", "HEAD"])
-                .output()
-                .expect("git runs");
-            assert!(head.status.success(), "the tests run in a git checkout");
-            String::from_utf8(head.stdout)
-                .expect("UTF-8")
-                .trim()
-                .to_owned()
-        };
+        let stamp = option_env!("KBF_BUILD_COMMIT_OVERRIDE");
+        let expected = stamp.map_or_else(git_head, str::to_owned);
         assert_eq!(commit, expected);
         assert_eq!(commit.len(), 12, "{commit}");
         assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{commit}");

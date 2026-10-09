@@ -29,10 +29,11 @@ fn git_path(name: &str) -> Option<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-env-changed={}", build_commit::OVERRIDE);
     let given = std::env::var_os(build_commit::OVERRIDE);
-    let commit = build_commit::choose(given.as_deref(), || {
-        git(&["rev-parse", "--short=12", "HEAD"])
-    })
-    .unwrap_or_else(|e| panic!("{e}"));
+    let head = git(&["rev-parse", "--short=12", "HEAD"]);
+    let commit = match build_commit::choose(given.as_deref(), head) {
+        Ok(commit) => commit,
+        Err(e) => panic!("{e}"),
+    };
     println!("cargo:rustc-env=KBF_BUILD_COMMIT={commit}");
     // Watched: HEAD (a checkout), the ref it names (a commit), and packed-refs (where
     // that ref lives once packed).
