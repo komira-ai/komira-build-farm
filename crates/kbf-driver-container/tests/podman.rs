@@ -281,34 +281,43 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
         &[graph_root],
         &["-name", &marker],
     );
-    let found = walk.unwrap_or_else(|why| panic!("{why}"));
+    let found = walk.unwrap_or_else(|why| panic!("{why}")).found;
     assert!(found.trim().is_empty(), "marker left behind:\n{found}");
     cell.assert_clean(1);
 }
 
-/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`, and
-/// returns its stdout. The walk passes when find exits 0, or when every error it
-/// reported is a directory below one of `racing` that vanished mid-walk: a directory
-/// that is gone holds no file, and find walks the rest of the tree past that error.
-/// Any other error, a vanished root among them, is an `Err` with find's stderr.
+/// A walk that passed: what find printed, over every attempt, and how many attempts
+/// fts gave up because a directory it was in vanished.
+#[derive(Debug)]
+struct Walk {
+    found: String,
+    aborted: usize,
+}
+
+/// How many times [`find`] walks again after fts gave up mid-walk.
+const WALK_ATTEMPTS: usize = 5;
+
+/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`. The walk
+/// passes when find exits 0, or when every error it reported is a directory below one
+/// of `racing` that vanished mid-walk: a directory that is gone holds no file, and find
+/// walks the rest of the tree past that error. Any other error, a vanished root among
+/// them, is an `Err` with find's stderr.
 ///
 /// `-ignore_readdir_race` is not enough: findutils applies it only to its own stat
 /// of an entry. A directory removed after it was listed is reported by fts (as an
 /// unreadable directory, or an entry that could not be stat'd) whatever that option
 /// says, and find then exits 1.
-fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<String, String> {
+///
+/// A directory removed while fts is deep inside it is worse: fts cannot go back up
+/// through it, stops, and find reports "failed to read file names from file system at
+/// or below" the root (#105, seen in
+/// `the_store_walk_passes_while_containers_come_and_go`). The rest of that root was not
+/// walked, so such an attempt passes nothing: when that report names one of `racing`
+/// and every other error is a vanished directory, the walk runs again, up to
+/// [`WALK_ATTEMPTS`] times. What an aborted attempt printed is kept: a marker it found
+/// is still found.
+fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<Walk, String> {
     let (program, prefix) = prefix.split_first().expect("a program");
-    let output = Command::new(program)
-        .args(prefix)
-        // The C locale fixes the message text and the quotes find puts around a path.
-        .args(["env", "LC_ALL=C", "find"])
-        .args(roots)
-        .arg("-ignore_readdir_race")
-        .args(expr)
-        .output()
-        .expect("run find");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
     let vanished = |line: &str| {
         line.strip_prefix("find: '")
             .and_then(|l| l.strip_suffix("': No such file or directory"))
@@ -319,15 +328,44 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
                 })
             })
     };
-    let benign = !stderr.trim().is_empty() && stderr.lines().all(vanished);
-    if output.status.success() || (output.status.code() == Some(1) && benign) {
-        Ok(stdout)
-    } else {
-        Err(format!(
-            "find {roots:?} {expr:?}: {}:\n{stderr}",
-            output.status
-        ))
+    let gave_up = |line: &str| {
+        racing.iter().any(|root| {
+            line == format!(
+                "find: failed to read file names from file system at or below '{root}': \
+                 No such file or directory"
+            )
+        })
+    };
+    let mut found = String::new();
+    let mut stderr = String::new();
+    for aborted in 0..WALK_ATTEMPTS {
+        let output = Command::new(program)
+            .args(prefix)
+            // The C locale fixes the message text and the quotes find puts around a path.
+            .args(["env", "LC_ALL=C", "find"])
+            .args(roots)
+            .arg("-ignore_readdir_race")
+            .args(expr)
+            .output()
+            .expect("run find");
+        found.push_str(&String::from_utf8_lossy(&output.stdout));
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let errors_ok = !stderr.trim().is_empty()
+            && output.status.code() == Some(1)
+            && stderr.lines().all(|l| vanished(l) || gave_up(l));
+        if output.status.success() || (errors_ok && !stderr.lines().any(gave_up)) {
+            return Ok(Walk { found, aborted });
+        }
+        if !errors_ok {
+            return Err(format!(
+                "find {roots:?} {expr:?}: {}:\n{stderr}",
+                output.status
+            ));
+        }
     }
+    Err(format!(
+        "find {roots:?} {expr:?}: gave up mid-walk {WALK_ATTEMPTS} times; last:\n{stderr}"
+    ))
 }
 
 /// Catches the marker walk failing when another test removes its container mid-walk
@@ -335,8 +373,10 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
 /// reaches deletes every other directory of the tree, which find has already listed
 /// and not yet entered, so one directory vanishes mid-walk whichever order find takes.
 /// That walk must pass and still print the trigger it matched (a marker found during
-/// a race is still found); a vanished root, a vanished directory outside `racing`,
-/// and an unreadable directory must each still fail.
+/// a race is still found). A tree removed while find is deep inside it makes fts give
+/// up; that walk must be walked again, once, and pass. A vanished root, a vanished
+/// directory outside `racing`, a give-up outside `racing` and an unreadable directory
+/// must each still fail.
 #[test]
 #[ignore = "needs GNU find: run by tools/ci/podman-tests.sh"]
 fn a_directory_vanishing_mid_walk_fails_nothing_else() {
@@ -373,7 +413,8 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     let root = tree("raced");
     let found = find(&["env"], &[&root], &[&root], &strs(&race(&root)))
         .unwrap_or_else(|why| panic!("a directory vanishing mid-walk failed the walk: {why}"));
-    let found: Vec<&str> = found.lines().collect();
+    assert_eq!(found.aborted, 0, "{found:?}");
+    let found: Vec<&str> = found.found.lines().collect();
     assert_eq!(
         found.len(),
         1,
@@ -385,6 +426,34 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     );
     let left: Vec<_> = std::fs::read_dir(&root).expect("read").flatten().collect();
     assert_eq!(left.len(), 1, "the other directory was removed mid-walk");
+
+    // A directory removed while find is deep inside it: fts keeps the last four
+    // directories it left on a descent open, so going back up past those it opens
+    // ".." of a directory that no longer exists, and stops. The first attempt walks
+    // into the tree and removes it; the second walks what is left.
+    let deep_tree = |name: &str| {
+        let root = scratch.join(name);
+        let deep = (0..10).fold(root.join("a"), |d, i| d.join(format!("l{i}")));
+        std::fs::create_dir_all(&deep).expect("create");
+        std::fs::write(deep.join("trigger"), b"t").expect("write");
+        root.to_string_lossy().into_owned()
+    };
+    let root = deep_tree("gives-up");
+    let top = format!("{root}/a");
+    let remove_top = ["-name", "trigger", "-exec", "rm", "-r", top.as_str(), ";"];
+    let walk = find(&["env"], &[&root], &[&root], &remove_top)
+        .unwrap_or_else(|why| panic!("a walk that fts gave up was not walked again: {why}"));
+    assert_eq!(walk.aborted, 1, "{walk:?}");
+    assert!(!exists(Path::new(&top)), "the walk removed the tree");
+    // The same in a tree where nothing may vanish.
+    let root = deep_tree("gives-up-not-racing");
+    let top = format!("{root}/a");
+    let remove_top = ["-name", "trigger", "-exec", "rm", "-r", top.as_str(), ";"];
+    let outcome = find(&["env"], &[&root], &[], &remove_top);
+    assert!(
+        matches!(outcome, Err(ref why) if why.contains("failed to read file names")),
+        "{outcome:?}"
+    );
 
     // The same race in a tree where nothing may vanish.
     let root = tree("not-racing");
@@ -575,8 +644,9 @@ async fn every_container_is_one_oom_group_once_its_action_runs() {
 /// Catches (issue #105) the marker test's walk of Podman's store failing because a
 /// container was removed while it walked. 40 leases run, two at a time, while the walk
 /// goes over the whole store again and again; every walk must pass and find nothing.
-/// The mutant makes `find` treat no error as benign: a layer directory that vanishes
-/// mid-walk then fails a walk.
+/// Each of `find`'s two tolerances is a mutant this turns red: a layer directory that
+/// vanishes mid-walk (no error treated as benign), and fts giving up when a layer is
+/// removed while it is deep inside it (no walk again).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn the_store_walk_passes_while_containers_come_and_go() {
@@ -611,7 +681,7 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
     let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
     let graph_root = graph_root.trim().to_owned();
     let name = format!("kbf-never-written-{}", std::process::id());
-    let mut walks = 0;
+    let (mut walks, mut gave_up) = (0, 0);
     while !churn.is_finished() {
         let (root, name) = (graph_root.clone(), name.clone());
         let walk = tokio::task::spawn_blocking(move || {
@@ -624,9 +694,10 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
         })
         .await
         .expect("join");
-        let found = walk.unwrap_or_else(|why| panic!("walk {walks}: {why}"));
-        assert!(found.trim().is_empty(), "{found}");
+        let walk = walk.unwrap_or_else(|why| panic!("walk {walks}: {why}"));
+        assert!(walk.found.trim().is_empty(), "{}", walk.found);
         walks += 1;
+        gave_up += walk.aborted;
     }
     for (i, outcome) in churn.await.expect("join").into_iter().enumerate() {
         let result = outcome.unwrap_or_else(|e| panic!("lease {}: {e:?}", i + 1));
@@ -637,7 +708,7 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
         walks > 1,
         "the store was walked {walks} times while leases ran"
     );
-    println!("{walks} walks of the store while 40 leases came and went");
+    println!("{walks} walks of the store while 40 leases came and went; {gave_up} walked again");
 }
 
 /// Catches a kernel OOM kill being reported as the action's own result (exit 137 would
