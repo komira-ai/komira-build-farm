@@ -130,7 +130,9 @@ pub enum Finished {
 /// A caller's handle on an operation: its name and its stage as it changes.
 #[derive(Debug)]
 pub struct Ticket {
-    /// The operation name the caller may pass to WaitExecution.
+    /// The operation name the caller may pass to WaitExecution. It must never name
+    /// another operation, including one of a later server process: a client can still
+    /// hold it after a restart (issue #154).
     pub name: String,
     /// The action digest, for the operation's metadata.
     pub action: Digest,
