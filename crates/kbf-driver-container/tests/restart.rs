@@ -53,15 +53,21 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
 /// restarted runtime's sweep has ended its action, it writes its status and events
 /// into the state directory, which made the removal fail with "Directory not empty".
 /// 200 rounds with the CPUs busy ([`support::CpuHog`]); each restarts and drops its
-/// Fake at once (the sweep's checks are the test above's), so the removal overlaps
-/// the orphaned `start`'s last writes. The removal must not fail, and nothing of that
-/// fake may run once it is done (it waited). The mutant drops the wait in the Fake's
-/// `Drop`.
+/// Fake at once (the sweep's checks are the test above's). Ballast in the state
+/// directory (2000 empty files in a subdirectory) makes its removal take long enough
+/// to overlap the orphaned `start`'s last writes, which land in the state directory
+/// after `rm` listed it. The removal must not fail, and nothing of that fake may run
+/// once it is done (it waited). The mutant drops the wait in the Fake's `Drop`.
 #[tokio::test]
 async fn no_round_of_kill_and_restart_races_the_removal() {
     let _hog = support::CpuHog::start();
     for round in 0..200 {
         let (fake, _) = kill_the_daemon(&format!("restart-stress-{round}")).await;
+        let ballast = fake.state.join("ballast");
+        std::fs::create_dir(&ballast).expect("mkdir ballast");
+        for i in 0..2000 {
+            std::fs::write(ballast.join(i.to_string()), b"").expect("write ballast");
+        }
         // What the fake's checks need from it, taken before it is gone.
         let probe = support::fake::Probe::of(&fake);
         let dir = fake.dir.clone();
