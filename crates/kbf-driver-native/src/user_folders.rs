@@ -136,9 +136,9 @@ impl UserFolders {
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
-        format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
-        )
+        // RED-RUN ONLY: main's profile, nothing in the user folders opened.
+        let _ = (temp, TEMPORARY_ITEMS, XCRUN_DB);
+        String::new()
     }
 
     /// Removes `xcrun`'s cache, `T/xcrun_db`, which any lease can rewrite: the daemon
