@@ -164,10 +164,8 @@ fn put_blobs_is_the_fold_of_put_blob() {
                     else {
                         panic!("seed {seed} step {step}: PutBlobs refused");
                     };
-                    let expected: Vec<BlobWrite> = blobs
-                        .iter()
-                        .map(|&(d, l)| put(&mut single, d, l))
-                        .collect();
+                    let expected: Vec<BlobWrite> =
+                        blobs.iter().map(|&(d, l)| put(&mut single, d, l)).collect();
                     assert_eq!(outcomes, expected, "seed {seed} step {step}: {blobs:?}");
                     for o in &outcomes {
                         match o {
@@ -182,7 +180,10 @@ fn put_blobs_is_the_fold_of_put_blob() {
         }
     }
     // The histories must exercise both paths a short-circuit or a reorder would break.
-    assert!(duplicates > 500 && heals > 50, "{duplicates} duplicates, {heals} heals");
+    assert!(
+        duplicates > 500 && heals > 50,
+        "{duplicates} duplicates, {heals} heals"
+    );
 }
 
 /// Catches: a `Corrupt` mark downgraded to `Missing` by a later 404 (a later re-probe

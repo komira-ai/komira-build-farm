@@ -148,7 +148,12 @@ async fn keys<O: ObjectStore>(store: &O) -> Vec<String> {
 }
 
 async fn location<M: MetaLog, O: ObjectStore>(cache: &Cache<M, O>, d: Digest) -> Location {
-    match cache.meta().query(move |s| s.blob(&d)).await.expect("query") {
+    match cache
+        .meta()
+        .query(move |s| s.blob(&d))
+        .await
+        .expect("query")
+    {
         BlobAnswer::Present(location) => location,
         other => panic!("{d} is not present: {other:?}"),
     }
@@ -219,8 +224,14 @@ async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
         );
     }
     for d in digests {
-        assert_eq!(a.read_blob(&d).await.expect("read").len() as u64, d.size_bytes);
-        assert_eq!(b.read_blob(&d).await.expect("read").len() as u64, d.size_bytes);
+        assert_eq!(
+            a.read_blob(&d).await.expect("read").len() as u64,
+            d.size_bytes
+        );
+        assert_eq!(
+            b.read_blob(&d).await.expect("read").len() as u64,
+            d.size_bytes
+        );
     }
 }
 
@@ -254,7 +265,9 @@ async fn each_written_segment_is_one_put_blobs_commit() {
         .await
         .expect("open")
         .with_segment_limit(footer_len(2) + 40);
-    let blobs: Vec<_> = (0..5).map(|n| blob(&format!("twenty-byte blob #{n:02}"))).collect();
+    let blobs: Vec<_> = (0..5)
+        .map(|n| blob(&format!("twenty-byte blob #{n:02}")))
+        .collect();
     assert!(blobs.iter().all(|b| b.digest().size_bytes == 20));
     small.store_blobs(blobs).await.expect("store");
     assert_eq!(log.batches(), [5, 2, 2, 1]);
@@ -386,10 +399,11 @@ async fn a_cache_whose_epoch_was_never_allocated_reports_nothing_present() {
     let stored = cache.store_blobs(vec![b.clone()]).await;
     assert!(matches!(stored, Err(CacheError::Internal(_))), "{stored:?}");
     let d = b.digest();
-    let answer = cache.meta().query(move |s| s.blob(&d)).await.expect("query");
+    let answer = cache
+        .meta()
+        .query(move |s| s.blob(&d))
+        .await
+        .expect("query");
     assert_eq!(answer, BlobAnswer::Absent);
-    assert_eq!(
-        cache.find_missing(&[d]).await.expect("find missing"),
-        [d]
-    );
+    assert_eq!(cache.find_missing(&[d]).await.expect("find missing"), [d]);
 }

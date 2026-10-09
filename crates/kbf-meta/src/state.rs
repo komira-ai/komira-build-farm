@@ -1,6 +1,6 @@
 //! The metadata state machine: commands in, outcomes out, queries on the side.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::iter;
 use std::time::Duration;
 
