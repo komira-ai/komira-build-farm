@@ -203,7 +203,8 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
 }
 
 /// Catches: an `--api-listen` flag that binds nothing, a start line without the API's
-/// address, and an API listener that does not answer `GET /v1/nodes`.
+/// address, an API listener that does not answer `GET /v1/nodes`, and an answer
+/// without the `server` field naming this binary's version and commit.
 #[cfg(unix)]
 #[test]
 fn api_listen_serves_the_operator_api() {
@@ -223,7 +224,12 @@ fn api_listen_serves_the_operator_api() {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.ends_with("\r\n\r\n{\"nodes\":[]}"), "{response}");
+    let version = built_version();
+    let (_, commit) = version.split_once('+').expect("a + in the version");
+    let body = format!(
+        "{{\"server\":{{\"version\":\"{version}\",\"commit\":\"{commit}\"}},\"nodes\":[]}}"
+    );
+    assert!(response.ends_with(&format!("\r\n\r\n{body}")), "{response}");
     interrupt(child);
 }
 
