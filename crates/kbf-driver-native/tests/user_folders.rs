@@ -249,6 +249,60 @@ perl -MTime::HiRes=time -e '
 ' "$direct"
 "#;
 
+/// Probe: watches `T/xcrun_db` (inode, size) every 2 ms while a run goes on.
+struct Watch {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl Watch {
+    fn start(what: String) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let db = user_folder("DARWIN_USER_TEMP_DIR").join("xcrun_db");
+        let handle = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let mut last: Option<(u64, u64)> = None;
+            let mut events = Vec::new();
+            let (mut replaced, mut gone, mut shrunk) = (0, 0, 0);
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                let now = std::fs::metadata(&db).ok().map(|m| (m.ino(), m.size()));
+                if now != last {
+                    match (last, now) {
+                        (Some(_), None) => gone += 1,
+                        (Some((i, s)), Some((j, z))) => {
+                            if i != j { replaced += 1; }
+                            if z < s { shrunk += 1; }
+                        }
+                        _ => {}
+                    }
+                    if events.len() < 40 {
+                        events.push(format!("{:.3}:{:?}", t0.elapsed().as_secs_f64(), now));
+                    }
+                    last = now;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            eprintln!(
+                "PROBE WATCH {what} start={stamp:.3} for {:.3}s replaced={replaced} gone={gone} shrunk={shrunk} {}",
+                t0.elapsed().as_secs_f64(),
+                events.join(" ")
+            );
+        });
+        Self { stop, handle }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.handle.join();
+    }
+}
+
 /// The output of [`SHIMS`] but its last line, and the two times on that line.
 fn shim_times(out: &str) -> (String, f64, f64) {
     let (rest, last) = out
@@ -297,11 +351,16 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
             spec = spec.property("xcode", build);
         }
         let seq = u64::try_from(seq).expect("small") + 1;
+        let w = Watch::start(format!("sandboxed {build:?}"));
         let result = run_long(&rt, &cas, seq, &spec).await;
+        w.stop();
         let (said, shim, direct) = shim_times(&stdout(&cas, &result));
+        let w = Watch::start(format!("open {build:?}"));
         let control = run_long(&open, &cas, seq, &spec).await;
+        w.stop();
         let (_, open_shim, _) = shim_times(&stdout(&cas, &control));
         let times = format!("cc {shim}s, unsandboxed cc {open_shim}s, clang {direct}s");
+        eprintln!("PROBE TIMES xcode={build:?} {times}");
         assert_eq!(
             (said.as_str(), stderr(&cas, &result).as_str()),
             ("", ""),
