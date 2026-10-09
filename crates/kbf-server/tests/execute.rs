@@ -3,6 +3,8 @@
 
 mod support;
 
+use std::time::Duration;
+
 use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_proto::reapi::{ActionResult, WaitExecutionRequest};
 use kbf_proto::worker::daemon_message;
@@ -470,6 +472,77 @@ async fn wait_execution_follows_a_running_operation() {
         .await
         .expect_err("a finished operation is forgotten");
     assert_eq!(gone.code(), Code::NotFound);
+}
+
+/// WaitExecution on `name`: the name of the first operation it streams, or the code.
+async fn wait_name(cell: &support::Client, name: &str) -> Result<String, Code> {
+    let mut ops = cell
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: name.to_owned(),
+        })
+        .await
+        .map_err(|s| s.code())?
+        .into_inner();
+    Ok(ops
+        .message()
+        .await
+        .expect("a healthy stream")
+        .expect("an update")
+        .name)
+}
+
+/// Catches (issue #154): a WaitExecution that still answers the old spelling
+/// `operations/{n}`, which a client of a server from before the term was in the name
+/// can hold across an upgrade restart. It would attach that client to whichever
+/// operation of the new process has number `n`. The operation running as number 0 is
+/// found by its own name only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_execution_refuses_the_name_spelling_without_a_term() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let job = Job::new("number 0", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let name = ops
+        .message()
+        .await
+        .expect("a stream")
+        .expect("an update")
+        .name;
+    daemon.start().await;
+    assert!(name.ends_with("-0"), "{name} is not number 0");
+
+    assert_eq!(wait_name(&cell, "operations/0").await, Err(Code::NotFound));
+    assert_eq!(wait_name(&cell, &name).await, Ok(name));
+}
+
+/// Catches: a refused operation whose caller is not forgotten. WaitExecution on its
+/// name would then replay the refusal (or follow a waiter nothing will ever answer
+/// again) instead of answering NOT_FOUND, as for every other finished operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_operation_is_forgotten() {
+    let cell = Cell::start_with_unservable_wait(Duration::from_millis(300)).await;
+    let mut linux = cell.daemon("node-b", 4, 8).await;
+    let job = Job::new("mac only", &[("OSFamily", "macos")]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let name = ops
+        .message()
+        .await
+        .expect("a stream")
+        .expect("an update")
+        .name;
+    assert_eq!(
+        wait_name(&cell, &name).await,
+        Ok(name.clone()),
+        "while queued"
+    );
+
+    let status = response(&done(&mut ops).await).status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+    assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
+    linux.no_work().await;
 }
 
 /// Catches: a `kbf-lease` kind dropped on the way to the `Start` (a whole-machine

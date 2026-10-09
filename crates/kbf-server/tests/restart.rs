@@ -14,7 +14,7 @@ mod support;
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::reapi::{ExecuteOperationMetadata, WaitExecutionRequest};
 use prost::Message;
-use support::{Cell, Client, Job, done, done_within_quiet, output, ran, response};
+use support::{Cell, Client, FakeDaemon, Job, done, done_within_quiet, output, ran, response};
 use tonic::{Code, Streaming};
 
 /// Catches issue #137: a restarted server that grants lease ids its predecessor
@@ -120,12 +120,47 @@ async fn wait_first(client: &Client, name: &str) -> Result<Operation, Code> {
         .expect("an update"))
 }
 
+/// Asserts WaitExecution on `name` is NOT_FOUND on `after`, the restarted server, and
+/// says which operation and action it attached to if it is not. `x` and `y` are the
+/// action before the restart and the one running after it.
+async fn assert_unknown_after_restart(after: &Client, name: &str, x: &Job, y: &Job) {
+    match wait_first(after, name).await {
+        Err(code) => assert_eq!(code, Code::NotFound, "WaitExecution({name:?})"),
+        Ok(op) => {
+            let action = op.metadata.as_ref().and_then(|any| {
+                ExecuteOperationMetadata::decode(any.value.as_slice())
+                    .ok()?
+                    .action_digest
+            });
+            panic!(
+                "WaitExecution({name:?}) on the restarted server attached to operation \
+                 {:?} of action {action:?}; X is {:?}, Y is {:?}",
+                op.name, x.action.proto, y.action.proto
+            );
+        }
+    }
+}
+
+/// Executes `y` on `after` and starts it on a daemon there, so it stays unfinished.
+/// Returns its operation name; the daemon and stream are returned to keep them open.
+async fn run_y(after: &Client, y: &Job) -> (String, FakeDaemon, Streaming<Operation>) {
+    let mut daemon = after.daemon("node-a", 4, 8).await;
+    after.upload(&y.blobs()).await;
+    let mut y_ops = after.execute(&y.action).await;
+    let y_name = first_name(&mut y_ops).await;
+    daemon.start().await;
+    (y_name, daemon, y_ops)
+}
+
 /// Catches issue #154: operation names that restart at `operations/0` in every server
 /// process. A client holds the name of action X's operation from the process before a
 /// restart; the new process is running action Y under the same number. WaitExecution
 /// with X's name must answer NOT_FOUND, never attach the client to Y's operation (it
-/// would be handed Y's result as X's). Also catches a fix that refuses every name: Y's
-/// own name still finds Y's operation.
+/// would be handed Y's result as X's). Also catches a fix that refuses every name (Y's
+/// own name still finds Y's operation, and X's name found X before the restart), and
+/// one whose parser checks a term other than the one the name was written with (the
+/// old process answers X's name first, so a term cached process-wide by the first
+/// lookup is the old one).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_server_does_not_answer_its_predecessor_s_operation_names() {
     let before = Cell::start().await;
@@ -135,35 +170,47 @@ async fn a_restarted_server_does_not_answer_its_predecessor_s_operation_names() 
     let mut x_ops = before.execute(&x.action).await;
     let x_name = first_name(&mut x_ops).await;
     old.start().await;
+    let found = wait_first(&before, &x_name).await.map(|op| op.name);
+    assert_eq!(found, Ok(x_name.clone()), "X's name on its own process");
 
     let after = before.restart().await;
-    let mut daemon = after.daemon("node-a", 4, 8).await;
     let y = Job::new("y, after the restart", &[]);
-    after.upload(&y.blobs()).await;
-    let mut y_ops = after.execute(&y.action).await;
-    let y_name = first_name(&mut y_ops).await;
-    daemon.start().await;
+    let (y_name, _daemon, _y_ops) = run_y(&after, &y).await;
 
-    match wait_first(&after, &x_name).await {
-        Err(code) => assert_eq!(code, Code::NotFound, "WaitExecution({x_name:?})"),
-        Ok(op) => {
-            let action = op.metadata.as_ref().and_then(|any| {
-                ExecuteOperationMetadata::decode(any.value.as_slice())
-                    .ok()?
-                    .action_digest
-            });
-            panic!(
-                "WaitExecution({x_name:?}) on the restarted server attached to operation \
-                 {:?} of action {action:?}; X is {:?}, Y is {:?}",
-                op.name, x.action.proto, y.action.proto
-            );
-        }
-    }
+    assert_unknown_after_restart(&after, &x_name, &x, &y).await;
     assert_ne!(
         x_name, y_name,
         "a restarted server reused an operation name"
     );
+    let waited = wait_first(&after, &y_name).await.map(|op| op.name);
+    assert_eq!(waited, Ok(y_name), "Y's own name");
+}
 
-    let waited = wait_first(&after, &y_name).await.expect("Y's own name");
-    assert_eq!(waited.name, y_name);
+/// Catches issue #154 for an operation that finished before the restart (its waiter
+/// is gone from the old process, as most names a client still holds are): X's name is
+/// NOT_FOUND on the old process once X is done, and stays NOT_FOUND on the new one
+/// while Y runs under the same number. Also catches a parser that checks a stale
+/// process-wide term: the first lookup is on the old process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_operation_s_name_stays_unknown_after_a_restart() {
+    let before = Cell::start().await;
+    let mut old = before.daemon("node-a", 4, 8).await;
+    let x = Job::new("x, finished before the restart", &[]);
+    before.upload(&x.blobs()).await;
+    let mut x_ops = before.execute(&x.action).await;
+    let x_name = first_name(&mut x_ops).await;
+    let start = old.start().await;
+    let result = output(&before, "x ran", 0).await;
+    assert!(old.report(ran(start.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut x_ops).await).result, Some(result));
+    let found = wait_first(&before, &x_name).await.map(|op| op.name);
+    assert_eq!(found, Err(Code::NotFound), "X's name once X is done");
+
+    let after = before.restart().await;
+    let y = Job::new("y, after the restart (X finished)", &[]);
+    let (y_name, _daemon, _y_ops) = run_y(&after, &y).await;
+
+    assert_unknown_after_restart(&after, &x_name, &x, &y).await;
+    let waited = wait_first(&after, &y_name).await.map(|op| op.name);
+    assert_eq!(waited, Ok(y_name), "Y's own name");
 }
