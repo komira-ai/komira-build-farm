@@ -362,7 +362,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         }
         let view = SoftwareView::new(status, received);
         let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
-        let changes = attention_changes(worker.as_str(), before, &view.xcodes);
+        let changes = attention_changes(worker.as_str(), &view.xcodes, &view.xcodes);
         for (raise, line) in &changes {
             if *raise {
                 tracing::warn!(target: "kbf_server::attention", "{line}");
