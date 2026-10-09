@@ -16,7 +16,8 @@ use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
 use kbf_proto::worker::ServerMessage;
-use kbf_server::expected::{ExpectedNodes, ExpectedNodesError};
+use kbf_server::expected::{ExpectedNodes, ExpectedNodesError, MAX_EXPECTED_NODES_BYTES};
+use kbf_server::token::ApiToken;
 use kbf_server::{Api, Args, ConfigError, Farm, Listeners, bind_server_with_api};
 use kbf_types::{Resources, WorkerId};
 use serde_json::{Value, json};
@@ -69,6 +70,17 @@ struct Server {
     serving: tokio::task::JoinHandle<()>,
 }
 
+/// The token the test servers' writes need.
+const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
+
+fn token() -> ApiToken {
+    use std::os::unix::fs::PermissionsExt;
+    let path = scratch("token");
+    std::fs::write(&path, TOKEN).expect("write the token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    ApiToken::from_file(&path).expect("a usable token")
+}
+
 /// A server with the operator API, expecting the nodes the file at `path` lists.
 fn start(path: &Path) -> Server {
     let listeners = Listeners {
@@ -89,7 +101,7 @@ fn start(path: &Path) -> Server {
     let expected = ExpectedNodes::open(path).expect("a usable file");
     let api = Api {
         listen: loopback(),
-        token: None,
+        token: Some(token()),
         expected_nodes: Some(Arc::new(expected)),
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
@@ -110,15 +122,36 @@ impl Server {
     }
 }
 
-async fn nodes(api: SocketAddr) -> Value {
+/// One HTTP/1.1 request; the status code and the body.
+async fn http(api: SocketAddr, request: &str) -> (u16, Value) {
     let mut stream = TcpStream::connect(api).await.expect("connect to the API");
-    let request = "GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
     stream.write_all(request.as_bytes()).await.expect("send");
     let mut response = String::new();
     stream.read_to_string(&mut response).await.expect("read");
     let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    serde_json::from_str(body).expect("JSON")
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status code");
+    (code, serde_json::from_str(body).expect("JSON"))
+}
+
+async fn nodes(api: SocketAddr) -> Value {
+    let request = "GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
+    let (code, body) = http(api, request).await;
+    assert_eq!(code, 200, "{body}");
+    body
+}
+
+/// An operator's cordon of `node`.
+async fn cordon(api: SocketAddr, node: &str) -> (u16, Value) {
+    let request = format!(
+        "POST /v1/nodes/{node}:cordon HTTP/1.1\r\nHost: kbf\r\nContent-Length: 0\r\n\
+         Authorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\n\
+         Connection: close\r\n\r\n"
+    );
+    http(api, &request).await
 }
 
 /// `GET /v1/nodes` until `done` holds for its body.
@@ -159,8 +192,9 @@ fn since(body: &Value, id: &str) -> u64 {
 /// node that does not come back after a restart vanishes; an absent node shown as
 /// connected, with software, or without the time it has been expected since; a node
 /// that registers still shown as absent; `expected` set on a node the file does not
-/// list; and a node that registered and then disconnected turned back into `absent`,
-/// which would hide its placement.
+/// list; a node that registered and then disconnected turned back into `absent`,
+/// which would hide its placement; a write's answer not marked `expected`; and a
+/// write accepted for an absent node, which the scheduler has never seen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_listed_but_not_registered_are_absent() {
     let path = scratch("expected");
@@ -210,6 +244,16 @@ async fn nodes_listed_but_not_registered_are_absent() {
     let gone = node(&got, "linux-1");
     assert_eq!(gone["placement"], json!({ "state": "serving" }), "{got}");
     assert!(gone["last_seen_unix_ms"].as_u64().is_some(), "{got}");
+
+    let (code, view) = cordon(api, "linux-1").await;
+    assert_eq!(code, 200, "{view}");
+    assert_eq!(
+        view["expected"], true,
+        "a write's answer is marked too: {view}"
+    );
+    assert_eq!(view["placement"], json!({ "state": "cordoned" }));
+    let (code, refused) = cordon(api, "mac-9").await;
+    assert_eq!(code, 404, "an absent node has never registered: {refused}");
     drop(stray);
     server.stop().await;
 }
@@ -243,10 +287,13 @@ async fn an_edit_is_read_again_and_a_failed_read_keeps_the_last_list() {
     assert_eq!(since(&got, "linux-2"), second, "{got}");
 
     std::fs::remove_file(&path).expect("remove");
-    let got = nodes(api).await;
-    assert_eq!(ids(&got), ["linux-2", "linux-3"], "{got}");
-    let why = got["expected_nodes_error"].as_str().expect("an error");
-    assert!(why.starts_with("read "), "{why}");
+    // Twice: the second read fails the same way.
+    for _ in 0..2 {
+        let got = nodes(api).await;
+        assert_eq!(ids(&got), ["linux-2", "linux-3"], "{got}");
+        let why = got["expected_nodes_error"].as_str().expect("an error");
+        assert!(why.starts_with("read "), "{why}");
+    }
 
     replace(&path, "linux-2\nlinux-3 linux-4\n");
     let got = nodes(api).await;
@@ -262,9 +309,10 @@ async fn an_edit_is_read_again_and_a_failed_read_keeps_the_last_list() {
     server.stop().await;
 }
 
-/// Catches: a missing, unparsable or non-regular file accepted at start (a server
-/// that runs believing it expects nodes it does not), a FIFO waited on instead of
-/// refused, and the flag accepted without the API that shows it.
+/// Catches: a missing, unparsable, non-UTF-8, oversized or non-regular file accepted
+/// at start (a server that runs believing it expects nodes it does not), a file of
+/// exactly the limit refused, a FIFO waited on instead of refused, and the flag
+/// accepted without the API that shows it.
 #[test]
 fn a_bad_file_stops_the_server_at_start() {
     let missing = scratch("missing");
@@ -290,6 +338,26 @@ fn a_bad_file_stops_the_server_at_start() {
         panic!("a line of two ids was not refused as a parse error");
     };
     assert_eq!(line, 3);
+
+    let large = scratch("large");
+    std::fs::write(&large, "#".repeat(MAX_EXPECTED_NODES_BYTES + 1)).expect("write");
+    assert!(matches!(
+        refused(&large),
+        ExpectedNodesError::NotAFile { .. }
+    ));
+    let largest = scratch("largest");
+    std::fs::write(&largest, "#".repeat(MAX_EXPECTED_NODES_BYTES)).expect("write");
+    assert!(
+        ExpectedNodes::open(&largest).is_ok(),
+        "a file of the limit is refused"
+    );
+
+    let binary = scratch("binary");
+    std::fs::write(&binary, b"linux-1\n\xff\n").expect("write");
+    assert!(matches!(
+        refused(&binary),
+        ExpectedNodesError::NotText { .. }
+    ));
 
     let dir = scratch("dir");
     std::fs::create_dir_all(&dir).expect("a directory");

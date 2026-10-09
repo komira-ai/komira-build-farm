@@ -17,7 +17,8 @@
 //! ```
 //!
 //! A line with more than one word, or a node listed twice, is refused. The file must
-//! be a regular file of at most [`MAX_EXPECTED_NODES_BYTES`].
+//! be a regular file of at most [`MAX_EXPECTED_NODES_BYTES`]; it is opened without
+//! blocking, so a FIFO is refused at once rather than waited on.
 //!
 //! **Reloads.** The file is read once at start; a file that cannot be read or parsed
 //! then stops the server. After that, each `GET /v1/nodes` (and each write's answer)
@@ -35,7 +36,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The most bytes the file may hold.
-pub const MAX_EXPECTED_NODES_BYTES: u64 = 1 << 20;
+pub const MAX_EXPECTED_NODES_BYTES: usize = 1 << 20;
 
 /// Why the file cannot be used.
 #[derive(Debug, thiserror::Error)]
@@ -160,29 +161,33 @@ impl ExpectedNodes {
 
 /// The file's metadata, and the node ids it lists.
 fn read(path: &Path) -> Result<(Stamp, Vec<String>), ExpectedNodesError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let unreadable = |source| ExpectedNodesError::Read {
         path: path.to_owned(),
         source,
     };
+    // Non-blocking: opening a FIFO for reading would otherwise wait for a writer.
+    let nonblocking = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nonblocking)
+        .open(path)
+        .map_err(unreadable)?;
+    // Taken from the open file, so that it describes the bytes read.
+    let meta = file.metadata().map_err(unreadable)?;
     let not_a_file = || ExpectedNodesError::NotAFile {
         path: path.to_owned(),
     };
-    // A FIFO or device is refused on its metadata, before an open could block on it.
-    let meta = std::fs::metadata(path).map_err(unreadable)?;
-    if !meta.is_file() || meta.len() > MAX_EXPECTED_NODES_BYTES {
-        return Err(not_a_file());
-    }
-    let file = std::fs::File::open(path).map_err(unreadable)?;
-    // Taken from the open file, so that it describes the bytes read.
-    let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() {
         return Err(not_a_file());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_EXPECTED_NODES_BYTES + 1)
+    let limit = u64::try_from(MAX_EXPECTED_NODES_BYTES + 1).unwrap_or(u64::MAX);
+    file.take(limit)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_EXPECTED_NODES_BYTES {
+    if bytes.len() > MAX_EXPECTED_NODES_BYTES {
         return Err(not_a_file());
     }
     let text = String::from_utf8(bytes).map_err(|_| ExpectedNodesError::NotText {
