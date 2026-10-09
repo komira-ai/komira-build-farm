@@ -10,6 +10,12 @@
 //! and its `NodeStatus` either way. Each change of an Xcode's state is logged once:
 //! at `WARN` when it is installed but not ready, with why and the fix, and at `INFO`
 //! when it is ready or gone. A survey that matches the last logs and sends nothing.
+//!
+//! Surveys are compared by each Xcode's app, `DEVELOPER_DIR`, build and state (which
+//! decides its fix), not by its reason: that is the failed question's stderr, and
+//! `xcodebuild` starts its NSLog lines with the time and its pid, which differ on every
+//! survey. A survey whose only difference is a reason logs and sends nothing, so the
+//! reason the daemon reports is the one its Xcode had when it last changed.
 
 use std::path::PathBuf;
 use std::thread::JoinHandle;
@@ -51,7 +57,7 @@ pub fn watch(
                 return;
             }
             let now = xcode::survey(&apps, &probe);
-            if now != last {
+            if !same(&last, &now) {
                 log(&changes(&last, &now));
                 send.send_replace(apply(&now));
                 last = now;
@@ -64,13 +70,29 @@ pub fn watch(
 /// Whether a change wants a human (`WARN`) or is news (`INFO`), and what it says.
 type Change = (bool, String);
 
-/// What changed from `before` to `after`, one line per app whose build, state or reason
-/// changed, appeared or went: an Xcode not ready says why and how to fix it.
+/// What a survey is compared by: an Xcode's app, `DEVELOPER_DIR`, build and state (and
+/// so its fix), not its reason (see the module documentation).
+fn key(xcode: &Xcode) -> (&PathBuf, Option<&PathBuf>, Option<&str>, State) {
+    (
+        &xcode.app,
+        xcode.developer_dir.as_ref(),
+        xcode.build.as_deref(),
+        xcode.state,
+    )
+}
+
+/// Whether `a` and `b` name the same Xcodes, in the same order, alike but for reasons.
+fn same(a: &[Xcode], b: &[Xcode]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| key(a) == key(b))
+}
+
+/// What changed from `before` to `after`, one line per app whose `DEVELOPER_DIR`, build
+/// or state changed, appeared or went: an Xcode not ready says why and how to fix it.
 fn changes(before: &[Xcode], after: &[Xcode]) -> Vec<Change> {
     let found = |list: &[Xcode], app: &PathBuf| list.iter().position(|x| &x.app == app);
     let mut lines: Vec<Change> = after
         .iter()
-        .filter(|x| found(before, &x.app).is_none_or(|i| before[i] != **x))
+        .filter(|x| found(before, &x.app).is_none_or(|i| key(&before[i]) != key(x)))
         .map(|x| match x.state {
             State::Ready => (false, format!("{} ready", named(x))),
             _ => (
@@ -132,8 +154,9 @@ mod tests {
         }
     }
 
-    /// Catches: a change logged on every survey rather than once, a change of reason
-    /// or build not logged, an Xcode not ready logged without its fix or not as a
+    /// Catches: a change logged on every survey rather than once, a change of state or
+    /// build not logged, a change of reason alone logged (an NSLog line's time and pid
+    /// differ on every survey), an Xcode not ready logged without its fix or not as a
     /// warning, one that became ready, appeared or went not logged, and a not-ready
     /// Xcode with no fix said to have one.
     #[test]
@@ -169,18 +192,27 @@ mod tests {
             reason: String::new(),
             ..licence.clone()
         };
-        let other_reason = Xcode {
+        let restamped = Xcode {
+            reason: "2026-10-09 12:00:03.456 xcodebuild[4321:9876] 69".to_owned(),
+            ..licence.clone()
+        };
+        assert_eq!(
+            changes(&before, &[restamped, good.clone(), mute.clone()]),
+            []
+        );
+        let other_build = Xcode {
+            build: Some("3C".to_owned()),
             reason: "hung".to_owned(),
             ..mute.clone()
         };
         let new = at("/A/Xcode_4.app", Some("4D"), State::Ready, "");
         assert_eq!(
-            changes(&before, &[accepted, other_reason, new]),
+            changes(&before, &[accepted, other_build, new]),
             [
                 (false, "Xcode 1A (/A/Xcode_1.app) ready".to_owned()),
                 (
                     true,
-                    "Xcode (/A/Xcode_3.app) installed but not ready: hung; fix: none known"
+                    "Xcode 3C (/A/Xcode_3.app) installed but not ready: hung; fix: none known"
                         .to_owned()
                 ),
                 (false, "Xcode 4D (/A/Xcode_4.app) ready".to_owned()),
@@ -278,6 +310,67 @@ mod tests {
                 [State::LicenseNotAccepted]
             ]
         );
+
+        drop(reports);
+        thread
+            .join()
+            .expect("the thread ends once the daemon is gone");
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches: an Xcode that stays not ready logged at `WARN` again, and its report
+    /// resent to the daemon (which resends `NodeStatus`, so the server raises it again),
+    /// on every survey whose only difference is the reason: here an NSLog-style line
+    /// whose time and pid differ on each run, as `xcodebuild`'s do. The log and the
+    /// send share one branch, so one application means one `WARN`.
+    #[test]
+    fn a_reason_that_changes_alone_is_logged_and_sent_once() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let dir = scratch("restamp");
+        let apps = dir.join("Applications");
+        std::fs::create_dir_all(apps.join("Xcode_16.app/Contents/Developer")).expect("app");
+        let xcodebuild = fake(
+            &dir,
+            "xcodebuild",
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                 -version) echo 'Build version 16C5032a' ;;\n\
+                 '-license check') echo \"$(date '+%Y-%m-%d %H:%M:%S') xcodebuild[$$:1] \
+                 {NOT_AGREED}\" >&2; exit 69 ;;\n\
+                 esac\n"
+            ),
+        );
+        let probe = Probe {
+            xcodebuild,
+            xcrun: PathBuf::from("/bin/echo"),
+            within: Duration::from_secs(5),
+            metal: false,
+        };
+        // The reasons do differ from survey to survey, by the pid at least.
+        let (one, two) = (xcode::survey(&apps, &probe), xcode::survey(&apps, &probe));
+        assert_ne!(one, two);
+        assert!(same(&one, &two));
+        assert!(one[0].reason.contains(NOT_AGREED), "{:?}", one[0].reason);
+
+        let applied = Arc::new(Mutex::new(0));
+        let seen = Arc::clone(&applied);
+        let apply: Apply = Box::new(move |xcodes| {
+            *seen.lock().expect("applied") += 1;
+            DriverReport {
+                entries: Vec::new(),
+                xcodes: xcodes.iter().map(Xcode::status).collect(),
+            }
+        });
+        let every = Duration::from_millis(50);
+        let (mut reports, thread) = watch(apps, probe, every, apply);
+        assert_eq!(
+            reports.borrow_and_update().xcodes[0].state(),
+            XcodeState::LicenseNotAccepted
+        );
+        std::thread::sleep(every * 10);
+        assert!(!reports.has_changed().expect("the watch runs"));
+        assert_eq!(*applied.lock().expect("applied"), 1);
 
         drop(reports);
         thread

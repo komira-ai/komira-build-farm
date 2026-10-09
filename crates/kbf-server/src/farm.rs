@@ -361,12 +361,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             return Vec::new();
         }
         let view = SoftwareView::new(status, received);
-        let before = state
-            .software
-            .get(worker)
-            .map(SoftwareView::needs_attention);
-        let after = view.needs_attention();
-        let changes = attention_changes(worker.as_str(), &before.unwrap_or_default(), &after);
+        let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
+        let changes = attention_changes(worker.as_str(), before, &view.xcodes);
         for (raise, line) in &changes {
             if *raise {
                 tracing::warn!(target: "kbf_server::attention", "{line}");

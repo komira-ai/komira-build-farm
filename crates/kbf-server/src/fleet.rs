@@ -12,7 +12,9 @@
 //! it (issue #164). kbf has no alert delivery yet, so the server also logs each item
 //! once, at `WARN` under the target `kbf_server::attention`, when it first appears, and
 //! at `INFO` when it clears ([`attention_changes`]); a status that repeats the same
-//! items (each new stream sends one) logs nothing.
+//! items (each new stream sends one) logs nothing. An item is the same while its
+//! Xcode's app, build, state and fix are: a reason that changes alone (an NSLog line's
+//! time and pid) is shown in `needs_attention` but not logged again.
 
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use serde::Serialize;
@@ -167,20 +169,36 @@ impl SoftwareView {
     }
 }
 
-/// What to log when a node's attention items go from `before` to `after`: each new
-/// item to raise (`true`, at `WARN`), then each gone one to clear (`false`, at `INFO`),
-/// as `node <node>: <item>` and `node <node>: resolved: <item>`. The same items give
-/// nothing.
+/// What to log when a node's Xcodes go from `before` to `after`: the attention item of
+/// each Xcode newly not ready (`true`, at `WARN`), then that of each no longer so
+/// (`false`, at `INFO`), as `node <node>: <item>` and `node <node>: resolved: <item>`.
+/// An Xcode is compared by its app, build, state and fix, not its reason (see the
+/// module documentation), so the same Xcodes give nothing.
 #[must_use]
-pub fn attention_changes(node: &str, before: &[String], after: &[String]) -> Vec<(bool, String)> {
+pub fn attention_changes(
+    node: &str,
+    before: &[XcodeView],
+    after: &[XcodeView],
+) -> Vec<(bool, String)> {
+    type Key<'a> = (&'a str, &'a str, &'a str, &'a str);
+    fn items(list: &[XcodeView]) -> Vec<(Key<'_>, String)> {
+        list.iter()
+            .filter_map(|x| {
+                let key = (x.app.as_str(), x.build.as_str(), x.state, x.fix.as_str());
+                Some((key, x.attention()?))
+            })
+            .collect()
+    }
+    let (before, after) = (items(before), items(after));
+    let has = |list: &[(Key<'_>, String)], key: &Key<'_>| list.iter().any(|(k, _)| k == key);
     let raised = after
         .iter()
-        .filter(|item| !before.contains(item))
-        .map(|item| (true, format!("node {node}: {item}")));
+        .filter(|(key, _)| !has(&before, key))
+        .map(|(_, item)| (true, format!("node {node}: {item}")));
     let cleared = before
         .iter()
-        .filter(|item| !after.contains(item))
-        .map(|item| (false, format!("node {node}: resolved: {item}")));
+        .filter(|(key, _)| !has(&after, key))
+        .map(|(_, item)| (false, format!("node {node}: resolved: {item}")));
     raised.chain(cleared).collect()
 }
 
@@ -275,18 +293,57 @@ mod tests {
     }
 
     /// Catches: an item raised again by a status that repeats it (every new stream
-    /// sends one), an item never raised or never cleared, and a line that does not
-    /// name the node.
+    /// sends one), or by one whose only difference is the reason (an NSLog line's time
+    /// and pid, which `xcodebuild` prints anew each time it is asked); an item never
+    /// raised or never cleared, one raised again when its state or build changed not
+    /// raised, a ready Xcode raised, and a line that does not name the node.
     #[test]
     fn attention_is_raised_and_cleared_once() {
-        let (a, b, c) = ("a".to_owned(), "b".to_owned(), "c".to_owned());
+        let view = |build: &str, state: XcodeState, reason: &str| {
+            XcodeView::new(xcode(build, state, reason, "sudo x -license accept"))
+        };
+        let licence = XcodeState::LicenseNotAccepted;
+        let a = view(
+            "1A",
+            licence,
+            "2026-10-09 12:00:01.123 xcodebuild[4321:9876] 69",
+        );
+        let restamped = view(
+            "1A",
+            licence,
+            "2026-10-09 12:03:01.456 xcodebuild[5555:1234] 69",
+        );
+        let b = view("2B", licence, "69");
+        let ready = view("3C", XcodeState::Ready, "");
         let same = std::slice::from_ref(&a);
         assert_eq!(attention_changes("n", same, same), []);
         assert_eq!(
-            attention_changes("mac-1", &[a, b.clone()], &[b, c]),
+            attention_changes("n", same, std::slice::from_ref(&restamped)),
+            []
+        );
+        let first_launch = XcodeView {
+            state: "first_launch_not_run",
+            ..b.clone()
+        };
+        assert_eq!(
+            attention_changes(
+                "mac-1",
+                &[a.clone(), b.clone()],
+                &[first_launch.clone(), ready]
+            ),
             [
-                (true, "node mac-1: c".to_owned()),
-                (false, "node mac-1: resolved: a".to_owned())
+                (
+                    true,
+                    format!("node mac-1: {}", first_launch.attention().expect("item"))
+                ),
+                (
+                    false,
+                    format!("node mac-1: resolved: {}", a.attention().expect("item"))
+                ),
+                (
+                    false,
+                    format!("node mac-1: resolved: {}", b.attention().expect("item"))
+                ),
             ]
         );
     }

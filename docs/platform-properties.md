@@ -163,7 +163,10 @@ Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
 command that fixes it (for example `sudo
 /Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license accept`),
 and `GET /v1/nodes` lists it under the node's `needs_attention`
-([api.md](api.md#get-v1nodes)). The daemon and the server each log it once at `WARN`.
+([api.md](api.md#get-v1nodes)). The daemon and the server each log it at `WARN` once
+when it appears, and again only when its build, state or fix changes: a reason that
+changes alone (`xcodebuild` starts its NSLog lines with the time and its pid) is not
+logged again, and is not by itself a change the daemon sends.
 The daemon asks again every three minutes (`--xcode-recheck-secs`), so an Xcode fixed
 while the daemon runs is advertised within minutes, without a restart, and one that
 stops being ready (an update whose new licence is not accepted) stops being advertised.

@@ -39,27 +39,37 @@ impl Log {
     }
 }
 
-fn status(licence: XcodeState) -> NodeStatus {
+fn status(licence: XcodeState, reason: &str) -> NodeStatus {
     NodeStatus {
         os_name: "macOS".to_owned(),
         xcodes: vec![XcodeStatus {
             app: "/Applications/Xcode_16.1.app".to_owned(),
             build: "16B40".to_owned(),
             state: licence.into(),
-            reason: "not agreed".to_owned(),
+            reason: reason.to_owned(),
             fix: "sudo x -license accept".to_owned(),
         }],
         ..NodeStatus::default()
     }
 }
 
-const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not \
-    ready: not agreed; fix: sudo x -license accept";
+/// What `xcodebuild -license check` prints, as an NSLog line: its time and pid differ
+/// each time it is asked.
+const FIRST: &str = "2026-10-09 12:00:01.123 xcodebuild[4321:9876] not agreed";
+const AGAIN: &str = "2026-10-09 12:03:01.456 xcodebuild[5555:1234] not agreed";
+
+fn not_ready(reason: &str) -> String {
+    format!(
+        "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: {reason}; \
+         fix: sudo x -license accept"
+    )
+}
 
 /// Catches: the server's alert not written to its log (kbf has no alert delivery yet,
 /// issue #189, so the log line is the alert), written below `WARN` or under another
 /// target, without the node, the problem or the fix; a status that repeats it logged
-/// again; and its resolution not logged.
+/// again, or one whose only difference is the reason's time and pid (each survey's);
+/// the newest reason not the one `GET /v1/nodes` shows; and its resolution not logged.
 #[tokio::test]
 async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     let log = Log::default();
@@ -96,20 +106,26 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     };
     log.take();
 
-    let _ = farm.node_status(&node, stream, status(XcodeState::LicenseNotAccepted));
+    let licence = XcodeState::LicenseNotAccepted;
+    let _ = farm.node_status(&node, stream, status(licence, FIRST));
     assert_eq!(
         attention(log.take()),
         [format!(
-            "WARN kbf_server::attention: node mac-1: {NOT_READY}"
+            "WARN kbf_server::attention: node mac-1: {}",
+            not_ready(FIRST)
         )]
     );
-    let _ = farm.node_status(&node, stream, status(XcodeState::LicenseNotAccepted));
+    let _ = farm.node_status(&node, stream, status(licence, FIRST));
     assert_eq!(attention(log.take()), Vec::<String>::new());
-    let _ = farm.node_status(&node, stream, status(XcodeState::Ready));
+    let _ = farm.node_status(&node, stream, status(licence, AGAIN));
+    assert_eq!(attention(log.take()), Vec::<String>::new());
+    assert_eq!(farm.nodes().nodes[0].needs_attention, [not_ready(AGAIN)]);
+    let _ = farm.node_status(&node, stream, status(XcodeState::Ready, ""));
     assert_eq!(
         attention(log.take()),
         [format!(
-            "INFO kbf_server::attention: node mac-1: resolved: {NOT_READY}"
+            "INFO kbf_server::attention: node mac-1: resolved: {}",
+            not_ready(AGAIN)
         )]
     );
 }
