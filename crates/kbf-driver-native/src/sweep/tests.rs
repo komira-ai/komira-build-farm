@@ -568,6 +568,25 @@ fn a_quarantine_planted_during_the_kill_is_not_moved_into() {
     assert!(dir.join("lease-stuck/root").is_dir(), "left in place");
 }
 
+/// Catches a quarantine that cannot be made reported as the open's error instead of
+/// the mkdir's ("mkdir error dropped" mutant: a scratch root the daemon may not write
+/// would read as a quarantine that is not there), and the entry moved anyway.
+#[test]
+fn a_quarantine_that_cannot_be_made_says_why() {
+    // SAFETY: geteuid takes nothing and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = scratch("qmkdir");
+    std::fs::create_dir(dir.join("lease-stuck")).expect("mkdir");
+    chmod(&dir, 0o500);
+    let taken = aside(&dir).take(&dir.join("lease-stuck"), OsStr::new("lease-stuck"));
+    chmod(&dir, 0o700);
+    let why = taken.expect_err("moved into no quarantine");
+    assert_eq!(why.kind(), io::ErrorKind::PermissionDenied, "{why}");
+    assert!(dir.join("lease-stuck").is_dir(), "left in place");
+}
+
 /// Catches a quarantine that another user could write
 /// (group- or other-writable) emptied and kept ("owner and mode unchecked" mutant):
 /// what the sweep later moves aside would sit where others can reach it. It is
