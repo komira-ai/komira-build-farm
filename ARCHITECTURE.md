@@ -102,7 +102,8 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
-| `kbf-alert`, `kbf-store`, `kbf-sim-cell` | no | placeholders (**planned**: alerting, storage engine, whole-cell simulation) |
+| `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
+| `kbf-store`, `kbf-sim-cell` | no | placeholders (**planned**: storage engine, whole-cell simulation) |
 
 A test in `kbf-it` reads the dependency graph and fails if a pure crate depends,
 directly or not, on an async runtime, a network crate or a random source, or if its
