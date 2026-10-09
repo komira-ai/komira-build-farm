@@ -464,9 +464,11 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         format!("--scratch={}", scratch.display()),
     ];
 
+    let t1 = Instant::now();
     let mut first = daemon(&flags, &dir.join("first.log"));
     let session = front.session(PROMPT);
     session.hello();
+    let first_hello = t1.elapsed();
     session.welcome();
     session.start(1, 1, action);
     let pid_file = scratch.join("lease-1-1/root/pid");
@@ -483,9 +485,16 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(!ended(pid), "the action outlived its daemon");
 
+    let t2 = Instant::now();
     let mut second = daemon(&flags, &dir.join("second.log"));
     let session = front.session(PROMPT);
     session.hello();
+    let second_hello = t2.elapsed();
+    for (which, took) in [("first", first_hello), ("second", second_hello)] {
+        let log = std::fs::read_to_string(dir.join(format!("{which}.log"))).unwrap_or_default();
+        let survey = log.lines().find(|l| l.contains("Xcodes")).unwrap_or("");
+        let _ = writeln!(std::io::stderr(), "PROBE restart: {which} daemon said Hello {took:.1?} after spawn; {survey}");
+    }
     // What holds as the new session begins.
     let action_ended = ended(pid);
     let lease_dir_left = scratch.join("lease-1-1").exists();
