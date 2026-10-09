@@ -756,6 +756,42 @@ mod tests {
         kbf_outputs::remove_tree(&scratch).expect("clean");
     }
 
+    /// Catches a start, or the end of a lease, that does not sweep the user folders'
+    /// old leftovers, and a runtime whose actions do not get the folders' sandbox rules.
+    /// This build's own copy of both sweeps: `tests/leftovers.rs` runs real leases.
+    #[tokio::test]
+    async fn the_user_folders_are_swept_at_start_and_after_a_lease() {
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("user-folders-{}", std::process::id()));
+        let _ = kbf_outputs::remove_tree(&scratch);
+        let left = scratch.join("T/TemporaryItems/left");
+        let leave = || {
+            std::fs::create_dir_all(&left).expect("mkdir");
+            std::fs::File::open(&left)
+                .expect("open")
+                .set_modified(SystemTime::UNIX_EPOCH)
+                .expect("mtime");
+        };
+        leave();
+        std::fs::create_dir_all(scratch.join("C")).expect("mkdir");
+        let folders = UserFolders::new(scratch.join("T"), scratch.join("C")).expect("fits");
+        let mut config = NativeConfig::new(scratch.join("leases"));
+        config.user_folders = Some(folders.clone());
+        let started =
+            NativeRuntime::with_remover(config, Arc::new(NoCas), &kbf_outputs::remove_tree)
+                .expect("started");
+        assert_eq!(started.rules, folders.rules());
+        assert!(!left.exists(), "kept past start");
+        leave();
+        sweep_user_folders_after_lease(&started.config).await;
+        assert!(!left.exists(), "kept past a lease");
+        kbf_outputs::remove_tree(&scratch).expect("clean");
+    }
+
     /// Catches a signal death reported as exit 0 or as the raw status.
     #[test]
     fn a_signal_is_128_plus_its_number() {
