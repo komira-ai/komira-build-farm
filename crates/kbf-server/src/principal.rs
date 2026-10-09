@@ -26,8 +26,11 @@
 //!   prints the line for a token read from stdin. Two lines with the same digest are
 //!   refused: a token names one principal.
 //!
-//! A parse error names its line number and what is wrong, never the digest field's
-//! value.
+//! A parse error names its line number, the field and the rule it breaks. It echoes
+//! no field of the bad line, so a line with its fields out of order, or a raw token
+//! pasted into a column, puts neither a digest nor a token into the error. The one
+//! value it may show is an earlier entry's principal, a name that has already passed
+//! the name rule.
 //!
 //! **File rules**, as for the operator API token ([`crate::token`]): a regular file,
 //! owned by the server's effective user, mode 0600 or 0400, opened without blocking
@@ -150,8 +153,10 @@ impl Principals {
     /// Parses a token file's text (format in the module docs).
     ///
     /// # Errors
-    /// The 1-based number of the first bad line, and what is wrong with it (never the
-    /// digest field's value).
+    /// The 1-based number of the first bad line, and which field breaks which rule.
+    /// No field's value is echoed: a line whose fields are out of order, or with a
+    /// raw token pasted into a column, would otherwise put a digest or a token into
+    /// the error, and so into the server's log.
     pub fn parse(text: &str) -> Result<Self, (usize, String)> {
         let mut entries: Vec<Principal> = Vec::new();
         for (at, line) in text.lines().enumerate() {
@@ -170,13 +175,15 @@ impl Principals {
             };
             if !valid_name(name) {
                 return Err(bad(format!(
-                    "principal {name:?} must be 1 to {MAX_PRINCIPAL_BYTES} characters from \
-                     A-Z a-z 0-9 . _ @ -"
+                    "the principal (field 1) must be 1 to {MAX_PRINCIPAL_BYTES} characters \
+                     from A-Z a-z 0-9 . _ @ -"
                 )));
             }
             let role = ClientRole::parse(role)
-                .ok_or_else(|| bad(format!("unknown role {role:?}; the role is `client`")))?;
-            let qos: Qos = qos.parse().map_err(|e| bad(format!("{e}")))?;
+                .ok_or_else(|| bad("the role (field 2) must be `client`".to_owned()))?;
+            let qos: Qos = qos.parse().map_err(|_| {
+                bad("the qos (field 3) must be `interactive`, `ci` or `batch`".to_owned())
+            })?;
             let digest = parse_digest(digest)
                 .ok_or_else(|| bad("the digest must be `sha256:` and 64 hex digits".to_owned()))?;
             if let Some(first) = entries.iter().position(|e| e.digest == digest) {

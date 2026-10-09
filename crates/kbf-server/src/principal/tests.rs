@@ -206,6 +206,30 @@ fn a_parse_error_does_not_echo_the_digest() {
     }
 }
 
+/// Catches: a name, role or qos error that echoes its field. A line with its fields
+/// out of order puts a digest there, and a raw token pasted into a column puts the
+/// token there; either would reach the server's log when the file is refused.
+#[test]
+fn a_line_with_its_fields_out_of_order_echoes_none_of_them() {
+    let hex = hex_of(TOKEN_A);
+    for bad in [
+        format!("sha256:{hex} client ci ci"),
+        format!("ci sha256:{hex} client ci"),
+        format!("ci {TOKEN_A} ci sha256:{hex}"),
+        format!("ci client sha256:{hex} ci"),
+        format!("ci client {TOKEN_A} sha256:{hex}"),
+    ] {
+        let Err((at, why)) = Principals::parse(&bad) else {
+            panic!("{bad:?} parsed");
+        };
+        assert_eq!(at, 1, "{why}");
+        assert!(
+            !why.contains(&hex[..16]) && !why.contains(&TOKEN_A[..16]),
+            "{bad:?}: {why}"
+        );
+    }
+}
+
 /// Catches: the hash-token line not in the file's format, the token hashed with its
 /// trailing newline, or a short or spaced token or a bad name accepted.
 #[test]
