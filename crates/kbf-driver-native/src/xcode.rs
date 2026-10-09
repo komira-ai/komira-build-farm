@@ -208,7 +208,8 @@ impl Probe {
 /// Every `Xcode*.app` in `apps`, in name order, each asked the questions in the module
 /// documentation as `probe` says. A directory that cannot be read has none. A question
 /// not answered in time (exit and close its output) is killed if still running. Each
-/// Xcode is asked on a thread of its own, so the survey takes as long as its slowest
+/// Xcode is asked once (an app that is a link to another is reported with that one's
+/// answers) and on a thread of its own, so the survey takes as long as its slowest
 /// Xcode, up to `probe.within` per question, not as long as all of them: an `xcrun`
 /// lookup it has not cached takes seconds, and the node says nothing to the server
 /// until its first survey is done. With [`Probe::sandbox`], its directory is made
@@ -242,19 +243,38 @@ pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
         }
     };
     let sandbox = sandbox.as_ref();
-    let found = std::thread::scope(|scope| {
-        let asking: Vec<_> = names
+    let found: Vec<PathBuf> = names.into_iter().map(|name| apps.join(name)).collect();
+    // Each Xcode once: a link (`Xcode.app` to `Xcode_16.2.app`) gets the answers of the
+    // app it leads to. One whose path does not resolve is asked alone, and fails.
+    let reals: Vec<PathBuf> = found
+        .iter()
+        .map(|app| std::fs::canonicalize(app).unwrap_or_else(|_| app.clone()))
+        .collect();
+    let mut first: BTreeMap<&PathBuf, &PathBuf> = BTreeMap::new();
+    for (app, real) in found.iter().zip(&reals) {
+        first.entry(real).or_insert(app);
+    }
+    let answers: BTreeMap<&PathBuf, Xcode> = std::thread::scope(|scope| {
+        let asking: Vec<_> = first
             .into_iter()
-            .map(|name| {
-                let app = apps.join(name);
-                scope.spawn(move || check(app, probe, sandbox))
+            .map(|(real, app)| {
+                let app = app.clone();
+                (real, scope.spawn(move || check(app, probe, sandbox)))
             })
             .collect();
         asking
             .into_iter()
-            .map(|asked| asked.join().expect("asking an Xcode does not panic"))
+            .map(|(real, asked)| (real, asked.join().expect("asking an Xcode does not panic")))
             .collect()
     });
+    let found = found
+        .iter()
+        .zip(&reals)
+        .map(|(app, real)| Xcode {
+            app: app.clone(),
+            ..answers[real].clone()
+        })
+        .collect();
     if let Some(sandbox) = sandbox {
         // One left behind (a removal that failed) is a `lease-` name: the next start
         // sweeps it.
@@ -476,9 +496,13 @@ impl Sandbox {
     /// `program args` under this sandbox with the network off, `TMPDIR` its directory.
     fn command(&self, program: &Path, args: &[&str]) -> std::process::Command {
         let args: Vec<String> = args.iter().map(|&a| a.to_owned()).collect();
-        let (program, args) =
-            self.isolation
-                .wrap(Network::Off, &self.dir, &self.rules, program.to_owned(), &args);
+        let (program, args) = self.isolation.wrap(
+            Network::Off,
+            &self.dir,
+            &self.rules,
+            program.to_owned(),
+            &args,
+        );
         let mut command = std::process::Command::new(program);
         command.args(args).env("TMPDIR", &self.dir);
         command

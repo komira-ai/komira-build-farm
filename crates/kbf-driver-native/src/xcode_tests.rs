@@ -257,7 +257,8 @@ const WITHIN: Duration = Duration::from_secs(2);
 /// Catches (CEO decision on issue #164): a question of the survey, `xcrun`'s lookup
 /// above all (it reads and fills a cache leases can write), run outside the sandbox,
 /// with the network on, without the user-folder rules, in another lease directory or
-/// `TMPDIR`, or with `--no-cache` (the fake `xcrun` refuses it); the survey's
+/// `TMPDIR`, or with `--no-cache` (the fake `xcrun` refuses it); an Xcode asked again
+/// through a link to it (`Xcode.app`), or the link not reported; the survey's
 /// directory left behind; and an Xcode asked, or reported as anything but failed with
 /// why, when that directory cannot be made. The sandbox program is a fake that logs
 /// what it runs and how, then runs it.
@@ -267,6 +268,8 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     let apps = dir.join("Applications");
     let xcodebuild = fake_xcodebuild(&dir);
     link_xcodebuild(&xcodebuild, &apps.join("Xcode_good.app"));
+    std::os::unix::fs::symlink(apps.join("Xcode_good.app"), apps.join("Xcode.app"))
+        .expect("link");
     let log = dir.join("sandbox-log");
     let sandbox_exec = fake(
         &dir,
@@ -283,8 +286,7 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     let sandbox = Sandbox {
         isolation: Isolation::Sandbox(sandbox_exec),
         dir: dir.join("scratch/lease-survey"),
-        rules: "(rules)
-".to_owned(),
+        rules: "(rules)\n".to_owned(),
     };
     let probe = Probe {
         xcrun: fake_xcrun(&dir),
@@ -295,16 +297,18 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     let surveyed = survey(&apps, &probe);
     let real_apps = std::fs::canonicalize(&apps).expect("real");
     let developer_dir = real_apps.join("Xcode_good.app/Contents/Developer");
-    assert_eq!(
-        surveyed,
-        [Xcode {
-            app: apps.join("Xcode_good.app"),
-            developer_dir: Some(developer_dir.clone()),
-            build: Some("16C5032a".to_owned()),
-            state: State::Ready,
-            reason: String::new(),
-        }]
-    );
+    let good = Xcode {
+        app: apps.join("Xcode_good.app"),
+        developer_dir: Some(developer_dir.clone()),
+        build: Some("16C5032a".to_owned()),
+        state: State::Ready,
+        reason: String::new(),
+    };
+    let link = Xcode {
+        app: apps.join("Xcode.app"),
+        ..good.clone()
+    };
+    assert_eq!(surveyed, [link, good]);
     let real = std::fs::canonicalize(&dir)
         .expect("real")
         .join("scratch/lease-survey");
@@ -338,17 +342,16 @@ fn the_survey_asks_every_question_under_its_sandbox() {
         ..probe
     };
     let refused = survey(&apps, &unmakeable);
-    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    for xcode in &refused {
+        assert_eq!((xcode.state, xcode.build.as_deref()), (State::Failed, None));
+        assert!(xcode.reason.contains("under-a-file"), "{}", xcode.reason);
+    }
     assert_eq!(
-        (refused[0].state, refused[0].build.as_deref()),
-        (State::Failed, None)
+        read(),
+        Vec::<String>::new(),
+        "asked with no sandbox to ask in"
     );
-    assert!(
-        refused[0].reason.contains("under-a-file"),
-        "{}",
-        refused[0].reason
-    );
-    assert_eq!(read(), Vec::<String>::new(), "asked with no sandbox to ask in");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 

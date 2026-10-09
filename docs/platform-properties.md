@@ -178,7 +178,8 @@ stops being ready (an update whose new licence is not accepted) stops being adve
 A hung question is killed, so it cannot keep the node from starting. An answer counts
 only once the program has exited and closed its output: one that exits but leaves a
 child holding its output open is not ready when the minute is up. Each Xcode is asked
-on a thread of its own, so a hung Xcode delays the daemon's start (it says nothing to
+once (an app that links to another, such as `Xcode.app`, is listed with that one's
+answers), on a thread of its own, so a hung Xcode delays the daemon's start (it says nothing to
 the server until its first survey is done) by up to a minute per question it is asked
 (four; five or six with `--require-metal-toolchain`), and the other Xcodes add
 nothing to that. An action

@@ -219,7 +219,9 @@ async fn the_sandboxed_survey_answers_as_an_unsandboxed_one() {
         sandbox_denials()
     );
     assert!(
-        !dir.join("leases").join(kbf_driver_native::SURVEY_DIR).exists(),
+        !dir.join("leases")
+            .join(kbf_driver_native::SURVEY_DIR)
+            .exists(),
         "the survey's directory stays"
     );
 }

@@ -473,7 +473,10 @@ mod tests {
         let xcodes = daemon.node_status().xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].build, "CACHE", "{xcodes:?}");
-        assert!(temp.join("xcrun_db").exists(), "the start removed the cache");
+        assert!(
+            temp.join("xcrun_db").exists(),
+            "the start removed the cache"
+        );
         drop(daemon);
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
@@ -495,8 +498,7 @@ mod tests {
         let write = |path: &Path, script: &str| {
             std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
             std::fs::write(path, script).expect("script");
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         };
         let sandbox_exec = dir.join("sandbox-exec");
         write(
@@ -542,12 +544,12 @@ mod tests {
         let leases = std::fs::canonicalize(dir.join("leases")).expect("real");
         let survey = leases.join(kbf_driver_native::SURVEY_DIR);
         assert!(!survey.exists(), "the survey's directory stays");
-        // The warm-up removes its directory when it ends.
+        // The warm-up removes its directory when it ends: waited for up to 20 s
+        // (without a branch of this test's own, which coverage would count).
         let warm = leases.join("lease-warm-up");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while warm.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        (0..1000)
+            .take_while(|_| warm.exists())
+            .for_each(|_| std::thread::sleep(Duration::from_millis(20)));
         let ran = std::fs::read_to_string(&log).expect("ran");
         let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
         let surveyed: Vec<String> = ran
