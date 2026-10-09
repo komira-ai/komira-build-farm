@@ -136,13 +136,34 @@ impl Fake {
         self.assert_action_gone(seq);
     }
 
+    /// The environment entry the fake gives lease `seq`'s action.
+    fn marker(&self, seq: u64) -> String {
+        format!("FAKE_LEASE={}/actions/kbf-lease-1-{seq}", self.nonce)
+    }
+
+    /// Asserts lease `seq`'s action runs and carries the marker
+    /// [`Fake::assert_action_gone`] looks for: the positive control that keeps that
+    /// check from passing because nothing ever carried the marker. Waits up to five
+    /// seconds, since the pid file is written before the action has exec'd.
+    pub fn assert_action_running(&self, seq: u64) {
+        let marker = self.marker(seq);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while running_with_env(marker.as_bytes()).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "no process carries lease {seq}'s marker {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Asserts nothing the lease's action started still runs. The fake gives the action
     /// `FAKE_LEASE=<this Fake's nonce><lease cgroup name>` and its children inherit it,
     /// so that is the fake's stand-in for membership of the lease cgroup. Waits up to
     /// five seconds, since a SIGKILL takes effect when its target next runs; a zombie
     /// (no environment left) has ended.
     pub fn assert_action_gone(&self, seq: u64) {
-        let marker = format!("FAKE_LEASE={}/actions/kbf-lease-1-{seq}", self.nonce);
+        let marker = self.marker(seq);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let left = running_with_env(marker.as_bytes());

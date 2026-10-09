@@ -299,6 +299,8 @@ async fn a_dropped_run_still_cleans_up() {
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
     fake.wait_for_start().await;
+    // Positive control: what `assert_clean` must find gone is there to find.
+    fake.assert_action_running(1);
     run.abort();
     assert!(run.await.expect_err("cancelled").is_cancelled());
     fake.assert_clean(1);
@@ -317,6 +319,7 @@ async fn a_dropped_run_still_cleans_up() {
     let run = tokio::spawn(async move { runtime.run(work(2, action, Resources::default())).await });
     std::fs::remove_file(fake.state.join("pid")).expect("rm pid");
     fake.wait_for_start().await;
+    fake.assert_action_running(2);
     run.abort();
     assert!(run.await.expect_err("cancelled").is_cancelled());
     assert!(!exists(&fake.lease_dir(2)), "scratch left");
