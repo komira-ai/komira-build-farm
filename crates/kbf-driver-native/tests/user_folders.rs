@@ -199,56 +199,6 @@ async fn xcodebuild_builds_a_target() {
     );
 }
 
-/// TEMPORARY (issue #163 investigation): `xcodebuild` resolving a package with
-/// Foundation's home in the lease (`CFFIXED_USER_HOME`); what it leaves when the
-/// lease directory cannot be removed.
-#[tokio::test]
-async fn xcodebuild_builds_a_package_with_its_home_in_the_lease() {
-    let Some((build, developer_dir)) = newest_xcode() else {
-        return;
-    };
-    let dir = scratch("xcodebuild-package");
-    let mut config: NativeConfig = config(&dir);
-    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
-    let cas = Arc::new(MemoryCas::default());
-    let rt = runtime(config, &cas);
-    let mut spec = Spec::sh(&format!(
-        "{LAYOUT}CFFIXED_USER_HOME=\"$HOME\" xcodebuild -scheme hello \
-         -destination platform=macOS -derivedDataPath \"$TMPDIR/dd\" build && echo built"
-    ))
-    .env("PATH", PATH)
-    .property("xcode", &build);
-    spec.inputs = package();
-    let action = spec.timeout(Duration::from_secs(600)).store(&cas);
-    let result = rt.run(work(1, action, 0)).await;
-    let result = match result {
-        Ok(result) => result,
-        Err(e) => {
-            let ls = std::process::Command::new("/bin/ls")
-                .arg("-laRO")
-                .arg(dir.join("leases"))
-                .output()
-                .expect("ls");
-            let listing = String::from_utf8_lossy(&ls.stdout);
-            let kept: Vec<&str> = listing
-                .lines()
-                .filter(|l| !l.contains(" dd"))
-                .take(200)
-                .collect();
-            panic!("{e:?}\n{}", kept.join("\n"));
-        }
-    };
-    let out = stdout(&cas, &result);
-    assert_eq!(
-        (result.exit_code, out.lines().last()),
-        (0, Some("built")),
-        "{}\n{}\n{}",
-        tail(&out),
-        tail(&stderr(&cas, &result)),
-        sandbox_denials()
-    );
-}
-
 /// The last 40 lines of `text`: `xcodebuild` says a lot.
 fn tail(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
