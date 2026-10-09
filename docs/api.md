@@ -65,12 +65,13 @@ request turns writes off.
 
 ## `GET /v1/nodes`
 
-Every node registered since the server started, and every node of
-[`--expected-nodes`](#expected-nodes) that has not, in node-id order, with its
-software and where it is in placement:
+The server that answers, then every node registered since it started, and every
+node of [`--expected-nodes`](#expected-nodes) that has not, in node-id order, with
+its software and where it is in placement:
 
 ```json
-{ "nodes": [
+{ "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
+  "nodes": [
   { "node_id": "linux-2", "connected": false, "expected": true,
     "last_seen_unix_ms": null, "software": null,
     "placement": { "state": "absent", "since_unix_ms": 1791369000000 } },
@@ -89,6 +90,8 @@ software and where it is in placement:
 
 | Field | Meaning |
 |---|---|
+| `server.version` | the `kbf-server` build that answers, as `--version` and the start line print it: the package version, `+`, and the commit |
+| `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
 | `expected` | whether `--expected-nodes` lists it |

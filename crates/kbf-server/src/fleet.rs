@@ -111,10 +111,12 @@ impl SoftwareView {
     }
 }
 
-/// The body of `GET /v1/nodes`: every node registered since the server started, and
-/// every expected node that has not, in node-id order.
+/// The body of `GET /v1/nodes`: the server that answers, every node registered since
+/// it started, and every expected node that has not, in node-id order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NodesView {
+    /// The server process that answers.
+    pub server: ServerView,
     /// The nodes.
     pub nodes: Vec<NodeView>,
     /// Why `--expected-nodes` could not be read again (the last list read is still in
@@ -155,4 +157,37 @@ pub fn with_expected(mut view: NodesView, expected: &Expected) -> NodesView {
 /// Marks `node` `expected` if `expected` lists it.
 pub fn mark(node: &mut NodeView, expected: &Expected) {
     node.expected = expected.listed.contains_key(&node.node_id);
+}
+
+impl NodesView {
+    /// `nodes`, as this server build lists them, with no `--expected-nodes` error
+    /// ([`with_expected`] sets it).
+    #[must_use]
+    pub fn of_this_build(nodes: Vec<NodeView>) -> Self {
+        Self {
+            server: ServerView::this_build(),
+            nodes,
+            expected_nodes_error: None,
+        }
+    }
+}
+
+/// The `kbf-server` build that answers, so a deploy can check which commit runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ServerView {
+    /// As `--version` and the start line print it: [`crate::SERVER_VERSION`].
+    pub version: String,
+    /// The commit alone: [`crate::BUILD_COMMIT`].
+    pub commit: String,
+}
+
+impl ServerView {
+    /// This build.
+    #[must_use]
+    pub fn this_build() -> Self {
+        Self {
+            version: crate::SERVER_VERSION.to_owned(),
+            commit: crate::BUILD_COMMIT.to_owned(),
+        }
+    }
 }

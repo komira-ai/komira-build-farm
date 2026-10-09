@@ -18,7 +18,9 @@ use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
 use kbf_proto::worker::ServerMessage;
 use kbf_server::expected::{ExpectedNodes, ExpectedNodesError, MAX_EXPECTED_NODES_BYTES};
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, Args, ConfigError, Farm, Listeners, bind_server_with_api};
+use kbf_server::{
+    Api, Args, BUILD_COMMIT, ConfigError, Farm, Listeners, SERVER_VERSION, bind_server_with_api,
+};
 use kbf_types::{Resources, WorkerId};
 use serde_json::{Value, json};
 use support::{FakeDaemon, HELLO_WAIT, INTERVAL, PROMPT, hello};
@@ -207,9 +209,10 @@ async fn nodes_listed_but_not_registered_are_absent() {
     let got = nodes(api).await;
     let mac_since = since(&got, "mac-9");
     assert!((before..=after).contains(&mac_since), "{got}");
+    let this_build = json!({ "version": SERVER_VERSION, "commit": BUILD_COMMIT });
     assert_eq!(
         got,
-        json!({ "nodes": [
+        json!({ "server": this_build, "nodes": [
             { "node_id": "linux-1", "connected": false, "expected": true,
               "last_seen_unix_ms": null, "software": null,
               "placement": { "state": "absent", "since_unix_ms": since(&got, "linux-1") } },

@@ -39,7 +39,7 @@ pub enum StoreKind {
 
 /// `kbf-server` flags.
 #[derive(Clone, Debug, Parser)]
-#[command(name = "kbf-server", version, about = "The kbf farm server")]
+#[command(name = "kbf-server", version = crate::SERVER_VERSION, about = "The kbf farm server")]
 pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
