@@ -35,7 +35,7 @@ async fn main() -> ExitCode {
         .init();
     let args = Args::parse();
     if let Some(Command::HashToken { principal, qos }) = &args.command {
-        return match token_line_from(principal, ClientRole::Client, qos, io::stdin().lock()) {
+        return match token_line_from(principal, ClientRole::Client, qos, &mut io::stdin().lock()) {
             Ok(line) => {
                 println!("{line}");
                 ExitCode::SUCCESS

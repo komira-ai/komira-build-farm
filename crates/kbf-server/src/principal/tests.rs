@@ -254,12 +254,12 @@ impl std::io::Read for Broken {
 fn a_token_input_is_bounded_and_its_errors_reported() {
     let max = crate::token::MAX_TOKEN_FILE_BYTES;
     let padded = format!("{TOKEN_A}{}", "\n".repeat(max - TOKEN_A.len()));
-    let made = token_line_from("dev", ClientRole::Client, &Qos::Ci, padded.as_bytes());
+    let made = token_line_from("dev", ClientRole::Client, &Qos::Ci, &mut padded.as_bytes());
     assert_eq!(made, Ok(line("dev", "ci", TOKEN_A)));
     let over = format!("{padded}\n");
-    let refused = token_line_from("dev", ClientRole::Client, &Qos::Ci, over.as_bytes());
+    let refused = token_line_from("dev", ClientRole::Client, &Qos::Ci, &mut over.as_bytes());
     assert!(refused.is_err_and(|e| e.contains("more than 4096 bytes")));
-    let refused = token_line_from("dev", ClientRole::Client, &Qos::Ci, Broken);
+    let refused = token_line_from("dev", ClientRole::Client, &Qos::Ci, &mut Broken);
     assert!(refused.is_err_and(|e| e.contains("read the token")));
 }
 

@@ -272,7 +272,7 @@ pub fn token_line_from(
     principal: &str,
     role: ClientRole,
     qos: &Qos,
-    input: impl std::io::Read,
+    input: &mut dyn std::io::Read,
 ) -> Result<String, String> {
     let max = crate::token::MAX_TOKEN_FILE_BYTES;
     let mut token = Vec::new();
