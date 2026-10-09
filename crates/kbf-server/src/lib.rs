@@ -34,6 +34,7 @@ pub mod identity;
 pub mod mdm;
 pub mod rollout;
 pub mod serve;
+mod stamp;
 pub mod token;
 pub mod worker;
 
