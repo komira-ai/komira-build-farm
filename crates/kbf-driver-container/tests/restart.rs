@@ -28,7 +28,64 @@ fn ended(pid: &str) -> bool {
 /// of it is dropped, so nothing of it is cleaned.
 #[tokio::test]
 async fn a_restarted_runtime_removes_what_its_predecessor_left() {
-    let fake = Fake::new("restart");
+    let (fake, pid) = kill_the_daemon("restart").await;
+    let pid = pid.as_str();
+    fake.restart().expect("the restarted runtime starts");
+    assert!(ended(pid), "the container's action still runs");
+    assert!(
+        exists(&fake.state.join("removed")),
+        "the container was not removed"
+    );
+    // Not `assert_clean`, which also requires `podman start` reaped before `rm`: that
+    // `podman start` was the killed daemon's child, which no later daemon can wait for.
+    // It ends by itself once its container is gone.
+    assert!(!exists(&fake.lease_dir(1)), "scratch directory left");
+    assert!(!exists(&fake.lease_cgroup(1)), "lease cgroup left");
+    let ps = std::fs::read_to_string(fake.state.join("ps.args")).expect("ps ran");
+    assert!(
+        ps.lines().any(|a| a == "--filter=label=kbf.owner=node-1"),
+        "{ps}"
+    );
+}
+
+/// Catches (issue #194) the test removing a Fake's directory while the killed
+/// daemon's `podman start` still runs: nobody waits for that process, and once the
+/// restarted runtime's sweep has ended its action, it writes its status and events
+/// into the state directory, which made the removal fail with "Directory not empty".
+/// 200 rounds with the CPUs busy ([`support::CpuHog`]); each restarts and drops its
+/// Fake at once (the sweep's checks are the test above's). Ballast in the state
+/// directory (2000 empty files in a subdirectory) makes its removal take long enough
+/// to overlap the orphaned `start`'s last writes, which land in the state directory
+/// after `rm` listed it. The removal must not fail, and nothing of that fake may run
+/// once it is done (it waited). The mutant drops the wait in the Fake's `Drop`.
+#[tokio::test]
+async fn no_round_of_kill_and_restart_races_the_removal() {
+    let _hog = support::CpuHog::start();
+    for round in 0..200 {
+        let (fake, _) = kill_the_daemon(&format!("restart-stress-{round}")).await;
+        let ballast = fake.state.join("ballast");
+        std::fs::create_dir(&ballast).expect("mkdir ballast");
+        for i in 0..2000 {
+            std::fs::write(ballast.join(i.to_string()), b"").expect("write ballast");
+        }
+        // What the fake's checks need from it, taken before it is gone.
+        let probe = support::fake::Probe::of(&fake);
+        let dir = fake.dir.clone();
+        fake.restart().expect("the restarted runtime starts");
+        drop(fake);
+        let left = probe.processes();
+        assert!(
+            left.is_empty(),
+            "round {round}: pids {left:?} of {} run after its removal",
+            dir.display()
+        );
+    }
+}
+
+/// Starts a lease and kills the daemon mid-run: the run is forgotten, never polled or
+/// dropped again. Returns the fake and the action's pid, which runs.
+async fn kill_the_daemon(name: &str) -> (Fake, String) {
+    let fake = Fake::new(name);
     // `exec`: the pid the fake records is the sleep itself, not a shell around it.
     fake.knob("action.sh", "exec sleep 300");
     let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
@@ -49,30 +106,14 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let pid = pid.trim();
-    assert!(!ended(pid), "the action runs");
+    let pid = pid.trim().to_owned();
+    assert!(!ended(&pid), "the action runs");
     let created = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
     assert!(
         created.lines().any(|a| a == "--label=kbf.owner=node-1"),
         "{created}"
     );
-
-    fake.restart().expect("the restarted runtime starts");
-    assert!(ended(pid), "the container's action still runs");
-    assert!(
-        exists(&fake.state.join("removed")),
-        "the container was not removed"
-    );
-    // Not `assert_clean`, which also requires `podman start` reaped before `rm`: that
-    // `podman start` was the killed daemon's child, which no later daemon can wait for.
-    // It ends by itself once its container is gone.
-    assert!(!exists(&fake.lease_dir(1)), "scratch directory left");
-    assert!(!exists(&fake.lease_cgroup(1)), "lease cgroup left");
-    let ps = std::fs::read_to_string(fake.state.join("ps.args")).expect("ps ran");
-    assert!(
-        ps.lines().any(|a| a == "--filter=label=kbf.owner=node-1"),
-        "{ps}"
-    );
+    (fake, pid)
 }
 
 /// Catches a runtime that starts although what its predecessor left could not be

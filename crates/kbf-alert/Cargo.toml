@@ -8,6 +8,13 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The webhook notifier's POST (plain HTTP, as the workspace pins it), on a runtime the
+# notifier's own thread owns.
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [lints]
 workspace = true

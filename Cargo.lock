@@ -1125,6 +1125,13 @@ dependencies = [
 [[package]]
 name = "kbf-alert"
 version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "kbf-caps"
@@ -1437,6 +1444,7 @@ name = "kbf-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "futures",
  "kbf-caps",

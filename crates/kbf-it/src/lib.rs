@@ -6,7 +6,9 @@
 //! It also holds the M1 integration harness. `m1/run.sh` starts a cell (MinIO, one
 //! `kbf-server` with in-memory metadata and the S3 store, one daemon) and builds the
 //! sample projects in `m1/` remote-only with pinned Bazel and buck2, twice; the second
-//! build must be all remote cache hits. The `kbf-cell` binary is its helper:
+//! build must be all remote cache hits. With buck2 it also builds `//:pause`, an action
+//! that sleeps, and drains the daemon's node through the operator API while that lease
+//! is in flight (`m1/run.sh` says what it checks). The `kbf-cell` binary is its helper:
 //! - `kbf-cell pki` writes the cell's throwaway certificates ([`pki`]);
 //! - `kbf-cell daemon` runs the test-only daemon ([`daemon`], Linux only);
 //! - `kbf-cell check` reads both builds' summaries and applies the exit rule
