@@ -41,10 +41,16 @@
 //! The container driver's own output walk is public too, but does not build on macOS;
 //! moving it onto `kbf-outputs` is a follow-up.
 //!
-//! At start the runtime removes every lease directory a previous daemon left; one that
-//! cannot be removed is moved aside into `quarantine/` under the scratch root and
-//! logged, and the daemon starts anyway (an action decides what its directory holds,
-//! so refusing to start would let one build step take the node out of the farm).
+//! Before an action's program runs, its run record (the leader's pid, start time and
+//! boot) is written under `runs/` in the scratch root (`record`): the child waits
+//! between fork and exec until it is. At start the runtime kills every action a
+//! previous daemon recorded and left running, the daemon having been killed (`sweep`;
+//! processes of the daemon's user that survive SIGKILL stop the start; anything in
+//! `runs/` that is not a record of the daemon's is moved aside into `quarantine/`, and
+//! another user's processes are left alone), then removes every lease directory it left;
+//! one that cannot be removed is moved aside into `quarantine/` under the scratch root
+//! and logged, and the daemon starts anyway (an action decides what its directory
+//! holds, so refusing to start would let one build step take the node out of the farm).
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
@@ -73,6 +79,18 @@
 //!   compiler shims read to find their tools.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.
+//! - **The run records.** The start-up sweep trusts `runs/` because only the daemon
+//!   writes it: on macOS the sandbox keeps actions out of it. On Linux an action, which
+//!   runs as the daemon's user, can write a well-formed record there (pids and start
+//!   times are readable in `/proc`), and the next start SIGKILLs every process of that
+//!   user in the group it names or below it. That holds for a group the daemon may not
+//!   signal too: another user's group is left alone, but the walk goes on below it and
+//!   kills the daemon's user's processes there. Only a record naming the daemon's own
+//!   group or its parent's is dropped without its group being walked. What is not a
+//!   regular file of the daemon's user that only it may write is set aside unread, and
+//!   neither another user's processes nor those the daemon never signals
+//!   ([`procs::Guards`]) are counted as survivors, so a forged entry cannot stop or hang
+//!   a start.
 //! - **Network "off" is not airtight**: Unix sockets stay open, the system resolver's
 //!   among them, so DNS lookups still leave the node and can carry data ([`network`]).
 //!
@@ -85,6 +103,7 @@ mod config;
 mod home;
 pub mod network;
 pub mod procs;
+mod record;
 mod runtime;
 mod sweep;
 pub mod user_folders;

@@ -137,6 +137,7 @@ the following. "Live" means heard from within G; "grant" means a `Commit` of a
 | I13 | **Dedup.** A joinable request with an unfinished twin of the same instance and digest joins it; a non-joinable one never joins; a join never lowers QoS and a promoted operation is placed in its new order. | shadow in-flight map |
 | I14 | **The queue is the set of queued operations.** Each `Queued` operation not awaiting a refusal is queued once, at its current QoS; nothing else is. | `queued()` vs `state` |
 | I15 | **A seed replays.** Two runs of a seed give the same trace hash. | one test per file |
+| I16 | **A finished operation is kept for the retention, then dropped.** Its `state` is its finished state until the finished retention after it finished, and none from the first input at or after that; the scheduler holds exactly the unfinished operations and those finished within the retention (issue #165). F4 checks it. | `state`, `waiters`, `operations()` vs shadow |
 
 ### Liveness, at the end of a run
 
@@ -228,6 +229,7 @@ in `sim_cell` today.
 | F2.11 | Lost and repeated results and acks | drops and duplicates on `Report` and `ReportAck` | results resent until acknowledged; each proposed once per holding; each operation answered once |
 | F2.12 | Two daemons claim one node id | two worker nodes (two daemon processes) register as the same worker in turn; on half the seeds the first then dies | only the newest stream's heartbeats count; `Start`s go only to it; the other fences in T; a lease of the other process is kept for the handover grace, then given up (issue #140); no self-fenced work twice (I12) |
 | F2.13 | A lease of another term, or of another worker, listed | a worker lists leases of an older and a newer term; a worker with no room lists leases of this term held on other workers | `not_held` names neither foreign lease, and no `Cancel` goes for them; it names each lease held on another worker |
+| F2.14 | A daemon crash and its restart | a worker's daemon dies at a random time and starts again at once on a new stream, its leases, results and contact clock lost | the restarted daemon's sweep ends the runs it left before its `Hello`, so their retries, after the handover grace, never run beside them (I12, issue #155); with the sweep off in the daemon model, some seed fails I12 |
 
 Planned, not simulated: the infra retry budget (#22), `RUN_ON` hermetic leases over a
 lost connection (the daemon self-fences every lease today; `sim_cell` already models

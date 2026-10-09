@@ -255,8 +255,16 @@ fn only_the_daemon_gets_a_reply() {
     assert!(handle(ours, &mut u, &me(), 0).is_err());
 }
 
-/// Catches: `run` not serving after its start-up checks, or a failed connection ending
-/// the service.
+/// Catches: `run` not serving after its start-up checks, or a failed or a served
+/// connection ending the service.
+///
+/// Every branch of the serving loop runs before the test returns, so coverage does not
+/// depend on timing. Connections are accepted in order and served one at a time, so a
+/// reply proves that `run` went back to `accept` after the connection before it. The
+/// hung-up connection fails: its request is read to end of file, which a Unix stream
+/// reports only once the peer is gone, so the reply's write gets `EPIPE`. A reply's
+/// end of file comes when `handle` drops the stream, before `run` sees the `Ok`, so
+/// only the second exchange proves the `Ok` branch of the first.
 #[test]
 fn run_serves_the_socket() {
     let short = testkit::short_dir("run");
@@ -282,8 +290,11 @@ fn run_serves_the_socket() {
     let mut hang_up = connect();
     hang_up.write_all(br#"{"verb":"status"}"#).unwrap();
     drop(hang_up);
-    let reply: Value = serde_json::from_str(&exchange(connect(), r#"{"verb":"status"}"#)).unwrap();
-    assert_eq!(reply["ok"]["installed"], Value::Null);
+    for _ in 0..2 {
+        let reply = exchange(connect(), r#"{"verb":"status"}"#);
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["ok"]["installed"], Value::Null);
+    }
 }
 
 /// Catches: `run` serving after a failed start-up step.

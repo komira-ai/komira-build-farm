@@ -23,7 +23,7 @@
 mod round;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Display;
 
 use super::reference::{Verdict, add, blame, fits, sub, verdict};
@@ -97,6 +97,8 @@ struct Op {
     wait: Option<Wait>,
     /// The last reason its callers were told, while it waits.
     told: Option<String>,
+    /// Finished, and dropped once the finished retention was up (I16).
+    dropped: bool,
 }
 
 /// How often each situation the family means to reach was reached.
@@ -109,6 +111,12 @@ pub struct Checker {
     step: u64,
     now: u64,
     wait_ms: u64,
+    /// The finished retention (I16).
+    retention_ms: u64,
+    /// Finished operations not dropped yet, in the order they finished, with when.
+    finished: VecDeque<(u64, OperationId)>,
+    /// Operations the scheduler should hold: submitted and not dropped.
+    kept: usize,
     workers: BTreeMap<WorkerId, Worker>,
     cordons: BTreeMap<WorkerId, Cordon>,
     ops: Vec<Op>,
@@ -129,15 +137,19 @@ pub struct Checker {
 }
 
 impl Checker {
-    /// A checker over `sched`, which refuses after `wait_ms` of unservable wait.
-    /// `replay` is the command that replays this run, printed with a violation.
-    pub fn new(sched: Scheduler, wait_ms: u64, replay: String) -> Self {
+    /// A checker over `sched`, which refuses after `wait_ms` of unservable wait and
+    /// keeps a finished operation for `retention_ms`. `replay` is the command that
+    /// replays this run, printed with a violation.
+    pub fn new(sched: Scheduler, wait_ms: u64, retention_ms: u64, replay: String) -> Self {
         Self {
             sched,
             replay,
             step: 0,
             now: 0,
             wait_ms,
+            retention_ms,
+            finished: VecDeque::new(),
+            kept: 0,
             workers: BTreeMap::new(),
             cordons: BTreeMap::new(),
             ops: Vec::new(),
@@ -235,9 +247,23 @@ impl Checker {
                 ),
             );
         }
+        self.retire();
         self.progress();
         self.compare();
         effects
+    }
+
+    /// Drops every finished operation whose retention is up (I16), as the scheduler
+    /// does after every input.
+    fn retire(&mut self) {
+        while let Some(&(at, id)) = self.finished.front()
+            && self.now >= at + self.retention_ms
+        {
+            self.finished.pop_front();
+            self.op_mut(id).dropped = true;
+            self.kept -= 1;
+            self.hit("dropped after the retention");
+        }
     }
 
     /// Applies `event` to the shadow. Returns the effects the model expects, or
@@ -464,7 +490,9 @@ impl Checker {
             proposed: false,
             wait: None,
             told: None,
+            dropped: false,
         });
+        self.kept += 1;
         self.touched_ops.insert(id);
         self.check_dedup(id);
         Vec::new()
@@ -592,6 +620,7 @@ impl Checker {
     fn finish(&mut self, id: OperationId, state: OpState) -> Vec<WaiterId> {
         let qos = self.op(id).request.qos.clone();
         self.queue.remove(&(Reverse(qos), id));
+        self.finished.push_back((self.now, id));
         let op = self.op_mut(id);
         op.done = Some(state);
         op.wait = None;
@@ -666,6 +695,18 @@ impl Checker {
 
     /// The scheduler's observable state against the shadow, for what this step touched.
     fn compare(&mut self) {
+        // I16: the scheduler holds exactly the operations not dropped.
+        if self.sched.operations() != self.kept {
+            self.violated(
+                "I16",
+                format!(
+                    "holds {} operations, expected {} (unfinished, or finished within the \
+                     retention)",
+                    self.sched.operations(),
+                    self.kept
+                ),
+            );
+        }
         for id in std::mem::take(&mut self.touched_ops) {
             self.compare_op(id);
         }
@@ -718,6 +759,15 @@ impl Checker {
     }
 
     fn compare_op(&self, id: OperationId) {
+        if self.op(id).dropped {
+            if self.sched.state(id).is_some() || self.sched.waiters(id).is_some() {
+                self.violated(
+                    "I16",
+                    format!("{id} is {:?} after its retention", self.sched.state(id)),
+                );
+            }
+            return;
+        }
         let want = self.expected_state(id);
         let got = self.sched.state(id);
         if got != Some(&want) {

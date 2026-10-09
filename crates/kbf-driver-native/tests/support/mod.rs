@@ -261,12 +261,21 @@ pub async fn pid_in(file: &Path) -> i32 {
     }
 }
 
-/// Whether the scratch root holds no lease directory.
+/// Whether the scratch root holds no lease directory and no run record: nothing but
+/// the empty `runs` directory the runtime makes for the records.
 pub fn no_leases(config: &NativeConfig) -> bool {
-    std::fs::read_dir(&config.scratch)
+    let empty = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .expect("a directory")
+            .next()
+            .is_none()
+    };
+    let runs = config.scratch.join("runs");
+    let others = std::fs::read_dir(&config.scratch)
         .expect("scratch root")
-        .next()
-        .is_none()
+        .filter(|entry| entry.as_ref().map_or(true, |e| e.path() != runs))
+        .count();
+    others == 0 && empty(&runs)
 }
 
 /// `getconf <name>` as the test's user (the driver's user) sees it, every link

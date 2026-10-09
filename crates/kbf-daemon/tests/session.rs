@@ -29,8 +29,9 @@ fn code(result: &kbf_proto::worker::Result) -> i32 {
 
 /// Catches: a Hello that leaves out detected capabilities (any CPU feature or ISA
 /// level the kernel reports), that is unsorted, whose hash is not SHA-256 of the
-/// encoded entries, or whose heartbeats carry a different hash; and a daemon that
-/// cannot complete mutual TLS.
+/// encoded entries, or whose heartbeats carry a different hash; a Hello whose
+/// `daemon_version` does not name the build; and a daemon that cannot complete mutual
+/// TLS.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registration_carries_every_detected_capability() {
@@ -77,6 +78,8 @@ async fn registration_carries_every_detected_capability() {
     assert_eq!(heartbeat.report_hash, want_hash);
     assert_eq!(hello.protocol_version, 1);
     assert_eq!(hello.node_id, "node-1");
+    // The build, not just the package version (issue #170).
+    assert_eq!(hello.daemon_version, kbf_daemon::DAEMON_VERSION);
     assert_eq!(hello.capabilities, h.report.capabilities());
 }
 

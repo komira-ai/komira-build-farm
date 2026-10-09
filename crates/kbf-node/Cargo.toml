@@ -28,8 +28,14 @@ tracing-subscriber.workspace = true
 kbf-driver-container.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+# The CAS the restart test's daemon reads its action from (tests/binary.rs).
+kbf-front.workspace = true
+kbf-proto.workspace = true
 libc.workspace = true
+prost.workspace = true
 rcgen.workspace = true
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true
