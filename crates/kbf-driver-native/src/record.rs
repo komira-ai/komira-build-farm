@@ -74,35 +74,35 @@ impl Record {
     }
 }
 
-/// This boot of the machine: the kernel's boot id on Linux, the boot time on macOS. A
-/// record of another boot names a process that is gone.
+/// This boot of the machine: the kernel's boot id on Linux, the boot session UUID on
+/// macOS. A record of another boot names a process that is gone.
 ///
 /// # Errors
 /// The kernel would not say.
 #[cfg(target_os = "linux")]
 pub fn boot_id() -> io::Result<String> {
-    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    Ok(id.trim().to_owned())
+    boot_text(&std::fs::read("/proc/sys/kernel/random/boot_id")?)
 }
 
-/// This boot of the machine: the kernel's boot id on Linux, the boot time on macOS. A
-/// record of another boot names a process that is gone.
+/// This boot of the machine: the kernel's boot id on Linux, the boot session UUID on
+/// macOS (`kern.bootsessionuuid`). Not the boot time (`kern.boottime`), which can move
+/// within one boot when the clock is set or the machine wakes: a record of this boot
+/// would then read as an earlier one's, and its action would be left running. A record
+/// of another boot names a process that is gone.
 ///
 /// # Errors
 /// The kernel would not say.
 #[cfg(target_os = "macos")]
 pub fn boot_id() -> io::Result<String> {
-    let mut boot = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut size = std::mem::size_of::<libc::timeval>();
-    // SAFETY: a C string name, and a writable timeval of `size` bytes, which the call
-    // fills and whose size it writes back.
+    // A UUID string and its NUL take 37 bytes.
+    let mut id = [0_u8; 64];
+    let mut size = id.len();
+    // SAFETY: a C string name, and a writable buffer of `size` bytes, which the call
+    // fills with a NUL-terminated string and whose length it writes back.
     let done = unsafe {
         libc::sysctlbyname(
-            c"kern.boottime".as_ptr(),
-            (&raw mut boot).cast(),
+            c"kern.bootsessionuuid".as_ptr(),
+            id.as_mut_ptr().cast(),
             &raw mut size,
             std::ptr::null_mut(),
             0,
@@ -111,7 +111,20 @@ pub fn boot_id() -> io::Result<String> {
     if done != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(format!("{}.{:06}", boot.tv_sec, boot.tv_usec))
+    boot_text(id.get(..size).unwrap_or(&id))
+}
+
+/// The boot id the kernel wrote into `bytes`: up to the first NUL, trimmed.
+///
+/// # Errors
+/// It is not one non-empty word of UTF-8 (a record holds it between spaces).
+fn boot_text(bytes: &[u8]) -> io::Result<String> {
+    let text = bytes.split(|&b| b == 0).next().unwrap_or_default();
+    let text = std::str::from_utf8(text).map_err(io::Error::other)?.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return Err(io::Error::other(format!("not a boot id: {text:?}")));
+    }
+    Ok(text.to_owned())
 }
 
 /// The record of the run whose lease directory is named `lease` (`lease-<term>-<seq>`).
@@ -451,6 +464,33 @@ mod tests {
         let exec = Exec::new(program, args, []).expect("exec");
         let gate = Gate::install(&mut command, exec);
         (command, gate)
+    }
+
+    /// Catches a boot id kept with its NUL padding or newline, or what follows the NUL,
+    /// and one accepted that a record could not hold (empty, two words, not UTF-8).
+    #[test]
+    fn a_boot_id_is_one_word() {
+        assert_eq!(boot_text(b"3f2a-77\n").expect("linux"), "3f2a-77");
+        assert_eq!(boot_text(b"AB-CD\0\0junk").expect("macos"), "AB-CD");
+        for bad in [&b""[..], b"\0AB-CD", b" \n", b"a b", b"\xff"] {
+            assert!(boot_text(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Catches a boot id that is empty or changes between two reads in one process (on
+    /// macOS, the real `kern.bootsessionuuid` call; on Linux, `/proc`), and one that a
+    /// record does not carry back.
+    #[test]
+    fn this_boot_reads_the_same_twice() {
+        let boot = boot_id().expect("boot id");
+        assert!(!boot.is_empty());
+        assert_eq!(boot_id().expect("again"), boot);
+        let record = Record {
+            pgid: 2,
+            start: 1,
+            boot,
+        };
+        assert_eq!(Record::parse(&record.line()), Some(record));
     }
 
     /// Catches a record that does not round-trip, and one taken from a torn or foreign

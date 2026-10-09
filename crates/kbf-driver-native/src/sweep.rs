@@ -11,18 +11,21 @@
 //! else's, so nothing is signalled. Processes of the daemon's own that survive SIGKILL
 //! for the kill wait stop the daemon from starting, with their pids: starting would let
 //! the scheduler run the same work beside them. Processes it may not signal (another
-//! user's) are not its actions: they are logged and their record dropped. So is a
-//! record naming the daemon's own group or its parent's, unread, and any process below
-//! a recorded group that the daemon never signals ([`procs::Guards`]: its parent, a
-//! member of either group).
+//! user's) are not its actions: they are logged, never counted as survivors, and their
+//! record is dropped; the walk still goes on below them. So are processes the daemon
+//! never signals ([`procs::Guards`]: its parent, a member of its own group or its
+//! parent's). A record naming the daemon's own group or its parent's is read and
+//! dropped, and that group is not walked at all.
 //!
 //! The records are trusted to be the daemon's: an entry of `runs/` that is not a
-//! regular file of the daemon's user (a FIFO, a directory, a symlink) is moved aside
-//! into [`QUARANTINE`] unread, a record is read without blocking and at most
-//! [`MAX_RECORD_BYTES`] of it, and none of this stops the start. Only the daemon writes
-//! `runs/` on macOS (the sandbox keeps actions out of it); on Linux an action of the
-//! same user can write a well-formed record there, naming a group of that user, which
-//! the next start then kills (see the crate documentation's known gaps).
+//! regular file of the daemon's user that only that user may write (a FIFO, a
+//! directory, a symlink, a group- or other-writable file), and a `runs` that is not
+//! such a directory, is moved aside into [`QUARANTINE`] unread; a record is read
+//! without blocking and at most [`MAX_RECORD_BYTES`] of it, and none of this stops the
+//! start. Only the daemon writes `runs/` on macOS (the sandbox keeps actions out of
+//! it); on Linux an action of the same user can write a well-formed record there,
+//! naming any group, and the next start then kills every process of that user in it
+//! or below it (see the crate documentation's known gaps).
 //!
 //! Not covered: a process of the action that left its group (`setsid`) and whose parent
 //! exited before the sweep (nothing links it to the record any more; a per-lease user or
@@ -92,12 +95,26 @@ pub(crate) fn sweep(
 ) -> io::Result<()> {
     let quarantine = scratch.join(QUARANTINE);
     // Absent until a sweep first needs it. Emptied first, so what this sweep sets aside
-    // stays there until the next start.
-    if let Ok(entries) = std::fs::read_dir(&quarantine) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Err(why) = remove(&path) {
-                tracing::error!(dir = %path.display(), "a quarantined entry still cannot be removed: {why}");
+    // stays there until the next start. One that is not the daemon's directory (a
+    // symlink an action planted) is removed itself, never emptied through.
+    match ours(&quarantine, std::fs::FileType::is_dir) {
+        Ok(()) => {
+            for entry in std::fs::read_dir(&quarantine)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = entry.path();
+                if let Err(why) = remove(&path) {
+                    tracing::error!(dir = %path.display(), "a quarantined entry still cannot be removed: {why}");
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(why) => {
+            tracing::error!(dir = %quarantine.display(), "the quarantine is not the daemon's directory ({why}); removing it");
+            if let Err(why) = remove(&quarantine) {
+                tracing::error!(dir = %quarantine.display(), "the quarantine cannot be removed: {why}");
             }
         }
     }
@@ -219,6 +236,13 @@ fn owned(meta: &std::fs::Metadata, kind: fn(&std::fs::FileType) -> bool) -> io::
             meta.uid()
         )));
     }
+    // What another user could have written is not the daemon's either.
+    if meta.mode() & 0o022 != 0 {
+        return Err(io::Error::other(format!(
+            "writable by others (mode {:o})",
+            meta.mode() & 0o7777
+        )));
+    }
     Ok(())
 }
 
@@ -286,7 +310,9 @@ fn end_group(
 
 /// Moves `path` into `quarantine` under its `name` and a suffix no earlier start used.
 fn move_aside(path: &Path, quarantine: &Path, name: &OsStr) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(quarantine)?;
+    // The daemon's alone, as `runs/` is.
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(quarantine)?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -322,10 +348,13 @@ mod tests {
         dir
     }
 
-    /// Fails for any path whose name is `lease-stuck`, as a directory the action
-    /// locked would; removes everything else.
+    /// Fails for any path whose name is `lease-stuck` or the quarantine's, as a
+    /// directory the action locked would; removes everything else.
     fn stuck(path: &Path) -> io::Result<()> {
-        if path.file_name().is_some_and(|n| n == "lease-stuck") {
+        if path
+            .file_name()
+            .is_some_and(|n| n == "lease-stuck" || n == QUARANTINE)
+        {
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
         kbf_outputs::remove_tree(path)
@@ -412,9 +441,28 @@ mod tests {
         )
     }
 
+    /// Writes a record as the daemon does: mode 0600 in a `runs` of mode 0700.
     fn write_record(dir: &Path, lease: &str, line: &str) {
-        std::fs::create_dir_all(dir.join(RUNS)).expect("mkdir");
-        std::fs::write(crate::record::path(dir, lease), line).expect("write");
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join(RUNS))
+            .expect("mkdir");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(crate::record::path(dir, lease))
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .expect("write");
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
     /// Whether `pid` has ended: gone, or a zombie not yet reaped.
@@ -556,8 +604,10 @@ mod tests {
 
     /// Catches a record naming another user's processes (forged, or a reused pid)
     /// stopping every start ("survived SIGKILL") or being kept: processes the daemon
-    /// may not signal are not its actions. Once with a table that says so, once with a
-    /// real group leader of another user, which `kill(pid, 0)` refuses.
+    /// may not signal are not its actions. The table is a fake one: a test never points
+    /// the real sweep at processes it did not start (it would kill what runs below
+    /// them). Also `signalable` taking init, another user's, for the daemon's; signal
+    /// 0 only checks, it delivers nothing.
     #[test]
     fn a_record_naming_another_users_group_is_dropped() {
         let dir = scratch("foreign");
@@ -581,23 +631,9 @@ mod tests {
         end_recorded(&dir, WAIT, &theirs).expect("not the daemon's");
         assert_eq!(runs_left(&dir), 0, "the record is dropped");
 
-        let victim = procs::snapshot()
-            .expect("table")
-            .into_iter()
-            .filter(|p| p.pid > 1)
-            .filter(|p| p.pgid == p.pid)
-            .filter(|p| !p.zombie)
-            .find(|p| !signalable(p.pid))
-            .expect("a group leader of another user");
-        let forged = Record {
-            pgid: victim.pid,
-            start: victim.start,
-            boot,
-        };
-        write_record(&dir, "lease-2-2", &forged.line());
-        sweep_within(&dir).expect("another user's group does not stop the start");
-        assert_eq!(runs_left(&dir), 0, "the record is dropped");
-        assert!(!ended(victim.pid), "untouched");
+        // SAFETY: geteuid takes nothing and cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(signalable(1), root, "init taken for the daemon's");
     }
 
     /// Catches entries of `runs/` that no daemon wrote stopping or hanging the start
@@ -641,16 +677,13 @@ mod tests {
         assert!(quarantined(&dir)[0].starts_with("runs.runs."));
 
         // A torn record that cannot be removed, and a FIFO that cannot be moved aside
-        // (the quarantine taken by a file): logged, and the start goes on.
-        let _ = kbf_outputs::remove_tree(&dir.join(QUARANTINE));
-        std::fs::write(dir.join(QUARANTINE), b"in the way").expect("write");
+        // (out of a `runs` the daemon cannot write): logged, and the start goes on.
         write_record(&dir, "lease-4-0", "torn");
         // SAFETY: as above.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        chmod(&runs, 0o500);
         let swept = sweep_within(&dir);
-        std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        chmod(&runs, 0o700);
         swept.expect("the start goes on");
         assert_eq!(runs_left(&dir), 2, "both left in place");
     }
@@ -660,6 +693,64 @@ mod tests {
     fn only_the_daemons_own_entries_are_read() {
         let why = ours(Path::new("/"), std::fs::FileType::is_dir).expect_err("root's");
         assert!(why.to_string().contains("owned by uid 0"), "{why}");
+    }
+
+    /// Catches a `runs` or a record that another user could write (group or other write
+    /// bits) read as the daemon's ("mode unchecked" mutant), and a `runs` that is a
+    /// symlink followed to a directory of records elsewhere ("ours follows links"
+    /// mutant): each is set aside unread, the action it names keeps running, and the
+    /// start goes on.
+    #[test]
+    fn a_runs_open_to_others_or_a_link_is_set_aside_unread() {
+        let dir = scratch("modes");
+        let (victim, record) = action("exec sleep 300");
+        let runs = dir.join(RUNS);
+
+        write_record(&dir, "lease-7-1", &record.line());
+        chmod(&runs, 0o770);
+        sweep_within(&dir).expect("the start goes on");
+        assert!(!runs.exists(), "a group-writable runs set aside");
+
+        write_record(&dir, "lease-7-2", &record.line());
+        chmod(&crate::record::path(&dir, "lease-7-2"), 0o602);
+        sweep_within(&dir).expect("the start goes on");
+        assert_eq!(runs_left(&dir), 0, "an other-writable record set aside");
+
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("mkdir");
+        chmod(&elsewhere, 0o700);
+        std::fs::write(elsewhere.join("lease-7-3"), record.line()).expect("write");
+        chmod(&elsewhere.join("lease-7-3"), 0o600);
+        std::fs::remove_dir(&runs).expect("rmdir");
+        std::os::unix::fs::symlink(&elsewhere, &runs).expect("symlink");
+        sweep_within(&dir).expect("the start goes on");
+        assert!(!runs.exists(), "the link set aside");
+        assert!(
+            elsewhere.join("lease-7-3").exists(),
+            "not read through the link"
+        );
+        assert!(
+            still_ran(victim),
+            "a record that is not the daemon's was read"
+        );
+    }
+
+    /// Catches a quarantine that is a symlink emptied through the link: an action that
+    /// points it at a directory of the user's would get that directory's entries
+    /// removed at the next start ("quarantine followed" mutant).
+    #[test]
+    fn a_quarantine_that_is_a_link_is_removed_not_followed() {
+        let dir = scratch("qlink");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("mkdir");
+        std::fs::write(elsewhere.join("keep"), b"the user's").expect("write");
+        std::os::unix::fs::symlink(&elsewhere, dir.join(QUARANTINE)).expect("symlink");
+        sweep_within(&dir).expect("the start goes on");
+        assert!(elsewhere.join("keep").exists(), "emptied through the link");
+        assert!(
+            std::fs::symlink_metadata(dir.join(QUARANTINE)).is_err(),
+            "the link removed"
+        );
     }
 
     /// Catches a pid that exited between the snapshot and the check taken for another

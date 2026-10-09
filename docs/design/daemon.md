@@ -94,12 +94,15 @@ them before it says `Hello` (issue #155), as part of building its driver:
   A record of an earlier boot, or whose pid now names a process with another start
   time, names nothing that runs, so nothing is signalled. The daemon never signals its
   own group, its parent or its parent's group, nor a group id of 1 or less: a record
-  naming either group is dropped unread. Processes of its own user that survive SIGKILL
-  for the kill wait stop the daemon from starting; processes of another user, and those
-  it never signals, found below a recorded group are not its actions, and the record is
-  dropped. An entry of `runs/` that is not a regular file of the daemon's user (a FIFO,
-  a directory, a symlink), or a `runs` that is not its directory, is moved aside into
-  `quarantine/` unread, and the start goes on.
+  naming either group is read and dropped, and that group is not walked. Processes of
+  its own user that survive SIGKILL for the kill wait stop the daemon from starting;
+  processes of another user, and those it never signals, found in or below a recorded
+  group are not its actions: they are left alone (the walk goes on below them), and
+  the record is dropped. An entry of `runs/` that is not a regular file of the daemon's
+  user that only that user may write (a FIFO, a directory, a symlink, a group- or
+  other-writable file), or a `runs` that is not such a directory, is moved aside into
+  `quarantine/` unread, and the start goes on. A `quarantine` that is not the daemon's
+  directory (a symlink) is removed, never emptied through.
 - **Container driver.** Every container is created with the label
   `kbf.owner=<node id>`. At start the driver removes each lease it finds, among the
   containers so labelled and the lease scratch directories, as a lease's clean does
@@ -134,7 +137,10 @@ guaranteed:
   lease runs as its own user, so an action, which runs as the daemon's user, can write
   a well-formed record there naming a group of that user, with its pid and start time
   (both readable in `/proc`), and the next start then SIGKILLs that group and every
-  process below it.
+  process below it. A record may name a group the daemon may not signal, another
+  user's: that group is left alone, but the walk goes on below it, and the daemon's
+  user's processes there are SIGKILLed. Only the daemon's own group and its parent's
+  are not walked.
 - **Results.** A result the killed daemon had not had acknowledged is lost (results are
   kept in memory only), and its lease is requeued.
 
