@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kbf_sched::fence::LEASE_GRACE;
+use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
 use kbf_sched::{Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_sim::{Chance, Event, NodeId, NodeInput, Output, SimRng};
 use kbf_types::{
@@ -35,6 +35,7 @@ const T_RESUME: u64 = 3;
 const T_RESTART: u64 = 4;
 const T_SUBMIT: u64 = 1 << 20;
 const T_HELD_START: u64 = 2 << 20;
+const T_GRACE_BEAT: u64 = 3 << 20;
 
 /// What the leader does besides serving.
 #[derive(Clone, Debug, Default)]
@@ -47,6 +48,11 @@ pub struct LeaderPlan {
     pub late_start: Option<(u64, u64)>,
     /// Ticks also at G - 1 ms, G and G + 1 ms after each time a worker is heard.
     pub boundary_ticks: bool,
+    /// With `late_start`: the newest heartbeat the late `Start`'s worker sent before
+    /// `START_GRACE - 1 ms`, `START_GRACE` and `START_GRACE + 1 ms` after that `Start`
+    /// was sent is delivered again at each of those times (a duplicate the network
+    /// delivered late), so reconciliation meets its boundary to the millisecond.
+    pub grace_beats: bool,
     /// Messages from these worker nodes are lost on the way in from `.1` to `.2` (ms).
     pub deaf: Vec<(&'static str, u64, u64)>,
     /// Messages to these worker nodes are lost on the way out from `.1` to `.2` (ms).
@@ -89,6 +95,14 @@ pub struct LeaderStats {
     pub cancels: u64,
     /// The held-back `Start`: (lease, operation, when the scheduler emitted it).
     pub late_start: Option<(LeaseId, OperationId, FarmTime)>,
+    /// Heartbeats delivered again at the `START_GRACE` boundary (`grace_beats`).
+    pub grace_beats: u64,
+    /// The late `Start`'s lease kept by a heartbeat leaving it out at
+    /// `START_GRACE - 1 ms`.
+    pub grace_kept_before: u64,
+    /// The late `Start`'s lease given up by a heartbeat leaving it out at exactly
+    /// `START_GRACE`.
+    pub grace_given_up_at: u64,
     pub resumed: u64,
 }
 
@@ -118,6 +132,10 @@ pub struct Leader {
     next_waiter: u64,
     starts_sent: u64,
     held: BTreeMap<u64, (NodeId, Msg)>,
+    /// Each simulated node's newest heartbeat received (`grace_beats`).
+    last_beat: BTreeMap<NodeId, Msg>,
+    /// The worker the late `Start` was for.
+    late_worker: Option<WorkerId>,
     pub stats: LeaderStats,
     out: Vec<Output<Msg>>,
 }
@@ -156,6 +174,8 @@ impl Leader {
             next_waiter: 0,
             starts_sent: 0,
             held: BTreeMap::new(),
+            last_beat: BTreeMap::new(),
+            late_worker: None,
             stats: LeaderStats::default(),
             out: Vec::new(),
         }
@@ -212,6 +232,7 @@ impl Leader {
             Event::Timer { tag } if (T_SUBMIT..T_HELD_START).contains(&tag) => {
                 self.submit(usize::try_from(tag - T_SUBMIT).expect("small"));
             }
+            Event::Timer { tag } if tag >= T_GRACE_BEAT => self.grace_beat(tag - T_GRACE_BEAT),
             Event::Timer { tag } => {
                 let (to, msg) = self.held.remove(&tag).expect("held Starts");
                 self.send(to, msg);
@@ -308,6 +329,14 @@ impl Leader {
                 seq,
                 running,
             } => {
+                if self.plan.grace_beats {
+                    let beat = Msg::Heartbeat {
+                        stream,
+                        seq,
+                        running: running.clone(),
+                    };
+                    self.last_beat.insert(from.clone(), beat);
+                }
                 let Some(node) = self.stream_node(&from, stream) else {
                     return;
                 };
@@ -406,6 +435,34 @@ impl Leader {
         self.heard();
     }
 
+    /// `grace_beats`: delivers the late `Start`'s worker's newest heartbeat again at
+    /// `START_GRACE - 1 ms` (`k` = 0), `START_GRACE` (1) and `START_GRACE + 1 ms` (2)
+    /// after that `Start` was sent, and counts what reconciliation did with its lease.
+    fn grace_beat(&mut self, k: u64) {
+        let Some((lease, _, _)) = self.stats.late_start else {
+            return;
+        };
+        let Some(worker) = self.late_worker.clone() else {
+            return;
+        };
+        let Some((from, _)) = self.links.get(&worker).cloned() else {
+            return;
+        };
+        let Some(beat) = self.last_beat.get(&from).cloned() else {
+            return;
+        };
+        let held = |l: &Self| l.sched.leases_on(&worker).contains(&lease);
+        let before = held(self);
+        self.stats.grace_beats += 1;
+        self.receive(from, beat, self.ctx.seed ^ k);
+        let after = held(self);
+        match k {
+            0 if before && after => self.stats.grace_kept_before += 1,
+            1 if before && !after => self.stats.grace_given_up_at += 1,
+            _ => {}
+        }
+    }
+
     /// After hearing a worker: the ticks at the edge of its grace, if asked for.
     fn heard(&mut self) {
         if self.plan.boundary_ticks {
@@ -497,6 +554,16 @@ impl Leader {
                     match self.plan.late_start {
                         Some((nth, delay)) if nth == self.starts_sent => {
                             self.stats.late_start = Some((s.lease, s.operation, self.now()));
+                            if self.plan.grace_beats {
+                                self.late_worker = Some(s.worker.clone());
+                                let ms = Duration::from_millis(1);
+                                for (k, after) in [START_GRACE - ms, START_GRACE, START_GRACE + ms]
+                                    .into_iter()
+                                    .enumerate()
+                                {
+                                    self.timer(after, T_GRACE_BEAT + k as u64);
+                                }
+                            }
                             let tag = T_HELD_START + self.starts_sent;
                             self.held.insert(tag, (to, msg));
                             self.timer(Duration::from_millis(delay), tag);

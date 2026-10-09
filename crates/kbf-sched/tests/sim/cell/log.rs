@@ -1,7 +1,8 @@
 //! The control log: commits each appended record after a random delay, and tells the
 //! leader its index. A record's index is given when it commits, so a slow record
 //! commits after records appended later: the log order the scheduler must follow is
-//! not always the order it proposed in.
+//! not always the order it proposed in. Every `Append` that arrives is committed, so
+//! one the bus duplicated commits twice (see the module notes in `mod.rs`).
 
 use std::collections::BTreeMap;
 use std::time::Duration;

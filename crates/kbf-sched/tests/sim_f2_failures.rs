@@ -9,14 +9,14 @@
 //! | F2.1 | a worker dies mid-lease and never returns (with a slow log) | `f2_1_*` |
 //! | F2.2 | heartbeat gaps shorter than G: partitions and one-way losses | `f2_2_*` |
 //! | F2.3 | the G boundary: ticks at G - 1 ms, G and G + 1 ms | `f2_3_*` |
-//! | F2.4 | a `Start` delayed beyond W | `f2_4_*` |
+//! | F2.4 | a `Start` delayed beyond W; heartbeats at `START_GRACE` - 1 ms, exactly and + 1 ms | `f2_4_*` |
 //! | F2.6 | a worker suspended below T, between T and G, and above G | `f2_6_*` |
 //! | F2.7 | the leader's clock paused with its process | `f2_7_*` |
 //! | F2.9 | a server restart (issue #137) | `f2_9_*` |
 //! | F2.10 | stale, duplicated and reordered session messages | `f2_10_*` |
 //! | F2.11 | lost and repeated results and acknowledgements | `f2_11_*` |
 //! | F2.12 | two daemons claiming one node id (ignored: issue #140) | `f2_12_*` |
-//! | F2.13 | leases of another term listed | `f2_13_*` |
+//! | F2.13 | leases of another term, and of other workers, listed | `f2_13_*` |
 //!
 //! F2.5 (a `Start` lost on a live session) and F2.8 (a reboot and a daemon restart inside
 //! G) are in `sim_cell.rs`.
@@ -38,6 +38,7 @@ mod cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use cell::leader::term;
 use cell::worker::{End, Took};
 use cell::{Ctx, LeaderPlan, LogPlan, Plan, WorkerPlan, World, calm_network, check::CheckStats};
 use kbf_sched::fence::{LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
@@ -135,6 +136,7 @@ fn plan(name: &'static str, seed: u64) -> Plan {
         "F2.4" => {
             let delay = rng.between(W_MS + SECOND, 2 * G_MS);
             plan.leader.late_start = Some((rng.between(1, 10), delay));
+            plan.leader.grace_beats = true;
         }
         "F2.6" => {
             let len = match seed % 3 {
@@ -194,6 +196,13 @@ fn plan(name: &'static str, seed: u64) -> Plan {
                 LeaseId::new(2, 1),
                 LeaseId::new(1, 1_000_000),
             ];
+            // A worker with no room, so it is never granted anything, that lists the
+            // first leases of this term (the first process's: F2.13 never restarts): while
+            // one is held on another worker, it must be named for cancelling here (held,
+            // but not on this worker).
+            let mut lister = WorkerPlan::plain("worker-4", 0);
+            lister.phantoms = (0..48).map(|seq| LeaseId::new(term(0), seq)).collect();
+            plan.workers.push(lister);
         }
         other => panic!("no scenario {other}"),
     }
@@ -310,6 +319,7 @@ fn stats(w: &World) -> CheckStats {
         s.answered_failed += t.answered_failed;
         s.named_not_held += t.named_not_held;
         s.foreign_listed += t.foreign_listed;
+        s.held_elsewhere_listed += t.held_elsewhere_listed;
         s.capacity_resends += t.capacity_resends;
         s.stale_grant_commits += t.stale_grant_commits;
         s.superseded_results += t.superseded_results;
@@ -437,13 +447,16 @@ fn f2_3_a_lease_is_kept_at_g_minus_1_ms_and_requeued_at_g() {
 
 /// F2.4. Catches: a daemon that acts on a `Start` W or more after the heartbeat it
 /// names (it then runs beside the retry), and a scheduler that gives the lease up
-/// before `START_GRACE` or never.
+/// before `START_GRACE`, after it (a heartbeat at exactly `START_GRACE` must give it
+/// up), or never.
 #[test]
 fn f2_4_a_late_start_is_dropped_and_its_lease_granted_again_after_the_grace() {
-    let mut dropped = 0;
+    let (mut dropped, mut kept_before, mut given_up_at) = (0, 0, 0);
     for seed in 0..SEEDS {
         let w = run("F2.4", seed);
         let l = w.leader();
+        kept_before += l.stats.grace_kept_before;
+        given_up_at += l.stats.grace_given_up_at;
         let Some((lease, op, sent)) = l.stats.late_start else {
             continue;
         };
@@ -472,6 +485,19 @@ fn f2_4_a_late_start_is_dropped_and_its_lease_granted_again_after_the_grace() {
         );
     }
     reached("F2.4", "a late Start dropped by the daemon", dropped);
+    // The `START_GRACE` boundary, as F2.3 meets G's: a heartbeat leaving the lease out
+    // 1 ms before it keeps the lease, one at exactly `START_GRACE` gives it up (R checks
+    // both on every heartbeat; these say the sweep met them).
+    reached(
+        "F2.4",
+        "a lease kept by a heartbeat at START_GRACE - 1 ms",
+        kept_before,
+    );
+    reached(
+        "F2.4",
+        "a lease given up by a heartbeat at exactly START_GRACE",
+        given_up_at,
+    );
 }
 
 /// F2.6. Catches: a resumed worker whose old contact keeps its runs going (no fence
@@ -635,17 +661,25 @@ fn f2_12_two_daemons_claiming_one_node_id() {
 }
 
 /// F2.13. Catches: `not_held` naming a lease of another term, or one of this term this
-/// scheduler never granted, for cancelling.
+/// scheduler never granted, for cancelling; and `not_held` that ignores which worker
+/// holds a lease (one held on another worker must be named).
 #[test]
 fn f2_13_leases_of_other_terms_are_never_cancelled() {
-    let mut foreign = 0;
+    let (mut foreign, mut elsewhere) = (0, 0);
     for seed in 0..SEEDS {
-        foreign += stats(&run("F2.13", seed)).foreign_listed;
+        let s = stats(&run("F2.13", seed));
+        foreign += s.foreign_listed;
+        elsewhere += s.held_elsewhere_listed;
     }
     reached(
         "F2.13",
         "a heartbeat listing a lease of another term",
         foreign,
+    );
+    reached(
+        "F2.13",
+        "a heartbeat listing a lease held on another worker",
+        elsewhere,
     );
 }
 
