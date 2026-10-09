@@ -367,7 +367,10 @@ fn ask(xcode: &mut Xcode, probe: &Probe, sandbox: Option<&Sandbox>) -> Result<()
         (probe.xcrun.as_path(), &["--find", "clang"][..]),
     ];
     if probe.metal {
-        asked.push((xcodebuild.as_path(), &["-showComponent", "MetalToolchain"][..]));
+        asked.push((
+            xcodebuild.as_path(),
+            &["-showComponent", "MetalToolchain"][..],
+        ));
     }
     let mut answers = std::thread::scope(|scope| {
         let asking: Vec<_> = asked

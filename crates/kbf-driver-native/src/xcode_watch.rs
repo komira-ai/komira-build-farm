@@ -47,8 +47,10 @@ pub fn watch(
     every: Duration,
     apply: Apply,
 ) -> (watch::Receiver<DriverReport>, JoinHandle<()>) {
+    let started = std::time::Instant::now();
     let mut last = xcode::survey(&apps, &probe);
-    tracing::info!(apps = %apps.display(), found = last.len(), "Xcodes");
+    let took = started.elapsed();
+    tracing::info!(apps = %apps.display(), found = last.len(), ?took, "Xcodes");
     log(&changes(&[], &last));
     let (send, receive) = watch::channel(apply(&last));
     let thread = std::thread::spawn(move || {
