@@ -161,7 +161,7 @@ fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
         every,
         Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
     );
-    Ok(daemon(cli, runtime)?.with_driver_report(driver))
+    { drop(driver); Ok(daemon(cli, runtime)?) }
 }
 
 /// Runs `daemon` until SIGTERM or SIGINT.
