@@ -649,11 +649,14 @@ person. Microcode rides the normal rollout as packages **[A]**.
 
 ## 9. VM images as rolled-out software
 
-A golden VM image (`macos-vms.md` section 7), built in CI on a Mac from a pinned
-restore image, Xcode and simulator runtimes and named by digest, is part of a pool's
-set. `kbf-updater stage` places it ahead of time and the node reports it in
-`vm.image`; switching the set makes VM leases ask for the new `vm.image`, with no
-reboot. A guest cannot run a newer macOS than its host **[A]**, so hosts move first.
+A golden VM image (`macos-vms.md` section 7) is named by its recipe digest: the
+digest of a pinned restore image, Xcode, simulator runtimes and the guest setup
+([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)). The recipe is part of a
+pool's set. It cannot be built in CI, since GitHub's hosted macOS runners are VMs and
+cannot run one; each Mac builds the image itself from the recipe, ahead of time, and
+reports it in `vm.image` once its file manifest re-verifies. Shipping built images
+between Macs waits for a legal review of the Xcode licence (same section). Switching
+the set makes VM leases ask for the new `vm.image`, with no reboot. A guest cannot run a newer macOS than its host **[A]**, so hosts move first.
 
 ## 10. GPU work and desktop-app tests on a bare-metal Mac
 
