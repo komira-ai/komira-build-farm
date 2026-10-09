@@ -345,6 +345,8 @@ mod tests {
     fn drain_waits_for_the_group_to_empty() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exec sleep 30"]).process_group(0);
+        // `Running::wait` below reaps it, as `Running::start` leaves it to.
+        #[allow(clippy::zombie_processes)]
         let child = command.spawn().expect("spawned");
         let running = Running {
             pid: libc::pid_t::try_from(child.id()).expect("pid"),
