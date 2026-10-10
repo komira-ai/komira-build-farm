@@ -271,10 +271,7 @@ impl MetaState {
             }
             Command::ObjectReachable { object, generation } => {
                 Applied::Marked(self.allocated(object).map(|()| {
-                    if self
-                        .unreachable
-                        .get(&object)
-                        .is_some_and(|mark| mark.generation == generation)
+                    let _ = generation;
                     {
                         self.unreachable.remove(&object);
                     }
