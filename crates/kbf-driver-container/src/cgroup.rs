@@ -80,6 +80,7 @@ impl LeaseCgroup {
         self.write("memory.oom.group", "1")?;
         if let Some(max) = memory_max(resources.memory_bytes) {
             self.write("memory.max", &max.to_string())?;
+            self.write("memory.high", &resources.memory_bytes.to_string())?;
         }
         if let Some(weight) = cpu_weight(resources.cpu_millis) {
             self.write("cpu.weight", &weight.to_string())?;
