@@ -6,10 +6,12 @@
 //! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
 //!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
 //!   certificate must name its node, and a deny list refuses certificates and nodes
-//!   ([`identity`]).
+//!   ([`identity`]). The same listener serves daemons `ByteStream` for their blob
+//!   reads and writes ([`blobs`]), each call admitted by the same rules.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
-//!   need the token of `--api-token-file` ([`token`]).
+//!   need the token of `--api-token-file` ([`token`]). On the same listener,
+//!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]).
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
@@ -32,11 +34,13 @@
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
 pub mod api;
+pub mod blobs;
 #[cfg(test)]
 mod build_commit;
 pub mod config;
 pub mod farm;
 pub mod fleet;
+pub mod health;
 pub mod identity;
 pub mod mdm;
 pub mod principal;
@@ -49,6 +53,7 @@ pub mod worker;
 
 pub use config::{Args, Command, ConfigError, Role, StoreKind};
 pub use farm::Farm;
+pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use serve::{Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api};
 pub use worker::WorkerService;

@@ -236,7 +236,7 @@ probe=host_identity:<path of the client's probe script>:<sha256 of the script>
 expect_probe=host_identity:17A000=26.6-0123456789abcdef
 expect_probe=host_identity:18A000=27.0-fedcba9876543210
 kbf_server=https://farm.example.net:8981
-kbf_cas=https://farm.example.net:8980
+kbf_cas=https://farm.example.net:8981
 kbf_labels=pool=mac rack=r2
 ```
 

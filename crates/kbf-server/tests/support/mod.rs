@@ -214,6 +214,7 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
+            store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store).await;
@@ -504,12 +505,21 @@ pub fn hello(node: &str, cpus: u32, mem_gib: u32) -> Hello {
     hello_on(node, cpus, mem_gib, &[("arch", "x86_64"), ("os", "linux")])
 }
 
-/// A Hello for `node` reporting `cpus`, `mem_gib` and the `platform` entries.
+/// A Hello for `node` reporting `cpus`, `mem_gib` and the `platform` entries, and
+/// `drivers=fake` (which serves `action` leases) unless `platform` names its drivers.
 pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) -> Hello {
-    let platform = platform.iter().map(|(key, value)| Capability {
-        key: (*key).to_owned(),
-        value: (*value).to_owned(),
-    });
+    let drivers: &[(&str, &str)] = if platform.iter().any(|(key, _)| *key == "drivers") {
+        &[]
+    } else {
+        &[("drivers", "fake")]
+    };
+    let platform = platform
+        .iter()
+        .chain(drivers)
+        .map(|(key, value)| Capability {
+            key: (*key).to_owned(),
+            value: (*value).to_owned(),
+        });
     Hello {
         protocol_version: 1,
         node_id: node.to_owned(),

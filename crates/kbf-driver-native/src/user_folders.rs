@@ -31,10 +31,15 @@
 //! ([`crate::xcode_watch`]), asks each question under the actions' sandbox, where
 //! `xcrun` reads and fills `xcrun_db` as an action's would (`crate::xcode::Probe::sandbox`),
 //! and runs `xcodebuild` from inside the Xcode rather than through its `/usr/bin` shim;
-//! its `xcrun` warm-ups, at start and for each Xcode a later survey makes ready, run
+//! its `xcrun` warm-ups, after its first survey and for each Xcode a later survey makes ready, run
 //! under the actions' sandbox too (`NativeRuntime::warm_xcrun`). It leaves `xcrun_db`
-//! in place at start: removing it would make every lookup of the first survey, which
-//! the node finishes before it says `Hello`, take seconds. It sweeps by descriptor.
+//! in place at start: removing it would make every lookup of the first survey take
+//! seconds, during which no Xcode is ready (the node says `Hello` without waiting for
+//! that survey, [`crate::xcode_watch`]). The cache is often cold anyway: it is gone
+//! after a reboot, and on the macOS runner each `swift build` and `xcodebuild` left it
+//! holding the default Xcode's entries alone, the other Xcodes' lookups dropped (a
+//! survey of 15 Xcodes then took 13.5 to 16 s, against 0.8 s warm; PR #173). It
+//! sweeps by descriptor.
 //!
 //! What a lease leaves there (a save it was killed in the middle of, a temporary
 //! `xcrun_db-*`) is swept ([`UserFolders::sweep`]) at daemon start and after every

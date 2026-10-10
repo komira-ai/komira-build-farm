@@ -85,6 +85,14 @@ pub struct Args {
     /// only trusted callers reach it (loopback).
     #[arg(long)]
     pub reapi_token_file: Option<PathBuf>,
+    /// How long, in milliseconds, `GET /readyz` on the operator API waits for the
+    /// object store to answer its read-only probe before it answers 503.
+    #[arg(
+        long,
+        default_value_t = crate::health::STORE_PROBE_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..=60_000)
+    )]
+    pub readyz_store_timeout_ms: u64,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]
@@ -249,7 +257,11 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        Ok(Some(Api {
+            listen,
+            token,
+            store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
+        }))
     }
 
     /// The S3 store and the key prefix of this start, for `--store=s3`. `env` reads

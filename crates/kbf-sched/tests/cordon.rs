@@ -22,6 +22,7 @@ fn request(n: u8) -> Request {
             action: digest(n),
         },
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,
@@ -67,7 +68,9 @@ impl Harness {
 
     /// Registers `name` (again) with 4 CPUs and 8 GiB.
     fn worker(&mut self, name: &str) {
-        let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap();
+        let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+            .unwrap()
+            .with_drivers(["container"]);
         self.feed(Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
@@ -298,7 +301,9 @@ fn work_only_cordoned_workers_can_run_waits_and_is_never_refused() {
     h.feed(Event::Capacity {
         worker: w("small"),
         capacity: Resources::new(1_000, GIB),
-        caps: NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap(),
+        caps: NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+            .unwrap()
+            .with_drivers(["container"]),
     });
     let (_, effects) = h.tick();
     let [Effect::Waiting(huge), Effect::Waiting(_)] = effects.as_slice() else {

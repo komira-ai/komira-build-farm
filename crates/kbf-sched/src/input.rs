@@ -2,8 +2,8 @@
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, ControlRecord, FarmTime, FencePolicy, LeaseId, OperationId, Outcome, Qos, Resources,
-    WaiterId, WorkerId,
+    ActionKey, ControlRecord, FarmTime, FencePolicy, LeaseId, LeaseKind, OperationId, Outcome, Qos,
+    Resources, WaiterId, WorkerId,
 };
 
 /// One execution request, as the front submits it after the cache missed.
@@ -13,7 +13,12 @@ pub struct Request {
     pub key: ActionKey,
     /// How urgent the caller says it is.
     pub qos: Qos,
-    /// The CPU and memory to book for it.
+    /// What the lease takes. Placement offers it only to a worker that reports a driver
+    /// serving the kind. An `action` books `resources`; a `whole_machine` lease waits
+    /// for an empty worker at least `resources` large and books all of it.
+    pub kind: LeaseKind,
+    /// The CPU, memory and GPUs to book for it (for a `whole_machine` lease, the least
+    /// worker it may run on).
     pub resources: Resources,
     /// What a worker must offer to run it, from the action's platform properties. The
     /// default asks for nothing: any worker may run it.

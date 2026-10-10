@@ -550,6 +550,7 @@ impl Checker {
             lease: grant.lease,
             operation: id,
             key: op.request.key.clone(),
+            kind: op.request.kind,
             resources: op.request.resources,
             fence: op.request.fence(),
         })]

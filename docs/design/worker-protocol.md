@@ -21,11 +21,11 @@ service Worker {
   certificate; the server's worker listener verifies it against a client CA, and
   requires the certificate to name the node the stream speaks for (see
   [Node identity](#node-identity-and-the-deny-list)).
-- **No blob bytes on this stream.** A daemon reads inputs and writes outputs through the
-  REAPI `ByteStream` service on separate connections. The session carries only small
-  control messages. Moving blob transfer onto the mutual-TLS worker listener, so a
-  daemon needs no path to REAPI, is **planned** (see
-  [Security model](../../ARCHITECTURE.md#security-model)).
+- **No blob bytes on this stream.** The session carries only small control messages.
+  A daemon reads inputs and writes outputs with `ByteStream` calls to the same worker
+  listener, over the same mutual TLS, each call admitted on its own (see
+  [Blobs on the worker listener](#blobs-on-the-worker-listener)). A daemon needs no
+  path to REAPI.
 - **Versions.** The server accepts protocol versions N-1 and N. Version 1 is the first,
   so today it accepts exactly 1. Fields and messages may be added within a version as
   long as a peer that ignores them keeps working.
@@ -135,15 +135,20 @@ node mac-07              # a node id, whatever certificate it presents
 `openssl x509 -noout -serial` prints a certificate's serial;
 `openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum` its
 public key hash, which outlives a reissue with the same key. The server reads the file
-at start (a bad file stops it), and **again at every check**: each first `Hello`
-(reconnects included), each resent `Hello`, each `Heartbeat`, each `Result` and each
-`NodeStatus`. An entry added while a denied daemon is connected ends its stream
+at start (a bad file stops it), and looks at it **again at every check**: each first
+`Hello` (reconnects included), each resent `Hello`, each `Heartbeat`, each `Result`,
+each `NodeStatus` and each blob call. A check reads the file's metadata (device,
+inode, size, mode, owner, modification and change time) and reads and parses the file
+again only when that changed since the last read. An entry added while a denied daemon is connected ends its stream
 `PERMISSION_DENIED` at the next of those it sends (a `Result` is refused, so it never
 reaches the action cache, and the stream ends without a `ResultAck`; a `NodeStatus`
 is refused, so the operator API keeps the node's last status from before the entry),
 and every reconnect is refused; no
-restart is needed. The server reads nothing more from a stream it has ended. Replace
-the file atomically (write a new file, then rename it over the old one).
+restart is needed. The server reads nothing more from a stream it has ended. A blob
+call is refused `PERMISSION_DENIED` from the first one after the entry is added, on a
+connection already open too. Replace the file atomically (write a new file, then
+rename it over the old one): an in-place edit that keeps the size and lands within
+the filesystem's timestamp granularity may go unseen until the next change.
 
 A file that cannot be read or parsed after start refuses every check `UNAVAILABLE`
 (fail closed) until it is fixed. That ends **every** connected daemon's stream within
@@ -155,6 +160,38 @@ readable and the daemons are back.
 off the list verifies until it expires or the cell CA is replaced. Issue node
 certificates with short lifetimes (30 days is a starting point) so a missed entry is
 bounded.
+
+### Blobs on the worker listener
+
+Besides `Worker.Session`, the worker listener serves the REAPI `ByteStream` service
+(`Read`, `Write`, `QueryWriteStatus`) over the farm's one cache, so a blob a daemon
+writes there is the blob clients read on the REAPI listener, and the other way round.
+It is the daemon's only CAS: `kbf-daemon --cas` (and `kbf-cell daemon --cas`) must be
+an `https://` URL, normally the same as `--server`, and the daemon dials it with its
+own CA, certificate, key and server name. A plain `http://` URL is refused at start.
+
+Each call is admitted before anything of it is served (a `Write` before its first
+message is read):
+
+- the listener serves mutual TLS; on a plain-text worker listener every call is
+  refused `UNAUTHENTICATED`;
+- the call's connection presented a client certificate the client CA verified (else
+  the TLS handshake fails, or the call is `UNAUTHENTICATED`);
+- the certificate carries exactly one DNS subjectAltName, which is the call's node
+  (else `PERMISSION_DENIED`). A blob call names no node id, so there is nothing to
+  compare the name with, as `Hello` has;
+- neither its serial, its public key nor that node is on the deny list, looked at
+  again for this call (`PERMISSION_DENIED`; a list that cannot be read or parsed
+  refuses `UNAVAILABLE`).
+
+The server logs each refused call at WARN with its code and reason. Only
+`ByteStream` is served here, because it is all a daemon's CAS client calls:
+`Execution`, `ActionCache`, `ContentAddressableStorage` and `Capabilities` answer
+`UNIMPLEMENTED` on this listener.
+
+Not checked: that the node is registered or connected, or that it reads only the
+inputs of leases it holds. A certificate the deny list does not refuse can read any
+blob whose digest it names, and write blobs.
 
 ### `Heartbeat` and `HeartbeatAck`
 
@@ -351,8 +388,11 @@ in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that preda
 the message ignores it as an empty message; a daemon that predates it is listed
 without software, and a server that predates `xcodes` ignores it.
 
-When the driver's report changes mid-session (today: the native driver re-checks its
-Xcodes every few minutes, and one became ready or stopped being so), the daemon resends
+When the driver's report changes mid-session (today: the native driver's first
+survey of its Xcodes ended, which the daemon does not wait for before `Hello`, so its
+first `Hello` advertises no Xcode and its first `NodeStatus` lists each as
+`XCODE_STATE_NOT_SURVEYED`; or a later survey, every few minutes, found one became
+ready or stopped being so), the daemon resends
 its `Hello` on the stream if the node report changed (the server takes a resent
 `Hello` as the node's new report, so placement sees the new `xcode` entries), and then
 sends `NodeStatus` again. Re-detecting the other software mid-session is **planned**

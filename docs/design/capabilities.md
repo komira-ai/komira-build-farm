@@ -70,19 +70,26 @@ The driver adds its own entries. The native driver (Macs) reports `network_isola
 build it can select (see [Matching](#matching)); an installed Xcode that is not ready is
 in the node status instead (`xcodes`, below).
 
-A daemon runs one driver today, so `drivers` has one value. The scheduler does not read
-it yet (see [Planned](#planned)); the daemon refuses a `Start` for a lease kind its
-driver does not serve.
+A daemon runs one driver today, so `drivers` has one value. Placement reads it
+(`kbf_types::LeaseKind::drivers`): a lease goes only to a worker that lists a driver
+serving its kind, by the table below, and a worker that lists none serves nothing. The
+daemon also refuses a `Start` for a lease kind its driver does not serve.
 
 | Value | Serves | Status |
 |---|---|---|
 | `container` | `action` | exists (Linux, rootless Podman) |
 | `native` | `action` | exists (Macs, plain processes) |
 | `fake` | `action` | exists, for bring-up only: runs nothing |
+| `local` | `action` | exists, in tests only: `kbf-daemon`'s child-process runtime |
 | `vm` | `vm` | **planned**: listed only when a check that boots no VM passes, at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
 | `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
 
-On `main` no driver serves `whole_machine`.
+On `main` no driver serves `whole_machine`, so a `whole_machine` lease waits, saying
+that no live worker serves the kind, and is refused after the unservable wait. A
+`whole_machine` lease books the whole worker and is placed only on one that holds no
+lease; while it waits it holds one worker in queue (QoS) order, which takes no less
+urgent work meanwhile (see
+[platform-properties.md](../platform-properties.md#kbf-lease)).
 
 ### Planned VM entries
 
@@ -271,8 +278,13 @@ naming no `container-image`.
   `INVALID_ARGUMENT`. One no kbf daemon can ever run, an `os` other than `linux` or
   `macos` or an `ISA` naming another architecture, is `FAILED_PRECONDITION` at once.
 - **Matching in placement.** The scheduler offers an action only to a live worker whose
-  report satisfies its request; matches are memoised per request within a placement
-  round. See [scheduler.md](scheduler.md#placement).
+  report lists a driver serving its lease kind and satisfies its request; matches are
+  memoised per request and kind within a placement round. See
+  [scheduler.md](scheduler.md#placement).
+- **Whole-machine booking.** A `whole_machine` lease is placed only on a worker that
+  holds no lease, and books all of its cores, memory and GPUs, so nothing is placed
+  beside it. One that fits nowhere holds one worker that could run it; work after it
+  in queue order is not placed there until it has emptied.
 - **Answers when nothing matches.** A request no live worker satisfies (or none that
   does is large enough for) waits in the queue, and its callers see why in the
   operation's metadata. After `--unservable-wait-secs` (300 by default) of that it
@@ -289,16 +301,15 @@ naming no `container-image`.
   `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
   clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0, each
   asked under the actions' sandbox with the network off, as an action runs. It runs an
-  action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. It asks
-  again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
+  action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. Its first
+  survey runs in the background: the daemon says `Hello` at once with no `xcode`
+  entry, each Xcode listed as not surveyed in its status, until the survey ends. It
+  asks again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
   sees it) and the `NodeStatus` (which lists every installed Xcode, ready or not, with
   the fix).
 
 ## Planned
 
-- **Drivers in placement.** A worker is feasible only if its `drivers` include one that
-  serves the lease kind: `native` or `container` for `action`, `vm` for `vm`,
-  `native-whole-machine` for `whole_machine` (today the daemon refuses the `Start`).
 - **Unknown keys refused.** An unknown property is refused at `Execute` with
   `INVALID_ARGUMENT` naming the closest known key; today it is ignored, so a misspelt
   `OSFamilly` matches every worker.

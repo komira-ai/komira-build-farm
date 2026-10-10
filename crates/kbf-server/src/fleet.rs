@@ -9,12 +9,20 @@
 //!
 //! **Attention.** What a node needs a human for is listed in its `needs_attention`:
 //! today, each installed Xcode that is not ready, with why and the command that fixes
-//! it (issue #164). kbf has no alert delivery yet, so the server also logs each item
-//! once, at `WARN` under the target `kbf_server::attention`, when it first appears, and
-//! at `INFO` when it clears ([`attention_changes`]); a status that repeats the same
-//! items (each new stream sends one) logs nothing. An item is the same while its
-//! Xcode's app, build, state and fix are: a reason that changes alone (an NSLog line's
-//! time and pid) is shown in `needs_attention` but not logged again.
+//! it (issue #164). An Xcode its node has not surveyed yet (`not_surveyed`: a daemon
+//! says Hello before its first survey ends, so a restarted one first sends every
+//! Xcode in that state) is listed in `xcodes` with that state, and **holds the item
+//! the same app had in the node's previous status**: that item stays in
+//! `needs_attention`, and is neither cleared nor raised again until a survey reports
+//! the app (an app with no previous item holds none: nothing for a human to do yet).
+//! kbf has no alert delivery yet, so the server also logs each item once, at `WARN`
+//! under the target `kbf_server::attention`, when it first appears, and at `INFO` when
+//! it clears ([`attention_changes`]); a status that repeats the same items, or that
+//! lists them not surveyed yet (each new stream sends one), logs nothing. An item is
+//! the same while its Xcode's app, build, state and fix are: a reason that changes
+//! alone (an NSLog line's time and pid) is shown in `needs_attention` but not logged
+//! again. The previous status is the one this server process received last: after a
+//! server restart, an item is raised again when its node's survey reports it.
 
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use serde::Serialize;
@@ -94,13 +102,18 @@ pub struct XcodeView {
     /// Its build; empty when not known.
     pub build: String,
     /// `ready`, `license_not_accepted`, `first_launch_not_run`,
-    /// `metal_toolchain_missing`, `failed`, or `unknown` (a state this server does not
-    /// know).
+    /// `metal_toolchain_missing`, `failed`, `not_surveyed` (found, not asked yet; never
+    /// advertised), or `unknown` (a state this server does not know).
     pub state: &'static str,
     /// Why it is not ready; empty when ready.
     pub reason: String,
     /// The command that makes it ready; empty when ready or none is known.
     pub fix: String,
+    /// While it is not surveyed yet: the same app as the node's previous status
+    /// counted it, if that had an item ([`SoftwareView::hold_unsurveyed`]). Not
+    /// listed: `state` says what the node sent.
+    #[serde(skip)]
+    held: Option<Box<XcodeView>>,
 }
 
 impl XcodeView {
@@ -111,6 +124,7 @@ impl XcodeView {
             Ok(XcodeState::FirstLaunchNotRun) => "first_launch_not_run",
             Ok(XcodeState::MetalToolchainMissing) => "metal_toolchain_missing",
             Ok(XcodeState::Failed) => "failed",
+            Ok(XcodeState::NotSurveyed) => "not_surveyed",
             Ok(XcodeState::Unspecified) | Err(_) => "unknown",
         };
         Self {
@@ -119,12 +133,19 @@ impl XcodeView {
             state,
             reason: status.reason,
             fix: status.fix,
+            held: None,
         }
     }
 
-    /// What an operator must do about it, unless it is ready.
+    /// What its attention item is judged by: what it holds while not surveyed yet,
+    /// else itself.
+    fn counted(&self) -> &Self {
+        self.held.as_deref().unwrap_or(self)
+    }
+
+    /// What an operator must do about it, unless it is ready or not surveyed yet.
     fn attention(&self) -> Option<String> {
-        if self.state == "ready" {
+        if matches!(self.state, "ready" | "not_surveyed") {
             return None;
         }
         let named = match self.build.as_str() {
@@ -158,22 +179,46 @@ impl SoftwareView {
         }
     }
 
-    /// What an operator must do on the node, one line per Xcode that is not ready:
+    /// Makes each Xcode not surveyed yet hold the item the same app has in `before`
+    /// (the node's previous status), so that it keeps it until a survey reports the
+    /// app (see the module documentation).
+    pub fn hold_unsurveyed(&mut self, before: &[XcodeView]) {
+        hold(before, &mut self.xcodes);
+    }
+
+    /// What an operator must do on the node, one line per Xcode that is not ready, or
+    /// not surveyed yet and holding an item:
     /// `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`.
     #[must_use]
     pub fn needs_attention(&self) -> Vec<String> {
         self.xcodes
             .iter()
-            .filter_map(XcodeView::attention)
+            .filter_map(|x| x.counted().attention())
             .collect()
+    }
+}
+
+/// [`SoftwareView::hold_unsurveyed`] on `after`.
+fn hold(before: &[XcodeView], after: &mut [XcodeView]) {
+    for x in after
+        .iter_mut()
+        .filter(|x| x.state == "not_surveyed" && x.held.is_none())
+    {
+        x.held = before
+            .iter()
+            .find(|b| b.app == x.app)
+            .map(XcodeView::counted)
+            .filter(|b| b.attention().is_some())
+            .map(|b| Box::new(b.clone()));
     }
 }
 
 /// What to log when a node's Xcodes go from `before` to `after`: the attention item of
 /// each Xcode newly not ready (`true`, at `WARN`), then that of each no longer so
 /// (`false`, at `INFO`), as `node <node>: <item>` and `node <node>: resolved: <item>`.
-/// An Xcode is compared by its app, build, state and fix, not its reason (see the
-/// module documentation), so the same Xcodes give nothing.
+/// An Xcode is compared by its app, build, state and fix, not its reason, and one not
+/// surveyed yet in `after` by the item it holds from `before` (see the module
+/// documentation), so the same Xcodes, or the same not surveyed yet, give nothing.
 #[must_use]
 pub fn attention_changes(
     node: &str,
@@ -184,12 +229,15 @@ pub fn attention_changes(
     fn items(list: &[XcodeView]) -> Vec<(Key<'_>, String)> {
         list.iter()
             .filter_map(|x| {
+                let x = x.counted();
                 let key = (x.app.as_str(), x.build.as_str(), x.state, x.fix.as_str());
                 Some((key, x.attention()?))
             })
             .collect()
     }
-    let (before, after) = (items(before), items(after));
+    let mut held = after.to_vec();
+    hold(before, &mut held);
+    let (before, after) = (items(before), items(&held));
     let has = |list: &[(Key<'_>, String)], key: &Key<'_>| list.iter().any(|(k, _)| k == key);
     let raised = after
         .iter()
@@ -258,8 +306,9 @@ mod tests {
     }
 
     /// Catches: a not-ready Xcode not listed for attention or listed without its reason
-    /// or fix, a ready one listed, a state shown under another name, a state number
-    /// this server does not know shown as ready, and an unknown build or fix left blank.
+    /// or fix, a ready one or one not surveyed yet listed (nothing for a human to do),
+    /// a state shown under another name, a state number this server does not know
+    /// shown as ready, and an unknown build or fix left blank.
     #[test]
     fn every_xcode_not_ready_needs_attention() {
         let status = NodeStatus {
@@ -289,6 +338,7 @@ mod tests {
                     ..xcode("9Z", XcodeState::Ready, "new", "")
                 },
                 xcode("8Y", XcodeState::Unspecified, "", ""),
+                xcode("", XcodeState::NotSurveyed, "not surveyed yet", ""),
             ],
             ..NodeStatus::default()
         };
@@ -303,7 +353,8 @@ mod tests {
                 "metal_toolchain_missing",
                 "failed",
                 "unknown",
-                "unknown"
+                "unknown",
+                "not_surveyed"
             ]
         );
         assert_eq!(
@@ -378,6 +429,47 @@ mod tests {
                     format!("node mac-1: resolved: {}", b.attention().expect("item"))
                 ),
             ]
+        );
+    }
+
+    /// Catches (review of PR #258): an Xcode that is not ready, reported as not
+    /// surveyed yet (the first status of a restarted daemon), logged as resolved, or
+    /// raised again when its survey reports it unchanged; and the item it held never
+    /// cleared once the survey finds it ready.
+    #[test]
+    fn an_xcode_not_surveyed_yet_keeps_its_item() {
+        let licence = XcodeView::new(xcode(
+            "1A",
+            XcodeState::LicenseNotAccepted,
+            "agree",
+            "sudo x",
+        ));
+        let pending = XcodeView::new(xcode("", XcodeState::NotSurveyed, "not surveyed yet", ""));
+        let pending = XcodeView {
+            app: licence.app.clone(),
+            ..pending
+        };
+        let other = XcodeView::new(xcode("", XcodeState::NotSurveyed, "not surveyed yet", ""));
+        let before = std::slice::from_ref(&licence);
+        assert_eq!(
+            attention_changes("mac-1", before, &[pending.clone(), other]),
+            []
+        );
+        let mut held = SoftwareView::new(NodeStatus::default(), 1);
+        held.xcodes = vec![pending];
+        held.hold_unsurveyed(before);
+        assert_eq!(held.needs_attention(), [licence.attention().expect("item")]);
+        assert_eq!(attention_changes("mac-1", &held.xcodes, before), []);
+        let ready = XcodeView::new(xcode("1A", XcodeState::Ready, "", ""));
+        assert_eq!(
+            attention_changes("mac-1", &held.xcodes, &[ready]),
+            [(
+                false,
+                format!(
+                    "node mac-1: resolved: {}",
+                    licence.attention().expect("item")
+                )
+            )]
         );
     }
 }

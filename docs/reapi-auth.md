@@ -115,8 +115,8 @@ bazel build --remote_executor=grpcs://<front> --remote_header=Authorization="Bea
 
 ## Daemons
 
-Today a daemon reads action inputs and writes outputs through the REAPI listener its
-`--cas` names, and it sends no token. A server started with `--reapi-token-file`
-refuses those calls, so daemons whose `--cas` points at it cannot run actions. The
-planned fix moves daemon blob traffic to the mutual-TLS worker listener, which needs no
-REAPI token. The worker listener itself is not affected by this flag.
+A daemon reads action inputs and writes outputs with `ByteStream` on the mutual-TLS
+worker listener its `--cas` names, each call checked against its node certificate and
+the deny list ([worker-protocol.md](design/worker-protocol.md#blobs-on-the-worker-listener)).
+It sends no REAPI token and needs none: `--reapi-token-file` guards only the REAPI
+listener, and the worker listener is not affected by it.

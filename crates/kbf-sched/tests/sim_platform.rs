@@ -79,13 +79,21 @@ fn workers() -> Vec<(&'static str, NodeCaps)> {
     vec![
         (
             "linux-arm",
-            NodeCaps::from_report([("arch", "arm64"), ("os", "linux")]).unwrap(),
+            NodeCaps::from_report([("arch", "arm64"), ("os", "linux")])
+                .unwrap()
+                .with_drivers(["container"]),
         ),
-        ("linux-x86", NodeCaps::from_report(linux).unwrap()),
+        (
+            "linux-x86",
+            NodeCaps::from_report(linux)
+                .unwrap()
+                .with_drivers(["container"]),
+        ),
         (
             "mac",
             NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")])
-                .unwrap(),
+                .unwrap()
+                .with_drivers(["native"]),
         ),
     ]
 }
@@ -383,6 +391,7 @@ fn request(n: u64, platform: usize) -> Request {
             action: digest(n),
         },
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,

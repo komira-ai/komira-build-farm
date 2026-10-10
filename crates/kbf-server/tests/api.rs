@@ -98,6 +98,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
+        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -342,6 +343,7 @@ async fn an_api_address_in_use_is_refused() {
     let api = Api {
         listen: addr,
         token: None,
+        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {
@@ -358,7 +360,9 @@ fn register(
     mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>,
 ) {
     let (outbound, responses) = mpsc::unbounded_channel();
-    let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
+    let caps = NodeCaps::from_report([("arch", "x86_64")])
+        .expect("caps")
+        .with_drivers(["container"]);
     let resources = Resources::new(8_000, 16 << 30);
     let stream = farm.register(
         &WorkerId::new(node),
@@ -762,4 +766,64 @@ async fn an_attention_item_is_logged_once_per_change() {
     let listed = farm.node_view(&node).expect("listed");
     assert_eq!(listed.needs_attention, Vec::<String>::new());
     assert_eq!(farm.node_status(&node, second, mac_status()), raised);
+}
+
+/// `mac_status` as a daemon sends it from its start until its first survey ends: every
+/// Xcode found, none asked yet (no build, no fix).
+fn not_surveyed_status() -> NodeStatus {
+    let mut status = mac_status();
+    status.xcode_builds.clear();
+    for xcode in &mut status.xcodes {
+        xcode.build.clear();
+        xcode.fix.clear();
+        xcode.state = XcodeState::NotSurveyed.into();
+        xcode.reason = "not surveyed yet".to_owned();
+    }
+    status
+}
+
+/// Catches (review of PR #258): a restarted daemon, whose first status lists every
+/// Xcode as not surveyed yet, logging a false "resolved" for an Xcode that is still
+/// not ready, dropping it from `needs_attention` until its survey ends, and raising it
+/// again when the survey reports it unchanged; and an Xcode fixed while its daemon was
+/// down not cleared once its survey says so.
+#[tokio::test]
+async fn a_restarted_daemon_neither_clears_nor_raises_an_unchanged_item() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let node = WorkerId::new("mac-1");
+    let (first, _first_rx) = register(&farm, "mac-1");
+    let raised = vec![(true, format!("node mac-1: {NOT_READY}"))];
+    assert_eq!(farm.node_status(&node, first, mac_status()), raised);
+    // The daemon restarts: a new stream, whose first status precedes its survey.
+    let (second, _second_rx) = register(&farm, "mac-1");
+    assert_eq!(farm.node_status(&node, second, not_surveyed_status()), []);
+    let listed = farm.node_view(&node).expect("listed");
+    assert_eq!(
+        listed.needs_attention,
+        [NOT_READY],
+        "kept while not surveyed"
+    );
+    let software = listed.software.expect("software");
+    assert_eq!(software.xcodes[0].state, "not_surveyed", "shown as sent");
+    assert_eq!(farm.node_status(&node, second, not_surveyed_status()), []);
+    assert_eq!(
+        farm.node_status(&node, second, mac_status()),
+        [],
+        "same item"
+    );
+    let listed = farm.node_view(&node).expect("listed");
+    assert_eq!(listed.needs_attention, [NOT_READY]);
+    // Restarted again, and fixed while it was down: cleared once its survey says so.
+    let (third, _third_rx) = register(&farm, "mac-1");
+    assert_eq!(farm.node_status(&node, third, not_surveyed_status()), []);
+    let mut accepted = mac_status();
+    accepted.xcodes[0].state = XcodeState::Ready.into();
+    let cleared = vec![(false, format!("node mac-1: resolved: {NOT_READY}"))];
+    assert_eq!(farm.node_status(&node, third, accepted), cleared);
+    let listed = farm.node_view(&node).expect("listed");
+    assert_eq!(listed.needs_attention, Vec::<String>::new());
 }

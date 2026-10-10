@@ -677,6 +677,40 @@ async fn the_environment_reaches_podman_and_odd_outputs_are_left_out() {
     fake.assert_clean(1);
 }
 
+/// Catches the configured container limits not reaching `podman create` (a flag left
+/// to Podman's defaults or the node's `containers.conf`), and the environment or the
+/// user left to the image: the lease's create carries `--unsetenv-all`, `--user=0:0`
+/// and each limit from the driver's configuration.
+#[tokio::test]
+async fn the_configured_limits_reach_podman_create() {
+    let fake = Fake::with("limits", |config| {
+        config.limits = kbf_driver_container::ContainerLimits {
+            pids: 71,
+            shm_mib: 72,
+            nofile: 73,
+            nproc: 74,
+        };
+    });
+    let mut spec = Spec::new(&image(), "unused");
+    spec.env = vec![("A".to_owned(), "1".to_owned())];
+    fake.run(1, &spec, "true").await.expect("ran");
+    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
+    let args: Vec<&str> = args.lines().collect();
+    for expected in [
+        "--unsetenv-all",
+        "--user=0:0",
+        "--pids-limit=71",
+        "--shm-size=72m",
+        "--ulimit=nofile=73:73",
+        "--ulimit=nproc=74:74",
+    ] {
+        assert!(args.contains(&expected), "{expected} missing: {args:?}");
+    }
+    let env: Vec<_> = args.iter().filter(|a| a.starts_with("--env")).collect();
+    assert_eq!(env, [&"--env=A=1"], "{args:?}");
+    fake.assert_clean(1);
+}
+
 /// Catches a node that cannot make the lease's scratch directory or cgroup running the
 /// action anyway, or reporting it as the client's error.
 #[tokio::test]
