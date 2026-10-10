@@ -137,7 +137,6 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     args.push(format!("--cgroup-parent={}", spec.cgroup_parent).into());
     args.push(format!("--user={CONTAINER_USER}").into());
     let limits = spec.limits;
-    args.push(format!("--pids-limit={}", limits.pids).into());
     args.push(format!("--shm-size={}m", limits.shm_mib).into());
     args.push(format!("--ulimit=nofile={0}:{0}", limits.nofile).into());
     args.push(format!("--ulimit=nproc={0}:{0}", limits.nproc).into());
