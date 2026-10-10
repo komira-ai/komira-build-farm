@@ -129,8 +129,8 @@ async fn killed_by_the_actions_backstop_within_its_cap_is_a_busy_node() {
         .await;
     assert!(
         matches!(outcome, Err(RuntimeError::BusyNode(ref why))
-            if why.contains("for the actions/ cgroup's own limit during the lease")
-                && !why.contains("did not run")),
+            if why.contains("oom 0, max 0")
+                && why.contains("time(s) for the actions/ cgroup's own limit during the lease")),
         "{outcome:?}"
     );
     cell.assert_clean(1);
