@@ -329,40 +329,45 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 }
 
 /// Catches the swap watch killing a lease for swap the host put there (the
-/// absolute-swap rule, seen on podman-arm): a lease that host pressure swapped out,
-/// and that then reaches its own cap and pushes a few MiB more into swap there, far
-/// less than the threshold, runs to exit 0. Production configuration: no
+/// absolute-swap rule, seen on podman-arm and podman-x86): a lease that host pressure
+/// swapped out, and that then reaches its own cap and pushes more into swap there,
+/// but less than the threshold, runs to exit 0. Production configuration: no
 /// `memory.swap.max` on the lease.
 ///
 /// The lease books 256 MiB, holds a 200 MiB buffer of random bytes (`dd` blocked
 /// writing it into a pipe nobody reads) and writes a 64 MiB file into its working
 /// directory, synced, so its pages are clean. The test reclaims from the lease
-/// (`memory.reclaim`, standing in for host pressure: no `max` event): the file's
-/// pages are dropped and most of the buffer goes to swap (about 200 MiB on both
-/// podman jobs), past the 128 MiB floor this cell's watch is given. It then lowers the lease's `memory.max` to 16 MiB
-/// above what it holds in RAM, so the action can reach its cap. The action reads the
-/// file, over and over (its page cache hits the cap: `max` grows, and reclaim drops
-/// the clean pages), then holds a new 24 MiB buffer for 2 s: at its cap, reclaim must
-/// push at least 8 MiB of the lease into swap, so `max` grows and swap rises in the
-/// same interval, with the lease holding far more than the floor in swap. The
-/// absolute-swap rule kills it there.
+/// (`memory.reclaim`, standing in for host pressure: no `max` event) until little is
+/// left in RAM: the file's pages are dropped and most of the buffer goes to swap
+/// (about 200 MiB on both podman jobs), past the 128 MiB floor this cell's watch is
+/// given. One reclaim is not enough on podman-arm, which kept 51 and 84 MB in RAM
+/// after one (pages written to swap stay in RAM, as swap cache, until a later reclaim
+/// drops them). The test then lowers the lease's `memory.max` to 16 MiB above what it
+/// holds in RAM, so the action can reach its cap. The action reads the file, over and
+/// over (its page cache hits the cap: `max` grows, and reclaim drops the clean
+/// pages), then holds a new 64 MiB buffer for 2 s. That buffer is more than the
+/// lease's RAM and headroom together, so at its cap reclaim must push some of the
+/// lease into swap: `max` grows and swap rises in the same interval, with the lease
+/// holding far more than the floor in swap. The absolute-swap rule kills it there.
 ///
 /// What the lease can push into swap itself at its cap is bounded: what it held in
-/// RAM after the reclaim, its cap's 16 MiB headroom, the 24 MiB buffer and a little
-/// for `cat` and the shell; the test asserts that bound is below the floor before the
-/// action reaches its cap (what stays in RAM after the reclaim differs: 2 MB on
-/// podman-x86, 51 MB on podman-arm), so a kill is the rule's error, never the lease's. Clean
-/// file pages for the `max` events, not written ones: a lease at so tight a cap that
-/// writes is OOM-killed by the kernel (seen on both podman jobs) before its dirty
+/// RAM after the reclaim, its cap's 16 MiB headroom, the 64 MiB buffer and a little
+/// (8 MiB) for `cat` and the shell. The test asserts both premises before the action
+/// reaches its cap: the buffer is more than RAM and headroom (the push is forced), and
+/// the bound is below the floor (a kill is the rule's error, never the lease's).
+/// Clean file pages for the `max` events, not written ones: a lease at so tight a cap
+/// that writes is OOM-killed by the kernel (seen on both podman jobs) before its dirty
 /// pages are written back.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     require_swap();
     const FLOOR: u64 = 128 * MIB;
-    // The buffer the action holds at its cap, and the headroom it is given there.
-    const PUSH: u64 = 24 * MIB;
+    // The buffer the action holds at its cap, the headroom it is given there, and what
+    // `cat` and the shell may add.
+    const PUSH: u64 = 64 * MIB;
     const HEADROOM: u64 = 16 * MIB;
+    const SLACK: u64 = 8 * MIB;
     let cell = Cell::with("swap-held", |config| {
         config.swap_kill = SwapKill {
             floor_bytes: FLOOR,
@@ -370,13 +375,14 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
             every: Duration::from_millis(200),
         };
     });
-    let mut spec = sh(
-        "dd if=/dev/urandom bs=200M count=1 iflag=fullblock 2>/dev/null | { \
-         dd if=/dev/zero of=f bs=1M count=64 2>/dev/null; sync; sleep 10; i=0; \
+    let mut spec = sh(&format!(
+        "dd if=/dev/urandom bs=200M count=1 iflag=fullblock 2>/dev/null | {{ \
+         dd if=/dev/zero of=f bs=1M count=64 2>/dev/null; sync; sleep 15; i=0; \
          while [ $i -lt 20 ]; do cat f >/dev/null; i=$((i + 1)); done; \
-         dd if=/dev/urandom bs=24M count=1 iflag=fullblock 2>/dev/null | sleep 2; \
-         rm -f f; }",
-    );
+         dd if=/dev/urandom bs={}M count=1 iflag=fullblock 2>/dev/null | sleep 2; \
+         rm -f f; }}",
+        PUSH / MIB
+    ));
     spec.timeout = Some(Duration::from_secs(120));
     let action = store_action(&cell.cas, &spec);
     let work = cell.work(1, action, Resources::new(1000, 256 * MIB));
@@ -403,19 +409,34 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(held >= 200 * MIB, "the buffer is not held: {held} bytes");
-    // EAGAIN when it reclaimed less than asked; what it moved is read below.
-    let _ = std::fs::write(lease.join("memory.reclaim"), "500M");
+    // EAGAIN when it reclaimed less than asked; what it moved is read below. Again,
+    // until little is left in RAM: what one reclaim wrote to swap can stay in RAM as
+    // swap cache until the next.
+    let mut reclaims = Vec::new();
+    for _ in 0..10 {
+        let _ = std::fs::write(lease.join("memory.reclaim"), "500M");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        reclaims.push(state(&lease));
+        if read_u64(&lease, "memory.current") < 8 * MIB {
+            break;
+        }
+    }
     let swapped = read_u64(&lease, "memory.swap.current");
     assert!(
         swapped > FLOOR,
         "the premise: host pressure moved more than the watch's floor to swap: {}",
-        state(&lease)
+        reclaims.join("\n")
     );
     let ram = read_u64(&lease, "memory.current");
     assert!(
-        ram + HEADROOM + PUSH + 8 * MIB < FLOOR,
+        PUSH > ram + HEADROOM,
+        "the premise: the buffer at the cap is more than the lease's RAM and headroom: {}",
+        reclaims.join("\n")
+    );
+    assert!(
+        ram + HEADROOM + PUSH + SLACK < FLOOR,
         "the premise: what the lease can push into swap at its cap is below the floor: {}",
-        state(&lease)
+        reclaims.join("\n")
     );
     write(&lease, "memory.max", &(ram + HEADROOM).to_string());
     let max_events = |lease: &Path| {
