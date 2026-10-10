@@ -76,6 +76,9 @@ struct Cli {
     /// actions' sandbox), is ready: it is reported as an `xcode` entry, and an action
     /// that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed
     /// in the node's status with why and the command that fixes it, and logged at WARN.
+    /// The daemon says Hello without waiting for its first survey, which runs in the
+    /// background: until it ends, each Xcode is listed as not surveyed yet and none is
+    /// reported.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
     /// How often, in seconds, the Xcodes are asked again (native), so one fixed while
@@ -147,20 +150,23 @@ fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
     )?)
 }
 
-/// The daemon with the native driver, which surveys the Xcodes in `--xcode-apps` now
-/// and again every `--xcode-recheck-secs` and hands each changed survey to the daemon
-/// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or not.
+/// The daemon with the native driver, which surveys the Xcodes in `--xcode-apps` in
+/// the background, at once and again every `--xcode-recheck-secs`, and hands each
+/// changed survey to the daemon (`Daemon::with_driver_report`): without it the node
+/// reports no Xcode, ready or not. It does not wait for the first survey: until that
+/// ends, the daemon reports every Xcode found as not surveyed yet, and none as ready.
 fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
-    native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))
+    Ok(native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))?.0)
 }
 
 /// [`native`] with `config` and the `xcrun` it surveys with and warms (a test names
-/// its own user folders and sandbox, and an `xcrun` of its own).
+/// its own user folders and sandbox, and an `xcrun` of its own); also returns what the
+/// watch sends the daemon, for a test to follow.
 fn native_with(
     cli: &Cli,
     config: NativeConfig,
     xcrun: &Path,
-) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
+) -> Result<(Daemon<NativeRuntime<CasClient>>, Reports), Error> {
     let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
@@ -169,19 +175,29 @@ fn native_with(
     // Every question runs as an action does: xcrun reads and fills its cache, which
     // leases can write, only under the sandbox.
     probe.sandbox = Some(runtime.sandbox(kbf_driver_native::SURVEY_DIR));
-    // The first survey is applied before this returns.
-    let (driver, _) = xcode_watch::watch(
-        cli.xcode_apps.clone(),
-        probe,
-        every,
-        Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
-    );
-    // In the background, sandboxed as an action: the node serves while xcrun fills its
-    // cache for the node's own Xcode and the ready ones; each later survey warms the
-    // Xcodes it makes ready.
-    let _ = runtime.warm_xcrun(xcrun, xcode::ANSWER_WITHIN);
-    Ok(daemon(cli, runtime)?.with_driver_report(driver))
+    let warm = xcrun.to_owned();
+    let warmed = std::sync::Once::new();
+    let apply = move |xcodes: &[xcode::Xcode]| {
+        let report = watched.apply_xcodes(xcodes);
+        // Once the first survey is applied, in the background and sandboxed as an
+        // action: xcrun fills its cache for the node's own Xcode and the ready ones
+        // while the node serves; each later survey warms the Xcodes it makes ready.
+        // Not before: the warm-up's lookups would make the survey's miss.
+        if xcodes.iter().all(|x| x.state != xcode::State::NotSurveyed) {
+            warmed.call_once(|| {
+                let _ = watched.warm_xcrun(&warm, xcode::ANSWER_WITHIN);
+            });
+        }
+        report
+    };
+    // Returns at once: the survey runs on the watch's thread.
+    let (driver, _) = xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
+    let daemon = daemon(cli, runtime)?.with_driver_report(driver.clone());
+    Ok((daemon, driver))
 }
+
+/// What the native driver's Xcode watch sends the daemon.
+type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
 /// Runs `daemon` until SIGTERM or SIGINT.
 fn serve<R: Runtime>(tokio: &tokio::runtime::Runtime, daemon: Daemon<R>) -> Result<(), Error> {
@@ -287,10 +303,30 @@ mod container {
 }
 
 #[cfg(test)]
+mod startup_tests;
+
+#[cfg(test)]
 mod tests {
+    use kbf_daemon::DriverReport;
     use kbf_proto::worker::XcodeState;
 
     use super::*;
+
+    /// The first report the watch sends with no Xcode left not surveyed, waited for up
+    /// to a minute.
+    pub(crate) async fn surveyed(reports: &mut Reports) -> DriverReport {
+        let pending = |r: &DriverReport| {
+            r.xcodes
+                .iter()
+                .any(|x| x.state() == XcodeState::NotSurveyed)
+        };
+        let surveyed = reports.wait_for(|r| !pending(r));
+        tokio::time::timeout(Duration::from_secs(60), surveyed)
+            .await
+            .expect("the first survey ends in time")
+            .expect("the watch runs")
+            .clone()
+    }
 
     fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
         let base = [
@@ -354,7 +390,7 @@ mod tests {
     }
 
     /// A fresh directory for one test, under the test binary's directory.
-    fn scratch(name: &str) -> PathBuf {
+    pub(crate) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::current_exe()
             .expect("test binary")
             .parent()
@@ -387,7 +423,7 @@ mod tests {
     /// so the node's `NodeStatus` lists no Xcode at all, ready or not, and its Hello
     /// advertises none: the silent removal an Xcode that is not ready must never get.
     /// The Xcode here is an empty app, which no `xcodebuild` accepts (on Linux there is
-    /// none), so it is listed as not ready, with why.
+    /// none), so the survey lists it as not ready, with why.
     #[tokio::test]
     async fn the_native_daemon_reports_every_installed_xcode() {
         let dir = scratch("native");
@@ -412,21 +448,26 @@ mod tests {
         let mut config = native_config(&cli).expect("config");
         // Not the runner's own (on macOS): the start sweeps them.
         config.user_folders = None;
-        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
+        let (daemon, mut reports) =
+            native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
+        // Not surveyed yet, or already surveyed (this one fails at once): either way
+        // listed. The gated tests (xcode_watch, startup_tests) hold the survey.
+        let listed = daemon.node_status().xcodes;
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].app, app.display().to_string());
+        let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].app, app.display().to_string());
         assert_eq!(xcodes[0].state(), XcodeState::Failed);
         assert!(!xcodes[0].reason.is_empty(), "{xcodes:?}");
-        drop(daemon);
+        drop((daemon, reports));
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
     /// Catches (CEO decision on issue #164): the native daemon removing `xcrun`'s cache
     /// before its first survey. Every `xcrun` lookup of the survey then has nothing
-    /// cached and takes seconds, while the node says nothing to the server: on the
-    /// macOS runner (15 `Xcode*.app`) that start took over the 30 s binary.rs allows,
-    /// against about 7 s with the cache kept. The survey runs under the sandbox, so
+    /// cached and takes seconds, while no Xcode is ready: on the macOS runner (15
+    /// `Xcode*.app`) that survey took over 30 s, against about 7 s with the cache kept. The survey runs under the sandbox, so
     /// what a lease wrote there reaches only sandboxed tools. The Xcode's own
     /// `xcodebuild` is a fake that answers a build saying whether it saw the cache.
     #[tokio::test]
@@ -469,15 +510,16 @@ mod tests {
         let mut config = native_config(&cli).expect("config");
         config.user_folders =
             kbf_driver_native::user_folders::UserFolders::new(temp.clone(), cache);
-        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
+        let (daemon, mut reports) =
+            native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
+        let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].build, "CACHE", "{xcodes:?}");
         assert!(
             temp.join("xcrun_db").exists(),
             "the start removed the cache"
         );
-        drop(daemon);
+        drop((daemon, reports));
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
@@ -487,7 +529,10 @@ mod tests {
     /// the daemon warms. The sandbox program is a fake that marks what it runs; the
     /// Xcode's `xcodebuild` and the `xcrun` are fakes that log each run and whether it
     /// was marked. The warm-up of the Xcode the survey finds ready runs too, also
-    /// sandboxed; the test waits for it to end.
+    /// sandboxed; the test waits for it to end. Also catches the warm-up not run, or
+    /// run before the survey's questions are answered (its lookups would make the
+    /// survey's miss): the fake `xcodebuild` answers after half a second, so a warm-up
+    /// started with the daemon logs before it.
     #[tokio::test]
     async fn the_daemons_survey_runs_under_the_sandbox() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -515,7 +560,7 @@ mod tests {
             .join(xcode::XCODEBUILD);
         write(
             &xcodebuild,
-            &format!("#!/bin/sh\n{logged}echo 'Build version 1A1'\n"),
+            &format!("#!/bin/sh\nsleep 0.5\n{logged}echo 'Build version 1A1'\n"),
         );
         let xcrun = dir.join("bin/xcrun");
         write(&xcrun, &format!("#!/bin/sh\n{logged}echo /x/clang\n"));
@@ -537,8 +582,8 @@ mod tests {
         // Not the runner's own (on macOS): the start sweeps them.
         config.user_folders = None;
         config.isolation = kbf_driver_native::network::Isolation::Sandbox(sandbox_exec);
-        let daemon = native_with(&cli, config, &xcrun).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
+        let (daemon, mut reports) = native_with(&cli, config, &xcrun).expect("the native daemon");
+        let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].state(), XcodeState::Ready, "{xcodes:?}");
         let leases = std::fs::canonicalize(dir.join("leases")).expect("real");
@@ -552,6 +597,21 @@ mod tests {
             .for_each(|_| std::thread::sleep(Duration::from_millis(20)));
         let ran = std::fs::read_to_string(&log).expect("ran");
         let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
+        let warmed = format!("xcrun {}", at(&warm, ""));
+        let asked = at(&survey, "");
+        assert!(
+            ran.lines().any(|l| l.starts_with(&warmed)),
+            "no warm-up: {ran}"
+        );
+        let asked_first = ran
+            .lines()
+            .take_while(|l| !l.starts_with(&warmed))
+            .filter(|l| l.contains(&asked))
+            .count();
+        assert_eq!(
+            asked_first, 4,
+            "the warm-up ran before the survey's answers: {ran}"
+        );
         // The survey's questions, asked at once, come before the warm-up's lookups.
         let mut surveyed: Vec<String> = ran
             .lines()
@@ -580,7 +640,7 @@ mod tests {
             .filter(|l| !l.contains(&*leases.to_string_lossy()))
             .collect();
         assert_eq!(unsandboxed, Vec::<&str>::new(), "{ran}");
-        drop(daemon);
+        drop((daemon, reports));
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

@@ -162,26 +162,38 @@ for which every question exits 0, each within a minute, is ready and is reported
 `-version` with exit 0, but `-license check` and every tool it runs (`xcrun`, `cc`,
 `swiftc`) exit 69, so it would fail every action placed on it.
 
+The daemon does not wait for its first survey before it says `Hello` (the survey
+can take seconds: each `xcrun` lookup the cache does not hold does, and after a reboot
+it holds none). Until that survey ends, the node's status lists each `Xcode*.app` it
+found as `not_surveyed`, and its node report advertises no Xcode, so nothing that
+names one is placed on it; when the survey ends the daemon sends its `Hello` and
+status again, with the Xcodes' states, without a restart. An Xcode not surveyed yet
+keeps whatever item its node's previous status gave it under `needs_attention` (a
+restarted daemon's broken Xcode stays listed, and is neither logged as resolved nor
+raised again by the survey that finds it unchanged); one with no previous item has
+none.
+
 An Xcode that is not ready is **not hidden**: the node's status lists every installed
 Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
 `metal_toolchain_missing`, `failed`), the question it failed with its answer, and the
 command that fixes it (for example `sudo
 /Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license accept`),
 and `GET /v1/nodes` lists it under the node's `needs_attention`
-([api.md](api.md#get-v1nodes)). The daemon and the server each log it at `WARN` once
-when it appears, and again only when its build, state or fix changes: a reason that
+([api.md](api.md#get-v1nodes)). The daemon (once per start) and the server each log
+it at `WARN` once when it appears, and again only when its build, state or fix
+changes: a reason that
 changes alone (`xcodebuild` starts its NSLog lines with the time and its pid) is not
 logged again, and is not by itself a change the daemon sends.
 The daemon asks again every three minutes (`--xcode-recheck-secs`), so an Xcode fixed
 while the daemon runs is advertised within minutes, without a restart, and one that
 stops being ready (an update whose new licence is not accepted) stops being advertised.
 
-A hung question is killed, so it cannot keep the node from starting. An answer counts
+A hung question is killed, so it cannot keep an Xcode not surveyed for long. An answer counts
 only once the program has exited and closed its output: one that exits but leaves a
 child holding its output open is not ready when the minute is up. Each Xcode is asked
 once (an app that links to another, such as `Xcode.app`, is listed with that one's
 answers), on a thread of its own, and its questions at once, so a hung Xcode delays
-the daemon's start (it says nothing to the server until its first survey is done) by
+the end of the survey (and the other Xcodes' readiness) by
 up to a minute (two with `--require-metal-toolchain`, whose `xcrun --find metal` is
 asked only after `-showComponent`), and the other Xcodes add nothing to that but
 for their `xcrun` lookups, which run one at a time (each rewrites `xcrun`'s whole
@@ -238,8 +250,8 @@ next lease reads. The daemon runs no developer tool outside the sandbox while it
 serves: it asks the Xcodes ([above](#xcode)) under the actions' sandbox, where
 `xcrun` reads and fills that cache as an action's would, and runs each Xcode's own
 `xcodebuild` rather than the `/usr/bin` one. It leaves the cache in place at start:
-without it every lookup of the first survey, which the daemon finishes before it
-connects, takes seconds. It warms the cache under the actions' sandbox too, at start for
+without it every lookup of the first survey takes seconds, and no Xcode is ready
+until that survey ends. It warms the cache under the actions' sandbox too, once its first survey ends for
 the node's own Xcode and the ready ones, and later for each Xcode that becomes ready.
 A tool that writes anywhere else (`/tmp`, a path
 under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule

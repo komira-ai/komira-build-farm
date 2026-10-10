@@ -351,8 +351,11 @@ in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that preda
 the message ignores it as an empty message; a daemon that predates it is listed
 without software, and a server that predates `xcodes` ignores it.
 
-When the driver's report changes mid-session (today: the native driver re-checks its
-Xcodes every few minutes, and one became ready or stopped being so), the daemon resends
+When the driver's report changes mid-session (today: the native driver's first
+survey of its Xcodes ended, which the daemon does not wait for before `Hello`, so its
+first `Hello` advertises no Xcode and its first `NodeStatus` lists each as
+`XCODE_STATE_NOT_SURVEYED`; or a later survey, every few minutes, found one became
+ready or stopped being so), the daemon resends
 its `Hello` on the stream if the node report changed (the server takes a resent
 `Hello` as the node's new report, so placement sees the new `xcode` entries), and then
 sends `NodeStatus` again. Re-detecting the other software mid-session is **planned**
