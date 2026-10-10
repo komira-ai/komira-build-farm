@@ -115,8 +115,9 @@ pub(crate) struct ContainerSpec {
 ///   container while the first exists ("not enough unused IDs in user namespace").
 ///   `--user=0:0` ([`CONTAINER_USER`]) whatever the image's `USER` says.
 /// - **Environment:** `--unsetenv-all`, then one `--env` per `Command` variable, so
-///   neither the image's `ENV`, Podman's defaults (`PATH`, `TERM`, `container`) nor a
-///   node's `containers.conf` `env` reaches the action. Podman (4.9) still adds two
+///   neither the image's `ENV`, Podman's defaults (`PATH`, `container`; `TERM` only
+///   with a tty, which an action never has) nor a node's `containers.conf` `env`
+///   reaches the action. Podman (4.9) still adds two
 ///   variables when the `Command` sets neither: `HOSTNAME=localhost` (the hostname
 ///   above) and `HOME`, uid 0's home in the image's `/etc/passwd`. Both follow from
 ///   the image digest, so they are the same on every node; a `Command` that sets

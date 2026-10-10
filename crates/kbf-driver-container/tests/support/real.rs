@@ -137,6 +137,10 @@ impl Cell {
     pub fn stdout(&self, result: &ActionResult) -> String {
         String::from_utf8(blob(&self.cas, result.stdout_digest.as_ref())).expect("utf-8")
     }
+
+    pub fn stderr(&self, result: &ActionResult) -> String {
+        String::from_utf8(blob(&self.cas, result.stderr_digest.as_ref())).expect("utf-8")
+    }
 }
 
 impl Drop for Cell {

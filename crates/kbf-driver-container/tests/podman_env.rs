@@ -33,8 +33,9 @@ fn env_action(env: &[(&str, &str)]) -> Spec {
 }
 
 /// Catches anything but the `Command`'s variables reaching the action (the "drop
-/// `--unsetenv-all`" mutant): the image's `PATH`, Podman's own `TERM` and `container`,
-/// and the node's `containers.conf` `env` would each appear. A `Command` that sets
+/// `--unsetenv-all`" mutant): the image's `PATH`, Podman's own `container`, and the
+/// node's `containers.conf` `env` would each appear (Podman sets `TERM` only for a tty,
+/// which an action never has). A `Command` that sets
 /// `HOME` and `HOSTNAME` (with a value holding a space and an `=` besides) gets
 /// exactly its variables. One that sets neither gets the two Podman adds whatever
 /// `--unsetenv-all` says: `HOSTNAME=localhost` and the busybox image's root home.
@@ -122,4 +123,44 @@ async fn the_default_limits_hold_inside_the_container() {
     assert_eq!(result.exit_code, 0, "{}", cell.stdout(&result));
     assert_eq!(cell.stdout(&result), expected(ContainerLimits::DEFAULT));
     cell.assert_clean(1);
+}
+
+/// Catches a program the container cannot start answered as the farm's fault: on
+/// real Podman and crun, a bare `argv[0]` in a Command without `PATH` (the container
+/// gets only the Command's environment), a bare name on a `PATH` that lacks it and a
+/// path that does not exist are the action's result, exit 127; a file without the
+/// executable bit and a directory are exit 126. Each with kbf's message naming the
+/// program and where it was looked up. The red run before the fix showed each as
+/// `RuntimeError::Failed` ("the container did not run to an exit").
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn a_program_the_container_cannot_start_is_the_actions_failure() {
+    let cell = Cell::new("program");
+    let action = |argv: &[&str], env: &[(&str, &str)]| {
+        let mut spec = env_action(env);
+        spec.argv = argv.iter().map(|a| (*a).to_owned()).collect();
+        spec.inputs = vec![("data", b"not a program", false)];
+        spec
+    };
+    let cases = [
+        (action(&["env"], &[]), 127, "the Command sets no PATH"),
+        (
+            action(&["no-such-tool"], &[("PATH", "/usr/bin:/bin")]),
+            127,
+            "PATH \"/usr/bin:/bin\"",
+        ),
+        (action(&["/no/such/tool"], &[]), 127, "was not found"),
+        (action(&["./data"], &[]), 126, "not an executable file"),
+        (action(&["/bin"], &[]), 126, "not an executable file"),
+    ];
+    for (seq, (spec, code, says)) in (1..).zip(cases) {
+        let result = cell.run(seq, &spec).await;
+        let result = result.unwrap_or_else(|e| panic!("{:?}: {e:?}", spec.argv));
+        let stderr = cell.stderr(&result);
+        assert_eq!(result.exit_code, code, "{:?}: {stderr}", spec.argv);
+        assert!(stderr.starts_with("kbf: "), "{stderr}");
+        assert!(stderr.contains(&format!("`{}`", spec.argv[0])), "{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        cell.assert_clean(seq);
+    }
 }
