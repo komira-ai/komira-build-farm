@@ -15,7 +15,8 @@
 //! its deletion closed).
 //!
 //! Callers must have ended every process of the uid first (`user-delete` refuses
-//! otherwise), so nothing of the departing user races the walk.
+//! otherwise; `kill-uid` sweeps the crontab and `at` jobs only after its kill), so
+//! nothing of the departing user races the walk.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
