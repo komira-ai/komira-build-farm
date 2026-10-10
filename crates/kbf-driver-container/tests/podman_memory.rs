@@ -59,6 +59,20 @@ fn require_swap() {
     );
 }
 
+/// What the lease cgroup `lease` holds and counts now, for a failure message.
+fn state(lease: &Path) -> String {
+    let read = |f: &str| {
+        std::fs::read_to_string(lease.join(f))
+            .map_or_else(|e| format!("({e})"), |t| t.trim().replace('\n', ","))
+    };
+    format!(
+        "memory.current {}, memory.swap.current {}, memory.events {}",
+        read("memory.current"),
+        read("memory.swap.current"),
+        read("memory.events")
+    )
+}
+
 /// Waits until a process whose command name is `comm` runs anywhere under `lease`.
 async fn wait_for(lease: &Path, comm: &str) {
     for _ in 0..1200 {
@@ -204,17 +218,28 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     spec.timeout = Some(Duration::from_secs(60));
     let action = store_action(&cell.cas, &spec);
     let started = Instant::now();
-    let outcome = cell
-        .runtime
-        .run(cell.work(1, action, Resources::new(1000, 16 * MIB)))
-        .await;
+    let runtime = Arc::clone(&cell.runtime);
+    let work = cell.work(1, action, Resources::new(1000, 16 * MIB));
+    let mut first = tokio::spawn(async move { runtime.run(work).await });
+    // What the lease looked like each second, for the failure message.
+    let lease = cell.cgroup.join(cell.name(1));
+    let mut seen = Vec::new();
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut first => break outcome.expect("join"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                seen.push(format!("{:?}: {}", started.elapsed(), state(&lease)));
+            }
+        }
+    };
     let took = started.elapsed();
     let want = cap(16 * MIB);
     // `used` is RAM plus swap at the kill: past the cap by more than the floor.
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used, limit })
             if limit == want && used > want + 128 * MIB),
-        "{outcome:?}"
+        "{outcome:?}\n{}",
+        seen.join("\n")
     );
     assert!(took < Duration::from_secs(20), "killed after {took:?}");
     println!("killed {took:?} after the start: {outcome:?}");
@@ -272,7 +297,8 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
     let swapped = read_u64(&lease, "memory.swap.current");
     assert!(
         swapped > FLOOR,
-        "the premise: the lease holds more than the watch's floor in swap: {swapped}"
+        "the premise: the lease holds more than the watch's floor in swap: {}",
+        state(&lease)
     );
     let events = std::fs::read_to_string(lease.join("memory.events")).expect("memory.events");
     assert!(
