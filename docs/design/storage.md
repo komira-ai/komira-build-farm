@@ -60,7 +60,9 @@ location in any other store fails `INTERNAL`.
 The front reaches it only through the `MetaLog` trait: `commit` a command and get back
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
 lock in the server process. A replicated log (**planned**) implements the same two
-calls: `commit` proposes and resolves after apply, `query` runs on the leader.
+calls: `commit` proposes and resolves after apply (on a follower, it sends the command
+to the leader), and `query` runs on the server's own applied state, behind a read
+index where a stronger guarantee is needed.
 
 ### Three answers, not two
 
@@ -243,9 +245,18 @@ each with a plain bucket and an Object Lock bucket.
   local disk, with its snapshots: one voter first, three on three hosts later
   ([deployment-topology.md](deployment-topology.md)). Whether snapshots are also copied
   to the object store, so a lost host can be rebuilt, is an open question there.
-  Every REAPI request reaches the leader, so answers that need fresh state (an
-  action-cache hit, "absent" on a read path) come from it; if it cannot be reached the
-  answer is `UNAVAILABLE`, never a guess.
+  The first deployment is one server. At three servers, any server ready to serve
+  reads answers `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and
+  `GetActionResult` from the metadata it has applied, and accepts upload bytes: it
+  verifies them and writes the segments to the object store, then sends the leader
+  the metadata commit. Only the leader commits; a read's touch is sent to it the same
+  way. A follower may be behind, so it may answer a false "missing" (the client
+  uploads again; harmless), but never a false "present": object collection's grace
+  period far exceeds the replication lag, so the bytes of a blob a lagging follower
+  still lists are still in the store, and where a stronger guarantee is needed the
+  follower waits until it has applied up to the leader's commit index (a read index). If the leader cannot be reached, an upload's
+  commit or a read index fails `UNAVAILABLE`, never a guess
+  ([deployment-topology.md](deployment-topology.md#reads-and-uploads-on-every-server)).
 - **Garbage collection.** Collection marks space dead; a segment is deleted only when no
   entry uses it, through a condemn step with a delay during which any touch revives it.
   Sparse segments are compacted. A periodic sweep removes orphan objects by comparing
@@ -258,4 +269,4 @@ each with a plain bucket and an Object Lock bucket.
   change plus a background copy.
 - **Compression.** zstd for ByteStream, advertised only once reads and writes decode it.
 - **Locality.** Daemons keep a local cache of hot inputs and report what they hold, and
-  the leader caches hot blobs above the object store.
+  each server caches hot blobs above the object store.

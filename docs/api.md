@@ -165,7 +165,7 @@ otherwise; the body lists each failing check and why:
 | Check | Fails when |
 |---|---|
 | `stopping` | the server has received SIGTERM or SIGINT. It answers `503` from that moment, before its REAPI streams are ended, and for the rest of its drain (`--shutdown-timeout-secs`) |
-| `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers are not ready |
+| `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
