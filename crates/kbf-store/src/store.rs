@@ -193,7 +193,9 @@ impl<F: Fs> Store<F> {
             if seg.first == 0 || seg.first > last + 1 {
                 return Err(corrupt(&seg.name, 0, "segment does not continue the log"));
             }
-            entries.truncate(usize::try_from(seg.first - 1).map_err(io::Error::other)?);
+            while entries.last().is_some_and(|e| e.id.index.0 >= seg.first) {
+                entries.pop();
+            }
             let bytes = fs.read(&seg.name)?;
             let is_last = k + 1 == segments.len();
             let mut off = 0;
