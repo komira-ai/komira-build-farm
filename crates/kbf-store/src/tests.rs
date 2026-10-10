@@ -349,6 +349,10 @@ fn open_refuses_files_that_do_not_form_one_log() {
         ("bad name", vec![("1-1.log".to_owned(), Vec::new())]),
         ("no dash", vec![("1.log".to_owned(), Vec::new())]),
         (
+            "short first index",
+            vec![(format!("{:020}-1.log", 1), Vec::new())],
+        ),
+        (
             "hard state trailing bytes",
             vec![(HARD_STATE.to_owned(), {
                 let mut b = record(&crate::record::encode_hard(hard(1, None)));
