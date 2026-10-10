@@ -137,6 +137,17 @@ CPU weight, from the booking; a lease that keeps pressing that cap while its swa
 keeps rising, and that holds more than 512 MiB or 25% of its booking in swap,
 whichever is more (the node's defaults), is killed as out of memory.
 
+The booking is where an action starts, not always where it runs. When a daemon reports
+that the action passed its own memory limit, the server runs it again with the memory
+booking doubled (1, 2, 4 GiB, ...), up to the largest node that could run it, and
+remembers the raised booking for the action (its instance name and action digest), so
+the next run of the same action starts there; only a kill at the largest node reaches
+the client, as `FAILED_PRECONDITION` saying the action needs more memory than any node
+offers. A node that kills the action under its own memory pressure reruns it with the
+same booking. See [scheduler.md](design/scheduler.md#memory-kills). Both drivers say
+which memory ran out: the native driver's memory watch and the container driver's
+lease cap are the action's own limit.
+
 ```starlark
 # Bazel: a link step that needs 4 cores and 12 GiB
 cc_binary(

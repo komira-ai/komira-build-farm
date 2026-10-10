@@ -20,6 +20,9 @@
 // - Hello.instance_id: which daemon process registered the node (issue #140).
 // - NodeStatus.xcodes: every installed Xcode with its readiness (issue #164); a daemon
 //   resends Hello and NodeStatus mid-stream when an Xcode becomes ready or stops being so.
+// - Result.memory_kill: which memory ran out when a lease was killed for memory
+//   (docs/design/failure-classes.md, 6.1). The native and container drivers set it; a
+//   Result without it is read as before.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -298,10 +301,10 @@ message Result {
   // operation it granted the lease for. Unset: not checked (a daemon that predates
   // this field, or a lease whose Start the daemon never saw).
   build.bazel.remote.execution.v2.Digest action_digest = 4;
-  // Why the lease was killed, when it was killed for memory. Meaningful only on a
-  // Result whose status is not OK. Unspecified: not killed for memory, or not known,
-  // and the status code alone decides. What a server does with it is
-  // docs/design/failure-classes.md, 6.1; this tree's server does not read it yet.
+  // Why the lease was killed, when it was killed for memory. Read only on a Result
+  // whose status is not OK, and then in place of the status code: the server runs the
+  // action again (docs/design/failure-classes.md, 6.1). Unspecified: not killed for
+  // memory, or not known, and the status code alone decides.
   MemoryKill memory_kill = 5;
 }
 
@@ -311,11 +314,15 @@ enum MemoryKill {
   MEMORY_KILL_UNSPECIFIED = 0;
   // The action passed its own memory limit, and was killed for it: the native
   // driver's memory watch, the kernel's OOM killer at the container lease's cap, or
-  // the container driver's swap watch at that cap. The booking was too small.
+  // the container driver's swap watch at that cap. The booking was too small: the
+  // server runs it again with its memory booking doubled, up to the largest node, and
+  // remembers the raised booking for its action key; at the largest node it answers
+  // the client that the action needs more memory than any node offers.
   MEMORY_KILL_OWN_LIMIT = 1;
   // The node killed it for memory while it was under its own limit: a node-wide
   // out-of-memory kill, or the node's backstop for all actions. The busy node's fault,
-  // not the booking's.
+  // not the booking's: the server runs it again with the same booking and counts the
+  // kill against the node. It never raises the booking.
   MEMORY_KILL_NODE_PRESSURE = 2;
 }
 
@@ -324,7 +331,8 @@ enum MemoryKill {
 // next stream and lists the lease in Heartbeat.running (issue #26).
 message ResultAck {
   LeaseId lease_id = 1;
-  // Whether this Result became the operation's result. False when the lease is
+  // Whether this Result became the operation's result, or was a memory kill the server
+  // took (memory_kill set: the operation runs again, or is answered). False when the lease is
   // unknown, held by another node, or no longer the operation's current lease (it was
   // given up and granted again), and for a copy of a Result that was already accepted
   // (its operation is finished). A refused result is never written to the action

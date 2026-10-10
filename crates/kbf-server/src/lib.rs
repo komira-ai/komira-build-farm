@@ -11,7 +11,9 @@
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
 //!   need the token of `--api-token-file` ([`token`]). On the same listener,
-//!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]).
+//!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]); the
+//!   REAPI listener answers the same readiness over `grpc.health.v1`
+//!   ([`grpc_health`]).
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
@@ -41,9 +43,11 @@ mod build_commit;
 pub mod config;
 pub mod farm;
 pub mod fleet;
+pub mod grpc_health;
 pub mod health;
 pub mod identity;
 pub mod mdm;
+mod memory;
 pub mod rollout;
 pub mod serve;
 mod stamp;

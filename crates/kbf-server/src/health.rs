@@ -14,6 +14,9 @@
 //! The routes are served by the same future as the REAPI and worker listeners, which
 //! are bound before it runs and stop when it returns, so an answer from either route
 //! means both listeners are bound.
+//!
+//! The REAPI listener answers the same readiness over `grpc.health.v1` ([`failing`] is
+//! the one evaluation both use; see [`crate::grpc_health`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,10 +45,12 @@ pub const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What `/readyz` reads besides the store: whether a stop signal has come, and
 /// whether this server holds the scheduler role. Shared by the serving future, which
-/// sets it, and the route, which reads it.
+/// sets it, and the route and the gRPC health service, which read it. Every change is
+/// announced to [`Readiness::subscribe`]rs, so a health `Watch` answers it at once.
 pub struct Readiness {
     stopping: AtomicBool,
     leader: AtomicBool,
+    changed: tokio::sync::watch::Sender<()>,
 }
 
 impl Default for Readiness {
@@ -55,6 +60,7 @@ impl Default for Readiness {
         Self {
             stopping: AtomicBool::new(false),
             leader: AtomicBool::new(true),
+            changed: tokio::sync::watch::Sender::new(()),
         }
     }
 }
@@ -63,6 +69,7 @@ impl Readiness {
     /// A stop signal has been received: `/readyz` answers 503 from now on.
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        self.changed.send_replace(());
     }
 
     /// Whether a stop signal has been received.
@@ -75,12 +82,20 @@ impl Readiness {
     /// yet; it is the hook for a replicated control log, whose followers are not ready.
     pub fn set_leader(&self, leader: bool) {
         self.leader.store(leader, Ordering::SeqCst);
+        self.changed.send_replace(());
     }
 
     /// Whether this server holds the scheduler role.
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.leader.load(Ordering::SeqCst)
+    }
+
+    /// A receiver that is marked changed whenever [`Readiness::stop`] or
+    /// [`Readiness::set_leader`] runs after this call.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
     }
 }
 
@@ -147,25 +162,7 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let mut failing = Vec::new();
-    if health.readiness.is_stopping() {
-        failing.push(Failing {
-            check: "stopping",
-            reason: "a stop signal was received; the server is shutting down".to_owned(),
-        });
-    }
-    if !health.readiness.is_leader() {
-        failing.push(Failing {
-            check: "leader",
-            reason: "this server does not hold the scheduler role".to_owned(),
-        });
-    }
-    if let Err(reason) = probe_store(&health.cache, health.timeout).await {
-        failing.push(Failing {
-            check: "store",
-            reason,
-        });
-    }
+    let failing = failing(&health.cache, &health.readiness, health.timeout).await;
     let ready = failing.is_empty();
     let code = if ready {
         StatusCode::OK
@@ -179,6 +176,40 @@ where
         failing,
     };
     json(code, &body)
+}
+
+/// The checks of `/readyz` that fail now, in the order the route lists them; empty
+/// when the server is ready. Probes `cache`'s store once ([`probe_store`]), waiting at
+/// most `timeout`.
+pub async fn failing<M, O>(
+    cache: &Cache<M, O>,
+    readiness: &Readiness,
+    timeout: Duration,
+) -> Vec<Failing>
+where
+    M: MetaLog,
+    O: ObjectStore,
+{
+    let mut failing = Vec::new();
+    if readiness.is_stopping() {
+        failing.push(Failing {
+            check: "stopping",
+            reason: "a stop signal was received; the server is shutting down".to_owned(),
+        });
+    }
+    if !readiness.is_leader() {
+        failing.push(Failing {
+            check: "leader",
+            reason: "this server does not hold the scheduler role".to_owned(),
+        });
+    }
+    if let Err(reason) = probe_store(cache, timeout).await {
+        failing.push(Failing {
+            check: "store",
+            reason,
+        });
+    }
+    failing
 }
 
 /// Reads the first byte of [`PROBE_KEY`] under `cache`'s prefix, waiting at most

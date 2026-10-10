@@ -230,7 +230,7 @@ fetching inputs on an offer is **planned**.
 | `kind` | the lease kind, the value of the platform property `kbf-lease`: `action` (default) or `whole_machine` |
 | `action_digest` | the action to run; its inputs are fetched from the CAS; the lease's `Result` echoes it |
 | `millicpus` | CPU booked for the lease, in thousandths of a CPU; 0 means not booked |
-| `memory_bytes` | memory booked for the lease; 0 means not booked |
+| `memory_bytes` | memory booked for the lease; 0 means not booked. A run after a memory kill books the raised amount ([scheduler.md](scheduler.md#memory-kills)) |
 | `heartbeat_seq` | the newest heartbeat of this stream the server had taken when it sent the `Start`; 0 before the first, which names the stream's `Hello` |
 | `valid_for_ms` | how long after sending that heartbeat (or `Hello`) the daemon may still act on the `Start`: 14 000; 0 means no bound |
 
@@ -274,7 +274,8 @@ is not running changes nothing.
 
 ### `Result` and `ResultAck`
 
-`Result { lease_id, status, action_result, action_digest }` reports one lease.
+`Result { lease_id, status, action_result, action_digest, memory_kill }` reports one
+lease.
 `action_digest` echoes the `Start`'s (unset for a lease whose `Start` the daemon did
 not keep, and from a daemon that predates the field). `status` is `OK` when
 the action ran, whatever its exit code, and then `action_result` is set; otherwise it
@@ -290,6 +291,24 @@ says why the action could not run:
 | `UNAVAILABLE` | contact was lost before the lease started |
 | `INTERNAL` | the farm failed (a kernel OOM kill, a lost container, a dirty node) |
 
+`memory_kill` says which memory ran out when the lease was killed for memory. The
+server reads it only on a `Result` whose status is not `OK`, and then in place of the
+status code ([failure-classes.md](failure-classes.md), 6.1; the scheduler's rules are
+in [scheduler.md](scheduler.md#memory-kills)):
+
+| `memory_kill` | Meaning | What the server does |
+|---|---|---|
+| `MEMORY_KILL_UNSPECIFIED` (0) | not killed for memory, or not known | the status code decides, as above |
+| `MEMORY_KILL_OWN_LIMIT` (1) | the action passed its own memory limit (the lease's cap) and was killed for it | runs it again with its memory booking doubled, up to the largest node, and keeps the raised booking as its action key's floor; at the largest node, answers that the action needs more memory than any node offers |
+| `MEMORY_KILL_NODE_PRESSURE` (2) | the node killed it while it was under its own limit: a node-wide out-of-memory kill, or the node's backstop | runs it again with the same booking (twice at most) and counts the kill against the node; never raises the booking |
+
+The daemon sets `memory_kill` from its driver's error: the native driver's memory
+watch sends `RESOURCE_EXHAUSTED` with `MEMORY_KILL_OWN_LIMIT`; the container driver
+reads the lease cgroup's `memory.events` and sends `RESOURCE_EXHAUSTED` with
+`MEMORY_KILL_OWN_LIMIT` for a kill at the lease's own cap, or `UNAVAILABLE` with
+`MEMORY_KILL_NODE_PRESSURE` for a kill by the node's `actions/` limit or the host
+([failure-classes.md](failure-classes.md), 6.1). Every other `Result` sends 0.
+
 The server accepts at most one `Result` per operation, only from the node holding
 the operation's current lease, and only if the `Result` names no action other than the
 one that lease runs. An `OK` result must have every output already in the
@@ -300,9 +319,12 @@ to the action cache, unless the action is `do_not_cache`, **before** the operati
 callers are answered.
 
 The server answers every `Result` that names a lease with `ResultAck { lease_id,
-accepted }`. `accepted` is false when the lease is unknown (a lease of another
+accepted }`. `accepted` is true when the `Result` became the operation's result, and
+for a memory kill the scheduler took (the operation then runs again, or is answered).
+It is false when the lease is unknown (a lease of another
 process is), held by another node, no longer the operation's current lease, when the
 `Result` names another action, or when the operation already finished (a duplicate).
+A copy of a memory kill already taken is refused: its lease is no longer current.
 A refused result never reaches the action cache.
 
 Until a daemon receives the `ResultAck` for a lease, it keeps the `Result`:

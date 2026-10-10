@@ -18,7 +18,10 @@ The two meet only through the metadata, which the server carries with the reques
 
 The policy covers the REAPI listener (`--listen`) and nothing else. The worker
 listener keeps its own mutual TLS and deny list, and the operator API its own token
-([api.md](api.md)); neither reads the policy file.
+([api.md](api.md)); neither reads the policy file. On the REAPI listener, the
+`grpc.health.v1.Health` service is answered without the policy, so a proxy's health
+check needs no credentials ([api.md](api.md#grpchealthv1-on-the-reapi-listener));
+every other call, a path the listener does not serve included, runs it.
 
 **Without a policy file, nothing changes:** every call is accepted with empty
 metadata and every authorizer allows. A farm whose front already limits who can
