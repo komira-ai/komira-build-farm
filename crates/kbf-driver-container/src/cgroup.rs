@@ -457,6 +457,9 @@ mod tests {
         assert_eq!(classify(events(3, 1, 2)), Some(OomKill::OwnCap));
         assert_eq!(classify(events(0, 0, 1)), Some(OomKill::BusyNode));
         assert_eq!(classify(events(5, 0, 1)), Some(OomKill::BusyNode));
+        // `oom` without `max` is a count the kernel does not give (the OOM killer runs
+        // for a limit only once usage reached it); it is not read as the lease's own.
+        assert_eq!(classify(events(0, 1, 1)), Some(OomKill::BusyNode));
         assert_eq!(classify(events(5, 1, 0)), None);
         assert_eq!(classify(events(0, 0, 0)), None);
     }

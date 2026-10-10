@@ -405,6 +405,55 @@ async fn exit_137_is_an_oom_only_with_a_kernel_oom_event() {
     fake.assert_clean(5);
 }
 
+/// Catches a busy node's kill that does not say whether `actions/`'s own limit ran the
+/// OOM killer during the lease (its `memory.events.local` `oom` grew), and an
+/// out-of-memory kill whose `memory.peak` cannot be read reported with a usage below
+/// the cap it reached.
+#[tokio::test]
+async fn a_memory_kill_says_whose_limit_ran_out() {
+    let fake = Fake::new("oom-whose");
+    let spec = Spec::new(&image(), "unused");
+    let local = fake.cgroup.join("actions/memory.events.local");
+    let busy = r#"printf 'max 0\noom 0\noom_kill 1\n' > "$CG/memory.events""#;
+
+    std::fs::write(&local, "low 0\noom 4\noom_kill 9\n").expect("write");
+    let grew = format!(r#"{busy}; printf 'oom 6\n' > "$CG/../memory.events.local"; exit 137"#);
+    let outcome = fake.run(1, &spec, &grew).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::BusyNode(ref why))
+            if why.contains("ran 2 time(s) for the actions/ cgroup's own limit")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
+
+    let outcome = fake.run(2, &spec, &format!("{busy}; exit 137")).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::BusyNode(ref why))
+            if why.contains("did not run for the actions/ cgroup's own limit")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(2);
+
+    std::fs::write(&local, "garbled\n").expect("write");
+    let outcome = fake.run(3, &spec, &format!("{busy}; exit 137")).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::BusyNode(ref why))
+            if why.contains("memory.events.local could not be read")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(3);
+
+    let cap = (3u64 << 29) + (512 << 20);
+    let own = r#"printf 'max 2\noom 1\noom_kill 1\n' > "$CG/memory.events"
+        echo n/a > "$CG/memory.peak"; exit 137"#;
+    let outcome = fake.run(4, &spec, own).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::OutOfMemory { used, limit }) if used == cap && limit == cap),
+        "{outcome:?}"
+    );
+    fake.assert_clean(4);
+}
+
 /// Catches Podman's own failures being reported as the action's result.
 #[tokio::test]
 async fn podman_failures_are_infrastructure_failures() {
