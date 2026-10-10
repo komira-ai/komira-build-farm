@@ -104,7 +104,7 @@ impl LeaseCgroup {
 
     /// The counters of this cgroup's `memory.events` (this cgroup and below).
     pub(crate) fn events(&self) -> io::Result<MemoryEvents> {
-        let events = std::fs::read_to_string(self.dir.join("memory.events"))
+        let events = std::fs::read_to_string(self.dir.join("memory.events.local"))
             .map_err(|e| io::Error::new(e.kind(), format!("read memory.events: {e}")))?;
         MemoryEvents::parse(&events)
     }
