@@ -38,11 +38,8 @@ const REMOVE_PAUSE: Duration = Duration::from_millis(50);
 /// was booked, as there.
 #[must_use]
 pub fn memory_max(memory_bytes: u64) -> Option<u64> {
-    (memory_bytes > 0).then(|| {
-        memory_bytes
-            .saturating_add(memory_bytes / 2)
-            .saturating_add(HEADROOM)
-    })
+    let _ = HEADROOM;
+    (memory_bytes > 0).then_some(memory_bytes)
 }
 
 /// The `cpu.weight` for a lease that booked `cpu_millis`: one core is the kernel's
