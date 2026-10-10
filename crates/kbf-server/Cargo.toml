@@ -42,6 +42,8 @@ libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+# The codec of the table test that calls every REAPI method by path (tests/reapi_auth.rs).
+tonic-prost.workspace = true
 
 [lints]
 workspace = true

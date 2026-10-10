@@ -1469,6 +1469,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tonic-prost",
  "tracing",
  "tracing-subscriber",
  "x509-parser",

@@ -15,6 +15,7 @@ use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::farm::Farm;
 use crate::identity::{DenyList, Peers};
+use crate::principal::TokenStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 
@@ -23,6 +24,9 @@ use crate::worker::WorkerService;
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
+    /// The token file every REAPI call is checked against ([`crate::reapi_auth`]);
+    /// `None` checks no credential, for a listener only trusted callers reach.
+    pub reapi_tokens: Option<Arc<TokenStore>>,
     /// The `kbf.worker.v1` listener (daemons).
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
@@ -214,6 +218,10 @@ where
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
     let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm), closing);
+    let reapi_routes = match listeners.reapi_tokens {
+        Some(tokens) => crate::reapi_auth::authenticated(reapi_routes, tokens),
+        None => reapi_routes,
+    };
 
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();

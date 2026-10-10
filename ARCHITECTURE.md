@@ -268,12 +268,16 @@ plain-text gRPC behind the front, bound to loopback (front on the same host) or 
 the mesh interface, whose traffic WireGuard already encrypts.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
-  text, checks no credential and accepts any bind address. Whoever reaches the port
-  can read action inputs and outputs, write the CAS and Execute actions.
-- **Planned:** bearer-token authentication, checked by `kbf-server` itself behind the
-  front; the front passes the `Authorization` header through and does not check it.
-  The caller's identity decides its role. A peer address does not identify a caller
-  here: a proxy on the same host connects from loopback, whoever its client is.
+  text and accepts any bind address. Without `--reapi-token-file` it checks no
+  credential: whoever reaches the port can read action inputs and outputs, write the
+  CAS and Execute actions, so bind it to loopback.
+- **Bearer tokens** (`--reapi-token-file`, [docs/reapi-auth.md](docs/reapi-auth.md)):
+  every REAPI call must carry `Authorization: Bearer <token>` for a token the file
+  admits, checked by `kbf-server` itself behind the front; the front passes the header
+  through and does not check it. The token's principal sets the QoS its work is queued
+  at. A peer address does not identify a caller here: a proxy on the same host
+  connects from loopback, whoever its client is. Daemons send no token on `--cas`
+  today, so they cannot use a listener that requires one (see the last point below).
 - **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
   bind that other machines could reach, and allows the front's hop: loopback, or an
   address the operator names as the front's.

@@ -50,6 +50,12 @@ pub mod kbf {
     }
 }
 
+/// The compiled files, every one `build.rs` generates code for and their imports, as
+/// an encoded `google.protobuf.FileDescriptorSet` (`prost_types::FileDescriptorSet`):
+/// the services and methods a listener can serve, for tests that must cover them all.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/kbf_descriptors.bin"));
+
 /// The Remote Execution API v2, under a short name.
 pub use build::bazel::remote::execution::v2 as reapi;
 /// The `kbf.worker.v1` protocol, under a short name.

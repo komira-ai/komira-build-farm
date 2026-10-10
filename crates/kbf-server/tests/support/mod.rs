@@ -29,6 +29,7 @@ use kbf_proto::worker::{
     Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, ResultAck,
     ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
 };
+use kbf_server::principal::TokenStore;
 use kbf_server::token::ApiToken;
 use kbf_server::{Api, Bound, Listeners, ServeError, bind_server, bind_server_with_api};
 use prost::Message;
@@ -145,6 +146,10 @@ pub struct Cell {
     pub api: Option<SocketAddr>,
     /// The operator API's configuration, kept for a restart.
     api_config: Option<Api>,
+    /// Where the REAPI listener is.
+    pub reapi: SocketAddr,
+    /// The REAPI token file, kept for a restart.
+    reapi_tokens: Option<Arc<TokenStore>>,
     /// Stops the server; taken by [`Cell::cold_restart`], sent on drop otherwise.
     stop: Option<oneshot::Sender<()>>,
     /// Answers once the server's runtime, and every task on it, is gone.
@@ -191,7 +196,15 @@ impl Cell {
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
-        Self::serve(Self::cold_cache(&store), store, None, wait, retention).await
+        Self::serve(Self::cold_cache(&store), store, None, None, wait, retention).await
+    }
+
+    /// A cell whose REAPI listener checks every call against `tokens`.
+    pub async fn start_with_reapi_tokens(tokens: Arc<TokenStore>) -> Self {
+        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        let cache = Self::cold_cache(&store);
+        Self::serve(cache, store, None, Some(tokens), wait, retention).await
     }
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
@@ -202,7 +215,15 @@ impl Cell {
             token: Some(api_token()),
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(Self::cold_cache(&store), store, Some(api), wait, retention).await
+        Self::serve(
+            Self::cold_cache(&store),
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+        )
+        .await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -215,7 +236,16 @@ impl Cell {
     pub async fn restart(&self) -> Self {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
-        Self::serve(cache, store, self.api_config.clone(), wait, retention).await
+        let tokens = self.reapi_tokens.clone();
+        Self::serve(
+            cache,
+            store,
+            self.api_config.clone(),
+            tokens,
+            wait,
+            retention,
+        )
+        .await
     }
 
     /// Stops this server, waits until its runtime and every task on it are gone (each
@@ -230,6 +260,7 @@ impl Cell {
         let stop = self.stop.take().expect("the server is running");
         let stopped = self.stopped.take().expect("the server is running");
         let (store, api_config) = (self.store.clone(), self.api_config.clone());
+        let tokens = self.reapi_tokens.clone();
         drop(self);
         stop.send(()).expect("the server is running");
         timeout(PROMPT * 4, stopped)
@@ -238,7 +269,7 @@ impl Cell {
             .expect("the old server stops cleanly");
         let cache = Self::cold_cache(&store);
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, api_config, wait, retention).await
+        Self::serve(cache, store, api_config, tokens, wait, retention).await
     }
 
     /// A new cache over `store`: an empty metadata log, and objects under
@@ -254,11 +285,13 @@ impl Cell {
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
         api_config: Option<Api>,
+        reapi_tokens: Option<Arc<TokenStore>>,
         wait: Duration,
         retention: Duration,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
+            reapi_tokens: reapi_tokens.clone(),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker_tls: None,
             heartbeat_interval: INTERVAL,
@@ -308,6 +341,8 @@ impl Cell {
             store,
             api,
             api_config,
+            reapi,
+            reapi_tokens,
             stop: Some(stop),
             stopped: Some(stopped),
             client: Client::connect(reapi, worker).await,

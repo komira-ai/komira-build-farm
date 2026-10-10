@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -13,6 +14,7 @@ use kbf_types::Qos;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::identity::{DenyList, DenyListError};
+use crate::principal::{TokenStore, TokenStoreError};
 use crate::serve::{Api, Listeners, WorkerTls};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -72,6 +74,17 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// A token file of REAPI client principals, one `<principal> client <qos>
+    /// sha256:<hex>` line per token (`kbf-server hash-token` prints one; format in
+    /// docs/reapi-auth.md). With it, every REAPI call must present `Authorization:
+    /// Bearer <token>` for a token the file admits, and Execute submits at that
+    /// principal's QoS. The file must be owned by the server's user with mode 0600 or
+    /// 0400, or the server refuses to start; edits (written to a new file and renamed
+    /// over it) take effect within a second, and while it is unusable every call is
+    /// refused. Without it, REAPI calls are not authenticated: bind --listen where
+    /// only trusted callers reach it (loopback).
+    #[arg(long)]
+    pub reapi_token_file: Option<PathBuf>,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]
@@ -173,13 +186,16 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The REAPI token file is refused.
+    #[error("--reapi-token-file: {0}")]
+    ReapiTokens(#[source] TokenStoreError),
 }
 
 impl Args {
     /// The listeners these flags describe.
     ///
     /// # Errors
-    /// A TLS file cannot be read.
+    /// A TLS file cannot be read, or the deny list or the REAPI token file is refused.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         let worker_tls = match (
             &self.worker_tls_cert,
@@ -198,8 +214,16 @@ impl Args {
             }),
             _ => None,
         };
+        let reapi_tokens = self
+            .reapi_token_file
+            .as_deref()
+            .map(TokenStore::open)
+            .transpose()
+            .map_err(ConfigError::ReapiTokens)?
+            .map(Arc::new);
         Ok(Listeners {
             reapi: self.listen,
+            reapi_tokens,
             worker: self.worker_listen,
             worker_tls,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),

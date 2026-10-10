@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use prost::Message as _;
+
 /// The files to generate code for. Their imports are resolved from the include roots
 /// and generated too; well-known `google.protobuf` types map to `prost-types`.
 const FILES: &[&str] = &[
@@ -27,6 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let descriptors = protox::compile(FILES, includes)?;
+    // `FILE_DESCRIPTOR_SET` in lib.rs: the services and methods, for tests that must
+    // cover every method a listener serves.
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    std::fs::write(out.join("kbf_descriptors.bin"), descriptors.encode_to_vec())?;
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)

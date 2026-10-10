@@ -44,6 +44,7 @@ impl Farm {
         let cache = Arc::new(Cache::memory());
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
+            reapi_tokens: None,
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker_tls: Some(WorkerTls {
                 server: pki.server_tls(),

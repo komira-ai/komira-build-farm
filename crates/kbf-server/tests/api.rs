@@ -86,6 +86,7 @@ fn start() -> Server {
 fn start_with(token: Option<ApiToken>) -> Server {
     let listeners = Listeners {
         reapi: loopback(),
+        reapi_tokens: None,
         worker: loopback(),
         worker_tls: None,
         heartbeat_interval: INTERVAL,
@@ -333,6 +334,7 @@ async fn an_api_address_in_use_is_refused() {
     let addr = taken.local_addr().expect("its address");
     let listeners = Listeners {
         reapi: loopback(),
+        reapi_tokens: None,
         worker: loopback(),
         worker_tls: None,
         heartbeat_interval: INTERVAL,

@@ -22,10 +22,12 @@
 //!   the action cache, before the callers are answered. Clients never write it.
 //!
 //! - REAPI client principals ([`principal`]): the token file format, its file rules
-//!   and reload, and `kbf-server hash-token`. No listener reads it yet.
+//!   and reload, and `kbf-server hash-token`. With `--reapi-token-file`, every REAPI
+//!   call needs a bearer token the file admits ([`reapi_auth`]), and Execute submits
+//!   at the principal's QoS; without it, REAPI calls are not authenticated.
 //!
 //! Not yet: Raft (the control log is in-process: a record commits as soon as it is
-//! appended, see [`farm`]), authentication of REAPI clients, operator roles (the
+//! appended, see [`farm`]), REAPI roles (every principal is `client`), operator roles (the
 //! API's writes need one token, [`token`]), the `x-kbf-qos` header, learned sizes,
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
@@ -38,6 +40,7 @@ pub mod fleet;
 pub mod identity;
 pub mod mdm;
 pub mod principal;
+pub mod reapi_auth;
 pub mod rollout;
 pub mod serve;
 mod stamp;

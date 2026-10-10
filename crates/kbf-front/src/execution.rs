@@ -25,8 +25,9 @@
 //! WaitExecution on an operation kept finished is answered even then: its first
 //! operation is the done one, and the stream ends there.
 //!
-//! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
-//! not read yet), and every action is hermetic, so it may be joined (a `networked`
+//! What v0 sends to the scheduler: the QoS of the call's [`Caller`], when a layer in
+//! front of the service put one into the request's extensions, and `ci` otherwise (the
+//! `x-kbf-qos` header is not read yet); every action is hermetic, so it may be joined (a `networked`
 //! property does not exist yet). The lease kind is the platform's `kbf-lease` value,
 //! `action` when absent; any other value than `action` or `whole_machine` is
 //! INVALID_ARGUMENT. The booking is one core and 1 GiB ([`DEFAULT_RESOURCES`]; learned
@@ -48,6 +49,9 @@
 //! (`kbf_caps::property_name`): `GPU`, `Kbf-Lease` and `osfamily` are `gpu`,
 //! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
 //! INVALID_ARGUMENT.
+//!
+//! Every Execute logs one `Execute` event at INFO with the action's digest and, when
+//! the request carries a [`Caller`], its `principal` field.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
@@ -110,6 +114,17 @@ pub struct Submission {
     pub request: Request,
     /// The lease kind, from the platform's `kbf-lease`.
     pub kind: String,
+}
+
+/// Who made a call, as found by an authenticating layer in front of the services,
+/// which puts it into the request's extensions. Execute submits its work at `qos` and
+/// logs `principal`. A request without one is submitted at `ci`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    /// The principal's name.
+    pub principal: Arc<str>,
+    /// The QoS level the principal's work gets.
+    pub qos: Qos,
 }
 
 /// Where an operation is, as its callers see it.
@@ -231,9 +246,15 @@ where
         &self,
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
+        let caller = request.extensions().get::<Caller>().cloned();
         let request = request.into_inner();
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
+        tracing::info!(
+            principal = caller.as_ref().map(|c| &*c.principal),
+            action = %action,
+            "Execute"
+        );
         if !request.skip_cache_lookup
             && let Some(result) = self.cache.action_result(&action).await?
         {
@@ -250,7 +271,8 @@ where
             );
             return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
         }
-        let submission = self.submission(request.instance_name, action).await?;
+        let qos = caller.map_or(Qos::Ci, |c| c.qos);
+        let submission = self.submission(request.instance_name, action, qos).await?;
         let ticket = self.dispatch.submit(submission)?;
         Ok(Response::new(operations(ticket, self.closing.clone())))
     }
@@ -276,7 +298,12 @@ where
     O: ObjectStore,
 {
     /// Reads the action and checks its inputs are all held; the scheduler's request.
-    async fn submission(&self, instance: String, action: Digest) -> Result<Submission, Status> {
+    async fn submission(
+        &self,
+        instance: String,
+        action: Digest,
+        qos: Qos,
+    ) -> Result<Submission, Status> {
         let Some(bytes) = self.read_input(&action).await? else {
             return Err(missing(&[action]));
         };
@@ -309,7 +336,7 @@ where
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
-                qos: Qos::Ci,
+                qos,
                 resources: booked.with_gpus(gpus),
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
