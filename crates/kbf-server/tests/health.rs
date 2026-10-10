@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use kbf_front::{Cache, MemoryMetaLog};
-use kbf_meta::Retention;
+use kbf_meta::{Epoch, Retention};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
@@ -132,6 +132,7 @@ fn start_with_prefix(prefix: &str) -> Server {
         MemoryMetaLog::new(Retention::default()),
         store,
         prefix,
+        Epoch::new(1),
     ));
     let listeners = Listeners {
         reapi: loopback,

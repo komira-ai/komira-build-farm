@@ -19,6 +19,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
 | [macos-vm-guests.md](docs/design/macos-vm-guests.md) | a VM guest's first-boot setup, capture inside the guest, guest networking, image identity (recipe and content digests), the VM helper's uid and signing, the probes a real Mac must run (**planned**) |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
+| [deployment-topology.md](docs/design/deployment-topology.md) | where servers run, the Raft log on local disk, the client front that routes to the leader, daemons dialling the servers directly, what is built and what is planned, the probes the front must pass (**planned**) |
 | [mdm-backend.md](docs/design/mdm-backend.md) | MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
 
 Decision records live in [docs/adr](docs/adr).
@@ -194,10 +195,10 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 | State | Today | Planned |
 |---|---|---|
-| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine replicated by Raft |
+| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
-| Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log |
-| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform | operator labels, report changes noticed by hash |
+| Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
+| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
 
 Because the index is in memory today, a restarted server forgets every blob. With
 `--store=s3` each start writes under a fresh key prefix so it never reads objects a
@@ -216,44 +217,41 @@ replicated log changes the implementation behind the seam, not its callers:
   is appended and fed straight back as committed is the step a replicated log
   replaces.
 
-## One endpoint, many servers
+## One endpoint, a leader and its followers
 
-Today kbf runs as one `kbf-server` process. The multi-server design (**planned**)
-keeps one rule: a client sees one address, whatever number of servers stand behind it.
+Today kbf runs as one `kbf-server` process. The shape decided for more than one
+server (**planned**) is in [deployment-topology.md](docs/design/deployment-topology.md),
+with what exists today and the probes still to run. In short:
 
-- **One name for the farm.** Bazel and Buck2 are configured with one remote address.
-  Buck2 sends everything to that one address, so the farm must look like one
-  endpoint. The deployment puts one virtual address (or one DNS name) in front of all
-  servers. That front terminates the clients' TLS with a certificate for the farm's
-  name and passes requests on in plain text; it routes nothing by content, because
-  every server can answer every request (see [Security model](#security-model)).
-  Daemons' worker streams do not go through it: `kbf-daemon --server` names the
-  worker listener, which keeps its own mutual TLS end to end. With several servers,
-  the worker listeners sit behind their own address, and a plain layer-4 balancer is
-  enough there, because it passes the TLS through untouched and every server can
-  answer every daemon. Today a daemon's blob reads and writes still reach REAPI
-  through `--cas`, normally via the front; moving them onto the worker listener is
-  planned.
-- **Any server answers.** A server process holds no farm state of its own, only
-  handles to shared state: the metadata state machine and the scheduler's control
-  log, each replicated by Raft across a small set of voting servers. A server that is
-  not a voter still serves requests; voters and serving servers are separate sets.
-- **One scheduler.** The leader of the control log places every action, so one place
-  sees all free room on all workers.
-- **Bytes go to their owner.** The design under discussion assigns each server a share
-  of digests (rendezvous hashing, so a server joining or leaving moves only its share);
-  a server that receives a blob request forwards it to the owner in one hop, and the
-  owner keeps hot blobs in memory and on local disk above the object store.
-- **Locality comes from placement.** A balancer cannot see what a request is about, so
-  kbf gets locality inside: daemons report which inputs they hold, and placement
+- **Servers on dedicated storage hosts,** each at a fixed address with a stable DNS
+  name. Durable state is a Raft log on each server's local disk: one voter first,
+  then three voters on three hosts for high availability (one leader, two followers).
+  Elastic or stateless servers are not part of the design.
+- **One name for the farm.** Bazel and Buck2 are configured with one remote address,
+  and Buck2 sends everything to it. A tailnet ingress with a constant name and an
+  automatic certificate terminates the clients' TLS; an HTTP/2 proxy behind it
+  health-checks the servers and routes every request to the one that reports ready,
+  the leader. `kbf-server` serves plain-text gRPC behind it (see
+  [Security model](#security-model)).
+- **Only the leader answers.** The leader of the control log serves REAPI and holds
+  every worker stream, so one place sees all free room on all workers and places every
+  action. A follower holds the replicated state, reports not ready, and takes over when
+  it is elected.
+- **Daemons dial the servers directly.** A daemon's worker stream does not go through
+  the front: it dials the servers' DNS names over mutual TLS and holds one stream, to
+  the leader. A follower answers a daemon with a redirect naming the leader. On
+  failover the daemon reconnects to the new leader. Today a daemon's blob reads and
+  writes still reach REAPI through `--cas`, normally via the front; moving them onto
+  the worker listener is planned.
+- **Locality comes from placement.** The front cannot see what a request is about,
+  so kbf gets locality inside: daemons report which inputs they hold, and placement
   prefers a worker that already has an action's inputs.
-- **Daemons need one address too.** A daemon dials the worker listeners' one address,
-  registers, and can learn the current server list from committed state.
 
-What already holds for this model in the single-node code: the seams above, lease ids
-that carry the leader's term, a scheduler that refuses results from stale leases,
-and a daemon protocol in which only the newest stream of a worker counts. See
-[scheduler.md](docs/design/scheduler.md#more-than-one-server).
+What already holds for this shape in the single-server code: the seams above, lease
+ids that carry the granting process's term, a scheduler that refuses results from
+leases it does not hold, a lease epoch in `Welcome` that makes a daemon drop leases a
+restarted server never granted, and a daemon protocol in which only the newest stream
+of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
 ## Security model
 
@@ -265,7 +263,10 @@ holds a real certificate for the farm's client-facing name: a load balancer, or 
 proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. `kbf-server`
 has no TLS of its own on the REAPI listener and none is planned. It serves REAPI as
 plain-text gRPC behind the front, bound to loopback (front on the same host) or to
-the mesh interface, whose traffic WireGuard already encrypts.
+the mesh interface, whose traffic WireGuard already encrypts. With several servers
+(**planned**), the front is a tailnet ingress followed by an HTTP/2 proxy that routes
+only to the leader ([deployment-topology.md](docs/design/deployment-topology.md)); that
+pair is not yet probed.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
   text, checks no credential and accepts any bind address. Whoever reaches the port
@@ -303,9 +304,11 @@ the mesh interface, whose traffic WireGuard already encrypts.
 
 **Daemons' worker streams do not go through the front.** A daemon's `--server` (the
 flag's help calls it "the kbf-server front") is the worker listener's address, not the
-client front above. The worker listener keeps its own mutual TLS end to end, so with
-several servers only a layer-4 balancer that passes TLS through can stand in front of
-it. Blob traffic is different today; see the last point below.
+client front above. The worker listener keeps its own mutual TLS end to end. With
+several servers (**planned**), daemons dial the servers' own names, with no balancer
+in between, and a follower redirects them to the leader
+([deployment-topology.md](docs/design/deployment-topology.md)). Blob traffic is
+different today; see the last point below.
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key

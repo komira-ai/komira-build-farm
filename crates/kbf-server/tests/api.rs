@@ -11,8 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
-use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_objstore::MemoryStore;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daemon_message};
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
@@ -31,11 +30,7 @@ use tokio::sync::mpsc;
 type MemoryCache = Cache<MemoryMetaLog, MemoryStore>;
 
 fn cache() -> Arc<MemoryCache> {
-    Arc::new(Cache::new(
-        MemoryMetaLog::new(Retention::default()),
-        MemoryStore::new(Capabilities::default()),
-        KeyPrefix::default(),
-    ))
+    Arc::new(Cache::memory())
 }
 
 fn loopback() -> SocketAddr {
