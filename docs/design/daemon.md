@@ -16,7 +16,7 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 | Start window | `window` | when this stream's heartbeats were sent, so a `Start` that arrives too late is not run |
 | Lease manager | `lease` | starts work only on `Start`, turns each outcome into one `Result`, fences, kills a cancelled lease |
 | Runtime | `runtime` | the `Runtime` trait every execution driver implements |
-| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service |
+| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service, on the worker listener (`--cas`, mutual TLS) |
 | Trees | `tree` | writes an input root to disk and reads outputs back |
 | Usage | `usage` | measures a child process's CPU time and peak memory when it is reaped |
 
@@ -240,9 +240,10 @@ loud.
 | Network | `--network=none`: loopback only. No action has network today. |
 | Image | by per-architecture manifest digest; `--pull=never` |
 | Entrypoint | the action's argv as a JSON array: the image's `ENTRYPOINT` and `CMD` are ignored and no argument is re-split |
-| Users | `--userns=nomap`: no container uid or gid is the daemon's user (below) |
+| Users | `--userns=nomap`: no container uid or gid is the daemon's user (below); `--user=0:0`, the container's root, whatever the image's `USER` |
 | Hostname | `localhost` |
-| Environment | the `Command`'s variables, passed with `--env` on top of what the image defines |
+| Environment | `--unsetenv-all`, then the `Command`'s variables with `--env`: nothing from the image's `ENV`, Podman's defaults (`PATH`, `TERM`, `container`) or the node's `containers.conf`. Podman 4.9 still adds `HOSTNAME=localhost` and `HOME` (uid 0's home in the image's `/etc/passwd`) when the `Command` sets neither; both follow from the image digest |
+| Limits | `--pids-limit`, `--shm-size` and `--ulimit` for `nofile` and `nproc` (soft = hard), from `kbf-daemon`'s `--container-pids-limit` (default 8192), `--container-shm-mib` (64), `--container-nofile` (65,536) and `--container-nproc` (32,768). `nproc` counts per user, and every container's root is the same subordinate id, so it bounds the node's actions together |
 | Working directory | the `Command`'s, under `/kbf/root` |
 | Files | the input root as a read-only overlay lower layer at `/kbf/root`; every write lands in a per-lease upper directory |
 | Cgroup | `--cgroup-parent` set to the lease cgroup, `--cgroup-manager=cgroupfs`, `memory.oom.group=1` |

@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::{Digest, LeaseId};
+use crate::{Digest, LeaseId, LeaseKind};
 
 /// One operation: one execution of an action that one or more waiters are attached to.
 /// Numbered by the scheduler in submission order.
@@ -214,7 +214,10 @@ pub struct StartLease {
     pub operation: OperationId,
     /// The action to run.
     pub key: ActionKey,
-    /// What the scheduler booked for it on `worker`.
+    /// What the lease takes: a share of the worker, or all of it.
+    pub kind: LeaseKind,
+    /// What the scheduler booked for it on `worker`: the request for an action lease,
+    /// the worker's whole capacity for a whole-machine one.
     pub resources: Resources,
     /// What the worker does if it loses touch.
     pub fence: FencePolicy,

@@ -29,6 +29,29 @@ pub struct NotLeader {
     pub leader: Option<ServerId>,
 }
 
+/// A compaction the core refused. Nothing changed.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum CompactError {
+    /// Only applied entries may be folded into a snapshot: the caller's state machine
+    /// holds nothing past `applied`, and an entry past the commit index may still be
+    /// replaced by a later leader.
+    #[error("cannot compact through {through:?}: entries are applied only through {applied:?}")]
+    NotApplied {
+        /// The index asked for.
+        through: LogIndex,
+        /// The last applied index.
+        applied: LogIndex,
+    },
+    /// The snapshot already ends after `through`.
+    #[error("cannot compact through {through:?}: the snapshot already ends at {base:?}")]
+    BeforeBase {
+        /// The index asked for.
+        through: LogIndex,
+        /// The current snapshot base.
+        base: LogId,
+    },
+}
+
 /// An accepted proposal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
@@ -47,6 +70,9 @@ struct Progress {
     next: LogIndex,
     /// The highest index known to match and be durable there.
     matched: LogIndex,
+    /// The peer rejected an append whose `prev` was this server's snapshot base, so
+    /// it needs entries the snapshot folded in. Cleared when it accepts one.
+    behind_base: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -91,27 +117,39 @@ impl Raft {
     ///
     /// The [`ConfigError`] that [`Config::validate`] finds.
     pub fn new(config: Config, entropy: u64) -> Result<Self, ConfigError> {
-        Self::restore(config, HardState::default(), Vec::new(), entropy)
+        Self::restore(
+            config,
+            HardState::default(),
+            LogId::default(),
+            Vec::new(),
+            entropy,
+        )
     }
 
-    /// A server restarted from what it persisted: the last [`HardState`] and the
-    /// entries, as its earlier persist effects left them. It starts as a follower with
-    /// nothing known to be committed, and applies again from the start as the leader
-    /// tells it what is committed.
+    /// A server restarted from what it persisted: the last [`HardState`], the id of
+    /// the last entry its newest snapshot holds (`base`; index 0, term 0 with no
+    /// snapshot), and the entries after it, as its earlier persist effects left them.
+    ///
+    /// The caller restores its state machine from that snapshot's bytes; the core
+    /// needs only the base. Everything through the base counts as committed and
+    /// applied. The server starts as a follower and applies again from `base + 1` as
+    /// the leader tells it what is committed.
     ///
     /// # Errors
     ///
     /// The [`ConfigError`] that [`Config::validate`] finds, or
-    /// [`ConfigError::BadLog`] if the entries are not numbered from 1, have a falling
-    /// term, or end in a term later than `hard.term`.
+    /// [`ConfigError::BadLog`] if the entries are not numbered from `base.index + 1`,
+    /// have a term that falls (from `base.term` on), or end in a term later than
+    /// `hard.term`.
     pub fn restore(
         config: Config,
         hard: HardState,
+        base: LogId,
         entries: Vec<Entry>,
         entropy: u64,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
-        let log = Log::restore(entries).map_err(ConfigError::BadLog)?;
+        let log = Log::restore(base, entries).map_err(ConfigError::BadLog)?;
         if log.last_id().term > hard.term {
             return Err(ConfigError::BadLog(log.last_id()));
         }
@@ -119,8 +157,8 @@ impl Raft {
             config,
             hard,
             log,
-            commit: LogIndex(0),
-            applied: LogIndex(0),
+            commit: base.index,
+            applied: base.index,
             state: State::Follower,
             leader: None,
             elapsed: 0,
@@ -165,10 +203,66 @@ impl Raft {
         self.commit
     }
 
-    /// The log, in index order.
+    /// The highest index applied: every [`Effect::Apply`] so far, or the snapshot
+    /// base after a restore or compaction.
+    #[must_use]
+    pub fn applied_index(&self) -> LogIndex {
+        self.applied
+    }
+
+    /// The last entry folded into a snapshot (index 0, term 0 with none).
+    #[must_use]
+    pub fn snapshot_base(&self) -> LogId {
+        self.log.base()
+    }
+
+    /// The log after the snapshot base, in index order.
     #[must_use]
     pub fn entries(&self) -> &[Entry] {
         self.log.entries()
+    }
+
+    /// Folds every entry through `through` into a snapshot: the core drops them from
+    /// its log, and the returned id (the entry at `through`, which the caller has
+    /// applied) becomes the snapshot base. The caller makes its state machine as of
+    /// `through` durable as a snapshot labelled with that id before it drops the
+    /// persisted entries through it, and restores from that pair after a restart.
+    /// Compacting at the current base changes nothing and returns it.
+    ///
+    /// # Errors
+    ///
+    /// [`CompactError::NotApplied`] if `through` is past the applied index, and
+    /// [`CompactError::BeforeBase`] if it is before the snapshot base.
+    pub fn compact(&mut self, through: LogIndex) -> Result<LogId, CompactError> {
+        if through > self.applied {
+            return Err(CompactError::NotApplied {
+                through,
+                applied: self.applied,
+            });
+        }
+        let base = self.log.base();
+        self.log
+            .compact(through)
+            .ok_or(CompactError::BeforeBase { through, base })
+    }
+
+    /// On a leader, the peers that rejected an append at this server's snapshot base:
+    /// they need entries the snapshot folded in and cannot be brought up to date by
+    /// appends. Sending a snapshot is not implemented yet, so the leader keeps probing
+    /// them at the base until the caller acts (for example by restoring one from a copy
+    /// of this server's snapshot) and a probe is accepted. A delayed rejection can name
+    /// a peer that is not behind; its next acceptance clears it. Empty on a follower or
+    /// candidate.
+    #[must_use]
+    pub fn behind_base(&self) -> Vec<ServerId> {
+        let State::Leader { progress, .. } = &self.state else {
+            return Vec::new();
+        };
+        progress
+            .iter()
+            .filter(|(_, p)| p.behind_base)
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// The last entry's id (index 0, term 0 when the log is empty).
@@ -365,10 +459,17 @@ impl Raft {
         let me = self.config.id;
         let next = self.log.last_index().next();
         let matched = LogIndex(0);
-        let progress = self
-            .peers()
-            .into_iter()
-            .map(|p| (p, Progress { next, matched }));
+        let progress = self.peers().into_iter().map(|p| {
+            let behind_base = false;
+            (
+                p,
+                Progress {
+                    next,
+                    matched,
+                    behind_base,
+                },
+            )
+        });
         self.state = State::Leader {
             progress: progress.collect(),
             since_heartbeat: 0,
@@ -414,12 +515,21 @@ impl Raft {
             return;
         };
         let prev_index = p.next.prev();
-        let Some(prev_term) = self.log.term_at(prev_index) else {
-            return;
+        let base = self.log.base();
+        let (prev, entries) = match self.log.term_at(prev_index) {
+            Some(term) => (
+                LogId::new(term, prev_index),
+                self.log.slice(p.next, self.config.max_entries_per_append),
+            ),
+            // The entries the peer needs are folded into the snapshot. Probe at the
+            // base instead: a peer that holds it (restored from a copy of this
+            // server's snapshot) accepts and is served from there; any other rejects,
+            // and the rejection is ignored (see `behind_base`).
+            None if prev_index < base.index => (base, Vec::new()),
+            None => return,
         };
-        let entries = self.log.slice(p.next, self.config.max_entries_per_append);
         let kind = MessageKind::AppendRequest {
-            prev: LogId::new(prev_term, prev_index),
+            prev,
             entries,
             commit: self.commit,
         };
@@ -442,6 +552,19 @@ impl Raft {
         }
         self.leader = Some(from);
         self.reset_election_timer(entropy);
+        let base = self.log.base();
+        let (prev, entries) = if prev.index < base.index {
+            // Everything through the base is committed here, and a leader holds every
+            // committed entry, so the two logs match through the base: skip to it.
+            let numbered = (prev.index.0 + 1..).map(LogIndex);
+            if numbered.zip(&entries).any(|(i, e)| e.id.index != i) {
+                return; // malformed request: the entries do not follow `prev`
+            }
+            let skip = usize::try_from(base.index.0 - prev.index.0).unwrap_or(usize::MAX);
+            (base, entries.into_iter().skip(skip).collect())
+        } else {
+            (prev, entries)
+        };
         if self.log.term_at(prev.index) != Some(prev.term) {
             let outcome = AppendOutcome::Rejected {
                 at: prev.index,
@@ -487,6 +610,7 @@ impl Raft {
 
     fn on_append_response(&mut self, from: ServerId, outcome: AppendOutcome) {
         let last = self.log.last_index();
+        let base = self.log.base().index;
         let State::Leader { progress, .. } = &mut self.state else {
             return;
         };
@@ -500,6 +624,7 @@ impl Raft {
                 }
                 p.matched = p.matched.max(matched);
                 p.next = p.next.max(matched.next());
+                p.behind_base = false;
                 let behind = p.next <= last;
                 self.advance_commit();
                 if behind {
@@ -507,6 +632,13 @@ impl Raft {
                 }
             }
             AppendOutcome::Rejected { at, last: theirs } => {
+                // A peer that lacks the base needs the snapshot (unless it has since
+                // been seen to hold it, which makes this rejection a delayed one).
+                // This holds for the probe at the base too, which the check below
+                // treats as old news.
+                if at == base && p.matched < base {
+                    p.behind_base = true;
+                }
                 if at >= p.next {
                     return; // answers a request older than the current position
                 }

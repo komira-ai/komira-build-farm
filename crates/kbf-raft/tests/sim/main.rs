@@ -8,6 +8,11 @@
 //! proposed after the heal is applied on every server, learner included, and every
 //! server has applied the same sequence.
 //!
+//! Every node now and then compacts its log through a random index (staying under the
+//! floor every server's disk has reached, since snapshots are not sent yet) and also
+//! asks for compactions past its applied index, which the core must refuse. A node
+//! restarts from its latest snapshot plus the log after it.
+//!
 //! A crash may strike part-way through the effects of one input: the effects before
 //! it happened (a message may already be on the wire), the rest did not, and the node
 //! restarts later from its disk alone. That is how a core that acknowledges before it
@@ -18,12 +23,15 @@
 mod checks;
 mod node;
 
-use kbf_raft::{Membership, Role, ServerId};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use kbf_raft::{LogIndex, Membership, Role, ServerId};
 use kbf_sim::{Chance, Faults, Partition, Sim, TraceHash};
 use kbf_types::FarmTime;
 
 use checks::Checker;
-use node::{Plan, RaftNode, is_final, node_id};
+use node::{Coverage, Plan, RaftNode, is_final, node_id};
 
 /// Seeds per CI run. `many_seeds` (ignored by default) runs more.
 const SEEDS: u64 = 500;
@@ -48,8 +56,9 @@ fn lossy() -> Faults {
     }
 }
 
-/// Runs one seed. Returns the trace hash, or what went wrong and when.
-fn run(seed: u64) -> Result<TraceHash, String> {
+/// Runs one seed. Returns the trace hash and what the run exercised, or what went
+/// wrong and when.
+fn run(seed: u64) -> Result<(TraceHash, Coverage), String> {
     let mut sim: Sim<RaftNode> = Sim::new(seed, lossy());
     let heal = FarmTime::from_millis(HEAL_MS);
     let plan = Plan {
@@ -58,7 +67,10 @@ fn run(seed: u64) -> Result<TraceHash, String> {
         crash_per_million: 10_000,
         heal,
         max_proposals: 16,
+        compact_per_million: 100_000,
+        floor: Rc::new(Cell::new(LogIndex(0))),
     };
+    let floor = Rc::clone(&plan.floor);
     for id in VOTERS.into_iter().chain([LEARNER]) {
         sim.add_node(node_id(id), RaftNode::new(id, plan.clone()));
     }
@@ -81,11 +93,12 @@ fn run(seed: u64) -> Result<TraceHash, String> {
         checker
             .check(sim.nodes().map(|(_, n)| n))
             .map_err(|v| format!("seed {seed} at {} ms: {v:?}", now.as_millis()))?;
+        floor.set(checker.compaction_floor(sim.nodes().map(|(_, n)| n)));
         if now < due {
             continue;
         }
         match check_liveness(&sim) {
-            Ok(()) => return Ok(sim.trace_hash()),
+            Ok(()) => return Ok((sim.trace_hash(), coverage(&sim))),
             Err(e) if now >= end => {
                 return Err(format!("seed {seed}: no progress after the heal: {e}"));
             }
@@ -131,12 +144,20 @@ impl Nemesis {
 }
 
 /// Every server is up, has applied a command proposed after the heal, and has applied
-/// the same entries as every other.
+/// the same entries as every other, and no leader reports a peer behind its snapshot
+/// base.
 fn check_liveness(sim: &Sim<RaftNode>) -> Result<(), String> {
     let mut reference: Option<&RaftNode> = None;
     for (_, node) in sim.nodes() {
-        if node.core().is_none() {
+        let Some(core) = node.core() else {
             return Err(format!("{} is down", node.id()));
+        };
+        if !core.behind_base().is_empty() {
+            return Err(format!(
+                "{} reports {:?} behind its snapshot base",
+                node.id(),
+                core.behind_base()
+            ));
         }
         if !node.applied().iter().any(|e| is_final(&e.payload)) {
             return Err(format!(
@@ -162,8 +183,33 @@ fn check_liveness(sim: &Sim<RaftNode>) -> Result<(), String> {
     Ok(())
 }
 
+fn coverage(sim: &Sim<RaftNode>) -> Coverage {
+    sim.nodes().fold(Coverage::default(), |acc, (_, n)| {
+        let c = n.coverage();
+        Coverage {
+            compactions: acc.compactions + c.compactions,
+            refused: acc.refused + c.refused,
+            restores_from_base: acc.restores_from_base + c.restores_from_base,
+        }
+    })
+}
+
 fn sweep(seeds: std::ops::Range<u64>) {
-    let failures: Vec<String> = seeds.filter_map(|seed| run(seed).err()).collect();
+    let mut failures = Vec::new();
+    let mut seeds_restoring = 0;
+    let mut total = Coverage::default();
+    let n = seeds.end - seeds.start;
+    for seed in seeds {
+        match run(seed) {
+            Ok((_, c)) => {
+                seeds_restoring += u64::from(c.restores_from_base > 0);
+                total.compactions += c.compactions;
+                total.refused += c.refused;
+                total.restores_from_base += c.restores_from_base;
+            }
+            Err(e) => failures.push(e),
+        }
+    }
     assert!(
         failures.is_empty(),
         "{} seeds failed; first ones:\n{}",
@@ -175,13 +221,22 @@ fn sweep(seeds: std::ops::Range<u64>) {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    eprintln!("{n} seeds: {total:?}, {seeds_restoring} seeds restored from a snapshot");
+    // The sweep must exercise what it claims to check: compactions, refused ones, and
+    // restarts from a snapshot in a good share of the seeds.
+    assert!(
+        total.compactions >= n && total.refused >= n && seeds_restoring * 2 >= n,
+        "too little compaction coverage over {n} seeds: {total:?}, {seeds_restoring} seeds restored from a snapshot"
+    );
 }
 
 /// Catches: any break of election safety (e.g. a server that grants two votes in one
 /// term), log matching, leader completeness or state machine safety (e.g. a follower
 /// that acknowledges entries before persisting them, or a leader that commits an entry
-/// of an earlier term by counting its replicas), and a cluster that stops making
-/// progress once the faults stop (lost retransmission, a learner left behind).
+/// of an earlier term by counting its replicas), a core that compacts entries it has
+/// not applied, one restored from a snapshot that loses the base's term or applies the
+/// base's entries again, and a cluster that stops making progress once the faults
+/// stop (lost retransmission, a learner left behind).
 #[test]
 fn raft_is_safe_and_live_over_seeds() {
     sweep(0..SEEDS);

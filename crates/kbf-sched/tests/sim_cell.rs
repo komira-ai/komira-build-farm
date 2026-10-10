@@ -420,6 +420,7 @@ fn request(n: u64) -> Request {
             action: digest(n),
         },
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         // Every third action is networked, so it self-fences.
         hermetic: !n.is_multiple_of(3),
@@ -487,7 +488,9 @@ impl StateMachine for Cell {
                             worker,
                             instance,
                             capacity,
-                            caps: kbf_caps::NodeCaps::from_report([("arch", "arm64")]).unwrap(),
+                            caps: kbf_caps::NodeCaps::from_report([("arch", "arm64")])
+                                .unwrap()
+                                .with_drivers(["container"]),
                         },
                     )
                 }

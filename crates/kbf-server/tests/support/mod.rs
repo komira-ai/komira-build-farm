@@ -191,7 +191,8 @@ impl Cell {
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
-        Self::serve(Self::cold_cache(&store), store, None, wait, retention).await
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, None, wait, retention).await
     }
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
@@ -200,9 +201,11 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
+            store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(Self::cold_cache(&store), store, Some(api), wait, retention).await
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, Some(api), wait, retention).await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -236,18 +239,19 @@ impl Cell {
             .await
             .expect("the old server stops in time")
             .expect("the old server stops cleanly");
-        let cache = Self::cold_cache(&store);
+        let cache = Self::cold_cache(&store).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         Self::serve(cache, store, api_config, wait, retention).await
     }
 
-    /// A new cache over `store`: an empty metadata log, and objects under
-    /// `start-<n>/`, where `n` is new to this test process.
-    fn cold_cache(store: &SharedStore) -> Arc<Cache<GateLog, SharedStore>> {
+    /// A new cache over `store`: an empty metadata log, a writer epoch it allocates,
+    /// and objects under `start-<n>/`, where `n` is new to this test process.
+    async fn cold_cache(store: &SharedStore) -> Arc<Cache<GateLog, SharedStore>> {
         static STARTS: AtomicU32 = AtomicU32::new(0);
         let n = STARTS.fetch_add(1, Ordering::Relaxed);
         let prefix = KeyPrefix::new(format!("start-{n}/")).expect("a key prefix");
-        Arc::new(Cache::new(GateLog::new(), store.clone(), prefix))
+        let cache = Cache::open(GateLog::new(), store.clone(), prefix).await;
+        Arc::new(cache.expect("open the cache"))
     }
 
     async fn serve(
@@ -474,12 +478,21 @@ pub fn hello(node: &str, cpus: u32, mem_gib: u32) -> Hello {
     hello_on(node, cpus, mem_gib, &[("arch", "x86_64"), ("os", "linux")])
 }
 
-/// A Hello for `node` reporting `cpus`, `mem_gib` and the `platform` entries.
+/// A Hello for `node` reporting `cpus`, `mem_gib` and the `platform` entries, and
+/// `drivers=fake` (which serves `action` leases) unless `platform` names its drivers.
 pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) -> Hello {
-    let platform = platform.iter().map(|(key, value)| Capability {
-        key: (*key).to_owned(),
-        value: (*value).to_owned(),
-    });
+    let drivers: &[(&str, &str)] = if platform.iter().any(|(key, _)| *key == "drivers") {
+        &[]
+    } else {
+        &[("drivers", "fake")]
+    };
+    let platform = platform
+        .iter()
+        .chain(drivers)
+        .map(|(key, value)| Capability {
+            key: (*key).to_owned(),
+            value: (*value).to_owned(),
+        });
     Hello {
         protocol_version: 1,
         node_id: node.to_owned(),

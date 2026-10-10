@@ -67,7 +67,7 @@ pub enum AppendOutcome {
 /// before it is durable, because the message may promise that state (a granted vote,
 /// an accepted entry). [`Effect::Apply`] entries are committed and arrive in index
 /// order, each once per core instance; a core restored after a restart applies again
-/// from the start of its log.
+/// from the entry after its snapshot base.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Make the term and vote durable.

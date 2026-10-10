@@ -4,6 +4,7 @@
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 pub mod fake;
+pub mod real;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
