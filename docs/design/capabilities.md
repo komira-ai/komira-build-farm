@@ -66,8 +66,9 @@ both architectures.
 ### Driver entries
 
 The driver adds its own entries. The native driver (Macs) reports `network_isolation`
-(`sandbox-exec` or `none`; reported, not matched) and one `xcode` entry per Xcode build
-it can select (see [Matching](#matching)).
+(`sandbox-exec` or `none`; reported, not matched) and one `xcode` entry per ready Xcode
+build it can select (see [Matching](#matching)); an installed Xcode that is not ready is
+in the node status instead (`xcodes`, below).
 
 A daemon runs one driver today, so `drivers` has one value. The scheduler does not read
 it yet (see [Planned](#planned)); the daemon refuses a `Start` for a lease kind its
@@ -78,7 +79,7 @@ driver does not serve.
 | `container` | `action` | exists (Linux, rootless Podman) |
 | `native` | `action` | exists (Macs, plain processes) |
 | `fake` | `action` | exists, for bring-up only: runs nothing |
-| `vm` | `vm` | **planned**: listed only when a boot check of a tiny VM passes at daemon start ([macos-vms.md](macos-vms.md#52-node-report-planned)) |
+| `vm` | `vm` | **planned**: listed only when a check that boots no VM passes, at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
 | `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
 
 On `main` no driver serves `whole_machine`.
@@ -92,10 +93,23 @@ The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will a
 |---|---|---|
 | `vm.slots` | how many VMs may run at once; fills a `vms` booking dimension | report-only |
 | `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only |
-| `vm.image` (repeated) | the golden images on the node's disk, by digest | capability: a request names one, matched by membership on the digest |
+| `vm.image` (repeated) | the golden images on the node's disk whose file manifest re-verifies, by recipe digest ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)) | capability: a request names one, matched by membership on the digest |
 
 A report-only entry is never a request key: an action cannot ask for `vm.slots`, and
 `vms` is booked only through `kbf-lease=vm`.
+
+### Planned device entries
+
+Physical iOS devices on a Mac node ([ios-devices.md](ios-devices.md#52-report-entries))
+will add, all **planned**:
+
+| Entry | Meaning | Kind |
+|---|---|---|
+| `ios.device` (repeated) | one per **ready** USB-attached iPhone or iPad: a sorted `k=v` list of `id` (the UDID), `class`, `product_type`, `os_version`, `os_build` | capability: one device is booked per lease, and one device must satisfy every `ios.device.*` key of a request |
+
+A device that is not ready is not a report entry; it is listed, with its state and the
+fix, in `NodeStatus` (planned `devices`). An older server skips the entry, as it skips
+every report entry it does not know.
 
 ## The node status
 
@@ -110,7 +124,8 @@ module), and the server shows it in `GET /v1/nodes` ([api.md](../api.md#get-v1no
 | `os_build` | `sw_vers -buildVersion` | `os-release` `BUILD_ID`, where set |
 | `kernel` | empty | `/proc/sys/kernel/osrelease` |
 | `daemon_version` | the `kbf-daemon` version | the same |
-| `xcode_builds` | the report's `xcode` entries, sorted | empty |
+| `xcode_builds` | the report's `xcode` entries (the ready Xcodes), sorted | empty |
+| `xcodes` | every installed Xcode: app, build, state (`ready` or why not), reason, fix command | empty |
 
 A field that cannot be read is empty; status never stops a node from joining.
 
@@ -167,9 +182,10 @@ Each key has one typed comparison:
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | the node has at least this amount (`gpu` is also booked, below) |
 | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
-| `xcode` | membership: the node reports one `xcode` entry per installed Xcode build, and the request names one of them |
+| `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | **planned**: membership on the digest (see [Planned VM entries](#planned-vm-entries)) |
+| `ios.device` | **planned**: `1` books one specific device; `ios.device.class`, `ios.device.product_type`, `ios.device.os_version`, `ios.device.os_build` are exact, and one device must satisfy all of them (see [Planned device entries](#planned-device-entries)) |
 
 Every other key may appear once. A value that does not parse or a repeated key is
 refused. A Mac with two Xcodes installed serves an action that names either build, and
@@ -266,10 +282,17 @@ naming no `container-image`.
 - The container driver reads `container-image` itself, by that exact name (see
   [daemon.md](daemon.md#the-container-driver)).
 - Unknown platform properties are ignored, not refused (see [Unknown keys](#unknown-keys)).
-- Each daemon sends its `NodeStatus` after `Welcome`; it routes no work.
-- A Mac's native driver reports one `xcode` entry per `Xcode*.app` in `/Applications`
-  (`--xcode-apps`) that answers `xcodebuild -version`, and runs an action that names
-  an `xcode` build with that Xcode's `DEVELOPER_DIR`.
+- Each daemon sends its `NodeStatus` after `Welcome`, and again when its Xcodes change;
+  it routes no work.
+- A Mac's native driver reports one `xcode` entry per ready `Xcode*.app` in
+  `/Applications` (`--xcode-apps`): one that answers `xcodebuild -version` and whose
+  `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
+  clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0, each
+  asked under the actions' sandbox with the network off, as an action runs. It runs an
+  action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. It asks
+  again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
+  sees it) and the `NodeStatus` (which lists every installed Xcode, ready or not, with
+  the fix).
 
 ## Planned
 
@@ -285,6 +308,11 @@ naming no `container-image`.
   microarchitecture), `nvme_gib`, `os_image` (on bootc Linux), the SDKs of each Xcode
   on macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)),
   and the VM driver's `drivers` value and `vm.*` entries (above).
+- **iOS devices:** `ios.device` report entries and request keys, a booking of one
+  device id per lease carried in `Start`, and `NodeStatus.devices` with an attention
+  item for each device that is not ready ([ios-devices.md](ios-devices.md)). Until the
+  server knows `ios.device`, a request for it is an unknown property and matches
+  every node (see [Unknown keys](#unknown-keys)).
 - **Client-defined probes** (`probe.<k>`) as `NodeStatus` values, never report entries
   or request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
 - **Re-detection:** the daemon re-detects its software keys after an update step and

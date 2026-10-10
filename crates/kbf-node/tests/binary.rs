@@ -4,7 +4,7 @@
 
 mod front;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -12,6 +12,20 @@ use std::time::{Duration, Instant};
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-daemon");
+
+/// Held by each test while it runs a native daemon, so one runs at a time, as on a
+/// node. Native daemons on one Mac share the user's `xcrun` cache, which each `xcrun`
+/// lookup rewrites whole: one daemon's lookups (its survey of the Xcodes, then its
+/// warm-up) make the other's miss, each then taking seconds, and on the macOS runner
+/// a survey took 27.5 s so, against about 4 s alone.
+static NATIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`NATIVE`], held until the guard is dropped.
+fn one_native_daemon() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Catches: a binary that fails to start, exits non-zero on `--version`, or reports a
 /// name or version other than its own package's and the commit it was built from
@@ -123,6 +137,7 @@ fn runs_until_sigterm_with_path(
     path: Option<&Path>,
 ) -> std::process::ExitStatus {
     let dir = tls(name);
+    let started = Instant::now();
     let mut command = Command::new(BIN);
     if let Some(path) = path {
         let system = std::env::var_os("PATH").unwrap_or_default();
@@ -154,6 +169,18 @@ fn runs_until_sigterm_with_path(
             Err(e) => panic!("no session attempt ({e}): {log:#?}"),
         }
     }
+    // How long the daemon took to try its first session (the native driver surveys its
+    // Xcodes before, and logs how long that took), for the CI log: written to stderr,
+    // which tests do not capture.
+    let survey = log
+        .iter()
+        .find(|l| l.contains("Xcodes"))
+        .map_or("", |l| l.as_str());
+    let _ = writeln!(
+        std::io::stderr(),
+        "binary.rs: the {name} daemon tried its first session {:.1?} after it started; {survey}",
+        started.elapsed()
+    );
     let pid = i32::try_from(child.id()).expect("pid");
     // SAFETY: kill(2) on the child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
@@ -193,7 +220,9 @@ fn each_driver_starts_and_stops_on_sigterm() {
         "--cas=http://127.0.0.1:1".to_owned(),
         format!("--scratch={}", scratch.display()),
     ];
+    let one = one_native_daemon();
     let status = runs_until_sigterm("native", &native);
+    drop(one);
     assert!(status.success(), "{status}");
     assert!(
         scratch.is_dir(),
@@ -417,6 +446,7 @@ fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
 fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     use std::os::unix::process::ExitStatusExt as _;
 
+    let _one = one_native_daemon();
     let dir = tls("restart");
     let scratch = dir.join("leases");
     let front = front::Front::start(&dir);

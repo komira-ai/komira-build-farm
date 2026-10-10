@@ -144,16 +144,51 @@ build is what `xcodebuild -version` prints after `Build version` (`16C5032a`), n
 marketing version (`16.2`), so two Xcodes that share a version but differ in build
 never share a cache entry.
 
-A Mac may have several Xcodes installed; it serves an action that names any of them.
-The daemon finds them at start: each `Xcode*.app` in `/Applications` (the
-`--xcode-apps` flag) that answers `xcodebuild -version` is reported as an `xcode`
-entry of its node report. An Xcode that does not answer (its licence not accepted, its
-first launch not run), or does not answer within a minute, is left out and logged; a
-hung one is killed, so it cannot keep the node from starting. An answer counts only
-once `xcodebuild` has exited and closed its output: one that exits but leaves a child
-holding its output open is left out when the minute is up. The Xcodes are asked one
-after another, so N hung Xcodes delay the daemon's start by up to N minutes. An action
-that names no `xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
+A Mac may have several Xcodes installed; it serves an action that names any of them
+that is **ready**. The daemon asks each `Xcode*.app` in `/Applications` (the
+`--xcode-apps` flag), under its own `DEVELOPER_DIR` and with its own `xcodebuild`
+(the one inside the app), these questions, all at once, and reads the answers in
+this order: `xcodebuild -version` (which must print a build),
+`xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
+clang`, and, on a node started with `--require-metal-toolchain` (one meant for GPU
+work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installed` (an
+Xcode before 26, which has no `-showComponent` and bundles Metal, passes when `xcrun
+--find metal` does). Every question runs as an action does: under the actions'
+sandbox with the network off, in a lease directory of the daemon's own
+(`lease-survey` under `--scratch`, removed when the survey ends), with the same
+writes allowed in the user folders ([below](#what-an-action-on-a-mac-may-write)). One
+for which every question exits 0, each within a minute, is ready and is reported as an
+`xcode` entry of its node report. An Xcode whose licence is not accepted still answers
+`-version` with exit 0, but `-license check` and every tool it runs (`xcrun`, `cc`,
+`swiftc`) exit 69, so it would fail every action placed on it.
+
+An Xcode that is not ready is **not hidden**: the node's status lists every installed
+Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
+`metal_toolchain_missing`, `failed`), the question it failed with its answer, and the
+command that fixes it (for example `sudo
+/Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license accept`),
+and `GET /v1/nodes` lists it under the node's `needs_attention`
+([api.md](api.md#get-v1nodes)). The daemon and the server each log it at `WARN` once
+when it appears, and again only when its build, state or fix changes: a reason that
+changes alone (`xcodebuild` starts its NSLog lines with the time and its pid) is not
+logged again, and is not by itself a change the daemon sends.
+The daemon asks again every three minutes (`--xcode-recheck-secs`), so an Xcode fixed
+while the daemon runs is advertised within minutes, without a restart, and one that
+stops being ready (an update whose new licence is not accepted) stops being advertised.
+
+A hung question is killed, so it cannot keep the node from starting. An answer counts
+only once the program has exited and closed its output: one that exits but leaves a
+child holding its output open is not ready when the minute is up. Each Xcode is asked
+once (an app that links to another, such as `Xcode.app`, is listed with that one's
+answers), on a thread of its own, and its questions at once, so a hung Xcode delays
+the daemon's start (it says nothing to the server until its first survey is done) by
+up to a minute (two with `--require-metal-toolchain`, whose `xcrun --find metal` is
+asked only after `-showComponent`), and the other Xcodes add nothing to that but
+for their `xcrun` lookups, which run one at a time (each rewrites `xcrun`'s whole
+cache, so two at once lose each other's entries and the next lookups take seconds;
+one that hangs delays the others').
+An action that names no
+`xcode` runs with the Mac's default Xcode (`xcode-select`), or with the
 `DEVELOPER_DIR` its own environment sets; one that names an `xcode` gets that Xcode
 whatever its environment says.
 
@@ -164,6 +199,24 @@ platform(
     exec_properties = {"OSFamily": "Darwin", "ISA": "arm-a64", "xcode": "16C5032a"},
 )
 ```
+
+## `ios.device` (planned)
+
+**Planned, not on `main`:** today `ios.device` is a name kbf does not know, so it is not
+acted on and an action that sends it may run on any worker, Linux included. The design
+is in [ios-devices.md](design/ios-devices.md):
+
+| Property | Values | Effect (planned) |
+|---|---|---|
+| `ios.device` | `1` | Books one USB-attached iPhone or iPad on a Mac for the lease alone; the action finds its UDID in `KBF_IOS_DEVICE_ID`. |
+| `ios.device.class` | `iPhone`, `iPad` | Exact. |
+| `ios.device.product_type` | a model identifier (`iPhone17,3`) | Exact. |
+| `ios.device.os_version` | an iOS version | Exact. |
+| `ios.device.os_build` | an iOS build | Exact. |
+
+One device must satisfy every `ios.device.*` key. An attribute key without
+`ios.device=1` will be refused, as will `ios.device` with `kbf-lease=vm` or
+`whole_machine`.
 
 ## What an action on a Mac may write
 
@@ -181,9 +234,14 @@ folder, and an action cannot remove, rename or replace it) and `xcrun`'s cache
 there once its last change is an hour from now, before or after, never through a
 symlink. Until each lease runs as its own user, leases on one Mac share those names:
 one lease can see another's temporary files there and rewrite the `xcrun` cache the
-next lease reads. The daemon does not trust that cache itself: it removes it at
-start, before it asks each Xcode for its build, and runs each Xcode's own
-`xcodebuild` rather than the `/usr/bin` one. A tool that writes anywhere else (`/tmp`, a path
+next lease reads. The daemon runs no developer tool outside the sandbox while it
+serves: it asks the Xcodes ([above](#xcode)) under the actions' sandbox, where
+`xcrun` reads and fills that cache as an action's would, and runs each Xcode's own
+`xcodebuild` rather than the `/usr/bin` one. It leaves the cache in place at start:
+without it every lookup of the first survey, which the daemon finishes before it
+connects, takes seconds. It warms the cache under the actions' sandbox too, at start for
+the node's own Xcode and the ready ones, and later for each Xcode that becomes ready.
+A tool that writes anywhere else (`/tmp`, a path
 under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule
 points such a tool into the lease: `swiftc -module-cache-path`,
 `xcodebuild -derivedDataPath`. `xcodebuild` and SwiftPM find `~` through the user

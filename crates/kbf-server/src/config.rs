@@ -6,9 +6,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
+use kbf_types::Qos;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use crate::identity::{DenyList, DenyListError};
@@ -38,8 +39,16 @@ pub enum StoreKind {
 
 /// `kbf-server` flags.
 #[derive(Clone, Debug, Parser)]
-#[command(name = "kbf-server", version, about = "The kbf farm server")]
+#[command(
+    name = "kbf-server",
+    version = crate::SERVER_VERSION,
+    about = "The kbf farm server",
+    args_conflicts_with_subcommands = true
+)]
 pub struct Args {
+    /// Run a subcommand instead of serving.
+    #[command(subcommand)]
+    pub command: Option<Command>,
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
@@ -121,6 +130,22 @@ pub struct Args {
     /// The store refuses to overwrite a key (MinIO and RustFS do).
     #[arg(long)]
     pub s3_conditional_put: bool,
+}
+
+/// `kbf-server` subcommands. Each runs instead of the server.
+#[derive(Clone, Debug, Subcommand)]
+pub enum Command {
+    /// Read a REAPI client token from stdin and print its token file line,
+    /// `<principal> client <qos> sha256:<hex>` (the format is in the `principal`
+    /// module docs). The token is never on the command line; surrounding whitespace
+    /// is stripped, and it must be at least 32 visible ASCII characters.
+    HashToken {
+        /// The principal the token names: 1 to 64 characters from A-Z a-z 0-9 . _ @ -.
+        principal: String,
+        /// The QoS level the principal's work gets when it names none.
+        #[arg(long, default_value = "ci", value_parser = |s: &str| s.parse::<Qos>())]
+        qos: Qos,
+    },
 }
 
 /// Why the flags do not make a working server.

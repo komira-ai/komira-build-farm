@@ -25,6 +25,14 @@ is its CycloneDX SBOM, `<same stem>.cdx.json`, made from `Cargo.lock` for that b
 and target by `cargo-cyclonedx` (pinned by version and SHA-256 in the workflow). One
 `SHA256SUMS` covers every tarball and SBOM of the commit.
 
+`kbf-server` embeds the first 12 characters of the commit it was built from, and
+`--version` prints `kbf-server <package version>+<commit>` (so do its start line and
+the `server` field of `GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before
+packaging, each Linux job checks that the binary's `--version` names `GITHUB_SHA`
+(`tools/ci/check-build-commit.sh check`). `KBF_BUILD_COMMIT_OVERRIDE` replaces the
+commit in a build, for CI tests that need two stamps from one checkout; a build that
+set it here would fail that check.
+
 The Linux binaries link glibc dynamically and need the glibc of Ubuntu 24.04 or
 newer.
 

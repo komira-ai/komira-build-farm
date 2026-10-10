@@ -18,6 +18,8 @@
 // - Welcome.epoch and Result.action_digest: a lease id never names leases of two server
 //   processes, and a Result answers only the action its Start named (issue #137).
 // - Hello.instance_id: which daemon process registered the node (issue #140).
+// - NodeStatus.xcodes: every installed Xcode with its readiness (issue #164); a daemon
+//   resends Hello and NodeStatus mid-stream when an Xcode becomes ready or stops being so.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -99,10 +101,10 @@ message Hello {
 
 // What software the node runs: status for operators and the fleet API, never matched
 // against an action's platform, so it is kept out of the node report and its hash.
-// The daemon sends it right after each Welcome. The server keeps the newest one per
-// node; a server that predates this message ignores it, and a node that never sends
-// one is listed without software. An empty string, or an empty list, means not known
-// on this node.
+// The daemon sends it right after each Welcome, and again when its Xcodes change. The
+// server keeps the newest one per node; a server that predates this message ignores
+// it, and a node that never sends one is listed without software. An empty string, or
+// an empty list, means not known on this node.
 message NodeStatus {
   // The operating system's name: `macOS` (`sw_vers -productName`), or the
   // `os-release` NAME on Linux (`Ubuntu`).
@@ -116,8 +118,49 @@ message NodeStatus {
   string kernel = 4;
   // The kbf-daemon version.
   string daemon_version = 5;
-  // Every installed Xcode build (Mac): the node report's `xcode` entries, sorted.
+  // The Xcode builds actions can use here (Mac): the node report's `xcode` entries,
+  // sorted. Only these route work; an Xcode that is installed but not ready is in
+  // `xcodes` only.
   repeated string xcode_builds = 6;
+  // Every installed Xcode (Mac), ready or not, in app-name order, with why one is not
+  // ready and how to make it so (issue #164). Empty from a daemon that predates this
+  // field, and on Linux. The daemon sends NodeStatus again when this changes.
+  repeated XcodeStatus xcodes = 7;
+}
+
+// One Xcode installed on a Mac, as the daemon last found it.
+message XcodeStatus {
+  // The app as found in the directory the daemon searches
+  // (`/Applications/Xcode_16.2.app`).
+  string app = 1;
+  // Its build (`16C5032a`); empty when `xcodebuild -version` did not say.
+  string build = 2;
+  // Whether actions can use it, and if not, why.
+  XcodeState state = 3;
+  // Why it is not ready, in the words of the check that failed (for example
+  // `xcodebuild -license check` exited 69: "You have not agreed to the Xcode license
+  // agreements."). Empty when ready.
+  string reason = 4;
+  // The command that makes it ready, when one is known (for example `sudo
+  // /Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license
+  // accept`). Empty when ready or when no single command is known.
+  string fix = 5;
+}
+
+// Whether an installed Xcode can run actions. Only READY is advertised for placement.
+enum XcodeState {
+  // Not set (a daemon that sent a state this server does not know).
+  XCODE_STATE_UNSPECIFIED = 0;
+  // It answered every check; its build is in `xcode_builds`.
+  XCODE_STATE_READY = 1;
+  // `xcodebuild -license check` failed: an administrator must accept the licence.
+  XCODE_STATE_LICENSE_NOT_ACCEPTED = 2;
+  // `xcodebuild -checkFirstLaunchStatus` failed: its first launch was not run.
+  XCODE_STATE_FIRST_LAUNCH_NOT_RUN = 3;
+  // The node requires the Metal toolchain and this Xcode has none installed.
+  XCODE_STATE_METAL_TOOLCHAIN_MISSING = 4;
+  // Another check failed (no build, no compiler, no answer in time).
+  XCODE_STATE_FAILED = 5;
 }
 
 // The server's answer to Hello.

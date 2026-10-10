@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod faulty;
+
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -12,7 +14,7 @@ use bytes::Bytes;
 use kbf_front::{
     Cache, Closing, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError,
 };
-use kbf_meta::{Applied, BlobAnswer, Command, Location, MetaState, Retention};
+use kbf_meta::{Applied, BlobAnswer, Command, MetaState, Retention};
 use kbf_objstore::{ByteRange, Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
@@ -107,11 +109,15 @@ impl Farm {
     }
 
     async fn serve(routes: impl FnOnce(Arc<TestCache>) -> Routes) -> Self {
-        let cache = Arc::new(Cache::new(
-            RaceLog::new(),
-            MemoryStore::new(Capabilities::default()),
-            KeyPrefix::default(),
-        ));
+        let cache = Arc::new(
+            Cache::open(
+                RaceLog::new(),
+                MemoryStore::new(Capabilities::default()),
+                KeyPrefix::default(),
+            )
+            .await
+            .expect("open the cache"),
+        );
         let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = incoming.local_addr().expect("local address");
         let routes = routes(Arc::clone(&cache));
@@ -215,7 +221,7 @@ impl Farm {
         let BlobAnswer::Present(location) = answer else {
             panic!("{d} is not present: {answer:?}");
         };
-        let key = self.cache.object_key(location.object()).expect("key");
+        let key = self.cache.object_key(location.object).expect("key");
         self.cache.objects().delete(&key).await.expect("delete");
     }
 
@@ -233,11 +239,8 @@ impl Farm {
         let BlobAnswer::Present(location) = answer else {
             panic!("{d} is not present: {answer:?}");
         };
-        let offset = match location {
-            Location::Segment { offset, .. } => offset,
-            Location::Object(_) => 0,
-        };
-        let key = self.cache.object_key(location.object()).expect("key");
+        let offset = location.offset;
+        let key = self.cache.object_key(location.object).expect("key");
         let objects = self.cache.objects();
         // A range past the end reads what exists: the whole object.
         let whole = ByteRange::new(0, u64::from(u32::MAX)).expect("range");
