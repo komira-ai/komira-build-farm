@@ -2,7 +2,9 @@
 //! an action and calls Execute; the server places it on the daemon over mutual TLS; the
 //! daemon fetches the action and its inputs from the server's CAS, runs it with the
 //! test-only local runtime, uploads the outputs, and reports the result with its
-//! resource usage; the client reads the result and the outputs back.
+//! resource usage; the client reads the result and the outputs back. A runtime that
+//! fails runs as a driver's memory kill would shows the server reading the daemon's
+//! `Result.memory_kill` (failure classes, 6.1).
 
 #![cfg(target_os = "linux")]
 
@@ -10,18 +12,19 @@ mod support;
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_daemon::cas::{Cas, CasClient, digest_of};
 use kbf_daemon::usage::usage_of;
-use kbf_daemon::{Daemon, DaemonConfig, LocalRuntime, NodeReport};
+use kbf_daemon::{Daemon, DaemonConfig, LocalRuntime, NodeReport, Runtime, RuntimeError, Work};
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::{KeyPrefix, MemoryStore, ObjectKey, ObjectStore, PageSize};
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::reapi::execution_client::ExecutionClient;
-use kbf_proto::reapi::{Digest, ExecuteRequest, ExecuteResponse};
+use kbf_proto::reapi::{ActionResult, Digest, ExecuteRequest, ExecuteResponse};
 use kbf_server::{Listeners, WorkerTls, bind_server};
+use kbf_types::LeaseId;
 use prost::Message;
 use support::memory::Spec;
 use support::{PROMPT, pki, scratch};
@@ -40,6 +43,14 @@ struct Farm {
 
 impl Farm {
     async fn start(name: &str) -> Self {
+        Self::start_with(name, |runtime| runtime).await
+    }
+
+    /// A farm whose daemon runs leases through `wrap` of the local runtime.
+    async fn start_with<R: Runtime>(
+        name: &str,
+        wrap: impl FnOnce(LocalRuntime<CasClient>) -> R,
+    ) -> Self {
         let pki = pki(name);
         let cache = Arc::new(Cache::memory());
         let listeners = Listeners {
@@ -67,10 +78,10 @@ impl Farm {
             .expect("connect");
 
         // The daemon reads and writes blobs over its own connection to the front.
-        let runtime = Arc::new(LocalRuntime::new(
+        let runtime = Arc::new(wrap(LocalRuntime::new(
             Arc::new(CasClient::new(reapi.clone())),
             scratch(name),
-        ));
+        )));
         let report = NodeReport::new([
             ("arch", "x86_64"),
             ("cpus", "4"),
@@ -257,4 +268,99 @@ async fn an_input_lost_from_the_cas_fails_the_action_cleanly() {
         farm.text(result.stdout_digest.as_ref()).await,
         "still here\n"
     );
+}
+
+const GIB: u64 = 1 << 30;
+
+/// The local runtime, except that a lease booked less memory than `needs` ends as a
+/// driver's own-limit memory kill does ([`RuntimeError::OutOfMemory`]: the native
+/// driver's memory watch, or the container driver at the lease's cap). Records each
+/// lease's memory booking in `booked`, in the order the leases started.
+struct NeedsMemory {
+    inner: LocalRuntime<CasClient>,
+    needs: u64,
+    booked: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Runtime for NeedsMemory {
+    fn driver(&self) -> &'static str {
+        self.inner.driver()
+    }
+
+    fn serves(&self, kind: &str) -> bool {
+        self.inner.serves(kind)
+    }
+
+    async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {
+        let limit = work.resources.memory_bytes;
+        self.booked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(limit);
+        if limit < self.needs {
+            return Err(RuntimeError::OutOfMemory {
+                used: self.needs,
+                limit,
+            });
+        }
+        self.inner.run(work).await
+    }
+
+    async fn kill(&self, lease_id: LeaseId) {
+        self.inner.kill(lease_id).await;
+    }
+}
+
+/// A farm whose one node (8 GiB) kills every lease booked less than `needs`, and the
+/// bookings its leases ran with, in GiB.
+async fn needing(name: &str, needs: u64) -> (Farm, impl Fn() -> Vec<u64>) {
+    let booked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&booked);
+    let farm = Farm::start_with(name, move |inner| NeedsMemory {
+        inner,
+        needs,
+        booked,
+    })
+    .await;
+    let gib = move || {
+        let booked = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        booked.iter().map(|bytes| bytes / GIB).collect()
+    };
+    (farm, gib)
+}
+
+/// Catches, with the real daemon and server between them: a daemon that sends a
+/// driver's own-limit kill without `MEMORY_KILL_OWN_LIMIT`, or a server that does not
+/// read it with the status the daemon pairs it with (either way the client is answered
+/// at once, after one run); a rerun that does not double (1, 2, 4 GiB) or whose doubled
+/// booking does not reach the daemon's `Start`; and a later Execute of the action that
+/// does not start at the booking that ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drivers_own_limit_kill_reruns_the_action_with_its_booking_doubled() {
+    let (farm, booked) = needing("exec-oom", 4 * GIB).await;
+    let action = farm.upload(&Spec::sh("echo fits")).await;
+
+    let response = farm.execute(&action).await;
+    assert_eq!(response.status.map(|s| s.code), Some(Code::Ok as i32));
+    let result = response.result.expect("a result");
+    assert_eq!(farm.text(result.stdout_digest.as_ref()).await, "fits\n");
+    assert_eq!(booked(), [1, 2, 4], "the bookings of the runs");
+
+    let again = farm.execute(&action).await;
+    assert_eq!(again.status.map(|s| s.code), Some(Code::Ok as i32));
+    assert_eq!(booked(), [1, 2, 4, 4], "starts at the raised booking");
+}
+
+/// Catches a driver's own-limit kill at the largest node run again forever, or answered
+/// as anything but the action needing more memory than any node offers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drivers_own_limit_kill_at_the_largest_node_is_answered() {
+    let (farm, booked) = needing("exec-oom-cap", 16 * GIB).await;
+    let action = farm.upload(&Spec::sh("echo never")).await;
+
+    let response = farm.execute(&action).await;
+    assert_eq!(response.result, None);
+    let status = response.status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+    assert_eq!(booked(), [1, 2, 4, 8], "doubled up to the node's 8 GiB");
 }
