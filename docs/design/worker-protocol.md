@@ -14,7 +14,9 @@ service Worker {
 ```
 
 - **One stream per daemon, opened by the daemon.** No daemon listens on an inbound
-  port, so a worker needs only outbound connectivity to the farm's address.
+  port, so a worker needs only outbound connectivity to the server's worker
+  listener. With several servers (**planned**) that one stream goes to the leader
+  ([deployment-topology.md](deployment-topology.md)).
 - **Mutual TLS.** The daemon connects only to `https://` URLs and presents its own
   certificate; the server's worker listener verifies it against a client CA, and
   requires the certificate to name the node the stream speaks for (see
@@ -304,8 +306,11 @@ close this, each on its own:
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
    and forgets their results without sending them: no server of the new epoch can
    accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
-   nothing, and a lease granted while no epoch was named is kept. With the replicated log, the epoch will name the log, which outlives
-   leaders and their terms, so a change of leader drops nothing.
+   nothing, and a lease granted while no epoch was named is kept. With the replicated
+   log, the plan is for the epoch to name the log, which outlives leaders and their
+   terms, so a change of leader drops nothing; whether a failover keeps leases this
+   way or drops them as a restart does today is an open question
+   ([deployment-topology.md](deployment-topology.md#open-questions)).
 3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
    in its `Result`, and the server refuses a `Result` whose `action_digest` is set and
    is not the action of the operation it granted the lease for, whatever the lease id
@@ -401,6 +406,9 @@ daemon restarts and server restarts:
   `NodeStatus.devices`: every iOS device the node knows, with its state and fix
   ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
-- With many servers: the daemon dials the worker listeners' one address and may learn
-  the current server list from the first server it reaches; that server relays the
-  session to the scheduler's leader.
+- With several servers ([deployment-topology.md](deployment-topology.md)): the daemon
+  dials the servers' own DNS names directly, with no balancer in between, and holds
+  its one stream to the leader. A follower does not serve or relay the session: it
+  answers with a redirect naming the leader, and the daemon dials that server. On
+  failover the daemon reconnects to the new leader. The redirect's form and how the
+  daemon is given the servers' names are open questions there.
