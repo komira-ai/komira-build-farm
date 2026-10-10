@@ -19,13 +19,16 @@
 //! - a lease cgroup under the daemon's `actions/` cgroup, which the daemon makes in
 //!   its delegated cgroup at start ([`delegate`]; [`adopt`] checks one given instead)
 //!   and whose limits ([`capacity`]) bound what the node reports, with
-//!   `memory.high` = reservation x 1.5 + 512 MiB, swap allowed, no per-lease hard cap,
-//!   `cpu.weight` from the booked CPU, and `memory.oom.group=1` and
-//!   `--oom-score-adj=0` on the container (the daemon's leaf gets `memory.min`);
+//!   a hard cap `memory.max` = booking x 1.5 + 512 MiB, `memory.oom.group=1` on the
+//!   lease cgroup and on the container, swap allowed (no `memory.swap.max`), a
+//!   watch that kills a lease which keeps pushing into swap at its own cap
+//!   ([`SwapKill`]), `cpu.weight` from the booked CPU, and `--oom-score-adj=0` on the
+//!   container (the daemon's leaf gets `memory.min`);
 //! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
 //!   `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
-//!   kill (exit 137 plus `oom_kill` in the lease cgroup's `memory.events`) reported as
-//!   an infrastructure failure;
+//!   kill told apart by the lease cgroup's `memory.events`: a kill at the lease's own
+//!   cap is [`kbf_daemon::RuntimeError::OutOfMemory`], one without it (the `actions/`
+//!   backstop or the host ran short) is [`kbf_daemon::RuntimeError::BusyNode`];
 //! - outputs, stdout and stderr stored one [`CHUNK`] at a time ([`FileBlob`]), never
 //!   read into memory whole;
 //! - cleanup on every path: the container, the lease cgroup and the scratch directory
@@ -49,7 +52,7 @@
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease),
-//! raising `memory.high` while the node has room, image import into the node's store,
+//! image import into the node's store,
 //! networked actions, and the private Podman socket for service containers.
 
 pub mod cas;
@@ -65,7 +68,7 @@ pub mod subids;
 pub mod tree;
 
 pub use cas::{CHUNK, FileBlob, MemoryCas};
-pub use cgroup::{cpu_weight, memory_high};
+pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;

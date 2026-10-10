@@ -104,6 +104,21 @@ struct Cli {
     /// together.
     #[arg(long, default_value_t = 32_768)]
     container_nproc: u64,
+    /// A lease at its own memory cap is killed, and reported out of memory, once it
+    /// holds more than this many MiB in swap... (container)
+    #[arg(long, default_value_t = 512)]
+    lease_swap_kill_mib: u64,
+    /// ...or this percentage of its booked memory, whichever is more. The kernel caps
+    /// each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit;
+    /// a lease is killed by this rule only while its own cap keeps being hit (its
+    /// `memory.events` `max` grew since the last sample) and its swap rose since the
+    /// last sample, never for swap that host pressure moved out of it earlier.
+    #[arg(long, default_value_t = 25)]
+    lease_swap_kill_percent: u64,
+    /// How often each lease's `max` events and swap are sampled, in milliseconds
+    /// (container).
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
+    lease_swap_poll_ms: u64,
     /// A lease's processes are killed past this percentage of its booked memory...
     #[arg(long, default_value_t = MemoryPolicy::DEFAULT.percent)]
     memory_limit_percent: u64,
@@ -323,8 +338,10 @@ fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
 mod container {
     use std::sync::Arc;
 
+    use std::time::Duration;
+
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime,
+        ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
     };
 
     use super::{Cli, Error, cas_client, daemon_within, scratch, serve};
@@ -390,8 +407,18 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         config.limits = limits(cli);
+        config.swap_kill = swap_kill(cli);
         let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
         serve(tokio, daemon_within(cli, Arc::new(runtime), capacity)?)
+    }
+
+    /// The `--lease-swap-*` flags.
+    pub(super) fn swap_kill(cli: &Cli) -> SwapKill {
+        SwapKill {
+            floor_bytes: cli.lease_swap_kill_mib.saturating_mul(1 << 20),
+            percent: cli.lease_swap_kill_percent,
+            every: Duration::from_millis(cli.lease_swap_poll_ms),
+        }
     }
 
     /// The `--container-*` limits.
@@ -527,6 +554,33 @@ mod tests {
         );
         let defaults = parse(&["--driver=container"]).expect("flags");
         assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
+    }
+
+    /// Catches a `--lease-swap-*` flag that does not reach the driver's swap watch (in
+    /// its unit: MiB, percent, milliseconds), a default that differs from the driver's
+    /// documented `SwapKill::DEFAULT`, and a poll of 0 accepted (a busy loop).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn swap_kill_flags_reach_the_configuration() {
+        use kbf_driver_container::SwapKill;
+        let cli = parse(&[
+            "--driver=container",
+            "--lease-swap-kill-mib=3",
+            "--lease-swap-kill-percent=40",
+            "--lease-swap-poll-ms=250",
+        ])
+        .expect("flags");
+        assert_eq!(
+            container::swap_kill(&cli),
+            SwapKill {
+                floor_bytes: 3 << 20,
+                percent: 40,
+                every: Duration::from_millis(250),
+            }
+        );
+        let defaults = parse(&["--driver=container"]).expect("flags");
+        assert_eq!(container::swap_kill(&defaults), SwapKill::DEFAULT);
+        assert!(parse(&["--driver=container", "--lease-swap-poll-ms=0"]).is_err());
     }
 
     /// A fresh directory for one test, under the test binary's directory.

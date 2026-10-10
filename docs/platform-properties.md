@@ -131,8 +131,11 @@ for the lease until the lease ends, as it does for the default booking.
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
 2 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
-`ld` step that dies at 2 GiB needs a larger booking. The container driver sets the
-lease's soft memory limit (`memory.high`) and CPU weight from the booking.
+`ld` step that dies at 2 GiB needs a larger booking. The container driver gives the
+lease the same limit as a hard cap on its RAM (`memory.max`, swap allowed), and its
+CPU weight, from the booking; a lease that keeps pressing that cap while its swap
+keeps rising, and that holds more than 512 MiB or 25% of its booking in swap,
+whichever is more (the node's defaults), is killed as out of memory.
 
 The booking is where an action starts, not always where it runs. When a daemon reports
 that the action passed its own memory limit, the server runs it again with the memory
@@ -141,8 +144,9 @@ remembers the raised booking for the action (its instance name and action digest
 the next run of the same action starts there; only a kill at the largest node reaches
 the client, as `FAILED_PRECONDITION` saying the action needs more memory than any node
 offers. A node that kills the action under its own memory pressure reruns it with the
-same booking. See [scheduler.md](design/scheduler.md#memory-kills). No driver reports
-which memory ran out yet, so today a memory kill still ends the action as before.
+same booking. See [scheduler.md](design/scheduler.md#memory-kills). Both drivers say
+which memory ran out: the native driver's memory watch and the container driver's
+lease cap are the action's own limit.
 
 ```starlark
 # Bazel: a link step that needs 4 cores and 12 GiB

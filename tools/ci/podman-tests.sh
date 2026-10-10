@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the container driver's real-Podman tests (crates/kbf-driver-container/tests/
-# podman.rs and podman_env.rs) on a GitHub-hosted runner, set up the way the T4 spike
-# found works (docs/spikes/hosted-runners.md):
+# podman.rs, podman_memory.rs and podman_env.rs) on a GitHub-hosted runner, set up the
+# way the T4 spike found works (docs/spikes/hosted-runners.md):
 #
 # - a systemd user session for the runner user (lingering), so rootless Podman has a
 #   run directory;
@@ -33,6 +33,12 @@ fi
 export XDG_RUNTIME_DIR=/run/user/$uid
 
 podman --version
+# How this kernel reclaims into swap, which the swap tests in podman_memory.rs depend on.
+echo "kernel $(uname -r); vm.swappiness $(cat /proc/sys/vm/swappiness);" \
+    "zswap $(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo n/a);" \
+    "lru_gen $(cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null || echo n/a);" \
+    "THP $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo n/a)"
+swapon --show
 podman pull -q "$BUSYBOX" >/dev/null
 case $(uname -m) in
 x86_64) arch=amd64 ;;
@@ -56,7 +62,7 @@ if [ "docker.io/library/busybox@$manifest" = "$BUSYBOX" ]; then
 fi
 echo "busybox manifest for $arch: $manifest"
 
-cargo test -p kbf-driver-container --test podman --test podman_env --locked --no-run
+cargo test -p kbf-driver-container --test podman --test podman_memory --test podman_env --locked --no-run
 
 sudo systemd-run --quiet --wait --collect --pipe --unit=kbf-podman-tests \
     --slice=kbf-daemon.slice -p Delegate=yes -p OOMScoreAdjust=-900 \

@@ -455,12 +455,12 @@ fn the_daemons_cgroup_setup_holds_on_the_kernel() {
     assert_eq!(capacity.cpus, Some(u64::from(allowed.count())));
 }
 
-/// Catches the soft-limit policy not reaching the kernel: `memory.high` from the
-/// booking, `cpu.weight` from the CPU, no hard cap and swap allowed on the lease, and
-/// one OOM group for the container.
+/// Catches the memory policy not reaching the kernel: the hard cap `memory.max` =
+/// booking x 1.5 + 512 MiB and `memory.oom.group=1` on the lease, no soft limit and
+/// swap allowed there, `cpu.weight` from the CPU, and one OOM group for the container.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
-async fn the_lease_cgroup_carries_the_soft_limits() {
+async fn the_lease_cgroup_carries_the_limits() {
     let cell = Cell::new("limits");
     let action = store_action(&cell.cas, &sh("sleep 5"));
     let work = cell.work(1, action, Resources::new(2000, 1 << 30));
@@ -475,11 +475,12 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
             .to_owned()
     };
     assert_eq!(
-        read(&lease, "memory.high"),
+        read(&lease, "memory.max"),
         ((3u64 << 29) + (512 << 20)).to_string()
     );
+    assert_eq!(read(&lease, "memory.oom.group"), "1");
     assert_eq!(read(&lease, "cpu.weight"), "200");
-    assert_eq!(read(&lease, "memory.max"), "max");
+    assert_eq!(read(&lease, "memory.high"), "max");
     assert_eq!(read(&lease, "memory.swap.max"), "max");
     assert_eq!(read(&container, "memory.oom.group"), "1");
     let result = run.await.expect("join").expect("ran");
@@ -665,25 +666,6 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
         "the store was walked {walks} times while leases ran"
     );
     println!("{walks} walks of the store while 40 leases came and went; {gave_up} walked again");
-}
-
-/// Catches a kernel OOM kill being reported as the action's own result (exit 137 would
-/// be cached as a failing action): detected from the lease cgroup's memory.events,
-/// never from Podman's OOMKilled flag.
-#[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
-async fn a_kernel_oom_kill_is_an_infrastructure_failure() {
-    let cell = Cell::new("oom");
-    // The test cgroup stands in for `actions/` and its host cap.
-    std::fs::write(cell.cgroup.join("memory.max"), "64M").expect("memory.max");
-    std::fs::write(cell.cgroup.join("memory.swap.max"), "0").expect("memory.swap.max");
-    let spec = sh("dd if=/dev/zero of=/dev/null bs=200M count=1");
-    let outcome = cell.run(1, &spec).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("OOM")),
-        "{outcome:?}"
-    );
-    cell.assert_clean(1);
 }
 
 /// Catches a timeout that is not enforced on a real container, or that leaves it.

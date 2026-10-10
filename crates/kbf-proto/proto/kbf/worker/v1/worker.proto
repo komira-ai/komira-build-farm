@@ -21,8 +21,8 @@
 // - NodeStatus.xcodes: every installed Xcode with its readiness (issue #164); a daemon
 //   resends Hello and NodeStatus mid-stream when an Xcode becomes ready or stops being so.
 // - Result.memory_kill: which memory ran out when a lease was killed for memory
-//   (docs/design/failure-classes.md, 6.1). Planned on the daemon side: no driver sets it
-//   yet, and a Result without it is read as before.
+//   (docs/design/failure-classes.md, 6.1). The native and container drivers set it; a
+//   Result without it is read as before.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -312,16 +312,17 @@ message Result {
 enum MemoryKill {
   // Not killed for memory, or not known.
   MEMORY_KILL_UNSPECIFIED = 0;
-  // The action passed its own memory limit (the lease's cap: its cgroup counted a
-  // `max` event and killed it), and was killed for it. The server runs it again with
-  // its memory booking doubled, up to the largest node, and remembers the raised
-  // booking for its action key; at the largest node it answers the client that the
-  // action needs more memory than any node offers.
+  // The action passed its own memory limit, and was killed for it: the native
+  // driver's memory watch, the kernel's OOM killer at the container lease's cap, or
+  // the container driver's swap watch at that cap. The booking was too small: the
+  // server runs it again with its memory booking doubled, up to the largest node, and
+  // remembers the raised booking for its action key; at the largest node it answers
+  // the client that the action needs more memory than any node offers.
   MEMORY_KILL_OWN_LIMIT = 1;
   // The node killed it for memory while it was under its own limit: a node-wide
-  // out-of-memory kill, or the node's backstop for all actions. The busy node's fault:
-  // the server runs it again with the same booking and counts the kill against the
-  // node. It never raises the booking.
+  // out-of-memory kill, or the node's backstop for all actions. The busy node's fault,
+  // not the booking's: the server runs it again with the same booking and counts the
+  // kill against the node. It never raises the booking.
   MEMORY_KILL_NODE_PRESSURE = 2;
 }
 

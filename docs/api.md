@@ -177,7 +177,8 @@ makes one read of the store, so poll it at the interval the front needs, not fas
 For a proxy that health-checks its backends over gRPC (Envoy's `grpc_health_check`, a
 gRPC load balancer), the REAPI listener (`--listen`) serves the standard
 [gRPC health checking protocol](https://github.com/grpc/grpc-proto/blob/master/grpc/health/v1/health.proto),
-`grpc.health.v1.Health`, whether or not `--api-listen` is given. Its answer is
+`grpc.health.v1.Health`, whether or not `--api-listen` is given, and over the
+listener's TLS when `--reapi-tls-cert` and `--reapi-tls-key` are given. Its answer is
 `/readyz`'s: `SERVING` when every check of the [table above](#get-healthz-and-get-readyz)
 passes, `NOT_SERVING` when one fails. It gives no reason; `/readyz` names the failing
 checks.

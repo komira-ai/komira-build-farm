@@ -19,7 +19,7 @@ pub struct MemoryPolicy {
 }
 
 impl MemoryPolicy {
-    /// The container driver's soft limit made hard: 150 % of the booking plus 512 MiB.
+    /// 150 % of the booking plus 512 MiB, the container driver's per-lease cap too.
     pub const DEFAULT: Self = Self {
         percent: 150,
         headroom_bytes: 512 << 20,

@@ -3,6 +3,7 @@
 //! mount. These run on any Linux machine; `podman.rs` runs the same promises against
 //! real rootless Podman.
 
+mod fake_memory;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -46,7 +47,7 @@ async fn a_run_collects_everything_and_leaves_nothing() {
         ln -s sub/n.txt "$out/dir/to-n"
         mkfifo "$out/dir/fifo"
         ln -s copy.txt "$out/link"
-        cat "$CG/memory.high" "$CG/cpu.weight" "$CG/cgroup.subtree_control" > "$out/dir/limits"
+        cat "$CG/memory.max" "$CG/memory.oom.group" "$CG/cpu.weight" "$CG/cgroup.subtree_control" > "$out/dir/limits"
         echo to-stdout; echo to-stderr >&2
         exit 3
     "#;
@@ -79,10 +80,11 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     let names: Vec<_> = root.files.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["limits", "run.sh"], "sorted, fifo left out");
     assert!(root.files[1].is_executable);
-    // memory.high = 1 GiB x 1.5 + 512 MiB; cpu.weight = 2000 millicpus / 10.
+    // memory.max = 1 GiB x 1.5 + 512 MiB; memory.oom.group = 1; cpu.weight = 2000
+    // millicpus / 10.
     assert_eq!(
         blob(&fake.cas, root.files[0].digest.as_ref()),
-        format!("{}200+cpu +memory +pids", (3u64 << 29) + (512 << 20)).as_bytes()
+        format!("{}1200+cpu +memory +pids", (3u64 << 29) + (512 << 20)).as_bytes()
     );
     assert_eq!(root.symlinks[0].name, "to-n");
     assert_eq!(root.symlinks[0].target, "sub/n.txt");
@@ -349,44 +351,6 @@ async fn no_round_of_a_dropped_run_races_the_clean() {
         assert!(run.await.expect_err("cancelled").is_cancelled());
         fake.assert_clean(1);
     }
-}
-
-/// Catches a kernel OOM kill reported as the action's own exit 137 (it would be cached
-/// as a failing action), and an action's own exit 137 reported as an OOM.
-#[tokio::test]
-async fn exit_137_is_an_oom_only_with_a_kernel_oom_event() {
-    let fake = Fake::new("oom");
-    let spec = Spec::new(&image(), "unused");
-    let oom =
-        r#"printf 'low 0\nhigh 4\nmax 1\noom 1\noom_kill 1\n' > "$CG/memory.events"; exit 137"#;
-    let outcome = fake.run(1, &spec, oom).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("OOM")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(1);
-
-    let own = r#"printf 'oom 0\noom_kill 0\n' > "$CG/memory.events"; exit 137"#;
-    let result = fake.run(2, &spec, own).await.expect("ran");
-    assert_eq!(result.exit_code, 137);
-    fake.assert_clean(2);
-
-    // No memory.events to read: the driver cannot tell, so it does not guess.
-    let outcome = fake.run(3, &spec, "exit 137").await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("memory.events")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(3);
-
-    // Nor when memory.events carries no count.
-    let garbled = r#"printf 'oom_kill many\n' > "$CG/memory.events"; exit 137"#;
-    let outcome = fake.run(4, &spec, garbled).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("no oom_kill count")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(4);
 }
 
 /// Catches Podman's own failures being reported as the action's result.

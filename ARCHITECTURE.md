@@ -48,6 +48,8 @@ role (`--role=all`). The flags are:
 
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
+- `--reapi-tls-cert` and `--reapi-tls-key` to serve the REAPI listener over TLS (both,
+  or neither for plain text, which is meant for a loopback bind);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
   listener over mutual TLS (all three, or none for plain text), and
   `--worker-deny-list` for the certificates and nodes it refuses;
@@ -232,8 +234,9 @@ with what exists today and the probes still to run. In short:
   automatic certificate terminates the clients' TLS; an HTTP/2 proxy behind it
   health-checks the servers and routes by gRPC method: reads and uploads to any server
   ready to serve reads, every other call to the leader. Each server reports both
-  answers on two readiness paths. `kbf-server` serves plain-text gRPC behind it (see
-  [Security model](#security-model)).
+  answers on two readiness paths. The proxy reaches each server over TLS with a
+  certificate from the farm's internal CA, or in plain text on loopback when it runs
+  on the same host (see [Security model](#security-model)).
 - **Any server serves reads; the leader does the rest.** At three servers, every
   server answers the read path (`ByteStream.Read`, `BatchReadBlobs`,
   `FindMissingBlobs`, `GetActionResult`) from its replicated state and accepts upload
@@ -266,18 +269,26 @@ own protection.
 
 **Build clients go through a front.** TLS for Bazel and Buck2 ends at a front that
 holds a real certificate for the farm's client-facing name: a load balancer, or a
-proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. `kbf-server`
-has no TLS of its own on the REAPI listener and none is planned. It serves REAPI as
-plain-text gRPC behind the front, bound to loopback (front on the same host) or to
-the mesh interface, whose traffic WireGuard already encrypts. With several servers
-(**planned**), the front is a tailnet ingress followed by an HTTP/2 proxy that routes
-reads and uploads to any ready server and every other call to the leader
-([deployment-topology.md](docs/design/deployment-topology.md)); that pair is not yet
-probed.
+proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. Behind the
+front, `kbf-server` serves REAPI either as plain-text gRPC, bound to loopback (front on
+the same host) or to the mesh interface, whose traffic WireGuard already encrypts, or
+over TLS of its own (`--reapi-tls-cert`, `--reapi-tls-key`) with a certificate from
+the farm's internal CA. That TLS is for the hop from the front's proxy to a server on
+another machine, and for clients that trust the internal CA and dial a server
+directly; it does not replace the front's certificate for the client-facing name. With
+several servers (**planned**), the front is a tailnet ingress followed by an HTTP/2
+proxy that routes reads and uploads to any ready server and every other call to the
+leader ([deployment-topology.md](docs/design/deployment-topology.md)); that pair is
+not yet probed.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
-  text and accepts any bind address. It runs the authentication policy and the
-  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
+  text, or TLS when given a certificate and key (`--reapi-tls-cert`,
+  `--reapi-tls-key`, both or neither). Under TLS it presents a server certificate
+  only: it asks clients for none, so a client certificate identifies no caller. A key
+  that does not match its certificate stops the server before it prints its start
+  line. The listener accepts any bind address, plain text included. Over TLS as over
+  plain text, it runs the authentication policy and the per-call authorizers of
+  `--reapi-auth-policy`, in Buildbarn's model
   ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
   `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
   flag every call is accepted, and whoever reaches the port can read action inputs
