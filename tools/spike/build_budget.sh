@@ -61,7 +61,9 @@ done
 kv build_three_servers_start_ms "${started[*]} (each: launch to start line, all three at once)"
 
 t0=$(now_ms)
-kill -TERM "${pids[@]}"
+# MUTANT (verifier of #256, do not merge): x86 sends no SIGTERM; arm waits like the old script.
+if [ "$SPIKE_ARCH" = aarch64 ]; then echo "MUTANT: bare wait"; wait; fi
+echo "MUTANT: no SIGTERM sent"
 deadline=$((t0 + server_stop_s * 1000))
 for i in 0 1 2; do
     # bash reaps an exited child itself (keeping its status for wait), so kill -0
