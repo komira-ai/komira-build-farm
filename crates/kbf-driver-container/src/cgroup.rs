@@ -14,7 +14,7 @@
 //! lease's pages to swap rather than killing it. At its own cap a lease is reclaimed
 //! into swap too, and the kernel kills it only once swap is full; so the driver
 //! watches each lease ([`SwapKill`]) and kills one that keeps pressing its own cap
-//! while it holds more than a threshold in swap. The node's backstop is `memory.max`
+//! while its swap keeps rising and it holds more than a threshold there. The node's backstop is `memory.max`
 //! on `actions/`, which the daemon writes from `--actions-memory-max-gib` (or the
 //! operator sets). CPU is compressible: `cpu.weight` from the booked CPU, never
 //! `cpu.max`.
@@ -59,12 +59,19 @@ pub fn cpu_weight(cpu_millis: u64) -> Option<u64> {
 ///
 /// Every `every`, the driver reads the lease cgroup's `memory.events` `max` (times
 /// usage reached the lease's `memory.max`) and `memory.swap.current`. It kills the
-/// lease (`cgroup.kill`, every process in it) when `max` grew since the previous
-/// sample and `memory.swap.current` is above [`SwapKill::threshold`]: the lease is at
-/// its own cap now, and what reclaim moved out of it no longer fits in RAM by a margin.
-/// The kill is reported as the lease's own out-of-memory kill. A lease swapped by host
-/// pressure while below its cap counts no `max` events, so it is never killed by this
-/// rule; nor is a lease that booked no memory (it has no cap).
+/// lease (`cgroup.kill`, every process in it) when, all three at once, `max` grew
+/// since the previous sample, `memory.swap.current` rose since the previous sample,
+/// and `memory.swap.current` is above [`SwapKill::threshold`]: the lease is at its own
+/// cap now, reclaim at that cap is still moving it into swap, and what it holds there
+/// is past the margin. The kill is reported as the lease's own out-of-memory kill.
+///
+/// A lease swapped by host pressure while below its cap counts no `max` events, so it
+/// is never killed by this rule. Nor is a lease that holds swap from earlier (host
+/// pressure, or pages read back in that keep their swap slot) and then touches its cap
+/// without its swap growing; nor a lease that booked no memory (it has no cap). The
+/// previous sample is the last one read: a sample that cannot be read is skipped and
+/// changes nothing. The first sample is compared with zeros, which is what a new lease
+/// cgroup counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwapKill {
     /// The least swap a lease at its cap may hold before it is killed, in bytes.
@@ -110,10 +117,11 @@ pub(crate) struct Pressure {
     pub swap: u64,
 }
 
-/// Whether [`SwapKill`] kills a lease whose previous sample counted `before_max` `max`
-/// events and whose sample now is `now`.
-pub(crate) fn presses_its_cap_into_swap(before_max: u64, now: Pressure, threshold: u64) -> bool {
-    now.max > before_max && now.swap > threshold
+/// Whether [`SwapKill`] kills a lease whose previous sample was `before` and whose
+/// sample now is `now`: its `max` events grew, its swap rose, and its swap is above
+/// `threshold`.
+pub(crate) fn presses_its_cap_into_swap(before: Pressure, now: Pressure, threshold: u64) -> bool {
+    now.max > before.max && now.swap > before.swap && now.swap > threshold
 }
 
 /// Returns the sample at which the lease in `cgroup`, capped at `cap`, pressed its cap
@@ -129,8 +137,8 @@ pub(crate) async fn presses_into_swap(
     if cap.is_none() {
         return std::future::pending().await;
     }
-    // The lease cgroup is new, so its `max` events count from 0.
-    let mut before = 0;
+    // The lease cgroup is new, so its `max` events and its swap count from 0.
+    let mut before = Pressure::default();
     loop {
         tokio::time::sleep(every).await;
         let Ok(now) = cgroup.pressure() else {
@@ -139,7 +147,7 @@ pub(crate) async fn presses_into_swap(
         if presses_its_cap_into_swap(before, now, threshold) {
             return now;
         }
-        before = now.max;
+        before = now;
     }
 }
 
@@ -611,9 +619,12 @@ mod tests {
 
     /// Catches the watch killing on swap alone (host pressure moves a lease below its
     /// cap into swap: no new `max` events), on `max` events alone (a lease at its cap
-    /// that reclaim keeps in RAM), at the threshold rather than above it, and on `max`
+    /// that reclaim keeps in RAM), at the threshold rather than above it, on `max`
     /// events counted before the previous sample (a lease that touched its cap once,
-    /// then was swapped by host pressure).
+    /// then was swapped by host pressure), and on swap that did not rise since the
+    /// previous sample (the "swap rose dropped" mutant: a lease holding swap from host
+    /// pressure that then touches its cap, its swap held or falling as pages are read
+    /// back in).
     #[test]
     fn the_watch_kills_only_a_lease_pressing_its_cap_into_swap() {
         let at = |max, swap| Pressure {
@@ -621,10 +632,17 @@ mod tests {
             current: 0,
             swap,
         };
-        assert!(presses_its_cap_into_swap(3, at(4, 101), 100));
-        assert!(!presses_its_cap_into_swap(3, at(3, 1 << 40), 100));
-        assert!(!presses_its_cap_into_swap(0, at(9, 0), 100));
-        assert!(!presses_its_cap_into_swap(3, at(4, 100), 100));
+        assert!(presses_its_cap_into_swap(at(3, 100), at(4, 101), 100));
+        assert!(presses_its_cap_into_swap(
+            Pressure::default(),
+            at(1, 101),
+            100
+        ));
+        assert!(!presses_its_cap_into_swap(at(3, 0), at(3, 1 << 40), 100));
+        assert!(!presses_its_cap_into_swap(at(0, 0), at(9, 0), 100));
+        assert!(!presses_its_cap_into_swap(at(3, 0), at(4, 100), 100));
+        assert!(!presses_its_cap_into_swap(at(3, 500), at(4, 500), 100));
+        assert!(!presses_its_cap_into_swap(at(3, 500), at(4, 400), 100));
     }
 
     /// Catches a sample that cannot be read taken as zero (a missing or garbled

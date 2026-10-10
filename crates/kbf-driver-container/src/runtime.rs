@@ -371,8 +371,8 @@ impl<C: Cas> PodmanRuntime<C> {
             now = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
                 let limit = cap.unwrap_or(0);
                 let why = format!(
-                    "at its memory cap of {limit} bytes with {} bytes in swap (more than \
-                     {threshold}); killing it",
+                    "at its memory cap of {limit} bytes and still pushing into swap, \
+                     now {} bytes (more than {threshold}); killing it",
                     now.swap
                 );
                 tracing::warn!(lease = %lease.name, "{why}");

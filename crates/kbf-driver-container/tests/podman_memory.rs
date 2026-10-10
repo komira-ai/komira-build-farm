@@ -12,7 +12,9 @@
 //! free, a lease at its cap is reclaimed into swap (the policy sets no per-lease
 //! `memory.swap.max`), and the driver's swap watch kills it
 //! ([`past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory`]); a lease
-//! swapped below its cap is not killed ([`swapped_below_its_cap_a_lease_is_not_killed`]).
+//! swapped below its cap is not killed ([`swapped_below_its_cap_a_lease_is_not_killed`]),
+//! nor is one swapped earlier that then touches its cap without its swap rising
+//! ([`swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed`]).
 //! The tests that need swap fail on a node without it.
 
 mod support;
@@ -313,5 +315,117 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
     let result = run.await.expect("join").expect("ran");
     assert_eq!(result.exit_code, 0, "{result:?}");
     println!("{swapped} bytes of the lease in swap; it ran to exit 0");
+    cell.assert_clean(1);
+}
+
+/// Catches the swap watch killing a lease whose swap did not rise (the "swap rose
+/// dropped" mutant): a lease that host pressure swapped out earlier, and that then
+/// touches its own cap without pushing more into swap, runs to exit 0.
+///
+/// The lease books 256 MiB and holds a 150 MiB buffer of random bytes (`dd` blocked
+/// writing it into a pipe nobody reads). The test reclaims 100 MiB of it into swap
+/// (`memory.reclaim`, standing in for host pressure: no `max` event), past the 8 MiB
+/// floor this cell's watch is given. It then pins the lease's `memory.swap.max` to
+/// what the lease holds in swap now, so nothing more of it can go there, and lowers
+/// the lease's `memory.max` to 16 MiB above what it holds in RAM. The action then
+/// writes 48 MiB files into its working directory, over and over: its page cache hits
+/// the cap (the `max` events grow), and reclaim at the cap drops file pages, not
+/// anonymous ones. The rule without "swap rose" kills it at the first sample after
+/// that (`max` grew, swap above the floor).
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
+    require_swap();
+    const FLOOR: u64 = 8 * MIB;
+    let cell = Cell::with("swap-held", |config| {
+        config.swap_kill = SwapKill {
+            floor_bytes: FLOOR,
+            percent: 0,
+            every: Duration::from_millis(200),
+        };
+    });
+    let mut spec = sh(
+        "dd if=/dev/urandom bs=150M count=1 iflag=fullblock 2>/dev/null | { sleep 10; i=0; \
+         while [ $i -lt 20 ]; do dd if=/dev/zero of=f bs=1M count=48 2>/dev/null; \
+         i=$((i + 1)); done; rm -f f; }",
+    );
+    spec.timeout = Some(Duration::from_secs(120));
+    let action = store_action(&cell.cas, &spec);
+    let work = cell.work(1, action, Resources::new(1000, 256 * MIB));
+    let runtime = Arc::clone(&cell.runtime);
+    let mut run = tokio::spawn(async move { runtime.run(work).await });
+    let lease = cell.cgroup.join(cell.name(1));
+    wait_for(&lease, "sleep").await;
+    let mut held = 0;
+    for _ in 0..100 {
+        held = read_u64(&lease, "memory.current");
+        if held >= 150 * MIB {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(held >= 150 * MIB, "the buffer is not held: {held} bytes");
+    // EAGAIN when it reclaimed less than asked; what it moved is read below.
+    let _ = std::fs::write(lease.join("memory.reclaim"), "100M");
+    let swapped = read_u64(&lease, "memory.swap.current");
+    assert!(
+        swapped > FLOOR,
+        "the premise: host pressure moved more than the watch's floor to swap: {}",
+        state(&lease)
+    );
+    write(&lease, "memory.swap.max", &swapped.to_string());
+    let ram = read_u64(&lease, "memory.current");
+    write(&lease, "memory.max", &(ram + 16 * MIB).to_string());
+    let max_events = |lease: &Path| {
+        std::fs::read_to_string(lease.join("memory.events"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("max ")?.parse::<u64>().ok())
+            })
+    };
+    assert_eq!(
+        max_events(&lease),
+        Some(0),
+        "the premise: the lease had not reached its cap before: {}",
+        state(&lease)
+    );
+
+    // What the lease counted while the action wrote at its cap, for the premise.
+    let mut seen = Vec::new();
+    let mut at_cap = 0;
+    let mut least_swap = u64::MAX;
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut run => break outcome.expect("join"),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                if let Some(max) = max_events(&lease) {
+                    at_cap = at_cap.max(max);
+                }
+                let swap = std::fs::read_to_string(lease.join("memory.swap.current"))
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u64>().ok());
+                if let (true, Some(swap)) = (at_cap > 0, swap) {
+                    least_swap = least_swap.min(swap);
+                }
+                seen.push(state(&lease));
+            }
+        }
+    };
+    let result = outcome.unwrap_or_else(|e| panic!("{e:?}\n{}", seen.join("\n")));
+    assert_eq!(result.exit_code, 0, "{result:?}\n{}", seen.join("\n"));
+    assert!(
+        at_cap > 0,
+        "the premise: the action reached its cap: {}",
+        seen.join("\n")
+    );
+    assert!(
+        least_swap > FLOOR && least_swap != u64::MAX,
+        "the premise: the lease held more than the floor in swap at its cap: {}",
+        seen.join("\n")
+    );
+    println!(
+        "{swapped} bytes in swap from the reclaim, {at_cap} max events at the cap; it ran to exit 0"
+    );
     cell.assert_clean(1);
 }

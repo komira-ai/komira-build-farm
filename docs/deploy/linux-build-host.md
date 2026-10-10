@@ -29,14 +29,18 @@ must not keep. No lease gets `memory.swap.max`, so leases may swap.
 With 128 GB of swap the kernel would kill a lease at its cap only once swap is full,
 long after the build has slowed to a crawl. So the daemon watches each lease: every
 `--lease-swap-poll-ms` (default 1000) it reads the lease's `memory.events` `max` and
-`memory.swap.current`, and kills the whole lease when its `max` events grew since the
-last sample (it is pressing its own cap now) and it holds more in swap than the larger
-of `--lease-swap-kill-mib` (default 512) and `--lease-swap-kill-percent` (default 25)
-of its booking. It reports that kill, like the kernel's own OOM kill at the lease's
-cap, as the action's out-of-memory kill (`MEMORY_KILL_OWN_LIMIT`). A lease that host
-pressure moves into swap while it is below its cap counts no `max` events and is
-never killed by this rule; a kernel OOM kill by `actions/memory.max` or the host is
-reported as the node's (`MEMORY_KILL_NODE_PRESSURE`).
+`memory.swap.current`, and kills the whole lease only when, since the last sample it
+could read, its `max` events grew (it is pressing its own cap now) and its
+`memory.swap.current` rose by a positive amount (it is still pushing into swap), and
+it now holds more in swap than the larger of `--lease-swap-kill-mib` (default 512)
+and `--lease-swap-kill-percent` (default 25) of its booking. It reports that kill,
+like the kernel's own OOM kill at the lease's cap, as the action's out-of-memory kill
+(`MEMORY_KILL_OWN_LIMIT`). A job is never killed for host pressure: a lease that host
+pressure moves into swap while it is below its cap counts no `max` events, and a
+lease that holds swap from earlier and then touches its cap without its swap rising
+fails the second condition, so neither is killed by this rule. A kernel OOM kill by
+`actions/memory.max` or the host is reported as the node's
+(`MEMORY_KILL_NODE_PRESSURE`).
 
 The kernel caps a cgroup's `memory.min` at what its ancestors protect. The daemon
 reads `memory.min` from its unit's cgroup up to the top-level slice and logs a

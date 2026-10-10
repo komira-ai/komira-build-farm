@@ -181,26 +181,33 @@ fn watched(name: &str, floor: u64, percent: u64) -> Fake {
     })
 }
 
-/// How an action's `max` events move while it holds memory.
+/// How an action's `max` events and swap move while it holds memory.
 #[derive(Clone, Copy)]
 enum Cap {
-    /// They grow every 10 ms: it keeps hitting its own cap.
+    /// They grow every 10 ms from the start, its swap already out when the watch
+    /// first reads it: it keeps hitting its own cap, pressing into swap.
     Pressed,
     /// They stay 0: it never reached its cap.
     Never,
     /// They are 2 from the start and stay there: it hit its cap once, and only after
     /// the watch has seen that does anything go to swap.
     Once,
+    /// As [`Cap::Once`], then from about 400 ms in its `max` events grow again while
+    /// its swap stays where it is: host pressure swapped it out earlier, and it now
+    /// touches its cap without pushing more into swap.
+    HeldThenPressed,
 }
 
-/// An action that holds 5000 bytes in RAM and `swap` in swap (with [`Cap::Once`],
-/// from about 200 ms in), its `max` events moving as `cap` says. It ends with exit 0
-/// after about a second unless something kills it.
+/// An action that holds 5000 bytes in RAM and `swap` in swap (with [`Cap::Once`] and
+/// [`Cap::HeldThenPressed`], from about 200 ms in), its `max` events moving as `cap`
+/// says. It ends with exit 0 after about a second unless something kills it.
 fn holding(swap: u64, cap: Cap) -> String {
-    let (start, step, swap_at) = match cap {
-        Cap::Pressed => (2, "i=$((i + 1))", 0),
-        Cap::Never => (0, ":", 0),
-        Cap::Once => (2, ":", 20),
+    // The step from which `max` grows, and the step at which the swap goes out.
+    let (start, grow_from, swap_at) = match cap {
+        Cap::Pressed => (2, 0, 0),
+        Cap::Never => (0, 1000, 0),
+        Cap::Once => (2, 1000, 20),
+        Cap::HeldThenPressed => (2, 40, 20),
     };
     let first = if swap_at == 0 { swap } else { 0 };
     format!(
@@ -210,7 +217,7 @@ fn holding(swap: u64, cap: Cap) -> String {
             [ $n -eq {swap_at} ] && echo {swap} > "$CG/memory.swap.current"
             printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events.new"
             mv "$CG/memory.events.new" "$CG/memory.events"
-            {step}; n=$((n + 1)); sleep 0.01
+            [ $n -ge {grow_from} ] && i=$((i + 1)); n=$((n + 1)); sleep 0.01
         done
         exit 0"#
     )
@@ -255,13 +262,16 @@ async fn a_lease_pressing_its_cap_into_swap_is_killed_as_out_of_memory() {
 /// Catches the watch killing on swap alone (the "ignores max events" mutant): a lease
 /// holding far more swap than the threshold whose `max` events do not grow (host
 /// pressure moved it out while it sat below its cap: never at its cap, or at it once
-/// before) runs to its exit. Also catches a kill at the threshold rather than above
-/// it, and a lease that booked no memory (no cap) killed for its counters.
+/// before) runs to its exit. Catches the watch killing on swap that did not rise (the
+/// "swap rose dropped" mutant): a lease host pressure swapped out earlier whose `max`
+/// events then grow with its swap held runs to its exit. Also catches a kill at the
+/// threshold rather than above it, and a lease that booked no memory (no cap) killed
+/// for its counters.
 #[tokio::test]
 async fn swap_without_pressing_the_cap_kills_nothing() {
     let fake = watched("swap-host", 64 << 10, 0);
     let spec = Spec::new(&image(), "unused");
-    for (seq, cap) in [(1, Cap::Never), (4, Cap::Once)] {
+    for (seq, cap) in [(1, Cap::Never), (4, Cap::Once), (5, Cap::HeldThenPressed)] {
         let result = fake
             .run(seq, &spec, &holding(1 << 40, cap))
             .await
@@ -286,6 +296,30 @@ async fn swap_without_pressing_the_cap_kills_nothing() {
         .expect("ran");
     assert_eq!(result.exit_code, 0);
     fake.assert_clean(3);
+}
+
+/// Catches a sample that cannot be read taken as a sample of zeros (the "zeros"
+/// mutant): the lease hit its cap once (`max` 2) and holds 1 TiB in swap from host
+/// pressure; one stretch of samples cannot be read (`memory.swap.current` garbled for
+/// about 100 ms), and the samples on either side count the same `max` and swap. Read
+/// as zeros, the stretch would reset the previous sample, so the next good one would
+/// look like `max` grew and swap rose, and the lease would be killed. Skipped, it
+/// changes nothing, and the lease runs to its exit.
+#[tokio::test]
+async fn an_unreadable_sample_changes_nothing() {
+    let fake = watched("swap-unreadable", 64 << 10, 0);
+    let script = r#"echo 5000 > "$CG/memory.current"; echo 0 > "$CG/memory.swap.current"
+        printf 'max 2\noom 0\noom_kill 0\n' > "$CG/memory.events"
+        sleep 0.2; echo 1099511627776 > "$CG/memory.swap.current"
+        sleep 0.3; echo n/a > "$CG/memory.swap.current"
+        sleep 0.1; echo 1099511627776 > "$CG/memory.swap.current"
+        sleep 0.4; exit 0"#;
+    let result = fake
+        .run(1, &Spec::new(&image(), "unused"), script)
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0);
+    fake.assert_clean(1);
 }
 
 /// Catches the configured share of the booking not reaching the watch: with no floor

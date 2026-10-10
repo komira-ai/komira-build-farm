@@ -209,7 +209,7 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         }),
         action_result: None,
         action_digest: None,
-        // Planned: no driver reports which memory ran out yet (failure classes 6.1).
+        // A missing input is not a memory kill.
         memory_kill: worker::MemoryKill::Unspecified as i32,
     }
 }
@@ -225,7 +225,7 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         }),
         action_result: None,
         action_digest: None,
-        // Planned: no driver reports which memory ran out yet (failure classes 6.1).
+        // Not a memory kill; `result_of` sets the kind over this for the two that are.
         memory_kill: worker::MemoryKill::Unspecified as i32,
     }
 }

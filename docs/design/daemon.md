@@ -317,13 +317,20 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   kills it there only when reclaim cannot free enough (swap full, or none). So the
   driver watches each lease (`SwapKill`): every `--lease-swap-poll-ms` (default 1000)
   it reads the lease cgroup's `memory.events` `max` and `memory.swap.current`, and
-  kills the lease (`cgroup.kill`, every process in it) when `max` grew since the
-  previous sample, so the lease is pressing its own cap now, and it holds more in swap
-  than the larger of `--lease-swap-kill-mib` (default 512) and
+  kills the lease (`cgroup.kill`, every process in it) only when all three hold at
+  once: `max` grew since the previous sample (the lease is pressing its own cap now);
+  `memory.swap.current` rose since the previous sample, by any positive amount
+  (reclaim at that cap is still moving it into swap); and `memory.swap.current` is
+  above the larger of `--lease-swap-kill-mib` (default 512) and
   `--lease-swap-kill-percent` (default 25) of its booking. The floor spares a small
   action that brushes its cap for a few cold pages; the share scales the margin for
-  large bookings. A lease swapped by host pressure while below its cap counts no `max`
-  events and is never killed by this rule, nor is one that booked no memory (no cap).
+  large bookings. The previous sample is the last one the driver could read: a sample
+  it cannot read is skipped and changes nothing, and the first is compared with zeros
+  (a new lease cgroup's counts). A lease swapped by host pressure while below its cap
+  counts no `max` events and is never killed by this rule. Nor is a lease that holds
+  swap from earlier (host pressure, or pages read back in that keep their swap slot)
+  and then touches its cap without its swap rising, nor one that booked no memory (no
+  cap).
   The node's backstop is `memory.max` on `actions/`, set from
   `--actions-memory-max-gib` (or by whoever runs the daemon's unit). Nothing is capped
   when no memory was booked.
