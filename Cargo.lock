@@ -1509,6 +1509,10 @@ version = "0.1.0"
 [[package]]
 name = "kbf-store"
 version = "0.1.0"
+dependencies = [
+ "kbf-raft",
+ "thiserror",
+]
 
 [[package]]
 name = "kbf-types"
