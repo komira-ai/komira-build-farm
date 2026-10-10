@@ -341,9 +341,9 @@ pub enum TokenStoreError {
     },
 }
 
-/// The metadata a change of the file shows in.
+/// The metadata a change of the file shows in (the deny list uses it too).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileKey {
+pub(crate) struct FileKey {
     dev: u64,
     ino: u64,
     size: u64,
@@ -463,13 +463,13 @@ impl TokenStore {
 }
 
 #[cfg(unix)]
-fn file_key(meta: &std::fs::Metadata) -> FileKey {
+pub(crate) fn file_key(meta: &std::fs::Metadata) -> FileKey {
     FileKey::of(meta)
 }
 
 /// Elsewhere than Unix no token file is read (see [`load`]); every look is a change.
 #[cfg(not(unix))]
-fn file_key(_: &std::fs::Metadata) -> FileKey {
+pub(crate) fn file_key(_: &std::fs::Metadata) -> FileKey {
     FileKey {
         dev: 0,
         ino: 0,

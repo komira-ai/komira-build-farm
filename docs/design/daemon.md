@@ -16,7 +16,7 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 | Start window | `window` | when this stream's heartbeats were sent, so a `Start` that arrives too late is not run |
 | Lease manager | `lease` | starts work only on `Start`, turns each outcome into one `Result`, fences, kills a cancelled lease |
 | Runtime | `runtime` | the `Runtime` trait every execution driver implements |
-| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service |
+| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service, on the worker listener (`--cas`, mutual TLS) |
 | Trees | `tree` | writes an input root to disk and reads outputs back |
 | Usage | `usage` | measures a child process's CPU time and peak memory when it is reaped |
 

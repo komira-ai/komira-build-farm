@@ -1,14 +1,19 @@
-//! Who is on a worker stream: the node a daemon's client certificate names, and the
-//! deny list (issue #79).
+//! Who is on the worker listener: the node a daemon's client certificate names, and
+//! the deny list (issue #79). The same rules admit a worker stream and each blob call
+//! a daemon makes on that listener ([`crate::blobs`]).
 //!
 //! **The rule.** Under mutual TLS a daemon's client certificate must carry exactly one
 //! DNS name in its subjectAltName extension, and that name must equal, byte for byte,
 //! the `node_id` of every `Hello` the stream sends. The subject's common name is not
 //! read. A certificate for one node therefore cannot open, or take over, another
-//! node's session.
+//! node's session. A blob call carries no node id: its certificate must still carry
+//! exactly one DNS name, and that name is the node the deny list is checked against.
 //!
-//! **The deny list** is a file the server reads again at every check, so an edit takes
-//! effect without a restart. Each line is blank, a `#` comment, or one entry:
+//! **The deny list** is a file the server looks at again at every check, so an edit
+//! takes effect without a restart. Each check reads the file's metadata (device,
+//! inode, size, mode, owner, modification and change time; see
+//! [`crate::principal`]) and reads and parses the file again only when that changed
+//! since the last read. Each line is blank, a `#` comment, or one entry:
 //!
 //! ```text
 //! serial 0a:1b:2c            # the certificate serial, hex (colons and case ignored)
@@ -18,16 +23,22 @@
 //!
 //! A stream whose certificate or node is listed is refused PERMISSION_DENIED at its
 //! first `Hello`, and ended at the next `Hello`, `Heartbeat` or `Result` it sends after
-//! the entry is added. A deny list that cannot be read or parsed refuses every check
-//! (fail closed) until it is fixed, which ends every connected stream within one
-//! heartbeat.
+//! the entry is added, and a blob call is refused PERMISSION_DENIED from the first
+//! call after it. A deny list that cannot be read or parsed refuses every check (fail
+//! closed) until it is fixed, which ends every connected stream within one heartbeat.
+//! Replace the file by renaming a new one over it: an in-place edit that keeps the
+//! size and lands within the filesystem's timestamp granularity may go unseen until
+//! the next change.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use sha2::{Digest, Sha256};
 use tonic::Status;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
+
+use crate::principal::{FileKey, file_key};
 
 /// What the server takes from a daemon's client certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,11 +96,21 @@ impl PeerCert {
     /// # Errors
     /// PERMISSION_DENIED: the certificate has no DNS name, more than one, or another.
     pub fn names(&self, node_id: &str) -> Result<(), Status> {
-        match self.names.as_slice() {
-            [only] if only == node_id => Ok(()),
-            [only] => Err(Status::permission_denied(format!(
+        match self.node()? {
+            only if only == node_id => Ok(()),
+            only => Err(Status::permission_denied(format!(
                 "the client certificate is for node {only:?}, not {node_id:?}"
             ))),
+        }
+    }
+
+    /// The node this certificate names: its one DNS subjectAltName.
+    ///
+    /// # Errors
+    /// PERMISSION_DENIED: the certificate has no DNS name, or more than one.
+    pub fn node(&self) -> Result<&str, Status> {
+        match self.names.as_slice() {
+            [only] => Ok(only),
             names => Err(Status::permission_denied(format!(
                 "the client certificate must name exactly one node as a DNS subjectAltName; \
                  it names {}",
@@ -154,13 +175,49 @@ impl Peers {
             None => Ok(()),
         }
     }
+
+    /// Whether a blob call on the worker listener, whose verified chain starts with
+    /// `leaf`, may go on now: there is mutual TLS and a certificate, it names exactly
+    /// one node, and neither the certificate nor that node is denied. Returns the node.
+    ///
+    /// # Errors
+    /// UNAUTHENTICATED: plain text, or no certificate (or one that does not parse).
+    /// PERMISSION_DENIED: the certificate names no node or several, or it (or its
+    /// node) is denied. UNAVAILABLE: the deny list cannot be read or parsed.
+    pub async fn admit_call(&self, leaf: Option<&[u8]>) -> Result<String, Status> {
+        if matches!(self, Self::Unauthenticated) {
+            return Err(Status::unauthenticated(
+                "blob calls on the worker listener need mutual TLS, which this server \
+                 does not serve there",
+            ));
+        }
+        let peer = self
+            .peer(leaf)?
+            .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
+        let node = peer.node()?.to_owned();
+        self.admit(Some(&peer), &node).await?;
+        Ok(node)
+    }
 }
 
-/// The deny list file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The deny list file. Clones share what was last read.
+#[derive(Clone, Debug)]
 pub struct DenyList {
     path: PathBuf,
+    /// The file's metadata at the last good read, and what that read gave.
+    last: Arc<Mutex<Option<LastRead>>>,
 }
+
+/// The file's metadata at a good read, and what that read gave.
+type LastRead = (FileKey, Arc<Denied>);
+
+impl PartialEq for DenyList {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for DenyList {}
 
 /// Why the deny list cannot be used.
 #[derive(Debug, thiserror::Error)]
@@ -190,21 +247,46 @@ impl DenyList {
     pub fn open(path: &Path) -> Result<Self, DenyListError> {
         let list = Self {
             path: path.to_owned(),
+            last: Arc::default(),
         };
         let text = std::fs::read_to_string(path).map_err(|source| list.unreadable(source))?;
         list.parse(&text)?;
         Ok(list)
     }
 
-    /// What the file denies now.
+    /// What the file denies now: what the last read gave if the file's metadata is
+    /// unchanged since, else what it holds now.
     ///
     /// # Errors
-    /// The file cannot be read or parsed.
-    pub async fn current(&self) -> Result<Denied, DenyListError> {
-        let text = tokio::fs::read_to_string(&self.path)
-            .await
-            .map_err(|source| self.unreadable(source))?;
-        self.parse(&text)
+    /// The file cannot be read or parsed (no earlier read is used then).
+    pub async fn current(&self) -> Result<Arc<Denied>, DenyListError> {
+        let fail = |source| self.unreadable(source);
+        let key = file_key(&tokio::fs::metadata(&self.path).await.map_err(fail)?);
+        if let Some((seen, denied)) = &*self.lock()
+            && *seen == key
+        {
+            return Ok(Arc::clone(denied));
+        }
+        // Read after the metadata: an edit in between is cached under the older key,
+        // so the next check sees a key that differs and reads again.
+        let read = tokio::fs::read_to_string(&self.path).await;
+        let parsed = read.map_err(fail).and_then(|text| self.parse(&text));
+        let mut last = self.lock();
+        match parsed {
+            Ok(denied) => {
+                let denied = Arc::new(denied);
+                *last = Some((key, Arc::clone(&denied)));
+                Ok(denied)
+            }
+            Err(e) => {
+                *last = None;
+                Err(e)
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<LastRead>> {
+        self.last.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn unreadable(&self, source: std::io::Error) -> DenyListError {

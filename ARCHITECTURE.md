@@ -231,9 +231,8 @@ keeps one rule: a client sees one address, whatever number of servers stand behi
   worker listener, which keeps its own mutual TLS end to end. With several servers,
   the worker listeners sit behind their own address, and a plain layer-4 balancer is
   enough there, because it passes the TLS through untouched and every server can
-  answer every daemon. Today a daemon's blob reads and writes still reach REAPI
-  through `--cas`, normally via the front; moving them onto the worker listener is
-  planned.
+  answer every daemon. A daemon's blob reads and writes go to the same worker
+  listener (`--cas`), not through the front.
 - **Any server answers.** A server process holds no farm state of its own, only
   handles to shared state: the metadata state machine and the scheduler's control
   log, each replicated by Raft across a small set of voting servers. A server that is
@@ -301,25 +300,38 @@ the mesh interface, whose traffic WireGuard already encrypts.
   the action. That front did not cut them. Another front whose idle timeout is shorter
   than the longest queue wait would cut these streams.
 
-**Daemons' worker streams do not go through the front.** A daemon's `--server` (the
-flag's help calls it "the kbf-server front") is the worker listener's address, not the
+**Daemons do not go through the front.** A daemon's `--server` (the flag's help calls
+it "the kbf-server front") and its `--cas` both name the worker listener, not the
 client front above. The worker listener keeps its own mutual TLS end to end, so with
 several servers only a layer-4 balancer that passes TLS through can stand in front of
-it. Blob traffic is different today; see the last point below.
+it.
 
 - Daemons connect only over mutual TLS (`https://` URLs; the daemon refuses anything
   else). The server's worker listener serves mutual TLS when given a certificate, key
   and client CA. A daemon's certificate must name its node id as its one DNS
   subjectAltName, so a certificate can speak only for its own node, and a deny list
-  (serials, public keys, node ids), read again at every `Hello`, `Heartbeat`, `Result` and `NodeStatus`, refuses
+  (serials, public keys, node ids), looked at again at every `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob call, refuses
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
-- Blob bytes do not travel on the worker stream yet. Today a daemon's real drivers
-  read inputs and write outputs through the REAPI listener that `--cas` names
-  (`http://` or `https://`), normally through the front, so a daemon still needs a
-  path to REAPI. **Planned:** daemons fetch and upload blobs over the mutual-TLS
-  worker listener, so they need neither the front nor a REAPI token.
+- **Built: blobs on the worker listener.** The worker listener also serves
+  `ByteStream` (Read, Write, QueryWriteStatus) over the farm's cache. A daemon's real
+  drivers, and the integration cell's daemon, read inputs and write outputs there:
+  `--cas` must be an `https://` URL, normally the same as `--server`, and the daemon
+  presents the same certificate as on its worker stream; plain `http://` is refused
+  at start. Each blob call is admitted on its own: the certificate must carry exactly
+  one DNS subjectAltName (the node), and neither the certificate's serial or public
+  key nor that node may be on the deny list, which is looked at again for every call
+  (its metadata at each call, the file read again only when that changed). A denied
+  daemon is refused PERMISSION_DENIED from its next blob call, on a connection
+  already open too. Nothing else of REAPI is served there (Execute, the action cache,
+  `ContentAddressableStorage` and `Capabilities` answer UNIMPLEMENTED), and on a
+  plain-text worker listener every blob call is refused UNAUTHENTICATED. So a daemon
+  needs neither the front nor a REAPI token. See
+  [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).
+- **Not built:** a check that a blob call's node is registered or connected, or that
+  it reads only the inputs of its own leases; any certificate the deny list does not
+  refuse can read every blob whose digest it names, and write blobs.
 
 **Inside the farm:**
 

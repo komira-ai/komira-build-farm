@@ -256,3 +256,37 @@ async fn admission_binds_the_node_and_reads_the_deny_list_each_time() {
         .expect_err("fail closed");
     assert_eq!(gone.code(), Code::Unavailable);
 }
+
+/// Catches: a deny list cached by its path or its size alone, so that a new list of
+/// the same size renamed over it (the documented way to replace it) is not seen, and a
+/// cache that keeps an old read once the file breaks.
+#[tokio::test]
+async fn a_list_renamed_over_the_old_one_is_read_even_at_the_same_size() {
+    let path = scratch("renamed.deny");
+    std::fs::write(&path, "node aaaa\n").expect("write");
+    let list = DenyList::open(&path).expect("open");
+    let first = list.current().await.expect("read");
+    assert!(first.refuses(None, "aaaa").is_some());
+    let unchanged = list.current().await.expect("read");
+    assert_eq!(unchanged, first);
+
+    let next = scratch("renamed.deny.next");
+    std::fs::write(&next, "node bbbb\n").expect("write");
+    std::fs::rename(&next, &path).expect("rename");
+    let second = list.current().await.expect("read");
+    assert_eq!(
+        second.refuses(None, "aaaa"),
+        None,
+        "the old list is still used"
+    );
+    assert!(second.refuses(None, "bbbb").is_some());
+
+    // Clones share the cache, and see the file break.
+    let clone = list.clone();
+    std::fs::write(&path, "node\n").expect("break");
+    assert!(matches!(
+        clone.current().await,
+        Err(DenyListError::Parse { line: 1, .. })
+    ));
+    assert!(list.current().await.is_err());
+}

@@ -217,7 +217,7 @@ fn each_driver_starts_and_stops_on_sigterm() {
     let scratch = tls("native-scratch").join("leases");
     let native = [
         "--driver=native".to_owned(),
-        "--cas=http://127.0.0.1:1".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
         format!("--scratch={}", scratch.display()),
     ];
     let one = one_native_daemon();
@@ -233,7 +233,7 @@ fn each_driver_starts_and_stops_on_sigterm() {
         let ids = id_files("container-ids", "65536");
         let container = [
             "--driver=container".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             format!("--scratch={}", scratch.display()),
             "--cgroup-parent=/kbf.slice/actions".to_owned(),
             format!("--id-files={}", ids.display()),
@@ -284,8 +284,9 @@ fn id_files(name: &str, count: &str) -> PathBuf {
     dir
 }
 
-/// Catches: a driver started without what it needs, or a configuration error that
-/// does not stop the daemon with a message and a non-zero exit.
+/// Catches: a driver started without what it needs (a plain-text `--cas` among
+/// them), or a configuration error that does not stop the daemon with a message and a
+/// non-zero exit.
 #[test]
 fn a_driver_missing_its_flags_refuses_to_start() {
     let dir = tls("refused");
@@ -296,13 +297,21 @@ fn a_driver_missing_its_flags_refuses_to_start() {
             "--cas is required",
         ),
         (
-            vec!["--driver=native".into(), "--cas=http://127.0.0.1:1".into()],
+            vec!["--driver=native".into(), "--cas=https://127.0.0.1:1".into()],
             "--scratch is required",
         ),
         (
             vec![
-                "--driver=container".into(),
+                "--driver=native".into(),
                 "--cas=http://127.0.0.1:1".into(),
+                scratch.clone(),
+            ],
+            "must be an https:// URL",
+        ),
+        (
+            vec![
+                "--driver=container".into(),
+                "--cas=https://127.0.0.1:1".into(),
                 scratch.clone(),
             ],
             if cfg!(target_os = "linux") {
@@ -358,7 +367,7 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
             .args(base(&ids))
             .args([
                 "--driver=container".to_owned(),
-                "--cas=http://127.0.0.1:1".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
                 format!("--scratch={}", ids.join("leases").display()),
                 "--cgroup-parent=/kbf.slice/actions".to_owned(),
                 format!("--id-files={}", ids.display()),
@@ -460,7 +469,7 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
         "--driver=native".to_owned(),
-        format!("--cas=http://{}", front.cas),
+        format!("--cas=https://127.0.0.1:{}", front.worker.port()),
         format!("--scratch={}", scratch.display()),
     ];
 
