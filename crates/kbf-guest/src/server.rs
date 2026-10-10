@@ -152,7 +152,7 @@ impl Agent {
         // The Hello deadline is still set on the socket, and the reader below shares
         // it: without this, a run that is silent for longer than the hello timeout
         // would read as a host that is gone, and be killed.
-        stream.set_read_timeout(None)?;
+        // MUTANT n4: the read timeout is not reset after Ready
 
         let mut reader = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();
