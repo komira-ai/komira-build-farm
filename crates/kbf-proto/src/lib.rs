@@ -1,5 +1,6 @@
 //! Generated protocol code: the Remote Execution API v2, the `kbf.worker.v1`
-//! server-daemon protocol and the gRPC health checking protocol (`grpc.health.v1`), compiled from vendored `.proto` files by `build.rs`.
+//! server-daemon protocol, the `kbf.log.v1` replicated-log entries and the gRPC health
+//! checking protocol (`grpc.health.v1`), compiled from `.proto` files by `build.rs`.
 //!
 //! Modules mirror the proto packages, because generated code names other packages by
 //! relative paths (`super::super::...`). The vendored files, their licences and the
@@ -51,6 +52,13 @@ pub mod grpc {
 
 /// `kbf.*`: kbf's own protocols.
 pub mod kbf {
+    pub mod log {
+        /// The payload of a command entry in the replicated log. The conversions to and
+        /// from the domain values are in `kbf-log`.
+        pub mod v1 {
+            tonic::include_proto!("kbf.log.v1");
+        }
+    }
     pub mod worker {
         /// The protocol between `kbf-daemon` and `kbf-server`.
         pub mod v1 {

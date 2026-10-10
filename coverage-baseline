@@ -17,6 +17,7 @@ kbf-estimator             -      -
 kbf-front                60      8
 kbf-guest                15      6
 kbf-it                    2      3
+kbf-log                   1      0
 kbf-mac-session           0      0
 kbf-mdm                   0      0
 kbf-mdm-api               0      0

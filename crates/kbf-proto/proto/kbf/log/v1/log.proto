@@ -1,0 +1,133 @@
+// kbf.log.v1: the payload of a command entry in the replicated log
+// (docs/design/ha.md, sections 4.1 and 4.6).
+//
+// Every replica decodes and applies the same bytes, so the encoding is strict:
+// - Enums are closed. Every enum's zero value is UNSPECIFIED and is refused, and so is
+//   any value this file does not name. A message whose `oneof` is unset (a command this
+//   file does not name) is refused. A refused entry is a decode error, which stops the
+//   replica; it is never read as a default.
+// - A message field the domain value requires is refused when absent.
+// - No `map` fields. A set is a repeated field in strictly increasing order, so one value
+//   has exactly one encoding; the decoder refuses a set out of order or with a repeat.
+//
+// Which encodings may appear in a log is the log's format version, committed in the log.
+// Format 1 is this file as it is now. A field or command added here is a new format.
+syntax = "proto3";
+
+package kbf.log.v1;
+
+// The payload of a command entry. Later formats add the other commands of ha.md
+// section 4.1 (Bootstrap, Farm, Report, Takeover, Checkpoint, MachineVersion).
+message LogCommand {
+  oneof command {
+    MetaCommand meta = 1;
+  }
+}
+
+// One command of the metadata state machine (kbf-meta's Command).
+message MetaCommand {
+  oneof command {
+    Tick tick = 1;
+    AllocEpoch alloc_epoch = 2;
+    PutBlob put_blob = 3;
+    PutBlobs put_blobs = 4;
+    PutAction put_action = 5;
+    Touch touch = 6;
+    ObjectUnreachable object_unreachable = 7;
+    ObjectReachable object_reachable = 8;
+    Collect collect = 9;
+  }
+}
+
+// Advances farm time to `farm_time_ms`, milliseconds of farm time.
+message Tick {
+  uint64 farm_time_ms = 1;
+}
+
+// Allocates a writer epoch.
+message AllocEpoch {}
+
+// The hash function of a Digest.
+enum DigestFunction {
+  DIGEST_FUNCTION_UNSPECIFIED = 0;
+  DIGEST_FUNCTION_SHA256 = 1;
+}
+
+// A content digest. `hash` is exactly 32 bytes.
+message Digest {
+  DigestFunction function = 1;
+  bytes hash = 2;
+  uint64 size_bytes = 3;
+}
+
+// An object in the object store: a writer epoch and a sequence number within it.
+message ObjectId {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+// A record `offset` bytes into an object of store `store` (at most 65535).
+message Location {
+  uint32 store = 1;
+  ObjectId object = 2;
+  uint64 offset = 3;
+}
+
+// Records that a blob's bytes are durable at a location.
+message PutBlob {
+  Digest digest = 1;
+  Location location = 2;
+}
+
+// Records several blobs, in order; a digest may repeat.
+message PutBlobs {
+  repeated PutBlob blobs = 1;
+}
+
+// Who asks to write the action cache.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_DAEMON = 1;
+  ROLE_CLIENT = 2;
+}
+
+// An action-cache entry: the ActionResult blob and its closure (a set).
+message ActionRecord {
+  Digest result = 1;
+  repeated Digest closure = 2;
+}
+
+// Writes the action-cache entry for `action`.
+message PutAction {
+  Role role = 1;
+  Digest action = 2;
+  ActionRecord record = 3;
+}
+
+// Touches blob and action-cache entries (two sets).
+message Touch {
+  repeated Digest blobs = 1;
+  repeated Digest actions = 2;
+}
+
+// Why an object is marked unreachable.
+enum UnreachableReason {
+  UNREACHABLE_REASON_UNSPECIFIED = 0;
+  UNREACHABLE_REASON_MISSING = 1;
+  UNREACHABLE_REASON_CORRUPT = 2;
+}
+
+// A read could not use the object; the entry's log index becomes the mark's generation.
+message ObjectUnreachable {
+  ObjectId object = 1;
+  UnreachableReason reason = 2;
+}
+
+// The object is reachable again, if its mark's generation is still `generation`.
+message ObjectReachable {
+  ObjectId object = 1;
+  uint64 generation = 2;
+}
+
+// Removes every blob and action entry whose retention has run out.
+message Collect {}

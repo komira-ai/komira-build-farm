@@ -5,7 +5,8 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{
-    DAY, HOUR, at, collect, commit_touch, digest, in_segment, meta, put, put_action, tick,
+    ANY_INDEX, DAY, HOUR, at, collect, commit_touch, digest, in_segment, meta, put, put_action,
+    tick,
 };
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, BlobAnswer, Closure, Command, MetaState, Role, Touch,
@@ -69,11 +70,11 @@ fn a_touch_after_collection_reports_the_loss() {
 fn farm_time_never_moves_back() {
     let mut m = meta();
     assert_eq!(
-        m.execute(Command::Tick(at(DAY * 5))),
+        m.execute(ANY_INDEX, Command::Tick(at(DAY * 5))),
         Applied::Ticked(at(DAY * 5))
     );
     assert_eq!(
-        m.execute(Command::Tick(at(DAY))),
+        m.execute(ANY_INDEX, Command::Tick(at(DAY))),
         Applied::Ticked(at(DAY * 5))
     );
     assert_eq!(m.now(), at(DAY * 5));
@@ -119,7 +120,7 @@ fn nothing_reported_present_is_collected_within_min_ttl() {
             match s.next(6) {
                 0 => {
                     now += s.next(u64::try_from(DAY.as_millis() * 3 / 2).unwrap());
-                    m.execute(Command::Tick(FarmTime::from_millis(now)));
+                    m.execute(ANY_INDEX, Command::Tick(FarmTime::from_millis(now)));
                 }
                 1 => {
                     put(&mut m, d, in_segment(step, 0));
@@ -210,10 +211,10 @@ fn replicas_applying_one_log_agree() {
     let mut b = meta();
     let mut effects = Vec::new();
     for c in log() {
-        effects.extend(a.apply(c));
+        effects.extend(a.apply((ANY_INDEX, c)));
     }
     for c in log() {
-        b.execute(c);
+        b.execute(ANY_INDEX, c);
     }
     assert!(effects.is_empty());
     assert_eq!(a, b);

@@ -1286,6 +1286,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-log"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "kbf-meta",
+ "kbf-proto",
+ "kbf-types",
+ "prost",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-mac-session"
 version = "0.1.0"
 dependencies = [
