@@ -12,9 +12,15 @@
 //!    daemon, and anything its unit started beside it), listing again if a process
 //!    appeared meanwhile;
 //! 3. enables `+cpu +memory +pids` for its children;
-//! 4. makes `actions/`, under which every lease cgroup is made, and enables the same
+//! 4. writes `supervisor/memory.min` (`--supervisor-memory-min-mib`): memory the
+//!    kernel does not reclaim from the daemon while it uses no more than that, so a
+//!    node short of memory takes it from the builds and not from the process that
+//!    reports them. The kernel caps a cgroup's protection at its ancestors', so the
+//!    unit and its slice need `MemoryMin=` at least as large; [`Delegation`] names
+//!    the nearest ancestor (below the root) whose `memory.min` is lower;
+//! 5. makes `actions/`, under which every lease cgroup is made, and enables the same
 //!    three in it;
-//! 5. writes `actions/memory.max` when given one (`--actions-memory-max-gib`): the most
+//! 6. writes `actions/memory.max` when given one (`--actions-memory-max-gib`): the most
 //!    memory all leases together may use, so the rest of the node stays for what else
 //!    runs on it.
 //!
@@ -53,6 +59,11 @@ pub struct Delegation {
     pub root: String,
     /// `<root>/actions`: what `--cgroup-parent` names when given.
     pub actions: String,
+    /// The nearest cgroup from `root` up (the root cgroup excluded) whose
+    /// `memory.min` is below the one written on `supervisor/`, with its value: the
+    /// kernel protects the daemon no further than that. `None` when every ancestor
+    /// that shows a `memory.min` protects at least as much.
+    pub memory_min_capped: Option<(String, u64)>,
 }
 
 /// Why the daemon cannot use its cgroup. Each message names the fix.
@@ -158,17 +169,24 @@ impl CgroupFs for Mount<'_> {
 }
 
 /// Sets up the daemon's delegated cgroup under the cgroup v2 mount `mount`, from the
-/// text of `/proc/self/cgroup` (see the module docs), and writes `actions/memory.max`
-/// when `actions_memory_max` (bytes) is given.
+/// text of `/proc/self/cgroup` (see the module docs). Writes `supervisor_memory_min`
+/// (bytes) to `supervisor/memory.min`, and `actions/memory.max` when
+/// `actions_memory_max` (bytes) is given.
 ///
 /// # Errors
 /// The host, the unit or the cgroup does not allow it; the message names the fix.
 pub fn delegate(
     mount: &Path,
     proc_self_cgroup: &str,
+    supervisor_memory_min: u64,
     actions_memory_max: Option<u64>,
 ) -> Result<Delegation, DelegateError> {
-    delegate_in(&Mount(mount), proc_self_cgroup, actions_memory_max)
+    delegate_in(
+        &Mount(mount),
+        proc_self_cgroup,
+        supervisor_memory_min,
+        actions_memory_max,
+    )
 }
 
 /// Checks the `actions` cgroup someone else set up (`--cgroup-parent`): cgroup v2 at
@@ -197,6 +215,7 @@ pub fn capacity(mount: &Path, actions: &str) -> Result<Capacity, DelegateError> 
 pub(crate) fn delegate_in(
     fs: &dyn CgroupFs,
     proc_self_cgroup: &str,
+    supervisor_memory_min: u64,
     actions_memory_max: Option<u64>,
 ) -> Result<Delegation, DelegateError> {
     let own = proc_self_cgroup
@@ -255,6 +274,14 @@ pub(crate) fn delegate_in(
         }
     }
 
+    fs.write(
+        &supervisor,
+        "memory.min",
+        &supervisor_memory_min.to_string(),
+    )
+    .map_err(io_err(fs, "write", &supervisor, "memory.min"))?;
+    let memory_min_capped = memory_min_below(fs, root, supervisor_memory_min)?;
+
     let actions = child(root, ACTIONS);
     make(fs, &actions)?;
     enable(fs, &actions).map_err(io_err(
@@ -269,7 +296,36 @@ pub(crate) fn delegate_in(
     Ok(Delegation {
         root: root.to_owned(),
         actions,
+        memory_min_capped,
     })
+}
+
+/// The nearest cgroup from `cgroup` up to (not including) the root whose `memory.min`
+/// is below `want`, with its value. Cgroups that show no `memory.min` are passed.
+fn memory_min_below(
+    fs: &dyn CgroupFs,
+    mut cgroup: &str,
+    want: u64,
+) -> Result<Option<(String, u64)>, DelegateError> {
+    while cgroup != "/" {
+        if let Some(text) = read_if_there(fs, cgroup, "memory.min")? {
+            let text = text.trim();
+            let min = if text == "max" {
+                u64::MAX
+            } else {
+                text.parse::<u64>()
+                    .map_err(|e| invalid(fs, cgroup, "memory.min", &format!("{text:?}: {e}")))?
+            };
+            if min < want {
+                return Ok(Some((cgroup.to_owned(), min)));
+            }
+        }
+        cgroup = match cgroup.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((parent, _)) => parent,
+        };
+    }
+    Ok(None)
 }
 
 pub(crate) fn adopt_in(

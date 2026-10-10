@@ -20,7 +20,8 @@
 //!   its delegated cgroup at start ([`delegate`]; [`adopt`] checks one given instead)
 //!   and whose limits ([`capacity`]) bound what the node reports, with
 //!   `memory.high` = reservation x 1.5 + 512 MiB, swap allowed, no per-lease hard cap,
-//!   `cpu.weight` from the booked CPU, and `memory.oom.group=1` on the container;
+//!   `cpu.weight` from the booked CPU, and `memory.oom.group=1` and
+//!   `--oom-score-adj=0` on the container (the daemon's leaf gets `memory.min`);
 //! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
 //!   `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
 //!   kill (exit 137 plus `oom_kill` in the lease cgroup's `memory.events`) reported as

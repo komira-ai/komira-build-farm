@@ -31,6 +31,9 @@ protocol, the daemon and execution, and capabilities.
 [docs/artifacts.md](docs/artifacts.md) says which binaries CI builds and attests, and
 how a node verifies one before it runs it.
 
+[docs/deploy/linux-build-host.md](docs/deploy/linux-build-host.md) sets up a Linux
+build host: the daemon's systemd units, swap and memory headroom.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a DCO sign-off, and
