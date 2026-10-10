@@ -237,7 +237,8 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                farm.node_status(worker, stream, status);
+                // Logged there; the lines are for tests.
+                let _ = farm.node_status(worker, stream, status);
                 None
             }
             Some(daemon_message::Message::Offer(_)) => None,

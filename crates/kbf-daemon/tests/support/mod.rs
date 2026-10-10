@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
-    Clock, Daemon, DaemonConfig, Event, FakeRuntime, Moment, NodeReport, Runtime, TlsFiles,
+    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, Runtime,
+    TlsFiles,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -408,6 +409,25 @@ impl Harness<FakeRuntime> {
         Self::with_runtime(name, Arc::new(FakeRuntime::new(run_for)), fence_after).await
     }
 
+    /// Starts a server and a daemon with the fake runtime whose driver reports what
+    /// `driver` sends ([`Daemon::with_driver_report`]). The daemon checks its fence
+    /// every 20 ms, so the driver's wakes fall among the fence's rechecks.
+    pub async fn with_driver(
+        name: &str,
+        driver: tokio::sync::watch::Receiver<DriverReport>,
+    ) -> Self {
+        let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
+        Self::build(
+            name,
+            runtime,
+            Duration::from_secs(40),
+            |config| config.recheck_every = Duration::from_millis(20),
+            None,
+            Some(driver),
+        )
+        .await
+    }
+
     /// Waits until the fake runtime has started `n` leases.
     pub async fn started(&self, n: usize) {
         let deadline = Instant::now() + PROMPT;
@@ -422,7 +442,7 @@ impl<R: Runtime> Harness<R> {
     /// Starts a server and a daemon running leases through `runtime`, whose fence time
     /// is `fence_after`. `name` keeps each test's TLS files apart.
     pub async fn with_runtime(name: &str, runtime: Arc<R>, fence_after: Duration) -> Self {
-        Self::build(name, runtime, fence_after, |_| {}, None).await
+        Self::build(name, runtime, fence_after, |_| {}, None, None).await
     }
 
     /// Starts a server and a daemon running leases through `runtime`, whose fence time
@@ -441,6 +461,7 @@ impl<R: Runtime> Harness<R> {
             fence_after,
             |config| config.recheck_every = recheck_every,
             Some(Arc::clone(&clock) as Arc<dyn Clock>),
+            None,
         )
         .await;
         (h, clock)
@@ -452,6 +473,7 @@ impl<R: Runtime> Harness<R> {
         fence_after: Duration,
         configure: impl FnOnce(&mut DaemonConfig),
         clock: Option<Arc<dyn Clock>>,
+        driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -496,6 +518,9 @@ impl<R: Runtime> Harness<R> {
             .with_events(events_tx);
         if let Some(clock) = clock {
             daemon = daemon.with_clock(clock);
+        }
+        if let Some(driver) = driver {
+            daemon = daemon.with_driver_report(driver);
         }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {

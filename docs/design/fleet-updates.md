@@ -112,8 +112,9 @@ not a capability key: a request naming it is refused once unknown keys are refus
 | `kbf-node` | pin a lease to one node, for qualification (section 4.2). The front refuses it from every client with `INVALID_ARGUMENT`: no REAPI caller can send it. The rollout driver submits qualification work to the scheduler directly, as a new internal submitter, so no client role is needed for it. | this document |
 
 **Re-detection is planned.** Today detection runs once, at daemon start
-(`crates/kbf-node/src/main.rs`), and `Hello` is sent only when a session opens
-(`crates/kbf-daemon/src/daemon.rs`). Noticing a changed report by its hash is listed as
+(`crates/kbf-node/src/main.rs`), except the native driver's Xcodes: it asks them again
+every few minutes, and a change resends `Hello` and `NodeStatus` mid-stream
+(`crates/kbf-driver-native/src/xcode_watch.rs`, issue #164). Noticing a changed report by its hash is listed as
 planned in [capabilities.md](capabilities.md#planned). This design adds:
 
 - The daemon re-detects the software keys when `kbf-updater` finishes a step and every
