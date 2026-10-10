@@ -53,15 +53,15 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
-    /// plain text with no authentication: bind it to loopback only.
+    /// plain text, which is meant for a loopback bind behind a front on the same host.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
     /// PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves
-    /// TLS; clients present no certificate. A daemon whose `--cas` is an `https://` URL
-    /// of this listener checks it with its own CA and `--tls-server-name` (the URL's
-    /// host without it), so the certificate must chain to that CA and carry that name;
-    /// the worker listener's certificate and key may be given here when its names
-    /// cover the REAPI address clients dial.
+    /// TLS with this server certificate only; clients present no certificate. It is meant
+    /// for a certificate from the farm's own internal CA, trusted by the front's proxy
+    /// (its hop to this server) and by clients that dial this server directly; TLS for
+    /// the farm's client-facing name still ends at the front. `--reapi-auth-policy`
+    /// applies over TLS as over plain text.
     #[arg(long, requires = "reapi_tls_key")]
     pub reapi_tls_cert: Option<PathBuf>,
     /// PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the
