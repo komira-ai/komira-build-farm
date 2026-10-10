@@ -21,8 +21,8 @@
 //!   and whose limits ([`capacity`]) bound what the node reports, with
 //!   a hard cap `memory.max` = booking x 1.5 + 512 MiB, `memory.oom.group=1` on the
 //!   lease cgroup and on the container, swap allowed (no `memory.swap.max`), a
-//!   watch that kills a lease which keeps pushing into swap at its own cap
-//!   ([`SwapKill`]), `cpu.weight` from the booked CPU, and `--oom-score-adj=0` on the
+//!   watch that kills a lease which keeps pushing into swap at its own cap, past a
+//!   threshold of swap it pushed there itself (not swap the host moved; [`SwapKill`]), `cpu.weight` from the booked CPU, and `--oom-score-adj=0` on the
 //!   container (the daemon's leaf gets `memory.min`);
 //! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
 //!   `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM

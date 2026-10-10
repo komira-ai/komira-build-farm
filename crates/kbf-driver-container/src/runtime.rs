@@ -368,11 +368,12 @@ impl<C: Cas> PodmanRuntime<C> {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
                 return Err(RuntimeError::Killed);
             }
-            now = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
+            (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
                 let limit = cap.unwrap_or(0);
                 let why = format!(
-                    "at its memory cap of {limit} bytes and still pushing into swap, \
-                     now {} bytes (more than {threshold}); killing it",
+                    "at its memory cap of {limit} bytes and still pushing into swap: \
+                     {own} of its {} bytes in swap pushed there at its cap (more than \
+                     {threshold}); killing it",
                     now.swap
                 );
                 tracing::warn!(lease = %lease.name, "{why}");

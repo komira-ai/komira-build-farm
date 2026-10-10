@@ -435,8 +435,9 @@ change the class.
 tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), and, in the
 container driver, a lease killed at its own cap: by the driver's swap watch (between
 two samples the lease's `memory.events` `max` grew, so it pressed its cap,
-`memory.max`, and its `memory.swap.current` rose, and it now holds more than a
-threshold in swap; swap held from earlier host pressure, with no rise, never counts), or
+`memory.max`, and its `memory.swap.current` rose, and the swap it has pushed there
+itself at its cap is now more than a threshold; swap that host pressure moved while
+the lease was below its cap never counts), or
 by the kernel's OOM killer for that cap (swap full), which the lease cgroup's
 `memory.events` shows with `oom_kill`, `oom` and `max`. The container driver reads
 those counters when the action ends with SIGKILL (137), when Podman recorded no exit,

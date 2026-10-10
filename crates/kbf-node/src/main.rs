@@ -105,14 +105,15 @@ struct Cli {
     #[arg(long, default_value_t = 32_768)]
     container_nproc: u64,
     /// A lease at its own memory cap is killed, and reported out of memory, once it
-    /// holds more than this many MiB in swap... (container)
+    /// has pushed more than this many MiB into swap at its cap... (container)
     #[arg(long, default_value_t = 512)]
     lease_swap_kill_mib: u64,
     /// ...or this percentage of its booked memory, whichever is more. The kernel caps
     /// each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit;
     /// a lease is killed by this rule only while its own cap keeps being hit (its
     /// `memory.events` `max` grew since the last sample) and its swap rose since the
-    /// last sample, never for swap that host pressure moved out of it earlier.
+    /// last sample, and only swap that rose so counts, never swap that host pressure
+    /// moved out of it.
     #[arg(long, default_value_t = 25)]
     lease_swap_kill_percent: u64,
     /// How often each lease's `max` events and swap are sampled, in milliseconds
