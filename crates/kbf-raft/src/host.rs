@@ -326,9 +326,6 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
                     unsynced = true;
                 }
                 Effect::Send { to, msg } => {
-                    if std::mem::take(&mut unsynced) {
-                        self.stop_on_error(S::sync)?;
-                    }
                     self.transport.send(to, msg);
                 }
                 Effect::Apply(entry) => {
