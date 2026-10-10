@@ -156,10 +156,13 @@ fn generated(rng: &mut Rng) -> (MetaState, u64) {
     (state, index)
 }
 
-/// The object whose mark `command` stamped when it applied as `applied`, if any.
-fn stamped(command: &Command, applied: &Applied) -> Option<ObjectId> {
+/// The object whose mark `command` stamped when it applied as `applied`, and the
+/// reason it gave, if any.
+fn stamped(command: &Command, applied: &Applied) -> Option<(ObjectId, UnreachableReason)> {
     match (command, applied) {
-        (Command::ObjectUnreachable { object, .. }, Applied::Marked(Ok(()))) => Some(*object),
+        (Command::ObjectUnreachable { object, reason }, Applied::Marked(Ok(()))) => {
+            Some((*object, *reason))
+        }
         _ => None,
     }
 }
@@ -223,46 +226,42 @@ fn check(once: &MetaState, twice: &MetaState, second: &Second<'_>, seen: &mut Se
     seen.epochs += u32::try_from(extra).expect("0 or 1");
     norm.next_epoch = once.next_epoch;
 
-    if let Some(object) = stamped(command, applied) {
-        let (Some(before), Some(after)) =
-            (once.loss_mark(object), norm.unreachable.get_mut(&object))
-        else {
-            panic!("{case}: the mark on {object} is gone after a second ObjectUnreachable");
-        };
+    if let Some((object, reason)) = stamped(command, applied) {
+        let before = once
+            .loss_mark(object)
+            .expect("the first apply marked the object");
+        let after = norm
+            .unreachable
+            .get_mut(&object)
+            .expect("a second ObjectUnreachable keeps the mark");
         assert_eq!(
             after.generation,
             Generation::new(j),
             "{case}: generation of {object}"
         );
         seen.restamped += 1;
-        if let Command::ObjectUnreachable { reason, .. } = command
-            && *reason == before.reason
-        {
-            seen.restamped_same_reason += 1;
-        }
+        seen.restamped_same_reason += u32::from(reason == before.reason);
         after.generation = before.generation;
     }
 
+    // Entries the second apply touched; `once` holds each of them, because a second
+    // apply adds no entry.
     let (blobs, actions, must_touch) = named(command, applied);
-    if let Some(later) = later {
-        for (digest, entry) in &mut norm.blobs {
-            let Some(old) = once.blobs.get(digest) else {
-                continue;
-            };
-            if blobs.contains(digest) && must_touch {
+    if let Some(later) = later
+        && must_touch
+    {
+        for digest in &blobs {
+            if let Some(entry) = norm.blobs.get_mut(digest) {
                 assert_eq!(entry.last_touch, later, "{case}: blob {digest} touch time");
+                entry.last_touch = once.blobs[digest].last_touch;
                 seen.touched_later += 1;
-                entry.last_touch = old.last_touch;
             }
         }
-        for (action, entry) in &mut norm.actions {
-            let Some(old) = once.actions.get(action) else {
-                continue;
-            };
-            if actions.contains(action) && must_touch {
+        for action in &actions {
+            if let Some(entry) = norm.actions.get_mut(action) {
                 assert_eq!(entry.last_hit, later, "{case}: action {action} hit time");
+                entry.last_hit = once.actions[action].last_hit;
                 seen.touched_later += 1;
-                entry.last_hit = old.last_hit;
             }
         }
     }
@@ -329,15 +328,13 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
     }
     // Every exception and the touch-time rule must have been exercised, the same-reason
     // retry (which a stamp-only-on-rise mutant leaves at i) included.
-    assert!(
-        seen.restamped > 200
-            && seen.restamped_same_reason > 100
-            && seen.epochs > 200
-            && seen.touched_later > 200,
+    let counts = format!(
         "restamped {}, same reason {}, epochs {}, touched later {}",
-        seen.restamped,
-        seen.restamped_same_reason,
-        seen.epochs,
-        seen.touched_later
+        seen.restamped, seen.restamped_same_reason, seen.epochs, seen.touched_later
     );
+    assert!(
+        seen.restamped.min(seen.epochs).min(seen.touched_later) > 200,
+        "{counts}"
+    );
+    assert!(seen.restamped_same_reason > 100, "{counts}");
 }
