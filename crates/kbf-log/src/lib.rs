@@ -10,8 +10,12 @@
 //! - an enum value that is unspecified (zero) or unnamed is an error, never a default;
 //! - a command whose `oneof` is unset (one this binary does not know) is an error;
 //! - a required message field that is absent is an error;
-//! - a set (a closure, a touch) must be in strictly increasing order, so a value has
-//!   exactly one encoding, and `encode(decode(bytes)) == bytes` for every accepted entry.
+//! - a set (a closure, a touch) must be in strictly increasing order;
+//! - the bytes must be the ones [`encode`] writes for the decoded value. prost on its own
+//!   accepts an explicit zero, a varint that is not minimal, a field repeated or out of
+//!   order, and drops a field it does not know; [`decode`] re-encodes the value and
+//!   refuses the entry unless the bytes match. So a value has exactly one encoding, and
+//!   `encode(decode(bytes)) == bytes` for every accepted entry.
 //!
 //! An error is fail-stop for the replica that meets it.
 
@@ -99,6 +103,9 @@ pub enum DecodeError {
     /// A set is out of order or repeats an element.
     #[error("{0} is not in strictly increasing order")]
     SetOrder(&'static str),
+    /// The bytes decode to a value, but are not the bytes [`encode`] writes for it.
+    #[error("entry is not the canonical encoding of its value")]
+    NotCanonical,
 }
 
 /// Encodes `command` under `format`.
@@ -119,8 +126,14 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
     if format != Format::V1 {
         return Err(DecodeError::Format(format));
     }
-    match proto::LogCommand::decode(bytes)?.command {
-        Some(proto::log_command::Command::Meta(c)) => Ok(LogCommand::Meta(meta::from_proto(c)?)),
-        None => Err(DecodeError::UnknownCommand("LogCommand")),
+    let command = match proto::LogCommand::decode(bytes)?.command {
+        Some(proto::log_command::Command::Meta(c)) => LogCommand::Meta(meta::from_proto(c)?),
+        None => return Err(DecodeError::UnknownCommand("LogCommand")),
+    };
+    // One value, one encoding: refuse anything prost accepted that `encode` would not
+    // have written (an unknown field, a non-minimal varint, a reordered field).
+    if encode(format, &command).as_deref() != Ok(bytes) {
+        return Err(DecodeError::NotCanonical);
     }
+    Ok(command)
 }

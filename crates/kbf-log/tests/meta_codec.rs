@@ -11,6 +11,8 @@
 //!   command it does not know as nothing at all, instead of refusing it;
 //! - a decoder that accepts an absent required field, a short hash, a store id past 16
 //!   bits, or a set out of order (which would give one value two encodings);
+//! - a decoder that accepts bytes `encode` would not write (an explicit zero, an
+//!   unknown field, a varint that is not minimal, a repeated or reordered field);
 //! - a format other than 1 written or read.
 
 use kbf_log::{DecodeError, EncodeError, Format, LogCommand, decode, encode};
@@ -621,4 +623,80 @@ fn only_format_1_is_written_or_read() {
     }
     assert_eq!(Format::V1.get(), 1);
     assert_eq!(decode(Format::new(1), &bytes), Ok(entry));
+}
+
+/// Catches: a decoder that accepts bytes `encode` would not write, so one value would
+/// have two encodings and an entry would carry fields this binary ignores. prost on its
+/// own accepts every case below and drops the unknown fields; each decodes to a value
+/// whose canonical bytes are `canonical`, and each must be refused.
+#[test]
+fn bytes_encode_would_not_write_are_refused() {
+    let tick = Command::Tick(FarmTime::from_millis(1500));
+    let reachable = Command::ObjectReachable {
+        object: object(2, 9),
+        generation: Generation::new(300),
+    };
+    let cases: [(&str, &str, &Command, &str); 7] = [
+        // Tick (0a) { farm_time_ms 0 written out (08 00) }
+        (
+            "an explicit zero",
+            "0a040a020800",
+            &Command::Tick(FarmTime::from_millis(0)),
+            "0a020a00",
+        ),
+        // Tick { 1500, field 15 varint 1 (78 01) }
+        (
+            "an unknown field",
+            "0a070a0508dc0b7801",
+            &tick,
+            "0a050a0308dc0b",
+        ),
+        // LogCommand { meta { tick { 1500 } }, field 15 varint 1 }
+        (
+            "an unknown top-level field",
+            "0a050a0308dc0b7801",
+            &tick,
+            "0a050a0308dc0b",
+        ),
+        // Tick { 1500 as a four-byte varint (dc 8b 80 00) }
+        (
+            "a varint that is not minimal",
+            "0a070a0508dc8b8000",
+            &tick,
+            "0a050a0308dc0b",
+        ),
+        // Tick { 1, then 1500 }: prost keeps the last
+        (
+            "a repeated field",
+            "0a070a05080108dc0b",
+            &tick,
+            "0a050a0308dc0b",
+        ),
+        // ObjectReachable { generation, then object }
+        (
+            "fields out of order",
+            "0a0b420910ac020a0408021009",
+            &reachable,
+            "0a0b42090a040802100910ac02",
+        ),
+        // ObjectId { seq, then epoch }
+        (
+            "nested fields out of order",
+            "0a0b42090a041009080210ac02",
+            &reachable,
+            "0a0b42090a040802100910ac02",
+        ),
+    ];
+    for (name, hex, value, canonical) in cases {
+        let bytes = hex::decode(hex).expect("hex");
+        assert_eq!(dec(&bytes), Err(DecodeError::NotCanonical), "{name}");
+        // The canonical bytes of the same value still decode: the refusal is the
+        // encoding's, not the value's.
+        assert_eq!(hex::encode(enc(value)), canonical, "{name}");
+        assert_eq!(
+            dec(&hex::decode(canonical).expect("hex")).as_ref(),
+            Ok(value),
+            "{name}"
+        );
+    }
 }

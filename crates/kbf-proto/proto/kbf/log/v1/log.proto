@@ -7,8 +7,11 @@
 //   file does not name) is refused. A refused entry is a decode error, which stops the
 //   replica; it is never read as a default.
 // - A message field the domain value requires is refused when absent.
-// - No `map` fields. A set is a repeated field in strictly increasing order, so one value
-//   has exactly one encoding; the decoder refuses a set out of order or with a repeat.
+// - No `map` fields. A set is a repeated field in strictly increasing order; the decoder
+//   refuses a set out of order or with a repeat.
+// - One value has exactly one encoding: the one prost writes for it (fields in tag order,
+//   zero values left out, minimal varints). The decoder (kbf-log) refuses any other bytes
+//   that decode to a value, including bytes with a field this file does not name.
 //
 // Which encodings may appear in a log is the log's format version, committed in the log.
 // Format 1 is this file as it is now. A field or command added here is a new format.
