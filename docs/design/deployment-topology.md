@@ -7,8 +7,10 @@ clients reach them, and how daemons reach them. Most of it is **planned**. The
 on `main` today; nothing else in this document does.
 
 Elastic or stateless servers (any number of interchangeable processes behind a
-balancer) are out of scope. The farm runs a small, fixed set of servers, and one of
-them, the leader, answers everything.
+balancer) are out of scope. The farm runs a small, fixed set of servers. At high
+availability (three servers) every server serves the read path and accepts upload
+bytes, and one of them, the leader, does everything else: every metadata write,
+`Execute` and `WaitExecution`, scheduling and the daemons' worker streams.
 
 ## The shape
 
@@ -25,10 +27,11 @@ them, the leader, answers everything.
           | plain HTTP/2                                    |
           v                                                 |
  +------------------------------+                           |
- | HTTP/2 proxy                 |                           |
- | health-checks every server,  |                           |
- | routes only to the ready one |                           |
- | (the leader)                 |                           |
+ | HTTP/2 proxy, routes by      |                           |
+ | gRPC method:                 |                           |
+ |  reads, uploads -> any server|                           |
+ |    ready to serve reads      |                           |
+ |  everything else -> leader   |                           |
  +------------------------------+                           |
           | plain gRPC                                      |
           v                                                 v
@@ -37,10 +40,12 @@ them, the leader, answers everything.
  | fixed address,   |   | (HA, later)      |   | (HA, later)      |
  | stable DNS name  |   |                  |   |                  |
  | kbf-server       |   | kbf-server       |   | kbf-server       |
- |   LEADER: ready  |   |   follower:      |   |   follower:      |
- |   REAPI, worker  |   |   not ready;     |   |   not ready;     |
- |   sessions       |   |   redirects      |   |   redirects      |
- |                  |   |   daemons to A   |   |   daemons to A   |
+ |   LEADER:        |   |   follower:      |   |   follower:      |
+ |   reads, upload  |   |   reads, upload  |   |   reads, upload  |
+ |   bytes; every   |   |   bytes; commits |   |   bytes; commits |
+ |   metadata write,|   |   via leader;    |   |   via leader;    |
+ |   Execute,       |   |   redirects      |   |   redirects      |
+ |   worker streams |   |   daemons to A   |   |   daemons to A   |
  | Raft log on      |<->| Raft log on      |<->| Raft log on      |
  | local disk       |   | local disk       |   | local disk       |
  +------------------+   +------------------+   +------------------+
@@ -51,7 +56,8 @@ them, the leader, answers everything.
 ```
 
 Today only host A's role exists, in one process, with its state in memory (see
-[Built and planned](#built-and-planned)).
+[Built and planned](#built-and-planned)). The first deployment (v0) is that single
+server; the split between reads and the leader applies from three servers on.
 
 ### Servers on dedicated storage hosts
 
@@ -69,14 +75,48 @@ the action cache, farm time) are applied from a Raft log
   server's disk. A restart replays the log, so the server comes back with its index,
   its action cache and its record of nodes and leases.
 - **Later, three voters on three hosts** for high availability: one leader and two
-  followers. A follower holds the replicated state and serves no client or daemon
-  traffic; it takes over when it is elected. The voter set grows from one to three
-  through learners (add a learner, let it catch up, promote it), one server at a
-  time.
+  followers. A follower holds the replicated state, serves the read path from it and
+  accepts upload bytes ([below](#reads-and-uploads-on-every-server)); it serves no
+  other client call and no daemon session, and it takes over when it is elected. The
+  voter set grows from one to three through learners (add a learner, let it catch up,
+  promote it), one server at a time.
 
 Blob bytes stay in the object store, as today ([storage.md](storage.md)).
 
-### Build clients: one name, routed to the leader
+### Reads and uploads on every server
+
+The heavy traffic of a build cache is blob bytes. So that it does not all land on one
+host, at high availability it is shared across the three servers, and the leader
+keeps only the small, ordered part, so the leader scales with the farm. (This was an
+open question, followers and blob traffic; the maintainers decided it on 2026-10-10.)
+
+| Served by | Calls |
+|---|---|
+| any server ready to serve reads | the read path: `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs`, `GetActionResult`; and upload bytes: `ByteStream.Write`, `BatchUpdateBlobs` |
+| the leader only | every metadata write (blob and action-cache commits), `Execute`, `WaitExecution`, scheduling, the daemons' worker streams |
+
+- **An upload on any server.** The server that receives the bytes verifies them,
+  writes them to the object store as segments ([storage.md](storage.md#writes)), and
+  then sends the leader the small metadata commit naming where they are. The upload
+  succeeds once the leader has committed it. If no leader can be reached, the upload
+  fails `UNAVAILABLE`; the bytes it wrote are unreferenced and are removed like any
+  other orphan object.
+- **Reads from the local replica.** A server answers a read from the metadata state it
+  has applied from the log, and reads the bytes from the object store. A read that
+  must record a touch ([storage.md](storage.md#retention-and-touches)) sends the touch
+  to the leader as a commit before it answers, as an upload does; an entry needs one
+  at most once per touch quantum (a day by default), so these commits are rare.
+- **The staleness rule.** A follower may be behind the leader. It may answer a false
+  "missing" (a blob committed on the leader that it has not applied yet); that is
+  harmless, because the client uploads the blob again. It must never answer a false
+  "present". Two things hold that:
+  - object garbage collection's grace period (the delay before a condemned object is
+    deleted) is far longer than any replication lag, so a blob a lagging follower
+    still lists as present has bytes in the store for the whole time it can be behind;
+  - where a stronger guarantee is needed, a follower first asks the leader for its
+    commit index and waits until it has applied up to it (a read index), then answers.
+
+### Build clients: one name, routed by method
 
 Bazel and Buck2 are configured with one remote address, and Buck2 sends everything to
 it, so the farm must look like one endpoint.
@@ -85,9 +125,21 @@ it, so the farm must look like one endpoint.
   certificate (for example, Tailscale's Kubernetes operator ingress) terminates the
   clients' TLS.
 - **An HTTP/2-capable proxy behind it** (for example, Envoy) health-checks every
-  server and routes requests only to the one that reports ready. Only the leader
-  reports ready, so every REAPI call reaches the leader. The proxy routes by
-  readiness, not by request content.
+  server and routes by gRPC method, the request's path: the read and upload calls
+  [above](#reads-and-uploads-on-every-server) go to any server that is ready to serve
+  reads, and every other call goes to the leader: `Execute`, `WaitExecution`,
+  `GetCapabilities`, `GetTree`, `QueryWriteStatus`, and `UpdateActionResult` (which a
+  client is refused). The proxy does not look inside a request.
+- **Two readiness paths.** The proxy needs two answers from each server, so the
+  operator API listener is planned to serve two readiness paths:
+  - **ready to serve reads:** the server is not stopping, its store probe passes, and
+    it is synced: it knows a current leader and has applied the log up to the commit
+    index that leader last sent it. Any synced server, leader or follower, passes;
+  - **leader:** `/readyz` as it is today, whose `leader` check passes only on the
+    server that holds the leader role, for writes and `Execute`.
+
+  The second path's name is not chosen. A server stops being ready to serve reads
+  when it falls behind or loses touch with the leader.
 - **`kbf-server` serves plain-text gRPC behind the front**, as the
   [Security model](../../ARCHITECTURE.md#security-model) already describes. TLS is the
   front's job.
@@ -133,10 +185,11 @@ The record of nodes becomes durable state in the control log:
 | Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk; `kbf-server` applies control and metadata state from it |
 | Metadata | `MemoryMetaLog`, in the server's memory; lost at restart. With `--store=s3` each start writes under a fresh key prefix | applied from the log, so a restart keeps it |
 | Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log (see [Open questions](#open-questions)) |
-| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. No `grpc.health.v1` service | the Raft role sets the leader flag, so `/readyz` is 200 only on the leader |
+| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path, and no `grpc.health.v1` service | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server ([above](#build-clients-one-name-routed-by-method)) |
+| Reads and uploads on followers | none: one server serves every call, and the cache commits its own metadata | at three servers, any synced server serves `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and `GetActionResult` from its applied state, and writes upload bytes to the object store before sending the leader the metadata commit; a read index where a stronger guarantee is needed ([above](#reads-and-uploads-on-every-server)) |
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower answers a daemon's session with a redirect naming the leader |
 | Daemon's servers | one `--server` URL; on a broken stream the daemon waits `--reconnect-ms` and dials the same URL again | the daemon is given the servers' names and follows a redirect to the leader |
-| Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)) | a tailnet ingress and an HTTP/2 proxy, after the probes below pass |
+| Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)); it routes by nothing, as there is one server | a tailnet ingress and an HTTP/2 proxy that routes by gRPC method, after the probes below pass |
 | Node registry | in the server's memory: a node whose stream closed stays listed with `connected: false` until the server restarts, and gets no work once it has not been heard from for G; a restart forgets every node. `kbf-alert` exists, but nothing raises alerts yet | durable, as [above](#a-durable-node-registry) |
 | Daemons' blobs | the drivers read and write blobs with `ByteStream` on the mutual-TLS worker listener (`--cas`, `https://` only), each call checked against the node certificate and the deny list; daemons need no path through the front ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)) | the same, on the leader's worker listener |
 
@@ -191,6 +244,3 @@ idle timeout bounds these streams the same way.
 6. **Snapshots off the host.** With a single voter, losing that host's disk loses the
    log. Whether snapshots are also copied to the object store, so a replacement host
    can rebuild, is not decided.
-7. **Followers and blob traffic.** All REAPI traffic, bytes included, reaches the
-   leader. Whether followers ever serve blob reads, to spread the byte load, is not
-   part of this shape.

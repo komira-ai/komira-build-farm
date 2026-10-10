@@ -19,7 +19,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
 | [macos-vm-guests.md](docs/design/macos-vm-guests.md) | a VM guest's first-boot setup, capture inside the guest, guest networking, image identity (recipe and content digests), the VM helper's uid and signing, the probes a real Mac must run (**planned**) |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
-| [deployment-topology.md](docs/design/deployment-topology.md) | where servers run, the Raft log on local disk, the client front that routes to the leader, daemons dialling the servers directly, what is built and what is planned, the probes the front must pass (**planned**) |
+| [deployment-topology.md](docs/design/deployment-topology.md) | where servers run, the Raft log on local disk, the client front that routes reads and uploads to any server and the rest to the leader, daemons dialling the servers directly, what is built and what is planned, the probes the front must pass (**planned**) |
 | [mdm-backend.md](docs/design/mdm-backend.md) | MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
 
 Decision records live in [docs/adr](docs/adr).
@@ -230,21 +230,28 @@ with what exists today and the probes still to run. In short:
 - **One name for the farm.** Bazel and Buck2 are configured with one remote address,
   and Buck2 sends everything to it. A tailnet ingress with a constant name and an
   automatic certificate terminates the clients' TLS; an HTTP/2 proxy behind it
-  health-checks the servers and routes every request to the one that reports ready,
-  the leader. `kbf-server` serves plain-text gRPC behind it (see
+  health-checks the servers and routes by gRPC method: reads and uploads to any server
+  ready to serve reads, every other call to the leader. Each server reports both
+  answers on two readiness paths. `kbf-server` serves plain-text gRPC behind it (see
   [Security model](#security-model)).
-- **Only the leader answers.** The leader of the control log serves REAPI and holds
-  every worker stream, so one place sees all free room on all workers and places every
-  action. A follower holds the replicated state, reports not ready, and takes over when
-  it is elected.
+- **Any server serves reads; the leader does the rest.** At three servers, every
+  server answers the read path (`ByteStream.Read`, `BatchReadBlobs`,
+  `FindMissingBlobs`, `GetActionResult`) from its replicated state and accepts upload
+  bytes, which it writes to the object store before sending the leader the small
+  metadata commit. So the byte traffic is shared across the three hosts. A follower
+  may answer a false "missing", which only makes the client upload again, but never a
+  false "present". The leader of the control log keeps every metadata write,
+  `Execute` and `WaitExecution`, and every worker stream, so one place sees all free
+  room on all workers and places every action. A follower takes over when it is
+  elected. The first deployment is a single server.
 - **Daemons dial the servers directly.** A daemon's worker stream does not go through
   the front: it dials the servers' DNS names over mutual TLS and holds one stream, to
   the leader. A follower answers a daemon with a redirect naming the leader. On
   failover the daemon reconnects to the new leader. A daemon's blob reads and writes
   go to the worker listener too (`--cas`), not through the front.
-- **Locality comes from placement.** The front cannot see what a request is about,
-  so kbf gets locality inside: daemons report which inputs they hold, and placement
-  prefers a worker that already has an action's inputs.
+- **Locality comes from placement.** The front sees a request's method but not what
+  it is about, so kbf gets locality inside: daemons report which inputs they hold,
+  and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
 ids that carry the granting process's term, a scheduler that refuses results from
@@ -264,16 +271,22 @@ has no TLS of its own on the REAPI listener and none is planned. It serves REAPI
 plain-text gRPC behind the front, bound to loopback (front on the same host) or to
 the mesh interface, whose traffic WireGuard already encrypts. With several servers
 (**planned**), the front is a tailnet ingress followed by an HTTP/2 proxy that routes
-only to the leader ([deployment-topology.md](docs/design/deployment-topology.md)); that
-pair is not yet probed.
+reads and uploads to any ready server and every other call to the leader
+([deployment-topology.md](docs/design/deployment-topology.md)); that pair is not yet
+probed.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
-  text, checks no credential and accepts any bind address. Whoever reaches the port
-  can read action inputs and outputs, write the CAS and Execute actions.
-- **Planned:** bearer-token authentication, checked by `kbf-server` itself behind the
-  front; the front passes the `Authorization` header through and does not check it.
-  The caller's identity decides its role. A peer address does not identify a caller
-  here: a proxy on the same host connects from loopback, whoever its client is.
+  text and accepts any bind address. It runs the authentication policy and the
+  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
+  ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
+  `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
+  flag every call is accepted, and whoever reaches the port can read action inputs
+  and outputs, write the CAS and Execute actions.
+- **Planned:** credential policies in the same file (a bearer JWT in the
+  `authorization` header, a remote authentication service), checked by `kbf-server`
+  itself behind the front; the front passes the header through and does not check
+  it. A peer address does not identify a caller here: a proxy on the same host
+  connects from loopback, whoever its client is.
 - **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
   bind that other machines could reach, and allows the front's hop: loopback, or an
   address the operator names as the front's.
@@ -329,7 +342,7 @@ in between, and a follower redirects them to the leader
   already open too. Nothing else of REAPI is served there (Execute, the action cache,
   `ContentAddressableStorage` and `Capabilities` answer UNIMPLEMENTED), and on a
   plain-text worker listener every blob call is refused UNAUTHENTICATED. So a daemon
-  needs neither the front nor a REAPI token. See
+  needs neither the front nor a REAPI credential. See
   [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).
 - **Not built:** a check that a blob call's node is registered or connected, or that
   it reads only the inputs of its own leases; any certificate the deny list does not

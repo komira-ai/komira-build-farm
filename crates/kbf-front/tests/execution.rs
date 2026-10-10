@@ -68,12 +68,14 @@ impl Dispatch for Script {
         let (tx, rx) = watch::channel(Stage::Queued);
         stages.push((name.clone(), tx));
         let action = submission.request.key.action;
+        let instance = submission.request.key.instance.clone();
         self.submitted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(submission);
         Ok(Ticket {
             name,
+            instance,
             action,
             stage: rx,
         })
@@ -84,6 +86,7 @@ impl Dispatch for Script {
         let (name, tx) = stages.iter().find(|(n, _)| n == name)?;
         Some(Ticket {
             name: name.clone(),
+            instance: String::new(),
             action: kbf_segments::sha256(b"unused"),
             stage: tx.subscribe(),
         })

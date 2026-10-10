@@ -325,7 +325,9 @@ fn cgroup_tree(dir: &Path, offered: &str) -> (PathBuf, Vec<String>) {
 /// Catches a container node that reports the node's memory and every CPU while its
 /// leases may use less (`actions/memory.max`, the cpuset): the scheduler would book
 /// past the cap on a host that also runs storage. The `Hello` the front receives says
-/// what `actions/` allows: 1 GiB (every runner has more) and CPU 0 alone.
+/// what `actions/` allows: 1 GiB (every runner has more) and CPU 0 alone. Also catches
+/// `--supervisor-memory-min-mib` not reaching the daemon's leaf, and a unit whose
+/// `memory.min` (0 here) caps it starting without the warning that names `MemoryMin=`.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -335,7 +337,8 @@ fn a_container_node_reports_what_its_leases_may_use() {
     let dir = tls("capacity");
     let front = front::Front::start(&dir);
     let ids = id_files("capacity-ids", "65536");
-    let (_, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
+    let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
+    std::fs::write(unit.join("memory.min"), "0\n").expect("plant");
     let (bin, _) = podman_stub("capacity-bin");
     let log = dir.join("daemon.log");
     let path = format!(
@@ -357,6 +360,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
             format!("--scratch={}", dir.join("leases").display()),
             format!("--id-files={}", ids.display()),
             "--actions-memory-max-gib=1".to_owned(),
+            "--supervisor-memory-min-mib=512".to_owned(),
         ])
         .args(cgroup_flags)
         .stderr(std::fs::File::create(&log).expect("log file"))
@@ -381,6 +385,12 @@ fn a_container_node_reports_what_its_leases_may_use() {
     assert_eq!(value("cpus"), ["1"], "{log}");
     assert_eq!(value("drivers"), ["container"], "{log}");
     assert!(status.success(), "{status}: {log}");
+    assert_eq!(read(&unit.join("supervisor/memory.min")), "536870912");
+    assert!(
+        log.contains("memory.min 0 bytes, below the daemon's 536870912")
+            && log.contains("set MemoryMin= on its unit and slice to at least 512 MiB"),
+        "{log}"
+    );
 }
 
 /// Catches `--cgroup-parent` set up again by the daemon (it names a cgroup someone else

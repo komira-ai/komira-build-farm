@@ -83,6 +83,8 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
+# The REAPI authentication layer (kbf-auth). Already in the tree through tonic.
+tower-layer = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 # Reads the fields of a daemon's client certificate the worker listener checks (its DNS
@@ -90,6 +92,7 @@ tracing-subscriber = "0.3.23"
 x509-parser = "0.18.1"
 
 kbf-alert = { path = "crates/kbf-alert" }
+kbf-auth = { path = "crates/kbf-auth" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }

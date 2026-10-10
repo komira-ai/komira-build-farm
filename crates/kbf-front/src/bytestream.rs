@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream;
+use kbf_auth::{Authorizers, authorize};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStream;
 use kbf_proto::google::bytestream::{
@@ -20,18 +21,29 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::cache::{Cache, VerifiedBlob};
 use crate::meta_log::MetaLog;
+use crate::wire::Resource;
 use crate::{MAX_BLOB_BYTES, READ_CHUNK_BYTES, wire};
 
-/// The `ByteStream` service over a [`Cache`].
+/// The `ByteStream` service over a [`Cache`]. Read is authorized by
+/// [`Authorizers::cas_get`], Write and QueryWriteStatus by [`Authorizers::cas_put`],
+/// each against the instance name before `blobs/` or `uploads/` in the resource name.
 #[derive(Debug)]
 pub struct ByteStreamService<M, O> {
     cache: Arc<Cache<M, O>>,
+    authorizers: Arc<Authorizers>,
 }
 
 impl<M, O> ByteStreamService<M, O> {
-    /// The service over `cache`.
-    pub const fn new(cache: Arc<Cache<M, O>>) -> Self {
-        Self { cache }
+    /// The service over `cache`, every call allowed.
+    #[must_use]
+    pub fn new(cache: Arc<Cache<M, O>>) -> Self {
+        Self::with_authorizers(cache, Arc::new(Authorizers::allow_all()))
+    }
+
+    /// The service over `cache`, each call authorized by `authorizers`.
+    #[must_use]
+    pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
+        Self { cache, authorizers }
     }
 }
 
@@ -46,8 +58,17 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         &self,
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
-        let digest = wire::read_resource(&request.resource_name)?;
+        let Resource { instance, digest } = wire::read_resource(&request.resource_name)?;
+        let cas_get = &*self.authorizers.cas_get;
+        authorize(
+            cas_get,
+            &caller,
+            "/google.bytestream.ByteStream/Read",
+            &instance,
+        )
+        .await?;
         let offset = u64::try_from(request.read_offset).map_err(|_| {
             Status::out_of_range(format!("read_offset {} is negative", request.read_offset))
         })?;
@@ -79,13 +100,22 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let mut stream = request.into_inner();
         let first = stream
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("write stream sent no message"))?;
         let name = first.resource_name.clone();
-        let digest = wire::write_resource(&name)?;
+        let Resource { instance, digest } = wire::write_resource(&name)?;
+        let cas_put = &*self.authorizers.cas_put;
+        authorize(
+            cas_put,
+            &caller,
+            "/google.bytestream.ByteStream/Write",
+            &instance,
+        )
+        .await?;
         let size = digest.size_bytes;
         let committed = |size: u64| {
             Response::new(WriteResponse {
@@ -142,7 +172,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         &self,
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        let digest = wire::write_resource(&request.into_inner().resource_name)?;
+        let caller = kbf_auth::metadata(&request);
+        let Resource { instance, digest } =
+            wire::write_resource(&request.into_inner().resource_name)?;
+        let call = "/google.bytestream.ByteStream/QueryWriteStatus";
+        authorize(&*self.authorizers.cas_put, &caller, call, &instance).await?;
         let complete = self.cache.is_durable(&digest).await?;
         let committed_size = if complete {
             i64::try_from(digest.size_bytes).unwrap_or(i64::MAX)

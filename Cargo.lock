@@ -1134,6 +1134,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-auth"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower-layer",
+ "tracing",
+]
+
+[[package]]
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [
@@ -1222,6 +1235,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "kbf-auth",
  "kbf-caps",
  "kbf-meta",
  "kbf-objstore",
@@ -1231,6 +1245,8 @@ dependencies = [
  "kbf-types",
  "prost",
  "prost-types",
+ "protox",
+ "serde_json",
  "thiserror",
  "tokio",
  "tonic",
@@ -1449,6 +1465,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "kbf-auth",
  "kbf-caps",
  "kbf-front",
  "kbf-mdm-api",

@@ -8,7 +8,8 @@
 //!   moving a process into a cgroup that enables controllers (no internal processes);
 //! - a process is in one cgroup: moving it removes it from the one it was in, and
 //!   moving a process that has ended is ESRCH;
-//! - `memory.max` exists only where the parent enables `memory`, and not at the root;
+//! - `memory.max` and `memory.min` exist only where the parent enables `memory`, and
+//!   not at the root;
 //!   `cpuset.cpus.effective` only where the parent enables `cpuset`, and at the root;
 //! - making a cgroup in one this process may not write is EACCES.
 
@@ -105,7 +106,9 @@ impl Fake {
 
     fn file_shown(&self, cgroup: &str, file: &str) -> bool {
         match file {
-            "memory.max" => cgroup != "/" && self.controllers(cgroup).iter().any(|c| c == "memory"),
+            "memory.max" | "memory.min" => {
+                cgroup != "/" && self.controllers(cgroup).iter().any(|c| c == "memory")
+            }
             "cpuset.cpus.effective" => {
                 cgroup == "/" || self.controllers(cgroup).iter().any(|c| c == "cpuset")
             }
@@ -165,6 +168,7 @@ impl CgroupFs for Fake {
                 }
                 Ok(value.unwrap_or_else(|| match file {
                     "memory.max" => "max\n".into(),
+                    "memory.min" => "0\n".into(),
                     _ => String::new(),
                 }))
             }
@@ -270,21 +274,27 @@ const UNIT: &str = "/system.slice/kbf-daemon.service";
 const ACTIONS_CG: &str = "/system.slice/kbf-daemon.service/actions";
 const SUPERVISOR_CG: &str = "/system.slice/kbf-daemon.service/supervisor";
 const SELF: &str = "0::/system.slice/kbf-daemon.service\n";
+/// The `memory.min` the tests ask for on `supervisor/`: 256 MiB.
+const MIN: u64 = 256 << 20;
 
 /// Catches the steps out of the kernel's order (enabling controllers before the
 /// processes left the delegated cgroup is EBUSY on a real host; enabling them in
 /// `actions/` before its parent offers them is ENOENT), a process left behind in the
 /// delegated cgroup, `actions/` without `memory` (no lease cgroup could set
-/// `memory.max`), and `--actions-memory-max-gib` not reaching `actions/memory.max`.
+/// `memory.max`), `--supervisor-memory-min-mib` not reaching `supervisor/memory.min`
+/// (builds could then reclaim the daemon's memory), and `--actions-memory-max-gib`
+/// not reaching `actions/memory.max`. The unit's own `memory.min` is the kernel's 0, so
+/// it caps the leaf's protection and is named.
 #[test]
 fn a_fresh_unit_gets_its_leaf_its_controllers_and_its_actions_cgroup() {
     let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41, 42]);
-    let got = delegate_in(&fake, SELF, Some(3 << 30)).expect("delegated");
+    let got = delegate_in(&fake, SELF, MIN, Some(3 << 30)).expect("delegated");
     assert_eq!(
         got,
         Delegation {
             root: UNIT.into(),
-            actions: ACTIONS_CG.into()
+            actions: ACTIONS_CG.into(),
+            memory_min_capped: Some((UNIT.into(), 0)),
         }
     );
     assert_eq!(
@@ -294,6 +304,7 @@ fn a_fresh_unit_gets_its_leaf_its_controllers_and_its_actions_cgroup() {
             format!("{SUPERVISOR_CG}/cgroup.procs <- 41"),
             format!("{SUPERVISOR_CG}/cgroup.procs <- 42"),
             format!("{UNIT}/cgroup.subtree_control <- +cpu +memory +pids"),
+            format!("{SUPERVISOR_CG}/memory.min <- 268435456"),
             format!("mkdir {ACTIONS_CG}"),
             format!("{ACTIONS_CG}/cgroup.subtree_control <- +cpu +memory +pids"),
             format!("{ACTIONS_CG}/memory.max <- 3221225472"),
@@ -306,6 +317,74 @@ fn a_fresh_unit_gets_its_leaf_its_controllers_and_its_actions_cgroup() {
         fake.read(ACTIONS_CG, "memory.max").expect("memory.max"),
         "3221225472"
     );
+    assert_eq!(
+        fake.read(SUPERVISOR_CG, "memory.min").expect("memory.min"),
+        "268435456"
+    );
+}
+
+/// Catches the leaf's protection reported as whole when an ancestor's `memory.min`
+/// (the unit's or the slice's `MemoryMin=`) caps it: the nearest lower one is named,
+/// `max` counts as unlimited, the root cgroup is passed, an ancestor that protects
+/// enough or shows no `memory.min` is not named, and 0 asks for nothing and is never
+/// capped. Then a write the daemon may not make stops the start, naming the file.
+#[test]
+fn the_daemons_protection_is_checked_against_its_ancestors() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    fake.set(UNIT, "memory.min", "max\n");
+    fake.set("/system.slice", "memory.min", "134217728\n");
+    let got = delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(
+        got.memory_min_capped,
+        Some(("/system.slice".into(), 128 << 20))
+    );
+
+    fake.set("/system.slice", "memory.min", "1073741824\n");
+    fake.set(UNIT, "memory.min", "268435456\n");
+    let got = delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(got.memory_min_capped, None);
+
+    fake.set(UNIT, "memory.min", "0\n");
+    let got = delegate_in(&fake, SELF, 0, None).expect("delegated");
+    assert_eq!(got.memory_min_capped, None);
+    assert_eq!(
+        fake.read(SUPERVISOR_CG, "memory.min").expect("memory.min"),
+        "0"
+    );
+
+    // An ancestor that shows no memory.min (its parent does not enable memory) is
+    // passed, not read as 0.
+    let hidden = Fake::host(UNIT, "cpu memory pids", &[41]);
+    hidden
+        .nodes
+        .borrow_mut()
+        .get_mut("/")
+        .expect("root")
+        .enabled
+        .retain(|c| c != "memory");
+    hidden.set(UNIT, "memory.min", "268435456\n");
+    let got = delegate_in(&hidden, SELF, MIN, None).expect("delegated");
+    assert_eq!(got.memory_min_capped, None);
+    assert!(
+        hidden.read("/system.slice", "memory.min").is_err(),
+        "the premise: the slice shows none"
+    );
+
+    fake.set(UNIT, "memory.min", "lots");
+    let err = delegate_in(&fake, SELF, MIN, None)
+        .expect_err("garbage")
+        .to_string();
+    assert!(err.contains("parse") && err.contains("memory.min"), "{err}");
+
+    let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
+    denied.denied = vec![format!("{SUPERVISOR_CG}/memory.min")];
+    let err = delegate_in(&denied, SELF, MIN, None)
+        .expect_err("denied")
+        .to_string();
+    assert!(
+        err.contains(&format!("write /sys/fs/cgroup{SUPERVISOR_CG}/memory.min")),
+        "{err}"
+    );
 }
 
 /// Catches a daemon started again in the same unit (now in `supervisor/`) that takes
@@ -315,9 +394,9 @@ fn a_fresh_unit_gets_its_leaf_its_controllers_and_its_actions_cgroup() {
 #[test]
 fn a_second_start_from_the_leaf_finds_its_work_done() {
     let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
-    delegate_in(&fake, SELF, None).expect("first");
+    delegate_in(&fake, SELF, MIN, None).expect("first");
     let again = format!("0::{SUPERVISOR_CG}\n");
-    let got = delegate_in(&fake, &again, None).expect("second");
+    let got = delegate_in(&fake, &again, MIN, None).expect("second");
     assert_eq!(got.actions, ACTIONS_CG);
     assert!(!fake.exists(&format!("{SUPERVISOR_CG}/supervisor")));
     assert!(
@@ -336,7 +415,7 @@ fn processes_that_come_and_go_during_the_move_are_handled() {
     let mut fake = Fake::host(UNIT, "cpu memory pids", &[41, 42]);
     fake.ended = vec![42];
     *fake.late.borrow_mut() = Some((UNIT.into(), 43));
-    delegate_in(&fake, SELF, None).expect("delegated");
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
     assert_eq!(fake.procs(SUPERVISOR_CG), [41, 43]);
     assert_eq!(fake.procs(UNIT), Vec::<u32>::new());
 }
@@ -349,7 +428,7 @@ fn processes_that_come_and_go_during_the_move_are_handled() {
 fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
     let v1 = "12:memory:/system.slice/kbf-daemon.service\n1:name=systemd:/system.slice\n";
     let refused = |fake: &Fake, text: &str| {
-        let err = delegate_in(fake, text, Some(1 << 30))
+        let err = delegate_in(fake, text, MIN, Some(1 << 30))
             .expect_err("refused")
             .to_string();
         assert!(fake.log().is_empty(), "{err}: changed {:?}", fake.log());
@@ -422,7 +501,7 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
 fn a_move_or_enable_that_fails_stops_the_start() {
     let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
     denied.denied = vec![format!("{SUPERVISOR_CG}/cgroup.procs")];
-    let err = delegate_in(&denied, SELF, None)
+    let err = delegate_in(&denied, SELF, MIN, None)
         .expect_err("denied")
         .to_string();
     assert!(
@@ -432,7 +511,7 @@ fn a_move_or_enable_that_fails_stops_the_start() {
 
     let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
     denied.denied = vec![format!("{UNIT}/cgroup.subtree_control")];
-    let err = delegate_in(&denied, SELF, None)
+    let err = delegate_in(&denied, SELF, MIN, None)
         .expect_err("denied")
         .to_string();
     assert!(err.contains("enable controllers in"), "{err}");
@@ -440,7 +519,7 @@ fn a_move_or_enable_that_fails_stops_the_start() {
     let mut busy = Fake::host(UNIT, "cpu memory pids", &[41]);
     busy.respawn = true;
     *busy.late.borrow_mut() = Some((UNIT.into(), 43));
-    let err = delegate_in(&busy, SELF, None)
+    let err = delegate_in(&busy, SELF, MIN, None)
         .expect_err("busy")
         .to_string();
     assert!(
@@ -515,7 +594,7 @@ fn an_actions_cgroup_given_on_the_command_line_is_checked() {
 #[test]
 fn capacity_is_the_lowest_memory_max_and_the_nearest_cpuset() {
     let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
-    delegate_in(&fake, SELF, None).expect("delegated");
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
     assert_eq!(
         capacity_in(&fake, ACTIONS_CG).expect("read"),
         Capacity::default()
@@ -556,7 +635,7 @@ fn capacity_is_the_lowest_memory_max_and_the_nearest_cpuset() {
     );
 
     let mut unreadable = Fake::host(UNIT, "cpu memory pids", &[41]);
-    delegate_in(&unreadable, SELF, None).expect("delegated");
+    delegate_in(&unreadable, SELF, MIN, None).expect("delegated");
     unreadable.denied = vec![format!("{ACTIONS_CG}/memory.max")];
     let err = capacity_in(&unreadable, ACTIONS_CG)
         .expect_err("unreadable")

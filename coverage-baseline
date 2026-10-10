@@ -7,13 +7,14 @@
 # `coverage-baseline.measured`; copy it here when a count changes or a crate is added.
 # crate lines-missed branches-missed
 kbf-alert                 0      0
+kbf-auth                  0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
 kbf-daemon               39     13
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                71      8
+kbf-front                60      8
 kbf-guest                15      6
 kbf-it                    2      3
 kbf-mac-session           0      0

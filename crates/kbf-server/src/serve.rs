@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::Either;
+use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -166,6 +167,9 @@ where
 
 /// [`bind_server`], and the operator API ([`crate::api`]) if `api` is given.
 ///
+/// The REAPI listener accepts and allows every call; [`bind_server_with_policy`] runs a
+/// policy instead.
+///
 /// It logs a warning that the scheduler's state (cordons, drains, leases, operations)
 /// starts empty, as it does at every start: nothing of an earlier process is restored.
 ///
@@ -184,6 +188,27 @@ pub fn bind_server_with_api<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
     api: Option<Api>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_policy(cache, listeners, api, Policy::allow_all(), shutdown)
+}
+
+/// [`bind_server_with_api`], with the REAPI listener running `policy`
+/// (`docs/reapi-auth.md`): its authenticator on every call of that listener, before
+/// routing, and its authorizers in the services. The worker listener and the operator
+/// API do not run it.
+///
+/// # Errors
+/// A listener cannot be bound, or the worker TLS configuration is refused.
+pub fn bind_server_with_policy<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -235,12 +260,16 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
-    let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm), closing);
+    let authorizers = Arc::new(policy.authorizers);
+    let reapi_routes =
+        kbf_front::routes_with_authorizers(cache, Arc::clone(&farm), closing, authorizers);
+    let authenticate = AuthenticateLayer::new(policy.authenticator);
 
     let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         let reapi_serve = Server::builder()
+            .layer(authenticate)
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
