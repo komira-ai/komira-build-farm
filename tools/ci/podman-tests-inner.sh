@@ -10,9 +10,10 @@ set -euo pipefail
 
 cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
 echo "delegated cgroup: ${cg#/sys/fs/cgroup} controllers: $(cat "$cg/cgroup.controllers")"
-# Both binaries run even when the first fails; the script fails if either did.
+# Every binary runs even when one before it fails; the script fails if any did.
 status=0
-cargo test -p kbf-driver-container --test podman --test podman_memory --locked -- --include-ignored || status=$?
+cargo test -p kbf-driver-container --test podman --locked -- --include-ignored || status=$?
+cargo test -p kbf-driver-container --test podman_memory --locked -- --include-ignored || status=$?
 # A node whose containers.conf sets its own environment and limits: the driver's
 # flags must win over every one of them (tests/podman_env.rs).
 CONTAINERS_CONF_OVERRIDE=$PWD/crates/kbf-driver-container/tests/fixtures/containers-override.conf \
