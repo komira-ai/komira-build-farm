@@ -11,9 +11,8 @@
 //!
 //! **The deny list** is a file the server looks at again at every check, so an edit
 //! takes effect without a restart. Each check reads the file's metadata (device,
-//! inode, size, mode, owner, modification and change time; see
-//! [`crate::principal`]) and reads and parses the file again only when that changed
-//! since the last read. Each line is blank, a `#` comment, or one entry:
+//! inode, size, mode, owner, modification and change time) and reads and parses the
+//! file again only when that changed since the last read. Each line is blank, a `#` comment, or one entry:
 //!
 //! ```text
 //! serial 0a:1b:2c            # the certificate serial, hex (colons and case ignored)
@@ -37,8 +36,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use sha2::{Digest, Sha256};
 use tonic::Status;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
-
-use crate::principal::{FileKey, file_key};
 
 /// What the server takes from a daemon's client certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,5 +368,46 @@ fn normal_hex(hex: &str) -> String {
         "0".to_owned()
     } else {
         trimmed
+    }
+}
+
+/// The metadata a change of the deny list shows in: device, inode, size, mode, owner,
+/// and modification and change times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileKey {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mode: u32,
+    uid: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+fn file_key(meta: &std::fs::Metadata) -> FileKey {
+    use std::os::unix::fs::MetadataExt;
+    FileKey {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        size: meta.size(),
+        mode: meta.mode(),
+        uid: meta.uid(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+    }
+}
+
+/// Elsewhere than Unix the metadata carries none of these: every look is a change.
+#[cfg(not(unix))]
+fn file_key(_: &std::fs::Metadata) -> FileKey {
+    FileKey {
+        dev: 0,
+        ino: 0,
+        size: 0,
+        mode: 0,
+        uid: 0,
+        mtime: (0, 0),
+        ctime: (0, 0),
     }
 }

@@ -10,12 +10,14 @@ pub fn fits(room: Resources, request: Resources) -> bool {
     request.cpu_millis <= room.cpu_millis
         && request.memory_bytes <= room.memory_bytes
         && request.gpus <= room.gpus
+        && request.vms <= room.vms
 }
 
 /// `a + b` on every axis.
 pub fn add(a: Resources, b: Resources) -> Resources {
     Resources::new(a.cpu_millis + b.cpu_millis, a.memory_bytes + b.memory_bytes)
         .with_gpus(a.gpus + b.gpus)
+        .with_vms(a.vms + b.vms)
 }
 
 /// `a - b` on every axis, at least zero.
@@ -25,6 +27,7 @@ pub fn sub(a: Resources, b: Resources) -> Resources {
         a.memory_bytes.saturating_sub(b.memory_bytes),
     )
     .with_gpus(a.gpus.saturating_sub(b.gpus))
+    .with_vms(a.vms.saturating_sub(b.vms))
 }
 
 /// Why no live worker can run a request now, as the reference sees it.

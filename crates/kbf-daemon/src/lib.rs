@@ -54,7 +54,7 @@ pub use config::{Args, DaemonConfig, FENCE_AFTER, RECHECK_EVERY, TlsFiles};
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
-pub use report::NodeReport;
+pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
 pub use status::DriverReport;
 

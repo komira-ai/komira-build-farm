@@ -173,8 +173,16 @@ Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first
 picked by `--driver`:
 
 - **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
-  runtime for Linux farm nodes, below. The binary requires `--cgroup-parent`, `--scratch`
-  and `--cas`, and checks the daemon user's subordinate ids before it starts.
+  runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
+  checks the daemon user's subordinate ids before it starts. It then sets up the cgroup
+  its systemd unit delegates (`Delegate=yes`): it moves its processes into a
+  `supervisor/` leaf, makes `actions/` with cpu, memory and pids enabled, and writes
+  `actions/memory.max` from `--actions-memory-max-gib`. It refuses to start, naming the
+  fix, on cgroup v1, from the root cgroup, or when the unit does not delegate those
+  controllers or the cgroup is not writable. `--cgroup-parent` names an `actions/`
+  cgroup set up by someone else instead (checked, not changed). The node reports at most
+  what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
+  `memory.max` above the leases, `cpus` the nearest `cpuset.cpus.effective`.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
   processes on the node, for Macs.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
@@ -234,7 +242,7 @@ loud.
 | Entrypoint | the action's argv as a JSON array: the image's `ENTRYPOINT` and `CMD` are ignored and no argument is re-split |
 | Users | `--userns=nomap`: no container uid or gid is the daemon's user (below); `--user=0:0`, the container's root, whatever the image's `USER` |
 | Hostname | `localhost` |
-| Environment | `--unsetenv-all`, then the `Command`'s variables with `--env`: nothing from the image's `ENV`, Podman's defaults (`PATH`, `TERM`, `container`) or the node's `containers.conf`. Podman 4.9 still adds `HOSTNAME=localhost` and `HOME` (uid 0's home in the image's `/etc/passwd`) when the `Command` sets neither; both follow from the image digest |
+| Environment | `--unsetenv-all`, then the `Command`'s variables with `--env`: nothing from the image's `ENV`, Podman's defaults (`PATH`, `container`; `TERM` only with a tty, which an action never has) or the node's `containers.conf`. Podman 4.9 still adds `HOSTNAME=localhost` and `HOME` (uid 0's home in the image's `/etc/passwd`) when the `Command` sets neither; both follow from the image digest |
 | Limits | `--pids-limit`, `--shm-size` and `--ulimit` for `nofile` and `nproc` (soft = hard), from `kbf-daemon`'s `--container-pids-limit` (default 8192), `--container-shm-mib` (64), `--container-nofile` (65,536) and `--container-nproc` (32,768). `nproc` counts per user, and every container's root is the same subordinate id, so it bounds the node's actions together |
 | Working directory | the `Command`'s, under `/kbf/root` |
 | Files | the input root as a read-only overlay lower layer at `/kbf/root`; every write lands in a per-lease upper directory |

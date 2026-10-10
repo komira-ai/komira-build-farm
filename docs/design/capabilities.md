@@ -93,17 +93,21 @@ urgent work meanwhile (see
 
 ### Planned VM entries
 
-The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will add, all
-**planned**:
+The macOS VM driver ([macos-vms.md](macos-vms.md#52-node-report-planned)) will report
+these entries. No driver serves a VM and no daemon reports any of them yet, so they are
+**planned** on the daemon side; the server already reads them (`kbf-caps`):
 
-| Entry | Meaning | Kind |
-|---|---|---|
-| `vm.slots` | how many VMs may run at once; fills a `vms` booking dimension | report-only |
-| `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only |
-| `vm.image` (repeated) | the golden images on the node's disk whose file manifest re-verifies, by recipe digest ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)) | capability: a request names one, matched by membership on the digest |
+| Entry | Meaning | Kind | Read by the server on `main` |
+|---|---|---|---|
+| `vm.slots` | how many VMs may run at once; planned to fill the `vms` booking dimension | report-only | checked to be a whole number, once; not read into capacity yet |
+| `vm.max_cpus`, `vm.max_mem_gib` | the framework's bounds, read at start | report-only | checked to be a whole number, once |
+| `vm.image` (repeated) | the golden images on the node's disk whose file manifest re-verifies, as `<name>@sha256:<recipe digest>` ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)) | capability: a request names one, matched by membership on the digest | yes: the digest of each entry joins the node's `vm.image` set; an entry without a digest refuses the report |
 
-A report-only entry is never a request key: an action cannot ask for `vm.slots`, and
-`vms` is booked only through `kbf-lease=vm`.
+A report-only entry is never a request key: a request that names `vm.slots`,
+`vm.max_cpus` or `vm.max_mem_gib` (in any case) is refused
+(`RequestError::ReportOnly`), and `vms` is planned to be booked only through
+`kbf-lease=vm`. `Resources` has the `vms` axis, checked by `fits` like `gpus`; nothing
+books it or fills it yet.
 
 ### Planned device entries
 
@@ -191,7 +195,7 @@ Each key has one typed comparison:
 | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
 | `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
-| `vm.image` | **planned**: membership on the digest (see [Planned VM entries](#planned-vm-entries)) |
+| `vm.image` | membership on the digest: the request names `<name>@sha256:<64 lowercase hex digits>` and matches a node that reports any name with that digest; a value without a digest is refused. No daemon reports `vm.image` yet, so a request for one matches no node (see [Planned VM entries](#planned-vm-entries)) |
 | `ios.device` | **planned**: `1` books one specific device; `ios.device.class`, `ios.device.product_type`, `ios.device.os_version`, `ios.device.os_build` are exact, and one device must satisfy all of them (see [Planned device entries](#planned-device-entries)) |
 
 Every other key may appear once. A value that does not parse or a repeated key is
@@ -209,8 +213,9 @@ its report.
 
 `Request::parse` refuses a key it does not know. But a client's platform reaches it
 through `Request::from_platform` (below), which passes on only the names kbf reads, so
-**an unknown platform property is ignored today**: `OSFamilly=darwin`, `os_build=24B83`
-or `vm.slots=2` matches every node. Refusing an unknown property at `Execute` is
+**an unknown platform property is ignored today**: `OSFamilly=darwin` or `os_build=24B83`
+matches every node. (`vm.slots` and the other report-only keys are known, and refused:
+see [Planned VM entries](#planned-vm-entries).) Refusing an unknown property at `Execute` is
 **planned** (see [Planned](#planned)).
 
 **Reserved keys** ask for a kind or a size of capacity, not a hardware fact, and are

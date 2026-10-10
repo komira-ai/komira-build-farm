@@ -365,11 +365,14 @@ hosts later, and the scheduler runs on its leader:
   and the log decides which result of an operation wins.
 - Submissions are committed too, so a new leader inherits the queue (not yet: today a
   leader change would lose queued work).
-- Only the leader serves. The client front routes every REAPI request, `Execute`
-  included, to the server that reports ready, which is the leader; a follower reports
-  not ready and relays nothing. Every daemon holds its one worker stream to the
-  leader, and a follower answers a daemon's session with a redirect naming the
-  leader. None of this is built: there is no readiness check and no redirect yet.
+- Only the leader schedules. At three servers any server serves the read path and
+  accepts upload bytes, but the client front routes `Execute` and `WaitExecution` to
+  the leader, the one server whose `/readyz` passes its `leader` check, and a follower
+  sends every metadata commit to the leader rather than applying it. Every daemon holds its one worker
+  stream to the leader, and a follower answers a daemon's session with a redirect
+  naming the leader. None of this is built: `/readyz` exists, but its `leader` check
+  always passes on the one server, and there is no second readiness path and no
+  redirect yet.
 
 ## Where to look
 

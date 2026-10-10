@@ -10,7 +10,7 @@
 //!   `gpu` capacity a request books whole and exclusively.
 //! - [`Request`] and [`NodeCaps`] match with typed comparisons: exact, at least for
 //!   ordered levels, subset for feature sets, membership for sets a node reports
-//!   (`xcode`), and minimums for countable resources.
+//!   (`xcode`, and `vm.image` on its digest), and minimums for countable resources.
 //! - [`Request::from_platform`] reads an action's REAPI platform (`OSFamily`, `ISA`
 //!   and kbf's own keys, the names in any case: [`property_name`]) as a request;
 //!   [`NodeCaps::from_report`] reads a daemon's node report as the capabilities
@@ -32,6 +32,8 @@ mod report;
 pub use cpu::{Arch, CpuCaps, ParseError, UnknownArch};
 pub use gpu::{PciFunction, gpus_from_linux_pci, gpus_from_macos_sysctl};
 pub use level::{ArmVersion, IsaLevel, UnknownIsaLevel, X86Level};
-pub use matching::{Consumable, NodeCaps, RESERVED_KEYS, Request, RequestError, Unmet};
+pub use matching::{
+    Consumable, NodeCaps, REPORT_ONLY_KEYS, RESERVED_KEYS, Request, RequestError, Unmet,
+};
 pub use platform::{DAEMON_OSES, FromPlatformError, REAPI_KEYS, property_name};
 pub use report::ReportError;

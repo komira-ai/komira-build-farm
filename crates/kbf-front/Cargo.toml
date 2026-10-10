@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
+kbf-auth.workspace = true
 kbf-caps.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
@@ -25,6 +26,10 @@ tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The REAPI service definitions, read from kbf-proto's vendored files, so the
+# authorization test (tests/auth.rs) covers every method the routes serve.
+protox.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]

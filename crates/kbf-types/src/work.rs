@@ -64,7 +64,10 @@ pub struct ActionKey {
 /// A request vector, or a node's capacity in the same units.
 ///
 /// GPUs are whole and exclusive: a request books whole GPUs, and a booked GPU is
-/// another lease's only once the lease holding it ends.
+/// another lease's only once the lease holding it ends. VM slots are counted the same
+/// way: a node's `vms` is how many VMs may run on it at once. Nothing books or fills
+/// `vms` yet: the VM lease kind (`kbf-lease=vm`) is planned and refused today, and no
+/// node's capacity carries VM slots.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Resources {
     /// CPU in thousandths of a core (1000 = one core).
@@ -73,17 +76,20 @@ pub struct Resources {
     pub memory_bytes: u64,
     /// Whole GPUs.
     pub gpus: u64,
+    /// VM slots.
+    pub vms: u64,
 }
 
 impl Resources {
     /// A vector of `cpu_millis` thousandths of a core and `memory_bytes` bytes, and no
-    /// GPU.
+    /// GPU or VM slot.
     #[must_use]
     pub const fn new(cpu_millis: u64, memory_bytes: u64) -> Self {
         Self {
             cpu_millis,
             memory_bytes,
             gpus: 0,
+            vms: 0,
         }
     }
 
@@ -93,12 +99,19 @@ impl Resources {
         Self { gpus, ..self }
     }
 
+    /// `self` with `vms` VM slots.
+    #[must_use]
+    pub const fn with_vms(self, vms: u64) -> Self {
+        Self { vms, ..self }
+    }
+
     /// Whether `request` fits in `self` on every axis.
     #[must_use]
     pub const fn fits(&self, request: &Self) -> bool {
         request.cpu_millis <= self.cpu_millis
             && request.memory_bytes <= self.memory_bytes
             && request.gpus <= self.gpus
+            && request.vms <= self.vms
     }
 
     /// `self + other` on every axis, saturating.
@@ -108,6 +121,7 @@ impl Resources {
             cpu_millis: self.cpu_millis.saturating_add(other.cpu_millis),
             memory_bytes: self.memory_bytes.saturating_add(other.memory_bytes),
             gpus: self.gpus.saturating_add(other.gpus),
+            vms: self.vms.saturating_add(other.vms),
         }
     }
 
@@ -118,6 +132,7 @@ impl Resources {
             cpu_millis: self.cpu_millis.saturating_sub(other.cpu_millis),
             memory_bytes: self.memory_bytes.saturating_sub(other.memory_bytes),
             gpus: self.gpus.saturating_sub(other.gpus),
+            vms: self.vms.saturating_sub(other.vms),
         }
     }
 }
@@ -321,6 +336,43 @@ mod tests {
         assert!(
             one_gpu.fits(&Resources::new(1_000, 1 << 30)),
             "a CPU action"
+        );
+    }
+
+    /// Catches: a fit test that ignores VM slots, which would place a VM lease on a node
+    /// that runs no VM, or a third VM on a node with two slots both booked.
+    #[test]
+    fn fits_counts_vm_slots() {
+        let room = Resources::new(12_000, 64 << 30);
+        let vm_lease = Resources::new(6_000, 17 << 30).with_vms(1);
+        assert!(!room.fits(&vm_lease), "a node with no VM slot");
+        assert!(room.with_vms(1).fits(&vm_lease));
+        let both_booked = room
+            .with_vms(2)
+            .saturating_sub(vm_lease.saturating_add(vm_lease));
+        assert_eq!(both_booked.vms, 0);
+        assert!(!both_booked.fits(&Resources::new(0, 0).with_vms(1)));
+        assert!(
+            room.fits(&Resources::new(1_000, 1 << 30)),
+            "a bare-metal action"
+        );
+    }
+
+    /// Catches: arithmetic that drops or wraps the VM axis, which would leave a slot
+    /// booked after its lease ends or free a slot that is still booked.
+    #[test]
+    fn vm_arithmetic_saturates() {
+        let two = Resources::default().with_vms(2);
+        let one = Resources::default().with_vms(1);
+        assert_eq!(one.saturating_add(one), two);
+        assert_eq!(two.saturating_sub(one), one);
+        assert_eq!(one.saturating_sub(two), Resources::default());
+        assert_eq!(
+            Resources::default()
+                .with_vms(u64::MAX)
+                .saturating_add(one)
+                .vms,
+            u64::MAX
         );
     }
 

@@ -23,11 +23,14 @@
 //!   holding the operation's current lease, and only an accepted result is written to
 //!   the action cache, before the callers are answered. Clients never write it.
 //!
-//! - REAPI client principals ([`principal`]): the token file format, its file rules
-//!   and reload, and `kbf-server hash-token`. No listener reads it yet.
+//! - REAPI authentication and authorization (`kbf-auth`): the REAPI listener runs the
+//!   policy of `--reapi-auth-policy` (`docs/reapi-auth.md`), an authentication layer
+//!   on that listener alone and an authorizer per kind of call in the services;
+//!   without the flag every call is accepted and allowed.
 //!
 //! Not yet: Raft (the control log is in-process: a record commits as soon as it is
-//! appended, see [`farm`]), authentication of REAPI clients, operator roles (the
+//! appended, see [`farm`]), REAPI authentication other than the policies
+//! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
 //! API's writes need one token, [`token`]), the `x-kbf-qos` header, learned sizes,
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
@@ -42,18 +45,20 @@ pub mod health;
 pub mod identity;
 pub mod mdm;
 mod memory;
-pub mod principal;
 pub mod rollout;
 pub mod serve;
 mod stamp;
 pub mod token;
 pub mod worker;
 
-pub use config::{Args, Command, ConfigError, Role, StoreKind};
+pub use config::{Args, ConfigError, Role, StoreKind};
 pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
-pub use serve::{Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api};
+pub use serve::{
+    Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
+    bind_server_with_policy,
+};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

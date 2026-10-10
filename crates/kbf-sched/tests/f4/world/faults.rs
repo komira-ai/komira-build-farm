@@ -8,9 +8,26 @@ impl World {
     pub(super) fn faults(&mut self) {
         let t = self.t;
         if self.scenario == Scenario::Churn && t > 0 && t.is_multiple_of(60) {
-            let mut pick: Vec<usize> = (0..self.nodes.len()).collect();
-            self.rng.shuffle(&mut pick);
-            pick.truncate(self.nodes.len().div_ceil(20));
+            let mut order: Vec<usize> = (0..self.nodes.len()).collect();
+            self.rng.shuffle(&mut order);
+            let (pick, rest) = order.split_at(self.nodes.len().div_ceil(20));
+            // A dead node outside the pick returns when the pick returned none, so every
+            // seed that churns twice reaches a return, whatever its draws.
+            let dead = |n: &Node| {
+                matches!(
+                    n.link,
+                    Link::Down {
+                        until: u64::MAX,
+                        ..
+                    }
+                )
+            };
+            let mut pick = pick.to_vec();
+            if !pick.iter().any(|&i| dead(&self.nodes[i]))
+                && let Some(&i) = rest.iter().find(|&&i| dead(&self.nodes[i]))
+            {
+                pick.push(i);
+            }
             for i in pick {
                 match self.nodes[i].link {
                     Link::Up => {
@@ -153,7 +170,9 @@ impl World {
         if rescale {
             let cpu = (n.base.cpu_millis * percent / 100).max(1_000);
             let mem = (n.base.memory_bytes * percent / 100).max(GIB);
-            n.capacity = Resources::new(cpu, mem).with_gpus(n.base.gpus);
+            n.capacity = Resources::new(cpu, mem)
+                .with_gpus(n.base.gpus)
+                .with_vms(n.base.vms);
         }
         if n.report.iter().any(|(k, v)| *k == "os" && v == "macos") {
             let had = n.report.iter().any(|(k, v)| *k == "xcode" && v == "15F31d");
