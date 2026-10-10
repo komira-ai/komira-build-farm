@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::Stream;
+use futures::future::BoxFuture;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -97,13 +98,40 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    async fn status(&self) -> ServingStatus {
+    async fn evaluate(&self) -> ServingStatus {
         let failing = failing(&self.cache, &self.readiness, self.probe_timeout).await;
         if failing.is_empty() {
             ServingStatus::Serving
         } else {
             ServingStatus::NotServing
         }
+    }
+}
+
+/// What a `Watch` stream reads: the status, the [`Readiness`] whose changes wake it,
+/// and its probe interval. A trait object, so the stream's state machine is one
+/// function and not one per metadata log and store type.
+trait Evaluate: Send + Sync {
+    fn status(&self) -> BoxFuture<'_, ServingStatus>;
+    fn readiness(&self) -> &Readiness;
+    fn watch_interval(&self) -> Duration;
+}
+
+impl<M, O> Evaluate for Inner<M, O>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    fn status(&self) -> BoxFuture<'_, ServingStatus> {
+        Box::pin(self.evaluate())
+    }
+
+    fn readiness(&self) -> &Readiness {
+        &self.readiness
+    }
+
+    fn watch_interval(&self) -> Duration {
+        self.watch_interval
     }
 }
 
@@ -122,10 +150,10 @@ fn stopping() -> Status {
 }
 
 /// Where a `Watch` stream is.
-enum Watching<M, O> {
+enum Watching {
     /// Sending: `last` is the status it sent last, if any.
     Open {
-        inner: Arc<Inner<M, O>>,
+        inner: Arc<dyn Evaluate>,
         known: bool,
         changed: tokio::sync::watch::Receiver<()>,
         last: Option<ServingStatus>,
@@ -136,11 +164,7 @@ enum Watching<M, O> {
     Done,
 }
 
-impl<M, O> Watching<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl Watching {
     async fn next(self) -> Option<(Result<HealthCheckResponse, Status>, Self)> {
         let (inner, known, mut changed, last) = match self {
             Self::Open {
@@ -155,7 +179,7 @@ where
         loop {
             // Read before the evaluation: a stop signal that comes during it is
             // answered by the next turn, which `changed` wakes at once.
-            let is_stopping = inner.readiness.is_stopping();
+            let is_stopping = inner.readiness().is_stopping();
             let status = if known {
                 inner.status().await
             } else {
@@ -179,8 +203,8 @@ where
             }
             // Wakes on a change of `Readiness` or at the interval, whichever is first.
             // `changed` fails only once its sender is dropped, and the sender lives in
-            // `inner.readiness`, which this stream holds.
-            let _ = tokio::time::timeout(inner.watch_interval, changed.changed()).await;
+            // `inner`'s readiness, which this stream holds.
+            let _ = tokio::time::timeout(inner.watch_interval(), changed.changed()).await;
         }
     }
 }
@@ -201,14 +225,14 @@ where
         if !known(&service) {
             return Err(Status::not_found(format!("unknown service {service:?}")));
         }
-        Ok(Response::new(response(self.inner.status().await)))
+        Ok(Response::new(response(self.inner.evaluate().await)))
     }
 
     async fn list(
         &self,
         _request: Request<HealthListRequest>,
     ) -> Result<Response<HealthListResponse>, Status> {
-        let status = self.inner.status().await;
+        let status = self.inner.evaluate().await;
         let statuses = SERVICES
             .iter()
             .map(|name| ((*name).to_owned(), response(status)))
@@ -225,8 +249,9 @@ where
         let known = known(&request.into_inner().service);
         // Subscribed before the first evaluation, so no change after it is missed.
         let changed = self.inner.readiness.subscribe();
+        let inner: Arc<dyn Evaluate> = Arc::clone(&self.inner) as Arc<dyn Evaluate>;
         let start = Watching::Open {
-            inner: Arc::clone(&self.inner),
+            inner,
             known,
             changed,
             last: None,
