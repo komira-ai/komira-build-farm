@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use futures::channel::mpsc::unbounded;
+use kbf_auth::Policy;
 use kbf_front::Cache;
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_proto::worker::{
     Capability, DaemonMessage, Hello, daemon_message, server_message, worker_client::WorkerClient,
 };
-use kbf_server::{Args, bind_server};
+use kbf_server::{Args, bind_server, bind_server_with_policy};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose,
@@ -255,6 +256,41 @@ async fn the_reapi_listener_serves_tls_and_refuses_plain_text() {
         !capabilities_answered(plain).await,
         "a plain-text client was answered on the TLS listener"
     );
+}
+
+/// Catches: the authentication layer dropped from the REAPI listener when it serves
+/// TLS (the TLS client would be answered although the policy denies every call), and a
+/// TLS listener that refuses before the policy is asked (the refusal would not carry
+/// the policy's message).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_auth_policy_applies_on_the_tls_reapi_listener() {
+    let pki = pki("reapi-auth");
+    let listeners = reapi_tls_args(&pki, "server.pem", "server.key")
+        .listeners()
+        .expect("listeners");
+    let policy = Policy::from_json(r#"{"authenticationPolicy": {"deny": "no TLS callers"}}"#)
+        .expect("a policy");
+    let bound = bind_server_with_policy(
+        Arc::new(Cache::memory()),
+        listeners,
+        None,
+        policy,
+        pending(),
+    )
+    .expect("bind");
+    let addr = bound.reapi;
+    tokio::spawn(async move { bound.serving.await.expect("serve") });
+
+    let channel = reapi_tls_endpoint(addr, &pki)
+        .connect()
+        .await
+        .expect("TLS handshake");
+    let status = CapabilitiesClient::new(channel)
+        .get_capabilities(GetCapabilitiesRequest::default())
+        .await
+        .expect_err("a denied call was answered over TLS");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(status.message(), "no TLS callers");
 }
 
 /// Catches: a REAPI listener that wants TLS when no REAPI TLS flag is given; plain
