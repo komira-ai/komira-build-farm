@@ -5,7 +5,8 @@
 //! `Delegate=yes` that the tests run in, and a busybox image pulled by its index
 //! digest. The first test to start sets the unit's cgroup up the way `kbf-daemon` does
 //! ([`kbf_driver_container::delegate`]: this process into `supervisor/`, `actions/`
-//! with cpu, memory and pids, and `actions/memory.max` = [`ACTIONS_MEMORY_MAX`]), and
+//! with cpu, memory and pids, `supervisor/memory.min` = [`SUPERVISOR_MEMORY_MIN`], and
+//! `actions/memory.max` = [`ACTIONS_MEMORY_MAX`]), and
 //! every test's cgroup is made under that `actions/`. So each test is `#[ignore]` with that reason, and
 //! the script runs them with `--include-ignored`. Run that way without the setup, a
 //! test fails (it never skips silently). The marker walk's own test needs only GNU
@@ -26,7 +27,9 @@ use std::time::Duration;
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_driver_container::PodmanRuntime;
 use kbf_types::{LeaseId, Resources};
-use support::real::{ACTIONS_MEMORY_MAX, Cell, MOUNT, delegation, describe, podman, sh, var};
+use support::real::{
+    ACTIONS_MEMORY_MAX, Cell, MOUNT, SUPERVISOR_MEMORY_MIN, delegation, describe, podman, sh, var,
+};
 use support::{Spec, blob, exists, store_action};
 
 /// Catches the action not seeing its inputs, environment, working directory or the
@@ -391,7 +394,9 @@ async fn tags_and_index_digests_are_refused() {
 
 /// Catches the daemon's cgroup setup failing on a real kernel, whose rules the unit
 /// tests' fake only imitates: enabling controllers before the move is EBUSY there, and
-/// `actions/` without `memory` fails every test's cgroup. Then the capacity `kbf-daemon`
+/// `actions/` without `memory` fails every test's cgroup. The daemon's leaf carries its
+/// `memory.min` (the kernel shows it only once the unit enables `memory`), and the
+/// unit's own `memory.min`, when lower, is the one named as capping it. Then the capacity `kbf-daemon`
 /// reports: `actions/memory.max` as written (below the runner's memory), and the CPUs
 /// this process may run on (its affinity is the unit's cpuset).
 #[test]
@@ -418,6 +423,21 @@ fn the_daemons_cgroup_setup_holds_on_the_kernel() {
         read(&delegation.actions, "memory.max"),
         ACTIONS_MEMORY_MAX.to_string()
     );
+    let supervisor = format!("{}/supervisor", delegation.root);
+    assert_eq!(
+        read(&supervisor, "memory.min"),
+        SUPERVISOR_MEMORY_MIN.to_string()
+    );
+    let unit_min: u64 = match read(&delegation.root, "memory.min").as_str() {
+        "max" => u64::MAX,
+        n => n.parse().expect("memory.min"),
+    };
+    if unit_min < SUPERVISOR_MEMORY_MIN {
+        assert_eq!(
+            delegation.memory_min_capped,
+            Some((delegation.root.clone(), unit_min))
+        );
+    }
     let mem_total_kib: u64 = std::fs::read_to_string("/proc/meminfo")
         .expect("meminfo")
         .lines()
@@ -464,6 +484,25 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     assert_eq!(read(&container, "memory.oom.group"), "1");
     let result = run.await.expect("join").expect("ran");
     assert_eq!(result.exit_code, 0);
+    cell.assert_clean(1);
+}
+
+/// Catches an action that inherits the daemon's lowered `oom_score_adj`: the script
+/// runs this process in a unit with `OOMScoreAdjust=-900`, as the daemon's unit does
+/// (docs/deploy/linux-build-host.md), so under memory pressure the kernel would pick
+/// the daemon before such a build. The action reads the kernel's default, 0.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn an_action_does_not_inherit_the_daemons_oom_score() {
+    let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read");
+    assert_eq!(own.trim(), "-900", "the premise: the unit lowers it");
+    let cell = Cell::new("oom-score");
+    let result = cell
+        .run(1, &sh("cat /proc/self/oom_score_adj"))
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(cell.stdout(&result).trim(), "0");
     cell.assert_clean(1);
 }
 

@@ -75,6 +75,13 @@ struct Cli {
     /// its memory when that is less, and the CPUs of their cpuset.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     actions_memory_max_gib: Option<u64>,
+    /// Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB
+    /// (container, without `--cgroup-parent`): memory the kernel does not reclaim from
+    /// the daemon while it uses no more, so builds short of memory never take it. The
+    /// kernel protects no more than the unit's and its slice's `MemoryMin=` allow; the
+    /// daemon warns when one is lower. 0 protects nothing.
+    #[arg(long, default_value_t = kbf_driver_container::SUPERVISOR_MEMORY_MIN_MIB)]
+    supervisor_memory_min_mib: u64,
     /// Where cgroup v2 is mounted (container). For tests of the cgroup setup only.
     #[arg(long, hide = true, default_value = "/sys/fs/cgroup")]
     cgroup_root: PathBuf,
@@ -345,13 +352,24 @@ mod container {
             None => {
                 let own = std::fs::read_to_string(&cli.self_cgroup)
                     .map_err(|e| format!("read {}: {e}", cli.self_cgroup.display()))?;
-                let delegation = kbf_driver_container::delegate(mount, &own, memory_max)?;
+                let memory_min = cli.supervisor_memory_min_mib.saturating_mul(1 << 20);
+                let delegation =
+                    kbf_driver_container::delegate(mount, &own, memory_min, memory_max)?;
                 tracing::info!(
-                    "cgroup {}: this daemon in {}/supervisor, leases under {}",
+                    "cgroup {}: this daemon in {}/supervisor (memory.min {} MiB), leases under {}",
                     delegation.root,
                     delegation.root,
+                    cli.supervisor_memory_min_mib,
                     delegation.actions
                 );
+                if let Some((cgroup, min)) = &delegation.memory_min_capped {
+                    tracing::warn!(
+                        "cgroup {cgroup} has memory.min {min} bytes, below the daemon's {memory_min}: \
+                         the kernel protects the daemon no further; set MemoryMin= on its unit \
+                         and slice to at least {} MiB",
+                        cli.supervisor_memory_min_mib
+                    );
+                }
                 delegation.actions
             }
         };

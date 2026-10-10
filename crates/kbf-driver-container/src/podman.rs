@@ -106,6 +106,10 @@ pub(crate) struct ContainerSpec {
 ///   already be an input, so each is whole there).
 /// - **Memory:** `memory.oom.group=1` on the container, so an OOM kill takes the whole
 ///   action. Limits live on the lease cgroup (see `cgroup`), never `--memory`.
+///   `--oom-score-adj=0`: a process inherits its parent's `oom_score_adj`, and the
+///   daemon's unit lowers the daemon's (`OOMScoreAdjust=`) so the kernel kills a build
+///   before the daemon; the action gets the kernel's default back (raising it needs no
+///   privilege).
 /// - **Users:** `--userns=nomap`, so no container uid or gid maps to the daemon's user:
 ///   container id 0 is the daemon user's first subordinate id, and so on up. Rootless
 ///   Podman's default makes the container's root the daemon's own uid on the host,
@@ -131,6 +135,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
         "--userns=nomap",
         "--hostname=localhost",
         "--cgroup-conf=memory.oom.group=1",
+        "--oom-score-adj=0",
         "--unsetenv-all",
     ]
     .into_iter()
@@ -429,11 +434,13 @@ mod tests {
     }
 
     /// Catches a hard per-lease memory cap or a missing OOM group: the policy is soft
-    /// limits on the lease cgroup, and one OOM kill ends the whole action.
+    /// limits on the lease cgroup, and one OOM kill ends the whole action. Also an
+    /// action left with the daemon's lowered `oom_score_adj`.
     #[test]
     fn no_hard_memory_cap_and_one_oom_group() {
         let args = strings(&create_args(&spec()));
         assert!(args.contains(&"--cgroup-conf=memory.oom.group=1".to_owned()));
+        assert!(args.contains(&"--oom-score-adj=0".to_owned()));
         assert!(args.contains(&"--cgroup-parent=/kbf.slice/actions/kbf-lease-1-2".to_owned()));
         for banned in ["--memory", "--memory-swap", "--cpus", "--cpu-quota"] {
             assert!(

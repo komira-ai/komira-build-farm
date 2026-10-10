@@ -12,6 +12,8 @@
 #   user manager alone gets no io controller and a daemon must own its subtree. The
 #   tests set the unit's cgroup up with kbf-daemon's own code (a `supervisor` leaf,
 #   then `actions` with cpu, memory and pids; tools/ci/podman-tests-inner.sh).
+#   The unit lowers its OOM score as the daemon's does (docs/deploy/
+#   linux-build-host.md), so the tests see what an action inherits from it.
 #
 # The test binary is built before the unit starts, so the unit only runs it.
 set -euo pipefail
@@ -57,7 +59,7 @@ echo "busybox manifest for $arch: $manifest"
 cargo test -p kbf-driver-container --test podman --test podman_env --locked --no-run
 
 sudo systemd-run --quiet --wait --collect --pipe --unit=kbf-podman-tests \
-    --slice=kbf-daemon.slice -p Delegate=yes \
+    --slice=kbf-daemon.slice -p Delegate=yes -p OOMScoreAdjust=-900 \
     --uid="$uid" --gid="$(id -g)" --working-directory="$PWD" \
     -E HOME="$HOME" -E PATH="$PATH" -E XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     -E CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-}" -E RUSTFLAGS="${RUSTFLAGS:-}" \
