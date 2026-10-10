@@ -200,6 +200,22 @@ platform(
 )
 ```
 
+## `vm.image` and the VM report keys
+
+macOS VM leases (`kbf-lease=vm`, [macos-vms.md](design/macos-vms.md)) are **planned**:
+no driver runs a VM and no daemon reports a VM entry. What the server already reads:
+
+| Property | Values | Effect |
+|---|---|---|
+| `vm.image` | `<name>@sha256:<64 lowercase hex digits>` | Matched by membership on the digest: the action runs only on a worker whose report lists an image with that digest, under any name. A value without a digest is refused with `INVALID_ARGUMENT`. |
+| `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` | none | Report-only: an action that names one, in any case, is refused with `INVALID_ARGUMENT`. |
+
+The digest is the image's recipe digest, which names the image's pinned inputs, not the
+bytes of one node's build ([macos-vm-guests.md](design/macos-vm-guests.md#5-image-identity)).
+Because no daemon reports `vm.image` yet, an action that names one matches no worker:
+it waits and then fails as described under [Where an action runs](#where-an-action-runs).
+`kbf-lease=vm` is still refused as an unknown lease kind.
+
 ## `ios.device` (planned)
 
 **Planned, not on `main`:** today `ios.device` is a name kbf does not know, so it is not

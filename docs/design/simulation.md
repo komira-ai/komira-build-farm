@@ -311,7 +311,7 @@ switches each fault kind on or off.
 | # | Scenario | Generator | Checks |
 |---|---|---|---|
 | F4.1 | Steady state | arrivals at 70 to 95 percent of capacity | I1 to I15 every step; L1 once arrivals stop |
-| F4.2 | Churn | 5 percent of workers die or return each minute | as F4.1; every unservable refusal checked by the reference verdict (I10) |
+| F4.2 | Churn | 5 percent of workers die or return each minute, at least one dead worker returning when any is dead | as F4.1; every unservable refusal checked by the reference verdict (I10) |
 | F4.3 | Mass reconnect | every worker re-registers within a few seconds | L3; each lost lease requeued once; no operation held twice (I3) |
 | F4.4 | Operator storm | cordon, drain and uncordon at random on a tenth of the fleet | I8, I9, I10 |
 

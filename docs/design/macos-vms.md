@@ -354,8 +354,9 @@ phase, or any other native daemon, never looks able to serve `whole_machine`. On
 
 ### 5.3 Booking and placement (planned)
 
-On `main`, `Resources` has three dimensions (`cpu_millis`, `memory_bytes`, `gpus`,
-`crates/kbf-types/src/work.rs`), every action books 1 core and 1 GiB
+On `main`, `Resources` has four dimensions (`cpu_millis`, `memory_bytes`, `gpus`,
+`vms`, `crates/kbf-types/src/work.rs`), with `vms` checked by `fits` but booked and
+filled by nothing yet; every action books 1 core and 1 GiB
 (`crates/kbf-front/src/execution.rs`), the lease kind is not in the scheduler's request,
 and placement is first fit in worker-name order with no reservation **[V]**. The
 changes:

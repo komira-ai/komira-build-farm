@@ -168,11 +168,12 @@ impl Servable {
         let r = request.resources;
         Verdict::Unservable(format!(
             "the {} live worker(s) that satisfy the action's platform are all smaller than \
-             its request ({} millicores, {} bytes of memory, {} GPU(s))",
+             its request ({} millicores, {} bytes of memory, {} GPU(s), {} VM slot(s))",
             matching.len(),
             r.cpu_millis,
             r.memory_bytes,
-            r.gpus
+            r.gpus,
+            r.vms
         ))
     }
 }

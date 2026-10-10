@@ -29,7 +29,8 @@
 //! A seed is the whole input, and picks its scenario as `seed % 4`:
 //!
 //! - F4.1 steady state: arrivals only (no worker or operator faults);
-//! - F4.2 churn: 5 percent of workers die or return each minute;
+//! - F4.2 churn: 5 percent of workers die or return each minute, at least one dead
+//!   worker among them when any is dead;
 //! - F4.3 mass reconnect: every worker reboots or restarts its daemon and comes back
 //!   in the same second, just after the handover grace, once or twice (more than one
 //!   placement round's worth of work is requeued at once); and once every worker
