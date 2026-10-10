@@ -159,6 +159,9 @@ fn runs_until_sigterm_with_path(
     path: Option<&Path>,
 ) -> std::process::ExitStatus {
     let dir = tls(name);
+    if extra.iter().any(|f| f == "--driver=native") {
+        probe_cold(name);
+    }
     let started = Instant::now();
     let mut command = Command::new(BIN);
     if let Some(path) = path {
@@ -412,7 +415,30 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
 const PROMPT: Duration = Duration::from_secs(30);
 
 /// Starts the daemon with `flags`, its log written to `log`.
+/// PROBE (do not merge): removes the user's `xcrun_db` on macOS, so the daemon about
+/// to start surveys its Xcodes with a cold cache; logs whether one was there.
+fn probe_cold(what: &str) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let out = Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .output()
+        .expect("getconf");
+    let temp = PathBuf::from(String::from_utf8(out.stdout).expect("utf-8").trim_end());
+    let db = temp.join("xcrun_db");
+    let size = std::fs::metadata(&db).map(|m| m.len()).ok();
+    let removed = std::fs::remove_file(&db).is_ok();
+    let _ = writeln!(
+        std::io::stderr(),
+        "PROBE: before the {what} daemon: {} size {size:?}, removed {removed}, still there {}",
+        db.display(),
+        db.exists()
+    );
+}
+
 fn daemon(flags: &[String], log: &Path) -> std::process::Child {
+    probe_cold(&log.display().to_string());
     Command::new(BIN)
         .args(flags)
         .stderr(std::fs::File::create(log).expect("log file"))
