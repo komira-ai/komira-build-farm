@@ -36,12 +36,21 @@
 //!   only cordoned workers could run waits, naming them, and is not refused for it; an
 //!   uncordon places queued work at once;
 //! - a finished operation is kept for [`FINISHED_RETENTION`] after its waiters are
-//!   answered, then dropped (issue #165).
+//!   answered, then dropped (issue #165);
+//! - memory kills (failure classes, 6.1): an action that passed its own memory limit
+//!   runs again with its memory booking doubled, up to the largest node that could run
+//!   it, and its action key keeps the raised booking as a floor for later submissions;
+//!   a kill at that largest node finishes it. A busy node's kill below the action's
+//!   own limit runs it again with the same booking, at most [`FARM_RERUNS`] times, and
+//!   counts against the node ([`Scheduler::memory_pressure`]). See
+//!   [`kbf_types::MemoryRun`].
 //!
 //! Not yet: placement scoring (alignment, best fit), a reservation for a large
 //! `action` request (issue #169), reclaimed
-//! room and preemption, the infra retry budget, and committing submissions so that a
-//! new leader inherits the queue. In v0 the scheduler runs on the leader only.
+//! room and preemption, the infra retry budget for other farm faults (a
+//! [`kbf_types::Failure::Infra`] result still finishes its operation), and committing
+//! submissions so that a new leader inherits the queue. In v0 the scheduler runs on
+//! the leader only.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.
@@ -58,5 +67,6 @@ mod servable;
 pub use cordon::Cordon;
 pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
-pub use requeue::{Requeue, RequeueReason};
+pub use requeue::{Gib, Requeue, RequeueReason};
+pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, raised};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

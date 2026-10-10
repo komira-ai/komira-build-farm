@@ -22,3 +22,5 @@ googleapis https://github.com/googleapis/googleapis ab5c1b0777e6f1f7c89bd0eb55b0
 remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 LICENSE
 remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 1f54f664eafff14de492248a8bdbf1878efc741afbc4c7b5b9ff2157af92c02f build/bazel/remote/execution/v2/remote_execution.proto
 remote-apis https://github.com/bazelbuild/remote-apis adbf4a27c86fbea4a37637a6cbcacef372406fe7 22b2af125690142af1c8152ba3a4ca15ffaa1265111dedc6e39b5412989b5be1 build/bazel/semver/semver.proto
+grpc-proto https://github.com/grpc/grpc-proto 813330824839bfdd3abc52f41807095c0de2ec19 cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 LICENSE
+grpc-proto https://github.com/grpc/grpc-proto 813330824839bfdd3abc52f41807095c0de2ec19 164b670058855c6277a0511a14e2a302dd5a8ff899853ca6851b6b201a413d28 grpc/health/v1/health.proto

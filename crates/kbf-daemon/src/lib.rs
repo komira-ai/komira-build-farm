@@ -1,6 +1,6 @@
 //! `kbf-daemon`: the worker daemon.
 //!
-//! It holds one outbound mutual-TLS `kbf.worker.v1` stream to a server front, reports
+//! It holds one outbound mutual-TLS `kbf.worker.v1` stream to a server, reports
 //! its node (detected through `kbf-caps`), sends heartbeats, and runs a lease manager:
 //! work starts only on `Start`, and only while the `Start` is inside the window it
 //! names (issue #23); each lease reports one `Result`, kept until the server
@@ -11,6 +11,8 @@
 //! outputs back through a [`Cas`]; [`CasClient`] is the one that talks to a front.
 //!
 //! - [`config`]: command-line flags and TLS files.
+//! - [`connect`]: which server to try next, and the wait between rounds of attempts;
+//!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
@@ -29,6 +31,7 @@
 pub mod cas;
 pub mod clock;
 pub mod config;
+pub mod connect;
 mod contact;
 mod daemon;
 mod lease;

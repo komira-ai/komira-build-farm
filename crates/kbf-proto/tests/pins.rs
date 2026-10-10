@@ -148,6 +148,8 @@ fn pins_cover_the_files_the_build_reads() {
         "googleapis/google/bytestream/bytestream.proto",
         "googleapis/google/longrunning/operations.proto",
         "googleapis/google/rpc/status.proto",
+        "grpc-proto/LICENSE",
+        "grpc-proto/grpc/health/v1/health.proto",
     ] {
         assert!(pins.contains_key(key), "PINS has no line for {key}");
     }

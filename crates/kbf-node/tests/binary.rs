@@ -121,6 +121,9 @@ fn base(dir: &Path) -> Vec<String> {
     ]
 }
 
+/// What the daemon logs (at WARN) when an attempt to reach a server fails.
+const FIRST_ATTEMPT: &str = "cannot reach a server";
+
 /// Starts the daemon with `extra` flags, its stderr a pipe, waits until its session
 /// loop has failed to connect once (so detection, the driver and the TLS files all
 /// worked), then sends SIGTERM and returns its exit status. Checks the log on the way
@@ -184,7 +187,7 @@ fn runs_until_sigterm_with_path(
     });
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut log = Vec::new();
-    while !log.iter().any(|l: &String| l.contains("session ended")) {
+    while !log.iter().any(|l: &String| l.contains(FIRST_ATTEMPT)) {
         let left = deadline.saturating_duration_since(Instant::now());
         match seen.recv_timeout(left) {
             Ok(line) => log.push(line),
@@ -220,7 +223,7 @@ fn runs_until_sigterm_with_path(
     );
     let ended = log
         .iter()
-        .find(|l| l.contains("session ended"))
+        .find(|l| l.contains(FIRST_ATTEMPT))
         .expect("seen");
     assert!(
         ended.contains("connect: transport error: ") && ended.contains("refused"),

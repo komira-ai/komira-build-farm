@@ -20,8 +20,9 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 | Trees | `tree` | writes an input root to disk and reads outputs back |
 | Usage | `usage` | measures a child process's CPU time and peak memory when it is reaped |
 
-The daemon is configured by flags only: `--server` (an `https://` URL), `--ca-cert`,
-`--cert`, `--key`, `--tls-server-name`, `--node-id`, `--runtime` and `--reconnect-ms`.
+The daemon is configured by flags only: `--server` (an `https://` URL; repeatable, or
+several separated by commas), `--ca-cert`, `--cert`, `--key`, `--tls-server-name`,
+`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`.
 The certificate must name `--node-id` as its one DNS subjectAltName, or the server
 refuses the session (see
 [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)).
@@ -35,9 +36,30 @@ stream and never kept across a restart: the scheduler gives up at once only the 
 of this process that a new stream's first heartbeat leaves out, and keeps those of
 another process sharing the node's certificate until that one has fenced
 ([scheduler.md](scheduler.md#reconciling-with-what-workers-say-they-run), issue #140). When the
-stream ends for any reason it waits `--reconnect-ms` and tries again. Leases keep
-running across reconnects, and the fence clock keeps running whether a stream is up or
-not.
+stream ends it waits `--reconnect-ms` and tries again. Leases keep running across
+reconnects, and the fence clock keeps running whether a stream is up or not.
+
+### Reaching a server
+
+The daemon never stops trying to reach a server (module `connect`). Each round of
+attempts resolves every `--server` host again (a DNS name may carry a record per
+server; an address literal resolves to itself) and tries each address in turn,
+starting after the address it tried last. An attempt that ends before `Welcome` for
+any reason (a refused connection, a TLS failure, a server answering `UNAVAILABLE`, no
+connection or no `Welcome` within 10 seconds) moves on to the next address at once.
+When every address of a round failed, the daemon waits and starts another round: the
+wait after the `n`th failed round in a row is `--reconnect-ms` (default 1000) times
+2^(n-1), at most `--reconnect-max-ms` (default 30 000), less a random part of up to
+half. After a welcomed session ends, the wait is `--reconnect-ms`, jittered the same
+way, and the count starts over.
+
+Each attempt verifies the server certificate against `--tls-server-name`, or the
+URL's host when that flag is not given, whatever address the host resolved to.
+Failed attempts are logged at WARN at most once a minute while they repeat (the first
+after a session always is), the rest at DEBUG; each WARN counts the attempts since the
+last session. An observer of the daemon's events sees `ConnectFailed` for each failed
+attempt and `Retrying` (failed rounds, the wait) for each wait. The blob client
+(`--cas`) is a single URL; it is not covered by this.
 
 Each lease is remembered with the lease epoch the newest `Welcome` named when its
 `Start` arrived, and the action the `Start` named; every `Result` echoes that action.
