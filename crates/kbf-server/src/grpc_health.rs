@@ -177,12 +177,10 @@ where
             if is_stopping {
                 return Some((Err(stopping()), Self::Done));
             }
+            // Wakes on a change of `Readiness` or at the interval, whichever is first.
             // `changed` fails only once its sender is dropped, and the sender lives in
             // `inner.readiness`, which this stream holds.
-            tokio::select! {
-                _ = changed.changed() => {}
-                () = tokio::time::sleep(inner.watch_interval) => {}
-            }
+            let _ = tokio::time::timeout(inner.watch_interval, changed.changed()).await;
         }
     }
 }
