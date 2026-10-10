@@ -191,8 +191,7 @@ fn native_with(
         report
     };
     // Returns at once: the survey runs on the watch's thread.
-    let (driver, _) =
-        xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
+    let (driver, _) = xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
     let daemon = daemon(cli, runtime)?.with_driver_report(driver.clone());
     Ok((daemon, driver))
 }

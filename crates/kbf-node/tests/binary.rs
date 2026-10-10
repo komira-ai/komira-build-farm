@@ -535,9 +535,24 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         // SAFETY: kill(2) takes plain integers.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    let lines = |file: &str| read(&dir.join(file)).lines().map(str::to_owned).collect::<Vec<_>>();
-    log_start("restart test's first", "said Hello", first_hello, &lines("first.log"));
-    log_start("restart test's second", "said Hello", second_hello, &lines("second.log"));
+    let lines = |file: &str| {
+        read(&dir.join(file))
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    log_start(
+        "restart test's first",
+        "said Hello",
+        first_hello,
+        &lines("first.log"),
+    );
+    log_start(
+        "restart test's second",
+        "said Hello",
+        second_hello,
+        &lines("second.log"),
+    );
     let log = read(&dir.join("second.log"));
     assert!(
         action_ended,

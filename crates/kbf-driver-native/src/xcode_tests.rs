@@ -322,7 +322,10 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     let mut want: BTreeSet<String> = ["Xcode_good.app", "Xcode_old.app"]
         .iter()
         .flat_map(|name| {
-            let own = real_apps.join(name).join("Contents/Developer").join(XCODEBUILD);
+            let own = real_apps
+                .join(name)
+                .join("Contents/Developer")
+                .join(XCODEBUILD);
             [
                 format!("{} -version", own.display()),
                 format!("{} -license check", own.display()),
@@ -346,7 +349,11 @@ fn the_survey_asks_every_question_under_its_sandbox() {
             .collect()
     };
     let ran = read();
-    assert_eq!(ran.len(), 11, "a question asked twice, or not at all: {ran:#?}");
+    assert_eq!(
+        ran.len(),
+        11,
+        "a question asked twice, or not at all: {ran:#?}"
+    );
     assert_eq!(ran.into_iter().collect::<BTreeSet<_>>(), want);
     assert!(!real.exists(), "the survey's directory stays");
 

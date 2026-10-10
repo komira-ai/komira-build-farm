@@ -84,6 +84,7 @@ async fn software_until(api: SocketAddr, done: impl Fn(&Value) -> bool) -> Value
 /// Stores an action naming `xcode=<build>` that writes its `DEVELOPER_DIR` to `marker`.
 async fn action(cas: &CasClient, build: &str, marker: &Path) -> Digest {
     let put = |message: Vec<u8>| async move { cas.put(message).await.expect("upload") };
+    // On the Action, where REAPI v2.2 reads it (the Command's field is deprecated).
     let platform = Some(Platform {
         properties: vec![Property {
             name: "xcode".to_owned(),
@@ -92,8 +93,9 @@ async fn action(cas: &CasClient, build: &str, marker: &Path) -> Digest {
     });
     let script = format!("echo \"$DEVELOPER_DIR\" > '{}'", marker.display());
     let command = Command {
-        arguments: ["/bin/sh", "-c", script.as_str()].map(str::to_owned).to_vec(),
-        platform: platform.clone(),
+        arguments: ["/bin/sh", "-c", script.as_str()]
+            .map(str::to_owned)
+            .to_vec(),
         ..Command::default()
     };
     let action = Action {
@@ -230,11 +232,21 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     assert!(hello < HELLO_WITHIN, "Hello waited: {hello:?}");
 
     let software = software_until(api, |s| !s.is_null()).await;
-    assert_eq!(software["xcode_builds"], serde_json::json!([]), "{software}");
+    assert_eq!(
+        software["xcode_builds"],
+        serde_json::json!([]),
+        "{software}"
+    );
     let xcodes = &software["xcodes"];
-    assert_eq!(xcodes[0]["app"], apps.join("Xcode_1.app").display().to_string());
+    assert_eq!(
+        xcodes[0]["app"],
+        apps.join("Xcode_1.app").display().to_string()
+    );
     assert_eq!(xcodes[0]["state"], "not_surveyed", "{software}");
-    assert_eq!(nodes(api).await["nodes"][0]["needs_attention"], serde_json::json!([]));
+    assert_eq!(
+        nodes(api).await["nodes"][0]["needs_attention"],
+        serde_json::json!([])
+    );
 
     let channel = Endpoint::from_shared(format!("http://{reapi}"))
         .expect("endpoint")
@@ -253,14 +265,21 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let report = surveyed(&mut reports).await;
     assert_eq!(report.xcodes[0].build, "1A1", "{report:?}");
     let software = software_until(api, |s| s["xcodes"][0]["state"] == "ready").await;
-    assert_eq!(software["xcode_builds"], serde_json::json!(["1A1"]), "{software}");
+    assert_eq!(
+        software["xcode_builds"],
+        serde_json::json!(["1A1"]),
+        "{software}"
+    );
     let code = tokio::time::timeout(PROMPT, running)
         .await
         .expect("placed once surveyed")
         .expect("execute");
     assert_eq!(code, 0);
     let ran_with = std::fs::read_to_string(&marker).expect("ran");
-    assert_eq!(ran_with.trim_end(), real_developer_dir.display().to_string());
+    assert_eq!(
+        ran_with.trim_end(),
+        real_developer_dir.display().to_string()
+    );
     drop(reports);
     kbf_outputs::remove_tree(&dir).expect("clean");
 }

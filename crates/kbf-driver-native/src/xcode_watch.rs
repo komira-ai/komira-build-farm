@@ -524,12 +524,18 @@ mod tests {
         assert!(status.reason.contains("not surveyed yet"), "{status:?}");
         assert_eq!(status.fix, "");
         std::thread::sleep(Duration::from_millis(300));
-        assert!(!reports.has_changed().expect("the watch runs"), "surveyed early");
+        assert!(
+            !reports.has_changed().expect("the watch runs"),
+            "surveyed early"
+        );
 
         std::fs::write(&go, "").expect("go");
         let surveyed = next(&mut reports);
         assert_eq!(surveyed.xcodes[0].state(), XcodeState::Ready);
-        assert_eq!(surveyed.entries, [("xcode".to_owned(), "16C5032a".to_owned())]);
+        assert_eq!(
+            surveyed.entries,
+            [("xcode".to_owned(), "16C5032a".to_owned())]
+        );
         let states: Vec<Vec<State>> = applied
             .lock()
             .expect("applied")
