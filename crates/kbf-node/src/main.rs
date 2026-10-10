@@ -529,7 +529,10 @@ mod tests {
     /// the daemon warms. The sandbox program is a fake that marks what it runs; the
     /// Xcode's `xcodebuild` and the `xcrun` are fakes that log each run and whether it
     /// was marked. The warm-up of the Xcode the survey finds ready runs too, also
-    /// sandboxed; the test waits for it to end.
+    /// sandboxed; the test waits for it to end. Also catches the warm-up not run, or
+    /// run before the survey's questions are answered (its lookups would make the
+    /// survey's miss): the fake `xcodebuild` answers after half a second, so a warm-up
+    /// started with the daemon logs before it.
     #[tokio::test]
     async fn the_daemons_survey_runs_under_the_sandbox() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -557,7 +560,7 @@ mod tests {
             .join(xcode::XCODEBUILD);
         write(
             &xcodebuild,
-            &format!("#!/bin/sh\n{logged}echo 'Build version 1A1'\n"),
+            &format!("#!/bin/sh\nsleep 0.5\n{logged}echo 'Build version 1A1'\n"),
         );
         let xcrun = dir.join("bin/xcrun");
         write(&xcrun, &format!("#!/bin/sh\n{logged}echo /x/clang\n"));
@@ -594,6 +597,21 @@ mod tests {
             .for_each(|_| std::thread::sleep(Duration::from_millis(20)));
         let ran = std::fs::read_to_string(&log).expect("ran");
         let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
+        let warmed = format!("xcrun {}", at(&warm, ""));
+        let asked = at(&survey, "");
+        assert!(
+            ran.lines().any(|l| l.starts_with(&warmed)),
+            "no warm-up: {ran}"
+        );
+        let asked_first = ran
+            .lines()
+            .take_while(|l| !l.starts_with(&warmed))
+            .filter(|l| l.contains(&asked))
+            .count();
+        assert_eq!(
+            asked_first, 4,
+            "the warm-up ran before the survey's answers: {ran}"
+        );
         // The survey's questions, asked at once, come before the warm-up's lookups.
         let mut surveyed: Vec<String> = ran
             .lines()

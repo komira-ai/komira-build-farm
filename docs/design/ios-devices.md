@@ -251,8 +251,11 @@ A device action needs, all **[A]** until probe P-D3:
 - **Preference writes.** The profile denies every preference write; whether
   `xcodebuild` on a device needs one is part of P-D3.
 
-The daemon itself runs `devicectl` outside the sandbox for its survey, precheck and
-cleanup ([section 8](#8-the-lease-lifecycle)). The action runs `xcodebuild` inside it.
+The daemon itself runs `devicectl` for its survey, precheck and cleanup
+([section 8](#8-the-lease-lifecycle)) under the actions' sandbox too, as it asks its
+Xcodes every question (CEO decision on issue #164: `xcrun` reads and fills a cache
+that leases can write); its profile is that of a device lease, which may reach
+CoreDevice (below). The action runs `xcodebuild` inside it.
 
 **Other leases must not reach a booked device.** The profile on `main` allows mach and
 XPC services (`(allow default)`) and every Unix socket, so any concurrent action on the
