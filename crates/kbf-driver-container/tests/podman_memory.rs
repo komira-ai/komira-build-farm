@@ -290,9 +290,19 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
     let run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
     wait_for(&lease, "sleep").await;
+    // The buffer is anonymous memory: `anon` in `memory.stat`, not the file's cache.
+    let anon = |lease: &Path| {
+        std::fs::read_to_string(lease.join("memory.stat"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("anon ")?.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
     let mut held = 0;
     for _ in 0..100 {
-        held = read_u64(&lease, "memory.current");
+        held = anon(&lease);
         if held >= 150 * MIB {
             break;
         }
@@ -300,7 +310,7 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
     }
     assert!(held >= 150 * MIB, "the buffer is not held: {held} bytes");
     // EAGAIN when it reclaimed less than asked; what it moved is read below.
-    let _ = std::fs::write(lease.join("memory.reclaim"), "100M");
+    let _ = std::fs::write(lease.join("memory.reclaim"), "200M");
     let swapped = read_u64(&lease, "memory.swap.current");
     assert!(
         swapped > FLOOR,
@@ -322,16 +332,19 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// dropped" mutant): a lease that host pressure swapped out earlier, and that then
 /// touches its own cap without pushing more into swap, runs to exit 0.
 ///
-/// The lease books 256 MiB and holds a 150 MiB buffer of random bytes (`dd` blocked
-/// writing it into a pipe nobody reads). The test reclaims 100 MiB of it into swap
-/// (`memory.reclaim`, standing in for host pressure: no `max` event), past the 8 MiB
-/// floor this cell's watch is given. It then pins the lease's `memory.swap.max` to
-/// what the lease holds in swap now, so nothing more of it can go there, and lowers
-/// the lease's `memory.max` to 16 MiB above what it holds in RAM. The action then
-/// writes 48 MiB files into its working directory, over and over: its page cache hits
-/// the cap (the `max` events grow), and reclaim at the cap drops file pages, not
-/// anonymous ones. The rule without "swap rose" kills it at the first sample after
-/// that (`max` grew, swap above the floor).
+/// The lease books 256 MiB, holds a 150 MiB buffer of random bytes (`dd` blocked
+/// writing it into a pipe nobody reads) and writes a 64 MiB file into its working
+/// directory, synced, so its pages are clean. The test reclaims 200 MiB from the lease
+/// (`memory.reclaim`, standing in for host pressure: no `max` event): the file's pages
+/// are dropped and much of the buffer goes to swap, past the 8 MiB floor this cell's
+/// watch is given. It then pins the lease's `memory.swap.max` to what the lease holds
+/// in swap now, so nothing more of it can go there, and lowers the lease's
+/// `memory.max` to 16 MiB above what it holds in RAM. The action then reads the file,
+/// over and over: its page cache hits the cap (the `max` events grow), and reclaim at
+/// the cap drops the clean file pages. The rule without "swap rose" kills it at the
+/// first sample after that (`max` grew, swap above the floor). Clean pages, not
+/// written ones: a lease at so tight a cap that writes is OOM-killed by the kernel
+/// (seen on both podman jobs) before its dirty pages are written back.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
@@ -345,9 +358,9 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         };
     });
     let mut spec = sh(
-        "dd if=/dev/urandom bs=150M count=1 iflag=fullblock 2>/dev/null | { sleep 10; i=0; \
-         while [ $i -lt 20 ]; do dd if=/dev/zero of=f bs=1M count=48 2>/dev/null; \
-         i=$((i + 1)); done; rm -f f; }",
+        "dd if=/dev/urandom bs=150M count=1 iflag=fullblock 2>/dev/null | { \
+         dd if=/dev/zero of=f bs=1M count=64 2>/dev/null; sync; sleep 10; i=0; \
+         while [ $i -lt 20 ]; do cat f >/dev/null; i=$((i + 1)); done; rm -f f; }",
     );
     spec.timeout = Some(Duration::from_secs(120));
     let action = store_action(&cell.cas, &spec);
@@ -356,9 +369,19 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     let mut run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
     wait_for(&lease, "sleep").await;
+    // The buffer is anonymous memory: `anon` in `memory.stat`, not the file's cache.
+    let anon = |lease: &Path| {
+        std::fs::read_to_string(lease.join("memory.stat"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("anon ")?.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
     let mut held = 0;
     for _ in 0..100 {
-        held = read_u64(&lease, "memory.current");
+        held = anon(&lease);
         if held >= 150 * MIB {
             break;
         }
@@ -366,7 +389,7 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     }
     assert!(held >= 150 * MIB, "the buffer is not held: {held} bytes");
     // EAGAIN when it reclaimed less than asked; what it moved is read below.
-    let _ = std::fs::write(lease.join("memory.reclaim"), "100M");
+    let _ = std::fs::write(lease.join("memory.reclaim"), "200M");
     let swapped = read_u64(&lease, "memory.swap.current");
     assert!(
         swapped > FLOOR,
