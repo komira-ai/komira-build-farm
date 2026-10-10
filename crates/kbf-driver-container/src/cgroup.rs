@@ -645,6 +645,126 @@ mod tests {
         assert!(!presses_its_cap_into_swap(at(3, 500), at(4, 400), 100));
     }
 
+    const MIB: u64 = 1 << 20;
+
+    /// The index of the sample, fed in order to the watch of a new lease, at which it
+    /// kills the lease: each sample is (`memory.events` `max`, `memory.swap.current`).
+    fn killed_at(samples: &[(u64, u64)], threshold: u64) -> Option<usize> {
+        // RED-FIRST: the rule before this change, as a sequence over samples.
+        let mut before = Pressure::default();
+        samples.iter().position(|&(max, swap)| {
+            let now = Pressure {
+                max,
+                current: 0,
+                swap,
+            };
+            let kills = presses_its_cap_into_swap(before, now, threshold);
+            before = now;
+            kills
+        })
+    }
+
+    /// Catches the false positive seen on podman-arm (a lease killed as out of memory
+    /// for swap the host put there): the absolute-swap rule. Host reclaim moved
+    /// 143265792 bytes of the lease to swap below its cap (`max` 0), a few pages were
+    /// read back (143233024), then the lease pressed its cap (`max` 156 to 7205) and
+    /// pushed 32 KiB back out. The lease pushed 32 KiB into swap itself, far below the
+    /// 8 MiB threshold; the old rule counted all 143 MB and killed it.
+    #[test]
+    fn a_lease_the_host_swapped_is_not_killed_for_a_few_pages_at_its_cap() {
+        let mut samples = vec![(0, 143_265_792); 17];
+        samples.push((0, 143_233_024));
+        for max in [
+            156, 565, 1184, 1986, 2838, 3650, 4268, 4829, 5411, 6043, 6628, 7205,
+        ] {
+            samples.push((max, 143_233_024));
+        }
+        samples.push((7800, 143_265_792));
+        assert_eq!(killed_at(&samples, 8 * MIB), None);
+    }
+
+    /// Catches a rule that never kills (or kills too late, or at the threshold rather
+    /// than past it): a lease at 0 swap pressing its cap pushes 3 MiB more into swap at
+    /// each sample. At exactly the 8 MiB threshold it lives; one byte past, it dies.
+    #[test]
+    fn a_lease_pressing_its_cap_into_swap_is_killed_past_the_threshold() {
+        let samples = [(10, 3 * MIB), (20, 6 * MIB), (30, 9 * MIB)];
+        assert_eq!(killed_at(&samples, 8 * MIB), Some(2));
+        let samples = [(10, 4 * MIB), (20, 8 * MIB), (30, 8 * MIB + 1)];
+        assert_eq!(killed_at(&samples, 8 * MIB), Some(2));
+        assert_eq!(killed_at(&samples[..2], 8 * MIB), None);
+    }
+
+    /// Catches host swap ignored for good (a lease the host swapped never killed, even
+    /// when it then pushes past the threshold itself at its cap) and the host's share
+    /// taken wrong: from the first sample (143265792) rather than after the pages read
+    /// back (143233024), the lease's own share at the last sample would be 32 KiB
+    /// short of the threshold and it would live.
+    #[test]
+    fn a_lease_the_host_swapped_is_killed_for_what_it_pushes_itself_past_the_threshold() {
+        let host = 143_233_024;
+        let samples = [
+            (0, 143_265_792),
+            (0, host),
+            (100, host + 4 * MIB),
+            (200, host + 8 * MIB),
+            (300, host + 8 * MIB + 1),
+        ];
+        assert_eq!(killed_at(&samples, 8 * MIB), Some(4));
+        assert_eq!(killed_at(&samples[..4], 8 * MIB), None);
+    }
+
+    /// Catches a share reset when the lease's `max` events pause (a lease pressing its
+    /// cap into swap in bursts never killed), and swap the host moves during the pause
+    /// counted as the lease's. The lease pushes 5 MiB at its cap, pauses (`max` flat)
+    /// while the host moves 100 MiB more of it to swap, then pushes 4 MiB more at its
+    /// cap: 9 MiB is its own, past 8 MiB. With only 1 MiB more, 6 MiB is its own.
+    #[test]
+    fn pushes_at_the_cap_add_up_across_a_pause_and_host_swap_in_the_pause_does_not() {
+        let samples = [
+            (10, 5 * MIB),
+            (10, 5 * MIB),
+            (10, 105 * MIB),
+            (20, 109 * MIB),
+        ];
+        assert_eq!(killed_at(&samples, 8 * MIB), Some(3));
+        let samples = [(10, 5 * MIB), (10, 105 * MIB), (20, 106 * MIB)];
+        assert_eq!(killed_at(&samples, 8 * MIB), None);
+    }
+
+    /// Catches a fall in swap taken from the host's share first: pages read back at the
+    /// cap and pushed out again would then add up as the lease's own until it was
+    /// killed. The host moved 100 MiB of the lease to swap; at its cap the lease pushes
+    /// 6 MiB out, reads 4 MiB back, pushes it out again, and so on. Its own share never
+    /// passes 6 MiB.
+    #[test]
+    fn pages_read_back_and_pushed_out_again_at_the_cap_do_not_add_up() {
+        let mut samples = vec![(0, 100 * MIB)];
+        for i in 1..=20 {
+            let swap = if i % 2 == 1 { 106 * MIB } else { 102 * MIB };
+            samples.push((i * 10, swap));
+        }
+        assert_eq!(killed_at(&samples, 8 * MIB), None);
+    }
+
+    /// Catches a kill on swap alone (the "ignores max events" mutant: host pressure
+    /// moves a lease below its cap, or one that hit its cap once before, into swap) and
+    /// on `max` events alone (a lease at its cap that reclaim keeps in RAM, or whose
+    /// swap is flat at the threshold).
+    #[test]
+    fn swap_without_max_events_or_max_events_without_swap_kill_nothing() {
+        assert_eq!(killed_at(&[(0, 1 << 40)], 8 * MIB), None);
+        assert_eq!(
+            killed_at(&[(3, 0), (3, 1 << 40), (3, 1 << 41)], 8 * MIB),
+            None
+        );
+        assert_eq!(killed_at(&[(9, 0), (99, 0), (999, 0)], 8 * MIB), None);
+        assert_eq!(
+            killed_at(&[(10, 8 * MIB), (20, 8 * MIB), (30, 8 * MIB)], 8 * MIB),
+            None
+        );
+    }
+
     /// Catches a sample that cannot be read taken as zero (a missing or garbled
     /// `memory.current` or `memory.swap.current` must fail the sample, which the watch
     /// then skips), and a whole sample read from the wrong files.
