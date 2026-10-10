@@ -5,14 +5,17 @@
 //! every service on it, and any path it does not serve, needs the header; a service
 //! added to the router later is covered without a change here. A call is served only
 //! when it carries exactly one `authorization` header whose value is `Bearer <token>`
-//! (the scheme in any case) and the token's digest is an entry of the file as
+//! (the scheme in any case, then a space, then any further spaces or tabs, then the
+//! token with nothing after it) and the token's digest is an entry of the file as
 //! [`TokenStore::current`] gives it now. Anything else is UNAUTHENTICATED:
 //!
 //! - no header, two headers, another scheme, or a token no entry admits: the message
 //!   says how to configure Buck2 and Bazel to send the header;
 //! - the file is missing, breaks a file rule or does not parse (fail closed, see
 //!   [`crate::principal`]): every call, with a message that says so and names no
-//!   path. The server logs the file's error at ERROR when it changes.
+//!   path. The server logs the file's error at ERROR once, and again only when the
+//!   error's text differs from the last one logged or the file was usable in between
+//!   (a file that stays missing is logged once, not at every look).
 //!
 //! A served call carries a [`kbf_front::Caller`] in its request extensions: the
 //! principal's name and default QoS. Execute submits at that QoS and logs the name.
@@ -32,7 +35,7 @@ use kbf_front::Caller;
 use tonic::Status;
 use tonic::service::Routes;
 
-use crate::principal::{TokenStore, TokenStoreError};
+use crate::principal::TokenStore;
 
 /// What a refused caller is told to do.
 pub const HOW_TO_SEND: &str = "every call to this server needs `authorization: Bearer \
@@ -64,8 +67,10 @@ pub fn guard(routes: Routes, tokens: Option<Arc<TokenStore>>) -> Routes {
 
 struct Gate {
     tokens: Arc<TokenStore>,
-    /// The file error last logged, so that one error is logged once, not per call.
-    logged: Mutex<Option<Arc<TokenStoreError>>>,
+    /// The text of the file error last logged, so that one error is logged once, not
+    /// per call. The text, not the error: a missing file gives a new error at every
+    /// look.
+    logged: Mutex<Option<String>>,
 }
 
 impl Gate {
@@ -77,13 +82,14 @@ impl Gate {
                 principals
             }
             Err(e) => {
+                let text = e.to_string();
                 let mut logged = self.logged.lock().unwrap_or_else(PoisonError::into_inner);
-                if !logged.as_ref().is_some_and(|l| Arc::ptr_eq(l, &e)) {
+                if logged.as_deref() != Some(text.as_str()) {
                     tracing::error!(
-                        error = %e,
+                        error = %text,
                         "--reapi-token-file is unusable: every REAPI call is refused"
                     );
-                    *logged = Some(e);
+                    *logged = Some(text);
                 }
                 return Err(Status::unauthenticated(FILE_UNUSABLE));
             }

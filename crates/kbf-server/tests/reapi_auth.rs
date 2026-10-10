@@ -133,8 +133,9 @@ fn unrouted(status: &Status) -> bool {
 /// Catches: any method of the REAPI listener served without a token, with a token the
 /// file does not hold, with the right token under another scheme, or with two
 /// `authorization` headers (one method or service left out of the layer, or a check
-/// that admits whatever it is shown); and a check that changes what an admitted call
-/// gets. The methods come from the compiled protos and the services from what the
+/// that admits whatever it is shown); a check that changes what an admitted call
+/// gets; and a header form the docs admit (lower-case scheme, more spaces or a tab
+/// after the first space) refused, or one they refuse (a tab with no space) admitted. The methods come from the compiled protos and the services from what the
 /// listener routes, so a service added to the listener later is in the table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_method_needs_a_token_the_file_admits() {
@@ -163,7 +164,7 @@ async fn every_method_needs_a_token_the_file_admits() {
     let cell = Cell::start_with_reapi_tokens(Arc::new(store)).await;
     let authed = channel(cell.reapi).await;
     let dev = format!("Bearer {DEV}");
-    let refused: [(&str, Vec<String>); 7] = [
+    let refused: [(&str, Vec<String>); 8] = [
         ("no header", vec![]),
         (
             "a token the file does not hold",
@@ -179,6 +180,10 @@ async fn every_method_needs_a_token_the_file_admits() {
         ),
         ("the token with no scheme", vec![DEV.to_owned()]),
         ("an empty bearer", vec!["Bearer ".to_owned()]),
+        (
+            "a tab and no space after the scheme",
+            vec![format!("Bearer\t{DEV}")],
+        ),
         ("two headers", vec![dev.clone(), dev.clone()]),
     ];
     for (path, open_answer) in methods.iter().zip(&answers) {
@@ -194,12 +199,17 @@ async fn every_method_needs_a_token_the_file_admits() {
             (open_answer.code(), open_answer.message()),
             "{path} with the right token is answered as without the check"
         );
-        let lower = call(&authed, path, &[&format!("bearer {CI}")]).await;
-        assert_eq!(
-            lower.code(),
-            open_answer.code(),
-            "{path}: the scheme in lower case"
-        );
+        for (what, value) in [
+            ("the scheme in lower case", format!("bearer {CI}")),
+            ("three spaces after the scheme", format!("Bearer   {CI}")),
+            (
+                "a space and a tab after the scheme",
+                format!("Bearer \t{CI}"),
+            ),
+        ] {
+            let status = call(&authed, path, &[&value]).await;
+            assert_eq!(status.code(), open_answer.code(), "{path}: {what}");
+        }
     }
 }
 
@@ -338,9 +348,10 @@ impl Captured {
 
 /// Catches: the layer reading the token file only once (a removed line still served,
 /// an added one refused until a restart); a file broken after start (here chmod-ed to
-/// 0644) that keeps serving the entries read before (fail open), or keeps refusing
-/// once fixed; and the file's error not logged, or logged at every refused call
-/// rather than once while it stays broken.
+/// 0644) or removed that keeps serving the entries read before (fail open), or keeps
+/// refusing once fixed; and the file's error not logged, or logged at every refused
+/// call (or, for a removed file, at every look) rather than once while it stays
+/// broken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_file_edits_apply_without_a_restart() {
     let log = Captured::get();
@@ -377,6 +388,24 @@ async fn token_file_edits_apply_without_a_restart() {
     assert_eq!(log.count("0644"), 1, "the log says why");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     until(&ch, &other, Code::Ok).await;
+
+    // A missing file gives a new error at every look (every 20 ms here): it is still
+    // logged once while it stays missing.
+    std::fs::remove_file(&path).expect("remove");
+    let gone = until(&ch, &other, Code::Unauthenticated).await;
+    assert_eq!(gone.message(), FILE_UNUSABLE);
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let again = call(&ch, CAPS, &[&other]).await;
+        assert_eq!(again.message(), FILE_UNUSABLE);
+    }
+    assert_eq!(
+        log.count(unusable),
+        2,
+        "a missing file is logged once, not at every look"
+    );
+    replace(&path, &line("other", &Qos::Ci, OTHER), 0o600);
+    until(&ch, &other, Code::Ok).await;
 }
 
 /// A `kbf-server` process, killed when dropped.
@@ -398,7 +427,8 @@ fn server(tokens: &Path) -> Command {
 }
 
 /// Catches: `--reapi-token-file` parsed but not applied to the listener; the principal
-/// missing from the Execute log line; a token or its digest in the log; and a token
+/// missing from the Execute log line, or a name there that is not the token's
+/// principal; a token or its digest in the log; and a token
 /// file others can read accepted at start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_checks_tokens_and_logs_the_principal() {
@@ -423,11 +453,18 @@ async fn the_binary_checks_tokens_and_logs_the_principal() {
     let ch = channel(reapi).await;
     assert_eq!(call(&ch, CAPS, &[]).await.code(), Code::Unauthenticated);
     let job = Job::new("logged", &[]);
-    let missing = ExecutionClient::new(ch)
-        .execute(execute(&job.action, &format!("Bearer {DEV}")))
-        .await
-        .expect_err("the action was never uploaded");
-    assert_eq!(missing.code(), Code::FailedPrecondition, "{missing:?}");
+    let ci_job = Job::new("logged-ci", &[]);
+    assert_ne!(
+        job.action.digest.hash_hex(),
+        ci_job.action.digest.hash_hex()
+    );
+    for (job, token) in [(&job, DEV), (&ci_job, CI)] {
+        let missing = ExecutionClient::new(ch.clone())
+            .execute(execute(&job.action, &format!("Bearer {token}")))
+            .await
+            .expect_err("the action was never uploaded");
+        assert_eq!(missing.code(), Code::FailedPrecondition, "{missing:?}");
+    }
 
     let _ = child.0.kill();
     let _ = child.0.wait();
@@ -440,18 +477,23 @@ async fn the_binary_checks_tokens_and_logs_the_principal() {
         .read_to_string(&mut stderr)
         .expect("UTF-8 stderr");
     let stderr = plain(&stderr);
-    let execute_line = stderr
-        .lines()
-        .find(|l| l.contains("Execute") && l.contains(&job.action.digest.hash_hex()))
-        .unwrap_or_else(|| panic!("no Execute line in {stderr}"));
-    assert!(execute_line.contains("principal=\"dev\""), "{execute_line}");
-    assert!(!stderr.contains(DEV), "the token is in the log: {stderr}");
-    let digest = line("dev", &Qos::Interactive, DEV);
-    let digest = digest.split("sha256:").nth(1).expect("a digest").trim();
-    assert!(
-        !stderr.contains(digest),
-        "the digest is in the log: {stderr}"
-    );
+    for (job, principal) in [(&job, "dev"), (&ci_job, "ci-bot")] {
+        let execute_line = stderr
+            .lines()
+            .find(|l| l.contains("Execute") && l.contains(&job.action.digest.hash_hex()))
+            .unwrap_or_else(|| panic!("no Execute line in {stderr}"));
+        let logged = format!("principal=\"{principal}\"");
+        assert!(execute_line.contains(&logged), "{execute_line}");
+    }
+    for (principal, qos, token) in [("dev", Qos::Interactive, DEV), ("ci-bot", Qos::Ci, CI)] {
+        assert!(!stderr.contains(token), "the token is in the log: {stderr}");
+        let digest = line(principal, &qos, token);
+        let digest = digest.split("sha256:").nth(1).expect("a digest").trim();
+        assert!(
+            !stderr.contains(digest),
+            "the digest is in the log: {stderr}"
+        );
+    }
 
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     let refused = server(&path)

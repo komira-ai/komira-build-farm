@@ -20,8 +20,9 @@ the action cache and Execution), and any path the listener does not serve, goes 
 one layer over the whole router. A call is served only when:
 
 - it has exactly one `authorization` header;
-- its value is `Bearer <token>` (the scheme in any case, one space, then the token with
-  nothing after it);
+- its value is `Bearer <token>` (the scheme in any case, then a space, then any further
+  spaces or tabs, then the token with nothing after it; a tab right after the scheme,
+  with no space, is refused);
 - the token's SHA-256 digest is one of the file's entries as last read. It is compared in
   constant time with every entry.
 
@@ -71,8 +72,9 @@ it changed. No restart is needed for any edit.
 **Fail closed.** While the file is missing, breaks a rule above (for example, it was
 `chmod`-ed to `0644`) or does not parse, every call is refused `UNAUTHENTICATED` with
 a message that says the server's token file is unusable. The server logs the reason at
-ERROR, once per change. No entry of an earlier read is kept. Fixing the file restores
-service within a second.
+ERROR once, and again only when the reason's text changes or the file was usable in
+between: a file that stays missing is logged once, not at every look. No entry of an
+earlier read is kept. Fixing the file restores service within a second.
 
 **Write a new file and rename it over the old one**, in the same directory, with the
 same owner and mode. An edit in place can be read half-written, and one that keeps the
