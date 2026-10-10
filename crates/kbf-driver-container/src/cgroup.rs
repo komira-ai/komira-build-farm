@@ -121,7 +121,7 @@ pub(crate) struct Pressure {
 /// sample now is `now`: its `max` events grew, its swap rose, and its swap is above
 /// `threshold`.
 pub(crate) fn presses_its_cap_into_swap(before: Pressure, now: Pressure, threshold: u64) -> bool {
-    now.max > before.max && now.swap > before.swap && now.swap > threshold
+    now.max > before.max && now.swap > threshold
 }
 
 /// Returns the sample at which the lease in `cgroup`, capped at `cap`, pressed its cap
