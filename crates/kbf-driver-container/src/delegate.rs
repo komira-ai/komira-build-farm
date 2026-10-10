@@ -277,12 +277,6 @@ pub(crate) fn delegate_in(
         }
     }
 
-    fs.write(
-        &supervisor,
-        "memory.min",
-        &supervisor_memory_min.to_string(),
-    )
-    .map_err(io_err(fs, "write", &supervisor, "memory.min"))?;
     let memory_min_capped = memory_min_below(fs, root, supervisor_memory_min)?;
 
     let actions = child(root, ACTIONS);
