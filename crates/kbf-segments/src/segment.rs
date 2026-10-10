@@ -8,7 +8,7 @@ use crate::crc32c::crc32c;
 use crate::error::{SegmentError, WriteError};
 use crate::layout::{ENTRY_LEN, Footer, IndexEntry, footer_len, write_footer};
 
-/// The largest segment the farm writes (RFC section 9.4).
+/// The largest segment the farm writes (`docs/design/storage.md#writes`).
 pub const MAX_SEGMENT_BYTES: u64 = 128 << 20;
 
 /// Packs blobs into one segment of at most `limit` bytes, footer included.

@@ -3,10 +3,11 @@
 //!
 //! The scheduler re-dispatches a node's leases G = 60 s after it last heard from the
 //! node. A daemon that must not run beside a re-dispatched copy stops its work T = 40 s
-//! after the newest heartbeat the server acknowledged (RFC 5.8). "After the heartbeat"
-//! means after the daemon *sent* it: the server heard the heartbeat no earlier than it
-//! was sent, so counting from the send time keeps the daemon's deadline inside the
-//! server's, whatever the acknowledgement's delay. Counting from when the
+//! after the newest heartbeat the server acknowledged
+//! (`docs/design/scheduler.md#fencing-g-and-t`). "After the heartbeat" means after the
+//! daemon *sent* it: the server heard the heartbeat no earlier than it was sent, so
+//! counting from the send time keeps the daemon's deadline inside the server's,
+//! whatever the acknowledgement's delay. Counting from when the
 //! acknowledgement arrived would let a slow acknowledgement push the deadline past G.
 //!
 //! Contact outlives a stream: leases keep running across a reconnect, and a new

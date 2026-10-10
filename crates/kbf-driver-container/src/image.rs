@@ -1,6 +1,6 @@
 //! The `container-image` platform property: `docker://<repo>@sha256:<digest>`.
 //!
-//! One action digest must never mean two sets of bytes (RFC 10.8), so an image is named
+//! One action digest must never mean two sets of bytes, so an image is named
 //! only by a per-architecture manifest digest. A tag is refused here, by its spelling.
 //! An image index digest (a multi-architecture list) cannot be told from a manifest
 //! digest by spelling, nor by Podman's image metadata: Podman 4.9 records one `Digest`

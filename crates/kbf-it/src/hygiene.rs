@@ -1,10 +1,18 @@
-//! Public-hygiene scan for repository text: no machine addresses and no home paths.
+//! Public-hygiene scan for repository text: no machine addresses, no home paths and no
+//! citations of a design document that is not in this repository.
 //!
 //! Everything in this repository is public, so a text file must not carry:
 //! - an IPv4 address, except the documentation ranges (192.0.2.0/24, 198.51.100.0/24,
 //!   203.0.113.0/24, RFC 5737), `127.0.0.1` and `0.0.0.0`; addresses in the private
 //!   ranges (10/8, 172.16/12, 192.168/16, RFC 1918) are reported as such;
-//! - an absolute home path such as `/home/<user>` or `/Users/<user>`.
+//! - an absolute home path such as `/home/<user>` or `/Users/<user>`;
+//! - a citation of an unpublished design document by its sections: the capitalised
+//!   acronym of a Request for Comments that is not followed by an IETF number. Such a
+//!   number has at least three digits and no section part, so `RFC 9113`, `RFC 3339.`
+//!   and `RFC-7540` pass, while a section number (`5.8`, `10`), a word (`section`,
+//!   `sections`, `§`, a possessive, a plural) or nothing after it is reported, and so is
+//!   that document's file name (`FARM_` and the acronym, in any case). A public design
+//!   doc is cited by its path under `docs/` instead.
 //!
 //! A dotted run is read as an address only when it has exactly four parts of one to
 //! three digits, each at most 255, so `1.2.3` (a version) and `1.2.3.4.5` are not
@@ -25,6 +33,9 @@ pub enum Kind {
     Ipv4([u8; 4]),
     /// An absolute home path; holds the matched prefix and user name.
     HomePath(String),
+    /// A citation of an unpublished design document; holds the text from the acronym
+    /// on (at most 16 characters).
+    DesignCitation(String),
 }
 
 /// One finding: a 1-based line number and what was found there.
@@ -43,6 +54,12 @@ impl fmt::Display for Finding {
             }
             Kind::Ipv4(a) => write!(f, "line {}: IPv4 address {}", self.line, dotted(a)),
             Kind::HomePath(p) => write!(f, "line {}: home path {p}", self.line),
+            Kind::DesignCitation(c) => write!(
+                f,
+                "line {}: `{c}` cites an unpublished design document; cite a doc under \
+                 docs/ instead",
+                self.line
+            ),
         }
     }
 }
@@ -130,8 +147,63 @@ pub fn scan(text: &str) -> Vec<Finding> {
                 kind: Kind::HomePath(p),
             });
         }
+        for c in design_citations_in(line) {
+            out.push(Finding {
+                line: i + 1,
+                kind: Kind::DesignCitation(c),
+            });
+        }
     }
     out
+}
+
+/// Every citation of an unpublished design document in `line`, in order: each token
+/// [`ACRONYM`] not followed by an IETF number, and each [`FILE`] in any case (reported
+/// once, as the file name). A token has no letter or digit before it and no capital
+/// letter after it (an acronym that starts a longer capitalised word is another word).
+fn design_citations_in(line: &str) -> Vec<String> {
+    let b = line.as_bytes();
+    let excerpt = |at: usize| line[at..].chars().take(16).collect::<String>();
+    let lower = line.to_ascii_lowercase();
+    let mut out: Vec<(usize, String)> = lower
+        .match_indices(FILE)
+        .map(|(at, _)| (at, excerpt(at)))
+        .collect();
+    let in_file_name = |at: usize| {
+        at >= FILE.len() - ACRONYM.len()
+            && lower[at - (FILE.len() - ACRONYM.len())..].starts_with(FILE)
+    };
+    for (at, _) in line.match_indices(ACRONYM) {
+        let after = &b[at + ACRONYM.len()..];
+        let word_before = at > 0 && b[at - 1].is_ascii_alphanumeric();
+        let word_after = after.first().is_some_and(u8::is_ascii_uppercase);
+        if word_before || word_after || in_file_name(at) || is_ietf_number(after) {
+            continue;
+        }
+        out.push((at, excerpt(at)));
+    }
+    out.sort_by_key(|(at, _)| *at);
+    out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// The acronym of a Request for Comments; written in two parts so this file does not
+/// trip its own scan.
+const ACRONYM: &str = concat!("R", "FC");
+
+/// The file name of the unpublished design document, lower case, in two parts for the
+/// same reason.
+const FILE: &str = concat!("farm_", "rfc");
+
+/// True if `after` (the text that follows the acronym) starts with an IETF number: an
+/// optional space or hyphen, then at least three digits not followed by `.` and a digit.
+fn is_ietf_number(after: &[u8]) -> bool {
+    let rest = match after {
+        [b' ' | b'-', rest @ ..] => rest,
+        rest => rest,
+    };
+    let digits = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+    let section = matches!(&rest[digits..], [b'.', d, ..] if d.is_ascii_digit());
+    digits >= 3 && !section
 }
 
 /// Every four-part dotted decimal in `line`.
@@ -319,6 +391,75 @@ mod tests {
             assert_eq!(decode(path, bytes), Ok(None), "{path}");
         }
         assert_eq!(decode("a.txt", b"plain"), Ok(Some("plain".to_owned())));
+    }
+
+    /// The acronym, assembled at run time so this file does not trip the scan.
+    fn acronym() -> String {
+        format!("R{}", "FC")
+    }
+
+    #[test]
+    fn design_citations_are_reported() {
+        // Catches: a citation by section number, by the word section or sections, by
+        // the section sign, by a possessive or a plural, or with nothing after it,
+        // passing the scan; and the document's file name in any case.
+        let a = acronym();
+        for planted in [
+            format!("({a} 5.8)"),
+            format!("({a} 10)"),
+            format!("({a} section 9.4)"),
+            format!("{a} sections 3.5 and 9"),
+            format!("{a} \u{a7}5"),
+            format!("the {a}'s retention"),
+            format!("the {a}s"),
+            format!("paused ({a}"),
+            format!("{a} 1234.5"),
+            format!("docs/x/FARM_{a}.md"),
+            format!("farm_{}.md", a.to_ascii_lowercase()),
+        ] {
+            let f = scan(&format!("ok\n{planted}"));
+            assert_eq!(f.len(), 1, "{planted:?}: {f:?}");
+            assert_eq!(f[0].line, 2, "{planted:?}");
+            assert!(matches!(&f[0].kind, Kind::DesignCitation(_)), "{planted:?}");
+        }
+        let f = scan(&format!("x FARM_{a}.md"));
+        assert_eq!(
+            f,
+            vec![Finding {
+                line: 1,
+                kind: Kind::DesignCitation(format!("FARM_{a}.md")),
+            }],
+            "reported once, as the file name"
+        );
+    }
+
+    #[test]
+    fn design_citations_on_one_line_are_reported_in_order() {
+        // Catches: the file-name matches reported before the acronym matches whatever
+        // their place in the line (the two are found in separate passes), or a second
+        // citation on a line dropped.
+        let a = acronym();
+        let file = format!("farm_{}.md", a.to_ascii_lowercase());
+        let f = scan(&format!("{a} 5.8, see {file}"));
+        let got: Vec<_> = f.into_iter().map(|x| x.kind).collect();
+        assert_eq!(
+            got,
+            vec![
+                Kind::DesignCitation(format!("{a} 5.8, see far")),
+                Kind::DesignCitation(file),
+            ]
+        );
+    }
+
+    #[test]
+    fn ietf_numbers_and_longer_words_are_not_design_citations() {
+        // Catches: a scan that refuses the IETF citations the code relies on (RFC 1918,
+        // RFC 3339, RFC 5737, ...), at the end of a sentence or hyphenated, or a word
+        // that merely contains the acronym.
+        let a = acronym();
+        let text =
+            format!("{a} 9113, {a} 3339. {a}-7540 {a}6570 Section 3.2.2 {a}OMM X{a} to_rfc3339");
+        assert_eq!(scan(&text), vec![]);
     }
 
     #[test]

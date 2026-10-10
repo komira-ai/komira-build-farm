@@ -259,7 +259,8 @@ fn message(message: server_message::Message) -> ServerMessage {
 
 /// What placement may book on a node: its `cpus` and `mem_gib` entries, and its `gpu`
 /// entry (0 when absent: a daemon that does not detect GPUs has none to book). v0 books
-/// the whole machine; the protected floors (RFC 4.3) are subtracted once they are
+/// the whole machine; the protected floors (planned,
+/// `docs/design/capabilities.md#planned`) are subtracted once they are
 /// reported.
 ///
 /// # Errors

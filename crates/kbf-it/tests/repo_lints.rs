@@ -9,9 +9,10 @@
 //!   names no linted action or workflow; a workflow or action file that is not valid
 //!   UTF-8 or holds a NUL byte (rules in `workflows/mod.rs`, which parses each file as
 //!   YAML; its module docs say what it cannot cover);
-//! - a text file carrying a non-documentation IPv4 address or an absolute home path,
-//!   and a file holding a NUL byte whose extension is not on the binary allow list
-//!   (rules in `kbf_it::hygiene`);
+//! - a text file carrying a non-documentation IPv4 address, an absolute home path or a
+//!   citation of an unpublished design document by its sections (the IETF numbers
+//!   pass), and a file holding a NUL byte whose extension is not on the binary allow
+//!   list (rules in `kbf_it::hygiene`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
@@ -172,7 +173,7 @@ fn workflows_are_hosted_pinned_and_least_privilege() {
 }
 
 #[test]
-fn text_files_carry_no_addresses_or_home_paths() {
+fn text_files_carry_no_addresses_home_paths_or_design_citations() {
     let root = repo_root();
     let files = listed_files(&root);
     let mut scanned = 0;
@@ -490,6 +491,22 @@ mod selection {
             check_text_file("notes.txt", &bytes),
             TextFile::Scanned(vec![format!(
                 "notes.txt: line 1: private IPv4 address {addr}"
+            )])
+        );
+    }
+
+    #[test]
+    fn a_design_citation_is_reported_with_its_file_and_line() {
+        // Catches: a citation of the unpublished design document by section passing the
+        // repository scan, or reported without the file and line that hold it. The
+        // acronym is assembled at run time so this file does not trip the scan.
+        let cite = format!("R{} section 5.8", "FC");
+        let text = format!("//! ok\n/// The fence ({cite}).\n");
+        assert_eq!(
+            check_text_file("crates/x/src/lib.rs", text.as_bytes()),
+            TextFile::Scanned(vec![format!(
+                "crates/x/src/lib.rs: line 2: `{cite})` cites an unpublished design \
+                 document; cite a doc under docs/ instead"
             )])
         );
     }

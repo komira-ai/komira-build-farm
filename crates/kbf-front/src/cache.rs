@@ -173,8 +173,9 @@ pub struct Cache<M, O> {
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
-    /// The single-process cache (`--store=memory`): the RFC's retention, an in-memory
-    /// index and an in-memory bucket.
+    /// The single-process cache (`--store=memory`): the default retention
+    /// (`docs/design/storage.md#retention-and-touches`), an in-memory index and an
+    /// in-memory bucket.
     #[must_use]
     pub fn memory() -> Self {
         let meta = MemoryMetaLog::new(Retention::default());
@@ -632,8 +633,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Stores a blob too large to share a segment as a segment of one record, so it
     /// carries a footer like every other object: its digest and CRC are in the store,
-    /// and an index can be rebuilt from it. Chunking such blobs (RFC section 9.4) comes
-    /// later.
+    /// and an index can be rebuilt from it. Chunking such blobs (`docs/design/storage.md#segments`)
+    /// comes later.
     async fn put_whole(&self, blob: VerifiedBlob) -> Result<Vec<(Digest, Location)>, CacheError> {
         let mut writer = SegmentWriter::new(blob.digest.size_bytes.saturating_add(footer_len(1)));
         writer.push(&blob.bytes)?;

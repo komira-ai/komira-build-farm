@@ -1,7 +1,7 @@
 //! `Capabilities`: what the cache tells a client before it sends anything.
 //!
-//! The answer is static, so the cache keeps serving while execution is paused (RFC
-//! section 3.5). A front that also serves `Execution` advertises it.
+//! The answer is fixed when the service is made and reads no farm state
+//! (`docs/design/storage.md#capabilities`). A front that also serves `Execution` advertises it.
 
 use std::sync::Arc;
 
@@ -46,15 +46,17 @@ impl CapabilitiesService {
 /// The capabilities the cache half serves.
 ///
 /// - SHA-256 only.
-/// - `update_enabled: false`: only daemons write the action cache (RFC 3.5, 16.2).
+/// - `update_enabled: false`: only daemons write the action cache.
 /// - One cache priority range, `[0, 0]`: retention follows the last touch alone
-///   (RFC 9.1), so a priority is accepted and changes nothing.
+///   (`docs/design/storage.md#retention-and-touches`), so a priority is accepted and
+///   changes nothing.
 /// - Batch calls carry at most [`MAX_BATCH_TOTAL_BYTES`] of blob data.
-/// - No compressors yet: the RFC's zstd is advertised only once reads and writes
-///   decode it, since a client that sees it will send it.
+/// - No compressors yet: zstd (planned, `docs/design/storage.md#planned`) is advertised
+///   only once reads and writes decode it, since a client that sees it will send it.
 /// - REAPI 2.0 to 2.3.
 /// - With `execution`: execution enabled, SHA-256. No priorities and no node
-///   properties are advertised yet; QoS is a header, never a property (RFC 4.5).
+///   properties are advertised yet; QoS is a header, never a property
+///   (`docs/design/scheduler.md#qos`).
 #[must_use]
 pub fn server_capabilities(execution: bool) -> ServerCapabilities {
     let sha256 = reapi::digest_function::Value::Sha256 as i32;

@@ -6,7 +6,7 @@
 //! the farm time, and carries out the [`kbf_types::Effect`]s it returns in order:
 //! commit a record to the control log, send a `Start` to a worker, answer waiters.
 //!
-//! What v0 covers (RFC section 5):
+//! What v0 covers (`docs/design/scheduler.md`):
 //!
 //! - operation states `Queued -> Leased -> Running -> Completed | Failed`;
 //! - commit before Start, and one accepted result per operation, fenced by lease id

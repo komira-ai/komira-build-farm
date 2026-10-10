@@ -1,6 +1,6 @@
 //! `ByteStream`: Read with offset and limit, Write, and QueryWriteStatus for CAS blobs.
 //!
-//! Uploads follow the RFC's one-state-machine-per-stream rule (section 9.4): bytes
+//! Uploads follow one rule per stream (`docs/design/storage.md#writes`): bytes
 //! arrive from offset 0 in order, are checked against the digest, become durable, and
 //! only then is the write acknowledged. There is no partial resume: a stream that
 //! breaks starts again from 0, so `QueryWriteStatus` reports a blob's full size once it
@@ -128,7 +128,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
                  ({MAX_BLOB_BYTES} bytes)"
             )));
         }
-        // The cheapest upload is the one we skip (RFC 9.4).
+        // The cheapest upload is the one we skip.
         if self.cache.is_durable(&digest).await? {
             return Ok(committed(size));
         }

@@ -1,5 +1,6 @@
 //! The node report: what the daemon detected about its machine, as the sorted
-//! `Capability` list a Hello carries, and the hash heartbeats repeat (RFC 4.3).
+//! `Capability` list a Hello carries, and the hash heartbeats repeat
+//! (`docs/design/capabilities.md#the-node-report`).
 //!
 //! Detection reads the text the kernel publishes and hands it to `kbf-caps`, which
 //! owns the parsing. On Linux and on macOS (Apple silicon) it reports `arch`, `os`,

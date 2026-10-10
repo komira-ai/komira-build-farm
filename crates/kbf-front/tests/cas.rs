@@ -132,8 +132,8 @@ async fn reupload_stores_again_when_a_collection_wins_the_touch_race() {
     assert_eq!(read.as_ref(), blob.data.as_slice());
 }
 
-/// Catches: a read that serves stored bytes without hashing them (RFC 9.1: never
-/// corrupt results; verified on read). Each read path gets its own corrupted object,
+/// Catches: a read that serves stored bytes without hashing them (`docs/design/storage.md`:
+/// never serve wrong bytes; verified on read). Each read path gets its own corrupted object,
 /// so the first read of each is the one that must notice; the blobs must then be
 /// reported missing (unreachable), so clients upload them again. A sound neighbour in
 /// its own object still reads.

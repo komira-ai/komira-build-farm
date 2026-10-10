@@ -1,4 +1,5 @@
-//! The lease cgroup, `<actions>/kbf-lease-<term>-<seq>` (RFC 10.6).
+//! The lease cgroup, `<actions>/kbf-lease-<term>-<seq>`
+//! (`docs/design/daemon.md#cgroups-and-limits`).
 //!
 //! The daemon owns an `actions/` cgroup in its delegated subtree (`crate::delegate`).
 //! For each lease the driver makes a child with the lease's limits and puts the

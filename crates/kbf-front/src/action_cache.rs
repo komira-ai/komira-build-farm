@@ -60,8 +60,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
     }
 
     /// Always PERMISSION_DENIED, before the request is read: a client never writes the
-    /// action cache (RFC 3.5, 16.2). The daemon that ran an action writes its result
-    /// through [`Cache::write_action_result`].
+    /// action cache (`docs/design/storage.md#the-closure-check`). The daemon that ran an
+    /// action writes its result through [`Cache::write_action_result`].
     async fn update_action_result(
         &self,
         _request: Request<UpdateActionResultRequest>,
