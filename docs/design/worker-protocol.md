@@ -365,11 +365,12 @@ close this, each on its own:
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
    and forgets their results without sending them: no server of the new epoch can
    accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
-   nothing, and a lease granted while no epoch was named is kept. With the replicated
-   log, the plan is for the epoch to name the log, which outlives leaders and their
-   terms, so a change of leader drops nothing; whether a failover keeps leases this
-   way or drops them as a restart does today is an open question
-   ([deployment-topology.md](deployment-topology.md#open-questions)).
+   nothing, and a lease granted while no epoch was named is kept. **Planned:** with
+   the replicated log, the epoch names the log, which outlives leaders and their
+   terms, so a change of leader drops nothing: the daemon keeps its running leases
+   and resends their unacknowledged results to the new leader, which knows the
+   committed grants from the log
+   ([deployment-topology.md](deployment-topology.md#daemons-straight-to-the-servers-one-stream-to-the-leader)).
 3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
    in its `Result`, and the server refuses a `Result` whose `action_digest` is set and
    is not the action of the operation it granted the lease for, whatever the lease id
@@ -476,8 +477,15 @@ daemon restarts and server restarts:
   ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
 - With several servers ([deployment-topology.md](deployment-topology.md)): the daemon
-  dials the servers' own DNS names directly, with no balancer in between, and holds
-  its one stream to the leader. A follower does not serve or relay the session: it
-  answers with a redirect naming the leader, and the daemon dials that server. On
-  failover the daemon reconnects to the new leader. The redirect's form and how the
-  daemon is given the servers' names are open questions there.
+  is given the servers as one DNS name with a record per server, or as a list of
+  addresses, dials them directly, with no balancer in between, and holds its one
+  stream to the leader. A follower does not serve or relay the session: it ends the
+  `Session` stream with a status naming the leader, and the daemon dials that server.
+  A follower that knows no leader answers `UNAVAILABLE`, and the daemon tries the next
+  server. The daemon retries forever, with a backoff that grows to a bound. This part
+  is built: `--server` is repeatable, each host is resolved again every round, and the
+  wait doubles with jitter up to `--reconnect-max-ms` (see
+  [daemon.md](daemon.md#reaching-a-server)); the redirect is planned. On
+  failover the daemon reconnects to the new leader and keeps its running leases (the
+  epoch names the log, above). Its blob calls go to the worker listeners of all the
+  servers, with reads spread across them.

@@ -205,6 +205,10 @@ does not run on these calls: a health check needs no credentials, whatever the p
 Every other call on the listener, a path it does not serve included, still runs it.
 The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
 
+**Planned:** with several servers, the answers follow the two readiness paths, ready
+to serve reads and leader; which service name reports which is not chosen
+([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)).
+
 ## Planned
 
 `/v1/software`, `/v1/rollouts` and the per-node update state of

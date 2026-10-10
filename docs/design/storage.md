@@ -243,8 +243,9 @@ each with a plain bucket and an Object Lock bucket.
 
 - **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's
   local disk, with its snapshots: one voter first, three on three hosts later
-  ([deployment-topology.md](deployment-topology.md)). Whether snapshots are also copied
-  to the object store, so a lost host can be rebuilt, is an open question there.
+  ([deployment-topology.md](deployment-topology.md)). Each snapshot is also copied to
+  the object store, so a host whose disk is lost can be rebuilt from it; with a single
+  voter, what was committed after the newest copied snapshot is lost with the disk.
   The first deployment is one server. At three servers, any server ready to serve
   reads answers `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and
   `GetActionResult` from the metadata it has applied, and accepts upload bytes: it
@@ -257,6 +258,8 @@ each with a plain bucket and an Object Lock bucket.
   follower waits until it has applied up to the leader's commit index (a read index). If the leader cannot be reached, an upload's
   commit or a read index fails `UNAVAILABLE`, never a guess
   ([deployment-topology.md](deployment-topology.md#reads-and-uploads-on-every-server)).
+  Daemons' blob reads are spread across all the servers the same way, on their worker
+  listeners.
 - **Garbage collection.** Collection marks space dead; a segment is deleted only when no
   entry uses it, through a condemn step with a delay during which any touch revives it.
   Sparse segments are compacted. A periodic sweep removes orphan objects by comparing
