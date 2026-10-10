@@ -211,7 +211,8 @@ fn crash_at_every_operation_and_tear_at_every_byte() {
     assert!(cases > 1000, "only {cases} cases");
 }
 
-/// Catches: a persist that ignores a write or fsync error (it returns `Ok`), and a store
+/// Catches: a persist that ignores a write or fsync error (it returns `Ok`) or hides
+/// which error it was (the I/O error must be the source), and a store
 /// that keeps writing after one (a retried fsync can succeed on bytes the kernel
 /// dropped). Every operation of the script fails once in turn: the call that hit it
 /// must fail, every later call must return `Failed` though the disk works again, and
@@ -230,6 +231,12 @@ fn an_error_at_any_operation_stops_the_store() {
         };
         let (failed, err) = err.unwrap_or_else(|| panic!("an error at op {n} was not reported"));
         assert!(matches!(err, StoreError::Io(_)), "op {n}: {err}");
+        let cause = std::error::Error::source(&err).map(ToString::to_string);
+        assert_eq!(
+            cause,
+            Some(format!("injected error at op {n}")),
+            "the I/O error is the source"
+        );
         stopped += 1;
         for step in &steps[failed + 1..] {
             let r = match step {
