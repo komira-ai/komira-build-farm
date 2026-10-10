@@ -337,9 +337,13 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// directory, synced, so its pages are clean. The test reclaims 200 MiB from the lease
 /// (`memory.reclaim`, standing in for host pressure: no `max` event): the file's pages
 /// are dropped and much of the buffer goes to swap, past the 8 MiB floor this cell's
-/// watch is given. It then pins the lease's `memory.swap.max` to what the lease holds
-/// in swap now, so nothing more of it can go there, and lowers the lease's
-/// `memory.max` to 16 MiB above what it holds in RAM. The action then reads the file,
+/// watch is given. It then sets the lease's `memory.swap.max` to 0, so no page of it
+/// can go to swap again and `memory.swap.current` can only fall, and lowers the
+/// lease's `memory.max` to 16 MiB above what it holds in RAM. (A `swap.max` pinned to
+/// what the lease held is not enough: a page read back from swap frees its slot, and
+/// reclaim at the cap may swap a page out into that room again, a rise of a few pages
+/// between two of the watch's samples, at which the rule kills, rightly. Seen on
+/// podman-arm.) The action then reads the file,
 /// over and over: its page cache hits the cap (the `max` events grow), and reclaim at
 /// the cap drops the clean file pages. The rule without "swap rose" kills it at the
 /// first sample after that (`max` grew, swap above the floor). Clean pages, not
@@ -396,7 +400,9 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         "the premise: host pressure moved more than the watch's floor to swap: {}",
         state(&lease)
     );
-    write(&lease, "memory.swap.max", &swapped.to_string());
+    // Below what the lease holds: the kernel takes it, swaps nothing more out of the
+    // lease, and leaves what is in swap there until it is read back.
+    write(&lease, "memory.swap.max", "0");
     let ram = read_u64(&lease, "memory.current");
     write(&lease, "memory.max", &(ram + 16 * MIB).to_string());
     let max_events = |lease: &Path| {
@@ -421,6 +427,7 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     let mut seen = Vec::new();
     let mut at_cap = 0;
     let mut swap_at_cap = None;
+    let mut swap_peak = 0;
     let outcome = loop {
         tokio::select! {
             outcome = &mut run => break outcome.expect("join"),
@@ -428,6 +435,7 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
                 let swap = std::fs::read_to_string(lease.join("memory.swap.current"))
                     .ok()
                     .and_then(|t| t.trim().parse::<u64>().ok());
+                swap_peak = swap_peak.max(swap.unwrap_or(0));
                 if let Some(max) = max_events(&lease) {
                     if at_cap == 0 && max > 0 {
                         swap_at_cap = swap;
@@ -448,6 +456,11 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     assert!(
         swap_at_cap.is_some_and(|swap| swap > FLOOR),
         "the premise: the lease held more than the floor in swap when it reached its cap: {}",
+        seen.join("\n")
+    );
+    assert!(
+        swap_peak <= swapped,
+        "the premise: nothing more of the lease went to swap after the reclaim: {}",
         seen.join("\n")
     );
     println!(
