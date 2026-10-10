@@ -65,9 +65,7 @@ pub mod tree;
 
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
-pub use delegate::{
-    DelegateError, Delegation, SUPERVISOR_MEMORY_MIN_MIB, adopt, capacity, delegate,
-};
+pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};

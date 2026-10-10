@@ -45,9 +45,6 @@ const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
 pub const SUPERVISOR: &str = "supervisor";
 /// The cgroup every lease cgroup is made under.
 pub const ACTIONS: &str = "actions";
-/// The default `supervisor/memory.min`, in MiB (`--supervisor-memory-min-mib`): above
-/// what the daemon holds while it serves leases.
-pub const SUPERVISOR_MEMORY_MIN_MIB: u64 = 256;
 /// How many times the processes are listed and moved again when one appeared after the
 /// listing (enabling controllers then fails with EBUSY).
 const MOVE_TRIES: u32 = 20;

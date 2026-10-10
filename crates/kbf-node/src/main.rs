@@ -80,7 +80,7 @@ struct Cli {
     /// the daemon while it uses no more, so builds short of memory never take it. The
     /// kernel protects no more than the unit's and its slice's `MemoryMin=` allow; the
     /// daemon warns when one is lower. 0 protects nothing.
-    #[arg(long, default_value_t = kbf_driver_container::SUPERVISOR_MEMORY_MIN_MIB)]
+    #[arg(long, default_value_t = 256)]
     supervisor_memory_min_mib: u64,
     /// Where cgroup v2 is mounted (container). For tests of the cgroup setup only.
     #[arg(long, hide = true, default_value = "/sys/fs/cgroup")]

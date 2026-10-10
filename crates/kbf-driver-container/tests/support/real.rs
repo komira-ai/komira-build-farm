@@ -40,8 +40,9 @@ pub const MOUNT: &str = "/sys/fs/cgroup";
 /// What the test setup writes to `actions/memory.max`: room for every test here, and
 /// below a hosted runner's memory, so the capacity test sees the cap and not MemTotal.
 pub const ACTIONS_MEMORY_MAX: u64 = 4 << 30;
-/// What the test setup writes to `supervisor/memory.min`: the daemon's default.
-pub const SUPERVISOR_MEMORY_MIN: u64 = kbf_driver_container::SUPERVISOR_MEMORY_MIN_MIB << 20;
+/// What the test setup writes to `supervisor/memory.min`: 256 MiB, `kbf-daemon`'s
+/// default.
+pub const SUPERVISOR_MEMORY_MIN: u64 = 256 << 20;
 
 /// The unit's cgroup, set up by the code `kbf-daemon` runs, once per test process.
 /// Each test binary sets it up again: the second finds itself in `supervisor/`
