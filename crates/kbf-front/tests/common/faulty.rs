@@ -6,12 +6,12 @@
 //! A fault can refuse the call, lose the answer of a call that succeeded, hold the call
 //! until the test lets it go, or answer OK while storing bytes other than those sent.
 //!
-//! [`AuditLog`] wraps a [`MemoryMetaLog`]. When a `PutBlob` commits, it reads the
-//! object the location names straight from the inner store (past any fault) and
-//! records a violation unless the bytes there hash to the blob's digest. So a cache
-//! that commits an index entry before its object is durable, or at a location that
-//! does not hold the blob, leaves a violation behind even if a later write fills the
-//! gap.
+//! [`AuditLog`] wraps a [`MemoryMetaLog`]. When a `PutBlob` commits (or a `PutBlobs`,
+//! for each of its entries), it reads the object the location names straight from the
+//! inner store (past any fault) and records a violation unless the bytes there hash to
+//! the blob's digest. So a cache that commits an index entry before its object is
+//! durable, or at a location that does not hold the blob, leaves a violation behind
+//! even if a later write fills the gap.
 
 use std::collections::VecDeque;
 use std::io;
@@ -212,8 +212,8 @@ impl ObjectStore for FaultyStore {
     }
 }
 
-/// A [`MemoryMetaLog`] that, as each `PutBlob` commits, checks the store already holds
-/// the blob's bytes at the committed location.
+/// A [`MemoryMetaLog`] that, as each `PutBlob` (or each entry of a `PutBlobs`) commits,
+/// checks the store already holds the blob's bytes at the committed location.
 #[derive(Debug)]
 pub struct AuditLog {
     inner: MemoryMetaLog,
@@ -250,10 +250,7 @@ impl AuditLog {
 
     /// Checks `digest` is readable at `location` in the inner bucket right now.
     async fn audit(&self, digest: Digest, location: Location) {
-        let (object, offset) = match location {
-            Location::Segment { segment, offset } => (segment, offset),
-            Location::Object(object) => (object, 0),
-        };
+        let Location { object, offset, .. } = location;
         let key = object_key(object);
         let problem = match self.store.stored(&key).await {
             None => Some(format!(
@@ -283,19 +280,25 @@ impl AuditLog {
 /// `Cache::object_key` so the audit can run before a `Cache` exists; if the two ever
 /// differ, every audit reports a violation.
 fn object_key(id: ObjectId) -> ObjectKey {
+    let (epoch, seq) = (id.epoch().get(), id.seq());
     KeyPrefix::default()
-        .key(&format!("cas/{:016x}", id.get()))
+        .key(&format!("cas/{epoch:016x}/{seq:016x}"))
         .expect("key")
 }
 
 impl MetaLog for AuditLog {
     async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
-        if let Command::PutBlob { digest, location } = &command {
+        let placed = match &command {
+            Command::PutBlob { digest, location } => vec![(*digest, *location)],
+            Command::PutBlobs(blobs) => blobs.clone(),
+            _ => Vec::new(),
+        };
+        for (digest, location) in placed {
             self.put_blobs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(*digest);
-            self.audit(*digest, *location).await;
+                .push(digest);
+            self.audit(digest, location).await;
         }
         self.inner.commit(command).await
     }

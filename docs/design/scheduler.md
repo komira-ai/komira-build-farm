@@ -297,8 +297,9 @@ Infrastructure retries and preemptions are charged to the farm, not to the user.
 ## More than one server
 
 The scheduler runs on one server today, and its queue lives only in that process.
-For many servers (**planned**), the scheduler runs on the leader of a replicated
-control log:
+In the planned shape ([deployment-topology.md](deployment-topology.md)) the control
+log is a Raft log on local disk, with one voter first and three voters on three
+hosts later, and the scheduler runs on its leader:
 
 - `Commit` effects become log proposals; `Committed` inputs come from the log's apply
   path, on every replica in the same order.
@@ -306,8 +307,11 @@ control log:
   and the log decides which result of an operation wins.
 - Submissions are committed too, so a new leader inherits the queue (not yet: today a
   leader change would lose queued work).
-- Any server front accepts `Execute` and relays it to the leader through the same
-  `Dispatch` trait the front already calls.
+- Only the leader serves. The client front routes every REAPI request, `Execute`
+  included, to the server that reports ready, which is the leader; a follower reports
+  not ready and relays nothing. Every daemon holds its one worker stream to the
+  leader, and a follower answers a daemon's session with a redirect naming the
+  leader. None of this is built: there is no readiness check and no redirect yet.
 
 ## Where to look
 
