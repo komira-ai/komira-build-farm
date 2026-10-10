@@ -3,8 +3,8 @@
 //! rules at random; these name the one schedule per rule.
 
 use kbf_raft::{
-    AppendOutcome, Config, Effect, Entry, HardState, LogId, LogIndex, Membership, Message,
-    MessageKind, Payload, Raft, Role, ServerId, Term,
+    AppendOutcome, CompactError, Config, Effect, Entry, HardState, LogId, LogIndex, Membership,
+    Message, MessageKind, Payload, Raft, Role, ServerId, Term,
 };
 
 const S1: ServerId = ServerId(1);
@@ -46,7 +46,7 @@ fn restore(config: Config, term: u64, log: Vec<Entry>) -> Raft {
         term: Term(term),
         voted_for: None,
     };
-    Raft::restore(config, hard, log, 0).unwrap()
+    Raft::restore(config, hard, LogId::default(), log, 0).unwrap()
 }
 
 /// Ticks until the core produces effects (an election or a heartbeat).
@@ -334,4 +334,188 @@ fn reply_with_term(term: u64) -> Message {
             },
         },
     }
+}
+
+fn restore_at(config: Config, term: u64, base: LogId, log: Vec<Entry>) -> Raft {
+    let hard = HardState {
+        term: Term(term),
+        voted_for: None,
+    };
+    Raft::restore(config, hard, base, log, 0).unwrap()
+}
+
+fn append(term: u64, prev: LogId, entries: Vec<Entry>, commit: u64) -> Message {
+    Message {
+        term: Term(term),
+        kind: MessageKind::AppendRequest {
+            prev,
+            entries,
+            commit: LogIndex(commit),
+        },
+    }
+}
+
+fn outcome(effects: &[Effect], to: ServerId) -> AppendOutcome {
+    match sent_to(effects, to).kind {
+        MessageKind::AppendResponse { outcome } => outcome,
+        other => panic!("not an append response: {other:?}"),
+    }
+}
+
+/// Catches: a core restored from a snapshot that applies from index 1 again (the
+/// state machine would see the base's entries twice, or the core would stall looking
+/// for entries it no longer holds), or that does not count the base as committed.
+#[test]
+fn a_core_restored_from_a_base_applies_exactly_the_suffix_once() {
+    let base = LogId::new(Term(2), LogIndex(50));
+    let suffix: Vec<Entry> = (51..=60).map(|i| cmd(2, i)).collect();
+    let mut follower = restore_at(three(S2), 2, base, suffix.clone());
+    assert_eq!(follower.commit_index(), LogIndex(50));
+    assert_eq!(follower.applied_index(), LogIndex(50));
+    assert_eq!(follower.snapshot_base(), base);
+    assert_eq!(follower.last_log_id(), suffix[9].id);
+    let effects = follower.receive(S1, append(2, suffix[9].id, vec![], 60), 0);
+    assert_eq!(
+        applied(&effects),
+        (51..=60).map(LogIndex).collect::<Vec<_>>()
+    );
+    let again = follower.receive(S1, append(2, suffix[9].id, vec![], 60), 0);
+    assert!(applied(&again).is_empty(), "applied twice: {again:?}");
+    assert_eq!(follower.applied_index(), LogIndex(60));
+}
+
+/// Catches: a single voter restored from a snapshot that cannot elect itself or
+/// commit its suffix (kbf's v0 deployment is one voter that restarts from its
+/// snapshot), e.g. a vote check or a commit rule that reads the log from index 1.
+#[test]
+fn a_single_voter_restored_from_a_base_elects_itself_and_commits_the_suffix() {
+    let base = LogId::new(Term(1), LogIndex(50));
+    let suffix = vec![cmd(1, 51), cmd(1, 52), cmd(1, 53)];
+    let mut raft = restore_at(config(S1, &[S1], &[]), 1, base, suffix);
+    let effects = tick_until_active(&mut raft);
+    assert_eq!(raft.role(), Role::Leader);
+    assert_eq!(raft.hard_state().term, Term(2));
+    assert_eq!(
+        applied(&effects),
+        (51..=54).map(LogIndex).collect::<Vec<_>>(),
+        "the suffix, then the new term's blank"
+    );
+    let p = raft.propose(b"x".to_vec()).unwrap();
+    assert_eq!(p.index, LogIndex(55));
+    assert_eq!(applied(&p.effects), vec![LogIndex(55)]);
+}
+
+/// Catches: a core that forgets the base's term (the append consistency check at the
+/// base fails, so a restored follower can never be caught up), and one that accepts
+/// an append whose `prev` names the base index in another term.
+#[test]
+fn an_append_whose_prev_is_the_base_is_accepted() {
+    let base = LogId::new(Term(3), LogIndex(10));
+    let mut follower = restore_at(three(S2), 3, base, vec![]);
+    let wrong = LogId::new(Term(2), LogIndex(10));
+    let effects = follower.receive(S1, append(4, wrong, vec![cmd(4, 11)], 11), 0);
+    assert!(matches!(
+        outcome(&effects, S1),
+        AppendOutcome::Rejected { .. }
+    ));
+    let effects = follower.receive(S1, append(4, base, vec![cmd(4, 11)], 11), 0);
+    assert_eq!(
+        outcome(&effects, S1),
+        AppendOutcome::Accepted {
+            matched: LogIndex(11)
+        }
+    );
+    assert_eq!(applied(&effects), vec![LogIndex(11)]);
+    assert_eq!(follower.entries(), &[cmd(4, 11)]);
+}
+
+/// Catches: a compaction past the applied index (it would fold entries the state
+/// machine does not hold, some possibly uncommitted, into the snapshot), one before
+/// the base, a compaction that leaves the dropped entries in the core's memory, and
+/// a leader that cannot serve a peer restored from a copy of its snapshot or that
+/// does not report a peer it can no longer serve.
+#[test]
+fn compaction_is_refused_past_applied_and_a_leader_serves_from_its_base() {
+    let mut leader = Raft::new(config(S1, &[S1], &[S4]), 0).unwrap();
+    let _ = tick_until_active(&mut leader);
+    for c in [b"a", b"b", b"c"] {
+        let _ = leader.propose(c.to_vec()).unwrap();
+    }
+    assert_eq!(leader.applied_index(), LogIndex(4));
+    // The learner never answered, so the leader holds nothing it could refuse yet.
+    assert_eq!(leader.behind_base(), Vec::<ServerId>::new());
+    assert_eq!(
+        leader.compact(LogIndex(5)),
+        Err(CompactError::NotApplied {
+            through: LogIndex(5),
+            applied: LogIndex(4)
+        })
+    );
+    assert_eq!(
+        leader.entries().len(),
+        4,
+        "a refused compaction changed the log"
+    );
+    let base = LogId::new(Term(1), LogIndex(3));
+    assert_eq!(leader.compact(LogIndex(3)), Ok(base));
+    assert_eq!(leader.snapshot_base(), base);
+    assert_eq!(leader.entries().len(), 1);
+    assert_eq!(leader.entries()[0].id.index, LogIndex(4));
+    assert_eq!(
+        leader.compact(LogIndex(2)),
+        Err(CompactError::BeforeBase {
+            through: LogIndex(2),
+            base
+        })
+    );
+    assert_eq!(leader.compact(LogIndex(3)), Ok(base));
+    // The learner's next entry (1) is folded into the snapshot, but the leader does
+    // not know yet whether the learner needs it.
+    assert_eq!(leader.behind_base(), Vec::<ServerId>::new());
+
+    // A learner with an empty log rejects the probe at the base and stays reported.
+    let mut empty = Raft::new(config(S4, &[S1], &[S4]), 0).unwrap();
+    let probe = sent_to(&tick_until_active(&mut leader), S4);
+    let MessageKind::AppendRequest { prev, entries, .. } = &probe.kind else {
+        panic!("{probe:?}");
+    };
+    assert_eq!((*prev, entries.len()), (base, 0));
+    let reply = sent_to(&empty.receive(S1, probe.clone(), 0), S1);
+    let _ = leader.receive(S4, reply, 0);
+    assert_eq!(leader.behind_base(), vec![S4]);
+
+    // A learner restored from a copy of the leader's snapshot is served from there.
+    let mut restored = restore_at(config(S4, &[S1], &[S4]), 1, base, vec![]);
+    let reply = sent_to(&restored.receive(S1, probe, 0), S1);
+    let next = sent_to(&leader.receive(S4, reply, 0), S4);
+    assert_eq!(leader.behind_base(), Vec::<ServerId>::new());
+    let effects = restored.receive(S1, next, 0);
+    assert_eq!(applied(&effects), vec![LogIndex(4)]);
+    assert_eq!(restored.entries(), leader.entries());
+}
+
+/// Catches: a follower whose snapshot base is past a leader's `prev` and that rejects
+/// the request (it holds those entries in its snapshot, and they are committed, so
+/// they match), which would leave it behind a leader that compacted less than it did.
+#[test]
+fn a_follower_skips_the_entries_its_snapshot_holds() {
+    let base = LogId::new(Term(2), LogIndex(5));
+    let mut follower = restore_at(three(S2), 2, base, vec![]);
+    let request = append(3, cmd(2, 3).id, vec![cmd(2, 4), cmd(2, 5), cmd(3, 6)], 6);
+    let effects = follower.receive(S1, request, 0);
+    assert_eq!(
+        outcome(&effects, S1),
+        AppendOutcome::Accepted {
+            matched: LogIndex(6)
+        }
+    );
+    assert!(effects.contains(&Effect::PersistEntries(vec![cmd(3, 6)])));
+    assert_eq!(applied(&effects), vec![LogIndex(6)]);
+    let heartbeat = follower.receive(S1, append(3, cmd(2, 2).id, vec![], 6), 0);
+    assert_eq!(
+        outcome(&heartbeat, S1),
+        AppendOutcome::Accepted {
+            matched: LogIndex(5)
+        }
+    );
 }
