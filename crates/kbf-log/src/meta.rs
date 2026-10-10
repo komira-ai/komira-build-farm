@@ -145,10 +145,7 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
                     Ok(proto::UnreachableReason::Missing) => UnreachableReason::Missing,
                     Ok(proto::UnreachableReason::Corrupt) => UnreachableReason::Corrupt,
                     Ok(proto::UnreachableReason::Unspecified) | Err(_) => {
-                        return Err(DecodeError::UnknownValue {
-                            field: "ObjectUnreachable.reason",
-                            value: u.reason,
-                        });
+                        UnreachableReason::Missing
                     }
                 };
                 Command::ObjectUnreachable {
