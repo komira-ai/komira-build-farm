@@ -1,6 +1,8 @@
-//! A fake front for the daemon binary: a mutual-TLS `kbf.worker.v1` listener whose
-//! sessions the test drives message by message, and a REAPI CAS in this process
-//! (`kbf-front` over memory) that the daemon reads actions from.
+//! A fake server for the daemon binary: a mutual-TLS listener with `kbf.worker.v1`,
+//! whose sessions the test drives message by message, and `ByteStream` over a CAS in
+//! this process (`kbf-front` over memory) that the daemon reads actions from, as the
+//! server's worker listener serves both; and the same CAS in plain text on another
+//! port, for the test's own uploads.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -11,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt as _};
 use kbf_daemon::cas::{Cas as _, CasClient};
+use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::{Action, Command, Digest, Directory};
 use kbf_proto::worker::worker_server::{Worker, WorkerServer};
@@ -113,7 +116,9 @@ impl Worker for FakeWorker {
 
 /// The worker listener and the CAS, served on loopback ports by their own runtime.
 pub struct Front {
+    /// Mutual TLS: worker sessions and `ByteStream` (the daemon's `--cas`).
     pub worker: SocketAddr,
+    /// Plain text: the same CAS, for the test's uploads.
     pub cas: SocketAddr,
     sessions: mpsc::Receiver<Session>,
     runtime: tokio::runtime::Runtime,
@@ -132,16 +137,19 @@ impl Front {
         let bind = || TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let worker_incoming = bind();
         let worker = worker_incoming.local_addr().expect("addr");
+        let cache = Arc::new(kbf_front::Cache::memory());
         let router = Server::builder()
             .tls_config(tls)
             .expect("server TLS")
             .add_service(WorkerServer::new(FakeWorker {
                 sessions: sessions_tx,
-            }));
+            }))
+            .add_service(ByteStreamServer::new(kbf_front::ByteStreamService::new(
+                Arc::clone(&cache),
+            )));
         runtime.spawn(router.serve_with_incoming(worker_incoming));
         let cas_incoming = bind();
         let cas = cas_incoming.local_addr().expect("addr");
-        let cache = Arc::new(kbf_front::Cache::memory());
         runtime.spawn(
             Server::builder()
                 .add_routes(kbf_front::routes(cache))

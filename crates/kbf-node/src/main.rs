@@ -3,11 +3,12 @@
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
 //! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
 //! `native` (plain processes; for Macs). The two real drivers read and write blobs
-//! through the front's REAPI listener named by `--cas`, and make lease directories
-//! under `--scratch`. A Mac in komira's pool runs, for example:
+//! over mutual TLS through the server's worker listener named by `--cas` (normally
+//! the same address as `--server`), with the daemon's own certificate, and make lease
+//! directories under `--scratch`. A Mac in komira's pool runs, for example:
 //!
 //! ```text
-//! kbf-daemon --driver native --server https://front:7070 --cas http://front:8980 \
+//! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
 //!   --scratch /var/kbf/leases --label pool=darwin-sized
 //! ```
@@ -48,9 +49,11 @@ struct Cli {
     /// How leases run.
     #[arg(long, value_enum)]
     driver: Driver,
-    /// The front's REAPI listener, `http://` or `https://` (which presents this
-    /// daemon's certificate), that the container and native drivers read and write
-    /// blobs through.
+    /// The server's worker listener, an `https://` URL (normally `--server`'s), that
+    /// the container and native drivers read and write blobs through, over mutual TLS
+    /// with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`.
+    /// Plain `http://` is refused: the worker listener admits each blob call by the
+    /// daemon's certificate.
     #[arg(long)]
     cas: Option<String>,
     /// The directory lease directories are made in (container and native drivers).
@@ -246,18 +249,22 @@ fn xcode_watch_args(cli: &Cli) -> (xcode::Probe, Duration) {
     (probe, Duration::from_secs(cli.xcode_recheck_secs.max(1)))
 }
 
-/// A client of the CAS `--cas` names. Connects on first use.
+/// A client of the blob service `--cas` names, over mutual TLS with the daemon's own
+/// TLS files. Connects on first use.
 fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
     let url = cli
         .cas
         .clone()
         .ok_or("--cas is required by the container and native drivers")?;
-    let mut endpoint = Endpoint::from_shared(url.clone())?;
-    if url.starts_with("https://") {
-        endpoint = endpoint.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
-    } else if !url.starts_with("http://") {
-        return Err(format!("--cas {url:?} must be an http:// or https:// URL").into());
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "--cas {url:?} must be an https:// URL: the server's worker listener, which \
+             serves blobs over mutual TLS only"
+        )
+        .into());
     }
+    let endpoint =
+        Endpoint::from_shared(url)?.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
     Ok(CasClient::new(endpoint.connect_lazy()))
 }
 
@@ -440,7 +447,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             flag("scratch", &dir.join("leases")),
             flag("xcode-apps", &apps),
         ])
@@ -502,7 +509,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             flag("scratch", &dir.join("leases")),
             flag("xcode-apps", &apps),
         ])
@@ -573,7 +580,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             flag("scratch", &dir.join("leases")),
             flag("xcode-apps", &apps),
         ])
@@ -644,18 +651,23 @@ mod tests {
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches: a CAS URL of another scheme accepted, and `--cas` not required.
+    /// Catches: a plain-text `--cas` accepted (the daemon would send blobs where no
+    /// certificate admits them, or fall back to an unauthenticated port), a CAS URL of
+    /// another scheme accepted, `--cas` not required, and an https URL that does not
+    /// read the daemon's own TLS files.
     #[tokio::test]
-    async fn the_cas_url_must_be_http_or_https() {
-        let http = parse(&["--driver=native", "--cas=http://front:8980"]).expect("flags");
-        assert!(cas_client(&http).is_ok());
-        let other = parse(&["--driver=native", "--cas=ftp://front"]).expect("flags");
-        let why = cas_client(&other).expect_err("ftp").to_string();
-        assert!(why.contains("must be an http"), "{why}");
+    async fn the_cas_url_must_be_https() {
+        for url in ["http://front:8981", "ftp://front", "front:8981"] {
+            let cli = parse(&["--driver=native", &format!("--cas={url}")]).expect("flags");
+            let why = cas_client(&cli).expect_err(url).to_string();
+            assert!(why.contains("must be an https:// URL"), "{url}: {why}");
+        }
         let none = parse(&["--driver=native"]).expect("flags");
-        assert!(cas_client(&none).is_err());
+        let why = cas_client(&none).expect_err("no --cas").to_string();
+        assert!(why.contains("--cas is required"), "{why}");
         // https reads the daemon's TLS files, which these flags name but do not hold.
-        let https = parse(&["--driver=native", "--cas=https://front:8980"]).expect("flags");
-        assert!(cas_client(&https).is_err());
+        let https = parse(&["--driver=native", "--cas=https://front:8981"]).expect("flags");
+        let why = cas_client(&https).expect_err("no TLS files").to_string();
+        assert!(why.contains("ca.pem"), "{why}");
     }
 }

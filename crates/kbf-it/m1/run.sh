@@ -3,9 +3,10 @@
 #
 # The cell: an S3 store (MinIO in CI), one kbf-server (in-memory metadata, blobs in the
 # store, REAPI on 127.0.0.1:8980, the worker listener on 127.0.0.1:8981 over mutual
-# TLS) and one daemon (`kbf-cell daemon`: the daemon library with the test-only local
-# runtime). For each tool given, the sample project under this directory is built
-# remote-only, cleaned, and built again; `kbf-cell check` then requires that the first
+# TLS, which also serves the daemon its blobs) and one daemon (`kbf-cell daemon`: the
+# daemon library with the test-only local runtime). For each tool given, the sample
+# project under this directory is built remote-only, cleaned, and built again;
+# `kbf-cell check` then requires that the first
 # build ran every action on the farm and the second answered every one of them from
 # the action cache. With buck2, one more build holds a lease in flight: the target
 # `//:pause` sleeps for a few seconds under a fresh salt (so it runs; see the BUCK
@@ -90,7 +91,7 @@ for _ in $(seq 100); do
 done
 grep ' reapi=' "$logs/server.out" || { echo "kbf-server did not start" >&2; exit 1; }
 
-"$bin_dir/kbf-cell" daemon --server https://127.0.0.1:8981 --cas http://127.0.0.1:8980 \
+"$bin_dir/kbf-cell" daemon --server https://127.0.0.1:8981 --cas https://127.0.0.1:8981 \
     --ca-cert "$work/pki/ca.pem" --cert "$work/pki/client.pem" --key "$work/pki/client.key" \
     --scratch "$work/leases" \
     2>"$logs/daemon.err" &

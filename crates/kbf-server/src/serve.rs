@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::Either;
-use kbf_front::{Cache, MAX_MESSAGE_BYTES, MetaLog};
+use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog};
 use kbf_objstore::ObjectStore;
+use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
+use crate::blobs::WorkerBlobs;
 use crate::farm::Farm;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
@@ -23,10 +25,11 @@ use crate::worker::WorkerService;
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
-    /// The `kbf.worker.v1` listener (daemons).
+    /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
+    /// for their blobs ([`crate::blobs`]).
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
-    /// node is bound to a certificate.
+    /// node is bound to a certificate and every blob call is refused.
     pub worker_tls: Option<WorkerTls>,
     /// The heartbeat interval `Welcome` names.
     pub heartbeat_interval: Duration,
@@ -204,6 +207,12 @@ where
         }
         None => Peers::Unauthenticated,
     };
+    let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
+        ByteStreamService::new(Arc::clone(&cache)),
+        peers.clone(),
+    ))
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -224,6 +233,7 @@ where
             });
         let worker_serve = worker_server
             .add_service(worker_service)
+            .add_service(worker_blobs)
             .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {

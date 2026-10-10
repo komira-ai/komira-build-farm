@@ -6,7 +6,8 @@
 //! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
 //!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
 //!   certificate must name its node, and a deny list refuses certificates and nodes
-//!   ([`identity`]).
+//!   ([`identity`]). The same listener serves daemons `ByteStream` for their blob
+//!   reads and writes ([`blobs`]), each call admitted by the same rules.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
 //!   need the token of `--api-token-file` ([`token`]).
@@ -30,6 +31,7 @@
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
 pub mod api;
+pub mod blobs;
 #[cfg(test)]
 mod build_commit;
 pub mod config;

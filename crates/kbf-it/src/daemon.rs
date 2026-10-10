@@ -10,7 +10,8 @@
 //! the result, the action-cache write), not isolation.
 //!
 //! Everything else is the production daemon: the same `Daemon`, mutual TLS to the
-//! worker listener, the node report detected from this machine, and the fence time.
+//! worker listener for the session and for blobs (`--cas`), the node report detected
+//! from this machine, and the fence time.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -29,8 +30,9 @@ pub struct DaemonArgs {
     /// The server's worker listener, an `https://host:port` URL.
     #[arg(long)]
     pub server: String,
-    /// The server's REAPI listener, an `http://host:port` URL: the daemon reads inputs
-    /// from its CAS and writes outputs to it.
+    /// The server's worker listener again, an `https://host:port` URL: the daemon
+    /// reads inputs and writes outputs through its `ByteStream`, over mutual TLS with
+    /// the same files as the session. Plain `http://` is refused.
     #[arg(long)]
     pub cas: String,
     /// PEM file of the CA that signed the server certificate.
@@ -62,6 +64,11 @@ pub enum DaemonError {
         #[source]
         source: tonic::transport::Error,
     },
+    #[error(
+        "--cas {0:?} must be an https:// URL: the server's worker listener, which serves \
+         blobs over mutual TLS only"
+    )]
+    CasNotHttps(String),
     #[error("detect the node: {0}")]
     Detect(#[from] DetectError),
     #[error(transparent)]
@@ -73,27 +80,30 @@ pub enum DaemonError {
 /// # Errors
 /// A flag is refused, a TLS file cannot be read, or the node cannot be detected.
 pub async fn run(args: DaemonArgs, shutdown: impl Future<Output = ()>) -> Result<(), DaemonError> {
-    // Lazy: the daemon may start before the server, and the CAS is reached per lease.
-    let channel = match Endpoint::from_shared(args.cas.clone()) {
-        Ok(endpoint) => endpoint.connect_lazy(),
-        Err(source) => {
-            return Err(DaemonError::Cas {
-                url: args.cas,
-                source,
-            });
-        }
-    };
-    let runtime = Arc::new(LocalRuntime::new(
-        Arc::new(CasClient::new(channel)),
-        args.scratch,
-    ));
-    let report = NodeReport::detect(&[LOCAL_DRIVER])?;
+    if !args.cas.starts_with("https://") {
+        return Err(DaemonError::CasNotHttps(args.cas));
+    }
     let tls = TlsFiles {
         ca_cert: args.ca_cert,
         cert: args.cert,
         key: args.key,
         server_name: Some(args.tls_server_name),
     };
+    let fail = |source| DaemonError::Cas {
+        url: args.cas.clone(),
+        source,
+    };
+    // Lazy: the daemon may start before the server, and the CAS is reached per lease.
+    let channel = Endpoint::from_shared(args.cas.clone())
+        .map_err(fail)?
+        .tls_config(tls.load()?)
+        .map_err(fail)?
+        .connect_lazy();
+    let runtime = Arc::new(LocalRuntime::new(
+        Arc::new(CasClient::new(channel)),
+        args.scratch,
+    ));
+    let report = NodeReport::detect(&[LOCAL_DRIVER])?;
     let config = DaemonConfig::new(args.server, tls, args.node_id);
     let daemon = Daemon::new(config, runtime, report)?;
     daemon.run(shutdown).await;

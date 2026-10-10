@@ -112,9 +112,10 @@ pub fn label(digest: &Digest) -> String {
     format!("{}/{}", digest.hash, digest.size_bytes)
 }
 
-/// A client of a server front's CAS: reads with ByteStream `Read`, writes with
-/// ByteStream `Write`, one blob per call. The front serves one cache per cell, so
-/// resource names carry no instance name.
+/// A client of the server's CAS: reads with ByteStream `Read`, writes with
+/// ByteStream `Write`, one blob per call. The server serves one cache per cell, so
+/// resource names carry no instance name. The daemon binaries dial the server's
+/// worker listener with it, over mutual TLS.
 #[derive(Debug)]
 pub struct CasClient {
     bytestream: ByteStreamClient<Channel>,
@@ -122,7 +123,7 @@ pub struct CasClient {
 }
 
 impl CasClient {
-    /// A client over `channel`, a connection to the front's REAPI listener.
+    /// A client over `channel`, a connection to a `ByteStream` service.
     #[must_use]
     pub fn new(channel: Channel) -> Self {
         Self {
