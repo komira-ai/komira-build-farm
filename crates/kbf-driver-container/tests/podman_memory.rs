@@ -414,7 +414,9 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         state(&lease)
     );
 
-    // What the lease counted while the action wrote at its cap, for the premise.
+    // What the lease counted while the action read at its cap, for the premise: the
+    // least swap it held in a sample whose `max` events grew since the one before
+    // (after the action exits, the lease cgroup lives on with nothing in swap).
     let mut seen = Vec::new();
     let mut at_cap = 0;
     let mut least_swap = u64::MAX;
@@ -422,14 +424,14 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         tokio::select! {
             outcome = &mut run => break outcome.expect("join"),
             () = tokio::time::sleep(Duration::from_millis(200)) => {
-                if let Some(max) = max_events(&lease) {
-                    at_cap = at_cap.max(max);
-                }
                 let swap = std::fs::read_to_string(lease.join("memory.swap.current"))
                     .ok()
                     .and_then(|t| t.trim().parse::<u64>().ok());
-                if let (true, Some(swap)) = (at_cap > 0, swap) {
-                    least_swap = least_swap.min(swap);
+                if let Some(max) = max_events(&lease) {
+                    if let (true, Some(swap)) = (max > at_cap, swap) {
+                        least_swap = least_swap.min(swap);
+                    }
+                    at_cap = at_cap.max(max);
                 }
                 seen.push(state(&lease));
             }
@@ -444,7 +446,7 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     );
     assert!(
         least_swap > FLOOR && least_swap != u64::MAX,
-        "the premise: the lease held more than the floor in swap at its cap: {}",
+        "the premise: the lease held more than the floor in swap while at its cap: {}",
         seen.join("\n")
     );
     println!(
