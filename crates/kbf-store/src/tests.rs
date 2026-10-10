@@ -342,6 +342,13 @@ fn open_refuses_files_that_do_not_form_one_log() {
             ],
         ),
         (
+            "empty segment past a gap",
+            vec![
+                (name(1, 1), segment_bytes(&entries(1..=2, 1))),
+                (name(2, 4), Vec::new()),
+            ],
+        ),
+        (
             "out of order",
             vec![(name(1, 1), segment_bytes(&[entry(1, 1), entry(3, 1)]))],
         ),
