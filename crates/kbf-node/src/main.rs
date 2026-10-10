@@ -421,10 +421,9 @@ mod tests {
 
     /// Catches: the native driver's Xcode survey not handed to the daemon (issue #164),
     /// so the node's `NodeStatus` lists no Xcode at all, ready or not, and its Hello
-    /// advertises none: the silent removal an Xcode that is not ready must never get;
-    /// and the Xcode not listed, as not surveyed yet, from the start. The Xcode here is
-    /// an empty app, which no `xcodebuild` accepts (on Linux there is none), so the
-    /// survey lists it as not ready, with why.
+    /// advertises none: the silent removal an Xcode that is not ready must never get.
+    /// The Xcode here is an empty app, which no `xcodebuild` accepts (on Linux there is
+    /// none), so the survey lists it as not ready, with why.
     #[tokio::test]
     async fn the_native_daemon_reports_every_installed_xcode() {
         let dir = scratch("native");
@@ -451,10 +450,11 @@ mod tests {
         config.user_folders = None;
         let (daemon, mut reports) =
             native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-        let pending = daemon.node_status().xcodes;
-        assert_eq!(pending.len(), 1, "{pending:?}");
-        assert_eq!(pending[0].app, app.display().to_string());
-        assert_eq!(pending[0].state(), XcodeState::NotSurveyed);
+        // Not surveyed yet, or already surveyed (this one fails at once): either way
+        // listed. The gated tests (xcode_watch, startup_tests) hold the survey.
+        let listed = daemon.node_status().xcodes;
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].app, app.display().to_string());
         let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].app, app.display().to_string());
