@@ -1,7 +1,8 @@
 # The M1 exit test on a hosted runner: MinIO (pinned by digest), one kbf-server and one
 # daemon, and the sample projects in crates/kbf-it/m1 built remote-only with pinned
 # Bazel and buck2, twice each. The second build of each must be all remote cache hits
-# (crates/kbf-it/m1/run.sh says exactly what is checked).
+# A last buck2 build holds a lease in flight (an action that sleeps) while the node is
+# drained through the operator API (crates/kbf-it/m1/run.sh says exactly what is checked).
 #
 # Its own workflow, using GitHub-owned actions only, so that it starts under the
 # repository's Actions policy whatever the other workflows use. Same hosted-runner,

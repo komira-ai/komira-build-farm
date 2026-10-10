@@ -9,7 +9,7 @@
 use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use kbf_meta::{Applied, Command, MetaState, Retention};
+use kbf_meta::{Applied, Command, Epoch, MetaState, Retention};
 
 /// Why the metadata log could not answer.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -49,6 +49,16 @@ impl MemoryMetaLog {
     pub fn new(retention: Retention) -> Self {
         Self {
             state: Mutex::new(MetaState::new(retention)),
+        }
+    }
+
+    /// Allocates a writer epoch now, for a cache built without an async context
+    /// ([`Cache::memory`](crate::Cache::memory)). The same as committing
+    /// [`Command::AllocEpoch`].
+    pub fn alloc_epoch(&self) -> Epoch {
+        match self.state().execute(Command::AllocEpoch) {
+            Applied::Epoch(epoch) => epoch,
+            other => unreachable!("AllocEpoch applied as {other:?}"),
         }
     }
 

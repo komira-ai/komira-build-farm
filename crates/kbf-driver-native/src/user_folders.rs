@@ -25,12 +25,16 @@
 //! each lease its own `/var/folders` entry): leases of the daemon's user share these
 //! names, so a lease can see, change or remove the temporary files another lease has
 //! open there, and can rewrite `xcrun_db`, which the next lease's compiler shims read
-//! to find their tools. The daemon itself trusts nothing there: it removes `xcrun_db`
-//! ([`UserFolders::forget_xcrun_cache`]) before it runs any developer tool at start,
-//! runs `xcodebuild` from inside the Xcode rather than through its `/usr/bin` shim
-//! ([`crate::xcode::discover`]), runs its `xcrun` warm-up, which goes on while the
-//! node serves, under the actions' sandbox (`NativeRuntime::warm_xcrun`), and sweeps
-//! by descriptor.
+//! to find their tools. The daemon runs no developer tool outside the sandbox while it
+//! serves, so what a lease wrote there reaches only sandboxed tools: every survey of
+//! the Xcodes, the first and those it repeats while the node serves
+//! ([`crate::xcode_watch`]), asks each question under the actions' sandbox, where
+//! `xcrun` reads and fills `xcrun_db` as an action's would (`crate::xcode::Probe::sandbox`),
+//! and runs `xcodebuild` from inside the Xcode rather than through its `/usr/bin` shim;
+//! its `xcrun` warm-ups, at start and for each Xcode a later survey makes ready, run
+//! under the actions' sandbox too (`NativeRuntime::warm_xcrun`). It leaves `xcrun_db`
+//! in place at start: removing it would make every lookup of the first survey, which
+//! the node finishes before it says `Hello`, take seconds. It sweeps by descriptor.
 //!
 //! What a lease leaves there (a save it was killed in the middle of, a temporary
 //! `xcrun_db-*`) is swept ([`UserFolders::sweep`]) at daemon start and after every
@@ -141,22 +145,6 @@ impl UserFolders {
         format!(
             "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
         )
-    }
-
-    /// Removes `xcrun`'s cache, `T/xcrun_db`, which any lease can rewrite: the daemon
-    /// calls this before it runs a developer tool of its own, so no tool it runs outside
-    /// the sandbox finds its tools through what a lease wrote. Logged when it fails.
-    pub fn forget_xcrun_cache(&self) {
-        self.forget_xcrun_cache_as(rustix::process::geteuid().as_raw());
-    }
-
-    /// [`Self::forget_xcrun_cache`] as if the daemon ran as `uid`.
-    fn forget_xcrun_cache_as(&self, uid: u32) {
-        let removed = open_own(CWD, &self.temp, uid)
-            .and_then(|temp| kbf_outputs::remove_tree_at(&temp, OsStr::new(XCRUN_DB)));
-        if let Err(e) = removed {
-            tracing::warn!(temp = %self.temp.display(), "xcrun cache not removed: {e}");
-        }
     }
 
     /// Removes, with `remove` (by name, from the folder it is in), every leftover the
@@ -548,36 +536,6 @@ mod tests {
             std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
             0o700
         );
-        kbf_outputs::remove_tree(&dir).expect("clean");
-    }
-
-    /// Catches `xcrun`'s cache kept for the daemon's own tools, whether a lease wrote
-    /// it as a file or made it a directory, a removal through a linked `T`, and one in
-    /// a folder another user owns; and a missing cache, or `T`, taken as a failure
-    /// worth more than a log line.
-    #[test]
-    fn the_xcrun_cache_is_forgotten() {
-        let dir = scratch("forget");
-        let f = folders(&dir);
-        let cache = f.temp().join(XCRUN_DB);
-        std::fs::write(&cache, b"lease-written").expect("cache");
-        let me = rustix::process::geteuid().as_raw();
-        f.forget_xcrun_cache_as(me + 1);
-        assert!(cache.exists(), "removed from another user's folder");
-        f.forget_xcrun_cache();
-        assert!(!cache.exists(), "the cache file stays");
-        std::fs::create_dir_all(cache.join("deep")).expect("a directory");
-        f.forget_xcrun_cache();
-        assert!(!cache.exists(), "the cache directory stays");
-        f.forget_xcrun_cache();
-
-        let elsewhere = dir.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
-        let kept = made(XCRUN_DB, &elsewhere, Duration::ZERO);
-        let linked = UserFolders::new(dir.join("T-link"), f.cache().to_owned()).expect("fits");
-        std::os::unix::fs::symlink(&elsewhere, linked.temp()).expect("symlink");
-        linked.forget_xcrun_cache();
-        assert!(kept.exists(), "removed through a linked T");
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

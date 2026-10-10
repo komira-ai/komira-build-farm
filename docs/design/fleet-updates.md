@@ -96,7 +96,7 @@ contains it. It is the comparison #85 defines for `vm.image`.
 | `xcode` (set) | Mac | every installed Xcode build | membership (changed from exact) | #85 phase 1 |
 | `vm.image` (set) | Mac | golden VM images on disk | membership on the digest only | #85 section 5.1 |
 | `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` | Mac | the VM driver | as #85 section 5.2 | #85 |
-| `drivers` gains `vm` | Mac | the VM driver's boot check | not a request key: placement maps the lease kind to it (exists, repeated) | #85 section 5.2 |
+| `drivers` gains `vm` | Mac | the VM driver's check, which boots nothing ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk) section 8) | not a request key: placement maps the lease kind to it (exists, repeated) | macos-vms.md section 5.2 |
 | `drivers` gains `native-whole-machine` | Mac | listed only when `kbf-mac-session` is present (10.1) | as `vm` | #85 section 5.2 |
 
 **Probes are reported, never requested.** A `probe.<name>` (6.1) is a status value,
@@ -112,8 +112,9 @@ not a capability key: a request naming it is refused once unknown keys are refus
 | `kbf-node` | pin a lease to one node, for qualification (section 4.2). The front refuses it from every client with `INVALID_ARGUMENT`: no REAPI caller can send it. The rollout driver submits qualification work to the scheduler directly, as a new internal submitter, so no client role is needed for it. | this document |
 
 **Re-detection is planned.** Today detection runs once, at daemon start
-(`crates/kbf-node/src/main.rs`), and `Hello` is sent only when a session opens
-(`crates/kbf-daemon/src/daemon.rs`). Noticing a changed report by its hash is listed as
+(`crates/kbf-node/src/main.rs`), except the native driver's Xcodes: it asks them again
+every few minutes, and a change resends `Hello` and `NodeStatus` mid-stream
+(`crates/kbf-driver-native/src/xcode_watch.rs`, issue #164). Noticing a changed report by its hash is listed as
 planned in [capabilities.md](capabilities.md#planned). This design adds:
 
 - The daemon re-detects the software keys when `kbf-updater` finishes a step and every
@@ -649,11 +650,14 @@ person. Microcode rides the normal rollout as packages **[A]**.
 
 ## 9. VM images as rolled-out software
 
-A golden VM image (`macos-vms.md` section 7), built in CI on a Mac from a pinned
-restore image, Xcode and simulator runtimes and named by digest, is part of a pool's
-set. `kbf-updater stage` places it ahead of time and the node reports it in
-`vm.image`; switching the set makes VM leases ask for the new `vm.image`, with no
-reboot. A guest cannot run a newer macOS than its host **[A]**, so hosts move first.
+A golden VM image (`macos-vms.md` section 7) is named by its recipe digest: the
+digest of a pinned restore image, Xcode, simulator runtimes and the guest setup
+([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)). The recipe is part of a
+pool's set. It cannot be built in CI, since GitHub's hosted macOS runners are VMs and
+cannot run one; each Mac builds the image itself from the recipe, ahead of time, and
+reports it in `vm.image` once its file manifest re-verifies. Shipping built images
+between Macs waits for a legal review of the Xcode licence (same section). Switching
+the set makes VM leases ask for the new `vm.image`, with no reboot. A guest cannot run a newer macOS than its host **[A]**, so hosts move first.
 
 ## 10. GPU work and desktop-app tests on a bare-metal Mac
 

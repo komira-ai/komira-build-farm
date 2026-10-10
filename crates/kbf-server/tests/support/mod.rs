@@ -4,11 +4,11 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
-use std::future::pending;
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -29,12 +29,16 @@ use kbf_proto::worker::{
     Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, ResultAck,
     ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
 };
-use kbf_server::{Listeners, bind_server};
+use kbf_server::token::ApiToken;
+use kbf_server::{Api, Bound, Listeners, ServeError, bind_server, bind_server_with_api};
 use prost::Message;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Streaming};
+
+mod store;
+pub use store::SharedStore;
 
 /// How long a test waits for something that should happen promptly.
 pub const PROMPT: Duration = Duration::from_secs(5);
@@ -134,8 +138,26 @@ impl MetaLog for GateLog {
 
 /// A running server in this process, and a [`Client`] of it.
 pub struct Cell {
-    pub cache: Arc<Cache<GateLog, MemoryStore>>,
+    pub cache: Arc<Cache<GateLog, SharedStore>>,
+    /// The bucket, shared with every restart of this cell.
+    pub store: SharedStore,
+    /// The operator API's address, for a cell started with one.
+    pub api: Option<SocketAddr>,
+    /// The operator API's configuration, kept for a restart.
+    api_config: Option<Api>,
+    /// Stops the server; taken by [`Cell::cold_restart`], sent on drop otherwise.
+    stop: Option<oneshot::Sender<()>>,
+    /// Answers once the server's runtime, and every task on it, is gone.
+    stopped: Option<oneshot::Receiver<()>>,
     client: Client,
+}
+
+impl Drop for Cell {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 
 impl Deref for Cell {
@@ -152,6 +174,9 @@ pub struct Client {
     channel: Channel,
 }
 
+/// The bearer token of a cell's operator API ([`Cell::start_with_api`]).
+pub const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
+
 impl Cell {
     pub async fn start() -> Self {
         Self::start_with(kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION).await
@@ -165,24 +190,73 @@ impl Cell {
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
-        let cache = Arc::new(Cache::new(
-            GateLog::new(),
-            MemoryStore::new(Capabilities::default()),
-            KeyPrefix::default(),
-        ));
-        Self::serve(cache, wait, retention).await
+        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, None, wait, retention).await
     }
 
-    /// A new server process over this cell's store and action cache, as after a
-    /// restart: a fresh scheduler, no daemon registered, nothing queued. This one is
-    /// left running; its daemons simply never reach the new one's state.
+    /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
+    pub async fn start_with_api() -> Self {
+        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let api = Api {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            token: Some(api_token()),
+        };
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, Some(api), wait, retention).await
+    }
+
+    /// A new server over this cell's store and its in-memory action cache and CAS
+    /// index, with a fresh scheduler, no daemon registered and nothing queued. This one
+    /// is left running; its daemons simply never reach the new one's state.
+    ///
+    /// Sharing the cache models a durable cache, which `kbf-server` does not have
+    /// today: its metadata is in memory. [`Cell::cold_restart`] is a restart as the
+    /// binary has it.
     pub async fn restart(&self) -> Self {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(Arc::clone(&self.cache), wait, retention).await
+        let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
+        Self::serve(cache, store, self.api_config.clone(), wait, retention).await
+    }
+
+    /// Stops this server, waits until its runtime and every task on it are gone (each
+    /// connection and stream of it ends, as when the process exits), and starts a new
+    /// one over the same bucket, as a restart of the `kbf-server` binary does: a new
+    /// `Cache` with a new, empty metadata log (so an empty CAS index and action
+    /// cache), a fresh scheduler (no daemon, no cordon, no drain, nothing queued), and
+    /// its objects written under a key prefix no earlier start used, as `--store=s3`
+    /// does. The objects earlier starts wrote stay in the bucket. The operator API, if
+    /// this cell has one, listens again on a new port.
+    pub async fn cold_restart(mut self) -> Self {
+        let stop = self.stop.take().expect("the server is running");
+        let stopped = self.stopped.take().expect("the server is running");
+        let (store, api_config) = (self.store.clone(), self.api_config.clone());
+        drop(self);
+        stop.send(()).expect("the server is running");
+        timeout(PROMPT * 4, stopped)
+            .await
+            .expect("the old server stops in time")
+            .expect("the old server stops cleanly");
+        let cache = Self::cold_cache(&store).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(cache, store, api_config, wait, retention).await
+    }
+
+    /// A new cache over `store`: an empty metadata log, a writer epoch it allocates,
+    /// and objects under `start-<n>/`, where `n` is new to this test process.
+    async fn cold_cache(store: &SharedStore) -> Arc<Cache<GateLog, SharedStore>> {
+        static STARTS: AtomicU32 = AtomicU32::new(0);
+        let n = STARTS.fetch_add(1, Ordering::Relaxed);
+        let prefix = KeyPrefix::new(format!("start-{n}/")).expect("a key prefix");
+        let cache = Cache::open(GateLog::new(), store.clone(), prefix).await;
+        Arc::new(cache.expect("open the cache"))
     }
 
     async fn serve(
-        cache: Arc<Cache<GateLog, MemoryStore>>,
+        cache: Arc<Cache<GateLog, SharedStore>>,
+        store: SharedStore,
+        api_config: Option<Api>,
         wait: Duration,
         retention: Duration,
     ) -> Self {
@@ -197,14 +271,74 @@ impl Cell {
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
         };
-        let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
-        let (reapi, worker) = (bound.reapi, bound.worker);
-        tokio::spawn(async move { bound.serving.await.expect("serve") });
+        let (stop, stop_rx) = oneshot::channel::<()>();
+        let (stopped_tx, stopped) = oneshot::channel::<()>();
+        let (bound_tx, bound_rx) = oneshot::channel();
+        let (server_cache, server_api) = (Arc::clone(&cache), api_config.clone());
+        // The server runs on a runtime of its own, as a process apart: once it stops,
+        // the runtime is dropped and every task of it (each connection, each stream)
+        // goes with it, as when the process exits.
+        std::thread::Builder::new()
+            .name("kbf-server-cell".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                runtime.block_on(async move {
+                    let shutdown = async move {
+                        let _ = stop_rx.await;
+                    };
+                    match server_api {
+                        None => {
+                            let bound = bind_server(server_cache, listeners, shutdown);
+                            run(bound.expect("bind"), bound_tx).await;
+                        }
+                        Some(api) => {
+                            let bound =
+                                bind_server_with_api(server_cache, listeners, Some(api), shutdown);
+                            run(bound.expect("bind"), bound_tx).await;
+                        }
+                    }
+                });
+                drop(runtime);
+                let _ = stopped_tx.send(());
+            })
+            .expect("a server thread");
+        let (reapi, worker, api) = bound_rx.await.expect("the server binds");
         Self {
             cache,
+            store,
+            api,
+            api_config,
+            stop: Some(stop),
+            stopped: Some(stopped),
             client: Client::connect(reapi, worker).await,
         }
     }
+}
+
+/// Says where `bound` listens on `addresses`, then serves it until it stops.
+async fn run(
+    bound: Bound<impl Future<Output = Result<(), ServeError>>>,
+    addresses: oneshot::Sender<(SocketAddr, SocketAddr, Option<SocketAddr>)>,
+) {
+    let _ = addresses.send((bound.reapi, bound.worker, bound.api));
+    bound.serving.await.expect("serve");
+}
+
+/// An operator API token holding [`API_TOKEN`], from a file of mode 0600 unique to
+/// this call.
+fn api_token() -> ApiToken {
+    use std::os::unix::fs::PermissionsExt;
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-cell");
+    std::fs::create_dir_all(&dir).expect("a token directory");
+    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    std::fs::write(&path, format!("{API_TOKEN}\n")).expect("write the token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    ApiToken::from_file(&path).expect("a usable token")
 }
 
 impl Client {
@@ -542,6 +676,15 @@ impl FakeDaemon {
         timeout(PROMPT, ending)
             .await
             .expect("the server ended the stream in time")
+    }
+
+    /// Waits, within [`PROMPT`], until the stream ends, by the server's status or by
+    /// the connection closing; messages before that are dropped.
+    pub async fn closed(&mut self) {
+        let ending = async { while let Ok(Some(_)) = self.inbound.message().await {} };
+        timeout(PROMPT, ending)
+            .await
+            .expect("the stream ended in time");
     }
 
     /// The lease of the next `Cancel` within [`QUIET`], if one arrives.

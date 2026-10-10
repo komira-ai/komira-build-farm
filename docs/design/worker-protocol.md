@@ -14,14 +14,18 @@ service Worker {
 ```
 
 - **One stream per daemon, opened by the daemon.** No daemon listens on an inbound
-  port, so a worker needs only outbound connectivity to the farm's address.
+  port, so a worker needs only outbound connectivity to the server's worker
+  listener. With several servers (**planned**) that one stream goes to the leader
+  ([deployment-topology.md](deployment-topology.md)).
 - **Mutual TLS.** The daemon connects only to `https://` URLs and presents its own
   certificate; the server's worker listener verifies it against a client CA, and
   requires the certificate to name the node the stream speaks for (see
   [Node identity](#node-identity-and-the-deny-list)).
 - **No blob bytes on this stream.** A daemon reads inputs and writes outputs through the
   REAPI `ByteStream` service on separate connections. The session carries only small
-  control messages.
+  control messages. Moving blob transfer onto the mutual-TLS worker listener, so a
+  daemon needs no path to REAPI, is **planned** (see
+  [Security model](../../ARCHITECTURE.md#security-model)).
 - **Versions.** The server accepts protocol versions N-1 and N. Version 1 is the first,
   so today it accepts exactly 1. Fields and messages may be added within a version as
   long as a peer that ignores them keeps working.
@@ -302,8 +306,11 @@ close this, each on its own:
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
    and forgets their results without sending them: no server of the new epoch can
    accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
-   nothing, and a lease granted while no epoch was named is kept. With the replicated log, the epoch will name the log, which outlives
-   leaders and their terms, so a change of leader drops nothing.
+   nothing, and a lease granted while no epoch was named is kept. With the replicated
+   log, the plan is for the epoch to name the log, which outlives leaders and their
+   terms, so a change of leader drops nothing; whether a failover keeps leases this
+   way or drops them as a restart does today is an open question
+   ([deployment-topology.md](deployment-topology.md#open-questions)).
 3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
    in its `Result`, and the server refuses a `Result` whose `action_digest` is set and
    is not the action of the operation it granted the lease for, whatever the lease id
@@ -328,12 +335,13 @@ action cache with the result.
 ### `NodeStatus`
 
 What software the node runs, for operators: the OS name, version and build, the
-kernel release (Linux), the `kbf-daemon` version, and the installed Xcode builds
-(Mac). It routes no work, so it is not part of the node report and does not change
+kernel release (Linux), the `kbf-daemon` version, the ready Xcode builds (Mac), and
+every installed Xcode with its state, why it is not ready and the command that fixes
+it (`xcodes`, Mac; issue #164). It routes no work, so it is not part of the node report and does not change
 `report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
 `sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
-are the node report's `xcode` entries, from the driver that discovers them. A field
-it cannot read is empty.
+are the node report's `xcode` entries, from the driver that discovers them, and
+`xcodes` comes from the same driver. A field it cannot read is empty.
 
 The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
 the first `Heartbeat`. The server keeps the newest one per node, from the node's
@@ -341,8 +349,14 @@ current stream only (one from a replaced stream is ignored, and one the deny lis
 refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
 in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
 the message ignores it as an empty message; a daemon that predates it is listed
-without software. Sending it again when the software changes mid-session is
-**planned** (fleet-updates.md section 3.1, re-detection).
+without software, and a server that predates `xcodes` ignores it.
+
+When the driver's report changes mid-session (today: the native driver re-checks its
+Xcodes every few minutes, and one became ready or stopped being so), the daemon resends
+its `Hello` on the stream if the node report changed (the server takes a resent
+`Hello` as the node's new report, so placement sees the new `xcode` entries), and then
+sends `NodeStatus` again. Re-detecting the other software mid-session is **planned**
+(fleet-updates.md section 3.1, re-detection).
 
 ### `Offer`
 
@@ -395,7 +409,13 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
+- `Start.device_id` (field 8): the one iOS device booked for the lease, and
+  `NodeStatus.devices`: every iOS device the node knows, with its state and fix
+  ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
-- With many servers: the daemon dials the farm's one address and may learn the current
-  server list from the first server it reaches; the front relays the session to the
-  scheduler's leader.
+- With several servers ([deployment-topology.md](deployment-topology.md)): the daemon
+  dials the servers' own DNS names directly, with no balancer in between, and holds
+  its one stream to the leader. A follower does not serve or relay the session: it
+  answers with a redirect naming the leader, and the daemon dials that server. On
+  failover the daemon reconnects to the new leader. The redirect's form and how the
+  daemon is given the servers' names are open questions there.

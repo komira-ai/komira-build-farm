@@ -2,6 +2,7 @@
 //! docs for what it wires together.
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
+//! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
 //! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
 //! when the operator API listens. On Unix the SIGINT and SIGTERM handlers are installed
 //! before that line is printed, so either signal any time after it stops the server
@@ -9,6 +10,10 @@
 //! connections are sent GOAWAY, and the server exits once they close or
 //! `--shutdown-timeout-secs` runs out (issue #168). If a handler cannot be installed it
 //! exits 2 without printing the start line.
+//!
+//! `kbf-server hash-token <principal> [--qos <level>]` serves nothing: it reads a
+//! token from stdin, prints its token file line on stdout and exits 0, or exits 2 with
+//! the reason on stderr.
 
 use std::error::Error;
 use std::future::Future;
@@ -21,7 +26,8 @@ use clap::Parser;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
-use kbf_server::{Args, StoreKind, bind_server_with_api};
+use kbf_server::principal::{ClientRole, token_line_from};
+use kbf_server::{Args, Command, SERVER_VERSION, StoreKind, bind_server_with_api};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -29,6 +35,18 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    if let Some(Command::HashToken { principal, qos }) = &args.command {
+        return match token_line_from(principal, ClientRole::Client, qos, &mut io::stdin().lock()) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("kbf-server hash-token: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let result = match args.store {
         StoreKind::Memory => {
             let store = MemoryStore::new(Capabilities::default());
@@ -54,11 +72,8 @@ async fn run<O: ObjectStore + 'static>(
     prefix: KeyPrefix,
 ) -> Result<(), Box<dyn Error>> {
     let listeners = args.listeners()?;
-    let cache = Arc::new(Cache::new(
-        MemoryMetaLog::new(Retention::default()),
-        store,
-        prefix,
-    ));
+    let cache =
+        Arc::new(Cache::open(MemoryMetaLog::new(Retention::default()), store, prefix).await?);
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_api(cache, listeners, api, shutdown)?;
@@ -70,8 +85,7 @@ async fn run<O: ObjectStore + 'static>(
 /// The start line: the version and the addresses bound.
 fn start_line(reapi: SocketAddr, worker: SocketAddr, api: Option<SocketAddr>) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
-    let version = env!("CARGO_PKG_VERSION");
-    format!("kbf-server {version} reapi={reapi} worker={worker}{api}")
+    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}")
 }
 
 /// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on

@@ -43,7 +43,7 @@ use kbf_types::{
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
-use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView};
+use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
 use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
@@ -359,17 +359,35 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     }
 
     /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was
-    /// replaced (a newer stream sends its own after its `Welcome`).
-    pub fn node_status(&self, worker: &WorkerId, stream: StreamId, status: NodeStatus) {
+    /// replaced (a newer stream sends its own after its `Welcome`). Each attention item
+    /// it raises or clears against the node's previous status is logged once
+    /// (`crate::fleet`); returns those lines, `true` for each raised.
+    pub fn node_status(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        status: NodeStatus,
+    ) -> Vec<(bool, String)> {
         let received = unix_ms();
         let mut state = self.lock();
-        if state.is_current(worker, stream) {
-            let view = SoftwareView::new(status, received);
-            state.software.insert(worker.clone(), view);
+        if !state.is_current(worker, stream) {
+            return Vec::new();
         }
+        let view = SoftwareView::new(status, received);
+        let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
+        let changes = attention_changes(worker.as_str(), before, &view.xcodes);
+        for (raise, line) in &changes {
+            if *raise {
+                tracing::warn!(target: "kbf_server::attention", "{line}");
+            } else {
+                tracing::info!(target: "kbf_server::attention", "{line}");
+            }
+        }
+        state.software.insert(worker.clone(), view);
+        changes
     }
 
-    /// Every node registered since this farm started, in node-id order.
+    /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
         let state = self.lock();
         let nodes = state
@@ -377,7 +395,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             .keys()
             .map(|worker| self.node(&state, worker))
             .collect();
-        NodesView { nodes }
+        NodesView::of_this_build(nodes)
     }
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.
@@ -438,6 +456,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             node_id: worker.as_str().to_owned(),
             connected: !state.links[worker].outbound.is_closed(),
             software: state.software.get(worker).cloned(),
+            needs_attention: state
+                .software
+                .get(worker)
+                .map(SoftwareView::needs_attention)
+                .unwrap_or_default(),
             placement,
         }
     }

@@ -156,10 +156,13 @@ fi
 ' sh "$shared"
 sudo -n test -e /private/var/at/tabs/kbf-lease-1-1 || fail "no crontab was planted"
 [ "$(sudo -n find /private/var/folders -user "$first" -name kbf-ci-temp | wc -l)" -eq 1 ] || fail "no temp file"
-pgrep -U "$first" sleep || fail "no sleep process"
+sleeper=$(pgrep -U "$first" sleep) || fail "no sleep process"
+echo "sleep is pid $sleeper"
 
-step "user-delete is refused while a process of the uid remains"
-expect_refused "processes of uid $first remain" "$client" delete "$socket" 1.1
+step "user-delete is refused while a process of the uid remains, naming it"
+# It waits about five seconds for the process to exit first.
+expect_refused "processes of uid $first remain after [0-9]* looks: .*$sleeper (sleep)" \
+  "$client" delete "$socket" 1.1
 id kbf-lease-1-1
 
 step "kill-uid ends every process of the uid"
@@ -215,8 +218,52 @@ done
 expect_refused "never reused" "$client" create "$socket" 1.3
 uid=$("$client" create "$socket" 1.5)
 [ "$uid" = $((first + 3)) ] || fail "uid $uid after a restart, want $((first + 3))"
+
+step "user-delete waits for a process of the uid that exits by itself"
 "$client" kill "$socket" 1.5
-"$client" delete "$socket" 1.5
+"$client" run "$socket" 1.5 "$lease_dir" /bin/sh -c '/bin/sleep 2 </dev/null >/dev/null 2>&1 &' >/dev/null
+pgrep -U $((first + 3)) sleep || fail "no sleep process"
+[ "$("$client" delete "$socket" 1.5)" = existed ] || fail "delete did not wait for the sleep"
+
+step "issue #195: no cron job of the lease user starts after kill-uid"
+# Staged, not left to chance: the lease user's crontab runs a 3 s sleep every minute,
+# and kill-uid comes in the last seconds of a minute. On a helper that leaves the
+# crontab in place, cron starts the job as the next minute begins, and launchd starts
+# per-user agents (distnoted) with it that never exit: the delete is refused. Each
+# round takes up to a minute; KBF_MAC_SESSION_RACE_ROUNDS sets how many (default 2).
+rounds=${KBF_MAC_SESSION_RACE_ROUNDS:-2}
+for round in $(seq "$rounds"); do
+  lease=1.$((5 + round))
+  uid=$("$client" create "$socket" "$lease")
+  "$client" run "$socket" "$lease" "$lease_dir" /bin/sh -c 'echo "* * * * * /bin/sleep 3" | crontab -' >/dev/null
+  sudo -n test -e "/private/var/at/tabs/kbf-lease-1-$((5 + round))" || fail "round $round: no crontab was planted"
+  # Out of the last seconds of this minute, then into those of the next ([ ] counts
+  # in decimal, so "08" is eight).
+  while [ "$(date +%S)" -ge 55 ]; do sleep 0.2; done
+  while [ "$(date +%S)" -lt 57 ]; do sleep 0.2; done
+  "$client" kill "$socket" "$lease"
+  done_at=$(date +%T)
+  echo "round $round: kill-uid done at $done_at"
+  # Ended past :04, the watch below would look at nothing: the round was not staged.
+  done_s=${done_at##*:}
+  if [ "$done_s" -ge 4 ] && [ "$done_s" -lt 55 ]; then
+    fail "round $round: kill-uid ended at $done_at, too late to stage the race"
+  fi
+  if sudo -n test -e "/private/var/at/tabs/kbf-lease-1-$((5 + round))"; then
+    fail "round $round: kill-uid left the crontab"
+  fi
+  # Watch past the minute's start, when cron would have started the job.
+  while [ "$(date +%S)" -ge 55 ]; do
+    if pgrep -lU "$uid"; then fail "round $round: a process of $uid started after kill-uid"; fi
+    sleep 0.2
+  done
+  until [ "$(date +%S)" -ge 4 ]; do
+    if pgrep -lU "$uid"; then fail "round $round: a process of $uid started after kill-uid"; fi
+    sleep 0.2
+  done
+  out=$("$client" delete "$socket" "$lease" 2>&1) || true
+  [ "$out" = existed ] || fail "round $round: delete: $out"
+done
 
 echo
 echo "kbf-mac-session: every check passed"

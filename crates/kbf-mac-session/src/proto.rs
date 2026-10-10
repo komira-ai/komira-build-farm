@@ -245,6 +245,9 @@ fn fill(
         ) {
             // The receive timeout set above ran out: the deadline passed.
             Err(rustix::io::Errno::AGAIN) if deadline.is_some() => return Err(late()),
+            // A signal handler ran; with a receive timeout set, the kernel does not
+            // restart the call. Read again, to the time the deadline leaves.
+            Err(rustix::io::Errno::INTR) => continue,
             other => other?,
         };
         for received in control.drain().filter_map(rights) {
@@ -486,6 +489,48 @@ mod tests {
         b.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
         let error = recv::<Reply>(b.as_fd(), 0).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    }
+
+    /// Catches a receive that gives up when a signal interrupts it. With a receive
+    /// timeout set, `recvmsg` is never restarted after a signal handler runs (Linux
+    /// returns EINTR even under `SA_RESTART`): the read must be retried, to the same
+    /// deadline, not reported as an error.
+    #[test]
+    fn a_signal_does_not_end_recv_by() {
+        use std::time::Duration;
+        extern "C" fn ignore(_: libc::c_int) {}
+        // SAFETY: installs a handler that does nothing for a signal no other code of
+        // this test binary sends or handles; the struct is zeroed, then filled.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR2, &raw const action, std::ptr::null_mut()),
+                0
+            );
+        }
+        // SAFETY: the calling thread's own id; it outlives the signalling thread,
+        // which is joined below.
+        let me = unsafe { libc::pthread_self() } as usize;
+        let (_a, b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(500);
+        let signaller = std::thread::spawn(move || {
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(100));
+                // SAFETY: the receiving thread is alive until this thread is joined.
+                unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR2) };
+            }
+        });
+        let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
+        let elapsed = start.elapsed();
+        signaller.join().unwrap();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "gave up after {elapsed:?}"
+        );
     }
 
     /// What a short `sendmsg` leaves is written after it, whole. (A blocking Unix
