@@ -10,8 +10,9 @@
 //! | `xcode` (repeated: one per installed build) | a set, matched by membership |
 //! | `vm.image` (repeated: one per image, `<name>@sha256:<64 hex>`) | a set of the `sha256:<hex>` digests, matched by membership |
 //! | `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` (once each) | checked to be whole numbers, not matched on (report-only) |
+//! | `drivers` (repeated: one per driver the daemon runs) | the drivers; placement reads them for the lease kind, no request key names them |
 //!
-//! Every other entry (`isa_level`, `drivers`, ...) is not matched on and is skipped.
+//! Every other entry (`isa_level`, ...) is not matched on and is skipped.
 //! The reported `isa_level` list is not read: the level is computed from the features,
 //! so it can never disagree with them.
 
@@ -80,6 +81,7 @@ impl NodeCaps {
                 value: value.to_owned(),
             })
         };
+        let mut drivers = BTreeSet::new();
         let repeated = |key: &str| ReportError::Repeated(key.to_owned());
         for (key, value) in entries {
             if key == "arch" {
@@ -88,6 +90,8 @@ impl NodeCaps {
                 }
             } else if key == "cpu.features" {
                 features.insert(value.to_owned());
+            } else if key == "drivers" {
+                drivers.insert(value.to_owned());
             } else if is_member_key(key) {
                 let token = member_token(key, value)
                     .ok_or_else(|| ReportError::NoImageDigest(value.to_owned()))?;
@@ -116,6 +120,7 @@ impl NodeCaps {
             exact,
             members,
             consumables,
+            drivers,
         })
     }
 }

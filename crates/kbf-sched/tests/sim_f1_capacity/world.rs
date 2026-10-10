@@ -49,10 +49,16 @@ pub fn caps(node: Node) -> NodeCaps {
             for level in kbf_caps::X86Level::ALL.iter().take(3) {
                 report.extend(level.adds().iter().map(|f| ("cpu.features", *f)));
             }
-            NodeCaps::from_report(report).unwrap()
+            NodeCaps::from_report(report)
+                .unwrap()
+                .with_drivers(["container"])
         }
-        Node::LinuxArm => NodeCaps::from_report([("arch", "arm64"), ("os", "linux")]).unwrap(),
-        Node::Mac => NodeCaps::from_report([("arch", "arm64"), ("os", "macos")]).unwrap(),
+        Node::LinuxArm => NodeCaps::from_report([("arch", "arm64"), ("os", "linux")])
+            .unwrap()
+            .with_drivers(["container"]),
+        Node::Mac => NodeCaps::from_report([("arch", "arm64"), ("os", "macos")])
+            .unwrap()
+            .with_drivers(["native"]),
     }
 }
 
@@ -98,6 +104,7 @@ pub fn request(key: u64, qos: Qos, resources: Resources, platform: usize) -> Req
             action: digest(key),
         },
         qos,
+        kind: kbf_types::LeaseKind::Action,
         resources,
         hermetic: true,
         do_not_cache: false,

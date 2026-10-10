@@ -31,6 +31,7 @@ fn request(n: u64, platform: &[(&str, &str)]) -> Request {
             action: digest(n),
         },
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,
@@ -39,11 +40,15 @@ fn request(n: u64, platform: &[(&str, &str)]) -> Request {
 }
 
 fn linux() -> NodeCaps {
-    NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap()
+    NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .unwrap()
+        .with_drivers(["container"])
 }
 
 fn mac() -> NodeCaps {
-    NodeCaps::from_report([("arch", "arm64"), ("os", "macos")]).unwrap()
+    NodeCaps::from_report([("arch", "arm64"), ("os", "macos")])
+        .unwrap()
+        .with_drivers(["native"])
 }
 
 fn w(name: &str) -> WorkerId {
@@ -428,7 +433,8 @@ fn a_resent_report_changes_what_the_worker_matches() {
     assert_eq!(h.tick().len(), 1, "waits with a reason");
     let labelled =
         NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")])
-            .unwrap();
+            .unwrap()
+            .with_drivers(["native"]);
     let resend = Event::Capacity {
         worker: w("mac"),
         capacity: Resources::new(4_000, 8 * GIB),

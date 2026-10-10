@@ -34,7 +34,10 @@
 //! advertised for placement ([`ready`]): the driver reports one `xcode` entry per ready
 //! build ([`CAPABILITY`]), which `kbf-caps` matches by membership, so an action that
 //! names a build runs on any Mac that has it ready. [`crate::xcode_watch`] asks again
-//! every few minutes, so an Xcode a human fixes becomes ready without a restart.
+//! every few minutes, so an Xcode a human fixes becomes ready without a restart. The
+//! daemon does not wait for its first survey to say `Hello`: until that survey ends,
+//! each Xcode found is reported [`State::NotSurveyed`] ([`not_surveyed`]) and none is
+//! advertised, so nothing is placed on an Xcode no question has been asked of yet.
 //!
 //! An action names its Xcode with the platform property `xcode` (the name in any case,
 //! as the front reads it) and runs with `DEVELOPER_DIR` set to that Xcode, so `xcrun`,
@@ -103,6 +106,9 @@ pub enum State {
     /// Anything else: no build, no compiler, a check not answered in time, an app whose
     /// path does not resolve.
     Failed,
+    /// Found in the directory, not asked yet ([`not_surveyed`]): what the daemon
+    /// reports from its start until its first survey ends. Never advertised.
+    NotSurveyed,
 }
 
 /// One `Xcode*.app` in the searched directory, as [`survey`] found it.
@@ -136,7 +142,7 @@ impl Xcode {
             State::LicenseNotAccepted => ("sudo ", "-license accept"),
             State::FirstLaunchNotRun => ("sudo ", "-runFirstLaunch"),
             State::MetalToolchainMissing => ("", "-downloadComponent MetalToolchain"),
-            State::Ready | State::Failed => return None,
+            State::Ready | State::Failed | State::NotSurveyed => return None,
         };
         let xcodebuild = self.developer_dir.as_ref()?.join("usr/bin/xcodebuild");
         Some(format!("{sudo}{} {args}", shell_quoted(&xcodebuild)))
@@ -151,6 +157,7 @@ impl Xcode {
             State::FirstLaunchNotRun => XcodeState::FirstLaunchNotRun,
             State::MetalToolchainMissing => XcodeState::MetalToolchainMissing,
             State::Failed => XcodeState::Failed,
+            State::NotSurveyed => XcodeState::NotSurveyed,
         };
         XcodeStatus {
             app: self.app.display().to_string(),
@@ -217,39 +224,20 @@ impl Probe {
 /// Xcode is asked once (an app that is a link to another is reported with that one's
 /// answers), on a thread of its own and its questions at once, so the survey takes
 /// about as long as its slowest Xcode, not as long as all of them, but for the
-/// `xcrun` lookups, which run one at a time (see the module documentation): the node
-/// says nothing to the server until its first survey is done. With [`Probe::sandbox`], its directory is made
+/// `xcrun` lookups, which run one at a time (see the module documentation). It can
+/// take seconds, and up to [`ANSWER_WITHIN`] per lookup when one hangs, so the daemon
+/// runs it in the background and reports [`not_surveyed`] until it ends
+/// ([`crate::xcode_watch`]). With [`Probe::sandbox`], its directory is made
 /// first (every Xcode is [`State::Failed`], and nothing is run, when it cannot be)
 /// and removed when every Xcode has answered.
 #[must_use]
 pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
-    let Ok(entries) = std::fs::read_dir(apps) else {
-        return Vec::new();
-    };
-    let mut names: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name())
-        .filter(|name| {
-            name.to_str()
-                .is_some_and(|n| n.starts_with("Xcode") && n.ends_with(".app"))
-        })
-        .collect();
-    names.sort();
+    let found = found_in(apps);
     let sandbox = match probe.sandbox.as_ref().map(Sandbox::made).transpose() {
         Ok(sandbox) => sandbox,
-        Err(why) => {
-            let unasked = |name| Xcode {
-                app: apps.join(name),
-                developer_dir: None,
-                build: None,
-                state: State::Failed,
-                reason: why.clone(),
-            };
-            return names.into_iter().map(unasked).collect();
-        }
+        Err(why) => return unasked(found, State::Failed, &why),
     };
     let sandbox = sandbox.as_ref();
-    let found: Vec<PathBuf> = names.into_iter().map(|name| apps.join(name)).collect();
     // Each Xcode once: a link (`Xcode.app` to `Xcode_16.2.app`) gets the answers of the
     // app it leads to. One whose path does not resolve is asked alone, and fails.
     let reals: Vec<PathBuf> = found
@@ -291,6 +279,49 @@ pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
         let _ = kbf_outputs::remove_tree(&sandbox.dir);
     }
     found
+}
+
+/// Every `Xcode*.app` in `apps`, as [`survey`] would find them, none asked anything:
+/// each [`State::NotSurveyed`], with no `DEVELOPER_DIR` or build yet. It only reads the
+/// directory, so the daemon reports these at once, before its first survey ends.
+#[must_use]
+pub fn not_surveyed(apps: &Path) -> Vec<Xcode> {
+    unasked(
+        found_in(apps),
+        State::NotSurveyed,
+        "not surveyed yet: the daemon's first survey of its Xcodes has not ended",
+    )
+}
+
+/// Every `Xcode*.app` in `apps`, in name order; none when it cannot be read.
+fn found_in(apps: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(apps) else {
+        return Vec::new();
+    };
+    let mut names: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| {
+            name.to_str()
+                .is_some_and(|n| n.starts_with("Xcode") && n.ends_with(".app"))
+        })
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| apps.join(name)).collect()
+}
+
+/// `found`, none of them asked: each in `state`, for `why`.
+fn unasked(found: Vec<PathBuf>, state: State, why: &str) -> Vec<Xcode> {
+    found
+        .into_iter()
+        .map(|app| Xcode {
+            app,
+            developer_dir: None,
+            build: None,
+            state,
+            reason: why.to_owned(),
+        })
+        .collect()
 }
 
 /// The ready Xcodes of `xcodes`, by build, as their `DEVELOPER_DIR`s. Of two with one

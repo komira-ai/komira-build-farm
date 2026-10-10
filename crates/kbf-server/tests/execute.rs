@@ -9,7 +9,10 @@ use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_proto::reapi::{ActionResult, WaitExecutionRequest};
 use kbf_proto::worker::daemon_message;
 use kbf_proto::worker::server_message::Message;
-use support::{Blob, Cell, Job, done, done_within_quiet, failed, output, ran, response, stage};
+use support::{
+    Blob, Cell, FakeDaemon, Job, done, done_within_quiet, failed, hello_on, output, ran, response,
+    stage,
+};
 use tonic::Code;
 
 /// Runs `job` on `daemon` to completion and returns the result it reported.
@@ -597,16 +600,24 @@ async fn a_refused_operation_is_forgotten_after_the_retention() {
 }
 
 /// Catches: a `kbf-lease` kind dropped on the way to the `Start` (a whole-machine
-/// lease run as a shared one).
+/// lease run as a shared one); a whole-machine lease offered to a daemon whose drivers
+/// serve only actions (`mac-0` sorts first, so placement that ignores the kind offers
+/// it there); and one that books less than the whole daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_lease_kind_reaches_the_start() {
+async fn a_whole_machine_lease_starts_only_on_a_daemon_that_serves_it() {
     let cell = Cell::start().await;
-    let mut daemon = cell.daemon("mac-1", 4, 8).await;
+    let mut shared = cell.daemon("mac-0", 4, 8).await;
+    let report = [("arch", "arm64"), ("drivers", "native-whole-machine")];
+    let mut whole = FakeDaemon::connect(cell.worker_addr, hello_on("mac-1", 4, 8, &report))
+        .await
+        .expect("registered");
     let job = Job::new("whole", &[("kbf-lease", "whole_machine")]);
     cell.upload(&job.blobs()).await;
     let _ops = cell.execute(&job.action).await;
-    let offer = daemon.offer().await;
-    let start = daemon.start().await;
+    let offer = whole.offer().await;
+    let start = whole.start().await;
     assert_eq!(offer.kind, "whole_machine");
     assert_eq!(start.kind, "whole_machine");
+    assert_eq!((start.millicpus, start.memory_bytes), (4_000, 8 << 30));
+    shared.no_work().await;
 }

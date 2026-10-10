@@ -7,9 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, MemoryMetaLog};
-use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_front::Cache;
 use kbf_proto::worker::ServerMessage;
 use kbf_server::Farm;
 use kbf_server::farm::NodeAction;
@@ -689,18 +687,16 @@ fn the_memory_store_keeps_whole_changes_only() {
 /// accepted.
 #[tokio::test]
 async fn the_driver_runs_against_the_farm() {
-    let cache = Arc::new(Cache::new(
-        MemoryMetaLog::new(Retention::default()),
-        MemoryStore::new(Capabilities::default()),
-        KeyPrefix::default(),
-    ));
+    let cache = Arc::new(Cache::memory());
     let farm = Farm::new(
         cache,
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     );
     let (outbound, _responses) = tokio::sync::mpsc::unbounded_channel();
-    let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
+    let caps = NodeCaps::from_report([("arch", "x86_64")])
+        .expect("caps")
+        .with_drivers(["container"]);
     farm.register(
         &w("a"),
         kbf_sched::DaemonInstance::new("a"),

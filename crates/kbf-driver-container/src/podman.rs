@@ -34,6 +34,41 @@ pub(crate) const CONTAINER_OWNER: &str = "1:1";
 /// action's `0600` file or `0700` directory among them) and removes the scratch itself.
 pub(crate) const DAEMON_OWNER: &str = "0:0";
 
+/// The user every action runs as, inside the container: its root. Explicit, so the
+/// image's `USER` does not choose it; under `--userns=nomap` it is the daemon user's
+/// first subordinate id on the host ([`CONTAINER_OWNER`]).
+pub(crate) const CONTAINER_USER: &str = "0:0";
+
+/// The per-container limits every action's container is created with. Each is passed
+/// explicitly, so neither Podman's defaults nor a node's `containers.conf` changes what
+/// an action gets. (Without `--pids-limit`, rootless Podman 4.9 on the hosted runners
+/// left `pids.max` at `max`: no limit.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainerLimits {
+    /// `--pids-limit`: the container's `pids.max`, its tasks (threads included).
+    pub pids: u64,
+    /// `--shm-size`, in MiB: the size of the container's `/dev/shm` tmpfs.
+    pub shm_mib: u64,
+    /// `--ulimit=nofile=<n>:<n>`: `RLIMIT_NOFILE`, soft and hard. Rootless, it cannot
+    /// exceed the daemon's own hard limit.
+    pub nofile: u64,
+    /// `--ulimit=nproc=<n>:<n>`: `RLIMIT_NPROC`, soft and hard. The kernel counts it per
+    /// user, and every container's root is the same subordinate id, so it bounds the
+    /// processes of all the node's actions together, not one container's.
+    pub nproc: u64,
+}
+
+impl ContainerLimits {
+    /// 8192 pids, a 64 MiB `/dev/shm` (Podman's own default size), 65,536 open files
+    /// and 32,768 processes.
+    pub const DEFAULT: Self = Self {
+        pids: 8192,
+        shm_mib: 64,
+        nofile: 65_536,
+        nproc: 32_768,
+    };
+}
+
 /// The container to create for one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContainerSpec {
@@ -55,6 +90,7 @@ pub(crate) struct ContainerSpec {
     pub working_directory: String,
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
+    pub limits: ContainerLimits,
 }
 
 /// The `podman create` arguments for `spec`.
@@ -77,6 +113,16 @@ pub(crate) struct ContainerSpec {
 ///   reach (fleet-updates-security S4.3). Not `--userns=auto`: rootless, it gives the
 ///   first container 65,535 ids of a standard 65,536-id range and refuses a second
 ///   container while the first exists ("not enough unused IDs in user namespace").
+///   `--user=0:0` ([`CONTAINER_USER`]) whatever the image's `USER` says.
+/// - **Environment:** `--unsetenv-all`, then one `--env` per `Command` variable, so
+///   neither the image's `ENV`, Podman's defaults (`PATH`, `TERM`, `container`) nor a
+///   node's `containers.conf` `env` reaches the action. Podman (4.9) still adds two
+///   variables when the `Command` sets neither: `HOSTNAME=localhost` (the hostname
+///   above) and `HOME`, uid 0's home in the image's `/etc/passwd`. Both follow from
+///   the image digest, so they are the same on every node; a `Command` that sets
+///   either gets its own value.
+/// - **Limits:** `--pids-limit`, `--shm-size` and `--ulimit` for `nofile` and `nproc`
+///   from [`ContainerLimits`], so a node's `containers.conf` cannot change them.
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "create",
@@ -85,6 +131,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
         "--userns=nomap",
         "--hostname=localhost",
         "--cgroup-conf=memory.oom.group=1",
+        "--unsetenv-all",
     ]
     .into_iter()
     .map(OsString::from)
@@ -92,6 +139,12 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     args.push(format!("--name={}", spec.name).into());
     args.push(format!("--label={OWNER_LABEL}={}", spec.owner).into());
     args.push(format!("--cgroup-parent={}", spec.cgroup_parent).into());
+    args.push(format!("--user={CONTAINER_USER}").into());
+    let limits = spec.limits;
+    args.push(format!("--pids-limit={}", limits.pids).into());
+    args.push(format!("--shm-size={}m", limits.shm_mib).into());
+    args.push(format!("--ulimit=nofile={0}:{0}", limits.nofile).into());
+    args.push(format!("--ulimit=nproc={0}:{0}", limits.nproc).into());
     let entrypoint = serde_json::Value::from(spec.argv.clone());
     args.push(format!("--entrypoint={entrypoint}").into());
     let workdir = if spec.working_directory.is_empty() {
@@ -325,6 +378,12 @@ mod tests {
             working_directory: "pkg".to_owned(),
             env: vec![("PATH".to_owned(), "/bin".to_owned())],
             argv: vec!["sh".to_owned(), "-c".to_owned(), "echo \"a b\"".to_owned()],
+            limits: ContainerLimits {
+                pids: 101,
+                shm_mib: 102,
+                nofile: 103,
+                nproc: 104,
+            },
         }
     }
 
@@ -401,5 +460,37 @@ mod tests {
         let mut at_root = spec();
         at_root.working_directory.clear();
         assert!(strings(&create_args(&at_root)).contains(&"--workdir=/kbf/root".to_owned()));
+    }
+
+    /// Catches the image's `ENV`, Podman's default variables or a node's
+    /// `containers.conf` `env` reaching the action (the "drop `--unsetenv-all`"
+    /// mutant), and the image's `USER` choosing who the action runs as.
+    /// `tests/podman_env.rs` checks the environment inside on real Podman.
+    #[test]
+    fn only_the_commands_environment_and_a_fixed_user() {
+        let args = strings(&create_args(&spec()));
+        assert!(args.contains(&"--unsetenv-all".to_owned()), "{args:?}");
+        let env: Vec<_> = args.iter().filter(|a| a.starts_with("--env")).collect();
+        assert_eq!(env, ["--env=PATH=/bin"], "{args:?}");
+        let users: Vec<_> = args.iter().filter(|a| a.starts_with("--user=")).collect();
+        assert_eq!(users, ["--user=0:0"], "{args:?}");
+    }
+
+    /// Catches a limit left to Podman's defaults or a node's `containers.conf` (the
+    /// "drop `--pids-limit`" mutant, and the same for `/dev/shm` and each ulimit), and a
+    /// limit that is not the configured one.
+    #[test]
+    fn every_limit_is_explicit() {
+        let args = strings(&create_args(&spec()));
+        let named = |prefix: &str| -> Vec<&String> {
+            args.iter().filter(|a| a.starts_with(prefix)).collect()
+        };
+        assert_eq!(named("--pids-limit"), ["--pids-limit=101"], "{args:?}");
+        assert_eq!(named("--shm-size"), ["--shm-size=102m"], "{args:?}");
+        assert_eq!(
+            named("--ulimit"),
+            ["--ulimit=nofile=103:103", "--ulimit=nproc=104:104"],
+            "{args:?}"
+        );
     }
 }

@@ -28,6 +28,7 @@ fn request(n: u8) -> Request {
     Request {
         key: key("main", n),
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,
@@ -37,7 +38,9 @@ fn request(n: u8) -> Request {
 
 /// A Linux x86-64 node, as its report describes it.
 fn caps() -> NodeCaps {
-    NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap()
+    NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .unwrap()
+        .with_drivers(["container"])
 }
 
 fn ok(n: u8) -> Outcome {

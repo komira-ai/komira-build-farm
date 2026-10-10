@@ -1,7 +1,9 @@
 //! Raft's safety properties (Figure 3 of the paper), checked after every simulation
 //! step against what every node has done so far, and the effect-order contract they
 //! rest on: a message that promises durable state leaves only after that state is
-//! persisted.
+//! persisted. One more rule covers compaction: a snapshot folds in only entries the
+//! server has applied. (The harness keeps compaction under `compaction_floor`, so no
+//! peer ever needs a snapshot sent; the liveness check holds the leader to that.)
 
 use std::collections::BTreeMap;
 
@@ -28,6 +30,14 @@ pub enum Violation {
     UndurablePromise { server: ServerId, msg: Message },
     /// A server applied an index out of order.
     ApplyOrder { index: LogIndex, server: ServerId },
+    /// A server's core compacted through an entry its state machine has not applied
+    /// (`held` is what it applied at that index, if anything).
+    BadSnapshot {
+        server: ServerId,
+        base: LogId,
+        applied: LogIndex,
+        held: Option<LogId>,
+    },
 }
 
 /// What the run has shown so far.
@@ -83,6 +93,18 @@ impl Checker {
                         });
                     }
                 }
+                Observed::BadSnapshot {
+                    base,
+                    applied,
+                    held,
+                } => {
+                    return Err(Violation::BadSnapshot {
+                        server,
+                        base: *base,
+                        applied: *applied,
+                        held: *held,
+                    });
+                }
                 Observed::UndurablePromise { msg } => {
                     let msg = msg.clone();
                     return Err(Violation::UndurablePromise { server, msg });
@@ -136,13 +158,11 @@ impl Checker {
             return Ok(());
         }
         *compared = self.applied_version;
-        let log = core.entries();
         for (index, (entry, committed_by)) in &self.applied {
             if *committed_by >= term {
                 continue;
             }
-            let held = usize::try_from(index.0 - 1).ok().and_then(|i| log.get(i));
-            if held != Some(entry) {
+            if node.log_entry(*index) != Some(entry) {
                 return Err(Violation::LeaderCompleteness {
                     leader: server,
                     term,
@@ -151,5 +171,17 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    /// The highest index at which every node's disk holds an entry known to be
+    /// committed (applied somewhere), or has folded it into its snapshot. A leader
+    /// that compacts no further than this can bring every peer up to date by appends:
+    /// a peer's log matches the leader's through that entry.
+    pub fn compaction_floor<'a>(&self, nodes: impl Iterator<Item = &'a RaftNode>) -> LogIndex {
+        let committed = |e: &Entry| self.applied.get(&e.id.index).is_some_and(|(a, _)| a == e);
+        nodes
+            .map(|n| n.durable_committed(committed))
+            .min()
+            .unwrap_or_default()
     }
 }

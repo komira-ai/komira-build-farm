@@ -156,7 +156,8 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).expect("read a PEM file")
 }
 
-/// Catches: harness certificates the worker listener refuses, a daemon that does not
+/// Catches: harness certificates the worker listener refuses (for the session or for
+/// the blob calls the daemon makes there, its only CAS), a daemon that does not
 /// run leases (or runs them without uploading outputs), and a result that does not
 /// reach the action cache, so the repeat Execute is not a cache hit. Also a daemon
 /// that does not stop cleanly on SIGINT, which would leave `run.sh` a stray process.
@@ -197,7 +198,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         .args(["daemon", "--server"])
         .arg(format!("https://127.0.0.1:{}", worker_addr.port()))
         .arg("--cas")
-        .arg(format!("http://{reapi_addr}"))
+        .arg(format!("https://127.0.0.1:{}", worker_addr.port()))
         .args(["--ca-cert", &path("ca.pem")])
         .args(["--cert", &path("client.pem"), "--key", &path("client.key")])
         .arg("--scratch")
@@ -248,8 +249,10 @@ fn the_daemon_refuses_bad_flags() {
         missing,
     ];
     for (cas, why) in [
-        ("not a uri", "--cas"),
-        ("http://127.0.0.1:1", "missing.pem"),
+        ("not a uri", "must be an https:// URL"),
+        ("https://not a uri", "--cas"),
+        ("http://127.0.0.1:1", "must be an https:// URL"),
+        ("https://127.0.0.1:1", "missing.pem"),
     ] {
         let out = cell(&[&base[..], &["--cas", cas]].concat());
         assert_eq!(out.status.code(), Some(2), "{cas}");

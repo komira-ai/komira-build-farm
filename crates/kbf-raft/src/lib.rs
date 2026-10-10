@@ -10,9 +10,15 @@
 //!
 //! In scope here: leader election with randomized timeouts, log replication with the
 //! append consistency check, commit by a majority of voters for entries of the current
-//! term only, and learners that receive and apply the log without voting. Snapshots,
-//! membership changes, PreVote and CheckQuorum come later; the log is already kept
-//! relative to a snapshot base so snapshots need no change to its users.
+//! term only, learners that receive and apply the log without voting, and a snapshot
+//! base in the log: a core restores from a snapshot (its base id; the caller holds the
+//! state bytes) plus the entries after it, and compacts its log through an applied
+//! index ([`Raft::compact`]).
+//!
+//! Not in scope yet: sending a snapshot to a follower (InstallSnapshot). A follower
+//! that needs entries a leader has compacted away is reported by
+//! [`Raft::behind_base`] and not served. Membership changes, PreVote and CheckQuorum
+//! also come later.
 //!
 //! The specification is the Raft paper (<https://raft.github.io/raft.pdf>) and Diego
 //! Ongaro's dissertation. The crate keeps the pure-crate rules (no clock, sleep,
@@ -26,7 +32,7 @@ mod raft;
 mod types;
 
 pub use message::{AppendOutcome, Effect, Message, MessageKind};
-pub use raft::{NotLeader, Proposed, Raft, Role};
+pub use raft::{CompactError, NotLeader, Proposed, Raft, Role};
 pub use types::{
     Config, ConfigError, Entry, HardState, LogId, LogIndex, Membership, Payload, ServerId, Term,
 };

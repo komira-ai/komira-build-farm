@@ -152,6 +152,7 @@ fn hello(node: &str) -> daemon_message::Message {
             entry("arch", "x86_64"),
             entry("cpus", "1"),
             entry("mem_gib", "1"),
+            entry("drivers", "fake"),
         ],
         ..Hello::default()
     })
@@ -532,6 +533,7 @@ async fn a_revoked_daemon_cannot_report_its_status() {
     let api = Api {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
+        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");

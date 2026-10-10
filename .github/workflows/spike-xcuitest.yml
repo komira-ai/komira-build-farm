@@ -1,0 +1,86 @@
+# The XCUITest fixtures (tools/spike/macos/fixtures): checks the generated Xcode
+# projects, runs the pixel checker's selftest, then builds each fixture and runs its UI
+# tests, the iOS one on a simulator and the macOS one in the runner's login session.
+# This proves the instrument only: a hosted runner's privacy (TCC) grants may be
+# seeded, so a pass here says nothing about a fresh Mac. Each step prints
+# `SPIKE macos-<arch>.xcuitest.*` lines; read them with
+#   gh run view <run id> --log | grep ' SPIKE '
+# The .xcresult bundles and exported screenshots are uploaded as the run's artifact.
+# Run by hand, or on a pull request that changes this file or the fixtures.
+name: spike-xcuitest
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/spike-xcuitest.yml
+      - tools/spike/lib.sh
+      - tools/spike/macos/fixtures/**
+
+permissions: {}
+
+concurrency:
+  group: spike-xcuitest-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Linux: the generated projects match their generator, and the scripts pass shellcheck.
+  fixtures-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 tools/spike/macos/fixtures/gen_projects.py --check
+      - run: shellcheck -S warning tools/spike/macos/fixtures/*.sh
+
+  # Every step after the first two runs even if an earlier one failed, so one failure
+  # does not hide the other platform's result; any failed step still fails the job.
+  xcuitest-macos:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Host facts
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun simctl list runtimes
+      - name: Generated projects are current and parse
+        if: ${{ !cancelled() }}
+        run: |
+          cd tools/spike/macos/fixtures
+          python3 gen_projects.py --check
+          plutil -lint MacFixture.xcodeproj/project.pbxproj IOSFixture.xcodeproj/project.pbxproj
+          xcodebuild -list -project MacFixture.xcodeproj
+          xcodebuild -list -project IOSFixture.xcodeproj
+      - name: Pixel checker selftest
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/fixtures/selftest.sh "$RUNNER_TEMP/xcuitest"
+      - name: iOS UI tests on a simulator
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/fixtures/run.sh ios "$RUNNER_TEMP/xcuitest"
+      - name: macOS UI tests in the login session
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/fixtures/run.sh macos "$RUNNER_TEMP/xcuitest"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: xcuitest-results
+          path: |
+            ${{ runner.temp }}/xcuitest/*.xcresult
+            ${{ runner.temp }}/xcuitest/*-attachments
+            ${{ runner.temp }}/xcuitest/*-xcodebuild.log
+          retention-days: 7

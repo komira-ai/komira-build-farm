@@ -283,7 +283,9 @@ impl Node {
 }
 
 fn caps_of(report: &[(&'static str, String)]) -> NodeCaps {
-    NodeCaps::from_report(report.iter().map(|(k, v)| (*k, v.as_str()))).expect("valid report")
+    NodeCaps::from_report(report.iter().map(|(k, v)| (*k, v.as_str())))
+        .expect("valid report")
+        .with_drivers(["container"])
 }
 
 fn digest(n: u64) -> Digest {
@@ -800,6 +802,7 @@ impl World {
                 action: digest(number),
             },
             qos: Qos::Ci,
+            kind: kbf_types::LeaseKind::Action,
             resources,
             needs: kbf_caps::Request::from_platform(PLATFORMS[platform].0.iter().copied())
                 .expect("valid platform"),

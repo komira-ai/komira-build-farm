@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the container driver's real-Podman tests (crates/kbf-driver-container/tests/
-# podman.rs) on a GitHub-hosted runner, set up the way the T4 spike found works
-# (docs/spikes/hosted-runners.md):
+# podman.rs and podman_env.rs) on a GitHub-hosted runner, set up the way the T4 spike
+# found works (docs/spikes/hosted-runners.md):
 #
 # - a systemd user session for the runner user (lingering), so rootless Podman has a
 #   run directory;
@@ -54,7 +54,7 @@ if [ "docker.io/library/busybox@$manifest" = "$BUSYBOX" ]; then
 fi
 echo "busybox manifest for $arch: $manifest"
 
-cargo test -p kbf-driver-container --test podman --locked --no-run
+cargo test -p kbf-driver-container --test podman --test podman_env --locked --no-run
 
 sudo systemd-run --quiet --wait --collect --pipe --unit=kbf-podman-tests \
     --slice=kbf-daemon.slice -p Delegate=yes \

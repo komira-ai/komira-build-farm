@@ -205,3 +205,21 @@ async fn the_hello_carries_what_placement_matches() {
     assert!(mac.report(ran(start.lease_id, &built)).await.accepted);
     done(&mut ops).await;
 }
+
+/// Catches: a whole-machine lease offered to a daemon whose drivers serve only actions
+/// (that daemon refuses its `Start`), and one left waiting without saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_whole_machine_lease_waits_while_no_daemon_serves_it() {
+    let cell = Cell::start().await;
+    let mut linux = cell.daemon("node-b", 4, 8).await;
+    let job = Job::new("whole", &[("kbf-lease", "whole_machine")]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let first = next(&mut ops).await;
+    let why = waiting_reason(&first).expect("a reason from the start");
+    assert!(
+        why.contains("serves lease kind whole_machine") && why.contains("native-whole-machine"),
+        "{why}"
+    );
+    linux.no_work().await;
+}

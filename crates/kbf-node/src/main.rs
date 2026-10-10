@@ -3,11 +3,12 @@
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
 //! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
 //! `native` (plain processes; for Macs). The two real drivers read and write blobs
-//! through the front's REAPI listener named by `--cas`, and make lease directories
-//! under `--scratch`. A Mac in komira's pool runs, for example:
+//! over mutual TLS through the server's worker listener named by `--cas` (normally
+//! the same address as `--server`), with the daemon's own certificate, and make lease
+//! directories under `--scratch`. A Mac in komira's pool runs, for example:
 //!
 //! ```text
-//! kbf-daemon --driver native --server https://front:7070 --cas http://front:8980 \
+//! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
 //!   --scratch /var/kbf/leases --label pool=darwin-sized
 //! ```
@@ -48,9 +49,11 @@ struct Cli {
     /// How leases run.
     #[arg(long, value_enum)]
     driver: Driver,
-    /// The front's REAPI listener, `http://` or `https://` (which presents this
-    /// daemon's certificate), that the container and native drivers read and write
-    /// blobs through.
+    /// The server's worker listener, an `https://` URL (normally `--server`'s), that
+    /// the container and native drivers read and write blobs through, over mutual TLS
+    /// with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`.
+    /// Plain `http://` is refused: the worker listener admits each blob call by the
+    /// daemon's certificate.
     #[arg(long)]
     cas: Option<String>,
     /// The directory lease directories are made in (container and native drivers).
@@ -61,6 +64,21 @@ struct Cli {
     /// The daemon's delegated cgroup for actions, from the cgroup root (container).
     #[arg(long)]
     cgroup_parent: Option<String>,
+    /// Each container's `pids.max`: its tasks, threads included (container).
+    #[arg(long, default_value_t = 8192)]
+    container_pids_limit: u64,
+    /// The size of each container's `/dev/shm`, in MiB (container).
+    #[arg(long, default_value_t = 64)]
+    container_shm_mib: u64,
+    /// Each container's open-file limit, soft and hard (container). Rootless, it cannot
+    /// exceed the daemon's own hard limit.
+    #[arg(long, default_value_t = 65_536)]
+    container_nofile: u64,
+    /// The process limit, soft and hard, of each container's user (container). Every
+    /// container's root is the same host id, so it bounds all the node's actions
+    /// together.
+    #[arg(long, default_value_t = 32_768)]
+    container_nproc: u64,
     /// A lease's processes are killed past this percentage of its booked memory...
     #[arg(long, default_value_t = MemoryPolicy::DEFAULT.percent)]
     memory_limit_percent: u64,
@@ -76,6 +94,9 @@ struct Cli {
     /// actions' sandbox), is ready: it is reported as an `xcode` entry, and an action
     /// that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed
     /// in the node's status with why and the command that fixes it, and logged at WARN.
+    /// The daemon says Hello without waiting for its first survey, which runs in the
+    /// background: until it ends, each Xcode is listed as not surveyed yet and none is
+    /// reported.
     #[arg(long, default_value = xcode::APPLICATIONS)]
     xcode_apps: PathBuf,
     /// How often, in seconds, the Xcodes are asked again (native), so one fixed while
@@ -147,20 +168,23 @@ fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
     )?)
 }
 
-/// The daemon with the native driver, which surveys the Xcodes in `--xcode-apps` now
-/// and again every `--xcode-recheck-secs` and hands each changed survey to the daemon
-/// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or not.
+/// The daemon with the native driver, which surveys the Xcodes in `--xcode-apps` in
+/// the background, at once and again every `--xcode-recheck-secs`, and hands each
+/// changed survey to the daemon (`Daemon::with_driver_report`): without it the node
+/// reports no Xcode, ready or not. It does not wait for the first survey: until that
+/// ends, the daemon reports every Xcode found as not surveyed yet, and none as ready.
 fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
-    native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))
+    Ok(native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))?.0)
 }
 
 /// [`native`] with `config` and the `xcrun` it surveys with and warms (a test names
-/// its own user folders and sandbox, and an `xcrun` of its own).
+/// its own user folders and sandbox, and an `xcrun` of its own); also returns what the
+/// watch sends the daemon, for a test to follow.
 fn native_with(
     cli: &Cli,
     config: NativeConfig,
     xcrun: &Path,
-) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
+) -> Result<(Daemon<NativeRuntime<CasClient>>, Reports), Error> {
     let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
@@ -169,19 +193,29 @@ fn native_with(
     // Every question runs as an action does: xcrun reads and fills its cache, which
     // leases can write, only under the sandbox.
     probe.sandbox = Some(runtime.sandbox(kbf_driver_native::SURVEY_DIR));
-    // The first survey is applied before this returns.
-    let (driver, _) = xcode_watch::watch(
-        cli.xcode_apps.clone(),
-        probe,
-        every,
-        Box::new(move |xcodes| watched.apply_xcodes(xcodes)),
-    );
-    // In the background, sandboxed as an action: the node serves while xcrun fills its
-    // cache for the node's own Xcode and the ready ones; each later survey warms the
-    // Xcodes it makes ready.
-    let _ = runtime.warm_xcrun(xcrun, xcode::ANSWER_WITHIN);
-    Ok(daemon(cli, runtime)?.with_driver_report(driver))
+    let warm = xcrun.to_owned();
+    let warmed = std::sync::Once::new();
+    let apply = move |xcodes: &[xcode::Xcode]| {
+        let report = watched.apply_xcodes(xcodes);
+        // Once the first survey is applied, in the background and sandboxed as an
+        // action: xcrun fills its cache for the node's own Xcode and the ready ones
+        // while the node serves; each later survey warms the Xcodes it makes ready.
+        // Not before: the warm-up's lookups would make the survey's miss.
+        if xcodes.iter().all(|x| x.state != xcode::State::NotSurveyed) {
+            warmed.call_once(|| {
+                let _ = watched.warm_xcrun(&warm, xcode::ANSWER_WITHIN);
+            });
+        }
+        report
+    };
+    // Returns at once: the survey runs on the watch's thread.
+    let (driver, _) = xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
+    let daemon = daemon(cli, runtime)?.with_driver_report(driver.clone());
+    Ok((daemon, driver))
 }
+
+/// What the native driver's Xcode watch sends the daemon.
+type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
 /// Runs `daemon` until SIGTERM or SIGINT.
 fn serve<R: Runtime>(tokio: &tokio::runtime::Runtime, daemon: Daemon<R>) -> Result<(), Error> {
@@ -230,18 +264,22 @@ fn xcode_watch_args(cli: &Cli) -> (xcode::Probe, Duration) {
     (probe, Duration::from_secs(cli.xcode_recheck_secs.max(1)))
 }
 
-/// A client of the CAS `--cas` names. Connects on first use.
+/// A client of the blob service `--cas` names, over mutual TLS with the daemon's own
+/// TLS files. Connects on first use.
 fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
     let url = cli
         .cas
         .clone()
         .ok_or("--cas is required by the container and native drivers")?;
-    let mut endpoint = Endpoint::from_shared(url.clone())?;
-    if url.starts_with("https://") {
-        endpoint = endpoint.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
-    } else if !url.starts_with("http://") {
-        return Err(format!("--cas {url:?} must be an http:// or https:// URL").into());
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "--cas {url:?} must be an https:// URL: the server's worker listener, which \
+             serves blobs over mutual TLS only"
+        )
+        .into());
     }
+    let endpoint =
+        Endpoint::from_shared(url)?.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
     Ok(CasClient::new(endpoint.connect_lazy()))
 }
 
@@ -249,7 +287,9 @@ fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
 mod container {
     use std::sync::Arc;
 
-    use kbf_driver_container::{IdFiles, OutputLimits, PodmanConfig, PodmanRuntime};
+    use kbf_driver_container::{
+        ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime,
+    };
 
     use super::{Cli, Error, cas_client, daemon, scratch, serve};
 
@@ -272,8 +312,19 @@ mod container {
             max_bytes: cli.outputs.max_bytes,
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
+        config.limits = limits(cli);
         let runtime = PodmanRuntime::new(config, Arc::new(cas_client(cli)?))?;
         serve(tokio, daemon(cli, Arc::new(runtime))?)
+    }
+
+    /// The `--container-*` limits.
+    pub(super) fn limits(cli: &Cli) -> ContainerLimits {
+        ContainerLimits {
+            pids: cli.container_pids_limit,
+            shm_mib: cli.container_shm_mib,
+            nofile: cli.container_nofile,
+            nproc: cli.container_nproc,
+        }
     }
 }
 
@@ -287,10 +338,30 @@ mod container {
 }
 
 #[cfg(test)]
+mod startup_tests;
+
+#[cfg(test)]
 mod tests {
+    use kbf_daemon::DriverReport;
     use kbf_proto::worker::XcodeState;
 
     use super::*;
+
+    /// The first report the watch sends with no Xcode left not surveyed, waited for up
+    /// to a minute.
+    pub(crate) async fn surveyed(reports: &mut Reports) -> DriverReport {
+        let pending = |r: &DriverReport| {
+            r.xcodes
+                .iter()
+                .any(|x| x.state() == XcodeState::NotSurveyed)
+        };
+        let surveyed = reports.wait_for(|r| !pending(r));
+        tokio::time::timeout(Duration::from_secs(60), surveyed)
+            .await
+            .expect("the first survey ends in time")
+            .expect("the watch runs")
+            .clone()
+    }
 
     fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
         let base = [
@@ -353,8 +424,36 @@ mod tests {
         assert!(native_config(&missing).is_err());
     }
 
+    /// Catches a `--container-*` flag that does not reach the driver's limits, and a
+    /// flag default that differs from the driver's documented
+    /// `ContainerLimits::DEFAULT`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_limit_flags_reach_the_configuration() {
+        use kbf_driver_container::ContainerLimits;
+        let cli = parse(&[
+            "--driver=container",
+            "--container-pids-limit=11",
+            "--container-shm-mib=12",
+            "--container-nofile=13",
+            "--container-nproc=14",
+        ])
+        .expect("flags");
+        assert_eq!(
+            container::limits(&cli),
+            ContainerLimits {
+                pids: 11,
+                shm_mib: 12,
+                nofile: 13,
+                nproc: 14,
+            }
+        );
+        let defaults = parse(&["--driver=container"]).expect("flags");
+        assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
+    }
+
     /// A fresh directory for one test, under the test binary's directory.
-    fn scratch(name: &str) -> PathBuf {
+    pub(crate) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::current_exe()
             .expect("test binary")
             .parent()
@@ -387,7 +486,7 @@ mod tests {
     /// so the node's `NodeStatus` lists no Xcode at all, ready or not, and its Hello
     /// advertises none: the silent removal an Xcode that is not ready must never get.
     /// The Xcode here is an empty app, which no `xcodebuild` accepts (on Linux there is
-    /// none), so it is listed as not ready, with why.
+    /// none), so the survey lists it as not ready, with why.
     #[tokio::test]
     async fn the_native_daemon_reports_every_installed_xcode() {
         let dir = scratch("native");
@@ -404,7 +503,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             flag("scratch", &dir.join("leases")),
             flag("xcode-apps", &apps),
         ])
@@ -412,21 +511,26 @@ mod tests {
         let mut config = native_config(&cli).expect("config");
         // Not the runner's own (on macOS): the start sweeps them.
         config.user_folders = None;
-        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
+        let (daemon, mut reports) =
+            native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
+        // Not surveyed yet, or already surveyed (this one fails at once): either way
+        // listed. The gated tests (xcode_watch, startup_tests) hold the survey.
+        let listed = daemon.node_status().xcodes;
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].app, app.display().to_string());
+        let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].app, app.display().to_string());
         assert_eq!(xcodes[0].state(), XcodeState::Failed);
         assert!(!xcodes[0].reason.is_empty(), "{xcodes:?}");
-        drop(daemon);
+        drop((daemon, reports));
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
     /// Catches (CEO decision on issue #164): the native daemon removing `xcrun`'s cache
     /// before its first survey. Every `xcrun` lookup of the survey then has nothing
-    /// cached and takes seconds, while the node says nothing to the server: on the
-    /// macOS runner (15 `Xcode*.app`) that start took over the 30 s binary.rs allows,
-    /// against about 7 s with the cache kept. The survey runs under the sandbox, so
+    /// cached and takes seconds, while no Xcode is ready: on the macOS runner (15
+    /// `Xcode*.app`) that survey took over 30 s, against about 7 s with the cache kept. The survey runs under the sandbox, so
     /// what a lease wrote there reaches only sandboxed tools. The Xcode's own
     /// `xcodebuild` is a fake that answers a build saying whether it saw the cache.
     #[tokio::test]
@@ -461,7 +565,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             flag("scratch", &dir.join("leases")),
             flag("xcode-apps", &apps),
         ])
@@ -469,15 +573,16 @@ mod tests {
         let mut config = native_config(&cli).expect("config");
         config.user_folders =
             kbf_driver_native::user_folders::UserFolders::new(temp.clone(), cache);
-        let daemon = native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
+        let (daemon, mut reports) =
+            native_with(&cli, config, &dir.join("no-xcrun")).expect("the native daemon");
+        let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].build, "CACHE", "{xcodes:?}");
         assert!(
             temp.join("xcrun_db").exists(),
             "the start removed the cache"
         );
-        drop(daemon);
+        drop((daemon, reports));
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
@@ -487,7 +592,10 @@ mod tests {
     /// the daemon warms. The sandbox program is a fake that marks what it runs; the
     /// Xcode's `xcodebuild` and the `xcrun` are fakes that log each run and whether it
     /// was marked. The warm-up of the Xcode the survey finds ready runs too, also
-    /// sandboxed; the test waits for it to end.
+    /// sandboxed; the test waits for it to end. Also catches the warm-up not run, or
+    /// run before the survey's questions are answered (its lookups would make the
+    /// survey's miss): the fake `xcodebuild` answers after half a second, so a warm-up
+    /// started with the daemon logs before it.
     #[tokio::test]
     async fn the_daemons_survey_runs_under_the_sandbox() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -515,7 +623,7 @@ mod tests {
             .join(xcode::XCODEBUILD);
         write(
             &xcodebuild,
-            &format!("#!/bin/sh\n{logged}echo 'Build version 1A1'\n"),
+            &format!("#!/bin/sh\nsleep 0.5\n{logged}echo 'Build version 1A1'\n"),
         );
         let xcrun = dir.join("bin/xcrun");
         write(&xcrun, &format!("#!/bin/sh\n{logged}echo /x/clang\n"));
@@ -528,7 +636,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
-            "--cas=http://127.0.0.1:1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
             flag("scratch", &dir.join("leases")),
             flag("xcode-apps", &apps),
         ])
@@ -537,8 +645,8 @@ mod tests {
         // Not the runner's own (on macOS): the start sweeps them.
         config.user_folders = None;
         config.isolation = kbf_driver_native::network::Isolation::Sandbox(sandbox_exec);
-        let daemon = native_with(&cli, config, &xcrun).expect("the native daemon");
-        let xcodes = daemon.node_status().xcodes;
+        let (daemon, mut reports) = native_with(&cli, config, &xcrun).expect("the native daemon");
+        let xcodes = surveyed(&mut reports).await.xcodes;
         assert_eq!(xcodes.len(), 1, "{xcodes:?}");
         assert_eq!(xcodes[0].state(), XcodeState::Ready, "{xcodes:?}");
         let leases = std::fs::canonicalize(dir.join("leases")).expect("real");
@@ -552,6 +660,21 @@ mod tests {
             .for_each(|_| std::thread::sleep(Duration::from_millis(20)));
         let ran = std::fs::read_to_string(&log).expect("ran");
         let at = |lease: &Path, what: &str| format!("{} {what}", lease.display());
+        let warmed = format!("xcrun {}", at(&warm, ""));
+        let asked = at(&survey, "");
+        assert!(
+            ran.lines().any(|l| l.starts_with(&warmed)),
+            "no warm-up: {ran}"
+        );
+        let asked_first = ran
+            .lines()
+            .take_while(|l| !l.starts_with(&warmed))
+            .filter(|l| l.contains(&asked))
+            .count();
+        assert_eq!(
+            asked_first, 4,
+            "the warm-up ran before the survey's answers: {ran}"
+        );
         // The survey's questions, asked at once, come before the warm-up's lookups.
         let mut surveyed: Vec<String> = ran
             .lines()
@@ -580,22 +703,27 @@ mod tests {
             .filter(|l| !l.contains(&*leases.to_string_lossy()))
             .collect();
         assert_eq!(unsandboxed, Vec::<&str>::new(), "{ran}");
-        drop(daemon);
+        drop((daemon, reports));
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
-    /// Catches: a CAS URL of another scheme accepted, and `--cas` not required.
+    /// Catches: a plain-text `--cas` accepted (the daemon would send blobs where no
+    /// certificate admits them, or fall back to an unauthenticated port), a CAS URL of
+    /// another scheme accepted, `--cas` not required, and an https URL that does not
+    /// read the daemon's own TLS files.
     #[tokio::test]
-    async fn the_cas_url_must_be_http_or_https() {
-        let http = parse(&["--driver=native", "--cas=http://front:8980"]).expect("flags");
-        assert!(cas_client(&http).is_ok());
-        let other = parse(&["--driver=native", "--cas=ftp://front"]).expect("flags");
-        let why = cas_client(&other).expect_err("ftp").to_string();
-        assert!(why.contains("must be an http"), "{why}");
+    async fn the_cas_url_must_be_https() {
+        for url in ["http://front:8981", "ftp://front", "front:8981"] {
+            let cli = parse(&["--driver=native", &format!("--cas={url}")]).expect("flags");
+            let why = cas_client(&cli).expect_err(url).to_string();
+            assert!(why.contains("must be an https:// URL"), "{url}: {why}");
+        }
         let none = parse(&["--driver=native"]).expect("flags");
-        assert!(cas_client(&none).is_err());
+        let why = cas_client(&none).expect_err("no --cas").to_string();
+        assert!(why.contains("--cas is required"), "{why}");
         // https reads the daemon's TLS files, which these flags name but do not hold.
-        let https = parse(&["--driver=native", "--cas=https://front:8980"]).expect("flags");
-        assert!(cas_client(&https).is_err());
+        let https = parse(&["--driver=native", "--cas=https://front:8981"]).expect("flags");
+        let why = cas_client(&https).expect_err("no TLS files").to_string();
+        assert!(why.contains("ca.pem"), "{why}");
     }
 }

@@ -23,6 +23,7 @@ fn request() -> Request {
             action: Digest::new(DigestFunction::Sha256, [7; 32], 7),
         },
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         hermetic: true,
         do_not_cache: false,
@@ -39,7 +40,9 @@ fn feed(s: &mut Scheduler, now: Duration, event: Event) -> Vec<Effect> {
 }
 
 fn up(s: &mut Scheduler, now: Duration, instance: &str) {
-    let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).expect("caps");
+    let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
     let event = Event::WorkerUp {
         worker: WorkerId::new("node-a"),
         instance: DaemonInstance::new(instance),
