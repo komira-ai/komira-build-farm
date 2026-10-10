@@ -1,4 +1,5 @@
-//! FastCDC content-defined chunking for large blobs (RFC section 9.4).
+//! FastCDC content-defined chunking for large blobs
+//! (`docs/design/storage.md#segments`).
 //!
 //! The algorithm is FastCDC (Xia et al., USENIX ATC 2016): a gear rolling hash, cut
 //! points skipped below the minimum size, and normalized chunking at level 1 (a harder

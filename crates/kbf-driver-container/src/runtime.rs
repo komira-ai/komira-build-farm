@@ -1,6 +1,7 @@
 //! [`PodmanRuntime`]: one action, one fresh rootless Podman container, never reused.
 //!
-//! Each lease goes through the six driver steps (RFC 10.1):
+//! Each lease goes through the six driver steps
+//! (`docs/design/daemon.md#the-container-driver`):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
 //!    input root into the lease's scratch directory, refuse outputs that are inputs,
 //!    give the overlay's directories to the container's root (a subordinate id, see
@@ -71,7 +72,7 @@ pub struct PodmanConfig {
     pub cgroup_parent: String,
     /// The timeout of an action that names none.
     pub default_timeout: Duration,
-    /// How long a container gets after SIGTERM before `cgroup.kill` (RFC 10.10).
+    /// How long a container gets after SIGTERM before `cgroup.kill`.
     pub kill_grace: Duration,
     /// How much output one action may leave; past it, the action fails.
     pub outputs: OutputLimits,
@@ -88,7 +89,7 @@ pub struct PodmanConfig {
 
 impl PodmanConfig {
     /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
-    /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace,
+    /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`ContainerLimits::DEFAULT`] and
     /// [`SwapKill::DEFAULT`].
     #[must_use]
@@ -487,7 +488,7 @@ impl<C: Cas> PodmanRuntime<C> {
         }
     }
 
-    /// The kill path (RFC 10.10): SIGTERM, the grace period, `cgroup.kill`, then the
+    /// The kill path: SIGTERM, the grace period, `cgroup.kill`, then the
     /// grace period again for Podman to notice. Returns once `podman start` has ended.
     async fn stop_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
         let grace = self.config.kill_grace;

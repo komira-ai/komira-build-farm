@@ -6,7 +6,8 @@ use std::time::Duration;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 /// T: a daemon fences its leases this long after the newest acknowledged heartbeat
-/// (RFC 5.8). The scheduler re-dispatches after G = 60 s; safety needs T + 5 s < G.
+/// (`docs/design/scheduler.md#fencing-g-and-t`). The scheduler re-dispatches after
+/// G = 60 s; safety needs T + 5 s < G.
 pub const FENCE_AFTER: Duration = Duration::from_secs(40);
 
 /// How long the daemon waits at most before it compares the fence with the

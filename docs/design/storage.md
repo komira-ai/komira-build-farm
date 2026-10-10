@@ -239,6 +239,25 @@ paging) and every capability it claims. A backend is trusted only once it passes
 runs the suite against the in-memory store and against MinIO and RustFS containers,
 each with a plain bucket and an Object Lock bucket.
 
+## Capabilities
+
+`GetCapabilities` answers with `kbf_front::server_capabilities`, which reads no farm
+state: the answer depends only on whether the front also serves `Execution`, which is
+fixed when the service is made. The call is authorized against the request's instance
+name like any other, and a refusal fails it rather than answering with empty
+capabilities.
+
+| Field | Value |
+|---|---|
+| digest functions | SHA-256 only |
+| `action_cache_update_capabilities.update_enabled` | `false`: only the daemon path writes the action cache ([The closure check](#the-closure-check)) |
+| cache priorities | one range, `[0, 0]`: retention follows the last touch alone ([Retention and touches](#retention-and-touches)), so a priority is accepted and changes nothing |
+| `max_batch_total_size_bytes` | 4 MiB (`MAX_BATCH_TOTAL_BYTES`) |
+| symlink absolute path strategy | `ALLOWED` |
+| compressors | none (zstd is **planned**, below) |
+| API versions | 2.0 to 2.3 |
+| execution (only with `Execution`) | enabled, SHA-256; no execution priorities and no node properties advertised. QoS is never a property ([scheduler.md](scheduler.md#qos)) |
+
 ## Planned
 
 - **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's

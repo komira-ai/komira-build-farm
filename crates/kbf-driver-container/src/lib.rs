@@ -1,5 +1,6 @@
 //! The container driver for `kbf-daemon`: runs each `action` lease in a fresh rootless
-//! Podman container, behind the daemon's `Runtime` trait (RFC section 10).
+//! Podman container, behind the daemon's `Runtime` trait
+//! (`docs/design/daemon.md#the-container-driver`).
 //!
 //! What one lease gets:
 //! - the image named by digest in the action's `container-image` platform property

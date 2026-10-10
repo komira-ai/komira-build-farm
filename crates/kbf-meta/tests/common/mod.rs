@@ -45,7 +45,7 @@ pub fn at(d: Duration) -> FarmTime {
     FarmTime::from_millis(0).saturating_add(d)
 }
 
-/// A state with the RFC retention (7 days, a 1-day touch quantum, 30-day actions) and
+/// A state with the default retention (7 days, a 1-day touch quantum, 30-day actions) and
 /// [`EPOCH`] allocated.
 pub fn meta() -> MetaState {
     let mut m = MetaState::new(Retention::default());

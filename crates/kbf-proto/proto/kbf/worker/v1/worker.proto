@@ -341,7 +341,7 @@ message ResultAck {
 }
 
 // What one action used, as the runtime that ran it measured it: an input to
-// accounting (RFC 5.9). The daemon carries it in the action's
+// accounting (docs/design/scheduler.md#accounting). The daemon carries it in the action's
 // `ActionResult.execution_metadata.auxiliary_metadata`, as an `Any` whose type URL is
 // `type.googleapis.com/kbf.worker.v1.ResourceUsage`, so it travels with the result to
 // the server and into the action cache. Zero in a field means not measured.

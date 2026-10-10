@@ -188,7 +188,8 @@ pub struct Retention {
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl Default for Retention {
-    /// The RFC constants: 7 days, touched at most once a day, actions kept 30 days.
+    /// The defaults (`docs/design/storage.md#retention-and-touches`): 7 days, touched at
+    /// most once a day, actions kept 30 days.
     fn default() -> Self {
         Self {
             min_ttl: DAY.saturating_mul(7),

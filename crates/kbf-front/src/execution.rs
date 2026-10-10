@@ -1,6 +1,7 @@
 //! `Execution`: Execute and WaitExecution, over the cache and a [`Dispatch`].
 //!
-//! Execute follows RFC section 5.3, steps 3 to 7:
+//! Execute does steps 1 to 3 of `ARCHITECTURE.md#executing-an-action`, then streams the
+//! operation:
 //! - the action cache is checked first (with the closure check, unless the client set
 //!   `skip_cache_lookup`); a hit answers at once, `cached_result` set, and nothing runs;
 //! - the `Action`, its `Command` and its whole input tree must be in the CAS; every blob
@@ -87,7 +88,8 @@ use crate::cache::{Cache, CacheError};
 use crate::meta_log::MetaLog;
 use crate::wire;
 
-/// The reserved platform key that names the lease kind (RFC 3.4).
+/// The reserved platform key that names the lease kind
+/// (`docs/platform-properties.md#kbf-lease`).
 pub const LEASE_KIND_KEY: &str = "kbf-lease";
 
 /// The lease kinds a request may name. The default is the first.

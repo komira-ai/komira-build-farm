@@ -1,5 +1,5 @@
 //! The Podman command line: the flags every action's container is created with, and
-//! the few Podman verbs the driver uses. The daemon decides; Podman executes (RFC 10.2).
+//! the few Podman verbs the driver uses. The daemon decides; Podman executes.
 //!
 //! Every invocation passes `--cgroup-manager=cgroupfs`: the daemon owns the delegated
 //! cgroup subtree, not the user's systemd.
@@ -98,9 +98,9 @@ pub(crate) struct ContainerSpec {
 /// - **Owner:** `--label=kbf.owner=<owner>`, which a restarted daemon's sweep looks
 ///   for ([`OWNER_LABEL`]).
 /// - **Network:** `--network=none`, loopback only. No REAPI action gets a network.
-/// - **Image:** `--pull=never`; nodes never pull at action time (RFC 10.7).
+/// - **Image:** `--pull=never`; nodes never pull at action time.
 /// - **Entrypoint:** the action's argv as a JSON array, so the image's `ENTRYPOINT`
-///   and `CMD` are both ignored (RFC 10.5) and no argument is re-split.
+///   and `CMD` are both ignored and no argument is re-split.
 /// - **Files:** the input root as an overlay: the host copy is never written, and
 ///   every write lands in `upper`, which the driver reads outputs from (no output may
 ///   already be an input, so each is whole there).

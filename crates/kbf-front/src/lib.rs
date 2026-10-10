@@ -9,7 +9,8 @@
 //! [`Cache::memory`] runs them in this process ([`MemoryMetaLog`] and the fake store),
 //! and the replicated log and the S3 store slot in behind the same traits.
 //!
-//! The promises the services keep (RFC sections 3.5 and 9):
+//! The promises the services keep (`ARCHITECTURE.md#cache-traffic` and
+//! `docs/design/storage.md`):
 //! - **FindMissingBlobs never omits a digest.** A digest that does not parse fails the
 //!   call; a blob held at an unreachable object is reported missing.
 //! - **Present means durable.** A blob is reported present, and an upload acknowledged,
@@ -21,7 +22,8 @@
 //! - **Clients never write the action cache:** `UpdateActionResult` is
 //!   PERMISSION_DENIED.
 //! - **Work never run:** Execute answers a hit from the action cache and joins a
-//!   running twin before anything is queued (RFC 5.3).
+//!   running twin before anything is queued
+//!   (`ARCHITECTURE.md#executing-an-action`).
 //!
 //! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
 //! call ([`routes_with_authorizers`]; which call asks which is on each service and in
@@ -72,9 +74,9 @@ pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 
 /// The largest blob the cache accepts. A ByteStream Write is held in memory until it
 /// is verified, so without a cap a client could make the front buffer whatever size
-/// its resource name claims. Chunked uploads (RFC section 9.4) come later and will
-/// stream larger blobs instead; until then anything bigger is refused before a byte
-/// is buffered.
+/// its resource name claims. Chunked uploads (planned,
+/// `docs/design/storage.md#segments`) come later and will stream larger blobs instead;
+/// until then anything bigger is refused before a byte is buffered.
 pub const MAX_BLOB_BYTES: u64 = 1 << 30;
 
 /// The most data in one ByteStream `ReadResponse`.

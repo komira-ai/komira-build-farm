@@ -32,7 +32,7 @@ async fn get(farm: &Farm, action: &Blob) -> Result<ActionResult, Code> {
 }
 
 /// Catches: a client `UpdateActionResult` that is accepted, which would let any client
-/// put a result of its choosing in front of everyone (RFC 16.2); and a refused
+/// put a result of its choosing in front of everyone; and a refused
 /// daemon-path write by a client that still stores its result blob.
 #[tokio::test]
 async fn client_update_action_result_is_refused() {

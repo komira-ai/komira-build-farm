@@ -281,7 +281,8 @@ async fn do_not_cache_is_neither_joined_nor_cached() {
 }
 
 /// Catches: a failing action (non-zero exit) written to the action cache, which would
-/// answer every later build with the failure (RFC 5.8: failures are not cached).
+/// answer every later build with the failure (`docs/design/scheduler.md#outcomes`: a
+/// failure is not cached).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_action_is_answered_but_not_cached() {
     let cell = Cell::start().await;
@@ -297,14 +298,15 @@ async fn a_failing_action_is_answered_but_not_cached() {
 }
 
 /// Catches: an attempt's failure passed to the callers as the daemon's status rather
-/// than the RFC's (INTERNAL for the farm's failure, DEADLINE_EXCEEDED for a timeout);
-/// an INVALID_ARGUMENT (the action's own fault, such as an image named by tag) turned
-/// into INTERNAL, which a client retries, or answered without the daemon's reason; a
-/// failed attempt placed again instead of answered (each case's Start must name its
-/// own action); an OK result whose outputs were never uploaded, or that carries no result at all,
-/// accepted as a result (callers would get files nobody can fetch); a failed attempt
-/// that also carries a valid `ActionResult` taken as completed (the protocol sets
-/// `action_result` only with OK); and a failure written to the action cache.
+/// than the status `docs/design/scheduler.md#outcomes` names (INTERNAL for the farm's
+/// failure, DEADLINE_EXCEEDED for a timeout); an INVALID_ARGUMENT (the action's own
+/// fault, such as an image named by tag) turned into INTERNAL, which a client retries,
+/// or answered without the daemon's reason; a failed attempt placed again instead of
+/// answered (each case's Start must name its own action); an OK result whose outputs
+/// were never uploaded, or that carries no result at all, accepted as a result (callers
+/// would get files nobody can fetch); a failed attempt that also carries a valid
+/// `ActionResult` taken as completed (the protocol sets `action_result` only with OK);
+/// and a failure written to the action cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_attempts_answer_with_the_rfc_codes() {
     let cell = Cell::start().await;

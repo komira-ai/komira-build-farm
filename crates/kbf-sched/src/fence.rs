@@ -26,10 +26,11 @@ pub const LEASE_GRACE: Duration = Duration::from_secs(60);
 /// How long after sending a lease's `Start` the scheduler keeps the lease while the
 /// worker's heartbeats leave it out of their running set. Until then the `Start` may
 /// still be on its way, and a heartbeat sent before it arrived rightly omits it; after
-/// that the lease is taken as lost and its operation requeued. RFC section 5.8 has one
-/// wait before re-dispatch, G; this is G, counted from the `Start`. It assumes a `Start`
-/// that arrives later than that is not run: a worker that refuses a `Start` older than
-/// [`START_VALIDITY`] makes it hold.
+/// that the lease is taken as lost and its operation requeued. The fence
+/// (`docs/design/scheduler.md#fencing-g-and-t`) has one wait before re-dispatch, G;
+/// this is G, counted from the `Start`. It assumes a `Start` that arrives later than
+/// that is not run: a worker that refuses a `Start` older than [`START_VALIDITY`] makes
+/// it hold.
 pub const START_GRACE: Duration = LEASE_GRACE;
 
 /// T: how long after sending its newest acknowledged heartbeat a worker keeps running a
@@ -39,8 +40,9 @@ pub const SELF_FENCE: Duration = Duration::from_secs(40);
 /// The slack the safety argument keeps between T and G.
 pub const LEADER_LEASE_MARGIN: Duration = Duration::from_secs(5);
 
-// The safety condition of RFC section 5.8. Changing a constant so that it fails is a
-// compile error, not a silent overlap of two runs.
+// The safety condition `T + 5 s < G` (`docs/design/scheduler.md#fencing-g-and-t`).
+// Changing a constant so that it fails is a compile error, not a silent overlap of two
+// runs.
 const _: () =
     assert!(SELF_FENCE.as_millis() + LEADER_LEASE_MARGIN.as_millis() < LEASE_GRACE.as_millis());
 
