@@ -60,13 +60,18 @@ impl Harness {
 
     /// Registers `name` with 8 cores and 16 GiB, running `drivers`.
     fn worker(&mut self, name: &str, drivers: &[&str]) {
+        self.worker_of(name, drivers, CAPACITY);
+    }
+
+    /// Registers `name` with `capacity`, running `drivers`.
+    fn worker_of(&mut self, name: &str, drivers: &[&str], capacity: Resources) {
         let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
             .unwrap()
             .with_drivers(drivers.iter().copied());
         self.feed(Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
-            capacity: CAPACITY,
+            capacity,
             caps,
         });
     }
@@ -163,13 +168,15 @@ fn each_kind_goes_only_to_a_worker_whose_driver_serves_it() {
 
 /// Catches: a whole-machine lease offered to workers that do not serve it (the daemon
 /// refuses its `Start`, as every daemon on `main` does), and one waiting without
-/// saying why. A worker that reports no driver at all serves nothing.
+/// saying why, or said to wait for a cordoned worker that does not serve it either. A
+/// worker that reports no driver at all serves nothing.
 #[test]
 fn a_whole_machine_lease_waits_while_no_live_worker_serves_it() {
     let mut h = Harness::new();
     h.worker("a", &["container"]);
     h.worker("b", &["native"]);
     h.worker("c", &[]);
+    h.feed(Event::Cordon { worker: w("a") });
     h.submit(1, whole(1));
     let (grants, reasons) = h.tick();
     assert!(grants.is_empty(), "{grants:?}");
@@ -178,13 +185,66 @@ fn a_whole_machine_lease_waits_while_no_live_worker_serves_it() {
     };
     assert_eq!(
         why,
-        "none of the 3 live worker(s) serves lease kind whole_machine: that needs a driver \
+        "none of the 2 live worker(s) serves lease kind whole_machine: that needs a driver \
          among native-whole-machine"
     );
 
     h.submit(2, action(2));
     let [grant] = h.grants().try_into().unwrap();
-    assert_ne!(grant.worker, w("c"), "an action on a worker with no driver");
+    assert_eq!(grant.worker, w("b"), "an action on a worker with no driver");
+}
+
+/// Catches: the platform checked against workers that do not serve the kind, so the
+/// reason names a closest worker that could never run the lease.
+#[test]
+fn a_platform_miss_is_explained_among_the_workers_that_serve_the_kind() {
+    let mut h = Harness::new();
+    h.worker("a", &["container"]);
+    h.worker("b", &["native-whole-machine"]);
+    let mac = kbf_caps::Request::parse([("os", "macos")]).unwrap();
+    h.submit(
+        1,
+        Request {
+            needs: mac,
+            ..whole(1)
+        },
+    );
+    let (grants, reasons) = h.tick();
+    assert!(grants.is_empty(), "{grants:?}");
+    let [why] = reasons.as_slice() else {
+        panic!("{reasons:?}");
+    };
+    assert_eq!(
+        why,
+        "none of the 1 live worker(s) serving lease kind whole_machine satisfies the \
+         action's platform; the closest, b, lacks os=macos"
+    );
+}
+
+/// Catches: two waiting whole-machine leases holding the same worker (the second then
+/// holds nothing back and is passed by every younger action), and a hold on a worker
+/// too small to ever run the lease. A third, with no worker left to hold, holds none.
+#[test]
+fn waiting_whole_machine_leases_hold_different_workers() {
+    let mut h = Harness::new();
+    let both = ["container", "native-whole-machine"];
+    h.worker_of("a", &both, Resources::new(500, GIB));
+    h.worker("b", &both);
+    h.worker("c", &both);
+    for n in 1..=9 {
+        h.submit(u64::from(n), action(n));
+    }
+    // `a` is too small for an action: eight on `b`, one on `c`.
+    let grants = h.grants();
+    assert_eq!(grants.iter().filter(|g| g.worker == w("c")).count(), 1);
+
+    for n in 10..=12 {
+        h.submit(u64::from(n), whole(n));
+    }
+    assert!(h.grants().is_empty());
+    let queued: Vec<_> = h.0.queued().collect();
+    let held: Vec<_> = queued.iter().map(|op| h.0.reservation(*op)).collect();
+    assert_eq!(held, [Some(&w("c")), Some(&w("b")), None]);
 }
 
 /// Catches: a whole-machine lease placed beside an action (a worker that is not empty

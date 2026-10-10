@@ -751,8 +751,6 @@ impl Scheduler {
         } = &mut op.state
             && *lease == grant.lease
             && !*committed
-            // A leased operation's lease is always held.
-            && let Some(held) = self.held.get_mut(&grant.lease)
         {
             *committed = true;
             let (session, process) = self
@@ -764,14 +762,21 @@ impl Scheduler {
                 session,
                 process,
             };
-            held.start_sent = Some(sent);
+            // A leased operation's lease is always held: no branch on it.
+            let booked = self
+                .held
+                .get_mut(&*lease)
+                .map_or(op.request.resources, |held| {
+                    held.start_sent = Some(sent);
+                    held.booked
+                });
             effects.push(Effect::Start(StartLease {
                 worker: worker.clone(),
                 lease: *lease,
                 operation: grant.operation,
                 key: op.request.key.clone(),
                 kind: op.request.kind,
-                resources: held.booked,
+                resources: booked,
                 fence: op.request.fence(),
             }));
         }
