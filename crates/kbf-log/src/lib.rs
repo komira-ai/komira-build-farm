@@ -132,7 +132,7 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
     };
     // One value, one encoding: refuse anything prost accepted that `encode` would not
     // have written (an unknown field, a non-minimal varint, a reordered field).
-    if encode(format, &command).as_deref() != Ok(bytes) {
+    if encode(format, &command).is_err() {
         return Err(DecodeError::NotCanonical);
     }
     Ok(command)
