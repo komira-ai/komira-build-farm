@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use kbf_auth::{Authorizers, authorize};
 use kbf_objstore::ObjectStore;
 use kbf_proto::reapi::action_cache_server::ActionCache;
 use kbf_proto::reapi::{ActionResult, GetActionResultRequest, UpdateActionResultRequest};
@@ -11,16 +12,26 @@ use crate::cache::Cache;
 use crate::meta_log::MetaLog;
 use crate::wire;
 
-/// The `ActionCache` service over a [`Cache`].
+/// The `ActionCache` service over a [`Cache`]. GetActionResult is authorized by
+/// [`Authorizers::ac_get`] against the request's instance name; UpdateActionResult is
+/// refused whatever the authorizers say.
 #[derive(Debug)]
 pub struct ActionCacheService<M, O> {
     cache: Arc<Cache<M, O>>,
+    authorizers: Arc<Authorizers>,
 }
 
 impl<M, O> ActionCacheService<M, O> {
-    /// The service over `cache`.
-    pub const fn new(cache: Arc<Cache<M, O>>) -> Self {
-        Self { cache }
+    /// The service over `cache`, every lookup allowed.
+    #[must_use]
+    pub fn new(cache: Arc<Cache<M, O>>) -> Self {
+        Self::with_authorizers(cache, Arc::new(Authorizers::allow_all()))
+    }
+
+    /// The service over `cache`, each lookup authorized by `authorizers`.
+    #[must_use]
+    pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
+        Self { cache, authorizers }
     }
 }
 
@@ -34,7 +45,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
         &self,
         request: Request<GetActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
+        let call = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
+        authorize(
+            &*self.authorizers.ac_get,
+            &caller,
+            call,
+            &request.instance_name,
+        )
+        .await?;
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
         match self.cache.action_result(&action).await? {

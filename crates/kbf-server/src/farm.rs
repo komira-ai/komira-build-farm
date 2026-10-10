@@ -623,6 +623,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let name = operation_name(self.term, waiter);
         let (stage, receiver) = watch::channel(Stage::Queued);
         let action = submission.request.key.action;
+        let instance = submission.request.key.instance.clone();
         state.waiters.insert(
             waiter,
             Waiter {
@@ -653,6 +654,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         }
         Ok(Ticket {
             name,
+            instance,
             action,
             stage: receiver,
         })
@@ -664,6 +666,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let waiter = state.waiters.get(&waiter)?;
         Some(Ticket {
             name: waiter.name.clone(),
+            instance: waiter.key.instance.clone(),
             action: waiter.key.action,
             stage: waiter.stage.subscribe(),
         })

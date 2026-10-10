@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream;
+use kbf_auth::{Authorizers, authorize};
 use kbf_objstore::ObjectStore;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorage;
 use kbf_proto::reapi::{
@@ -28,17 +29,39 @@ use crate::{MAX_BATCH_TOTAL_BYTES, wire};
 /// Directories per `GetTreeResponse` when the client sets no smaller page size.
 const TREE_PAGE_DIRECTORIES: usize = 1_000;
 
-/// The `ContentAddressableStorage` service over a [`Cache`].
+/// The `ContentAddressableStorage` service over a [`Cache`]. FindMissingBlobs is
+/// authorized by [`Authorizers::cas_find_missing`]; BatchReadBlobs, GetTree, SplitBlob
+/// and GetChunkMapping by [`Authorizers::cas_get`]; BatchUpdateBlobs, SpliceBlob and
+/// RegisterChunkMapping by [`Authorizers::cas_put`]; each against the request's
+/// instance name, before anything else in the request is read.
 #[derive(Debug)]
 pub struct CasService<M, O> {
     cache: Arc<Cache<M, O>>,
+    authorizers: Arc<Authorizers>,
 }
 
 impl<M, O> CasService<M, O> {
-    /// The service over `cache`.
-    pub const fn new(cache: Arc<Cache<M, O>>) -> Self {
-        Self { cache }
+    /// The service over `cache`, every call allowed.
+    #[must_use]
+    pub fn new(cache: Arc<Cache<M, O>>) -> Self {
+        Self::with_authorizers(cache, Arc::new(Authorizers::allow_all()))
     }
+
+    /// The service over `cache`, each call authorized by `authorizers`.
+    #[must_use]
+    pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
+        Self { cache, authorizers }
+    }
+}
+
+/// The gRPC path of a `ContentAddressableStorage` method, as calls are logged.
+macro_rules! cas_call {
+    ($method:literal) => {
+        concat!(
+            "/build.bazel.remote.execution.v2.ContentAddressableStorage/",
+            $method
+        )
+    };
 }
 
 type Stream<T> = stream::Iter<std::vec::IntoIter<Result<T, Status>>>;
@@ -52,7 +75,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         &self,
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
+        let find_missing = &*self.authorizers.cas_find_missing;
+        let call = cas_call!("FindMissingBlobs");
+        authorize(find_missing, &caller, call, &request.instance_name).await?;
         wire::check_digest_function(request.digest_function)?;
         let digests = wire::digests(&request.blob_digests)?;
         let missing = self.cache.find_missing(&digests).await?;
@@ -67,7 +94,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         &self,
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
+        let call = cas_call!("BatchUpdateBlobs");
+        authorize(
+            &*self.authorizers.cas_put,
+            &caller,
+            call,
+            &request.instance_name,
+        )
+        .await?;
         wire::check_digest_function(request.digest_function)?;
         let total: usize = request.requests.iter().map(|r| r.data.len()).sum();
         if total > MAX_BATCH_TOTAL_BYTES {
@@ -107,7 +143,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         &self,
         request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
+        let call = cas_call!("BatchReadBlobs");
+        authorize(
+            &*self.authorizers.cas_get,
+            &caller,
+            call,
+            &request.instance_name,
+        )
+        .await?;
         wire::check_digest_function(request.digest_function)?;
         let total = request
             .digests
@@ -153,7 +198,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         &self,
         request: Request<GetTreeRequest>,
     ) -> Result<Response<Self::GetTreeStream>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
+        let call = cas_call!("GetTree");
+        authorize(
+            &*self.authorizers.cas_get,
+            &caller,
+            call,
+            &request.instance_name,
+        )
+        .await?;
         wire::check_digest_function(request.digest_function)?;
         let root = wire::digest(request.root_digest.as_ref())?;
         let skip = if request.page_token.is_empty() {
@@ -172,33 +226,55 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         Ok(Response::new(stream::iter(pages(directories, skip, page))))
     }
 
+    /// UNIMPLEMENTED, once authorized as a read.
     async fn split_blob(
         &self,
-        _request: Request<SplitBlobRequest>,
+        request: Request<SplitBlobRequest>,
     ) -> Result<Response<SplitBlobResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let instance = &request.get_ref().instance_name;
+        let call = cas_call!("SplitBlob");
+        authorize(&*self.authorizers.cas_get, &caller, call, instance).await?;
         Err(chunking_unimplemented())
     }
 
     type GetChunkMappingStream = Stream<GetChunkMappingResponse>;
 
+    /// UNIMPLEMENTED, once authorized as a read.
     async fn get_chunk_mapping(
         &self,
-        _request: Request<GetChunkMappingRequest>,
+        request: Request<GetChunkMappingRequest>,
     ) -> Result<Response<Self::GetChunkMappingStream>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let instance = &request.get_ref().instance_name;
+        let call = cas_call!("GetChunkMapping");
+        authorize(&*self.authorizers.cas_get, &caller, call, instance).await?;
         Err(chunking_unimplemented())
     }
 
+    /// UNIMPLEMENTED, once authorized as a write.
     async fn splice_blob(
         &self,
-        _request: Request<SpliceBlobRequest>,
+        request: Request<SpliceBlobRequest>,
     ) -> Result<Response<SpliceBlobResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let instance = &request.get_ref().instance_name;
+        let call = cas_call!("SpliceBlob");
+        authorize(&*self.authorizers.cas_put, &caller, call, instance).await?;
         Err(chunking_unimplemented())
     }
 
+    /// UNIMPLEMENTED, once authorized as a write against the first message's instance
+    /// name (the empty name when the stream sends none).
     async fn register_chunk_mapping(
         &self,
-        _request: Request<Streaming<RegisterChunkMappingRequest>>,
+        request: Request<Streaming<RegisterChunkMappingRequest>>,
     ) -> Result<Response<RegisterChunkMappingResponse>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let first = request.into_inner().message().await?;
+        let instance = first.map(|m| m.instance_name).unwrap_or_default();
+        let call = cas_call!("RegisterChunkMapping");
+        authorize(&*self.authorizers.cas_put, &caller, call, &instance).await?;
         Err(chunking_unimplemented())
     }
 }

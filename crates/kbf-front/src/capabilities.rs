@@ -3,6 +3,9 @@
 //! The answer is static, so the cache keeps serving while execution is paused (RFC
 //! section 3.5). A front that also serves `Execution` advertises it.
 
+use std::sync::Arc;
+
+use kbf_auth::{Authorizers, authorize};
 use kbf_proto::build::bazel::semver::SemVer;
 use kbf_proto::reapi::capabilities_server::Capabilities;
 use kbf_proto::reapi::{
@@ -13,23 +16,37 @@ use tonic::{Request, Response, Status};
 
 use crate::MAX_BATCH_TOTAL_BYTES;
 
-/// The `Capabilities` service.
-#[derive(Clone, Copy, Debug, Default)]
+/// The `Capabilities` service. GetCapabilities is authorized by
+/// [`Authorizers::capabilities`] against the request's instance name; a refusal fails
+/// the call (it does not answer with empty capabilities).
+#[derive(Clone, Debug)]
 pub struct CapabilitiesService {
     execution: bool,
+    authorizers: Arc<Authorizers>,
 }
 
 impl CapabilitiesService {
-    /// Capabilities of a front that serves the cache only.
+    /// Capabilities of a front that serves the cache only, every call allowed.
     #[must_use]
-    pub const fn cache_only() -> Self {
-        Self { execution: false }
+    pub fn cache_only() -> Self {
+        Self::new(false, Arc::new(Authorizers::allow_all()))
     }
 
-    /// Capabilities of a front that serves the cache and `Execution`.
+    /// Capabilities of a front that serves the cache and `Execution`, every call
+    /// allowed.
     #[must_use]
-    pub const fn with_execution() -> Self {
-        Self { execution: true }
+    pub fn with_execution() -> Self {
+        Self::new(true, Arc::new(Authorizers::allow_all()))
+    }
+
+    /// Capabilities of a front that serves `Execution` too if `execution`, each call
+    /// authorized by `authorizers`.
+    #[must_use]
+    pub const fn new(execution: bool, authorizers: Arc<Authorizers>) -> Self {
+        Self {
+            execution,
+            authorizers,
+        }
     }
 }
 
@@ -87,8 +104,12 @@ pub fn server_capabilities(execution: bool) -> ServerCapabilities {
 impl Capabilities for CapabilitiesService {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<ServerCapabilities>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let instance = &request.get_ref().instance_name;
+        let call = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
+        authorize(&*self.authorizers.capabilities, &caller, call, instance).await?;
         Ok(Response::new(server_capabilities(self.execution)))
     }
 }

@@ -268,12 +268,17 @@ only to the leader ([deployment-topology.md](docs/design/deployment-topology.md)
 pair is not yet probed.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
-  text, checks no credential and accepts any bind address. Whoever reaches the port
-  can read action inputs and outputs, write the CAS and Execute actions.
-- **Planned:** bearer-token authentication, checked by `kbf-server` itself behind the
-  front; the front passes the `Authorization` header through and does not check it.
-  The caller's identity decides its role. A peer address does not identify a caller
-  here: a proxy on the same host connects from loopback, whoever its client is.
+  text and accepts any bind address. It runs the authentication policy and the
+  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
+  ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
+  `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
+  flag every call is accepted, and whoever reaches the port can read action inputs
+  and outputs, write the CAS and Execute actions.
+- **Planned:** credential policies in the same file (a bearer JWT in the
+  `authorization` header, a remote authentication service), checked by `kbf-server`
+  itself behind the front; the front passes the header through and does not check
+  it. A peer address does not identify a caller here: a proxy on the same host
+  connects from loopback, whoever its client is.
 - **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
   bind that other machines could reach, and allows the front's hop: loopback, or an
   address the operator names as the front's.
@@ -329,7 +334,7 @@ in between, and a follower redirects them to the leader
   already open too. Nothing else of REAPI is served there (Execute, the action cache,
   `ContentAddressableStorage` and `Capabilities` answer UNIMPLEMENTED), and on a
   plain-text worker listener every blob call is refused UNAUTHENTICATED. So a daemon
-  needs neither the front nor a REAPI token. See
+  needs neither the front nor a REAPI credential. See
   [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).
 - **Not built:** a check that a blob call's node is registered or connected, or that
   it reads only the inputs of its own leases; any certificate the deny list does not

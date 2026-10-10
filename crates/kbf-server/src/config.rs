@@ -6,11 +6,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
-use kbf_types::Qos;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+
+use kbf_auth::{Policy, PolicyError};
 
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
@@ -42,13 +43,9 @@ pub enum StoreKind {
 #[command(
     name = "kbf-server",
     version = crate::SERVER_VERSION,
-    about = "The kbf farm server",
-    args_conflicts_with_subcommands = true
+    about = "The kbf farm server"
 )]
 pub struct Args {
-    /// Run a subcommand instead of serving.
-    #[command(subcommand)]
-    pub command: Option<Command>,
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
@@ -58,6 +55,12 @@ pub struct Args {
     /// The REAPI listener.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
+    /// A JSON file with the REAPI listener's authentication policy and authorizers
+    /// (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy
+    /// stops the server. Without it every REAPI call is accepted and allowed. The
+    /// worker listener and the operator API do not read it.
+    #[arg(long)]
+    pub reapi_auth_policy: Option<PathBuf>,
     /// The `kbf.worker.v1` listener.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
@@ -140,22 +143,6 @@ pub struct Args {
     pub s3_conditional_put: bool,
 }
 
-/// `kbf-server` subcommands. Each runs instead of the server.
-#[derive(Clone, Debug, Subcommand)]
-pub enum Command {
-    /// Read a REAPI client token from stdin and print its token file line,
-    /// `<principal> client <qos> sha256:<hex>` (the format is in the `principal`
-    /// module docs). The token is never on the command line; surrounding whitespace
-    /// is stripped, and it must be at least 32 visible ASCII characters.
-    HashToken {
-        /// The principal the token names: 1 to 64 characters from A-Z a-z 0-9 . _ @ -.
-        principal: String,
-        /// The QoS level the principal's work gets when it names none.
-        #[arg(long, default_value = "ci", value_parser = |s: &str| s.parse::<Qos>())]
-        qos: Qos,
-    },
-}
-
 /// Why the flags do not make a working server.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -181,6 +168,20 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The REAPI policy file cannot be read.
+    #[error("--reapi-auth-policy: read {path}: {source}")]
+    PolicyRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The REAPI policy file is not a policy.
+    #[error("--reapi-auth-policy: {path}: {source}")]
+    Policy {
+        path: PathBuf,
+        #[source]
+        source: PolicyError,
+    },
 }
 
 impl Args {
@@ -216,6 +217,25 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
+        })
+    }
+
+    /// The REAPI listener's policy: the file `--reapi-auth-policy` names, or
+    /// [`Policy::allow_all`] without it.
+    ///
+    /// # Errors
+    /// The file cannot be read, or is not a policy ([`Policy::from_json`]).
+    pub fn reapi_auth_policy(&self) -> Result<Policy, ConfigError> {
+        let Some(path) = &self.reapi_auth_policy else {
+            return Ok(Policy::allow_all());
+        };
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::PolicyRead {
+            path: path.clone(),
+            source,
+        })?;
+        Policy::from_json(&text).map_err(|source| ConfigError::Policy {
+            path: path.clone(),
+            source,
         })
     }
 
