@@ -318,6 +318,20 @@ async fn readyz_is_503_on_a_server_that_is_not_the_leader() {
     assert_eq!(code, 200, "{body}");
 }
 
+/// Catches: a `/readyz` that ignores a stopping server, or names another check for
+/// it; and a stopping server whose `/healthz` stops answering 200. The binary test
+/// below proves the signal sets it; this one, the answer it gives.
+#[tokio::test]
+async fn readyz_is_503_once_the_server_is_stopping() {
+    let server = start();
+    server.readiness.stop();
+    let (code, body) = get_within(server.api, "/readyz", PROMPT).await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(failing(&body), ["stopping"], "{body}");
+    let (code, body) = get_within(server.api, "/healthz", PROMPT).await;
+    assert_eq!(code, 200, "{body}");
+}
+
 /// The binary across a SIGTERM.
 #[cfg(unix)]
 mod binary {
