@@ -113,10 +113,13 @@ pub(crate) struct ContainerSpec {
 ///   first container 65,535 ids of a standard 65,536-id range and refuses a second
 ///   container while the first exists ("not enough unused IDs in user namespace").
 ///   `--user=0:0` ([`CONTAINER_USER`]) whatever the image's `USER` says.
-/// - **Environment:** `--unsetenv-all`, then one `--env` per `Command` variable, so the
-///   action sees the `Command`'s variables and no others: not the image's `ENV`, not
-///   Podman's defaults (`PATH`, `TERM`, `container`, `HOME`, `HOSTNAME`), not a
-///   node's `containers.conf` `env`.
+/// - **Environment:** `--unsetenv-all`, then one `--env` per `Command` variable, so
+///   neither the image's `ENV`, Podman's defaults (`PATH`, `TERM`, `container`) nor a
+///   node's `containers.conf` `env` reaches the action. Podman (4.9) still adds two
+///   variables when the `Command` sets neither: `HOSTNAME=localhost` (the hostname
+///   above) and `HOME`, uid 0's home in the image's `/etc/passwd`. Both follow from
+///   the image digest, so they are the same on every node; a `Command` that sets
+///   either gets its own value.
 /// - **Limits:** `--pids-limit`, `--shm-size` and `--ulimit` for `nofile` and `nproc`
 ///   from [`ContainerLimits`], so a node's `containers.conf` cannot change them.
 pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
