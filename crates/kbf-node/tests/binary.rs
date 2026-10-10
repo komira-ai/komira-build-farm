@@ -607,22 +607,88 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
             .spawn()
             .expect("spawn");
         // A daemon that passed the check would run until stopped: bound the wait.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("wait") {
-                break status;
-            }
-            if Instant::now() > deadline {
-                child.kill().expect("kill");
-                child.wait().expect("reap");
-                panic!("{name}: the daemon started: {}", read(&log));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let status = refused_within(&mut child, name, &log);
         assert_eq!(status.code(), Some(1), "{name}");
         let stderr = read(&log);
         let says = format!("kbf-daemon: {}/{says}", ids.display());
         assert!(stderr.contains(&says), "{name}: {stderr}");
+    }
+}
+
+/// The exit status of `child`, a daemon expected to refuse to start, waited for up to
+/// 30 s. A daemon still running then has started: it is killed and the test fails,
+/// naming `what` and the log `child` writes to `log`.
+fn refused_within(
+    child: &mut std::process::Child,
+    what: &str,
+    log: &Path,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            return status;
+        }
+        if Instant::now() > deadline {
+            child.kill().expect("kill");
+            child.wait().expect("reap");
+            panic!("{what}: the daemon started: {}", read(log));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Catches the `--container-*` limits not reaching the container driver's
+/// configuration (`config.limits = limits(cli)` in `container::start`): the driver
+/// would create every container with `ContainerLimits::DEFAULT` whatever the flags
+/// say. The driver refuses a limit of 0 before it asks Podman anything, so a daemon
+/// given one 0 limit exits non-zero naming that limit; a daemon whose flags never
+/// reach the driver gets the defaults, starts, and is killed after 30 s. One case per
+/// limit, so a flag left out of the wiring is caught on its own.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_given_a_zero_limit_refuses_to_start() {
+    let ids = id_files("zero-limit-ids", "65536");
+    for (flag, name) in [
+        ("--container-pids-limit=0", "pids"),
+        ("--container-shm-mib=0", "shm"),
+        ("--container-nofile=0", "nofile"),
+        ("--container-nproc=0", "nproc"),
+    ] {
+        let dir = tls(&format!("zero-{name}"));
+        let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
+        let (bin, podman_log) = podman_stub(&format!("zero-{name}-bin"));
+        let log = dir.join("stderr");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = Command::new(BIN)
+            .env("PATH", path)
+            .args(base(&dir))
+            .args([
+                "--driver=container".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+                format!("--scratch={}", dir.join("leases").display()),
+                format!("--id-files={}", ids.display()),
+                flag.to_owned(),
+            ])
+            .args(cgroup_flags)
+            .stderr(std::fs::File::create(&log).expect("stderr file"))
+            .spawn()
+            .expect("spawn");
+        let status = refused_within(&mut child, flag, &log);
+        let stderr = read(&log);
+        assert_eq!(status.code(), Some(1), "{flag}: {stderr}");
+        let says = format!("kbf-daemon: the container {name} limit must be at least 1");
+        assert!(stderr.contains(&says), "{flag}: {stderr}");
+        // The limits are checked after the cgroup setup and before the start-up
+        // sweep: `actions/` is made, and Podman was never asked for leftovers.
+        assert!(unit.join("actions").is_dir(), "{flag}: {stderr}");
+        assert!(!podman_log.exists(), "{flag}: podman ran: {stderr}");
     }
 }
 
