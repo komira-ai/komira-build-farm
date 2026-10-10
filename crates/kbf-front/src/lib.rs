@@ -22,6 +22,13 @@
 //!   PERMISSION_DENIED.
 //! - **Work never run:** Execute answers a hit from the action cache and joins a
 //!   running twin before anything is queued (RFC 5.3).
+//!
+//! **Authorization.** Every service asks a `kbf_auth` authorizer before it serves a
+//! call ([`routes_with_authorizers`]; which call asks which is on each service and in
+//! `docs/reapi-auth.md`). The caller is whoever the server's authentication layer
+//! ([`kbf_auth::AuthenticateLayer`]) found, read from the request's extensions; with no
+//! layer it is empty metadata. [`routes`] and [`routes_with_execution`] allow every
+//! call.
 
 mod action_cache;
 mod bytestream;
@@ -34,6 +41,7 @@ mod wire;
 
 use std::sync::Arc;
 
+use kbf_auth::Authorizers;
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::reapi::action_cache_server::ActionCacheServer;
@@ -72,18 +80,20 @@ pub const MAX_BLOB_BYTES: u64 = 1 << 30;
 /// The most data in one ByteStream `ReadResponse`.
 pub const READ_CHUNK_BYTES: usize = 1 << 20;
 
-/// The four cache services over `cache`, ready for a tonic server.
+/// The four cache services over `cache`, ready for a tonic server. Every call is
+/// allowed.
 pub fn routes<M, O>(cache: Arc<Cache<M, O>>) -> Routes
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    cache_routes(cache, CapabilitiesService::cache_only())
+    let authorizers = Arc::new(Authorizers::allow_all());
+    cache_routes(cache, CapabilitiesService::cache_only(), &authorizers)
 }
 
 /// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
 /// that advertise execution. Open Execute and WaitExecution streams end UNAVAILABLE
-/// when `closing`'s [`Closer`] closes.
+/// when `closing`'s [`Closer`] closes. Every call is allowed.
 pub fn routes_with_execution<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -94,30 +104,59 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
-    let execution =
-        ExecutionServer::new(ExecutionService::new(Arc::clone(&cache), dispatch, closing))
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    cache_routes(cache, CapabilitiesService::with_execution()).add_service(execution)
+    routes_with_authorizers(cache, dispatch, closing, Arc::new(Authorizers::allow_all()))
 }
 
-fn cache_routes<M, O>(cache: Arc<Cache<M, O>>, capabilities: CapabilitiesService) -> Routes
+/// [`routes_with_execution`], each call authorized by `authorizers` before it is
+/// served.
+pub fn routes_with_authorizers<M, O, D>(
+    cache: Arc<Cache<M, O>>,
+    dispatch: Arc<D>,
+    closing: Closing,
+    authorizers: Arc<Authorizers>,
+) -> Routes
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+    D: Dispatch,
+{
+    let execution = ExecutionServer::new(ExecutionService::with_authorizers(
+        Arc::clone(&cache),
+        dispatch,
+        closing,
+        Arc::clone(&authorizers),
+    ))
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
+    cache_routes(cache, capabilities, &authorizers).add_service(execution)
+}
+
+fn cache_routes<M, O>(
+    cache: Arc<Cache<M, O>>,
+    capabilities: CapabilitiesService,
+    authorizers: &Arc<Authorizers>,
+) -> Routes
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    let cas = CasService::with_authorizers(Arc::clone(&cache), Arc::clone(authorizers));
+    let bytestream =
+        ByteStreamService::with_authorizers(Arc::clone(&cache), Arc::clone(authorizers));
+    let action_cache = ActionCacheService::with_authorizers(cache, Arc::clone(authorizers));
     Routes::new(CapabilitiesServer::new(capabilities))
         .add_service(
-            ContentAddressableStorageServer::new(CasService::new(Arc::clone(&cache)))
+            ContentAddressableStorageServer::new(cas)
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         )
         .add_service(
-            ByteStreamServer::new(ByteStreamService::new(Arc::clone(&cache)))
+            ByteStreamServer::new(bytestream)
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         )
-        .add_service(ActionCacheServer::new(ActionCacheService::new(cache)))
+        .add_service(ActionCacheServer::new(action_cache))
 }
 
 /// A REAPI digest as kbf's [`kbf_types::Digest`], or INVALID_ARGUMENT naming why not.

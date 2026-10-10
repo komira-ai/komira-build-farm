@@ -505,6 +505,48 @@ fn startup_failures_exit_2() {
     assert_eq!(code, Some(2), "a zero heartbeat interval accepted");
 }
 
+/// Catches: a `--reapi-auth-policy` the binary does not run on its REAPI listener, and
+/// a policy file that is not a policy but does not stop the start (exit 2, with the
+/// flag and the mistake on stderr).
+#[cfg(unix)]
+#[test]
+fn the_reapi_auth_policy_flag_is_read_at_start() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-binary");
+    std::fs::create_dir_all(&dir).expect("a policy directory");
+    let bad = dir.join(format!("bad-policy-{}.json", std::process::id()));
+    std::fs::write(&bad, r#"{"authenticationPolicy": {"jwt": {}}}"#).expect("write");
+    let deny = dir.join(format!("deny-policy-{}.json", std::process::id()));
+    std::fs::write(&deny, r#"{"authenticationPolicy": {"deny": "closed"}}"#).expect("write");
+
+    let mut c = server(&ANY_PORT);
+    c.arg("--reapi-auth-policy").arg(&bad);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("--reapi-auth-policy: "), "{stderr}");
+    assert!(stderr.contains("$.authenticationPolicy.jwt"), "{stderr}");
+
+    let mut c = server(&ANY_PORT);
+    c.arg("--reapi-auth-policy").arg(&deny);
+    let (child, _, reapi) = started(c);
+    let refused = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            CapabilitiesClient::connect(format!("http://{reapi}"))
+                .await
+                .expect("connect")
+                .get_capabilities(GetCapabilitiesRequest::default())
+                .await
+                .expect_err("the policy denies every call")
+        });
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (tonic::Code::Unauthenticated, "closed")
+    );
+    interrupt(child);
+}
+
 /// Catches (issue #23): a heartbeat interval longer than half the window in which a
 /// daemon may act on a `Start` accepted (each `Start` names the newest heartbeat, so
 /// a Start sent just before the next one would be refused), or the longest one that

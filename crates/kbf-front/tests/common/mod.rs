@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
+use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     Cache, Closing, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError,
 };
@@ -108,7 +109,27 @@ impl Farm {
         Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch, closing)).await
     }
 
+    /// The cache services and `Execution` over `dispatch` (streams never closed),
+    /// served as kbf-server serves its REAPI listener under `policy`: its
+    /// authenticator as a layer in front of every call, its authorizers in the
+    /// services.
+    pub async fn with_policy<D: Dispatch>(dispatch: Arc<D>, policy: Policy) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let authorizers = Arc::new(policy.authorizers);
+        let layer = AuthenticateLayer::new(policy.authenticator);
+        let routes =
+            |cache| kbf_front::routes_with_authorizers(cache, dispatch, closing, authorizers);
+        Self::serve_with(routes, Some(layer)).await
+    }
+
     async fn serve(routes: impl FnOnce(Arc<TestCache>) -> Routes) -> Self {
+        Self::serve_with(routes, None).await
+    }
+
+    async fn serve_with(
+        routes: impl FnOnce(Arc<TestCache>) -> Routes,
+        layer: Option<AuthenticateLayer>,
+    ) -> Self {
         let cache = Arc::new(
             Cache::open(
                 RaceLog::new(),
@@ -122,11 +143,19 @@ impl Farm {
         let addr = incoming.local_addr().expect("local address");
         let routes = routes(Arc::clone(&cache));
         tokio::spawn(async move {
-            Server::builder()
-                .add_routes(routes)
-                .serve_with_incoming(incoming)
-                .await
-                .expect("serve");
+            match layer {
+                Some(layer) => Server::builder()
+                    .layer(layer)
+                    .add_routes(routes)
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("serve"),
+                None => Server::builder()
+                    .add_routes(routes)
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("serve"),
+            }
         });
         let channel = Endpoint::from_shared(format!("http://{addr}"))
             .expect("endpoint")
