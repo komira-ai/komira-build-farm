@@ -1,7 +1,8 @@
 # The operator API
 
 `kbf-server` serves an HTTP/JSON API under `/v1` for the Fleet UI, scripts and
-clients ([fleet-updates.md](design/fleet-updates.md) section 11.4). It listens on its
+clients ([fleet-updates.md](design/fleet-updates.md) section 11.4), and
+[`/healthz` and `/readyz`](#get-healthz-and-get-readyz) for a front's health check. It listens on its
 own address, given with `--api-listen`; without the flag there is no API. The start
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
@@ -136,6 +137,39 @@ or not, could run, and the time spent waiting for a cordon does not count toward
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
 message yet: the daemon is not told, and the server simply sends it no new `Start`.
+
+## `GET /healthz` and `GET /readyz`
+
+For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
+of the REAPI listener. Both are reads, open like `GET /v1/nodes`, and are served only
+when `--api-listen` is given. The routes are served by the same task as the REAPI
+and worker listeners, which are bound before it starts and stop when it ends, so any
+answer means both are bound.
+
+**`GET /healthz`**: the process is alive. It reads nothing, and answers `200` for as
+long as the server runs, during a stop too:
+
+```json
+{ "status": "alive", "version": "0.1.0+0123456789ab", "commit": "0123456789ab" }
+```
+
+**`GET /readyz`**: the server is ready to serve. `200` when every check passes, `503`
+otherwise; the body lists each failing check and why:
+
+```json
+{ "ready": false, "version": "0.1.0+0123456789ab", "commit": "0123456789ab",
+  "failing": [ { "check": "store",
+                 "reason": "a read of kbf/1791370000000000000/readyz-probe had no answer within 2000 ms" } ] }
+```
+
+| Check | Fails when |
+|---|---|
+| `stopping` | the server has received SIGTERM or SIGINT. It answers `503` from that moment, before its REAPI streams are ended, and for the rest of its drain (`--shutdown-timeout-secs`) |
+| `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers are not ready |
+| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
+
+`version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
+makes one read of the store, so poll it at the interval the front needs, not faster.
 
 ## Planned
 

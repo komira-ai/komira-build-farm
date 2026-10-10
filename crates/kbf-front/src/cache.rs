@@ -209,6 +209,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.objects
     }
 
+    /// The prefix every key this cache writes starts with.
+    pub const fn prefix(&self) -> &KeyPrefix {
+        &self.prefix
+    }
+
     /// The key of object `id` in the store.
     ///
     /// # Errors
