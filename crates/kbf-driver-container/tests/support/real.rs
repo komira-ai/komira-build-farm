@@ -162,6 +162,11 @@ pub fn podman(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// An action running `script` with the image's `/bin/sh`, named by its path: the
+/// action's environment is the `Command`'s alone (`--unsetenv-all`), and these name no
+/// `PATH` to look a bare `sh` up in.
 pub fn sh(script: &str) -> Spec {
-    Spec::new(&var("KBF_TEST_IMAGE"), script)
+    let mut spec = Spec::new(&var("KBF_TEST_IMAGE"), script);
+    spec.argv[0] = "/bin/sh".to_owned();
+    spec
 }

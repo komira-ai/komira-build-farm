@@ -15,8 +15,11 @@ mkdir "$cg/actions"
 echo "+cpu +memory +pids" >"$cg/actions/cgroup.subtree_control"
 
 export KBF_TEST_CGROUP=${cg#/sys/fs/cgroup}/actions
-cargo test -p kbf-driver-container --test podman --locked -- --include-ignored
+# Both binaries run even when the first fails; the script fails if either did.
+status=0
+cargo test -p kbf-driver-container --test podman --locked -- --include-ignored || status=$?
 # A node whose containers.conf sets its own environment and limits: the driver's
 # flags must win over every one of them (tests/podman_env.rs).
 CONTAINERS_CONF_OVERRIDE=$PWD/crates/kbf-driver-container/tests/fixtures/containers-override.conf \
-    exec cargo test -p kbf-driver-container --test podman_env --locked -- --include-ignored
+    cargo test -p kbf-driver-container --test podman_env --locked -- --include-ignored || status=$?
+exit "$status"
