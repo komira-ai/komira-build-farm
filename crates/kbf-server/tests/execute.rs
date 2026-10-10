@@ -308,7 +308,7 @@ async fn a_failing_action_is_answered_but_not_cached() {
 /// `ActionResult` taken as completed (the protocol sets `action_result` only with OK);
 /// and a failure written to the action cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_attempts_answer_with_the_rfc_codes() {
+async fn failed_attempts_answer_with_the_documented_codes() {
     let cell = Cell::start().await;
     let mut daemon = cell.daemon("node-a", 8, 16).await;
     let never_uploaded = ActionResult {
