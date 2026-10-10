@@ -6,14 +6,15 @@
 # everywhere. The coverage job uploads the measured file as
 # `coverage-baseline.measured`; copy it here when a count changes or a crate is added.
 # crate lines-missed branches-missed
-kbf-alert                 -      -
+kbf-alert                 0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
 kbf-daemon               39     13
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                86      8
+kbf-front                81      8
+kbf-guest                15      6
 kbf-it                    2      3
 kbf-mac-session           0      0
 kbf-mdm                   0      0
@@ -25,7 +26,7 @@ kbf-outputs               0      0
 kbf-proto                 -      -
 kbf-raft                 23     20
 kbf-sched                 2      2
-kbf-segments              9      5
+kbf-segments              8      5
 kbf-server                0      0
 kbf-sim                   9      3
 kbf-sim-cell              -      -

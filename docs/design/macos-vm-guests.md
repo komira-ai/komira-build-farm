@@ -280,10 +280,14 @@ Files:
 - Golden images live in a directory owned by root, files mode 0644 and directories
   0755, so every lease user can read them and none can change them.
 - The lease directory is the daemon's. Before `run`, the driver (its owner, so no
-  root is needed) adds two inherited ACL entries to it: the lease user may add files
-  and subdirectories, and the daemon's account may read and delete everything below,
-  the entry fleet-updates-security.md section S4.2 already plans for every Mac lease.
-  This is planned; nothing on `main` sets an ACL on a lease directory today.
+  root is needed) adds two inherited ACL entries to it: the lease user may search,
+  list and read it and everything below (so `kbf-vmm` reaches the fetched inputs and
+  shares the execution root) and add files and subdirectories (the clone, the stdout
+  and stderr files, the outputs), and the daemon's account may read and delete
+  everything below, the entry fleet-updates-security.md section S4.2 already plans for
+  every Mac lease. The lease user also needs search on each parent directory of the
+  lease directory. This is planned; nothing on `main` sets an ACL on a lease directory
+  today, and P5 checks that the lease user reaches every input.
 - `kbf-vmm` makes the clone itself, as the lease user, inside the lease directory:
   `mkdir` for the bundle's directories (which inherit both entries) and `clonefile` on
   each file. The clone is then the lease user's, on the same APFS volume as the golden
@@ -291,8 +295,9 @@ Files:
 - Removal: the driver deletes the lease directory, clone included, as the daemon's
   account, through the inherited delete entry. Whether a `clonefile` result takes the
   directory's inherited entry or copies the golden file's (empty) ACL is **[A]**; it
-  does not matter for deletion, which needs the delete-child right on the parent
-  directory, and the parents are directories `kbf-vmm` made. P5 checks it: after the
+  does not matter for deletion: on macOS a delete entry on the item itself or the
+  delete-child right on its parent directory suffices, and every parent here is a
+  directory `kbf-vmm` made, which carries the inherited delete entry. P5 checks it: after the
   lease, the daemon's account removes the whole directory and nothing the lease user
   made is left. If it cannot, the fallback is a change to the root helper:
   `user-delete` also sweeps the lease directory it is given.
@@ -408,7 +413,7 @@ list, and, if a run shows it, `isSupported` being false inside a VM (a real nega
 | P2 | Does a third running guest fail with `VZErrorVirtualMachineLimitExceeded`, and does a `kbf-vmm` killed with `SIGKILL` free its slot? | boot two, try a third; kill one helper with -9, boot again within a bound | no |
 | P3 | Does a network-off guest have no interface but `lo0`, and what can a NAT guest reach? | `ifconfig -l` in each; a NAT guest's reach to the host and the farm network recorded | no |
 | P4 | Boot time, idle guest memory, clone growth over one XCUITest run, virtiofs throughput for a build step | timed boots, `vm_stat` in the guest, the clone's allocated size | no |
-| P5 | Does a VM start from a launch daemon's `kbf-mac-session run` child, as a lease user, with nobody logged in? | the production chain of section 8; after the lease, the daemon's account removes the lease directory, clone included, and nothing the lease user made is left (section 6.1) | **yes**: `kbf-mac-session` installed as a launch daemon |
+| P5 | Does a VM start from a launch daemon's `kbf-mac-session run` child, as a lease user, with nobody logged in? | the production chain of section 8; `kbf-vmm`, as the lease user, reads every fetched input; after the lease, the daemon's account removes the lease directory, clone included, and nothing the lease user made is left (section 6.1) | **yes**: `kbf-mac-session` installed as a launch daemon |
 | P6 | Does macOS accept an ad hoc, hardened-runtime signature carrying the virtualization entitlement? | start a VM from a binary signed the way section 7 plans | no |
 | P7 | Is a guest newer than its host refused, and is that refusal what the builder checks? | the builder's check against the host's build; one attempted newer restore image | no |
 | P8 | Does a full image build with the first-boot daemon (section 2.3) pass its verification boot? | `kbf-vmm image build` of one recipe | only if P0 failed |
