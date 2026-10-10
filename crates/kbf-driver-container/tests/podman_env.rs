@@ -33,25 +33,40 @@ fn env_action(env: &[(&str, &str)]) -> Spec {
 }
 
 /// Catches anything but the `Command`'s variables reaching the action (the "drop
-/// `--unsetenv-all`" mutant): the image's `PATH`, Podman's own `TERM`, `container`,
-/// `HOME` and `HOSTNAME`, and the node's `containers.conf` `env` would each appear.
-/// A `Command` with no variables gets an empty environment; one with two (a value
-/// holding a space and an `=`) gets exactly those.
+/// `--unsetenv-all`" mutant): the image's `PATH`, Podman's own `TERM` and `container`,
+/// and the node's `containers.conf` `env` would each appear. A `Command` that sets
+/// `HOME` and `HOSTNAME` (with a value holding a space and an `=` besides) gets
+/// exactly its variables. One that sets neither gets the two Podman adds whatever
+/// `--unsetenv-all` says: `HOSTNAME=localhost` and the busybox image's root home.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
-async fn the_action_sees_exactly_the_commands_environment() {
+async fn the_action_sees_only_the_commands_environment() {
     assert_override();
     let cell = Cell::new("env");
-    let result = cell.run(1, &env_action(&[])).await.expect("ran");
+    let sorted = |stdout: &str| -> Vec<String> {
+        let mut lines: Vec<String> = stdout.lines().map(str::to_owned).collect();
+        lines.sort_unstable();
+        lines
+    };
+    let spec = env_action(&[
+        ("A_B", "x y=z"),
+        ("HOME", "/kbf/home"),
+        ("HOSTNAME", "h"),
+        ("LANG", "C"),
+    ]);
+    let result = cell.run(1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    assert_eq!(cell.stdout(&result), "", "an empty Command environment");
-    let spec = env_action(&[("A_B", "x y=z"), ("LANG", "C")]);
-    let result = cell.run(2, &spec).await.expect("ran");
+    assert_eq!(
+        sorted(&cell.stdout(&result)),
+        ["A_B=x y=z", "HOME=/kbf/home", "HOSTNAME=h", "LANG=C"]
+    );
+    let result = cell.run(2, &env_action(&[])).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    let stdout = cell.stdout(&result);
-    let mut seen: Vec<&str> = stdout.lines().collect();
-    seen.sort_unstable();
-    assert_eq!(seen, ["A_B=x y=z", "LANG=C"], "{stdout}");
+    assert_eq!(
+        sorted(&cell.stdout(&result)),
+        ["HOME=/root", "HOSTNAME=localhost"],
+        "an empty Command environment"
+    );
     cell.assert_clean(1);
     cell.assert_clean(2);
 }
