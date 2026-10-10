@@ -36,7 +36,8 @@ podman --version
 # How this kernel reclaims into swap, which the swap tests in podman_memory.rs depend on.
 echo "kernel $(uname -r); vm.swappiness $(cat /proc/sys/vm/swappiness);" \
     "zswap $(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo n/a);" \
-    "lru_gen $(cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null || echo n/a)"
+    "lru_gen $(cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null || echo n/a);" \
+    "THP $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo n/a)"
 swapon --show
 podman pull -q "$BUSYBOX" >/dev/null
 case $(uname -m) in

@@ -197,6 +197,9 @@ async fn past_its_booking_within_its_cap_an_action_runs() {
 /// (`dd` then blocks writing it into a pipe nobody reads), so reclaim at its cap moves
 /// some 360 MiB of it to swap, past the 128 MiB floor this cell's watch is given; the
 /// watch samples every second. Lease 2 sleeps beside it and must still be running.
+/// The buffer is random, not zeros: a kernel that splits huge pages under reclaim
+/// (podman-x86's) drops zero-filled pages for the shared zero page, so a buffer of
+/// zeros shrinks below the cap and never reaches swap.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
@@ -214,7 +217,7 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     let second = tokio::spawn(async move { runtime.run(work).await });
     wait_for(&cell.cgroup.join(cell.name(2)), "sleep").await;
 
-    let mut spec = sh("dd if=/dev/zero bs=900M count=1 | sleep 3600");
+    let mut spec = sh("dd if=/dev/urandom bs=900M count=1 iflag=fullblock | sleep 3600");
     spec.timeout = Some(Duration::from_secs(60));
     let action = store_action(&cell.cas, &spec);
     let started = Instant::now();
@@ -257,8 +260,9 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
 }
 
 /// Catches the swap watch killing on swap alone (the "ignores max events" mutant), as
-/// host pressure would have it: a lease well below its cap holds a 150 MiB buffer
-/// (`dd` blocked writing it into a pipe nobody reads yet), the test reclaims 100 MiB
+/// host pressure would have it: a lease well below its cap holds a 150 MiB buffer of
+/// random bytes (`dd` blocked writing it into a pipe nobody reads yet; random, so
+/// reclaim cannot drop it as zero pages), the test reclaims 100 MiB
 /// from it (`memory.reclaim`, the kernel's reclaim run on that one cgroup, standing in
 /// for the host's), so its `memory.swap.current` rises with no `max` event, past the
 /// 8 MiB floor this cell's watch is given, and the action still exits 0 after the watch
@@ -276,7 +280,8 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
             every: Duration::from_millis(200),
         };
     });
-    let spec = sh("dd if=/dev/zero bs=150M count=1 | { sleep 10; cat >/dev/null; }");
+    let spec =
+        sh("dd if=/dev/urandom bs=150M count=1 iflag=fullblock | { sleep 10; cat >/dev/null; }");
     let action = store_action(&cell.cas, &spec);
     let work = cell.work(1, action, Resources::new(1000, 256 * MIB));
     let runtime = Arc::clone(&cell.runtime);
