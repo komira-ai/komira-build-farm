@@ -205,7 +205,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         "--node-id=mac-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
         "--driver=native".to_owned(),
-        format!("--cas=http://{reapi}"),
+        format!("--cas=https://127.0.0.1:{}", worker.port()),
         flag("scratch", &dir.join("leases")),
         flag("xcode-apps", &apps),
     ])
