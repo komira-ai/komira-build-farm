@@ -304,48 +304,87 @@ fn tail(text: &str) -> String {
     lines[lines.len().saturating_sub(40)..].join("\n")
 }
 
+/// How many times [`SHIMS`] times each compiler, one call at a time.
+const CALLS: usize = 7;
+
 /// What [`the_compiler_shims_print_nothing_on_stderr`] runs: each shim's `--version`
 /// with its stderr (but the version line `swiftc` always prints there) copied to
-/// stdout, then, as the last line, the seconds five `cc --version` take and the
-/// seconds five of the `clang` it runs take, called directly.
+/// stdout, then, as the last line, the seconds each of `$CALLS` `cc --version` calls
+/// takes and the seconds each of as many calls of the `clang` it runs takes, called
+/// directly: two comma-separated lists.
 const SHIMS: &str = r#"for tool in cc clang swiftc; do
   $tool --version > /dev/null 2> "err-$tool" || echo "$tool failed"
 done
 cat err-cc err-clang; grep -v '^swift-driver version' err-swiftc
 direct=$(xcrun --find clang) || exit 1
 perl -MTime::HiRes=time -e '
-  sub t { my $s = time; for (1..5) { system("$_[0] --version > /dev/null 2>&1") == 0 or die "$_[0]" } time - $s }
-  my ($shim, $direct) = (t("cc"), t($ARGV[0]));
-  printf "%.3f %.3f\n", $shim, $direct;
+  sub t {
+    my @t;
+    for (1..$ENV{CALLS}) {
+      my $s = time;
+      system("$_[0] --version > /dev/null 2>&1") == 0 or die "$_[0]";
+      push @t, sprintf "%.3f", time - $s;
+    }
+    join ",", @t
+  }
+  printf "%s %s\n", t("cc"), t($ARGV[0]);
 ' "$direct"
 "#;
 
-/// The output of [`SHIMS`] but its last line, and the two times on that line.
-fn shim_times(out: &str) -> (String, f64, f64) {
+/// The output of [`SHIMS`] but its last line, and the call times on that line: those
+/// of `cc`, then those of `clang` called directly.
+fn shim_times(out: &str) -> (String, Vec<f64>, Vec<f64>) {
     let (rest, last) = out
         .trim_end()
         .rsplit_once('\n')
         .unwrap_or(("", out.trim_end()));
-    let times: Vec<f64> = last
+    let times: Vec<Vec<f64>> = last
         .split(' ')
-        .map(|t| t.parse().unwrap_or_else(|_| panic!("times in {out:?}")))
+        .map(|list| {
+            list.split(',')
+                .map(|t| t.parse().unwrap_or_else(|_| panic!("times in {out:?}")))
+                .collect()
+        })
         .collect();
-    (rest.to_owned(), times[0], times[1])
+    match <[Vec<f64>; 2]>::try_from(times) {
+        Ok([shim, direct]) if shim.len() == CALLS && direct.len() == CALLS => {
+            (rest.to_owned(), shim, direct)
+        }
+        _ => panic!("{CALLS} times twice in {out:?}"),
+    }
 }
+
+/// The fastest of `times`: what a call costs with the runner's noise (other tests,
+/// other jobs on the host) taken out, as noise only ever adds.
+fn fastest(times: &[f64]) -> f64 {
+    times.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+/// How much slower than twice its reference the fastest sandboxed `cc` call may be.
+/// The defect costs at least 0.31 s a call (issue #163, with an older cache still
+/// readable), 1.2 s with the cache lost (PR #172) and 5.3 s with none. In the first
+/// two hosted runs of this timing (PR #322; the test prints its times on every run),
+/// the fastest healthy `cc` call took 0.016 to 0.039 s, sandboxed or not, and `clang`
+/// 0.008 to 0.016 s, so the bounds came to 0.12 to 0.18 s: several times a healthy
+/// call, under the smallest defect's.
+const SHIM_MARGIN: f64 = 0.1;
 
 /// Catches the `/usr/bin` compiler shims failing to write `xcrun`'s cache in the
 /// user's temporary folder: every `cc`, `clang` or `swiftc` call then prints
 /// "couldn't create cache file" and runs several times slower (0.31 s a call against
 /// 0.065 s for `clang` called directly, in issue #163). Checked with the node's own
 /// Xcode and with each Xcode an action can name (the oldest and the newest here),
-/// whose lookups no earlier, unsandboxed call has cached. The sandboxed `cc` must take
-/// at most twice as long as the same action's unsandboxed `cc`, run after it, plus a
-/// quarter second; with the node's own Xcode, also at most twice `clang` called
-/// directly plus a quarter second.
+/// whose lookups no earlier, unsandboxed call has cached. The fastest of [`CALLS`]
+/// sandboxed `cc` calls must take at most twice the fastest of the same action's
+/// unsandboxed `cc` calls, run after it, plus [`SHIM_MARGIN`]; with the node's own
+/// Xcode, also at most twice the fastest `clang` called directly plus [`SHIM_MARGIN`].
+/// The fastest call, not the total: one call slowed by the shared runner failed a
+/// bound on the total of five (0.485 s against 0.46 s on `main`).
 /// It runs with no other developer tool running in this binary ([`DEVELOPER_TOOLS`]):
 /// with them, `xcrun`'s own cache is lost to their rewrites whatever the sandbox does.
 #[tokio::test]
 async fn the_compiler_shims_print_nothing_on_stderr() {
+    use std::io::Write as _;
     // Alone: no other test's `xcrun` calls drop this one's cache entries meanwhile.
     let _tools = DEVELOPER_TOOLS.write().await;
     let dir = scratch("shims");
@@ -367,7 +406,9 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
     let mut cases: Vec<Option<String>> = vec![None];
     cases.extend(picked.into_iter().map(Some));
     for (seq, build) in cases.iter().enumerate() {
-        let mut spec = Spec::sh(SHIMS).env("PATH", PATH);
+        let mut spec = Spec::sh(SHIMS)
+            .env("PATH", PATH)
+            .env("CALLS", &CALLS.to_string());
         if let Some(build) = build {
             spec = spec.property("xcode", build);
         }
@@ -376,16 +417,30 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
         let (said, shim, direct) = shim_times(&stdout(&cas, &result));
         let control = run_long(&open, &cas, seq, &spec).await;
         let (_, open_shim, _) = shim_times(&stdout(&cas, &control));
-        let times = format!("cc {shim}s, unsandboxed cc {open_shim}s, clang {direct}s");
+        let (shim_min, open_min, direct_min) =
+            (fastest(&shim), fastest(&open_shim), fastest(&direct));
+        let times = format!(
+            "fastest call: cc {shim_min}s, unsandboxed cc {open_min}s, clang {direct_min}s; \
+             all: cc {shim:?}, unsandboxed cc {open_shim:?}, clang {direct:?}"
+        );
+        // Past the test harness's capture, so that every run's times are in the log:
+        // they are what SHIM_MARGIN is set from.
+        let _ = writeln!(std::io::stderr(), "shim times: xcode={build:?} {times}");
         assert_eq!(
             (said.as_str(), stderr(&cas, &result).as_str()),
             ("", ""),
             "xcode={build:?} {times}\n{}",
             sandbox_denials()
         );
-        assert!(shim <= 2.0 * open_shim + 0.25, "xcode={build:?} {times}");
+        assert!(
+            shim_min <= 2.0 * open_min + SHIM_MARGIN,
+            "xcode={build:?} {times}"
+        );
         if build.is_none() {
-            assert!(shim <= 2.0 * direct + 0.25, "xcode={build:?} {times}");
+            assert!(
+                shim_min <= 2.0 * direct_min + SHIM_MARGIN,
+                "xcode={build:?} {times}"
+            );
         }
     }
 }
