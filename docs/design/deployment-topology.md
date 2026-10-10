@@ -133,7 +133,7 @@ The record of nodes becomes durable state in the control log:
 | Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk; `kbf-server` applies control and metadata state from it |
 | Metadata | `MemoryMetaLog`, in the server's memory; lost at restart. With `--store=s3` each start writes under a fresh key prefix | applied from the log, so a restart keeps it |
 | Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log (see [Open questions](#open-questions)) |
-| Readiness | none: no `/readyz`, no `grpc.health.v1` service. The operator API (`--api-listen`) serves only `/v1/nodes` | a readiness check that is true only on the leader, for the proxy to health-check |
+| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. No `grpc.health.v1` service | the Raft role sets the leader flag, so `/readyz` is 200 only on the leader |
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower answers a daemon's session with a redirect naming the leader |
 | Daemon's servers | one `--server` URL; on a broken stream the daemon waits `--reconnect-ms` and dials the same URL again | the daemon is given the servers' names and follows a redirect to the leader |
 | Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)) | a tailnet ingress and an HTTP/2 proxy, after the probes below pass |
@@ -178,10 +178,11 @@ idle timeout bounds these streams the same way.
    version 1. A follower that knows no leader (an election in progress) has nothing
    to name; whether it answers `UNAVAILABLE` and the daemon tries the next name is
    not decided.
-4. **Where readiness is served.** A `/readyz` HTTP path (on the operator API listener
-   or its own), or the standard `grpc.health.v1` service on the REAPI listener.
-   Either way, it must report not ready as soon as the server stops being the
-   leader.
+4. **Readiness on a follower.** `/readyz` is served on the operator API listener
+   ([api.md](../api.md#get-healthz-and-get-readyz)) and fails its `leader` check
+   when the server's leader flag is clear; nothing clears it yet. It must clear as
+   soon as the server stops being the leader. Whether a `grpc.health.v1` service on
+   the REAPI listener is also wanted is not decided.
 5. **The proxy-to-server hop.** The [Security model](../../ARCHITECTURE.md#security-model)
    has `kbf-server` serve plain-text REAPI on loopback or on a mesh interface whose
    traffic is already encrypted, and plans a bind guard that allows only the front's

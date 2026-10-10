@@ -16,6 +16,7 @@ use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::blobs::WorkerBlobs;
 use crate::farm::Farm;
+use crate::health::{Readiness, STORE_PROBE_TIMEOUT};
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -67,6 +68,9 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
+    /// How long `GET /readyz` waits for the object store to answer its probe
+    /// ([`crate::health`]).
+    pub store_probe_timeout: Duration,
 }
 
 /// Why the server could not start or stopped.
@@ -96,6 +100,9 @@ pub struct Bound<F> {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
+    /// What `GET /readyz` reads besides the store; the serving future marks it
+    /// stopping when `shutdown` completes.
+    pub readiness: Arc<Readiness>,
     /// Serves every listener and the tick until the shutdown future completes.
     pub serving: F,
 }
@@ -162,7 +169,8 @@ where
 /// It logs a warning that the scheduler's state (cordons, drains, leases, operations)
 /// starts empty, as it does at every start: nothing of an earlier process is restored.
 ///
-/// When `shutdown` completes, the REAPI listener stops accepting, every connection on
+/// When `shutdown` completes, `GET /readyz` answers 503 (`stopping`) from then on, the
+/// REAPI listener stops accepting, every connection on
 /// it is sent GOAWAY, and every open Execute and WaitExecution stream that is not done
 /// ends UNAVAILABLE, which clients retry (issue #168). The serving future returns once
 /// the REAPI connections have closed, or after `listeners.shutdown_timeout` if one
@@ -189,10 +197,15 @@ where
     ));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let (api_listen, token, probe_timeout) = api.map_or((None, None, STORE_PROBE_TIMEOUT), |api| {
+        (Some(api.listen), api.token, api.store_probe_timeout)
+    });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
-    let api_routes = crate::api::router(Arc::clone(&farm), token);
+    let readiness = Arc::new(Readiness::default());
+    let health_routes =
+        crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
+    let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);
     // Logged at every start, the first one too (issue #156).
     let term = farm.term();
     tracing::warn!(term, "{STATE_IN_MEMORY}");
@@ -224,6 +237,7 @@ where
     let (closer, closing) = kbf_front::closing();
     let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm), closing);
 
+    let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         let reapi_serve = Server::builder()
@@ -248,6 +262,8 @@ where
         // in time, completes first.
         let stopping = async {
             shutdown.await;
+            // Before anything stops, so a front's health check sends no new work here.
+            stop_readiness.stop();
             closer.close();
             let _ = drain.send(());
             tokio::time::sleep(listeners.shutdown_timeout).await;
@@ -268,6 +284,7 @@ where
         reapi,
         worker,
         api,
+        readiness,
         serving,
     })
 }

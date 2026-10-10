@@ -201,6 +201,7 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
+            store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store).await;
