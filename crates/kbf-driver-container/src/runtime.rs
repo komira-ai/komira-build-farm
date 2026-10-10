@@ -7,8 +7,9 @@
 //!    `podman::create_args`), make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
-//! 4. **collect:** the exit code from Podman's record, OOM from the lease cgroup's
-//!    `memory.events`; the overlay's directories back to the daemon's user; outputs,
+//! 4. **collect:** the exit code from Podman's record (a container crun could not
+//!    start because the program is not there or not executable is the action's exit
+//!    127 or 126, see `program`), OOM from the lease cgroup's `memory.events`; the overlay's directories back to the daemon's user; outputs,
 //!    stdout and stderr into the CAS;
 //! 5. **clean:** remove the container, the lease cgroup and the scratch directory;
 //! 6. **verify-clean:** neither directory may remain.
@@ -38,7 +39,10 @@ use tokio::sync::oneshot;
 use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
-use crate::podman::{CONTAINER_OWNER, ContainerSpec, DAEMON_OWNER, LEASE_PREFIX, Podman};
+use crate::podman::{
+    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
+};
+use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -68,6 +72,8 @@ pub struct PodmanConfig {
     pub kill_grace: Duration,
     /// How much output one action may leave; past it, the action fails.
     pub outputs: OutputLimits,
+    /// The pids, `/dev/shm` and ulimits each container is created with.
+    pub limits: ContainerLimits,
     /// Whose containers these are: each is labelled `kbf.owner=<owner>`
     /// ([`crate::podman::OWNER_LABEL`]), and at start the runtime removes every
     /// container so labelled. The daemon passes its node id. Two runtimes that share a
@@ -77,8 +83,8 @@ pub struct PodmanConfig {
 
 impl PodmanConfig {
     /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
-    /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace and
-    /// the default [`OutputLimits`].
+    /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace,
+    /// the default [`OutputLimits`] and [`ContainerLimits::DEFAULT`].
     #[must_use]
     pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
         Self {
@@ -89,6 +95,7 @@ impl PodmanConfig {
             default_timeout: Duration::from_secs(3600),
             kill_grace: Duration::from_secs(5),
             outputs: OutputLimits::DEFAULT,
+            limits: ContainerLimits::DEFAULT,
             owner,
         }
     }
@@ -105,6 +112,19 @@ impl PodmanConfig {
         if self.owner.is_empty() {
             return Err(ConfigError::Owner);
         }
+        let limits = self.limits;
+        for (name, value) in [
+            ("pids", limits.pids),
+            ("shm", limits.shm_mib),
+            ("nofile", limits.nofile),
+            ("nproc", limits.nproc),
+        ] {
+            // Podman reads a pids limit of 0 as "unlimited", and a 0 for the others
+            // would leave nothing to run with.
+            if value == 0 {
+                return Err(ConfigError::Limit(name));
+            }
+        }
         Ok(())
     }
 }
@@ -119,6 +139,9 @@ pub enum ConfigError {
     CgroupParent(String),
     #[error("the container owner must not be empty")]
     Owner,
+    /// One of the [`ContainerLimits`], by name, is 0.
+    #[error("the container {0} limit must be at least 1")]
+    Limit(&'static str),
 }
 
 /// Why a [`PodmanRuntime`] does not start.
@@ -269,6 +292,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 .map(|v| (v.name.clone(), v.value.clone()))
                 .collect(),
             argv: command.arguments.clone(),
+            limits: self.config.limits,
         };
         Ok(Prepared {
             spec,
@@ -319,7 +343,8 @@ impl<C: Cas> PodmanRuntime<C> {
         tokio::select! {
             // `podman start`'s own status is not the action's: Podman's record, read
             // below, is. An error waiting for it is not trusted either way, since
-            // `exit_code` fails the lease unless that record says the container exited.
+            // `ended` fails the lease unless that record says the container exited, or crun
+            // reports it could not start the program (`program::not_run`).
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
@@ -332,11 +357,15 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         }
 
-        let exit_code = self
+        let exit_code = match self
             .podman
-            .exit_code(&lease.name)
+            .ended(&lease.name)
             .await
-            .map_err(RuntimeError::Failed)?;
+            .map_err(RuntimeError::Failed)?
+        {
+            Ended::Exited(code) => code,
+            Ended::NotRun(state) => program::not_run(&spec, &stderr_path, &state).await?,
+        };
         // 137 is SIGKILL. Whether the kernel's OOM killer sent it is read from the
         // lease cgroup, not from Podman.
         if exit_code == 137 {
@@ -723,7 +752,7 @@ fn clean_task_failed(error: tokio::task::JoinError) -> String {
     format!("clean task: {error}")
 }
 
-fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
+pub(crate) fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
     RuntimeError::Failed(format!("{}: {error}", path.display()))
 }
 
@@ -802,7 +831,8 @@ mod tests {
 
     /// Catches a scratch path Podman's `--volume` syntax would split, a cgroup parent
     /// Podman would read relative to its own default, and an empty owner (whose sweep
-    /// would look for containers labelled `kbf.owner=`). A usable one starts, its sweep
+    /// would look for containers labelled `kbf.owner=`), and a container limit of 0
+    /// (to Podman, an unlimited pids count). A usable one starts, its sweep
     /// asking a `podman` that knows no container (`true`).
     #[test]
     fn unusable_configurations_are_refused() {
@@ -829,9 +859,20 @@ mod tests {
             refused(config),
             Some(ConfigError::CgroupParent("actions".to_owned()).into())
         );
-        let mut config = ok;
+        let mut config = ok.clone();
         config.owner.clear();
         assert_eq!(refused(config), Some(ConfigError::Owner.into()));
+        for name in ["pids", "shm", "nofile", "nproc"] {
+            let mut config = ok.clone();
+            let limits = &mut config.limits;
+            match name {
+                "pids" => limits.pids = 0,
+                "shm" => limits.shm_mib = 0,
+                "nofile" => limits.nofile = 0,
+                _ => limits.nproc = 0,
+            }
+            assert_eq!(refused(config), Some(ConfigError::Limit(name).into()));
+        }
     }
 
     /// Catches a clean that removes the lease while `podman start` still runs (kbf

@@ -19,7 +19,7 @@ daemon's side of fencing are in [worker-protocol.md](worker-protocol.md) and
 | Harness | Where | What it drives | What it checks |
 |---|---|---|---|
 | `kbf-sim` kernel | `crates/kbf-sim` | `StateMachine` nodes on a virtual clock, a seeded ChaCha8 stream, a bus with delay, drop, duplicate, reorder and partitions; a SHA-256 trace hash | its own tests: bus faults (`tests/bus.rs`), one seed one trace (`tests/determinism.rs`), a toy counter that a seeded partition breaks (`tests/toy_counter.rs`) |
-| Raft simulation | `crates/kbf-raft/tests/sim` | 3 voters and 1 learner, partitions, crashes part-way through an input's effects | Raft safety after every step, liveness after the heal; 500 seeds in CI, more in an ignored test |
+| Raft simulation | `crates/kbf-raft/tests/sim` | 3 voters and 1 learner, partitions, crashes part-way through an input's effects, log compaction (including asks past the applied index, which the core must refuse) and restarts from the latest snapshot | Raft safety after every step, a snapshot folds in only applied entries, liveness after the heal with no peer left behind a snapshot base; 500 seeds in CI, more in an ignored test |
 | `sim_cell` **exists** | `crates/kbf-sched/tests/sim_cell.rs` | the scheduler on the kernel: a leader, a control log node and two workers with a `SelfFence`; 48 seeds | `Start` only after commit; each operation answered once, by its newest grant; no self-fenced work twice at once; a reboot and a daemon restart inside G; a `Start` lost on a live session; a lease hidden from the running set; replay |
 | `sim_platform` **exists** | `crates/kbf-sched/tests/sim_platform.rs` | the scheduler alone with an in-process log: Linux x86-64, Linux arm64 and a one-core Mac, two random outages each; 64 seeds | grants satisfy the platform on a live worker; answered once; a refusal only after a stated reason and an unbroken unservable run; the refusal tick exactly; replay |
 | `sim_cordon` **exists** | `crates/kbf-sched/tests/sim_cordon.rs` | the scheduler alone, three always-up workers, random cordon, drain and uncordon; 64 seeds | no grant to a cordoned worker; a drain never kills; a cordon never refuses; drain states true; all work runs once uncordoned; replay |
@@ -311,7 +311,7 @@ switches each fault kind on or off.
 | # | Scenario | Generator | Checks |
 |---|---|---|---|
 | F4.1 | Steady state | arrivals at 70 to 95 percent of capacity | I1 to I15 every step; L1 once arrivals stop |
-| F4.2 | Churn | 5 percent of workers die or return each minute | as F4.1; every unservable refusal checked by the reference verdict (I10) |
+| F4.2 | Churn | 5 percent of workers die or return each minute, at least one dead worker returning when any is dead | as F4.1; every unservable refusal checked by the reference verdict (I10) |
 | F4.3 | Mass reconnect | every worker re-registers within a few seconds | L3; each lost lease requeued once; no operation held twice (I3) |
 | F4.4 | Operator storm | cordon, drain and uncordon at random on a tenth of the fleet | I8, I9, I10 |
 

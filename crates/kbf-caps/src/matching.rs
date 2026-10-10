@@ -10,9 +10,20 @@
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | countable: the node has at least the amount |
 //! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
 //! | `xcode` | membership: the node reports a set (one entry per installed Xcode build) and the request names one |
+//! | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 hex>`, the node reports one entry in that form per image it holds, and only the `sha256:<hex>` parts are compared |
 //!
 //! `gpu` is a count of whole GPUs (`gpu=1`). Matching compares it with the node's
 //! count; the scheduler also books it, so a GPU serves one lease at a time.
+//!
+//! `vm.image` names a VM image by the digest of the recipe it is built from, so two
+//! names for one recipe are one image, and one name for two recipes is two. A value
+//! without `@sha256:<64 lowercase hex digits>` is refused, in a request and in a report.
+//!
+//! The report-only keys ([`REPORT_ONLY_KEYS`]: `vm.slots`, `vm.max_cpus`,
+//! `vm.max_mem_gib`) are whole numbers a node reports about what it can run; a request
+//! that names one is refused ([`RequestError::ReportOnly`]): a request never asks for VM
+//! slots by count. Nothing books VM slots yet: the planned VM lease kind
+//! (`kbf-lease=vm`) is refused as an unknown kind.
 //!
 //! The reserved keys ([`RESERVED_KEYS`]: `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`,
 //! `kbf-book-cpus`, `kbf-book-mem-gib`) ask for a kind or a size of capacity, not a
@@ -64,7 +75,14 @@ impl fmt::Display for Consumable {
 const EXACT_KEYS: [&str; 4] = ["os", "os_image", "cpu.model", "page_size"];
 
 /// Keys a node reports as a set and a request names one member of.
-const MEMBER_KEYS: [&str; 1] = ["xcode"];
+const MEMBER_KEYS: [&str; 2] = ["xcode", VM_IMAGE_KEY];
+
+/// The VM image key: membership on the `sha256:<hex>` part of the value.
+const VM_IMAGE_KEY: &str = "vm.image";
+
+/// Keys a node reports and a request may not name: whole numbers about the VMs a node
+/// can run.
+pub const REPORT_ONLY_KEYS: [&str; 3] = ["vm.slots", "vm.max_cpus", "vm.max_mem_gib"];
 
 /// Reserved keys: they ask for a kind or a size of capacity, not a capability, and are
 /// read by the front, not matched.
@@ -87,10 +105,30 @@ pub(crate) fn is_member_key(key: &str) -> bool {
     MEMBER_KEYS.contains(&key)
 }
 
-/// Whether `key` is one of kbf's own platform keys: a capability key, or a reserved
-/// key [`Request::parse`] skips.
+/// What membership compares for a value of member key `key`: the `sha256:<hex>` part of
+/// a `vm.image` value (`None` if it has none), and any other key's whole value.
+pub(crate) fn member_token<'v>(key: &str, value: &'v str) -> Option<&'v str> {
+    if key == VM_IMAGE_KEY {
+        image_digest(value)
+    } else {
+        Some(value)
+    }
+}
+
+/// The `sha256:<hex>` part of `<name>@sha256:<hex>`: a non-empty name with no `@` or
+/// whitespace, and exactly 64 lowercase hex digits.
+fn image_digest(value: &str) -> Option<&str> {
+    let (name, digest) = value.split_once('@')?;
+    let hex = digest.strip_prefix("sha256:")?;
+    let name_ok = !name.is_empty() && !name.contains(char::is_whitespace);
+    let hex_ok = hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (name_ok && hex_ok).then_some(digest)
+}
+
+/// Whether `key` is one of kbf's own platform keys: a capability key, a reserved key
+/// [`Request::parse`] skips, or a report-only key it refuses.
 pub(crate) fn is_own_key(key: &str) -> bool {
-    is_capability_key(key) || RESERVED_KEYS.contains(&key)
+    is_capability_key(key) || RESERVED_KEYS.contains(&key) || REPORT_ONLY_KEYS.contains(&key)
 }
 
 /// Whether [`Request::parse`] reads `key` as a capability (reserved keys are not).
@@ -109,14 +147,19 @@ pub struct NodeCaps {
     /// Values compared exactly, by request key (`os`, `cpu.model`, `label.rack`, ...).
     pub exact: BTreeMap<String, String>,
     /// Sets a request names one member of, by request key (`xcode`: every installed
-    /// build).
+    /// build; `vm.image`: the `sha256:<hex>` digest of every image).
     pub members: BTreeMap<String, BTreeSet<String>>,
     /// Countable capacity. A missing entry counts as zero.
     pub consumables: BTreeMap<Consumable, u64>,
+    /// The drivers the node's daemon runs (`container`, `native`, ...), from its
+    /// report's `drivers` entries. No request key matches them; the scheduler reads
+    /// them to place a lease kind only where a driver serves it.
+    pub drivers: BTreeSet<String>,
 }
 
 impl NodeCaps {
-    /// A node with only CPU capabilities: no exact values, no sets, no capacity.
+    /// A node with only CPU capabilities: no exact values, no sets, no capacity, no
+    /// driver.
     #[must_use]
     pub fn new(cpu: CpuCaps) -> Self {
         Self {
@@ -124,7 +167,15 @@ impl NodeCaps {
             exact: BTreeMap::new(),
             members: BTreeMap::new(),
             consumables: BTreeMap::new(),
+            drivers: BTreeSet::new(),
         }
+    }
+
+    /// This node, running `drivers` as well.
+    #[must_use]
+    pub fn with_drivers<'d>(mut self, drivers: impl IntoIterator<Item = &'d str>) -> Self {
+        self.drivers.extend(drivers.into_iter().map(str::to_owned));
+        self
     }
 }
 
@@ -140,6 +191,14 @@ pub enum RequestError {
     /// A key that takes one value appears more than once.
     #[error("capability key {0:?} appears more than once")]
     Repeated(String),
+    /// A `vm.image` value without a digest.
+    #[error(
+        "vm.image {0:?} names no digest; name an image as <name>@sha256:<64 lowercase hex digits>"
+    )]
+    NoImageDigest(String),
+    /// The key is one a node reports and a request may not name.
+    #[error("{0:?} is reported by a node and cannot be requested")]
+    ReportOnly(String),
 }
 
 /// What an action requires of a node.
@@ -149,7 +208,8 @@ pub struct Request {
     isa_level: Option<IsaLevel>,
     features: BTreeSet<String>,
     pub(crate) exact: BTreeMap<String, String>,
-    members: BTreeMap<String, String>,
+    /// By key: the value as requested, and what membership compares.
+    members: BTreeMap<String, (String, String)>,
     minimums: BTreeMap<Consumable, u64>,
 }
 
@@ -167,7 +227,7 @@ pub enum Unmet<'a> {
         key: &'a str,
         want: &'a str,
     },
-    /// The node's set under `key` does not hold `want`.
+    /// The node's set under `key` does not hold `want` (for `vm.image`, its digest).
     Member {
         key: &'a str,
         want: &'a str,
@@ -197,11 +257,19 @@ impl Request {
     /// Builds a request from `(key, value)` properties; see the module table.
     ///
     /// `cpu.feature` may repeat; every other key may appear once. A membership key
-    /// (`xcode`) names one non-empty value.
+    /// (`xcode`, `vm.image`) names one non-empty value; a `vm.image` value carries a
+    /// digest. A report-only key is refused.
     pub fn parse<'p, I>(properties: I) -> Result<Self, RequestError>
     where
         I: IntoIterator<Item = (&'p str, &'p str)>,
     {
+        Self::parse_each(&mut properties.into_iter())
+    }
+
+    /// [`Self::parse`], compiled once rather than once per caller's iterator type.
+    fn parse_each<'p>(
+        properties: &mut dyn Iterator<Item = (&'p str, &'p str)>,
+    ) -> Result<Self, RequestError> {
         let mut req = Self::default();
         for (key, value) in properties {
             let bad = || RequestError::BadValue {
@@ -211,6 +279,9 @@ impl Request {
             let repeated = || RequestError::Repeated(key.to_owned());
             if RESERVED_KEYS.contains(&key) {
                 continue;
+            }
+            if REPORT_ONLY_KEYS.contains(&key) {
+                return Err(RequestError::ReportOnly(key.to_owned()));
             }
             if key == "arch" {
                 let arch = value.parse().map_err(|_| bad())?;
@@ -236,11 +307,10 @@ impl Request {
                 if value.is_empty() {
                     return Err(bad());
                 }
-                if req
-                    .members
-                    .insert(key.to_owned(), value.to_owned())
-                    .is_some()
-                {
+                let token = member_token(key, value)
+                    .ok_or_else(|| RequestError::NoImageDigest(value.to_owned()))?;
+                let member = (value.to_owned(), token.to_owned());
+                if req.members.insert(key.to_owned(), member).is_some() {
                     return Err(repeated());
                 }
             } else {
@@ -276,8 +346,8 @@ impl Request {
                 unmet.push(Unmet::Exact { key, want });
             }
         }
-        for (key, want) in &self.members {
-            if !node.members.get(key).is_some_and(|set| set.contains(want)) {
+        for (key, (want, token)) in &self.members {
+            if !node.members.get(key).is_some_and(|set| set.contains(token)) {
                 unmet.push(Unmet::Member { key, want });
             }
         }

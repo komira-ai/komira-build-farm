@@ -1,0 +1,25 @@
+[package]
+name = "kbf-guest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The agent inside a macOS VM guest (docs/design/macos-vms.md section 6, step 4). No
+# async runtime and no network crate: it speaks one framed protocol over one byte
+# stream and runs one command.
+[[bin]]
+name = "kbf-guest"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+hex.workspace = true
+libc.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

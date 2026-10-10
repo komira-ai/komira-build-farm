@@ -69,11 +69,22 @@ pub(crate) fn rpc_ok() -> rpc::Status {
     }
 }
 
+/// A blob a ByteStream resource name names, and the instance name before it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Resource {
+    /// Every segment before `blobs/` (a read) or `uploads/` (a write), joined by `/`;
+    /// empty when there is none. Authorization reads it; the cache does not, since one
+    /// cell has one cache.
+    pub instance: String,
+    /// The blob.
+    pub digest: Digest,
+}
+
 /// The blob a ByteStream `Read` names: `{instance}/blobs/{sha256/}{hash}/{size}`.
 ///
-/// The instance name is ignored: one cell has one cache. Compressed reads
-/// (`compressed-blobs/...`) are refused because no compressor is advertised.
-pub(crate) fn read_resource(name: &str) -> Result<Digest, Status> {
+/// Compressed reads (`compressed-blobs/...`) are refused because no compressor is
+/// advertised.
+pub(crate) fn read_resource(name: &str) -> Result<Resource, Status> {
     let parts: Vec<&str> = name.split('/').collect();
     let at = parts
         .iter()
@@ -88,12 +99,15 @@ pub(crate) fn read_resource(name: &str) -> Result<Digest, Status> {
     if !rest.is_empty() {
         return Err(bad_resource(name, "unexpected segments after the size"));
     }
-    Ok(digest)
+    Ok(Resource {
+        instance: parts[..at].join("/"),
+        digest,
+    })
 }
 
 /// The blob a ByteStream `Write` or `QueryWriteStatus` names:
 /// `{instance}/uploads/{uuid}/blobs/{sha256/}{hash}/{size}{/metadata}`.
-pub(crate) fn write_resource(name: &str) -> Result<Digest, Status> {
+pub(crate) fn write_resource(name: &str) -> Result<Resource, Status> {
     let parts: Vec<&str> = name.split('/').collect();
     let at = parts
         .iter()
@@ -110,7 +124,10 @@ pub(crate) fn write_resource(name: &str) -> Result<Digest, Status> {
     }
     // Anything after the size is client metadata, which REAPI lets the server ignore.
     let (digest, _metadata) = blob_digest(name, &parts[at + 3..])?;
-    Ok(digest)
+    Ok(Resource {
+        instance: parts[..at].join("/"),
+        digest,
+    })
 }
 
 /// Parses `{sha256/}{hash}/{size}` from the segments after `blobs`, returning the
@@ -138,24 +155,32 @@ mod tests {
 
     const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-    /// Catches: a parser that misreads the instance name, the optional digest function
-    /// segment or the trailing upload metadata, which would make a well-formed client
-    /// read or write the wrong blob or fail.
+    /// Catches: a parser that misreads the instance name (which authorization checks),
+    /// the optional digest function segment or the trailing upload metadata, which
+    /// would make a well-formed client read or write the wrong blob or fail, or be
+    /// authorized against the wrong instance.
     #[test]
     fn resource_names_parse_every_spelling() {
         let want = Digest::parse(DigestFunction::Sha256, &format!("{HASH}/7")).unwrap();
-        for name in [
-            format!("blobs/{HASH}/7"),
-            format!("main/ci/blobs/{HASH}/7"),
-            format!("blobs/sha256/{HASH}/7"),
+        let at = |instance: &str| Resource {
+            instance: instance.to_owned(),
+            digest: want,
+        };
+        for (name, instance) in [
+            (format!("blobs/{HASH}/7"), ""),
+            (format!("main/ci/blobs/{HASH}/7"), "main/ci"),
+            (format!("blobs/sha256/{HASH}/7"), ""),
         ] {
-            assert_eq!(read_resource(&name).unwrap(), want, "{name}");
+            assert_eq!(read_resource(&name).unwrap(), at(instance), "{name}");
         }
-        for name in [
-            format!("uploads/u-1/blobs/{HASH}/7"),
-            format!("inst/uploads/u-1/blobs/sha256/{HASH}/7/some/metadata"),
+        for (name, instance) in [
+            (format!("uploads/u-1/blobs/{HASH}/7"), ""),
+            (
+                format!("inst/a/uploads/u-1/blobs/sha256/{HASH}/7/some/metadata"),
+                "inst/a",
+            ),
         ] {
-            assert_eq!(write_resource(&name).unwrap(), want, "{name}");
+            assert_eq!(write_resource(&name).unwrap(), at(instance), "{name}");
         }
         for bad in [
             format!("blobs/{HASH}"),

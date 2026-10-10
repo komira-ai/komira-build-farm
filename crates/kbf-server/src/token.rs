@@ -79,48 +79,9 @@ impl ApiToken {
     /// whitespace).
     #[cfg(unix)]
     pub fn from_file(path: &Path) -> Result<Self, TokenFileError> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        let read = |source| TokenFileError::Read {
-            path: path.to_owned(),
-            source,
-        };
-        // Non-blocking: opening a FIFO for reading would otherwise wait for a writer.
-        let nonblocking = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nonblocking)
-            .open(path)
-            .map_err(read)?;
-        let meta = file.metadata().map_err(read)?;
-        if !meta.is_file() {
-            return Err(TokenFileError::NotAFile {
-                path: path.to_owned(),
-            });
-        }
-        let server = rustix::process::geteuid().as_raw();
-        if meta.uid() != server {
-            return Err(TokenFileError::Owner {
-                path: path.to_owned(),
-                owner: meta.uid(),
-                server,
-            });
-        }
-        let mode = meta.mode() & 0o7777;
-        if !owner_only(mode) {
-            return Err(TokenFileError::Mode {
-                path: path.to_owned(),
-                mode,
-            });
-        }
-        let mut content = Vec::new();
-        let limit = u64::try_from(MAX_TOKEN_FILE_BYTES + 1).unwrap_or(u64::MAX);
-        file.take(limit).read_to_end(&mut content).map_err(read)?;
+        let content = read_owner_only(path, MAX_TOKEN_FILE_BYTES)?;
         let token = content.trim_ascii();
-        if content.len() > MAX_TOKEN_FILE_BYTES
-            || token.len() < MIN_TOKEN_BYTES
-            || !token.iter().all(u8::is_ascii_graphic)
-        {
+        if content.len() > MAX_TOKEN_FILE_BYTES || !usable(token) {
             return Err(TokenFileError::Content {
                 path: path.to_owned(),
             });
@@ -146,14 +107,76 @@ impl ApiToken {
     /// compared in constant time.
     #[must_use]
     pub fn admits(&self, authorization: &[u8]) -> bool {
-        let Some(space) = authorization.iter().position(|&b| b == b' ') else {
-            return false;
-        };
-        let (scheme, presented) = authorization.split_at(space);
-        let presented = presented.trim_ascii_start();
-        let presented: [u8; 32] = Sha256::digest(presented).into();
-        scheme.eq_ignore_ascii_case(b"bearer") && bool::from(presented.ct_eq(&self.0))
+        bearer_digest(authorization).is_some_and(|presented| bool::from(presented.ct_eq(&self.0)))
     }
+}
+
+/// Whether `token` is usable as a secret: at least [`MIN_TOKEN_BYTES`] bytes, all
+/// visible ASCII.
+fn usable(token: &[u8]) -> bool {
+    token.len() >= MIN_TOKEN_BYTES && token.iter().all(u8::is_ascii_graphic)
+}
+
+/// The SHA-256 digest of the token an `Authorization` header's value presents as
+/// `Bearer <token>` (the scheme in any case, spaces after it skipped), or `None` when
+/// the value has no space or another scheme. Nothing after the token is trimmed: a
+/// trailing byte is part of what is hashed.
+fn bearer_digest(authorization: &[u8]) -> Option<[u8; 32]> {
+    let space = authorization.iter().position(|&b| b == b' ')?;
+    let (scheme, presented) = authorization.split_at(space);
+    let presented = presented.trim_ascii_start();
+    let presented: [u8; 32] = Sha256::digest(presented).into();
+    scheme.eq_ignore_ascii_case(b"bearer").then_some(presented)
+}
+
+/// Reads the file at `path` under the rules in the module docs: opened without
+/// blocking, a regular file, owned by this process's effective user, mode 0600 or
+/// 0400 (checked on the open file, so what is checked is what is read). Returns at
+/// most `limit + 1` bytes, so a caller can tell a file over `limit` by its length.
+///
+/// # Errors
+/// The file cannot be opened or read, is not a regular file, or has another owner or
+/// mode.
+#[cfg(unix)]
+fn read_owner_only(path: &Path, limit: usize) -> Result<Vec<u8>, TokenFileError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let read = |source| TokenFileError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    // Non-blocking: opening a FIFO for reading would otherwise wait for a writer.
+    let nonblocking = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nonblocking)
+        .open(path)
+        .map_err(read)?;
+    let meta = file.metadata().map_err(read)?;
+    if !meta.is_file() {
+        return Err(TokenFileError::NotAFile {
+            path: path.to_owned(),
+        });
+    }
+    let server = rustix::process::geteuid().as_raw();
+    if meta.uid() != server {
+        return Err(TokenFileError::Owner {
+            path: path.to_owned(),
+            owner: meta.uid(),
+            server,
+        });
+    }
+    let mode = meta.mode() & 0o7777;
+    if !owner_only(mode) {
+        return Err(TokenFileError::Mode {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    let mut content = Vec::new();
+    let limit = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
+    file.take(limit).read_to_end(&mut content).map_err(read)?;
+    Ok(content)
 }
 
 /// Whether a file mode (permission bits) is 0600 or 0400: readable by its owner, and

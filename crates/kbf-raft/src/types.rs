@@ -210,8 +210,9 @@ pub enum ConfigError {
     /// An append request must be able to carry an entry.
     #[error("max_entries_per_append must be at least 1")]
     ZeroBatch,
-    /// Restored entries must be numbered 1, 2, 3, ... with terms that never fall and
-    /// never exceed the restored term.
+    /// Restored entries must be numbered from the snapshot base's index + 1, with
+    /// terms that never fall (from the base's term on) and never exceed the restored
+    /// term.
     #[error("restored log is not contiguous at entry {0:?}")]
     BadLog(LogId),
 }

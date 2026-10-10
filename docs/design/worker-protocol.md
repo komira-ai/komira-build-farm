@@ -14,14 +14,18 @@ service Worker {
 ```
 
 - **One stream per daemon, opened by the daemon.** No daemon listens on an inbound
-  port, so a worker needs only outbound connectivity to the farm's address.
+  port, so a worker needs only outbound connectivity to the server's worker
+  listener. With several servers (**planned**) that one stream goes to the leader
+  ([deployment-topology.md](deployment-topology.md)).
 - **Mutual TLS.** The daemon connects only to `https://` URLs and presents its own
   certificate; the server's worker listener verifies it against a client CA, and
   requires the certificate to name the node the stream speaks for (see
   [Node identity](#node-identity-and-the-deny-list)).
-- **No blob bytes on this stream.** A daemon reads inputs and writes outputs through the
-  REAPI `ByteStream` service on separate connections. The session carries only small
-  control messages.
+- **No blob bytes on this stream.** The session carries only small control messages.
+  A daemon reads inputs and writes outputs with `ByteStream` calls to the same worker
+  listener, over the same mutual TLS, each call admitted on its own (see
+  [Blobs on the worker listener](#blobs-on-the-worker-listener)). A daemon needs no
+  path to REAPI.
 - **Versions.** The server accepts protocol versions N-1 and N. Version 1 is the first,
   so today it accepts exactly 1. Fields and messages may be added within a version as
   long as a peer that ignores them keeps working.
@@ -131,15 +135,20 @@ node mac-07              # a node id, whatever certificate it presents
 `openssl x509 -noout -serial` prints a certificate's serial;
 `openssl x509 -noout -pubkey | openssl pkey -pubin -outform DER | sha256sum` its
 public key hash, which outlives a reissue with the same key. The server reads the file
-at start (a bad file stops it), and **again at every check**: each first `Hello`
-(reconnects included), each resent `Hello`, each `Heartbeat`, each `Result` and each
-`NodeStatus`. An entry added while a denied daemon is connected ends its stream
+at start (a bad file stops it), and looks at it **again at every check**: each first
+`Hello` (reconnects included), each resent `Hello`, each `Heartbeat`, each `Result`,
+each `NodeStatus` and each blob call. A check reads the file's metadata (device,
+inode, size, mode, owner, modification and change time) and reads and parses the file
+again only when that changed since the last read. An entry added while a denied daemon is connected ends its stream
 `PERMISSION_DENIED` at the next of those it sends (a `Result` is refused, so it never
 reaches the action cache, and the stream ends without a `ResultAck`; a `NodeStatus`
 is refused, so the operator API keeps the node's last status from before the entry),
 and every reconnect is refused; no
-restart is needed. The server reads nothing more from a stream it has ended. Replace
-the file atomically (write a new file, then rename it over the old one).
+restart is needed. The server reads nothing more from a stream it has ended. A blob
+call is refused `PERMISSION_DENIED` from the first one after the entry is added, on a
+connection already open too. Replace the file atomically (write a new file, then
+rename it over the old one): an in-place edit that keeps the size and lands within
+the filesystem's timestamp granularity may go unseen until the next change.
 
 A file that cannot be read or parsed after start refuses every check `UNAVAILABLE`
 (fail closed) until it is fixed. That ends **every** connected daemon's stream within
@@ -151,6 +160,38 @@ readable and the daemons are back.
 off the list verifies until it expires or the cell CA is replaced. Issue node
 certificates with short lifetimes (30 days is a starting point) so a missed entry is
 bounded.
+
+### Blobs on the worker listener
+
+Besides `Worker.Session`, the worker listener serves the REAPI `ByteStream` service
+(`Read`, `Write`, `QueryWriteStatus`) over the farm's one cache, so a blob a daemon
+writes there is the blob clients read on the REAPI listener, and the other way round.
+It is the daemon's only CAS: `kbf-daemon --cas` (and `kbf-cell daemon --cas`) must be
+an `https://` URL, normally the same as `--server`, and the daemon dials it with its
+own CA, certificate, key and server name. A plain `http://` URL is refused at start.
+
+Each call is admitted before anything of it is served (a `Write` before its first
+message is read):
+
+- the listener serves mutual TLS; on a plain-text worker listener every call is
+  refused `UNAUTHENTICATED`;
+- the call's connection presented a client certificate the client CA verified (else
+  the TLS handshake fails, or the call is `UNAUTHENTICATED`);
+- the certificate carries exactly one DNS subjectAltName, which is the call's node
+  (else `PERMISSION_DENIED`). A blob call names no node id, so there is nothing to
+  compare the name with, as `Hello` has;
+- neither its serial, its public key nor that node is on the deny list, looked at
+  again for this call (`PERMISSION_DENIED`; a list that cannot be read or parsed
+  refuses `UNAVAILABLE`).
+
+The server logs each refused call at WARN with its code and reason. Only
+`ByteStream` is served here, because it is all a daemon's CAS client calls:
+`Execution`, `ActionCache`, `ContentAddressableStorage` and `Capabilities` answer
+`UNIMPLEMENTED` on this listener.
+
+Not checked: that the node is registered or connected, or that it reads only the
+inputs of leases it holds. A certificate the deny list does not refuse can read any
+blob whose digest it names, and write blobs.
 
 ### `Heartbeat` and `HeartbeatAck`
 
@@ -302,8 +343,11 @@ close this, each on its own:
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
    and forgets their results without sending them: no server of the new epoch can
    accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
-   nothing, and a lease granted while no epoch was named is kept. With the replicated log, the epoch will name the log, which outlives
-   leaders and their terms, so a change of leader drops nothing.
+   nothing, and a lease granted while no epoch was named is kept. With the replicated
+   log, the plan is for the epoch to name the log, which outlives leaders and their
+   terms, so a change of leader drops nothing; whether a failover keeps leases this
+   way or drops them as a restart does today is an open question
+   ([deployment-topology.md](deployment-topology.md#open-questions)).
 3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
    in its `Result`, and the server refuses a `Result` whose `action_digest` is set and
    is not the action of the operation it granted the lease for, whatever the lease id
@@ -328,12 +372,13 @@ action cache with the result.
 ### `NodeStatus`
 
 What software the node runs, for operators: the OS name, version and build, the
-kernel release (Linux), the `kbf-daemon` version, and the installed Xcode builds
-(Mac). It routes no work, so it is not part of the node report and does not change
+kernel release (Linux), the `kbf-daemon` version, the ready Xcode builds (Mac), and
+every installed Xcode with its state, why it is not ready and the command that fixes
+it (`xcodes`, Mac; issue #164). It routes no work, so it is not part of the node report and does not change
 `report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
 `sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
-are the node report's `xcode` entries, from the driver that discovers them. A field
-it cannot read is empty.
+are the node report's `xcode` entries, from the driver that discovers them, and
+`xcodes` comes from the same driver. A field it cannot read is empty.
 
 The daemon sends `NodeStatus` on every stream after the resent `Result`s and before
 the first `Heartbeat`. The server keeps the newest one per node, from the node's
@@ -341,8 +386,17 @@ current stream only (one from a replaced stream is ignored, and one the deny lis
 refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
 in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
 the message ignores it as an empty message; a daemon that predates it is listed
-without software. Sending it again when the software changes mid-session is
-**planned** (fleet-updates.md section 3.1, re-detection).
+without software, and a server that predates `xcodes` ignores it.
+
+When the driver's report changes mid-session (today: the native driver's first
+survey of its Xcodes ended, which the daemon does not wait for before `Hello`, so its
+first `Hello` advertises no Xcode and its first `NodeStatus` lists each as
+`XCODE_STATE_NOT_SURVEYED`; or a later survey, every few minutes, found one became
+ready or stopped being so), the daemon resends
+its `Hello` on the stream if the node report changed (the server takes a resent
+`Hello` as the node's new report, so placement sees the new `xcode` entries), and then
+sends `NodeStatus` again. Re-detecting the other software mid-session is **planned**
+(fleet-updates.md section 3.1, re-detection).
 
 ### `Offer`
 
@@ -395,7 +449,13 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
+- `Start.device_id` (field 8): the one iOS device booked for the lease, and
+  `NodeStatus.devices`: every iOS device the node knows, with its state and fix
+  ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
-- With many servers: the daemon dials the farm's one address and may learn the current
-  server list from the first server it reaches; the front relays the session to the
-  scheduler's leader.
+- With several servers ([deployment-topology.md](deployment-topology.md)): the daemon
+  dials the servers' own DNS names directly, with no balancer in between, and holds
+  its one stream to the leader. A follower does not serve or relay the session: it
+  answers with a redirect naming the leader, and the daemon dials that server. On
+  failover the daemon reconnects to the new leader. The redirect's form and how the
+  daemon is given the servers' names are open questions there.

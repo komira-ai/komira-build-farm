@@ -4,6 +4,7 @@
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 pub mod fake;
+pub mod real;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -230,6 +231,43 @@ pub fn deep(dir: &Path, levels: usize, bottom: &[u8]) {
     let file = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
     let fd = openat(&here, "f", file, Mode::from_raw_mode(0o644)).expect("create");
     std::io::Write::write_all(&mut std::fs::File::from(fd), bottom).expect("write");
+}
+
+/// Keeps CPUs busy until dropped: one spinning thread per CPU, at most four (a hosted
+/// runner's count; more would take a shared machine's CPUs from its other work), so a
+/// race between processes that is rare on an idle machine shows up within a stress
+/// loop.
+pub struct CpuHog {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl CpuHog {
+    pub fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+        let threads = (0..cpus)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for CpuHog {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Whether anything exists at `path` (a dangling symlink counts).

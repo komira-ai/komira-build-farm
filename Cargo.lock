@@ -1125,6 +1125,26 @@ dependencies = [
 [[package]]
 name = "kbf-alert"
 version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "kbf-auth"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower-layer",
+ "tracing",
+]
 
 [[package]]
 name = "kbf-caps"
@@ -1215,6 +1235,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "kbf-auth",
  "kbf-caps",
  "kbf-meta",
  "kbf-objstore",
@@ -1224,10 +1245,23 @@ dependencies = [
  "kbf-types",
  "prost",
  "prost-types",
+ "protox",
+ "serde_json",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "kbf-guest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "libc",
+ "subtle",
+ "thiserror",
 ]
 
 [[package]]
@@ -1338,9 +1372,11 @@ dependencies = [
  "kbf-front",
  "kbf-outputs",
  "kbf-proto",
+ "kbf-server",
  "libc",
  "prost",
  "rcgen",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -1426,8 +1462,10 @@ name = "kbf-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "futures",
+ "kbf-auth",
  "kbf-caps",
  "kbf-front",
  "kbf-mdm-api",

@@ -9,7 +9,8 @@ joins and leaves the farm.
 
 It covers the bare-metal host. Simulator, GUI and UI tests run in macOS VMs on that
 host (two guests per Mac), and GPU work runs on bare metal with the whole Mac; both are
-designed in the [macOS VMs design](https://github.com/komira-ai/komira-build-farm/pull/85) (`docs/design/macos-vms.md`, open PR). Where the two designs touch, this one defers to it:
+designed in the [macOS VMs design](macos-vms.md), with guest setup and image identity in
+[macos-vm-guests.md](macos-vm-guests.md). Where the two designs touch, this one defers to it:
 Xcodes per host and the `xcode` key, simulator runtimes, VM golden images, and GUI
 leases.
 
@@ -235,7 +236,7 @@ probe=host_identity:<path of the client's probe script>:<sha256 of the script>
 expect_probe=host_identity:17A000=26.6-0123456789abcdef
 expect_probe=host_identity:18A000=27.0-fedcba9876543210
 kbf_server=https://farm.example.net:8981
-kbf_cas=https://farm.example.net:8980
+kbf_cas=https://farm.example.net:8981
 kbf_labels=pool=mac rack=r2
 ```
 

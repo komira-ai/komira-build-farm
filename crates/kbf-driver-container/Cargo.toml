@@ -25,6 +25,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 prost-types.workspace = true
+# sched_getaffinity, which the real-Podman capacity test compares with.
+rustix = { workspace = true, features = ["thread"] }
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

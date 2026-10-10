@@ -2,8 +2,12 @@
 //!
 //! These need what a hosted runner has once `tools/ci/podman-tests.sh` has set it up
 //! (the T4 spike, `docs/spikes/hosted-runners.md`): rootless Podman, a system unit with
-//! `Delegate=yes` whose `actions` cgroup enables cpu, memory and pids, and a busybox
-//! image pulled by its index digest. So each test is `#[ignore]` with that reason, and
+//! `Delegate=yes` that the tests run in, and a busybox image pulled by its index
+//! digest. The first test to start sets the unit's cgroup up the way `kbf-daemon` does
+//! ([`kbf_driver_container::delegate`]: this process into `supervisor/`, `actions/`
+//! with cpu, memory and pids, `supervisor/memory.min` = [`SUPERVISOR_MEMORY_MIN`], and
+//! `actions/memory.max` = [`ACTIONS_MEMORY_MAX`]), and
+//! every test's cgroup is made under that `actions/`. So each test is `#[ignore]` with that reason, and
 //! the script runs them with `--include-ignored`. Run that way without the setup, a
 //! test fails (it never skips silently). The marker walk's own test needs only GNU
 //! find, which those runners have, and runs the same way. The variables the script
@@ -11,167 +15,22 @@
 //!
 //! - `KBF_TEST_IMAGE`: `docker://<repo>@sha256:<per-architecture manifest digest>`;
 //! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest (pulled by it,
-//!   so the store holds the index too);
-//! - `KBF_TEST_CGROUP`: the delegated cgroup, relative to `/sys/fs/cgroup`.
+//!   so the store holds the index too).
 
 mod support;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError, Work};
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
-use kbf_proto::reapi::{ActionResult, Digest};
+use kbf_driver_container::PodmanRuntime;
 use kbf_types::{LeaseId, Resources};
-use support::{Spec, blob, exists, store_action, work};
-
-fn var(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
-        panic!("{name} is not set: run these tests through tools/ci/podman-tests.sh")
-    })
-}
-
-/// One test's cgroup parent (under the delegated cgroup), scratch and runtime.
-struct Cell {
-    /// The lease term this test's leases use. Container names are unique per Podman
-    /// store, and the tests share one, so each test gets its own term.
-    term: u64,
-    cgroup: PathBuf,
-    scratch: PathBuf,
-    config: PodmanConfig,
-    cas: Arc<MemoryCas>,
-    runtime: Arc<PodmanRuntime<MemoryCas>>,
-}
-
-static TERMS: AtomicU64 = AtomicU64::new(1);
-
-/// Each cgroup under `dir` with the processes in it, for a failure message.
-fn describe(dir: &Path) -> String {
-    let mut out = String::new();
-    let mut pending = vec![dir.to_owned()];
-    while let Some(d) = pending.pop() {
-        let procs = std::fs::read_to_string(d.join("cgroup.procs")).unwrap_or_default();
-        let commands: Vec<String> = procs
-            .split_whitespace()
-            .map(|pid| {
-                std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-                    .unwrap_or_default()
-                    .replace('\0', " ")
-            })
-            .collect();
-        out.push_str(&format!("\n  {}: {commands:?}", d.display()));
-        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                pending.push(entry.path());
-            }
-        }
-    }
-    out
-}
-
-/// Shows the driver's logs (its clean errors among them) in a failing test's output.
-fn trace() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-}
-
-impl Cell {
-    fn new(name: &str) -> Self {
-        trace();
-        let term = TERMS.fetch_add(1, Ordering::Relaxed);
-        let parent = format!("{}/{name}", var("KBF_TEST_CGROUP"));
-        let cgroup = Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/'));
-        if exists(&cgroup) {
-            std::fs::remove_dir(&cgroup).expect("remove a stale test cgroup");
-        }
-        std::fs::create_dir(&cgroup).expect("create the test cgroup");
-        std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory +pids")
-            .expect("enable controllers");
-        let scratch = support::scratch(&format!("podman-{name}"));
-        // Each test its own owner: they share one Podman store, and a runtime removes
-        // its owner's containers when it starts.
-        let mut config = PodmanConfig::new(scratch.clone(), parent, format!("kbf-test-{name}"));
-        config.default_timeout = Duration::from_secs(120);
-        config.kill_grace = Duration::from_secs(2);
-        let cas = Arc::new(MemoryCas::new());
-        let runtime =
-            Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
-        Self {
-            term,
-            cgroup,
-            scratch,
-            config,
-            cas,
-            runtime,
-        }
-    }
-
-    /// Lease (`term`, `seq`) running `action`.
-    fn work(&self, seq: u64, action: Digest, resources: Resources) -> Work {
-        let mut work = work(seq, action, resources);
-        work.lease_id = LeaseId::new(self.term, seq);
-        work
-    }
-
-    /// The container and lease cgroup name of lease `seq`.
-    fn name(&self, seq: u64) -> String {
-        format!("kbf-lease-{}-{seq}", self.term)
-    }
-
-    async fn run(&self, seq: u64, spec: &Spec) -> Result<ActionResult, RuntimeError> {
-        let action = store_action(&self.cas, spec);
-        self.runtime
-            .run(self.work(seq, action, Resources::new(1000, 256 << 20)))
-            .await
-    }
-
-    /// Asserts lease `seq` left no container, cgroup or scratch directory.
-    fn assert_clean(&self, seq: u64) {
-        let name = self.name(seq);
-        assert!(!exists(&self.scratch.join(&name)), "{name}: scratch left");
-        let lease = self.cgroup.join(&name);
-        assert!(
-            !exists(&lease),
-            "{name}: lease cgroup left: {}",
-            describe(&lease)
-        );
-        let names = podman(&["ps", "--all", "--format={{.Names}}"]);
-        assert!(!names.lines().any(|n| n == name), "container left: {names}");
-    }
-
-    fn stdout(&self, result: &ActionResult) -> String {
-        String::from_utf8(blob(&self.cas, result.stdout_digest.as_ref())).expect("utf-8")
-    }
-}
-
-impl Drop for Cell {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            let _ = std::fs::remove_dir(&self.cgroup);
-            support::force_remove(&self.scratch);
-        }
-    }
-}
-
-/// Runs podman (the test's own checks) and returns its stdout.
-fn podman(args: &[&str]) -> String {
-    let output = Command::new("podman")
-        .args(args)
-        .output()
-        .expect("run podman");
-    assert!(
-        output.status.success(),
-        "podman {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn sh(script: &str) -> Spec {
-    Spec::new(&var("KBF_TEST_IMAGE"), script)
-}
+use support::real::{
+    ACTIONS_MEMORY_MAX, Cell, MOUNT, SUPERVISOR_MEMORY_MIN, delegation, describe, podman, sh, var,
+};
+use support::{Spec, blob, exists, store_action};
 
 /// Catches the action not seeing its inputs, environment, working directory or the
 /// constant hostname, and its exit code, stdout, stderr or outputs going uncollected.
@@ -281,34 +140,43 @@ async fn the_marker_test_nothing_outside_the_outputs_survives() {
         &[graph_root],
         &["-name", &marker],
     );
-    let found = walk.unwrap_or_else(|why| panic!("{why}"));
+    let found = walk.unwrap_or_else(|why| panic!("{why}")).found;
     assert!(found.trim().is_empty(), "marker left behind:\n{found}");
     cell.assert_clean(1);
 }
 
-/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`, and
-/// returns its stdout. The walk passes when find exits 0, or when every error it
-/// reported is a directory below one of `racing` that vanished mid-walk: a directory
-/// that is gone holds no file, and find walks the rest of the tree past that error.
-/// Any other error, a vanished root among them, is an `Err` with find's stderr.
+/// A walk that passed: what find printed, over every attempt, and how many attempts
+/// fts gave up because a directory it was in vanished.
+#[derive(Debug)]
+struct Walk {
+    found: String,
+    aborted: usize,
+}
+
+/// How many times [`find`] walks again after fts gave up mid-walk.
+const WALK_ATTEMPTS: usize = 5;
+
+/// Runs GNU find (through `prefix`) over `roots` with the expression `expr`. The walk
+/// passes when find exits 0, or when every error it reported is a directory below one
+/// of `racing` that vanished mid-walk: a directory that is gone holds no file, and find
+/// walks the rest of the tree past that error. Any other error, a vanished root among
+/// them, is an `Err` with find's stderr.
 ///
 /// `-ignore_readdir_race` is not enough: findutils applies it only to its own stat
 /// of an entry. A directory removed after it was listed is reported by fts (as an
 /// unreadable directory, or an entry that could not be stat'd) whatever that option
 /// says, and find then exits 1.
-fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<String, String> {
+///
+/// fts can also stop: going back up, it checks that ".." is the directory it came
+/// down from, and a directory moved while fts is deep inside it fails that check.
+/// find then reports "failed to read file names from file system at or below" the
+/// root (#105, seen in `the_store_walk_passes_while_containers_come_and_go`). The rest
+/// of that root was not walked, so such an attempt passes nothing: when that report
+/// names one of `racing` and every other error is a vanished directory, the walk runs
+/// again, up to [`WALK_ATTEMPTS`] times. What an aborted attempt printed is kept: a
+/// marker it found is still found.
+fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Result<Walk, String> {
     let (program, prefix) = prefix.split_first().expect("a program");
-    let output = Command::new(program)
-        .args(prefix)
-        // The C locale fixes the message text and the quotes find puts around a path.
-        .args(["env", "LC_ALL=C", "find"])
-        .args(roots)
-        .arg("-ignore_readdir_race")
-        .args(expr)
-        .output()
-        .expect("run find");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
     let vanished = |line: &str| {
         line.strip_prefix("find: '")
             .and_then(|l| l.strip_suffix("': No such file or directory"))
@@ -319,15 +187,44 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
                 })
             })
     };
-    let benign = !stderr.trim().is_empty() && stderr.lines().all(vanished);
-    if output.status.success() || (output.status.code() == Some(1) && benign) {
-        Ok(stdout)
-    } else {
-        Err(format!(
-            "find {roots:?} {expr:?}: {}:\n{stderr}",
-            output.status
-        ))
+    let gave_up = |line: &str| {
+        racing.iter().any(|root| {
+            line == format!(
+                "find: failed to read file names from file system at or below '{root}': \
+                 No such file or directory"
+            )
+        })
+    };
+    let mut found = String::new();
+    let mut stderr = String::new();
+    for aborted in 0..WALK_ATTEMPTS {
+        let output = Command::new(program)
+            .args(prefix)
+            // The C locale fixes the message text and the quotes find puts around a path.
+            .args(["env", "LC_ALL=C", "find"])
+            .args(roots)
+            .arg("-ignore_readdir_race")
+            .args(expr)
+            .output()
+            .expect("run find");
+        found.push_str(&String::from_utf8_lossy(&output.stdout));
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let errors_ok = !stderr.trim().is_empty()
+            && output.status.code() == Some(1)
+            && stderr.lines().all(|l| vanished(l) || gave_up(l));
+        if output.status.success() || (errors_ok && !stderr.lines().any(gave_up)) {
+            return Ok(Walk { found, aborted });
+        }
+        if !errors_ok {
+            return Err(format!(
+                "find {roots:?} {expr:?}: {}:\n{stderr}",
+                output.status
+            ));
+        }
     }
+    Err(format!(
+        "find {roots:?} {expr:?}: gave up mid-walk {WALK_ATTEMPTS} times; last:\n{stderr}"
+    ))
 }
 
 /// Catches the marker walk failing when another test removes its container mid-walk
@@ -335,8 +232,10 @@ fn find(prefix: &[&str], roots: &[&str], racing: &[&str], expr: &[&str]) -> Resu
 /// reaches deletes every other directory of the tree, which find has already listed
 /// and not yet entered, so one directory vanishes mid-walk whichever order find takes.
 /// That walk must pass and still print the trigger it matched (a marker found during
-/// a race is still found); a vanished root, a vanished directory outside `racing`,
-/// and an unreadable directory must each still fail.
+/// a race is still found). A tree moved away while find is deep inside it makes fts
+/// stop; that walk must be walked again, once, and pass. A vanished root, a vanished
+/// directory outside `racing`, a give-up outside `racing` and an unreadable directory
+/// must each still fail.
 #[test]
 #[ignore = "needs GNU find: run by tools/ci/podman-tests.sh"]
 fn a_directory_vanishing_mid_walk_fails_nothing_else() {
@@ -373,7 +272,8 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     let root = tree("raced");
     let found = find(&["env"], &[&root], &[&root], &strs(&race(&root)))
         .unwrap_or_else(|why| panic!("a directory vanishing mid-walk failed the walk: {why}"));
-    let found: Vec<&str> = found.lines().collect();
+    assert_eq!(found.aborted, 0, "{found:?}");
+    let found: Vec<&str> = found.found.lines().collect();
     assert_eq!(
         found.len(),
         1,
@@ -385,6 +285,49 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     );
     let left: Vec<_> = std::fs::read_dir(&root).expect("read").flatten().collect();
     assert_eq!(left.len(), 1, "the other directory was removed mid-walk");
+
+    // A tree moved out of the root while find is ten levels inside it: going back up,
+    // ".." of its top is no longer the root, and fts stops. The first attempt walks
+    // into the tree and moves it away; the second walks what is left.
+    let deep_tree = |name: &str| {
+        let root = scratch.join(name);
+        let deep = (0..10).fold(root.join("a"), |d, i| d.join(format!("l{i}")));
+        std::fs::create_dir_all(&deep).expect("create");
+        std::fs::write(deep.join("trigger"), b"t").expect("write");
+        root.to_string_lossy().into_owned()
+    };
+    let move_away = |root: &str, to: &str| -> Vec<String> {
+        let top = format!("{root}/a");
+        let to = scratch.join(to).to_string_lossy().into_owned();
+        [
+            "-name",
+            "trigger",
+            "-exec",
+            "mv",
+            top.as_str(),
+            to.as_str(),
+            ";",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let root = deep_tree("gives-up");
+    let walk = find(
+        &["env"],
+        &[&root],
+        &[&root],
+        &strs(&move_away(&root, "moved")),
+    )
+    .unwrap_or_else(|why| panic!("a walk that fts gave up was not walked again: {why}"));
+    assert_eq!(walk.aborted, 1, "{walk:?}");
+    assert!(exists(&scratch.join("moved")), "the walk moved the tree");
+    // The same in a tree where nothing may vanish.
+    let root = deep_tree("gives-up-not-racing");
+    let outcome = find(&["env"], &[&root], &[], &strs(&move_away(&root, "moved-2")));
+    assert!(
+        matches!(outcome, Err(ref why) if why.contains("failed to read file names")),
+        "{outcome:?}"
+    );
 
     // The same race in a tree where nothing may vanish.
     let root = tree("not-racing");
@@ -449,6 +392,69 @@ async fn tags_and_index_digests_are_refused() {
     cell.assert_clean(2);
 }
 
+/// Catches the daemon's cgroup setup failing on a real kernel, whose rules the unit
+/// tests' fake only imitates: enabling controllers before the move is EBUSY there, and
+/// `actions/` without `memory` fails every test's cgroup. The daemon's leaf carries its
+/// `memory.min` (the kernel shows it only once the unit enables `memory`), and the
+/// unit's own `memory.min`, when lower, is the one named as capping it. Then the capacity `kbf-daemon`
+/// reports: `actions/memory.max` as written (below the runner's memory), and the CPUs
+/// this process may run on (its affinity is the unit's cpuset).
+#[test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+fn the_daemons_cgroup_setup_holds_on_the_kernel() {
+    let delegation = delegation();
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read");
+    assert_eq!(own.trim(), format!("0::{}/supervisor", delegation.root));
+    let dir = |cgroup: &str| Path::new(MOUNT).join(cgroup.trim_start_matches('/'));
+    let read = |cgroup: &str, file: &str| {
+        std::fs::read_to_string(dir(cgroup).join(file))
+            .expect(file)
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(read(&delegation.root, "cgroup.procs"), "");
+    for cgroup in [&delegation.root, &delegation.actions] {
+        let enabled = read(cgroup, "cgroup.subtree_control");
+        for c in ["cpu", "memory", "pids"] {
+            assert!(enabled.split(' ').any(|e| e == c), "{cgroup}: {enabled}");
+        }
+    }
+    assert_eq!(
+        read(&delegation.actions, "memory.max"),
+        ACTIONS_MEMORY_MAX.to_string()
+    );
+    let supervisor = format!("{}/supervisor", delegation.root);
+    assert_eq!(
+        read(&supervisor, "memory.min"),
+        SUPERVISOR_MEMORY_MIN.to_string()
+    );
+    let unit_min: u64 = match read(&delegation.root, "memory.min").as_str() {
+        "max" => u64::MAX,
+        n => n.parse().expect("memory.min"),
+    };
+    if unit_min < SUPERVISOR_MEMORY_MIN {
+        assert_eq!(
+            delegation.memory_min_capped,
+            Some((delegation.root.clone(), unit_min))
+        );
+    }
+    let mem_total_kib: u64 = std::fs::read_to_string("/proc/meminfo")
+        .expect("meminfo")
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().strip_suffix("kB")?.trim().parse().ok())
+        .expect("MemTotal");
+    assert!(
+        mem_total_kib << 10 > ACTIONS_MEMORY_MAX,
+        "the premise: the cap is below the node"
+    );
+    let capacity =
+        kbf_driver_container::capacity(Path::new(MOUNT), &delegation.actions).expect("capacity");
+    assert_eq!(capacity.memory_bytes, Some(ACTIONS_MEMORY_MAX));
+    let allowed = rustix::thread::sched_getaffinity(None).expect("affinity");
+    assert_eq!(capacity.cpus, Some(u64::from(allowed.count())));
+}
+
 /// Catches the soft-limit policy not reaching the kernel: `memory.high` from the
 /// booking, `cpu.weight` from the CPU, no hard cap and swap allowed on the lease, and
 /// one OOM group for the container.
@@ -461,11 +467,7 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     let runtime = Arc::clone(&cell.runtime);
     let run = tokio::spawn(async move { runtime.run(work).await });
     let lease = cell.cgroup.join(cell.name(1));
-    let container = wait_for_container_cgroup(&lease).await;
-    // The directory alone is not enough: the OCI runtime makes it first and writes the
-    // container's cgroup files (memory.oom.group among them) later in `create`. The
-    // action's own program running is the state the driver relies on (#88).
-    wait_for_program_in(&container, "sleep").await;
+    let container = set_up_container_cgroup(&lease, "sleep").await;
     let read = |dir: &Path, file: &str| {
         std::fs::read_to_string(dir.join(file))
             .expect(file)
@@ -485,8 +487,40 @@ async fn the_lease_cgroup_carries_the_soft_limits() {
     cell.assert_clean(1);
 }
 
+/// Catches an action that inherits the daemon's lowered `oom_score_adj`: the script
+/// runs this process in a unit with `OOMScoreAdjust=-900`, as the daemon's unit does
+/// (docs/deploy/linux-build-host.md), so under memory pressure the kernel would pick
+/// the daemon before such a build. The action reads the kernel's default, 0.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn an_action_does_not_inherit_the_daemons_oom_score() {
+    let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read");
+    assert_eq!(own.trim(), "-900", "the premise: the unit lowers it");
+    let cell = Cell::new("oom-score");
+    let result = cell
+        .run(1, &sh("cat /proc/self/oom_score_adj"))
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(cell.stdout(&result).trim(), "0");
+    cell.assert_clean(1);
+}
+
+/// The container's cgroup under the lease cgroup `lease`, once the OCI runtime has set
+/// it up. The directory alone is not enough: the runtime makes it first and writes the
+/// container's cgroup files (memory.oom.group among them) later in `create`. The
+/// action's own program (`comm`) running in it is the state the driver relies on (#88).
+async fn set_up_container_cgroup(lease: &Path, comm: &str) -> PathBuf {
+    let container = wait_for_container_cgroup(lease).await;
+    wait_for_program_in(&container, comm).await;
+    container
+}
+
+/// The container's cgroup under `lease`, as soon as its directory exists. Polled every
+/// 5 ms: a read right after it appears is what `set_up_container_cgroup` must not do,
+/// and the stress test only shows that if this one is quick.
 async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
-    for _ in 0..600 {
+    for _ in 0..6000 {
         let found = std::fs::read_dir(lease)
             .into_iter()
             .flatten()
@@ -498,7 +532,7 @@ async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
         if let Some(entry) = found {
             return entry.path();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("no container cgroup under {}", lease.display());
 }
@@ -526,6 +560,111 @@ async fn wait_for_program_in(container: &Path, comm: &str) {
         container.display(),
         describe(container)
     );
+}
+
+/// Catches (issue #88) a container's cgroup files read before the OCI runtime wrote
+/// them: 100 leases, five at a time, each container's `memory.oom.group` read once
+/// `set_up_container_cgroup` returns, which must be 1 every time. The mutant drops
+/// that function's wait for the action's program: the read then follows the
+/// directory's creation by at most one 5 ms poll, inside the window #88 hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn every_container_is_one_oom_group_once_its_action_runs() {
+    let cell = Cell::new("oom-group-stress");
+    for batch in 0..20 {
+        let seqs: Vec<u64> = (1..=5).map(|i| batch * 5 + i).collect();
+        let runs: Vec<_> = seqs
+            .iter()
+            .map(|&seq| {
+                let action = store_action(&cell.cas, &sh("sleep 3"));
+                let work = cell.work(seq, action, Resources::default());
+                let runtime = Arc::clone(&cell.runtime);
+                tokio::spawn(async move { runtime.run(work).await })
+            })
+            .collect();
+        for &seq in &seqs {
+            let container =
+                set_up_container_cgroup(&cell.cgroup.join(cell.name(seq)), "sleep").await;
+            let group = std::fs::read_to_string(container.join("memory.oom.group"))
+                .expect("memory.oom.group");
+            assert_eq!(group.trim(), "1", "lease {seq}");
+        }
+        for (run, seq) in runs.into_iter().zip(seqs) {
+            let result = run.await.expect("join").expect("ran");
+            assert_eq!(result.exit_code, 0, "lease {seq}");
+            cell.assert_clean(seq);
+        }
+    }
+}
+
+/// Catches (issue #105) the marker test's walk of Podman's store failing because a
+/// container was removed while it walked. 40 leases run, two at a time, while the walk
+/// goes over the whole store again and again; every walk must pass and find nothing.
+/// Each of `find`'s two tolerances is a mutant this turns red: a layer directory that
+/// vanishes mid-walk (no error treated as benign), and fts stopping mid-walk (no walk
+/// again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn the_store_walk_passes_while_containers_come_and_go() {
+    let cell = Cell::new("walk-churn");
+    let pairs: Vec<Vec<Work>> = (0..20)
+        .map(|pair| {
+            (1..=2)
+                .map(|i| {
+                    let action = store_action(&cell.cas, &sh("echo churn > /tmp/churn"));
+                    cell.work(pair * 2 + i, action, Resources::new(1000, 256 << 20))
+                })
+                .collect()
+        })
+        .collect();
+    let runtime = Arc::clone(&cell.runtime);
+    let churn = tokio::spawn(async move {
+        let mut outcomes = Vec::new();
+        for pair in pairs {
+            let runs: Vec<_> = pair
+                .into_iter()
+                .map(|work| {
+                    let runtime = Arc::clone(&runtime);
+                    tokio::spawn(async move { runtime.run(work).await })
+                })
+                .collect();
+            for run in runs {
+                outcomes.push(run.await.expect("join"));
+            }
+        }
+        outcomes
+    });
+    let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
+    let graph_root = graph_root.trim().to_owned();
+    let name = format!("kbf-never-written-{}", std::process::id());
+    let (mut walks, mut gave_up) = (0, 0);
+    while !churn.is_finished() {
+        let (root, name) = (graph_root.clone(), name.clone());
+        let walk = tokio::task::spawn_blocking(move || {
+            find(
+                &["podman", "unshare"],
+                &[&root],
+                &[&root],
+                &["-name", &name],
+            )
+        })
+        .await
+        .expect("join");
+        let walk = walk.unwrap_or_else(|why| panic!("walk {walks}: {why}"));
+        assert!(walk.found.trim().is_empty(), "{}", walk.found);
+        walks += 1;
+        gave_up += walk.aborted;
+    }
+    for (i, outcome) in churn.await.expect("join").into_iter().enumerate() {
+        let result = outcome.unwrap_or_else(|e| panic!("lease {}: {e:?}", i + 1));
+        assert_eq!(result.exit_code, 0, "lease {}", i + 1);
+        cell.assert_clean(i as u64 + 1);
+    }
+    assert!(
+        walks > 1,
+        "the store was walked {walks} times while leases ran"
+    );
+    println!("{walks} walks of the store while 40 leases came and went; {gave_up} walked again");
 }
 
 /// Catches a kernel OOM kill being reported as the action's own result (exit 137 would
@@ -673,8 +812,7 @@ async fn no_container_id_is_the_daemons_on_the_host() {
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let run = tokio::spawn(async move { runtime.run(work).await });
-    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
-    wait_for_program_in(&container, "sleep").await;
+    let container = set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let procs = std::fs::read_to_string(container.join("cgroup.procs")).expect("cgroup.procs");
     let seen: Vec<_> = procs.split_whitespace().flat_map(ids).collect();
@@ -717,8 +855,7 @@ async fn two_containers_run_at_once() {
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let first = tokio::spawn(async move { runtime.run(work).await });
-    let container = wait_for_container_cgroup(&cell.cgroup.join(cell.name(1))).await;
-    wait_for_program_in(&container, "sleep").await;
+    set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let second = cell.run(2, &sh("echo second")).await;
     let still = podman(&["ps", "--format={{.Names}}"]);

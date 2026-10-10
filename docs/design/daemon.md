@@ -16,7 +16,7 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 | Start window | `window` | when this stream's heartbeats were sent, so a `Start` that arrives too late is not run |
 | Lease manager | `lease` | starts work only on `Start`, turns each outcome into one `Result`, fences, kills a cancelled lease |
 | Runtime | `runtime` | the `Runtime` trait every execution driver implements |
-| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service |
+| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service, on the worker listener (`--cas`, mutual TLS) |
 | Trees | `tree` | writes an input root to disk and reads outputs back |
 | Usage | `usage` | measures a child process's CPU time and peak memory when it is reaped |
 
@@ -169,13 +169,28 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
 
-Three runtimes exist:
+Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first three,
+picked by `--driver`:
 
-- **`PodmanRuntime`** (`kbf-driver-container`, driver `container`): the runtime for farm
-  nodes, below.
-- **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result. The only
-  runtime the `kbf-daemon` binary offers today, for bring-up; the binary that runs the
-  container driver is **planned**.
+- **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
+  runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
+  checks the daemon user's subordinate ids before it starts. It then sets up the cgroup
+  its systemd unit delegates (`Delegate=yes`): it moves its processes into a
+  `supervisor/` leaf, writes its `memory.min` from `--supervisor-memory-min-mib`
+  (default 256; it warns when its unit or slice protects less), makes `actions/` with
+  cpu, memory and pids enabled, and writes `actions/memory.max` from
+  `--actions-memory-max-gib`. It refuses to start, naming the
+  fix, on cgroup v1, from the root cgroup, or when the unit does not delegate those
+  controllers or the cgroup is not writable. `--cgroup-parent` names an `actions/`
+  cgroup set up by someone else instead (checked, not changed). The node reports at most
+  what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
+  `memory.max` above the leases, `cpus` the nearest `cpuset.cpus.effective`.
+  [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
+  units and the host's swap and memory headroom.
+- **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
+  processes on the node, for Macs.
+- **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
+  bring-up.
 - **`LocalRuntime`** (driver `local`): **tests only**. Runs each action as a plain child
   process of the daemon so the whole path (fetch, write inputs, run, measure, upload,
   report) can be tested where no container runtime exists. It isolates nothing and
@@ -229,9 +244,10 @@ loud.
 | Network | `--network=none`: loopback only. No action has network today. |
 | Image | by per-architecture manifest digest; `--pull=never` |
 | Entrypoint | the action's argv as a JSON array: the image's `ENTRYPOINT` and `CMD` are ignored and no argument is re-split |
-| Users | `--userns=nomap`: no container uid or gid is the daemon's user (below) |
+| Users | `--userns=nomap`: no container uid or gid is the daemon's user (below); `--user=0:0`, the container's root, whatever the image's `USER` |
 | Hostname | `localhost` |
-| Environment | the `Command`'s variables, passed with `--env` on top of what the image defines |
+| Environment | `--unsetenv-all`, then the `Command`'s variables with `--env`: nothing from the image's `ENV`, Podman's defaults (`PATH`, `container`; `TERM` only with a tty, which an action never has) or the node's `containers.conf`. Podman 4.9 still adds `HOSTNAME=localhost` and `HOME` (uid 0's home in the image's `/etc/passwd`) when the `Command` sets neither; both follow from the image digest |
+| Limits | `--pids-limit`, `--shm-size` and `--ulimit` for `nofile` and `nproc` (soft = hard), from `kbf-daemon`'s `--container-pids-limit` (default 8192), `--container-shm-mib` (64), `--container-nofile` (65,536) and `--container-nproc` (32,768). `nproc` counts per user, and every container's root is the same subordinate id, so it bounds the node's actions together |
 | Working directory | the `Command`'s, under `/kbf/root` |
 | Files | the input root as a read-only overlay lower layer at `/kbf/root`; every write lands in a per-lease upper directory |
 | Cgroup | `--cgroup-parent` set to the lease cgroup, `--cgroup-manager=cgroupfs`, `memory.oom.group=1` |
@@ -354,8 +370,6 @@ runtime reports usage; the container driver does not yet.
 
 ## Planned
 
-- A shipped daemon binary that runs the container driver, with the driver's
-  configuration as flags.
 - **Re-adopting leases across a daemon restart:** each lease runs as its own systemd
   unit, so work continues while the daemon restarts, and the daemon lists every
   re-adopted lease in its first heartbeat.

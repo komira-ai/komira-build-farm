@@ -13,7 +13,7 @@ use objc2_foundation::{NSError, NSString};
 use objc2_open_directory::{ODNode, ODRecord, ODSession, kODNodeTypeLocalNodes};
 use security_framework::random::SecRandom;
 
-use crate::helper::{self, Host, NewUser};
+use crate::helper::{self, Host, LiveProcess, NewUser};
 
 const USERS: &str = "dsRecTypeStandard:Users";
 const GROUPS: &str = "dsRecTypeStandard:Groups";
@@ -202,12 +202,12 @@ impl Host for MacHost {
         Ok(())
     }
 
-    fn live_processes(&self, uid: u32) -> io::Result<usize> {
+    fn live_processes(&self, uid: u32) -> io::Result<Vec<LiveProcess>> {
         let mut pids = BTreeSet::new();
         for filter in [PROC_UID_ONLY, PROC_RUID_ONLY] {
             pids.extend(list_pids(filter, uid)?);
         }
-        Ok(pids.into_iter().filter(|&pid| !exited(pid)).count())
+        Ok(pids.into_iter().filter_map(live).collect())
     }
 
     fn pause(&self) {
@@ -293,8 +293,9 @@ fn list_pids(filter: u32, uid: u32) -> io::Result<Vec<libc::pid_t>> {
     Ok(pids)
 }
 
-/// Whether `pid` has exited: it waits to be reaped, or is gone already.
-fn exited(pid: libc::pid_t) -> bool {
+/// `pid` with its command name, unless it has exited: it waits to be reaped, or is
+/// gone already.
+fn live(pid: libc::pid_t) -> Option<LiveProcess> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .expect("proc_bsdinfo is a few hundred bytes");
@@ -310,11 +311,25 @@ fn exited(pid: libc::pid_t) -> bool {
     };
     let error = (wrote <= 0).then(io::Error::last_os_error);
     // SAFETY: read only when the call filled the whole struct.
-    let status = (wrote == size).then(|| unsafe { info.assume_init() }.pbi_status);
-    exited_from(status, error.as_ref())
+    let info = (wrote == size).then(|| unsafe { info.assume_init() });
+    if exited_from(info.map(|info| info.pbi_status), error.as_ref()) {
+        return None;
+    }
+    let command = info.map_or_else(|| "?".to_owned(), |info| c_name(&info.pbi_comm));
+    Some(LiveProcess { pid, command })
 }
 
-/// What `proc_pidinfo` said, as [`exited`] decides it: a full answer is a zombie or a
+/// A NUL-terminated name of at most `raw.len()` bytes, as text.
+fn c_name(raw: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = raw
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| u8::from_ne_bytes(c.to_ne_bytes()))
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What `proc_pidinfo` said, as [`live`] decides it: a full answer is a zombie or a
 /// live process by its status; otherwise only "no such process" (`ESRCH`) is gone.
 /// Any other failure, or a short answer, counts the process as live, so that
 /// `user-delete` refuses rather than under-counts.
@@ -343,16 +358,37 @@ mod tests {
     }
 
     /// The same against the kernel: this process is live, an exited child not yet
-    /// reaped is a zombie, and a reaped one is gone.
+    /// reaped is a zombie, and a reaped one is gone. A live one is named by its
+    /// command (catches: the name read from the wrong field, or not cut at its NUL).
     #[test]
     fn the_kernel_agrees() {
         let me = libc::pid_t::try_from(std::process::id()).unwrap();
-        assert!(!exited(me));
+        assert_eq!(live(me).map(|p| p.pid), Some(me));
+        let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = libc::pid_t::try_from(sleeper.id()).unwrap();
+        // Polled: the name is the parent's until the child has executed sleep.
+        let mut named = live(pid);
+        for _ in 0..100 {
+            if named.as_ref().is_some_and(|p| p.command == "sleep") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            named = live(pid);
+        }
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert_eq!(
+            named,
+            Some(LiveProcess {
+                pid,
+                command: "sleep".to_owned()
+            })
+        );
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
         let mut zombie = false;
         for _ in 0..100 {
-            zombie = exited(pid);
+            zombie = live(pid).is_none();
             if zombie {
                 break;
             }
@@ -360,6 +396,21 @@ mod tests {
         }
         assert!(zombie, "the exited child was never a zombie");
         child.wait().unwrap();
-        assert!(exited(pid));
+        assert_eq!(live(pid), None);
+    }
+
+    /// Catches: a name that runs past its NUL, or a full buffer with no NUL misread.
+    #[test]
+    fn a_c_name_stops_at_its_nul() {
+        let raw: Vec<libc::c_char> = b"sleep\0junk"
+            .iter()
+            .map(|&b| libc::c_char::from_ne_bytes([b]))
+            .collect();
+        assert_eq!(c_name(&raw), "sleep");
+        let full: Vec<libc::c_char> = b"abcd"
+            .iter()
+            .map(|&b| libc::c_char::from_ne_bytes([b]))
+            .collect();
+        assert_eq!(c_name(&full), "abcd");
     }
 }

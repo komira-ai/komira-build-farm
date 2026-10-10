@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the container driver's real-Podman tests (crates/kbf-driver-container/tests/
-# podman.rs) on a GitHub-hosted runner, set up the way the T4 spike found works
-# (docs/spikes/hosted-runners.md):
+# podman.rs and podman_env.rs) on a GitHub-hosted runner, set up the way the T4 spike
+# found works (docs/spikes/hosted-runners.md):
 #
 # - a systemd user session for the runner user (lingering), so rootless Podman has a
 #   run directory;
@@ -10,8 +10,10 @@
 #   index (Podman's own `.Digest` is the digest of the first pull, here the index);
 # - the tests run inside a system unit with Delegate=yes, as the runner user: the
 #   user manager alone gets no io controller and a daemon must own its subtree. The
-#   unit moves itself into a leaf and enables cpu, memory and pids for `actions`
-#   (tools/ci/podman-tests-inner.sh).
+#   tests set the unit's cgroup up with kbf-daemon's own code (a `supervisor` leaf,
+#   then `actions` with cpu, memory and pids; tools/ci/podman-tests-inner.sh).
+#   The unit lowers its OOM score as the daemon's does (docs/deploy/
+#   linux-build-host.md), so the tests see what an action inherits from it.
 #
 # The test binary is built before the unit starts, so the unit only runs it.
 set -euo pipefail
@@ -54,10 +56,10 @@ if [ "docker.io/library/busybox@$manifest" = "$BUSYBOX" ]; then
 fi
 echo "busybox manifest for $arch: $manifest"
 
-cargo test -p kbf-driver-container --test podman --locked --no-run
+cargo test -p kbf-driver-container --test podman --test podman_env --locked --no-run
 
 sudo systemd-run --quiet --wait --collect --pipe --unit=kbf-podman-tests \
-    --slice=kbf-daemon.slice -p Delegate=yes \
+    --slice=kbf-daemon.slice -p Delegate=yes -p OOMScoreAdjust=-900 \
     --uid="$uid" --gid="$(id -g)" --working-directory="$PWD" \
     -E HOME="$HOME" -E PATH="$PATH" -E XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     -E CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-}" -E RUSTFLAGS="${RUSTFLAGS:-}" \

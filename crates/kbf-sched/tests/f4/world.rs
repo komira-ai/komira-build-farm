@@ -65,13 +65,16 @@ const PLATFORMS: [(&[(&str, &str)], u64); 13] = [
 ];
 /// How many nodes carry `label.pool=release`: the first ones in the storm set.
 const RELEASE_NODES: usize = 4;
+/// The plain `OSFamily=Darwin` platform, whose smallest requests book a VM slot.
+const DARWIN: usize = 6;
 
 /// The scenario a seed runs: `seed % 4`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
     /// F4.1: arrivals at 70 to 95 percent of capacity, no worker or operator faults.
     Steady,
-    /// F4.2: 5 percent of workers die or return each minute.
+    /// F4.2: 5 percent of workers die or return each minute, and at least one dead
+    /// worker returns when any is dead.
     Churn,
     /// F4.3: every worker registers again within a few seconds, once or twice.
     MassReconnect,
@@ -244,9 +247,13 @@ impl Node {
                 if rng.chance(Chance::percent(50)) {
                     r.push(("xcode", "15F31d".to_owned()));
                 }
+                // No, one or two VM slots, by the node's number (no draw, so the
+                // rest of the seed's stream is unchanged).
+                let vms = u64::try_from(i % 3).expect("small");
+                r.push(("vm.slots", vms.to_string()));
                 (
                     r,
-                    Resources::new(cores(rng, 1, 3), rng.between(16, 64) * GIB),
+                    Resources::new(cores(rng, 1, 3), rng.between(16, 64) * GIB).with_vms(vms),
                 )
             }
             _ => {
@@ -276,7 +283,9 @@ impl Node {
 }
 
 fn caps_of(report: &[(&'static str, String)]) -> NodeCaps {
-    NodeCaps::from_report(report.iter().map(|(k, v)| (*k, v.as_str()))).expect("valid report")
+    NodeCaps::from_report(report.iter().map(|(k, v)| (*k, v.as_str())))
+        .expect("valid report")
+        .with_drivers(["container"])
 }
 
 fn digest(n: u64) -> Digest {
@@ -766,6 +775,8 @@ impl World {
             pick -= weight;
         }
         let resources = match rng.below(100) {
+            // On a plain Mac platform, a VM lease: one of the Macs' VM slots.
+            0..56 if platform == DARWIN => Resources::new(1_000, GIB).with_vms(1),
             0..56 => Resources::new(1_000, GIB),
             56..76 => Resources::new(rng.between(2, 8) * 1_000, rng.between(2, 16) * GIB),
             76..86 => Resources::new(2_000, rng.between(24, 96) * GIB),
@@ -791,6 +802,7 @@ impl World {
                 action: digest(number),
             },
             qos: Qos::Ci,
+            kind: kbf_types::LeaseKind::Action,
             resources,
             needs: kbf_caps::Request::from_platform(PLATFORMS[platform].0.iter().copied())
                 .expect("valid platform"),
@@ -839,9 +851,11 @@ impl World {
                 .collect();
             let cpu: u64 = matching.iter().map(|n| n.base.cpu_millis).sum();
             let gpus: u64 = matching.iter().map(|n| n.base.gpus).sum();
+            let vms: u64 = matching.iter().map(|n| n.base.vms).sum();
             let run = self.durations[&request.key];
             backlog += request.resources.cpu_millis * run / cpu.max(1);
             backlog += request.resources.gpus * run / gpus.max(1);
+            backlog += request.resources.vms * run / vms.max(1);
         }
         self.bound_s =
             outage + 2 * backlog + 2 * MAX_RUN_S + GRACE_S + WAIT_S + 2 * HEARTBEAT_S + 10;

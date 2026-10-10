@@ -75,7 +75,9 @@ impl World {
             longest_cordon_wait: 0,
         };
         for name in WORKERS {
-            let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")]).unwrap();
+            let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+                .unwrap()
+                .with_drivers(["container"]);
             w.feed(Event::WorkerUp {
                 worker: WorkerId::new(name),
                 instance: DaemonInstance::new(name),
@@ -192,6 +194,7 @@ impl World {
                     action: digest(n),
                 },
                 qos: Qos::Ci,
+                kind: kbf_types::LeaseKind::Action,
                 resources: Resources::new(1_000, GIB),
                 hermetic: true,
                 do_not_cache: false,

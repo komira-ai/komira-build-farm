@@ -13,6 +13,14 @@
 //!   (reason [`NO_WORKER_REASON`], domain [`ERROR_DOMAIN`], the explanation under
 //!   metadata key `why`) in `partial_execution_metadata.auxiliary_metadata`.
 //!
+//! Execute is authorized by the [`Authorizers::execute`] authorizer against the
+//! request's instance name, before anything else is read; WaitExecution by the same
+//! authorizer against the instance name of the operation it names, once that is found
+//! (an unknown name is NOT_FOUND whoever asks). The reads Execute makes for itself (the
+//! action cache, the action, its inputs) are not authorized again. Each Execute runs
+//! in an `execute` trace span carrying the instance name and the caller's public
+//! authentication metadata (`caller`, `-` when there is none).
+//!
 //! WaitExecution streams the same updates for an operation name Execute returned, until
 //! it is done. A finished operation is kept for a short retention the [`Dispatch`]
 //! sets, in which waiting on it streams the done operation; after that it is
@@ -33,7 +41,7 @@
 //! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
 //! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
-//! key on a `whole_machine` lease (which is planned to book the whole node). The
+//! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
 //! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
 //! value that is not a whole number is INVALID_ARGUMENT.
 //!
@@ -55,6 +63,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{Stream, stream};
+use kbf_auth::{Authorizers, authorize};
 use kbf_caps::FromPlatformError;
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::longrunning::{Operation, operation};
@@ -67,11 +76,12 @@ use kbf_proto::reapi::{
     ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
-use kbf_types::{ActionKey, Digest, Platform, Qos, Resources};
+use kbf_types::{ActionKey, Digest, LeaseKind, Platform, Qos, Resources};
 use prost::Message;
 use prost_types::Any;
 use tokio::sync::watch;
 use tonic::{Code, Request as GrpcRequest, Response, Status};
+use tracing::Instrument as _;
 
 use crate::cache::{Cache, CacheError};
 use crate::meta_log::MetaLog;
@@ -102,14 +112,12 @@ pub const ERROR_DOMAIN: &str = "kbf";
 /// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
 
-/// One execution the front hands to the scheduler: the scheduler's request and the
-/// lease kind its `Start` names.
+/// One execution the front hands to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
-    /// What to run, keyed for dedup.
+    /// What to run, keyed for dedup, with the lease kind from the platform's
+    /// `kbf-lease`.
     pub request: Request,
-    /// The lease kind, from the platform's `kbf-lease`.
-    pub kind: String,
 }
 
 /// Where an operation is, as its callers see it.
@@ -142,6 +150,9 @@ pub struct Ticket {
     /// another operation, including one of a later server process: a client can still
     /// hold it after a restart (issue #154).
     pub name: String,
+    /// The instance name the operation was submitted under, which WaitExecution is
+    /// authorized against.
+    pub instance: String,
     /// The action digest, for the operation's metadata.
     pub action: Digest,
     /// The stage, updated until [`Stage::Done`]. A sender dropped before then means the
@@ -201,15 +212,30 @@ pub struct ExecutionService<M, O, D> {
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
     closing: Closing,
+    authorizers: Arc<Authorizers>,
 }
 
+/// The gRPC path of Execute, as calls are logged.
+const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
+
+/// The gRPC path of WaitExecution, as calls are logged.
+const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
+
 impl<M, O, D> ExecutionService<M, O, D> {
-    /// The service over `cache` and `dispatch`, whose streams end when `closing` does.
-    pub const fn new(cache: Arc<Cache<M, O>>, dispatch: Arc<D>, closing: Closing) -> Self {
+    /// The service over `cache` and `dispatch`, whose streams end when `closing` does,
+    /// each call authorized by `authorizers`.
+    #[must_use]
+    pub const fn with_authorizers(
+        cache: Arc<Cache<M, O>>,
+        dispatch: Arc<D>,
+        closing: Closing,
+        authorizers: Arc<Authorizers>,
+    ) -> Self {
         Self {
             cache,
             dispatch,
             closing,
+            authorizers,
         }
     }
 }
@@ -231,7 +257,47 @@ where
         &self,
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
+        let caller = kbf_auth::metadata(&request);
         let request = request.into_inner();
+        let instance = request.instance_name.as_str();
+        authorize(&*self.authorizers.execute, &caller, EXECUTE, instance).await?;
+        let span = tracing::info_span!(
+            "execute",
+            instance,
+            caller = %caller.public_display()
+        );
+        self.execute_authorized(request).instrument(span).await
+    }
+
+    async fn wait_execution(
+        &self,
+        request: GrpcRequest<WaitExecutionRequest>,
+    ) -> Result<Response<OperationStream>, Status> {
+        let caller = kbf_auth::metadata(&request);
+        let name = request.into_inner().name;
+        let Some(ticket) = self.dispatch.wait(&name) else {
+            return Err(Status::not_found(format!(
+                "no operation {name:?}: finished operations are kept only briefly; \
+                 Execute answers a finished one from the action cache"
+            )));
+        };
+        let execute = &*self.authorizers.execute;
+        authorize(execute, &caller, WAIT_EXECUTION, &ticket.instance).await?;
+        Ok(Response::new(operations(ticket, self.closing.clone())))
+    }
+}
+
+impl<M, O, D> ExecutionService<M, O, D>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+    D: Dispatch,
+{
+    /// Execute, once authorized: an action-cache hit, or the operation's stream.
+    async fn execute_authorized(
+        &self,
+        request: ExecuteRequest,
+    ) -> Result<Response<OperationStream>, Status> {
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
         if !request.skip_cache_lookup
@@ -242,6 +308,7 @@ where
                 action.hash_hex(),
                 action.size_bytes
             );
+            tracing::debug!(%action, "answered from the action cache");
             let done = operation(
                 &name,
                 &action,
@@ -252,21 +319,8 @@ where
         }
         let submission = self.submission(request.instance_name, action).await?;
         let ticket = self.dispatch.submit(submission)?;
+        tracing::debug!(%action, operation = %ticket.name, "submitted");
         Ok(Response::new(operations(ticket, self.closing.clone())))
-    }
-
-    async fn wait_execution(
-        &self,
-        request: GrpcRequest<WaitExecutionRequest>,
-    ) -> Result<Response<OperationStream>, Status> {
-        let name = request.into_inner().name;
-        match self.dispatch.wait(&name) {
-            Some(ticket) => Ok(Response::new(operations(ticket, self.closing.clone()))),
-            None => Err(Status::not_found(format!(
-                "no operation {name:?}: finished operations are kept only briefly; \
-                 Execute answers a finished one from the action cache"
-            ))),
-        }
     }
 }
 
@@ -304,18 +358,18 @@ where
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
         let gpus = gpus(&platform)?;
-        let booked = booking(&platform, &kind)?;
+        let booked = booking(&platform, kind)?;
         let needs = needs(&platform)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
+                kind,
                 resources: booked.with_gpus(gpus),
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
                 needs,
             },
-            kind,
         })
     }
 
@@ -418,7 +472,7 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
 /// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
 /// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
 /// lease.
-fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
+fn booking(platform: &Platform, kind: LeaseKind) -> Result<Resources, Status> {
     let mut booked = DEFAULT_RESOURCES;
     for (key, unit, slot) in [
         (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
@@ -427,10 +481,11 @@ fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
         let Some(value) = platform.get(key) else {
             continue;
         };
-        if kind != LEASE_KINDS[0] {
+        if kind != LeaseKind::Action {
             return Err(Status::invalid_argument(format!(
-                "platform property {key} sizes an {:?} lease only, not a {kind:?} one",
-                LEASE_KINDS[0]
+                "platform property {key} sizes an {:?} lease only, not a {:?} one",
+                LeaseKind::Action.name(),
+                kind.name()
             )));
         }
         *slot = Some(value)
@@ -471,15 +526,19 @@ fn needs(platform: &Platform) -> Result<kbf_caps::Request, Status> {
     })
 }
 
-/// The lease kind a platform names, or INVALID_ARGUMENT.
-fn lease_kind(platform: &Platform) -> Result<String, Status> {
-    match platform.get(LEASE_KIND_KEY) {
-        None => Ok(LEASE_KINDS[0].to_owned()),
-        Some(kind) if LEASE_KINDS.contains(&kind) => Ok(kind.to_owned()),
-        Some(kind) => Err(Status::invalid_argument(format!(
-            "platform property {LEASE_KIND_KEY}={kind:?} is not one of {LEASE_KINDS:?}"
-        ))),
-    }
+/// The lease kind a platform names, or INVALID_ARGUMENT for one not in
+/// [`LEASE_KINDS`] (`vm` among them, until the front books it).
+fn lease_kind(platform: &Platform) -> Result<LeaseKind, Status> {
+    let Some(kind) = platform.get(LEASE_KIND_KEY) else {
+        return Ok(LeaseKind::Action);
+    };
+    LeaseKind::from_name(kind)
+        .filter(|k| LEASE_KINDS.contains(&k.name()))
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "platform property {LEASE_KIND_KEY}={kind:?} is not one of {LEASE_KINDS:?}"
+            ))
+        })
 }
 
 /// FAILED_PRECONDITION with one `MISSING` violation per blob, as REAPI asks.
@@ -585,6 +644,7 @@ fn operations(ticket: Ticket, closing: Closing) -> OperationStream {
         name,
         action,
         stage,
+        ..
     } = ticket;
     let state = Some((stage, closing, true));
     Box::pin(stream::unfold(state, move |state| {

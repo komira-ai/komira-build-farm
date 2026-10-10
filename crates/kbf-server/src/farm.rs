@@ -37,13 +37,14 @@ use kbf_proto::worker::{
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
+    OperationId, Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting,
+    WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
-use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView};
+use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
 use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
@@ -136,7 +137,7 @@ pub enum NodeAction {
 struct Waiter {
     name: String,
     key: kbf_types::ActionKey,
-    kind: String,
+    kind: LeaseKind,
     do_not_cache: bool,
     stage: watch::Sender<Stage>,
     /// When it was submitted, on the wall clock.
@@ -359,17 +360,39 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     }
 
     /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was
-    /// replaced (a newer stream sends its own after its `Welcome`).
-    pub fn node_status(&self, worker: &WorkerId, stream: StreamId, status: NodeStatus) {
+    /// replaced (a newer stream sends its own after its `Welcome`). Each attention item
+    /// it raises or clears against the node's previous status, from any stream, is
+    /// logged once; an Xcode it lists not surveyed yet keeps its previous item
+    /// (`crate::fleet`). Returns those lines, `true` for each raised.
+    pub fn node_status(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        status: NodeStatus,
+    ) -> Vec<(bool, String)> {
         let received = unix_ms();
         let mut state = self.lock();
-        if state.is_current(worker, stream) {
-            let view = SoftwareView::new(status, received);
-            state.software.insert(worker.clone(), view);
+        if !state.is_current(worker, stream) {
+            return Vec::new();
         }
+        let mut view = SoftwareView::new(status, received);
+        let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
+        // An Xcode not surveyed yet (a restarted daemon's first status) keeps the item
+        // it had: neither cleared now nor raised again by the survey (`crate::fleet`).
+        view.hold_unsurveyed(before);
+        let changes = attention_changes(worker.as_str(), before, &view.xcodes);
+        for (raise, line) in &changes {
+            if *raise {
+                tracing::warn!(target: "kbf_server::attention", "{line}");
+            } else {
+                tracing::info!(target: "kbf_server::attention", "{line}");
+            }
+        }
+        state.software.insert(worker.clone(), view);
+        changes
     }
 
-    /// Every node registered since this farm started, in node-id order.
+    /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
         let state = self.lock();
         let nodes = state
@@ -377,7 +400,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             .keys()
             .map(|worker| self.node(&state, worker))
             .collect();
-        NodesView { nodes }
+        NodesView::of_this_build(nodes)
     }
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.
@@ -438,6 +461,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             node_id: worker.as_str().to_owned(),
             connected: !state.links[worker].outbound.is_closed(),
             software: state.software.get(worker).cloned(),
+            needs_attention: state
+                .software
+                .get(worker)
+                .map(SoftwareView::needs_attention)
+                .unwrap_or_default(),
             placement,
         }
     }
@@ -595,12 +623,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let name = operation_name(self.term, waiter);
         let (stage, receiver) = watch::channel(Stage::Queued);
         let action = submission.request.key.action;
+        let instance = submission.request.key.instance.clone();
         state.waiters.insert(
             waiter,
             Waiter {
                 name: name.clone(),
                 key: submission.request.key.clone(),
-                kind: submission.kind,
+                kind: submission.request.kind,
                 do_not_cache: submission.request.do_not_cache,
                 stage,
                 queued: SystemTime::now(),
@@ -625,6 +654,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         }
         Ok(Ticket {
             name,
+            instance,
             action,
             stage: receiver,
         })
@@ -636,6 +666,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let waiter = state.waiters.get(&waiter)?;
         Some(Ticket {
             name: waiter.name.clone(),
+            instance: waiter.key.instance.clone(),
             action: waiter.key.action,
             stage: waiter.stage.subscribe(),
         })
@@ -793,7 +824,7 @@ impl State {
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
-                kind: w.kind.clone(),
+                kind: w.kind.name().to_owned(),
                 action_digest: Some(kbf_front::digest_to_proto(&w.key.action)),
             })
         });
@@ -804,10 +835,10 @@ impl State {
     /// after it in which the daemon may still act on the `Start` (issue #23).
     fn start(&mut self, start: StartLease) {
         let heartbeat_seq = self.links.get(&start.worker).map_or(0, |l| l.newest_beat);
-        self.send_for(&start.worker, start.operation, |w| {
+        self.send_for(&start.worker, start.operation, |_| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
-                kind: w.kind.clone(),
+                kind: start.kind.name().to_owned(),
                 action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
                 millicpus: start.resources.cpu_millis,
                 memory_bytes: start.resources.memory_bytes,

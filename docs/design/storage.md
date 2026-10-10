@@ -35,22 +35,34 @@ Bytes never enter the metadata layer; the object store never decides anything.
 
 `kbf_meta::MetaState` is a pure state machine. It holds:
 
-- the **CAS index**: each digest maps to a `Location` (a record at an offset in a
-  segment, or a large blob stored as its own object) and the farm time of its last
-  touch;
+- the **CAS index**: each digest maps to a `Location` (a store id, an object id, and
+  the offset of the blob's record in that object) and the farm time of its last touch;
 - the **action cache**: each action digest maps to an `ActionRecord` (the digest of the
   stored `ActionResult` and its *closure*) and the time of its last hit;
-- the set of objects found unreachable;
-- the committed farm time.
+- the objects found unreachable, each with the reason: `Missing` (the store did not
+  produce the object or the range) or `Corrupt` (the bytes failed their digest). A
+  `Corrupt` mark is never downgraded to `Missing`;
+- the committed farm time;
+- the next writer epoch.
 
-It changes only through `Command`s applied in order: `Tick`, `PutBlob`, `PutAction`,
-`Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`. Reads are queries against
-the committed state.
+It changes only through `Command`s applied in order: `Tick`, `AllocEpoch`, `PutBlob`,
+`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`.
+Reads are queries against the committed state.
+
+An object id is a writer epoch and a sequence number. `AllocEpoch` returns an epoch
+greater than every one before it; a cache takes one when it opens (`Cache::open`) and
+numbers its objects from 1 within it. A `PutBlob`, `PutBlobs` or mark that names an
+object of an epoch never allocated is refused and changes nothing. `PutBlobs` records a
+list of blobs as one entry: it applies exactly as one `PutBlob` per blob in order, and
+all or nothing. A `Location`'s store id is 0, the configured store, today; a read of a
+location in any other store fails `INTERNAL`.
 
 The front reaches it only through the `MetaLog` trait: `commit` a command and get back
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
 lock in the server process. A replicated log (**planned**) implements the same two
-calls: `commit` proposes and resolves after apply, `query` runs on the leader.
+calls: `commit` proposes and resolves after apply (on a follower, it sends the command
+to the leader), and `query` runs on the server's own applied state, behind a read
+index where a stronger guarantee is needed.
 
 ### Three answers, not two
 
@@ -113,11 +125,13 @@ runs on a schedule.
    digest the client sent. A mismatch is `INVALID_ARGUMENT`.
 2. Blobs already present are touched, not written again.
 3. The rest are packed into segments of at most 128 MiB (`MAX_SEGMENT_BYTES`). A blob
-   too large for an empty segment is written whole as its own object.
+   too large for an empty segment is written as a segment of its own, with one record
+   at offset 0 and a footer like any other, so every object in the store carries the
+   digest and CRC of what it holds.
 4. Each segment is written with `put_new`, then its footer is **read back from the
    store**, and the location of every blob is taken from the stored footer.
-5. Only then is each blob's location committed (`PutBlob`). The upload is acknowledged
-   after that.
+5. Only then are the blobs' locations committed: one `PutBlobs` per segment. The
+   upload is acknowledged after that.
 
 So a blob is never reported present before its bytes are durable in the store.
 
@@ -130,19 +144,20 @@ uploads exist, a ByteStream write is held in memory until verified, so blobs ove
 1 GiB (`MAX_BLOB_BYTES`) are refused before any byte is buffered. Batch calls carry at
 most 4 MiB of blob data.
 
-Object keys are `<prefix>cas/<object id as 16 hex digits>`. Object ids count up within
-one process; with `--store=s3` each server start writes under its own prefix (the
-configured prefix plus the start time), so keys never collide across restarts. The
-replicated store (**planned**) names keys by writer epoch and sequence, so a key is
-never reused.
+Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
+caches over one metadata log hold different epochs, so they never name the same key.
+The metadata is in memory today and starts again from epoch 1 at every start, so with
+`--store=s3` each server start still writes under its own prefix (the configured
+prefix plus the start time), and keys never collide across restarts.
 
 ## Reads
 
 `Cache::read_blob` answers from the index, then reads exactly the blob's byte range
 from its object (`get_range` at the record's offset, for the digest's size) and checks
 the SHA-256 of what came back. If the store says the object does not exist, or the
-range is not there, or the bytes fail their digest, the object is marked unreachable
-(`ObjectUnreachable`) and the read fails `UNAVAILABLE`. The bad bytes are never served,
+range is not there, the object is marked unreachable as `Missing`; if the bytes fail
+their digest, as `Corrupt` (`ObjectUnreachable`). Either way the read fails
+`UNAVAILABLE`. The bad bytes are never served,
 and the blob is never reported absent.
 
 `GetActionResult` runs the closure check, touches what it serves, then reads and decodes
@@ -226,10 +241,22 @@ each with a plain bucket and an Object Lock bucket.
 
 ## Planned
 
-- **Replicated metadata.** `MetaState` applied from a Raft log on every server, with
-  snapshots stored in the object store. Answers that need fresh state (an action-cache
-  hit, "absent" on a read path) come from the leader; if it cannot be reached the
-  answer is `UNAVAILABLE`, never a guess.
+- **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's
+  local disk, with its snapshots: one voter first, three on three hosts later
+  ([deployment-topology.md](deployment-topology.md)). Whether snapshots are also copied
+  to the object store, so a lost host can be rebuilt, is an open question there.
+  The first deployment is one server. At three servers, any server ready to serve
+  reads answers `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and
+  `GetActionResult` from the metadata it has applied, and accepts upload bytes: it
+  verifies them and writes the segments to the object store, then sends the leader
+  the metadata commit. Only the leader commits; a read's touch is sent to it the same
+  way. A follower may be behind, so it may answer a false "missing" (the client
+  uploads again; harmless), but never a false "present": object collection's grace
+  period far exceeds the replication lag, so the bytes of a blob a lagging follower
+  still lists are still in the store, and where a stronger guarantee is needed the
+  follower waits until it has applied up to the leader's commit index (a read index). If the leader cannot be reached, an upload's
+  commit or a read index fails `UNAVAILABLE`, never a guess
+  ([deployment-topology.md](deployment-topology.md#reads-and-uploads-on-every-server)).
 - **Garbage collection.** Collection marks space dead; a segment is deleted only when no
   entry uses it, through a condemn step with a delay during which any touch revives it.
   Sparse segments are compacted. A periodic sweep removes orphan objects by comparing
@@ -242,4 +269,4 @@ each with a plain bucket and an Object Lock bucket.
   change plus a background copy.
 - **Compression.** zstd for ByteStream, advertised only once reads and writes decode it.
 - **Locality.** Daemons keep a local cache of hot inputs and report what they hold, and
-  servers cache hot blobs above the object store.
+  each server caches hot blobs above the object store.

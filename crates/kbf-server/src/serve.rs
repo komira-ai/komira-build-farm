@@ -7,13 +7,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::Either;
-use kbf_front::{Cache, MAX_MESSAGE_BYTES, MetaLog};
+use kbf_auth::{AuthenticateLayer, Policy};
+use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog};
 use kbf_objstore::ObjectStore;
+use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
+use crate::blobs::WorkerBlobs;
 use crate::farm::Farm;
+use crate::health::{Readiness, STORE_PROBE_TIMEOUT};
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -26,10 +30,11 @@ pub struct Listeners {
     /// TLS for the REAPI listener (a server certificate; clients present none). `None`
     /// serves it in plain text, which is meant for a loopback bind.
     pub reapi_tls: Option<ServerTlsConfig>,
-    /// The `kbf.worker.v1` listener (daemons).
+    /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
+    /// for their blobs ([`crate::blobs`]).
     pub worker: SocketAddr,
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
-    /// node is bound to a certificate.
+    /// node is bound to a certificate and every blob call is refused.
     pub worker_tls: Option<WorkerTls>,
     /// The heartbeat interval `Welcome` names.
     pub heartbeat_interval: Duration,
@@ -67,6 +72,9 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
+    /// How long `GET /readyz` waits for the object store to answer its probe
+    /// ([`crate::health`]).
+    pub store_probe_timeout: Duration,
 }
 
 /// Why the server could not start or stopped.
@@ -96,6 +104,9 @@ pub struct Bound<F> {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
+    /// What `GET /readyz` reads besides the store; the serving future marks it
+    /// stopping when `shutdown` completes.
+    pub readiness: Arc<Readiness>,
     /// Serves every listener and the tick until the shutdown future completes.
     pub serving: F,
 }
@@ -135,6 +146,10 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
+/// The warning every start logs ([`bind_server_with_api`]).
+const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
+    operation of an earlier server process is restored, and the server keeps no rollout record";
+
 /// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
 /// Nothing is served until the returned future runs; it serves until `shutdown`
 /// completes, or a listener fails.
@@ -156,7 +171,14 @@ where
 
 /// [`bind_server`], and the operator API ([`crate::api`]) if `api` is given.
 ///
-/// When `shutdown` completes, the REAPI listener stops accepting, every connection on
+/// The REAPI listener accepts and allows every call; [`bind_server_with_policy`] runs a
+/// policy instead.
+///
+/// It logs a warning that the scheduler's state (cordons, drains, leases, operations)
+/// starts empty, as it does at every start: nothing of an earlier process is restored.
+///
+/// When `shutdown` completes, `GET /readyz` answers 503 (`stopping`) from then on, the
+/// REAPI listener stops accepting, every connection on
 /// it is sent GOAWAY, and every open Execute and WaitExecution stream that is not done
 /// ends UNAVAILABLE, which clients retry (issue #168). The serving future returns once
 /// the REAPI connections have closed, or after `listeners.shutdown_timeout` if one
@@ -177,6 +199,27 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    bind_server_with_policy(cache, listeners, api, Policy::allow_all(), shutdown)
+}
+
+/// [`bind_server_with_api`], with the REAPI listener running `policy`
+/// (`docs/reapi-auth.md`): its authenticator on every call of that listener, before
+/// routing, and its authorizers in the services. The worker listener and the operator
+/// API do not run it.
+///
+/// # Errors
+/// A listener cannot be bound, or the worker TLS configuration is refused.
+pub fn bind_server_with_policy<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
     let farm = Arc::new(Farm::new(
         Arc::clone(&cache),
         listeners.unservable_wait,
@@ -184,10 +227,18 @@ where
     ));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let (api_listen, token, probe_timeout) = api.map_or((None, None, STORE_PROBE_TIMEOUT), |api| {
+        (Some(api.listen), api.token, api.store_probe_timeout)
+    });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
-    let api_routes = crate::api::router(Arc::clone(&farm), token);
+    let readiness = Arc::new(Readiness::default());
+    let health_routes =
+        crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
+    let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);
+    // Logged at every start, the first one too (issue #156).
+    let term = farm.term();
+    tracing::warn!(term, "{STATE_IN_MEMORY}");
 
     let mut reapi_server = Server::builder();
     if let Some(tls) = listeners.reapi_tls {
@@ -203,6 +254,12 @@ where
         }
         None => Peers::Unauthenticated,
     };
+    let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
+        ByteStreamService::new(Arc::clone(&cache)),
+        peers.clone(),
+    ))
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -212,17 +269,23 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
-    let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm), closing);
+    let authorizers = Arc::new(policy.authorizers);
+    let reapi_routes =
+        kbf_front::routes_with_authorizers(cache, Arc::clone(&farm), closing, authorizers);
+    let authenticate = AuthenticateLayer::new(policy.authenticator);
 
+    let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         let reapi_serve = reapi_server
+            .layer(authenticate)
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
             });
         let worker_serve = worker_server
             .add_service(worker_service)
+            .add_service(worker_blobs)
             .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {
@@ -237,6 +300,8 @@ where
         // in time, completes first.
         let stopping = async {
             shutdown.await;
+            // Before anything stops, so a front's health check sends no new work here.
+            stop_readiness.stop();
             closer.close();
             let _ = drain.send(());
             tokio::time::sleep(listeners.shutdown_timeout).await;
@@ -257,6 +322,7 @@ where
         reapi,
         worker,
         api,
+        readiness,
         serving,
     })
 }

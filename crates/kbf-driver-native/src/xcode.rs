@@ -1,14 +1,43 @@
-//! The Xcodes on this Mac, and the one an action names.
+//! The Xcodes on this Mac, whether each can run actions, and the one an action names.
 //!
 //! A Mac may have several Xcodes installed side by side (`/Applications/Xcode.app`,
-//! `/Applications/Xcode_16.2.app`, ...). [`discover`] finds every `Xcode*.app` in a
-//! directory and asks each for its build with its own `xcodebuild -version` (the one
-//! inside the app, never the `/usr/bin` shim, which may find it through `xcrun`'s
-//! cache, a file any lease can write: `crate::user_folders`) under that Xcode's
-//! `DEVELOPER_DIR`; one that does not answer (not set up, licence not
-//! accepted, or no answer within [`ANSWER_WITHIN`]) is left out and logged. The
-//! driver reports one `xcode` entry per build ([`CAPABILITY`]), which `kbf-caps`
-//! matches by membership, so an action that names a build runs on any Mac that has it.
+//! `/Applications/Xcode_16.2.app`, ...). [`survey`] finds every `Xcode*.app` in a
+//! directory and asks each, under that Xcode's `DEVELOPER_DIR`, these questions (with
+//! its own `xcodebuild`, the one inside the app, never the `/usr/bin` shim), whose
+//! answers it reads in this order:
+//!
+//! 1. `xcodebuild -version`, which must print a build;
+//! 2. `xcodebuild -license check` (an Xcode whose licence is not accepted still answers
+//!    `-version` with exit 0, while this, and `cc`, `swiftc` and `xcrun` in every
+//!    action, exit 69; issue #164);
+//! 3. `xcodebuild -checkFirstLaunchStatus` (its first launch was run);
+//! 4. `xcrun --find clang` (its compiler can be found);
+//! 5. only on a node that requires it ([`Probe::metal`]): `xcodebuild -showComponent
+//!    MetalToolchain` reports `Status: installed`. An Xcode that does not know
+//!    `-showComponent` (before Xcode 26, which bundled Metal) passes when `xcrun
+//!    --find metal` does.
+//!
+//! The daemon's survey asks every question as an action runs ([`Probe::sandbox`]):
+//! under the actions' sandbox with the network off, in a lease directory of its own,
+//! with the user-folder rules. `xcrun` reads and fills its cache there, a file any
+//! lease can write (`crate::user_folders`), so what a lease wrote there reaches only
+//! sandboxed lookups, never a tool the daemon runs outside the sandbox.
+//!
+//! The questions are asked at once, each on a thread of its own (`xcrun --find metal`
+//! only after `-showComponent`), and their answers read in this order; the `xcrun`
+//! lookups of all the Xcodes [`survey`] asks run one at a time (each rewrites
+//! `xcrun`'s whole cache, so two at once lose each other's entries). Each must exit
+//! 0 within [`ANSWER_WITHIN`]. The first that fails, in this order, decides the
+//! Xcode's [`State`], and a failed check that a human can fix carries the command that
+//! fixes it ([`Xcode::fix`]). Every installed Xcode is reported, ready or not, in the
+//! node's status ([`Xcode::status`]), so an operator sees what to do; only ready ones are
+//! advertised for placement ([`ready`]): the driver reports one `xcode` entry per ready
+//! build ([`CAPABILITY`]), which `kbf-caps` matches by membership, so an action that
+//! names a build runs on any Mac that has it ready. [`crate::xcode_watch`] asks again
+//! every few minutes, so an Xcode a human fixes becomes ready without a restart. The
+//! daemon does not wait for its first survey to say `Hello`: until that survey ends,
+//! each Xcode found is reported [`State::NotSurveyed`] ([`not_surveyed`]) and none is
+//! advertised, so nothing is placed on an Xcode no question has been asked of yet.
 //!
 //! An action names its Xcode with the platform property `xcode` (the name in any case,
 //! as the front reads it) and runs with `DEVELOPER_DIR` set to that Xcode, so `xcrun`,
@@ -21,10 +50,12 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::{Action, Command, Platform};
+use kbf_proto::worker::{XcodeState, XcodeStatus};
 
 use crate::network::{Isolation, Network};
 
@@ -34,11 +65,14 @@ pub const CAPABILITY: &str = "xcode";
 /// The variable that selects an Xcode for `xcrun` and the tools behind it.
 pub const DEVELOPER_DIR: &str = "DEVELOPER_DIR";
 
-/// Where an Xcode keeps its `xcodebuild`, inside its `DEVELOPER_DIR`. The daemon runs
-/// it there, never through the `/usr/bin/xcodebuild` shim: the shim may look the tool
-/// up in `xcrun`'s cache, which leases can rewrite (`crate::user_folders`), and the
-/// daemon runs it outside the sandbox.
+/// Where an Xcode keeps its `xcodebuild`, inside its `DEVELOPER_DIR`. The survey runs
+/// it there, never through the `/usr/bin/xcodebuild` shim, which finds the tool through
+/// `xcrun` and its cache, a file leases can rewrite (`crate::user_folders`).
 pub const XCODEBUILD: &str = "usr/bin/xcodebuild";
+
+/// Where macOS keeps `xcrun` (a shim that finds tools in the `DEVELOPER_DIR` Xcode),
+/// behind every `/usr/bin` developer tool shim.
+pub const XCRUN: &str = "/usr/bin/xcrun";
 
 /// The directory Xcodes are installed in.
 pub const APPLICATIONS: &str = "/Applications";
@@ -53,108 +87,507 @@ pub fn build_of(version: &str) -> Option<&str> {
         .filter(|build| !build.contains(char::is_whitespace))
 }
 
-/// How long one Xcode has to answer `xcodebuild -version` at daemon start. A first
-/// run after an install can take some seconds; one that takes longer is hung (waiting
-/// on a licence prompt or a broken install), and is left out rather than holding the
-/// node out of the farm.
+/// How long an Xcode has to answer each question. A first run after an install can
+/// take some seconds; one that takes longer is hung (waiting on a licence prompt or a
+/// broken install), and is not ready rather than holding the node out of the farm.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(60);
 
-/// Every Xcode in `apps` that answers `xcodebuild -version` within `within` each
-/// (`xcodebuild` is the program's path inside the Xcode's `DEVELOPER_DIR`, as
-/// [`XCODEBUILD`]; a path that leads out of it, an absolute one included, is never
-/// run), by build, as its `DEVELOPER_DIR`: the app's real
-/// path (links resolved) joined with `Contents/Developer`. Apps are tried in name
-/// order; of two with one build (a link `Xcode.app` to `Xcode_16.2.app`), the first is
-/// kept. A directory that cannot be read has none. One that does not answer in time
-/// (exit and close its output) is killed if still running, left out and logged; each
-/// such Xcode delays the return by up to `within`.
+/// Whether an installed Xcode can run actions, and if not, which check it failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// It answered every check; its build is advertised.
+    Ready,
+    /// `xcodebuild -license check` exited non-zero.
+    LicenseNotAccepted,
+    /// `xcodebuild -checkFirstLaunchStatus` exited non-zero.
+    FirstLaunchNotRun,
+    /// The node requires the Metal toolchain ([`Probe::metal`]) and this Xcode has none.
+    MetalToolchainMissing,
+    /// Anything else: no build, no compiler, a check not answered in time, an app whose
+    /// path does not resolve.
+    Failed,
+    /// Found in the directory, not asked yet ([`not_surveyed`]): what the daemon
+    /// reports from its start until its first survey ends. Never advertised.
+    NotSurveyed,
+}
+
+/// One `Xcode*.app` in the searched directory, as [`survey`] found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Xcode {
+    /// The app as found (`/Applications/Xcode_16.2.app`).
+    pub app: PathBuf,
+    /// Its `DEVELOPER_DIR`: the app's real path (links resolved) joined with
+    /// `Contents/Developer`; `None` when the app's path does not resolve.
+    pub developer_dir: Option<PathBuf>,
+    /// Its build, once `xcodebuild -version` printed one.
+    pub build: Option<String>,
+    /// Whether it can run actions.
+    pub state: State,
+    /// Why it cannot: the question that failed and its answer (stderr, cut to
+    /// [`REASON_BYTES`]). Empty when ready.
+    pub reason: String,
+}
+
+/// At most this much of a failed question's answer is kept as the reason.
+pub const REASON_BYTES: usize = 500;
+
+impl Xcode {
+    /// The command an administrator runs on the node to make this Xcode ready, when
+    /// one is known: this Xcode's own `xcodebuild` (by path, as `sudo` drops
+    /// `DEVELOPER_DIR`) with `-license accept` or `-runFirstLaunch` (as root), or
+    /// `-downloadComponent MetalToolchain` (as the daemon's user).
+    #[must_use]
+    pub fn fix(&self) -> Option<String> {
+        let (sudo, args) = match self.state {
+            State::LicenseNotAccepted => ("sudo ", "-license accept"),
+            State::FirstLaunchNotRun => ("sudo ", "-runFirstLaunch"),
+            State::MetalToolchainMissing => ("", "-downloadComponent MetalToolchain"),
+            State::Ready | State::Failed | State::NotSurveyed => return None,
+        };
+        let xcodebuild = self.developer_dir.as_ref()?.join("usr/bin/xcodebuild");
+        Some(format!("{sudo}{} {args}", shell_quoted(&xcodebuild)))
+    }
+
+    /// This Xcode as `NodeStatus.xcodes` carries it.
+    #[must_use]
+    pub fn status(&self) -> XcodeStatus {
+        let state = match self.state {
+            State::Ready => XcodeState::Ready,
+            State::LicenseNotAccepted => XcodeState::LicenseNotAccepted,
+            State::FirstLaunchNotRun => XcodeState::FirstLaunchNotRun,
+            State::MetalToolchainMissing => XcodeState::MetalToolchainMissing,
+            State::Failed => XcodeState::Failed,
+            State::NotSurveyed => XcodeState::NotSurveyed,
+        };
+        XcodeStatus {
+            app: self.app.display().to_string(),
+            build: self.build.clone().unwrap_or_default(),
+            state: state.into(),
+            reason: self.reason.clone(),
+            fix: self.fix().unwrap_or_default(),
+        }
+    }
+}
+
+/// `path` as one shell word: as it is when it holds only characters no shell treats
+/// specially, otherwise in single quotes.
+fn shell_quoted(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
+    {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// How [`survey`] asks each Xcode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probe {
+    /// The `xcodebuild` run, as a path inside each Xcode's `DEVELOPER_DIR`
+    /// ([`XCODEBUILD`]). A path that leads out of it (absolute, or with `..`) is never
+    /// run: the Xcode is [`State::Failed`].
+    pub xcodebuild: PathBuf,
+    /// The `xcrun` run ([`XCRUN`]).
+    pub xcrun: PathBuf,
+    /// How long each question may take ([`ANSWER_WITHIN`]).
+    pub within: Duration,
+    /// Whether this node's actions need the Metal toolchain (a node meant for GPU
+    /// work): then an Xcode without it is not ready.
+    pub metal: bool,
+    /// Where every question runs: under this sandbox (the daemon's survey,
+    /// `crate::NativeRuntime::sandbox`), its directory made before the survey and
+    /// removed after it; `None`: as the caller runs (a test, [`discover`]).
+    pub sandbox: Option<Sandbox>,
+}
+
+impl Probe {
+    /// Each Xcode's own `xcodebuild` and the system's `xcrun`, each question given
+    /// [`ANSWER_WITHIN`], with no sandbox (the daemon sets [`Probe::sandbox`]).
+    #[must_use]
+    pub fn system(metal: bool) -> Self {
+        Self {
+            xcodebuild: PathBuf::from(XCODEBUILD),
+            xcrun: PathBuf::from(XCRUN),
+            within: ANSWER_WITHIN,
+            metal,
+            sandbox: None,
+        }
+    }
+}
+
+/// Every `Xcode*.app` in `apps`, in name order, each asked the questions in the module
+/// documentation as `probe` says. A directory that cannot be read has none. A question
+/// not answered in time (exit and close its output) is killed if still running. Each
+/// Xcode is asked once (an app that is a link to another is reported with that one's
+/// answers), on a thread of its own and its questions at once, so the survey takes
+/// about as long as its slowest Xcode, not as long as all of them, but for the
+/// `xcrun` lookups, which run one at a time (see the module documentation). It can
+/// take seconds, and up to [`ANSWER_WITHIN`] per lookup when one hangs, so the daemon
+/// runs it in the background and reports [`not_surveyed`] until it ends
+/// ([`crate::xcode_watch`]). With [`Probe::sandbox`], its directory is made
+/// first (every Xcode is [`State::Failed`], and nothing is run, when it cannot be)
+/// and removed when every Xcode has answered.
 #[must_use]
-pub fn discover(apps: &Path, xcodebuild: &Path, within: Duration) -> BTreeMap<String, PathBuf> {
-    let mut found = BTreeMap::new();
-    let names = match std::fs::read_dir(apps) {
-        Ok(entries) => {
-            let mut names: Vec<_> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name())
-                .filter(|name| {
-                    name.to_str()
-                        .is_some_and(|n| n.starts_with("Xcode") && n.ends_with(".app"))
-                })
-                .collect();
-            names.sort();
-            names
-        }
-        Err(e) => {
-            tracing::info!(apps = %apps.display(), "no Xcode: {e}");
-            return found;
-        }
+pub fn survey(apps: &Path, probe: &Probe) -> Vec<Xcode> {
+    let found = found_in(apps);
+    let sandbox = match probe.sandbox.as_ref().map(Sandbox::made).transpose() {
+        Ok(sandbox) => sandbox,
+        Err(why) => return unasked(found, State::Failed, &why),
     };
-    for name in names {
-        let app = apps.join(name);
-        match developer_dir_of(&app, xcodebuild, within) {
-            Ok((build, dir)) => {
-                tracing::info!(app = %app.display(), build, "Xcode");
-                found.entry(build).or_insert(dir);
-            }
-            Err(why) => tracing::warn!(app = %app.display(), "Xcode left out: {why}"),
-        }
+    let sandbox = sandbox.as_ref();
+    // Each Xcode once: a link (`Xcode.app` to `Xcode_16.2.app`) gets the answers of the
+    // app it leads to. One whose path does not resolve is asked alone, and fails.
+    let reals: Vec<PathBuf> = found
+        .iter()
+        .map(|app| std::fs::canonicalize(app).unwrap_or_else(|_| app.clone()))
+        .collect();
+    let mut first: BTreeMap<&PathBuf, &PathBuf> = BTreeMap::new();
+    for (app, real) in found.iter().zip(&reals) {
+        first.entry(real).or_insert(app);
+    }
+    let lookups = &Mutex::new(());
+    let answers: BTreeMap<&PathBuf, Xcode> = std::thread::scope(|scope| {
+        let asking: Vec<_> = first
+            .into_iter()
+            .map(|(real, app)| {
+                let app = app.clone();
+                (
+                    real,
+                    scope.spawn(move || check(app, probe, sandbox, lookups)),
+                )
+            })
+            .collect();
+        asking
+            .into_iter()
+            .map(|(real, asked)| (real, asked.join().expect("asking an Xcode does not panic")))
+            .collect()
+    });
+    let found = found
+        .iter()
+        .zip(&reals)
+        .map(|(app, real)| Xcode {
+            app: app.clone(),
+            ..answers[real].clone()
+        })
+        .collect();
+    if let Some(sandbox) = sandbox {
+        // One left behind (a removal that failed) is a `lease-` name: the next start
+        // sweeps it.
+        let _ = kbf_outputs::remove_tree(&sandbox.dir);
     }
     found
 }
 
-/// The build and `DEVELOPER_DIR` of the Xcode at `app`.
-fn developer_dir_of(
-    app: &Path,
+/// Every `Xcode*.app` in `apps`, as [`survey`] would find them, none asked anything:
+/// each [`State::NotSurveyed`], with no `DEVELOPER_DIR` or build yet. It only reads the
+/// directory, so the daemon reports these at once, before its first survey ends.
+#[must_use]
+pub fn not_surveyed(apps: &Path) -> Vec<Xcode> {
+    unasked(
+        found_in(apps),
+        State::NotSurveyed,
+        "not surveyed yet: the daemon's first survey of its Xcodes has not ended",
+    )
+}
+
+/// Every `Xcode*.app` in `apps`, in name order; none when it cannot be read.
+fn found_in(apps: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(apps) else {
+        return Vec::new();
+    };
+    let mut names: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| {
+            name.to_str()
+                .is_some_and(|n| n.starts_with("Xcode") && n.ends_with(".app"))
+        })
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| apps.join(name)).collect()
+}
+
+/// `found`, none of them asked: each in `state`, for `why`.
+fn unasked(found: Vec<PathBuf>, state: State, why: &str) -> Vec<Xcode> {
+    found
+        .into_iter()
+        .map(|app| Xcode {
+            app,
+            developer_dir: None,
+            build: None,
+            state,
+            reason: why.to_owned(),
+        })
+        .collect()
+}
+
+/// The ready Xcodes of `xcodes`, by build, as their `DEVELOPER_DIR`s. Of two with one
+/// build (a link `Xcode.app` to `Xcode_16.2.app`), the first is kept.
+#[must_use]
+pub fn ready(xcodes: &[Xcode]) -> BTreeMap<String, PathBuf> {
+    let mut found = BTreeMap::new();
+    let builds = xcodes
+        .iter()
+        .filter(|x| x.state == State::Ready)
+        .filter_map(|x| Some((x.build.as_ref()?, x.developer_dir.as_ref()?)));
+    for (build, dir) in builds {
+        found.entry(build.clone()).or_insert_with(|| dir.clone());
+    }
+    found
+}
+
+/// The ready Xcodes in `apps`, by build, as their `DEVELOPER_DIR`s: [`ready`] of
+/// [`survey`], asking with `xcodebuild` and `xcrun`, `within` for each question, and
+/// not asking for the Metal toolchain.
+#[must_use]
+pub fn discover(
+    apps: &Path,
     xcodebuild: &Path,
+    xcrun: &Path,
     within: Duration,
-) -> Result<(String, PathBuf), String> {
-    let dir = std::fs::canonicalize(app)
-        .map_err(|e| e.to_string())?
+) -> BTreeMap<String, PathBuf> {
+    let probe = Probe {
+        xcodebuild: xcodebuild.to_owned(),
+        xcrun: xcrun.to_owned(),
+        within,
+        metal: false,
+        sandbox: None,
+    };
+    ready(&survey(apps, &probe))
+}
+
+/// The Xcode at `app`, asked as `probe` says, under `sandbox` (made) if any, one
+/// `xcrun` lookup at a time (holding `lookups`).
+fn check(app: PathBuf, probe: &Probe, sandbox: Option<&Sandbox>, lookups: &Mutex<()>) -> Xcode {
+    let mut xcode = Xcode {
+        app,
+        developer_dir: None,
+        build: None,
+        state: State::Ready,
+        reason: String::new(),
+    };
+    if let Err((state, reason)) = ask(&mut xcode, probe, sandbox, lookups) {
+        xcode.state = state;
+        xcode.reason = reason;
+    }
+    xcode
+}
+
+/// Asks `xcode` the questions in order, filling in its `DEVELOPER_DIR` and build as
+/// they are learnt; the first that fails decides the state it is not ready in, and why.
+fn ask(
+    xcode: &mut Xcode,
+    probe: &Probe,
+    sandbox: Option<&Sandbox>,
+    lookups: &Mutex<()>,
+) -> Result<(), (State, String)> {
+    let failed = |why: String| (State::Failed, why);
+    let dir = std::fs::canonicalize(&xcode.app)
+        .map_err(|e| failed(e.to_string()))?
         .join("Contents")
         .join("Developer");
-    if !xcodebuild
+    xcode.developer_dir = Some(dir.clone());
+    if !probe
+        .xcodebuild
         .components()
         .all(|part| matches!(part, std::path::Component::Normal(_)))
     {
-        return Err(format!("{} is not inside the Xcode", xcodebuild.display()));
+        return Err(failed(format!(
+            "{} is not inside the Xcode",
+            probe.xcodebuild.display()
+        )));
     }
-    let program = dir.join(xcodebuild);
-    let mut command = std::process::Command::new(&program);
-    command.arg("-version").env(DEVELOPER_DIR, &dir);
-    let out = output_within(command, within)
-        .map_err(|e| format!("{} -version: {e}", program.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() {
-        return Err(format!(
-            "xcodebuild -version exited with {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+    let xcodebuild = dir.join(&probe.xcodebuild);
+    let question = |program: &Path, args: &[&str]| {
+        // `xcrun` rewrites its whole cache with each lookup, so two at once drop each
+        // other's entries and the next lookups miss, each then taking seconds: the
+        // Xcodes' lookups run one after another (each about 0.1 s when cached).
+        let _one = (program == probe.xcrun)
+            .then(|| lookups.lock().unwrap_or_else(PoisonError::into_inner));
+        answer(program, args, &dir, probe.within, sandbox)
+    };
+    // All at once (each takes about a second, most of it the tool starting), each
+    // answer then read in the order of the module documentation.
+    let mut asked: Vec<(&Path, &[&str])> = vec![
+        (xcodebuild.as_path(), &["-version"][..]),
+        (xcodebuild.as_path(), &["-license", "check"][..]),
+        (xcodebuild.as_path(), &["-checkFirstLaunchStatus"][..]),
+        (probe.xcrun.as_path(), &["--find", "clang"][..]),
+    ];
+    if probe.metal {
+        asked.push((
+            xcodebuild.as_path(),
+            &["-showComponent", "MetalToolchain"][..],
         ));
     }
-    let build = build_of(&stdout)
-        .ok_or_else(|| format!("no build in xcodebuild -version: {:?}", stdout.trim()))?;
-    Ok((build.to_owned(), dir))
+    let mut answers = std::thread::scope(|scope| {
+        let asking: Vec<_> = asked
+            .into_iter()
+            .map(|(program, args)| scope.spawn(move || question(program, args)))
+            .collect();
+        asking
+            .into_iter()
+            .map(|answer| answer.join().expect("asking a question does not panic"))
+            .collect::<Vec<_>>()
+            .into_iter()
+    });
+    let mut next = || answers.next().expect("an answer to each question");
+    let version = next().map_err(Unanswered::into_failed)?;
+    let build = build_of(&version).ok_or_else(|| {
+        failed(format!(
+            "no build in xcodebuild -version: {:?}",
+            version.trim()
+        ))
+    })?;
+    xcode.build = Some(build.to_owned());
+    next().map_err(|e| e.into_state(State::LicenseNotAccepted))?;
+    next().map_err(|e| e.into_state(State::FirstLaunchNotRun))?;
+    next().map_err(Unanswered::into_failed)?;
+    if probe.metal {
+        let asked = "xcodebuild -showComponent MetalToolchain";
+        match next() {
+            Ok(shown) => match component_status(&shown) {
+                Some("installed") => {}
+                status => {
+                    return Err((
+                        State::MetalToolchainMissing,
+                        format!("{asked} says Status: {}", status.unwrap_or("(none)")),
+                    ));
+                }
+            },
+            // An Xcode before 26 has no -showComponent; its Metal is bundled.
+            Err(Unanswered::Refused(_)) => {
+                question(&probe.xcrun, &["--find", "metal"])
+                    .map_err(|e| e.into_state(State::MetalToolchainMissing))?;
+            }
+            Err(e) => return Err(e.into_failed()),
+        }
+    }
+    Ok(())
 }
 
-/// Where macOS keeps `xcrun`, behind every `/usr/bin` developer tool shim.
-pub const XCRUN: &str = "/usr/bin/xcrun";
+/// The `Status:` line's value in `xcodebuild -showComponent` output, if it has one.
+fn component_status(shown: &str) -> Option<&str> {
+    shown
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Status:"))
+        .map(str::trim)
+}
+
+/// Why a question has no answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Unanswered {
+    /// It ran and exited non-zero: the answer is no.
+    Refused(String),
+    /// It could not be run, or did not answer in time.
+    NoAnswer(String),
+}
+
+impl Unanswered {
+    /// The state a refusal means, with why; no answer at all is [`State::Failed`].
+    fn into_state(self, refused: State) -> (State, String) {
+        match self {
+            Self::Refused(why) => (refused, why),
+            Self::NoAnswer(why) => (State::Failed, why),
+        }
+    }
+
+    fn into_failed(self) -> (State, String) {
+        self.into_state(State::Failed)
+    }
+}
+
+/// What `program args` prints to stdout, run with `DEVELOPER_DIR` set to
+/// `developer_dir` (and under `sandbox`, if any: [`Sandbox::command`]), if it exits 0
+/// within `within`; otherwise what was asked and why it did not answer (with its
+/// stderr, cut to [`REASON_BYTES`], when it exited non-zero).
+fn answer(
+    program: &Path,
+    args: &[&str],
+    developer_dir: &Path,
+    within: Duration,
+    sandbox: Option<&Sandbox>,
+) -> Result<String, Unanswered> {
+    let asked = format!("{} {}", program.display(), args.join(" "));
+    let mut command = match sandbox {
+        Some(sandbox) => sandbox.command(program, args),
+        None => {
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            command
+        }
+    };
+    command.env(DEVELOPER_DIR, developer_dir);
+    let out = output_within(command, within)
+        .map_err(|e| Unanswered::NoAnswer(format!("{asked}: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(Unanswered::Refused(format!(
+            "{asked} exited with {}: {}",
+            out.status,
+            cut(stderr.trim(), REASON_BYTES)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `text`, or its first `bytes` bytes (backed off to a character boundary) and `...`.
+fn cut(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_owned();
+    }
+    format!("{}...", &text[..text.floor_char_boundary(bytes)])
+}
 
 /// The tools [`warm`] has `xcrun` look up: the compilers and linker builds call most.
 pub const WARM_TOOLS: [&str; 6] = ["cc", "clang", "clang++", "swift", "swiftc", "ld"];
 
-/// Where the warm-up's lookups run: under the actions' sandbox with the network off
+/// Where the survey's questions ([`Probe::sandbox`]) and the warm-up's lookups
+/// ([`warm`]) run: as an action does, under the actions' sandbox with the network off
 /// (`isolation`), with `dir` as their lease directory and `TMPDIR`, and the user-folder
 /// `rules` (`crate::user_folders::UserFolders::rules`), which let `xcrun` write its
 /// cache and nothing else outside `dir`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WarmSandbox {
+pub struct Sandbox {
     pub isolation: Isolation,
     pub dir: PathBuf,
     pub rules: String,
 }
 
-/// On a thread of its own, has `xcrun` look up each of [`WARM_TOOLS`] for the node's
-/// own Xcode (no `DEVELOPER_DIR`) and for each of `developer_dirs`, each lookup given
+impl Sandbox {
+    /// This sandbox with its directory made and named by its real path (the sandbox
+    /// compares real paths), or why it cannot be.
+    fn made(&self) -> Result<Self, String> {
+        std::fs::create_dir_all(&self.dir)
+            .and_then(|()| std::fs::canonicalize(&self.dir))
+            .map(|dir| Self {
+                dir,
+                ..self.clone()
+            })
+            .map_err(|e| format!("{}: {e}", self.dir.display()))
+    }
+
+    /// `program args` under this sandbox with the network off, `TMPDIR` its directory.
+    fn command(&self, program: &Path, args: &[&str]) -> std::process::Command {
+        let args: Vec<String> = args.iter().map(|&a| a.to_owned()).collect();
+        let (program, args) = self.isolation.wrap(
+            Network::Off,
+            &self.dir,
+            &self.rules,
+            program.to_owned(),
+            &args,
+        );
+        let mut command = std::process::Command::new(program);
+        command.args(args).env("TMPDIR", &self.dir);
+        command
+    }
+}
+
+/// On a thread of its own, has `xcrun` look up each of [`WARM_TOOLS`] for each of
+/// `developer_dirs` (`None`: the node's own Xcode, no `DEVELOPER_DIR`), each lookup given
 /// `within` to answer, so `xcrun`'s cache (`crate::user_folders`) holds them before
 /// the first action asks: a lookup it has not cached takes seconds. A lookup that
 /// fails is logged and the rest go on. `None`, and nothing run, where `xcrun` is not a
@@ -163,31 +596,26 @@ pub struct WarmSandbox {
 /// `xcrun` is the `/usr/bin` one (the cache it fills is that one's, and no Xcode
 /// carries its own), and it reads a cache that leases can write. So every lookup runs
 /// as an action does, under `sandbox` ([`lookup`]): the warm-up goes on while the
-/// node serves, and the daemon runs no developer tool outside the sandbox once it
-/// serves. `sandbox.dir` is made first and removed when the warm-up ends.
+/// node serves. `sandbox.dir` is made first and removed when the warm-up ends.
 pub(crate) fn warm(
     xcrun: &Path,
-    developer_dirs: Vec<PathBuf>,
+    developer_dirs: Vec<Option<PathBuf>>,
     within: Duration,
-    sandbox: WarmSandbox,
+    sandbox: &Sandbox,
 ) -> Option<std::thread::JoinHandle<()>> {
     if !xcrun.is_file() {
         return None;
     }
-    // The sandbox compares real paths.
-    let made =
-        std::fs::create_dir_all(&sandbox.dir).and_then(|()| std::fs::canonicalize(&sandbox.dir));
-    let sandbox = match made {
-        Ok(dir) => WarmSandbox { dir, ..sandbox },
+    let sandbox = match sandbox.made() {
+        Ok(sandbox) => sandbox,
         Err(e) => {
-            tracing::warn!(dir = %sandbox.dir.display(), "no xcrun warm-up: {e}");
+            tracing::warn!("no xcrun warm-up: {e}");
             return None;
         }
     };
     let xcrun = xcrun.to_owned();
     Some(std::thread::spawn(move || {
-        let dirs = std::iter::once(None).chain(developer_dirs.into_iter().map(Some));
-        for dir in dirs {
+        for dir in developer_dirs {
             for tool in WARM_TOOLS {
                 let command = lookup(&xcrun, dir.as_deref(), tool, &sandbox);
                 let failed = match output_within(command, within) {
@@ -216,17 +644,9 @@ fn lookup(
     xcrun: &Path,
     developer_dir: Option<&Path>,
     tool: &str,
-    sandbox: &WarmSandbox,
+    sandbox: &Sandbox,
 ) -> std::process::Command {
-    let (program, args) = sandbox.isolation.wrap(
-        Network::Off,
-        &sandbox.dir,
-        &sandbox.rules,
-        xcrun.to_owned(),
-        &["--find".to_owned(), tool.to_owned()],
-    );
-    let mut command = std::process::Command::new(program);
-    command.args(args).env("TMPDIR", &sandbox.dir);
+    let mut command = sandbox.command(xcrun, &["--find", tool]);
     match developer_dir {
         Some(dir) => command.env(DEVELOPER_DIR, dir),
         None => command.env_remove(DEVELOPER_DIR),
@@ -239,17 +659,26 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// What `command` prints and how it exits (stdin `/dev/null`), if it exits and closes
 /// its output within `within`; otherwise this is a `TimedOut` error, and the process is
-/// killed if it has not exited. Its stdout and stderr are read on two threads while it
-/// runs, so a full pipe cannot stall it. A process it started and left holding the
-/// pipes keeps those threads reading; they are waited for only until `within` is up
+/// killed if it has not exited. A program that is busy (ETXTBSY: a file just written
+/// is held open for writing by any child another thread forks before it execs) is
+/// started again until `within` is up. Its stdout and stderr are read on two threads
+/// while it runs, so a full pipe cannot stall it. A process it started and left holding
+/// the pipes keeps those threads reading; they are waited for only until `within` is up
 /// and are left behind after that (each ends when the pipe it reads closes).
 fn output_within(mut command: std::process::Command, within: Duration) -> io::Result<Output> {
-    let mut child = command
+    let deadline = Instant::now() + within;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let deadline = Instant::now() + within;
+        .stderr(Stdio::piped());
+    let mut child = loop {
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                std::thread::sleep(POLL);
+            }
+            spawned => break spawned?,
+        }
+    };
     let stdout = read_all(child.stdout.take().expect("stdout is piped"));
     let stderr = read_all(child.stderr.take().expect("stderr is piped"));
     let status = loop {
@@ -330,401 +759,5 @@ pub fn developer_dir(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    use kbf_proto::reapi::platform::Property;
-
-    use super::*;
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("xcode-{name}-{}", std::process::id()));
-        // Absent unless a run with this pid left it.
-        let _ = kbf_outputs::remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
-    }
-
-    /// Catches: a build read from the wrong line, kept with its spacing, or made up
-    /// from output that carries none.
-    #[test]
-    fn the_build_is_read_from_xcodebuild_version() {
-        assert_eq!(
-            build_of("Xcode 16.2\nBuild version 16C5032a\n"),
-            Some("16C5032a")
-        );
-        assert_eq!(build_of("  Build version 15F31d  \n"), Some("15F31d"));
-        for none in [
-            "",
-            "Xcode 16.2\n",
-            "Build version \n",
-            "Build version a b\n",
-        ] {
-            assert_eq!(build_of(none), None, "{none:?}");
-        }
-    }
-
-    /// A stand-in for `xcodebuild`, linked into each app in `apps` at [`XCODEBUILD`]:
-    /// writes the path it was run by (`$0`) to the returned log, then prints a build
-    /// for every `DEVELOPER_DIR` (so only the name filter keeps `Safari.app` out),
-    /// prints one and then fails for `broken` (so only the exit status keeps it out),
-    /// prints none for `mute`, and prints one and then hangs for `hung` (so only the
-    /// timeout keeps it out).
-    fn fake_xcodebuild(dir: &Path, apps: &[PathBuf]) -> PathBuf {
-        let path = dir.join("xcodebuild");
-        let log = dir.join("argv0");
-        let script = format!(
-            "#!/bin/sh\n\
-            echo \"$0\" >> '{}'\n\
-            case \"$DEVELOPER_DIR\" in\n\
-            *Xcode_good.app/Contents/Developer) echo 'Xcode 16.2'; echo 'Build version 16C5032a' ;;\n\
-            *Xcode_twin.app/Contents/Developer) echo 'Build version 16C5032a' ;;\n\
-            *Xcode_new.app/Contents/Developer) echo 'Build version 16E140' ;;\n\
-            *Xcode_broken.app/Contents/Developer) echo 'Build version 16B40'; echo 'licence not accepted' >&2; exit 69 ;;\n\
-            *Xcode_mute.app/Contents/Developer) echo 'Xcode ?' ;;\n\
-            *Xcode_hung.app/Contents/Developer) echo 'Build version 16A242d'; exec sleep 60 ;;\n\
-            *) echo 'Build version 99Z999' ;;\n\
-            esac\n",
-            log.display()
-        );
-        std::fs::write(&path, script).expect("script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        for app in apps {
-            let at = app.join("Contents/Developer").join(XCODEBUILD);
-            std::fs::create_dir_all(at.parent().expect("usr/bin")).expect("usr/bin");
-            std::os::unix::fs::symlink(&path, at).expect("link");
-        }
-        log
-    }
-
-    /// Catches a warm-up lookup run outside the sandbox (the review of issue #163:
-    /// the `/usr/bin/xcrun` the warm-up runs reads a cache leases can write, while the
-    /// node already serves), with the network on, without the user-folder rules that
-    /// let `xcrun` write its cache, or with another lease directory or `TMPDIR`; the
-    /// node's own Xcode looked up with a `DEVELOPER_DIR` the daemon was started with
-    /// (the warm-up then fills another Xcode's entries), and a named Xcode looked up
-    /// with any other.
-    #[test]
-    fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
-        let xcrun = Path::new("/x/xcrun");
-        let sandbox = WarmSandbox {
-            isolation: Isolation::Sandbox(PathBuf::from(crate::network::SANDBOX_EXEC)),
-            dir: PathBuf::from("/s/lease-warm-up"),
-            rules: "(allow file-write* (literal \"/c\"))\n".to_owned(),
-        };
-        let own = lookup(xcrun, None, "cc", &sandbox);
-        assert_eq!(own.get_program(), crate::network::SANDBOX_EXEC);
-        let profile = format!("{}{}", crate::network::NO_NETWORK_PROFILE, sandbox.rules);
-        assert_eq!(
-            own.get_args().collect::<Vec<_>>(),
-            [
-                "-D",
-                "KBF_LEASE=/s/lease-warm-up",
-                "-p",
-                &profile,
-                "/x/xcrun",
-                "--find",
-                "cc"
-            ]
-        );
-        let tmpdir = (OsStr::new("TMPDIR"), Some(sandbox.dir.as_os_str()));
-        assert_eq!(
-            own.get_envs().collect::<Vec<_>>(),
-            [(OsStr::new(DEVELOPER_DIR), None), tmpdir]
-        );
-        let dir = Path::new("/A/Xcode.app/Contents/Developer");
-        let named = lookup(xcrun, Some(dir), "swiftc", &sandbox);
-        assert_eq!(named.get_args().last(), Some(OsStr::new("swiftc")));
-        assert_eq!(
-            named.get_envs().collect::<Vec<_>>(),
-            [(OsStr::new(DEVELOPER_DIR), Some(dir.as_os_str())), tmpdir]
-        );
-    }
-
-    /// Catches: a lookup missed for the node's own Xcode or for one of the others, or
-    /// run other than through the sandbox program in the warm-up's own directory
-    /// (here a fake that logs its lease parameter and runs the rest), the warm stopped
-    /// by a lookup that fails or hangs, the directory left behind, and `xcrun` run
-    /// where there is none or where the directory cannot be made.
-    #[test]
-    fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
-        let dir = scratch("warm");
-        let log = dir.join("log");
-        let xcrun = dir.join("xcrun");
-        let script = format!(
-            "#!/bin/sh\n\
-             echo \"${{DEVELOPER_DIR-none}} $*\" >> {}\n\
-             case \"$2\" in\n\
-             ld) echo 'not found' >&2; exit 1 ;;\n\
-             swift) case \"$DEVELOPER_DIR\" in /hung) exec sleep 60 ;; esac ;;\n\
-             esac\n",
-            log.display()
-        );
-        std::fs::write(&xcrun, script).expect("script");
-        std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let sandbox_log = dir.join("sandbox-log");
-        let sandbox_exec = dir.join("sandbox-exec");
-        let script = format!(
-            "#!/bin/sh\necho \"$2 TMPDIR=$TMPDIR\" >> {}\nshift 4\nexec \"$@\"\n",
-            sandbox_log.display()
-        );
-        std::fs::write(&sandbox_exec, script).expect("script");
-        std::fs::set_permissions(&sandbox_exec, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod");
-        let sandbox = WarmSandbox {
-            isolation: Isolation::Sandbox(sandbox_exec),
-            dir: dir.join("scratch/lease-warm-up"),
-            rules: String::new(),
-        };
-        let real = std::fs::canonicalize(&dir)
-            .expect("real")
-            .join("scratch/lease-warm-up");
-        let thread = warm(
-            &xcrun,
-            vec![PathBuf::from("/x1"), PathBuf::from("/hung")],
-            Duration::from_millis(500),
-            sandbox.clone(),
-        )
-        .expect("a thread");
-        thread.join().expect("warmed");
-        let read = |path: &Path| -> Vec<String> {
-            std::fs::read_to_string(path)
-                .expect("log")
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        };
-        let want: Vec<String> = ["none", "/x1", "/hung"]
-            .iter()
-            .flat_map(|dir| WARM_TOOLS.map(|tool| format!("{dir} --find {tool}")))
-            .collect();
-        assert_eq!(read(&log), want);
-        let lease = format!("KBF_LEASE={0} TMPDIR={0}", real.display());
-        assert_eq!(read(&sandbox_log), vec![lease; want.len()]);
-        assert!(!real.exists(), "the warm-up's directory stays");
-
-        assert!(warm(&dir.join("missing"), Vec::new(), WITHIN, sandbox.clone()).is_none());
-        let unmakeable = WarmSandbox {
-            dir: log.join("under-a-file"),
-            ..sandbox
-        };
-        assert!(warm(&xcrun, Vec::new(), WITHIN, unmakeable).is_none());
-    }
-
-    /// How long the fake Xcodes have to answer.
-    const WITHIN: Duration = Duration::from_secs(2);
-
-    /// Catches: an Xcode left out that answers, one kept that does not answer, has no
-    /// build, hangs, or is a dangling link, another app taken for an Xcode, the
-    /// `DEVELOPER_DIR` not the app's real `Contents/Developer`, a later twin replacing
-    /// the first, a missing directory or program treated as anything but "no Xcode",
-    /// and a hung Xcode waited for past its time (its fake sleeps for a minute).
-    /// Catches too `xcodebuild` run other than from inside each Xcode (the review of
-    /// issue #163: the `/usr/bin` shim may find it through `xcrun`'s cache, which
-    /// leases can write), and a program path that leads out of the Xcode run at all.
-    #[test]
-    fn every_xcode_that_answers_is_found() {
-        let dir = scratch("discover");
-        let apps = dir.join("Applications");
-        let names = [
-            "Xcode_good.app",
-            "Xcode_twin.app",
-            "Xcode_new.app",
-            "Xcode_broken.app",
-            "Xcode_mute.app",
-            "Xcode_hung.app",
-            "Safari.app",
-        ];
-        let made: Vec<PathBuf> = names.iter().map(|app| apps.join(app)).collect();
-        let ran = fake_xcodebuild(&dir, &made);
-        std::os::unix::fs::symlink(apps.join("Xcode_new.app"), apps.join("Xcode.app"))
-            .expect("link");
-        std::os::unix::fs::symlink(apps.join("nowhere"), apps.join("Xcode_gone.app"))
-            .expect("dangling link");
-        let xcodebuild = Path::new(XCODEBUILD);
-        let real = std::fs::canonicalize(&apps).expect("real");
-        let started = Instant::now();
-        let found = discover(&apps, xcodebuild, WITHIN);
-        let took = started.elapsed();
-        assert!(
-            took >= WITHIN,
-            "the hung Xcode was not given its time: {took:?}"
-        );
-        assert!(
-            took < WITHIN * 10,
-            "the hung Xcode was waited for: {took:?}"
-        );
-        let want = BTreeMap::from([
-            (
-                "16C5032a".to_owned(),
-                real.join("Xcode_good.app/Contents/Developer"),
-            ),
-            (
-                "16E140".to_owned(),
-                real.join("Xcode_new.app/Contents/Developer"),
-            ),
-        ]);
-        assert_eq!(found, want);
-        // Each Xcode's own, by its real path, in name order (`Xcode.app` is the new one).
-        let inside = |app: &str| {
-            real.join(app)
-                .join("Contents/Developer")
-                .join(XCODEBUILD)
-                .display()
-                .to_string()
-        };
-        let want_ran: Vec<String> = [
-            "Xcode_new.app",
-            "Xcode_broken.app",
-            "Xcode_good.app",
-            "Xcode_hung.app",
-            "Xcode_mute.app",
-            "Xcode_new.app",
-            "Xcode_twin.app",
-        ]
-        .map(inside)
-        .into();
-        let read_ran = || -> Vec<String> {
-            std::fs::read_to_string(&ran)
-                .expect("ran")
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        };
-        assert_eq!(read_ran(), want_ran);
-
-        assert!(discover(&dir.join("missing"), xcodebuild, WITHIN).is_empty());
-        assert!(discover(&apps, Path::new("usr/bin/missing"), WITHIN).is_empty());
-        // A program outside the Xcode (the fake itself, as a shim would be) is not run.
-        let outside = dir.join("xcodebuild");
-        assert!(discover(&apps, &outside, WITHIN).is_empty());
-        let up = Path::new("../../../../xcodebuild");
-        assert!(discover(&apps, up, WITHIN).is_empty());
-        assert_eq!(read_ran(), want_ran);
-        assert_eq!(
-            developer_dir_of(&apps.join("Xcode_good.app"), &outside, WITHIN),
-            Err(format!("{} is not inside the Xcode", outside.display()))
-        );
-
-        // What the log says of the hung one.
-        let hung = developer_dir_of(&apps.join("Xcode_hung.app"), xcodebuild, WITHIN);
-        assert_eq!(
-            hung,
-            Err(format!(
-                "{} -version: no answer within 2s; killed",
-                inside("Xcode_hung.app")
-            ))
-        );
-        kbf_outputs::remove_tree(&dir).expect("clean");
-    }
-
-    /// Catches output read only after the process exits: a process that prints more
-    /// than a pipe holds would block on the full pipe and be killed as hung.
-    #[test]
-    fn a_long_answer_is_read_whole() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "head -c 300000 /dev/zero; head -c 200000 /dev/zero >&2",
-        ]);
-        let out = output_within(command, WITHIN).expect("answers");
-        assert!(out.status.success());
-        assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 200_000));
-    }
-
-    /// Catches a time limit that covers the process but not its output: an Xcode that
-    /// exits but leaves a child holding stdout and stderr (here for 8 s, four times the
-    /// limit) must be given up on when the limit is up, not when the child ends.
-    #[test]
-    fn output_held_open_past_the_limit_is_not_waited_for() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "sleep 8 & echo 'Build version 1A1'"]);
-        let started = Instant::now();
-        let out = output_within(command, WITHIN);
-        let took = started.elapsed();
-        assert!(
-            took < WITHIN * 2,
-            "the held output was waited for: {took:?}"
-        );
-        let err = out.expect_err("the output is still open at the limit");
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(
-            err.to_string(),
-            "exited, but its output was still open after 2s"
-        );
-    }
-
-    fn platform(name: &str, value: &str) -> Option<Platform> {
-        Some(Platform {
-            properties: vec![Property {
-                name: name.to_owned(),
-                value: value.to_owned(),
-            }],
-        })
-    }
-
-    /// Catches: the named Xcode not selected, the name read in one spelling only (the
-    /// front accepted `XCODE` and the scheduler matched it), the Command's deprecated
-    /// platform ignored for an old client or preferred over the Action's, and a build
-    /// the node lacks run with another Xcode instead of failed.
-    #[test]
-    #[allow(deprecated)]
-    fn the_action_names_its_xcode() {
-        let xcodes = BTreeMap::from([
-            (
-                "16C5032a".to_owned(),
-                PathBuf::from("/A/Xcode_16.2.app/Contents/Developer"),
-            ),
-            (
-                "16E140".to_owned(),
-                PathBuf::from("/A/Xcode_16.3.app/Contents/Developer"),
-            ),
-        ]);
-        let none = Command::default();
-        let named = |name: &str, build: &str| Action {
-            platform: platform(name, build),
-            ..Action::default()
-        };
-        assert_eq!(
-            developer_dir(&xcodes, &Action::default(), &none).ok(),
-            Some(None)
-        );
-        assert_eq!(
-            developer_dir(&xcodes, &named("network", "on"), &none).ok(),
-            Some(None)
-        );
-        for name in ["xcode", "XCODE", "Xcode"] {
-            assert_eq!(
-                developer_dir(&xcodes, &named(name, "16E140"), &none).ok(),
-                Some(Some(PathBuf::from("/A/Xcode_16.3.app/Contents/Developer"))),
-                "{name}"
-            );
-        }
-        let old_client = Command {
-            platform: platform("xcode", "16C5032a"),
-            ..Command::default()
-        };
-        assert_eq!(
-            developer_dir(&xcodes, &Action::default(), &old_client).ok(),
-            Some(Some(PathBuf::from("/A/Xcode_16.2.app/Contents/Developer")))
-        );
-        assert_eq!(
-            developer_dir(&xcodes, &named("xcode", "16E140"), &old_client).ok(),
-            Some(Some(PathBuf::from("/A/Xcode_16.3.app/Contents/Developer")))
-        );
-        let missing = developer_dir(&xcodes, &named("xcode", "15F31d"), &none);
-        assert_eq!(
-            missing.map_err(|e| e.to_string()),
-            Err(
-                "the action names Xcode build \"15F31d\"; this node has [\"16C5032a\", \"16E140\"]"
-                    .to_owned()
-            )
-        );
-    }
-}
+#[path = "xcode_tests.rs"]
+pub(crate) mod tests;

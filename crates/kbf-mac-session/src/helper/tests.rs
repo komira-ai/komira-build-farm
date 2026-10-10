@@ -225,6 +225,9 @@ fn kill_uid_boots_out_then_kills_until_none_is_left() {
             "pause".to_owned(),
             format!("kill_all {uid}"),
             format!("live_processes {uid}"),
+            // The second kill, after the crontab and `at` jobs are swept.
+            format!("kill_all {uid}"),
+            format!("live_processes {uid}"),
         ]
     );
 
@@ -470,10 +473,12 @@ fn a_process_started_during_user_delete_stops_it() {
     std::fs::create_dir_all(rig.dir.join("tabs")).unwrap();
     std::fs::write(&tab, "* * * * * job").unwrap();
 
-    // A job starts while the crontab is removed: found at the second look, before the
-    // home folder is touched.
-    rig.host.state().live_script.extend([0, 1]);
+    // A job starts while the crontab is removed and does not exit: found at the
+    // second look, before the home folder is touched.
+    rig.host.state().live_script.push_back(0);
+    rig.host.state().procs.insert(uid, 1);
     let error = rig.helper.user_delete("11.1").unwrap_err();
+    rig.host.state().procs.clear();
     assert!(error.contains("1 processes of uid"), "{error}");
     assert!(!tab.exists(), "the schedules go first");
     assert!(home.exists(), "nothing else is swept while a process lives");
@@ -482,15 +487,25 @@ fn a_process_started_during_user_delete_stops_it() {
     // One starts during the rest of the sweep: found at the last look, and the user
     // record stays.
     log(&rig);
-    rig.host.state().live_script.extend([0, 0, 1]);
+    rig.host.state().live_script.extend([0, 0]);
+    rig.host.state().procs.insert(uid, 1);
     let error = rig.helper.user_delete("11.1").unwrap_err();
+    rig.host.state().procs.clear();
     assert!(error.contains("1 processes of uid"), "{error}");
     assert!(!home.exists());
     assert!(rig.host.state().users.contains_key("kbf-lease-11-1"));
+    let calls = log(&rig);
     assert_eq!(
-        log(&rig),
-        vec![format!("live_processes {uid}"); 3],
-        "three looks, and no delete_user"
+        calls
+            .iter()
+            .filter(|c| c.starts_with("live_processes"))
+            .count(),
+        2 + EXIT_LOOKS,
+        "two looks, then the third waits its whole bound: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.starts_with("delete_user")),
+        "{calls:?}"
     );
 
     // With none left the delete completes, after three looks.
@@ -577,4 +592,134 @@ fn a_home_folder_is_new_private_and_the_users() {
     assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
     std::os::unix::fs::symlink(&dir, dir.join("linked")).unwrap();
     assert!(make_home(&dir.join("linked"), "x", me(), my_gid()).is_err());
+}
+
+/// Catches the race of issue #195: a process of the uid (a cron job) that starts after
+/// `kill-uid` and exits by itself a moment later. `user-delete` waits for it at each
+/// look instead of refusing at once. Red with a single listing per look (no wait).
+#[test]
+fn user_delete_waits_for_a_process_that_exits() {
+    let rig = rig("delete-wait", 2);
+    let uid = rig.helper.user_create("12.1", None).unwrap();
+    log(&rig);
+    // Alive at the first two listings of the first look, gone at the third.
+    rig.host.state().live_script.extend([1, 1]);
+    assert_eq!(rig.helper.user_delete("12.1"), Ok(true));
+    let look = format!("live_processes {uid}");
+    assert_eq!(
+        log(&rig),
+        [
+            look.clone(),
+            "pause".to_owned(),
+            look.clone(),
+            "pause".to_owned(),
+            look.clone(),
+            look.clone(),
+            look,
+            "delete_user kbf-lease-12-1".to_owned(),
+        ]
+    );
+
+    // One that exits during the last look, after the sweep: waited for too.
+    let uid = rig.helper.user_create("12.2", None).unwrap();
+    log(&rig);
+    let mut script = vec![0, 0];
+    script.extend(std::iter::repeat_n(3, EXIT_LOOKS - 1));
+    rig.host.state().live_script.extend(script);
+    assert_eq!(rig.helper.user_delete("12.2"), Ok(true));
+    let calls = log(&rig);
+    assert_eq!(
+        calls.iter().filter(|c| **c == "pause").count(),
+        EXIT_LOOKS - 1,
+        "{uid}: {calls:?}"
+    );
+    assert_eq!(calls.last().unwrap(), "delete_user kbf-lease-12-2");
+}
+
+/// Catches: a wait without a bound (the fake host panics past its pause limit), a
+/// bound other than [`EXIT_LOOKS`], or a refusal that does not say which processes
+/// are left. More than [`NAMED`] are counted, not listed.
+#[test]
+fn user_delete_gives_up_naming_what_is_left() {
+    let rig = rig("delete-give-up", 2);
+    let uid = rig.helper.user_create("13.1", None).unwrap();
+    log(&rig);
+    rig.host.state().procs.insert(uid, 2);
+    let error = rig.helper.user_delete("13.1").unwrap_err();
+    assert_eq!(
+        error,
+        format!(
+            "2 processes of uid {uid} remain after {EXIT_LOOKS} looks: \
+             1000 (proc0), 1001 (proc1); kill-uid first"
+        )
+    );
+    let calls = log(&rig);
+    let looks = calls
+        .iter()
+        .filter(|c| c.starts_with("live_processes"))
+        .count();
+    let pauses = calls.iter().filter(|c| **c == "pause").count();
+    assert_eq!((looks, pauses), (EXIT_LOOKS, EXIT_LOOKS - 1));
+    assert!(rig.host.state().users.contains_key("kbf-lease-13-1"));
+
+    rig.host.state().procs.insert(uid, NAMED + 2);
+    let error = rig.helper.user_delete("13.1").unwrap_err();
+    assert!(
+        error.contains("1007 (proc7), and 2 more; kill-uid first"),
+        "{error}"
+    );
+    assert!(!error.contains("proc8"), "{error}");
+}
+
+/// Catches the cause of issue #195: a crontab (or `at` job) left in place by
+/// `kill-uid`, whose job then starts a process of the uid that `user-delete` refuses,
+/// a job that fired before the sweep left alive (no second kill), and a sweep after
+/// both kills (the fake host logs at each kill whether the crontab is there). A schedule
+/// that cannot be removed is reported, after the processes are killed all the same.
+#[test]
+fn kill_uid_removes_the_schedules_between_two_kills() {
+    let rig = rig("kill-schedules", 2);
+    rig.helper.user_create("14.1", None).unwrap();
+    let tabs = rig.dir.join("tabs");
+    let tab = tabs.join("kbf-lease-14-1");
+    std::fs::create_dir_all(&tabs).unwrap();
+    std::fs::write(&tab, "* * * * * job").unwrap();
+    log(&rig);
+    // Nothing left after the first kill; a job fires before the sweep, so the
+    // second kill finds one and kills it.
+    rig.host.state().live_script.extend([0, 1]);
+    rig.host.state().watch = Some(tab.clone());
+    assert_eq!(rig.helper.kill_uid("14.1"), Ok(()));
+    assert!(!tab.exists(), "kill-uid left the crontab");
+    let kills: Vec<String> = log(&rig)
+        .into_iter()
+        .filter(|c| c.starts_with("kill_all"))
+        .collect();
+    // The crontab goes after the first kill and before the second: a sweep after
+    // both kills leaves a window in which its job starts a process nothing kills.
+    let uid = rig.host.state().users["kbf-lease-14-1"].uid;
+    assert_eq!(
+        kills,
+        [
+            format!("kill_all {uid} (watched file present)"),
+            format!("kill_all {uid} (watched file absent)"),
+            format!("kill_all {uid} (watched file absent)"),
+        ],
+        "one round, the sweep, then two rounds"
+    );
+
+    if me() != 0 {
+        std::fs::write(&tab, "* * * * * job").unwrap();
+        std::fs::set_permissions(&tabs, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let error = rig.helper.kill_uid("14.1").unwrap_err();
+        std::fs::set_permissions(&tabs, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert!(error.contains("incomplete"), "{error}");
+        let kills = log(&rig)
+            .iter()
+            .filter(|c| c.starts_with("kill_all"))
+            .count();
+        assert_eq!(kills, 2, "killed before and after the failed sweep");
+    }
 }

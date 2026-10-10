@@ -328,6 +328,29 @@ async fn a_dropped_run_still_cleans_up() {
     fake.assert_action_gone(2);
 }
 
+/// Catches (issue #157) a dropped run whose clean removes the lease while the `podman
+/// start` it ran may still be there: the start would write into the removed
+/// directories after the clean, as the flake did. `a_dropped_run_still_cleans_up`'s
+/// first half, 200 times over with the CPUs busy (`support::CpuHog`), so a timing one
+/// run passes by luck shows up. The mutant skips `reap` in the lease's clean: `rm`
+/// then finds `start` still there.
+#[tokio::test]
+async fn no_round_of_a_dropped_run_races_the_clean() {
+    let _hog = support::CpuHog::start();
+    for round in 0..200 {
+        let fake = Fake::new(&format!("dropped-stress-{round}"));
+        fake.knob("action.sh", "sleep 30");
+        let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
+        let runtime = Arc::clone(&fake.runtime);
+        let run =
+            tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
+        fake.wait_for_start().await;
+        run.abort();
+        assert!(run.await.expect_err("cancelled").is_cancelled());
+        fake.assert_clean(1);
+    }
+}
+
 /// Catches a kernel OOM kill reported as the action's own exit 137 (it would be cached
 /// as a failing action), and an action's own exit 137 reported as an OOM.
 #[tokio::test]
@@ -651,6 +674,40 @@ async fn the_environment_reaches_podman_and_odd_outputs_are_left_out() {
     assert!(args.lines().any(|a| a == "--env=FOO=a b=c"), "{args}");
     assert!(result.output_files.is_empty() && result.output_directories.is_empty());
     assert!(result.output_symlinks.is_empty());
+    fake.assert_clean(1);
+}
+
+/// Catches the configured container limits not reaching `podman create` (a flag left
+/// to Podman's defaults or the node's `containers.conf`), and the environment or the
+/// user left to the image: the lease's create carries `--unsetenv-all`, `--user=0:0`
+/// and each limit from the driver's configuration.
+#[tokio::test]
+async fn the_configured_limits_reach_podman_create() {
+    let fake = Fake::with("limits", |config| {
+        config.limits = kbf_driver_container::ContainerLimits {
+            pids: 71,
+            shm_mib: 72,
+            nofile: 73,
+            nproc: 74,
+        };
+    });
+    let mut spec = Spec::new(&image(), "unused");
+    spec.env = vec![("A".to_owned(), "1".to_owned())];
+    fake.run(1, &spec, "true").await.expect("ran");
+    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
+    let args: Vec<&str> = args.lines().collect();
+    for expected in [
+        "--unsetenv-all",
+        "--user=0:0",
+        "--pids-limit=71",
+        "--shm-size=72m",
+        "--ulimit=nofile=73:73",
+        "--ulimit=nproc=74:74",
+    ] {
+        assert!(args.contains(&expected), "{expected} missing: {args:?}");
+    }
+    let env: Vec<_> = args.iter().filter(|a| a.starts_with("--env")).collect();
+    assert_eq!(env, [&"--env=A=1"], "{args:?}");
     fake.assert_clean(1);
 }
 

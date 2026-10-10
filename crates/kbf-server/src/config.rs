@@ -11,6 +11,8 @@ use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
+use kbf_auth::{Policy, PolicyError};
+
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
 use crate::token::{ApiToken, TokenFileError};
@@ -38,7 +40,11 @@ pub enum StoreKind {
 
 /// `kbf-server` flags.
 #[derive(Clone, Debug, Parser)]
-#[command(name = "kbf-server", version, about = "The kbf farm server")]
+#[command(
+    name = "kbf-server",
+    version = crate::SERVER_VERSION,
+    about = "The kbf farm server"
+)]
 pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
@@ -62,6 +68,12 @@ pub struct Args {
     /// server refuses to start.
     #[arg(long, requires = "reapi_tls_cert")]
     pub reapi_tls_key: Option<PathBuf>,
+    /// A JSON file with the REAPI listener's authentication policy and authorizers
+    /// (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy
+    /// stops the server. Without it every REAPI call is accepted and allowed. The
+    /// worker listener and the operator API do not read it.
+    #[arg(long)]
+    pub reapi_auth_policy: Option<PathBuf>,
     /// The `kbf.worker.v1` listener.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
@@ -76,6 +88,14 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// How long, in milliseconds, `GET /readyz` on the operator API waits for the
+    /// object store to answer its read-only probe before it answers 503.
+    #[arg(
+        long,
+        default_value_t = crate::health::STORE_PROBE_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..=60_000)
+    )]
+    pub readyz_store_timeout_ms: u64,
     /// PEM certificate of the worker listener. With `--worker-tls-key` and
     /// `--worker-client-ca` it serves mutual TLS; without all three, plain text.
     #[arg(long, requires_all = ["worker_tls_key", "worker_client_ca"])]
@@ -161,6 +181,20 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The REAPI policy file cannot be read.
+    #[error("--reapi-auth-policy: read {path}: {source}")]
+    PolicyRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The REAPI policy file is not a policy.
+    #[error("--reapi-auth-policy: {path}: {source}")]
+    Policy {
+        path: PathBuf,
+        #[source]
+        source: PolicyError,
+    },
 }
 
 impl Args {
@@ -206,6 +240,25 @@ impl Args {
         })
     }
 
+    /// The REAPI listener's policy: the file `--reapi-auth-policy` names, or
+    /// [`Policy::allow_all`] without it.
+    ///
+    /// # Errors
+    /// The file cannot be read, or is not a policy ([`Policy::from_json`]).
+    pub fn reapi_auth_policy(&self) -> Result<Policy, ConfigError> {
+        let Some(path) = &self.reapi_auth_policy else {
+            return Ok(Policy::allow_all());
+        };
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::PolicyRead {
+            path: path.clone(),
+            source,
+        })?;
+        Policy::from_json(&text).map_err(|source| ConfigError::Policy {
+            path: path.clone(),
+            source,
+        })
+    }
+
     /// The operator API these flags describe, if `--api-listen` is given, with the
     /// token read from `--api-token-file`.
     ///
@@ -220,7 +273,11 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        Ok(Some(Api {
+            listen,
+            token,
+            store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
+        }))
     }
 
     /// The S3 store and the key prefix of this start, for `--store=s3`. `env` reads

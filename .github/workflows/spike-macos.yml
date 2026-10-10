@@ -1,0 +1,112 @@
+# The macOS P0 spike: what a GitHub-hosted macOS runner shows of the mechanics a UI
+# test on a farm Mac needs (automationmodetool, simctl in a private device set, the
+# TCC rows a runner image seeded). Findings: docs/spikes/macos-p0.md. Each probe
+# prints `SPIKE macos-<arch>.<probe>.<arm>=<value>` lines and one `<probe>.verdict`;
+# the results directory (those lines and the simulator screenshot) is uploaded. Read
+# them with
+#   gh run view <run id> --log | grep ' SPIKE '
+# Run by hand, or on a pull request that changes this file or tools/spike/macos/.
+name: spike-macos
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/spike-macos.yml
+      - tools/spike/macos/**
+
+permissions: {}
+
+concurrency:
+  group: spike-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The probes' verdict logic against fakes (tools/spike/macos/test), and the planted
+  # mutants, each of which must turn its test red.
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: shellcheck --version && shellcheck -x -S warning tools/spike/macos/*.sh tools/spike/macos/test/fakecmd tools/spike/macos/test/*.sh
+      - run: bash tools/spike/macos/test/run.sh
+      - run: bash tools/spike/macos/test/mutants.sh
+
+  # One job per runner label (the workflow lint wants a literal label in runs-on).
+  # Every probe step runs even if an earlier one failed. The automation-mode probe
+  # changes a device setting, so it runs last. Results land in
+  # $RUNNER_TEMP/kbf-spike-macos (lib.sh's default). The last step fails the job only on
+  # a probe defect (a BROKEN verdict or a probe with no verdict); a FAIL verdict is a
+  # measured result, read from the log and the job summary.
+  probes-macos-26:
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Host facts
+        run: sw_vers && uname -m && xcodebuild -version && ls -d /Applications/Xcode*.app
+      - name: TCC rows as seeded
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/tcc.sh
+      - name: simctl in a private device set
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/simctl.sh
+      - name: automationmodetool status, enable and control
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/automation_mode.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: spike-macos-26
+          path: |
+            ${{ runner.temp }}/kbf-spike-macos/spike.txt
+            ${{ runner.temp }}/kbf-spike-macos/*.png
+          if-no-files-found: error
+      - name: Verdicts
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/verdicts.sh tcc simctl automation_mode
+
+  probes-macos-15:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Host facts
+        run: sw_vers && uname -m && xcodebuild -version && ls -d /Applications/Xcode*.app
+      - name: TCC rows as seeded
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/tcc.sh
+      - name: simctl in a private device set
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/simctl.sh
+      - name: automationmodetool status, enable and control
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/automation_mode.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: spike-macos-15
+          path: |
+            ${{ runner.temp }}/kbf-spike-macos/spike.txt
+            ${{ runner.temp }}/kbf-spike-macos/*.png
+          if-no-files-found: error
+      - name: Verdicts
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/verdicts.sh tcc simctl automation_mode

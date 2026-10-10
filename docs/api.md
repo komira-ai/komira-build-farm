@@ -1,7 +1,8 @@
 # The operator API
 
 `kbf-server` serves an HTTP/JSON API under `/v1` for the Fleet UI, scripts and
-clients ([fleet-updates.md](design/fleet-updates.md) section 11.4). It listens on its
+clients ([fleet-updates.md](design/fleet-updates.md) section 11.4), and
+[`/healthz` and `/readyz`](#get-healthz-and-get-readyz) for a front's health check. It listens on its
 own address, given with `--api-listen`; without the flag there is no API. The start
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
@@ -65,28 +66,45 @@ request turns writes off.
 
 ## `GET /v1/nodes`
 
-Every node registered since the server started, in node-id order, with its software
-and where it is in placement:
+The server that answers, then every node registered since it started, in node-id
+order, with its software and where it is in placement:
 
 ```json
-{ "nodes": [
+{ "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
+  "nodes": [
   { "node_id": "mac-1", "connected": true, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
+      "xcodes": [
+        { "app": "/Applications/Xcode_15.4.app", "build": "15F31d", "state": "ready",
+          "reason": "", "fix": "" },
+        { "app": "/Applications/Xcode_16.1.app", "build": "16B40",
+          "state": "license_not_accepted",
+          "reason": "/usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.",
+          "fix": "sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" },
+        { "app": "/Applications/Xcode_16.2.app", "build": "16C5032a", "state": "ready",
+          "reason": "", "fix": "" } ],
       "received_at_unix_ms": 1791370000000 },
+    "needs_attention": [
+      "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: /usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.; fix: sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" ],
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
                    "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "software": null,
+  { "node_id": "old-1", "connected": false, "software": null, "needs_attention": [],
     "placement": { "state": "serving" } }
 ] }
 ```
 
 | Field | Meaning |
 |---|---|
+| `server.version` | the `kbf-server` build that answers, as `--version` and the start line print it: the package version, `+`, and the commit |
+| `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
+| `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
+| `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the daemon's start until its first survey of its Xcodes ends (never advertised; the daemon sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the daemon's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
+| `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
@@ -117,8 +135,41 @@ refusing would fail builds. An uncordon places it at once. The scheduler's unser
 wait (`--unservable-wait-secs`) still refuses work that no connected node, cordoned
 or not, could run, and the time spent waiting for a cordon does not count toward it.
 A server restart forgets every cordon, as it forgets the rest of the scheduler's
-state. The protocol has no drain message yet:
-the daemon is not told, and the server simply sends it no new `Start`.
+state, and every start logs a warning that says so. The protocol has no drain
+message yet: the daemon is not told, and the server simply sends it no new `Start`.
+
+## `GET /healthz` and `GET /readyz`
+
+For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
+of the REAPI listener. Both are reads, open like `GET /v1/nodes`, and are served only
+when `--api-listen` is given. The routes are served by the same task as the REAPI
+and worker listeners, which are bound before it starts and stop when it ends, so any
+answer means both are bound.
+
+**`GET /healthz`**: the process is alive. It reads nothing, and answers `200` for as
+long as the server runs, during a stop too:
+
+```json
+{ "status": "alive", "version": "0.1.0+0123456789ab", "commit": "0123456789ab" }
+```
+
+**`GET /readyz`**: the server is ready to serve. `200` when every check passes, `503`
+otherwise; the body lists each failing check and why:
+
+```json
+{ "ready": false, "version": "0.1.0+0123456789ab", "commit": "0123456789ab",
+  "failing": [ { "check": "store",
+                 "reason": "a read of kbf/1791370000000000000/readyz-probe had no answer within 2000 ms" } ] }
+```
+
+| Check | Fails when |
+|---|---|
+| `stopping` | the server has received SIGTERM or SIGINT. It answers `503` from that moment, before its REAPI streams are ended, and for the rest of its drain (`--shutdown-timeout-secs`) |
+| `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
+| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
+
+`version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
+makes one read of the store, so poll it at the interval the front needs, not faster.
 
 ## Planned
 
