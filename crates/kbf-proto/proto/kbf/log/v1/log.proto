@@ -62,8 +62,8 @@ message Digest {
 
 // An object in the object store: a writer epoch and a sequence number within it.
 message ObjectId {
-  uint64 epoch = 1;
-  uint64 seq = 2;
+  uint64 epoch = 2;
+  uint64 seq = 1;
 }
 
 // A record `offset` bytes into an object of store `store` (at most 65535).
