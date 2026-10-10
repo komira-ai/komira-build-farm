@@ -752,7 +752,7 @@ fn clean_task_failed(error: tokio::task::JoinError) -> String {
     format!("clean task: {error}")
 }
 
-fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
+pub(crate) fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
     RuntimeError::Failed(format!("{}: {error}", path.display()))
 }
 

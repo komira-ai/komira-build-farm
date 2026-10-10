@@ -22,6 +22,7 @@ use std::path::Path;
 use kbf_daemon::RuntimeError;
 
 use crate::podman::{ContainerSpec, EXEC_ROOT};
+use crate::runtime::failed;
 
 /// How much of `podman start`'s stderr is read back when the container did not run.
 const SAID_MAX: u64 = 64 << 10;
@@ -106,8 +107,7 @@ pub(crate) async fn not_run(
     stderr: &Path,
     state: &str,
 ) -> Result<i32, RuntimeError> {
-    let failed = |e: std::io::Error| RuntimeError::Failed(format!("{}: {e}", stderr.display()));
-    let said = said(stderr).await.map_err(failed)?;
+    let said = said(stderr).await.map_err(|e| failed(stderr, &e))?;
     let program = spec.argv.first().map_or("", String::as_str);
     let Some(why) = classify(program, &said) else {
         return Err(RuntimeError::Failed(format!(
@@ -118,7 +118,7 @@ pub(crate) async fn not_run(
     tracing::info!(container = %spec.name, "{message}");
     tokio::fs::write(stderr, format!("{message}\npodman start: {said}\n"))
         .await
-        .map_err(failed)?;
+        .map_err(|e| failed(stderr, &e))?;
     Ok(why.exit_code())
 }
 

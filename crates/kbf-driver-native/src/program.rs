@@ -122,18 +122,19 @@ fn executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn program(resolved: Result<Resolved, String>) -> PathBuf {
-        match resolved {
-            Ok(Resolved::Program(path)) => path,
-            other => panic!("not a program: {other:?}"),
-        }
+    fn program(path: &str) -> Result<Resolved, String> {
+        Ok(Resolved::Program(PathBuf::from(path)))
     }
 
-    fn refusal(resolved: Result<Resolved, String>) -> Refused {
-        match resolved {
-            Ok(Resolved::Refused(refused)) => refused,
-            other => panic!("not refused: {other:?}"),
-        }
+    fn refused(exit_code: i32, message: &str) -> Result<Resolved, String> {
+        Ok(Resolved::Refused(Refused {
+            exit_code,
+            message: message.to_owned(),
+        }))
+    }
+
+    fn env(path: &str) -> Vec<(String, String)> {
+        vec![("PATH".to_owned(), path.to_owned())]
     }
 
     /// Catches a bare program name not looked up in the Command's PATH (or looked up in
@@ -143,16 +144,21 @@ mod tests {
     #[test]
     fn programs_resolve_as_reapi_says() {
         let wd = Path::new("/nonexistent/wd");
-        let env = |path: &str| vec![("PATH".to_owned(), path.to_owned())];
         assert_eq!(
-            program(resolve("sh", wd, &env("/nonexistent:/bin"))),
-            Path::new("/bin/sh")
+            resolve("sh", wd, &env("/nonexistent:/bin")),
+            program("/bin/sh")
         );
-        assert_eq!(program(resolve("env", wd, &[])), Path::new("/usr/bin/env"));
+        assert_eq!(resolve("env", wd, &[]), program("/usr/bin/env"));
         assert!(resolve("sh", wd, &env("/nonexistent")).is_err());
-        assert_eq!(refusal(resolve("sh", wd, &env("bin"))).exit_code, 127);
-        assert_eq!(program(resolve("/bin/sh", wd, &[])), Path::new("/bin/sh"));
-        assert_eq!(refusal(resolve("./tool", wd, &[])).exit_code, 127);
+        assert!(matches!(
+            resolve("sh", wd, &env("bin")),
+            Ok(Resolved::Refused(Refused { exit_code: 127, .. }))
+        ));
+        assert_eq!(resolve("/bin/sh", wd, &[]), program("/bin/sh"));
+        assert!(matches!(
+            resolve("./tool", wd, &[]),
+            Ok(Resolved::Refused(Refused { exit_code: 127, .. }))
+        ));
         assert!(resolve("/", wd, &[]).is_err(), "a directory");
         assert!(resolve("/etc/hosts", wd, &[]).is_err(), "not executable");
     }
@@ -165,38 +171,53 @@ mod tests {
     #[test]
     fn a_program_only_the_input_root_could_hold_is_the_actions() {
         let wd = Path::new("/");
-        let env = |path: &str| vec![("PATH".to_owned(), path.to_owned())];
-        let dir = refusal(resolve("./etc", wd, &[]));
-        assert_eq!(dir.exit_code, 126, "a directory is there, not executable");
-        assert!(
-            dir.message.contains("`./etc` is not an executable file"),
-            "{dir:?}"
+        assert_eq!(
+            resolve("./etc", wd, &[]),
+            refused(
+                126,
+                "kbf: the action's program `./etc` is not an executable file in the input root"
+            ),
+            "a directory is there, not executable"
         );
-        let hosts = refusal(resolve("hosts", wd, &env("etc:nope")));
-        assert_eq!(hosts.exit_code, 126);
-        assert!(
-            hosts
-                .message
-                .contains("`hosts` is not an executable file on the Command's PATH \"etc:nope\""),
-            "{hosts:?}"
+        assert_eq!(
+            resolve("hosts", wd, &env("etc:nope")),
+            refused(
+                126,
+                "kbf: the action's program `hosts` is not an executable file on the Command's \
+                 PATH \"etc:nope\" (entries relative to the working directory, in the input root)"
+            )
         );
-        let missing = refusal(resolve("kbf-none", wd, &env("")));
-        assert_eq!(missing.exit_code, 127);
-        assert!(missing.message.contains("PATH \"\""), "{missing:?}");
-
-        let mixed = resolve("kbf-none", wd, &env("bin:/usr/bin")).expect_err("farm");
-        assert!(mixed.contains("`kbf-none` was not found"), "{mixed}");
-        assert!(
-            mixed.contains("the Command's PATH \"bin:/usr/bin\""),
-            "{mixed}"
+        assert_eq!(
+            resolve("kbf-none", wd, &env("")),
+            refused(
+                127,
+                "kbf: the action's program `kbf-none` was not found on the Command's PATH \"\" \
+                 (entries relative to the working directory, in the input root)"
+            )
         );
-        let default = resolve("kbf-none", wd, &[]).expect_err("farm");
-        assert!(default.contains("default PATH"), "{default}");
-        assert!(default.contains("\"/usr/bin:/bin\""), "{default}");
-        let absolute = resolve("/etc/hosts", wd, &[]).expect_err("farm");
-        assert!(
-            absolute.contains("`/etc/hosts` is not an executable file"),
-            "{absolute}"
+        assert_eq!(
+            resolve("kbf-none", wd, &env("bin:/usr/bin")),
+            Err(
+                "the action's program `kbf-none` was not found on this node, on the Command's \
+                 PATH \"bin:/usr/bin\""
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            resolve("kbf-none", wd, &[]),
+            Err(
+                "the action's program `kbf-none` was not found on this node, on the default \
+                 PATH \"/usr/bin:/bin\" (the Command sets none)"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            resolve("/etc/hosts", wd, &[]),
+            Err(
+                "the action's program `/etc/hosts` is not an executable file on this node (an \
+                 absolute path, outside the input root)"
+                    .to_owned()
+            )
         );
     }
 }
