@@ -403,7 +403,11 @@ impl Leader {
         stream: u64,
         capacity: Resources,
     ) {
-        let caps = || kbf_caps::NodeCaps::from_report([("arch", "x86_64")]).expect("valid");
+        let caps = || {
+            kbf_caps::NodeCaps::from_report([("arch", "x86_64")])
+                .expect("valid")
+                .with_drivers(["container"])
+        };
         if let Some(claimed) = self.streams.get(&(from.clone(), stream)) {
             let current = self
                 .links

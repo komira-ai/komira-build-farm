@@ -700,7 +700,9 @@ async fn the_driver_runs_against_the_farm() {
         kbf_sched::FINISHED_RETENTION,
     );
     let (outbound, _responses) = tokio::sync::mpsc::unbounded_channel();
-    let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
+    let caps = NodeCaps::from_report([("arch", "x86_64")])
+        .expect("caps")
+        .with_drivers(["container"]);
     farm.register(
         &w("a"),
         kbf_sched::DaemonInstance::new("a"),

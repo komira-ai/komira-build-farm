@@ -98,7 +98,9 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
         &node,
         kbf_sched::DaemonInstance::new("mac-1"),
         Resources::new(8_000, 16 << 30),
-        NodeCaps::from_report([("arch", "arm64")]).expect("caps"),
+        NodeCaps::from_report([("arch", "arm64")])
+            .expect("caps")
+            .with_drivers(["container"]),
         outbound,
         ServerMessage::default(),
     );

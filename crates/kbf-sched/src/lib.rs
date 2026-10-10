@@ -19,7 +19,12 @@
 //!   its `Start` has been out for G;
 //! - first-fit placement of a CPU, memory and GPU request onto worker capacity, GPUs
 //!   whole and held by one lease each until it ends, on workers whose node report
-//!   satisfies the action's platform (`kbf-caps` matching);
+//!   lists a driver serving the lease kind and satisfies the action's platform
+//!   (`kbf-caps` matching);
+//! - whole-machine leases: one goes only to a worker that holds no lease, and books
+//!   all of it, so nothing is placed beside it; one that fits nowhere holds a worker
+//!   that could run it, in queue (QoS) order, and less urgent work is not placed there
+//!   until it has emptied;
 //! - work no live worker can run (none satisfies its platform, or none that does is
 //!   large enough) waits with a reason its callers see, and is refused after
 //!   [`UNSERVABLE_WAIT`], the refusal committed before its callers are answered;
@@ -33,7 +38,8 @@
 //! - a finished operation is kept for [`FINISHED_RETENTION`] after its waiters are
 //!   answered, then dropped (issue #165).
 //!
-//! Not yet: placement scoring (alignment, best fit), reclaimed
+//! Not yet: placement scoring (alignment, best fit), a reservation for a large
+//! `action` request (issue #169), reclaimed
 //! room and preemption, the infra retry budget, and committing submissions so that a
 //! new leader inherits the queue. In v0 the scheduler runs on the leader only.
 //!

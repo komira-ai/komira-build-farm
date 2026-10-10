@@ -33,7 +33,7 @@
 //! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
 //! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
-//! key on a `whole_machine` lease (which is planned to book the whole node). The
+//! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
 //! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
 //! value that is not a whole number is INVALID_ARGUMENT.
 //!
@@ -67,7 +67,7 @@ use kbf_proto::reapi::{
     ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
-use kbf_types::{ActionKey, Digest, Platform, Qos, Resources};
+use kbf_types::{ActionKey, Digest, LeaseKind, Platform, Qos, Resources};
 use prost::Message;
 use prost_types::Any;
 use tokio::sync::watch;
@@ -102,14 +102,12 @@ pub const ERROR_DOMAIN: &str = "kbf";
 /// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
 
-/// One execution the front hands to the scheduler: the scheduler's request and the
-/// lease kind its `Start` names.
+/// One execution the front hands to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Submission {
-    /// What to run, keyed for dedup.
+    /// What to run, keyed for dedup, with the lease kind from the platform's
+    /// `kbf-lease`.
     pub request: Request,
-    /// The lease kind, from the platform's `kbf-lease`.
-    pub kind: String,
 }
 
 /// Where an operation is, as its callers see it.
@@ -304,18 +302,18 @@ where
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
         let gpus = gpus(&platform)?;
-        let booked = booking(&platform, &kind)?;
+        let booked = booking(&platform, kind)?;
         let needs = needs(&platform)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
+                kind,
                 resources: booked.with_gpus(gpus),
                 hermetic: true,
                 do_not_cache: decoded.do_not_cache,
                 needs,
             },
-            kind,
         })
     }
 
@@ -418,7 +416,7 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
 /// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
 /// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
 /// lease.
-fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
+fn booking(platform: &Platform, kind: LeaseKind) -> Result<Resources, Status> {
     let mut booked = DEFAULT_RESOURCES;
     for (key, unit, slot) in [
         (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
@@ -427,10 +425,11 @@ fn booking(platform: &Platform, kind: &str) -> Result<Resources, Status> {
         let Some(value) = platform.get(key) else {
             continue;
         };
-        if kind != LEASE_KINDS[0] {
+        if kind != LeaseKind::Action {
             return Err(Status::invalid_argument(format!(
-                "platform property {key} sizes an {:?} lease only, not a {kind:?} one",
-                LEASE_KINDS[0]
+                "platform property {key} sizes an {:?} lease only, not a {:?} one",
+                LeaseKind::Action.name(),
+                kind.name()
             )));
         }
         *slot = Some(value)
@@ -471,15 +470,19 @@ fn needs(platform: &Platform) -> Result<kbf_caps::Request, Status> {
     })
 }
 
-/// The lease kind a platform names, or INVALID_ARGUMENT.
-fn lease_kind(platform: &Platform) -> Result<String, Status> {
-    match platform.get(LEASE_KIND_KEY) {
-        None => Ok(LEASE_KINDS[0].to_owned()),
-        Some(kind) if LEASE_KINDS.contains(&kind) => Ok(kind.to_owned()),
-        Some(kind) => Err(Status::invalid_argument(format!(
-            "platform property {LEASE_KIND_KEY}={kind:?} is not one of {LEASE_KINDS:?}"
-        ))),
-    }
+/// The lease kind a platform names, or INVALID_ARGUMENT for one not in
+/// [`LEASE_KINDS`] (`vm` among them, until the front books it).
+fn lease_kind(platform: &Platform) -> Result<LeaseKind, Status> {
+    let Some(kind) = platform.get(LEASE_KIND_KEY) else {
+        return Ok(LeaseKind::Action);
+    };
+    LeaseKind::from_name(kind)
+        .filter(|k| LEASE_KINDS.contains(&k.name()))
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "platform property {LEASE_KIND_KEY}={kind:?} is not one of {LEASE_KINDS:?}"
+            ))
+        })
 }
 
 /// FAILED_PRECONDITION with one `MISSING` violation per blob, as REAPI asks.

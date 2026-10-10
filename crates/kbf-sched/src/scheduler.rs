@@ -7,8 +7,8 @@ use std::time::Duration;
 use kbf_caps::NodeCaps;
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId,
-    OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord, StartLease,
-    StateMachine, WaiterId, Waiting, WorkerId,
+    LeaseKind, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
+    StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 use crate::cordon::{Cordon, Cordons};
@@ -141,6 +141,8 @@ struct Unservable {
 #[derive(Clone, Copy, Debug)]
 struct Held {
     operation: OperationId,
+    /// What it booked on its worker.
+    booked: Resources,
     /// When and to which session its `Start` was emitted; `None` until its grant is
     /// committed.
     start_sent: Option<StartSent>,
@@ -159,6 +161,10 @@ pub(crate) struct Worker {
     pub(crate) capacity: Resources,
     pub(crate) caps: NodeCaps,
     pub(crate) booked: Resources,
+    /// How many leases it holds.
+    pub(crate) leases: usize,
+    /// A whole-machine lease holds it: nothing else is placed on it.
+    pub(crate) whole: bool,
     last_heard: FarmTime,
     /// Counts the worker's registrations: the session a `Start` emitted now goes to.
     session: u64,
@@ -179,6 +185,18 @@ impl Worker {
 
     pub(crate) fn alive(&self, now: FarmTime) -> bool {
         now < self.last_heard.saturating_add(LEASE_GRACE)
+    }
+
+    /// Whether `request` can be placed on it now, platform and kind aside: an action
+    /// if no whole-machine lease holds it and its free room holds the request; a
+    /// whole-machine lease if it holds no lease and its capacity holds the request.
+    pub(crate) fn has_room(&self, request: &Request) -> bool {
+        match request.kind {
+            LeaseKind::WholeMachine => self.leases == 0 && self.capacity.fits(&request.resources),
+            LeaseKind::Action | LeaseKind::Vm => {
+                !self.whole && self.free().fits(&request.resources)
+            }
+        }
     }
 }
 
@@ -232,6 +250,9 @@ pub struct Scheduler {
     /// Requeues not yet taken, while they are recorded at all
     /// ([`Scheduler::recording_requeues`]).
     requeues: Option<Vec<Requeue>>,
+    /// Queued whole-machine operations that fit nowhere, and the worker each holds:
+    /// work after it in queue order is not placed there (see [`Scheduler::place`]).
+    reservations: BTreeMap<OperationId, WorkerId>,
 }
 
 impl Scheduler {
@@ -253,6 +274,7 @@ impl Scheduler {
             finished_retention: FINISHED_RETENTION,
             finished: VecDeque::new(),
             requeues: None,
+            reservations: BTreeMap::new(),
         }
     }
 
@@ -350,6 +372,13 @@ impl Scheduler {
             .collect()
     }
 
+    /// The worker queued whole-machine `operation` holds while it waits for it to empty,
+    /// if any.
+    #[must_use]
+    pub fn reservation(&self, operation: OperationId) -> Option<&WorkerId> {
+        self.reservations.get(&operation)
+    }
+
     /// What is booked on `worker`, if it is registered.
     #[must_use]
     pub fn booked(&self, worker: &WorkerId) -> Option<Resources> {
@@ -445,10 +474,14 @@ impl Scheduler {
     fn release(&mut self, id: OperationId) {
         let op = self.ops.get_mut(&id).expect("released operations exist");
         if let Some((lease, worker)) = op.state.holding() {
-            if let Some(w) = self.workers.get_mut(worker) {
-                w.booked = w.booked.saturating_sub(op.request.resources);
+            let held = self.held.remove(&lease);
+            if let Some((w, held)) = self.workers.get_mut(worker).zip(held) {
+                w.booked = w.booked.saturating_sub(held.booked);
+                w.leases -= 1;
+                if op.request.kind == LeaseKind::WholeMachine {
+                    w.whole = false;
+                }
             }
-            self.held.remove(&lease);
         }
         op.result_proposed = false;
     }
@@ -540,8 +573,17 @@ impl Scheduler {
     }
 
     /// One placement round. Each queued operation, most urgent first, goes to the first
-    /// live worker (in name order) that satisfies its platform and has room for its
-    /// whole request vector, up to [`PLACEMENT_ROUND`] grants.
+    /// live worker (in name order) that serves its lease kind, satisfies its platform
+    /// and has room for it, up to [`PLACEMENT_ROUND`] grants. An action has room where
+    /// its whole request vector is free and no whole-machine lease is held; a
+    /// whole-machine lease only on a worker that holds no lease, and it books all of it.
+    ///
+    /// A whole-machine operation that fits nowhere holds one worker that could run it
+    /// (the one it held last round while that still could, else the one with fewest
+    /// leases): no operation after it in queue order (less urgent, or as urgent and
+    /// younger) is placed there, so the worker empties as its leases end. Work before
+    /// it in queue order still is, so a reservation never holds back more urgent work.
+    /// It lasts while the operation is queued and the worker could run it.
     ///
     /// Every queued operation is also checked against what live workers could ever give
     /// it: one that no live worker satisfies, or that is larger than every one that
@@ -553,25 +595,43 @@ impl Scheduler {
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
         let mut verdicts = Vec::new();
+        let mut reserved = BTreeSet::new();
+        let mut reservations = BTreeMap::new();
         for &(_, id) in &self.queue {
             let op = &self.ops[&id];
             let request = &op.request;
-            let verdict = if placed.len() < PLACEMENT_ROUND
-                && let Some(name) = servable.fit(&mut self.workers, request)
-            {
-                placed.push((id, name));
+            let fitted = placed.len() < PLACEMENT_ROUND
+                && servable
+                    .fit(&mut self.workers, request, &reserved)
+                    .map(|(name, booked)| placed.push((id, name, booked)))
+                    .is_some();
+            let verdict = if fitted {
                 Verdict::Servable
             } else {
                 servable.verdict(&self.workers, request)
             };
+            if !fitted
+                && request.kind == LeaseKind::WholeMachine
+                && verdict == Verdict::Servable
+                && let Some(name) = servable.reserve(
+                    &self.workers,
+                    request,
+                    &reserved,
+                    self.reservations.get(&id),
+                )
+            {
+                reserved.insert(name.clone());
+                reservations.insert(id, name);
+            }
             if op.unservable.is_some() || verdict != Verdict::Servable {
                 verdicts.push((id, verdict));
             }
         }
+        self.reservations = reservations;
         for (id, verdict) in verdicts {
             self.note(id, verdict, effects);
         }
-        for (id, worker) in placed {
+        for (id, worker, booked) in placed {
             let lease = LeaseId::new(self.term, self.next_seq);
             self.next_seq += 1;
             let op = self.ops.get_mut(&id).expect("queued operations exist");
@@ -585,6 +645,7 @@ impl Scheduler {
                 lease,
                 Held {
                     operation: id,
+                    booked,
                     start_sent: None,
                 },
             );
@@ -690,9 +751,10 @@ impl Scheduler {
         } = &mut op.state
             && *lease == grant.lease
             && !*committed
+            // A leased operation's lease is always held.
+            && let Some(held) = self.held.get_mut(&grant.lease)
         {
             *committed = true;
-            // A leased operation's lease is always held: no branch on it.
             let (session, process) = self
                 .workers
                 .get(&*worker)
@@ -702,15 +764,14 @@ impl Scheduler {
                 session,
                 process,
             };
-            self.held
-                .entry(*lease)
-                .and_modify(|held| held.start_sent = Some(sent));
+            held.start_sent = Some(sent);
             effects.push(Effect::Start(StartLease {
                 worker: worker.clone(),
                 lease: *lease,
                 operation: grant.operation,
                 key: op.request.key.clone(),
-                resources: op.request.resources,
+                kind: op.request.kind,
+                resources: held.booked,
                 fence: op.request.fence(),
             }));
         }
@@ -825,6 +886,8 @@ impl StateMachine for Scheduler {
                                 capacity,
                                 caps,
                                 booked: Resources::default(),
+                                leases: 0,
+                                whole: false,
                                 last_heard: now,
                                 session: 0,
                                 instance,

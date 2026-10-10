@@ -285,6 +285,7 @@ fn a_report_becomes_node_caps() {
     assert_eq!(node.exact.get("os").map(String::as_str), Some("linux"));
     assert_eq!(node.exact.get("label.rack").map(String::as_str), Some("r1"));
     assert!(!node.exact.contains_key("drivers"));
+    assert_eq!(node.drivers, ["container".to_owned()].into());
     assert_eq!(node.consumables.get(&Consumable::Gpus), Some(&2));
     assert_eq!(node.consumables.get(&Consumable::MemGib), Some(&64));
     assert!(req(&[("cpus", "16"), ("os", "linux"), ("cpu.feature", "avx2")]).matches(&node));

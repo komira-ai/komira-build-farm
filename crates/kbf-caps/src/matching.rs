@@ -113,10 +113,15 @@ pub struct NodeCaps {
     pub members: BTreeMap<String, BTreeSet<String>>,
     /// Countable capacity. A missing entry counts as zero.
     pub consumables: BTreeMap<Consumable, u64>,
+    /// The drivers the node's daemon runs (`container`, `native`, ...), from its
+    /// report's `drivers` entries. No request key matches them; the scheduler reads
+    /// them to place a lease kind only where a driver serves it.
+    pub drivers: BTreeSet<String>,
 }
 
 impl NodeCaps {
-    /// A node with only CPU capabilities: no exact values, no sets, no capacity.
+    /// A node with only CPU capabilities: no exact values, no sets, no capacity, no
+    /// driver.
     #[must_use]
     pub fn new(cpu: CpuCaps) -> Self {
         Self {
@@ -124,7 +129,15 @@ impl NodeCaps {
             exact: BTreeMap::new(),
             members: BTreeMap::new(),
             consumables: BTreeMap::new(),
+            drivers: BTreeSet::new(),
         }
+    }
+
+    /// This node, running `drivers` as well.
+    #[must_use]
+    pub fn with_drivers<'d>(mut self, drivers: impl IntoIterator<Item = &'d str>) -> Self {
+        self.drivers.extend(drivers.into_iter().map(str::to_owned));
+        self
     }
 }
 

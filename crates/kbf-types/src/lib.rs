@@ -1,5 +1,5 @@
 //! Shared value types for kbf: the content digest (function, hash, size), platform
-//! properties, QoS levels, lease identifiers, farm time, the vocabulary of scheduled
+//! properties, QoS levels, lease identifiers and kinds, farm time, the vocabulary of scheduled
 //! work (operations, workers, request vectors, control-log records), and the
 //! `StateMachine` trait and `Effect` enum that the pure cores implement and emit, and
 //! the fleet rollout record with its per-node steps.
@@ -21,7 +21,7 @@ mod time;
 mod work;
 
 pub use digest::{Digest, DigestFunction, ParseDigestError};
-pub use lease::LeaseId;
+pub use lease::{LeaseId, LeaseKind};
 pub use platform::{Platform, PlatformError};
 pub use qos::{CustomQos, Qos, QosError};
 pub use rollout::{

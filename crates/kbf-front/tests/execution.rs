@@ -21,7 +21,7 @@ use kbf_proto::reapi::{
     ExecuteRequest, ExecuteResponse, FileNode, GetCapabilitiesRequest, Platform,
     WaitExecutionRequest, platform,
 };
-use kbf_types::{ActionKey, Qos};
+use kbf_types::{ActionKey, LeaseKind, Qos};
 use prost::Message;
 use tokio::sync::watch;
 use tonic::{Code, Status, Streaming};
@@ -233,7 +233,7 @@ async fn execute_submits_and_streams_each_stage() {
     assert_eq!(submission.request.qos, Qos::Ci);
     assert_eq!(submission.request.resources, DEFAULT_RESOURCES);
     assert!(submission.request.hermetic && !submission.request.do_not_cache);
-    assert_eq!(submission.kind, "action");
+    assert_eq!(submission.request.kind, LeaseKind::Action);
 
     script.set(0, Stage::Executing);
     let executing = next(&mut ops).await.expect("healthy").expect("an update");
@@ -620,15 +620,17 @@ async fn the_lease_kind_comes_from_the_platform() {
     start(&farm, &action).await.expect("Execute");
 
     let submitted = script.submitted();
-    assert_eq!(submitted[0].kind, "whole_machine");
+    assert_eq!(submitted[0].request.kind, LeaseKind::WholeMachine);
     assert!(submitted[0].request.do_not_cache, "do_not_cache dropped");
     assert!(!submitted[0].request.joinable());
     assert_eq!(
-        submitted[1].kind, "whole_machine",
+        submitted[1].request.kind,
+        LeaseKind::WholeMachine,
         "the Command's platform ignored"
     );
     assert_eq!(
-        submitted[2].kind, "whole_machine",
+        submitted[2].request.kind,
+        LeaseKind::WholeMachine,
         "an empty Action platform hid the Command's"
     );
 
@@ -858,7 +860,7 @@ async fn property_names_are_read_in_any_case() {
     let want = kbf_caps::Request::parse([("os", "macos"), ("arch", "arm64")]).unwrap();
     assert_eq!(submitted.request.needs, want);
     assert_eq!(submitted.request.resources, DEFAULT_RESOURCES.with_gpus(1));
-    assert_eq!(submitted.kind, "whole_machine");
+    assert_eq!(submitted.request.kind, LeaseKind::WholeMachine);
 
     for props in [
         vec![("gpu", "1"), ("GPU", "2")],

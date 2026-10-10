@@ -239,7 +239,10 @@ message LeaseOffer {
 message Start {
   LeaseId lease_id = 1;
   // The lease kind, the value of the reserved platform key `kbf-lease`: `action` or
-  // `whole_machine`. The daemon refuses a kind it has no driver for.
+  // `whole_machine` (planned: `vm`). The server places a kind only on a daemon whose
+  // Hello lists a `drivers` entry serving it; the daemon still refuses a kind it has no
+  // driver for. A `whole_machine` lease books the daemon's whole capacity, which
+  // millicpus and memory_bytes then carry.
   string kind = 2;
   // The action to run. Its inputs are fetched from the CAS.
   build.bazel.remote.execution.v2.Digest action_digest = 3;

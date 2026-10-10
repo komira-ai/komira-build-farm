@@ -219,10 +219,25 @@ What the code does today:
   whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
   [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)),
   its `gpu` count, and what its platform asks of a worker (`Request::needs`).
+- Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
+  worker is feasible for it only if its node report lists a driver that serves the
+  kind (`container`, `native` or `fake` for `action`, `native-whole-machine` for
+  `whole_machine`; see [capabilities.md](capabilities.md#driver-entries)).
 - A placement round walks the queue in order and gives each operation to the first
-  live worker, in name order, whose capabilities satisfy its platform and whose free
-  room (capacity minus bookings) fits the whole request on every axis. A worker is live
-  if it was heard from within G. Matches are memoised per platform request in a round.
+  live, feasible worker, in name order, whose capabilities satisfy its platform and
+  that has room for it. An action has room where its free room (capacity minus
+  bookings) fits the whole request on every axis and no whole-machine lease is held. A
+  `whole_machine` lease has room only on a worker that holds no lease and is at least
+  its request large; it books the worker's whole capacity, which its `Start` carries.
+  A worker is live if it was heard from within G. Matches are memoised per platform
+  request and kind in a round.
+- A `whole_machine` lease that fits nowhere holds one feasible worker it could run on:
+  the one it held at the last round while that one still could, else the one with the
+  fewest leases, then the least booked. No operation after it in queue order (less
+  urgent, or as urgent and younger) is placed there, so that worker empties as its
+  leases end; operations before it still are. The hold lasts while the operation is
+  queued and the worker could run it (live, not cordoned, feasible). No lease is ever
+  stopped for it. A large `action` request has no such hold yet (issue #169).
 - At most `PLACEMENT_ROUND` = 256 grants are made per round (one log flush per round).
 - A booking is released when the operation finishes or its lease is given up.
 - Every queued operation is also checked, past the grant limit too, against what live
@@ -245,8 +260,6 @@ What the code does today:
 
 **Planned**, in roughly the order they are needed:
 
-- **Drivers in placement.** Only workers with a driver for the lease kind are
-  feasible.
 - **Learned sizes** (`kbf-estimator`). Requests are sized from what earlier runs of
   similar actions used, with a margin that shrinks as samples grow, raised quickly
   after an overshoot and lowered slowly. Cold actions get a cautious prior.
