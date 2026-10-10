@@ -307,7 +307,7 @@ fn memory_min_below(
     mut cgroup: &str,
     want: u64,
 ) -> Result<Option<(String, u64)>, DelegateError> {
-    while cgroup != "/" && !cgroup.is_empty() {
+    while cgroup != "/" {
         if let Some(text) = read_if_there(fs, cgroup, "memory.min")? {
             let text = text.trim();
             let min = if text == "max" {
