@@ -627,6 +627,35 @@ mod tests {
         assert!(!presses_its_cap_into_swap(3, at(4, 100), 100));
     }
 
+    /// Catches a sample that cannot be read taken as zero (a missing or garbled
+    /// `memory.current` or `memory.swap.current` must fail the sample, which the watch
+    /// then skips), and a whole sample read from the wrong files.
+    #[test]
+    fn a_pressure_sample_reads_its_three_files_or_fails() {
+        let root = scratch("pressure");
+        let lease = LeaseCgroup::at(&root, "/", "kbf-lease-1-1");
+        std::fs::create_dir(lease.dir()).expect("mkdir");
+        let put = |f: &str, v: &str| std::fs::write(lease.dir().join(f), v).expect("write");
+        put("memory.events", "max 3\noom 0\noom_kill 0\n");
+        let err = lease.pressure().expect_err("no memory.current");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("read memory.current"), "{err}");
+        put("memory.current", "4096\n");
+        put("memory.swap.current", "lots\n");
+        let err = lease.pressure().expect_err("garbled");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("memory.swap.current"), "{err}");
+        put("memory.swap.current", "8192\n");
+        assert_eq!(
+            lease.pressure().expect("read"),
+            Pressure {
+                max: 3,
+                current: 4096,
+                swap: 8192
+            }
+        );
+    }
+
     /// Catches CPU booked as a hard cap's units, or a weight outside the kernel's range.
     #[test]
     fn cpu_weight_is_a_hundred_per_core_within_range() {

@@ -306,3 +306,42 @@ async fn the_swap_threshold_follows_the_configuration() {
     );
     fake.assert_clean(2);
 }
+
+/// Catches the swap watch's kill hanging, or reported as anything but the lease's
+/// out-of-memory kill, when `cgroup.kill` cannot be written (the lease cgroup is
+/// read-only for a moment) and `podman start` outlives the grace period; and anything
+/// of the lease left behind afterwards.
+#[tokio::test]
+async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
+    let fake = Fake::with("swap-kill-fails", |config| {
+        config.swap_kill = SwapKill {
+            floor_bytes: 64 << 10,
+            percent: 0,
+            every: Duration::from_millis(20),
+        };
+        config.kill_grace = Duration::from_secs(1);
+    });
+    // The lease cgroup goes read-only before its `max` events start to grow, and
+    // writable again 300 ms later, after the watch's kill and before the grace ends.
+    let script = r#"echo 5000 > "$CG/memory.current"; echo 1048576 > "$CG/memory.swap.current"
+        printf 'max 0\noom 0\noom_kill 0\n' > "$CG/memory.events"
+        chmod a-w "$CG"
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events"; sleep 0.01
+        done
+        sleep 0.2; chmod u+w "$CG"; exec sleep 30"#;
+    let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
+        "{outcome:?}"
+    );
+    assert!(
+        !fake
+            .events()
+            .iter()
+            .any(|e| e == "cgroup.kill ended the action"),
+        "the premise: cgroup.kill could not be written: {:?}",
+        fake.events()
+    );
+    fake.assert_clean(1);
+}

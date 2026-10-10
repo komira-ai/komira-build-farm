@@ -370,12 +370,12 @@ impl<C: Cas> PodmanRuntime<C> {
             }
             now = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
                 let limit = cap.unwrap_or(0);
-                tracing::warn!(
-                    lease = %lease.name,
+                let why = format!(
                     "at its memory cap of {limit} bytes with {} bytes in swap (more than \
                      {threshold}); killing it",
                     now.swap
                 );
+                tracing::warn!(lease = %lease.name, "{why}");
                 self.kill_container(&lease.name, &lease.cgroup, child).await;
                 return Err(RuntimeError::OutOfMemory {
                     used: now.current.saturating_add(now.swap),
