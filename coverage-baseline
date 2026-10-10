@@ -24,7 +24,7 @@ kbf-node                  0      0
 kbf-objstore             71     22
 kbf-outputs               0      0
 kbf-proto                 -      -
-kbf-raft                 23     20
+kbf-raft                 19     19
 kbf-sched                 2      2
 kbf-segments              8      5
 kbf-server                0      0
