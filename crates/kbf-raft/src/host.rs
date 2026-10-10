@@ -315,6 +315,7 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
     /// before it to be synced; the input ends synced.
     fn carry_out(&mut self, effects: Vec<Effect>) -> Result<(), HostError<S::Error>> {
         let mut unsynced = false;
+        let mut held = Vec::new();
         for effect in effects {
             match effect {
                 Effect::PersistHardState(hard) => {
@@ -335,9 +336,12 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
                     if std::mem::take(&mut unsynced) {
                         self.stop_on_error(S::sync)?;
                     }
-                    self.machine.apply(&entry);
+                    held.push(entry);
                 }
             }
+        }
+        for entry in held.iter().rev() {
+            self.machine.apply(entry);
         }
         if unsynced {
             self.stop_on_error(S::sync)?;
