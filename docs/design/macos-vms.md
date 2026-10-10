@@ -647,8 +647,8 @@ the node id checked against the certificate ([#79](https://github.com/komira-ai/
 
 | Crate | Change |
 |---|---|
-| `kbf-front`, `kbf-caps` | the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-partly-planned)): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
-| `kbf-caps` | `xcode` becomes a set the node reports, matched by membership (today an exact key, and a repeated entry is refused) |
+| `kbf-front`, `kbf-caps` | done on `main` ([#90](https://github.com/komira-ai/komira-build-farm/pull/90)): the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-partly-planned)) set what an `action` lease books in place of the default 1 core and 1 GiB (`DEFAULT_RESOURCES`, `crates/kbf-front/src/execution.rs`), and the native driver's memory kill, 150% + 512 MiB of the booking (`crates/kbf-driver-native/src/config.rs`), follows the booking **[V]**; an action without `kbf-book-mem-gib` is still killed at 2 GiB, which large `swiftc` and `ld` steps exceed |
+| `kbf-caps` | done on `main` ([#90](https://github.com/komira-ai/komira-build-farm/pull/90)): `xcode` is a set the node reports, one entry per Xcode build, and a request names one build, matched by membership; a request naming two `xcode` entries, or an empty one, is refused (`crates/kbf-caps/src/matching.rs`) **[V]** |
 | `kbf-driver-native` | deny file writes outside the lease, `TMPDIR` and a per-lease `HOME`; set `HOME`, `TMPDIR`, the module cache paths and the per-user cache folder per lease; per-lease user; fill usage |
 | `kbf-daemon` | report each Xcode build (several `xcode` entries) and SDKs; set `DEVELOPER_DIR` from the action |
 | `kbf-server`, `kbf-sched` | subtract the host floor from capacity, not from the report (the planned "Protected floors"); lease kind in placement from `drivers` (the planned "Drivers in placement") |
