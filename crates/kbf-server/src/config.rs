@@ -75,8 +75,9 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
-    /// How long, in milliseconds, `GET /readyz` on the operator API waits for the
-    /// object store to answer its read-only probe before it answers 503.
+    /// How long, in milliseconds, `GET /readyz` on the operator API and the REAPI
+    /// listener's `grpc.health.v1` service wait for the object store to answer their
+    /// read-only probe before they answer not ready.
     #[arg(
         long,
         default_value_t = crate::health::STORE_PROBE_TIMEOUT.as_millis() as u64,
@@ -217,6 +218,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
+            store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
         })
     }
 
@@ -253,11 +255,7 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api {
-            listen,
-            token,
-            store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
-        }))
+        Ok(Some(Api { listen, token }))
     }
 
     /// The S3 store and the key prefix of this start, for `--store=s3`. `env` reads

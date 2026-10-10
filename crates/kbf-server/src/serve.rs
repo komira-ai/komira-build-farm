@@ -11,13 +11,16 @@ use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
+use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
+use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::blobs::WorkerBlobs;
 use crate::farm::Farm;
-use crate::health::{Readiness, STORE_PROBE_TIMEOUT};
+use crate::grpc_health::{HealthService, WATCH_INTERVAL};
+use crate::health::Readiness;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -50,6 +53,10 @@ pub struct Listeners {
     /// How long shutdown waits for the REAPI listener to drain (see
     /// [`bind_server_with_api`]) before it stops anyway.
     pub shutdown_timeout: Duration,
+    /// How long `GET /readyz` on the operator API, and the REAPI listener's
+    /// `grpc.health.v1` service, wait for the object store to answer their probe
+    /// ([`crate::health`]).
+    pub store_probe_timeout: Duration,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -69,9 +76,6 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
-    /// How long `GET /readyz` waits for the object store to answer its probe
-    /// ([`crate::health`]).
-    pub store_probe_timeout: Duration,
 }
 
 /// Why the server could not start or stopped.
@@ -173,8 +177,12 @@ where
 /// It logs a warning that the scheduler's state (cordons, drains, leases, operations)
 /// starts empty, as it does at every start: nothing of an earlier process is restored.
 ///
-/// When `shutdown` completes, `GET /readyz` answers 503 (`stopping`) from then on, the
-/// REAPI listener stops accepting, every connection on
+/// The REAPI listener also serves `grpc.health.v1.Health` ([`crate::grpc_health`]),
+/// with `/readyz`'s answer.
+///
+/// When `shutdown` completes, `GET /readyz` answers 503 (`stopping`) from then on and
+/// the health service `NOT_SERVING` (an open Watch is sent it, then ends UNAVAILABLE);
+/// then the REAPI listener stops accepting, every connection on
 /// it is sent GOAWAY, and every open Execute and WaitExecution stream that is not done
 /// ends UNAVAILABLE, which clients retry (issue #168). The serving future returns once
 /// the REAPI connections have closed, or after `listeners.shutdown_timeout` if one
@@ -199,8 +207,9 @@ where
 
 /// [`bind_server_with_api`], with the REAPI listener running `policy`
 /// (`docs/reapi-auth.md`): its authenticator on every call of that listener, before
-/// routing, and its authorizers in the services. The worker listener and the operator
-/// API do not run it.
+/// routing, and its authorizers in the services. The worker listener, the operator
+/// API and the REAPI listener's `grpc.health.v1` service do not run it: a proxy's
+/// health check carries no credentials.
 ///
 /// # Errors
 /// A listener cannot be bound, or the worker TLS configuration is refused.
@@ -222,9 +231,8 @@ where
     ));
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let (api_listen, token, probe_timeout) = api.map_or((None, None, STORE_PROBE_TIMEOUT), |api| {
-        (Some(api.listen), api.token, api.store_probe_timeout)
-    });
+    let probe_timeout = listeners.store_probe_timeout;
+    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
@@ -261,15 +269,25 @@ where
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
     let authorizers = Arc::new(policy.authorizers);
+    let cache_for_health = Arc::clone(&cache);
     let reapi_routes =
         kbf_front::routes_with_authorizers(cache, Arc::clone(&farm), closing, authorizers);
     let authenticate = AuthenticateLayer::new(policy.authenticator);
+    // The layer wraps the REAPI routes (and the fallback for unknown paths) present
+    // when it is applied; the health service, added after, is answered without it.
+    let health = HealthServer::new(HealthService::new(
+        cache_for_health,
+        Arc::clone(&readiness),
+        probe_timeout,
+        WATCH_INTERVAL,
+    ));
+    let reapi_routes =
+        Routes::from(reapi_routes.into_axum_router().layer(authenticate)).add_service(health);
 
     let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         let reapi_serve = Server::builder()
-            .layer(authenticate)
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
@@ -291,7 +309,8 @@ where
         // in time, completes first.
         let stopping = async {
             shutdown.await;
-            // Before anything stops, so a front's health check sends no new work here.
+            // Before anything stops, so a front's health check (`/readyz`, or the
+            // health service) sends no new work here.
             stop_readiness.stop();
             closer.close();
             let _ = drain.send(());
