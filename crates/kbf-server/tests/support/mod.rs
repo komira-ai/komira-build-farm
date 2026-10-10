@@ -191,7 +191,8 @@ impl Cell {
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
-        Self::serve(Self::cold_cache(&store).await, store, None, wait, retention).await
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, None, wait, retention).await
     }
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
@@ -202,7 +203,8 @@ impl Cell {
             token: Some(api_token()),
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(Self::cold_cache(&store).await, store, Some(api), wait, retention).await
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, Some(api), wait, retention).await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
