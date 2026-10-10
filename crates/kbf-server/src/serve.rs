@@ -199,7 +199,7 @@ where
     });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
-    let readiness = Arc::new(Readiness::new());
+    let readiness = Arc::new(Readiness::default());
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
     let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);

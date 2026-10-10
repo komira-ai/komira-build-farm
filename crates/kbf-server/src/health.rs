@@ -26,7 +26,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use kbf_front::{Cache, MetaLog};
-use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::{ByteRange, ObjectStore, ObjectStoreError};
 use serde::Serialize;
 
 use crate::api::JSON;
@@ -49,17 +49,18 @@ pub struct Readiness {
     leader: AtomicBool,
 }
 
-impl Readiness {
+impl Default for Readiness {
     /// Not stopping, and the leader: a single server runs every role, and its control
     /// log commits in this process, so it holds the scheduler role from its start.
-    #[must_use]
-    pub const fn new() -> Self {
+    fn default() -> Self {
         Self {
             stopping: AtomicBool::new(false),
             leader: AtomicBool::new(true),
         }
     }
+}
 
+impl Readiness {
     /// A stop signal has been received: `/readyz` answers 503 from now on.
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -84,14 +85,8 @@ impl Readiness {
     }
 }
 
-impl Default for Readiness {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// One failing check of `/readyz`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Failing {
     /// `stopping`, `leader` or `store`.
     pub check: &'static str,
@@ -199,11 +194,14 @@ where
     M: MetaLog,
     O: ObjectStore,
 {
-    let key: ObjectKey = cache
-        .prefix()
-        .key(PROBE_KEY)
-        .map_err(|e| format!("the probe key: {e}"))?;
-    let first = ByteRange::new(0, 1).ok_or_else(|| "the probe range".to_owned())?;
+    let prefix = cache.prefix();
+    let probe = prefix.key(PROBE_KEY).ok().zip(ByteRange::new(0, 1));
+    let Some((key, first)) = probe else {
+        return Err(format!(
+            "{PROBE_KEY} under the prefix ({} bytes) is not a valid key",
+            prefix.as_str().len()
+        ));
+    };
     match tokio::time::timeout(timeout, cache.objects().get_range(&key, first)).await {
         Ok(Ok(_) | Err(ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
             Ok(())

@@ -49,7 +49,7 @@ impl Faults {
 
 /// A [`MemoryStore`] that counts every call, and whose reads can fail or never answer.
 struct FaultStore {
-    inner: MemoryStore,
+    inner: Arc<MemoryStore>,
     faults: Arc<Faults>,
 }
 
@@ -105,6 +105,8 @@ impl ObjectStore for FaultStore {
 /// stopped when the test's runtime ends.
 struct Server {
     api: SocketAddr,
+    /// The bucket behind the [`FaultStore`], written to without counting.
+    bucket: Arc<MemoryStore>,
     faults: Arc<Faults>,
     readiness: Arc<Readiness>,
 }
@@ -113,13 +115,19 @@ struct Server {
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 fn start() -> Server {
+    start_with_prefix("kbf/1/")
+}
+
+/// [`start`], with the cache's keys under `prefix`.
+fn start_with_prefix(prefix: &str) -> Server {
     let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
     let faults = Arc::new(Faults::default());
+    let bucket = Arc::new(MemoryStore::new(Capabilities::default()));
     let store = FaultStore {
-        inner: MemoryStore::new(Capabilities::default()),
+        inner: Arc::clone(&bucket),
         faults: Arc::clone(&faults),
     };
-    let prefix = KeyPrefix::new("kbf/1/").expect("a prefix");
+    let prefix = KeyPrefix::new(prefix).expect("a prefix");
     let cache = Arc::new(Cache::new(
         MemoryMetaLog::new(Retention::default()),
         store,
@@ -148,6 +156,7 @@ fn start() -> Server {
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     Server {
         api,
+        bucket,
         faults,
         readiness,
     }
@@ -228,6 +237,37 @@ async fn readyz_reads_the_store_once_per_poll_and_never_writes() {
         );
         assert_eq!(server.faults.counts(), [poll, 0, 0, 0], "after poll {poll}");
     }
+}
+
+/// Catches: a probe that takes an existing probe key for a fault, whether the object
+/// has bytes (the read answers them) or is empty (the one-byte range starts past its
+/// end). Nothing in kbf writes the key, but an operator or another tool may.
+#[tokio::test]
+async fn readyz_passes_whatever_the_probe_key_holds() {
+    let server = start();
+    let key = ObjectKey::new("kbf/1/readyz-probe").expect("a key");
+    for body in [&b"x"[..], &b""[..]] {
+        server.bucket.delete(&key).await.expect("delete");
+        let body = Bytes::copy_from_slice(body);
+        server.bucket.put_new(&key, body, None).await.expect("put");
+        let (code, body) = get_within(server.api, "/readyz", PROMPT).await;
+        assert_eq!(code, 200, "{body}");
+    }
+    assert_eq!(server.faults.counts(), [2, 0, 0, 0]);
+}
+
+/// Catches: a probe that cannot form its key (the cache's prefix leaves no room for
+/// it under the 1024-byte key limit) yet reports the server ready, or reads some
+/// other key.
+#[tokio::test]
+async fn readyz_is_503_when_the_probe_key_does_not_fit_the_prefix() {
+    let server = start_with_prefix(&format!("{}/", "p".repeat(1020)));
+    let (code, body) = get_within(server.api, "/readyz", PROMPT).await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(failing(&body), ["store"], "{body}");
+    let reason = body["failing"][0]["reason"].as_str().expect("a reason");
+    assert!(reason.contains("1021 bytes"), "{reason}");
+    assert_eq!(server.faults.counts(), [0, 0, 0, 0]);
 }
 
 /// Catches: a `/readyz` that answers 200 whatever the store says, one that does not
