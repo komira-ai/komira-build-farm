@@ -126,7 +126,7 @@ pub(crate) async fn presses_into_swap(
     threshold: u64,
     every: Duration,
 ) -> Pressure {
-    if cap.is_none() {
+    if cap.is_none() || threshold < u64::MAX {
         return std::future::pending().await;
     }
     // The lease cgroup is new, so its `max` events count from 0.
