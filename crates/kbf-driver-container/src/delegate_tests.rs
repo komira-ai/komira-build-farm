@@ -326,8 +326,8 @@ fn a_fresh_unit_gets_its_leaf_its_controllers_and_its_actions_cgroup() {
 /// Catches the leaf's protection reported as whole when an ancestor's `memory.min`
 /// (the unit's or the slice's `MemoryMin=`) caps it: the nearest lower one is named,
 /// `max` counts as unlimited, the root cgroup is passed, an ancestor that protects
-/// enough is not named, and 0 asks for nothing and is never capped. Then a write the
-/// daemon may not make stops the start, naming the file.
+/// enough or shows no `memory.min` is not named, and 0 asks for nothing and is never
+/// capped. Then a write the daemon may not make stops the start, naming the file.
 #[test]
 fn the_daemons_protection_is_checked_against_its_ancestors() {
     let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
@@ -350,6 +350,24 @@ fn the_daemons_protection_is_checked_against_its_ancestors() {
     assert_eq!(
         fake.read(SUPERVISOR_CG, "memory.min").expect("memory.min"),
         "0"
+    );
+
+    // An ancestor that shows no memory.min (its parent does not enable memory) is
+    // passed, not read as 0.
+    let hidden = Fake::host(UNIT, "cpu memory pids", &[41]);
+    hidden
+        .nodes
+        .borrow_mut()
+        .get_mut("/")
+        .expect("root")
+        .enabled
+        .retain(|c| c != "memory");
+    hidden.set(UNIT, "memory.min", "268435456\n");
+    let got = delegate_in(&hidden, SELF, MIN, None).expect("delegated");
+    assert_eq!(got.memory_min_capped, None);
+    assert!(
+        hidden.read("/system.slice", "memory.min").is_err(),
+        "the premise: the slice shows none"
     );
 
     fake.set(UNIT, "memory.min", "lots");
