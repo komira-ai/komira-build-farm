@@ -40,6 +40,11 @@ struct Fake {
     late: RefCell<Option<(String, u32)>>,
     /// The mount has no cgroup v2 root (`cgroup.controllers`).
     v1_mount: bool,
+    /// Reads and writes of `<cg>/<file>` that fail with EACCES, as a file the
+    /// daemon's user may not open would.
+    denied: Vec<String>,
+    /// Whether [`Fake::late`] comes back after each move: a cgroup that never empties.
+    respawn: bool,
 }
 
 fn parent(cgroup: &str) -> &str {
@@ -122,6 +127,13 @@ impl Fake {
         self.nodes.borrow()[cgroup].enabled.clone()
     }
 
+    fn check_denied(&self, cgroup: &str, file: &str) -> io::Result<()> {
+        if self.denied.iter().any(|d| *d == format!("{cgroup}/{file}")) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(())
+    }
+
     fn log(&self) -> Vec<String> {
         self.log.borrow().clone()
     }
@@ -129,6 +141,7 @@ impl Fake {
 
 impl CgroupFs for Fake {
     fn read(&self, cgroup: &str, file: &str) -> io::Result<String> {
+        self.check_denied(cgroup, file)?;
         if !self.exists(cgroup) {
             return Err(io::ErrorKind::NotFound.into());
         }
@@ -159,6 +172,7 @@ impl CgroupFs for Fake {
     }
 
     fn write(&self, cgroup: &str, file: &str, value: &str) -> io::Result<()> {
+        self.check_denied(cgroup, file)?;
         if !self.exists(cgroup) {
             return Err(io::ErrorKind::NotFound.into());
         }
@@ -182,7 +196,12 @@ impl CgroupFs for Fake {
                 nodes.get_mut(cgroup).expect("cgroup").procs.push(pid);
             }
             "cgroup.subtree_control" => {
-                if let Some((at, pid)) = self.late.borrow_mut().take_if(|(at, _)| at == cgroup) {
+                let respawn = self.respawn;
+                let late = self.late.borrow_mut().take_if(|(at, _)| at == cgroup);
+                if respawn {
+                    self.late.borrow_mut().clone_from(&late);
+                }
+                if let Some((at, pid)) = late {
                     self.nodes
                         .borrow_mut()
                         .get_mut(&at)
@@ -359,6 +378,16 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
     );
     let err = refused(&fake, "0::/supervisor\n");
     assert!(err.contains("root cgroup"), "{err}");
+    let err = refused(&fake, "0::\n");
+    assert!(err.contains("root cgroup"), "{err}");
+
+    let mut unreadable = Fake::host(UNIT, "cpu memory pids", &[41]);
+    unreadable.denied = vec!["//cgroup.controllers".into()];
+    let err = refused(&unreadable, SELF);
+    assert!(
+        err.contains("read /sys/fs/cgroup/cgroup.controllers"),
+        "{err}"
+    );
 
     let undelegated = Fake::host(UNIT, "cpu pids", &[41]);
     let err = refused(&undelegated, SELF);
@@ -384,6 +413,42 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
         err.contains("may not write its cgroup") && err.contains("User="),
         "{err}"
     );
+}
+
+/// Catches a failed move or enable read as done (leases would then fail making their
+/// cgroups), and a cgroup that never empties retried forever: each is an error naming
+/// the file, after a bounded number of tries.
+#[test]
+fn a_move_or_enable_that_fails_stops_the_start() {
+    let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
+    denied.denied = vec![format!("{SUPERVISOR_CG}/cgroup.procs")];
+    let err = delegate_in(&denied, SELF, None)
+        .expect_err("denied")
+        .to_string();
+    assert!(
+        err.contains("move a process into") && err.contains("User="),
+        "{err}"
+    );
+
+    let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
+    denied.denied = vec![format!("{UNIT}/cgroup.subtree_control")];
+    let err = delegate_in(&denied, SELF, None)
+        .expect_err("denied")
+        .to_string();
+    assert!(err.contains("enable controllers in"), "{err}");
+
+    let mut busy = Fake::host(UNIT, "cpu memory pids", &[41]);
+    busy.respawn = true;
+    *busy.late.borrow_mut() = Some((UNIT.into(), 43));
+    let err = delegate_in(&busy, SELF, None)
+        .expect_err("busy")
+        .to_string();
+    assert!(
+        err.contains(&format!("enable controllers in /sys/fs/cgroup{UNIT}")),
+        "{err}"
+    );
+    let moves = busy.log().iter().filter(|l| l.ends_with("<- 43")).count();
+    assert_eq!(moves, MOVE_TRIES as usize - 1, "{:?}", busy.log());
 }
 
 /// Catches `--cgroup-parent` taken without a check (every lease would fail making its
@@ -438,6 +503,9 @@ fn an_actions_cgroup_given_on_the_command_line_is_checked() {
         fake.log(),
         [format!("{ACTIONS_CG}/memory.max <- 2147483648")]
     );
+    fake.log.borrow_mut().clear();
+    adopt_in(&fake, ACTIONS_CG, None).expect("adopted");
+    assert!(fake.log().is_empty(), "{:?}", fake.log());
 }
 
 /// Catches capacity read from MemTotal alone (a host that also runs storage would be
@@ -477,6 +545,23 @@ fn capacity_is_the_lowest_memory_max_and_the_nearest_cpuset() {
         .expect_err("garbage")
         .to_string();
     assert!(err.contains("memory.max"), "{err}");
+    fake.set(UNIT, "memory.max", "max");
+    fake.set("/system.slice", "cpuset.cpus.effective", "0-");
+    let err = capacity_in(&fake, ACTIONS_CG)
+        .expect_err("garbage")
+        .to_string();
+    assert!(
+        err.contains("parse") && err.contains("cpuset.cpus.effective"),
+        "{err}"
+    );
+
+    let mut unreadable = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&unreadable, SELF, None).expect("delegated");
+    unreadable.denied = vec![format!("{ACTIONS_CG}/memory.max")];
+    let err = capacity_in(&unreadable, ACTIONS_CG)
+        .expect_err("unreadable")
+        .to_string();
+    assert!(err.contains("read") && err.contains("memory.max"), "{err}");
 }
 
 /// Catches a CPU list miscounted: ranges are inclusive, and a malformed list is an

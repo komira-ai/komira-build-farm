@@ -361,6 +361,37 @@ fn a_container_node_reports_what_its_leases_may_use() {
     assert!(status.success(), "{status}: {log}");
 }
 
+/// Catches `--cgroup-parent` set up again by the daemon (it names a cgroup someone else
+/// made) or its cap not written: the daemon makes no `supervisor` leaf, and writes the
+/// given cgroup's `memory.max` and nothing else.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_given_its_actions_cgroup_writes_only_its_cap() {
+    let dir = tls("adopted");
+    let ids = id_files("adopted-ids", "65536");
+    let (unit, mut flags) = cgroup_tree(&dir, "cpu memory pids");
+    let actions = unit.join("actions");
+    std::fs::create_dir(&actions).expect("mkdir");
+    std::fs::write(actions.join("cgroup.subtree_control"), "cpu memory pids\n").expect("plant");
+    flags.extend([
+        "--driver=container".to_owned(),
+        "--cas=http://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", dir.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+        "--cgroup-parent=/kbf.slice/kbf-daemon.service/actions".to_owned(),
+        "--actions-memory-max-gib=2".to_owned(),
+    ]);
+    let (bin, _) = podman_stub("adopted-bin");
+    let status = runs_until_sigterm_with_path("adopted", &flags, Some(&bin));
+    assert!(status.success(), "{status}");
+    assert_eq!(read(&actions.join("memory.max")), "2147483648");
+    assert!(!unit.join("supervisor").exists());
+    assert!(!unit.join("cgroup.subtree_control").exists());
+}
+
 /// Catches a container node that starts on a host or under a unit where every lease
 /// would fail to make its cgroup, instead of exiting non-zero with the fix: cgroup v1,
 /// a unit that does not delegate `memory`, and a cgroup the daemon may not write.
@@ -401,6 +432,12 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
         stderr.contains("systemd.unified_cgroup_hierarchy=1"),
         "{stderr}"
     );
+
+    let gone = |dir: &Path, _: &Path| {
+        std::fs::remove_file(dir.join("self-cgroup")).expect("remove");
+    };
+    let stderr = refused("no-self-cgroup", "cpu memory pids", &gone);
+    assert!(stderr.contains("self-cgroup: "), "{stderr}");
 
     let stderr = refused("no-memory", "cpu pids", &|_, _| {});
     assert!(
