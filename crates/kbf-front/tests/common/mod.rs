@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod faulty;
+
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
