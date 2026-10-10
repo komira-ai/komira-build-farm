@@ -50,7 +50,7 @@ separate arms in `429a7b4`); arm `CPUWeight=1000` arm 18.5 to 19.1 ms in
 | **Memory pressure.** A hog under `memory.high` beside small actions. The neighbours finish and the hog lives. | **fits** | The hog asked for 512 MiB under a 256 MiB high mark with no swap. It stayed at 271 MiB, alive, with 274 / 864 `high` events and 0 `oom_kill`. Neighbours took 203 to 208 ms with the hog, against 203 to 306 ms alone (arm: 131 to 137 against 131 to 201). Control: the same hog under `memory.max` was OOM-killed on both. |
 | **No network for an action.** DNS and outbound connect fail, and the store's port is unreachable. The mutant runs the action on the host network. | **fits** | `--network=none`: DNS fails and the connect to MinIO fails, on both. The host-network mutant reaches MinIO. See "Networked actions" below for the default network. |
 | **Node readiness check, PSI off.** | **fits with limits** | PSI cannot be switched off: it is a boot-time kernel setting, and `/proc/pressure/{cpu,memory,io}` and the per-cgroup `*.pressure` files exist on both. A test feeds the check a planted pressure source or a planted cgroupfs kubelet config. A real PSI-off kernel needs a farm probe. |
-| **Integration cell.** Three servers, MinIO and RustFS, two daemons, real buck2 and Bazel on one runner. Also the upgrade and rollback test on a three-node cell, and the token and certificate tests. | **fits** (budget). Behaviour is measured once the server and daemon exist. | Seven endpoints all answered within 0.45 s / 0.34 s of starting, after a one-time pull of 0.6 to 4.1 s per image. Memory available fell by 96 / 71 MiB. Container memory: MinIO 89 / 56 MB, RustFS 72 / 65 MB, the daemon stand-ins under 1 MB each. The three stand-ins are Python HTTP servers; the `kbf-server` binary only prints its version today. |
+| **Integration cell.** Three servers, MinIO and RustFS, two daemons, real buck2 and Bazel on one runner. Also the upgrade and rollback test on a three-node cell, and the token and certificate tests. | **fits** (budget). Behaviour is measured once the server and daemon exist. | Seven endpoints all answered within 0.45 s / 0.34 s of starting, after a one-time pull of 0.6 to 4.1 s per image. Memory available fell by 96 / 71 MiB. Container memory: MinIO 89 / 56 MB, RustFS 72 / 65 MB, the daemon stand-ins under 1 MB each. The three stand-ins are Python HTTP servers. `build_budget.sh` starts three real `kbf-server` processes at once, each on free ports, times each to its start line, and stops them with SIGTERM. |
 | **Store conformance against real stores.** | **fits** for MinIO and RustFS. **Garage and a degraded store: not measured yet.** | The `objstore-s3` job already runs both stores, pinned by digest, as service containers on x86. Here the same digests pulled and ran under rootless Podman on both arches. MinIO answered its health check 920 / 698 ms after `podman run`. Garage needs a pinned image first. |
 | **Build-tool conformance.** buck2 remote-test results and per-target no-cache marking. | **fits** | buck2 release `2026-10-01`, fetched and checked against its sha256: 388 ms / 1089 ms. `bazel` (bazelisk) is preinstalled on both images. |
 | **Daemon cgroup delegation.** A prerequisite for the slice, memory and lease tests. | **fits** | See "Delegation" below. |
@@ -96,8 +96,9 @@ anything. The step fails if a control comes out wrong.
   write and the container's cgroup as seen from the host.
 - **Footprint** (`several_servers.sh`). The step fails unless all seven endpoints
   answer.
-- **Build budget** (`build_budget.sh`). The buck2 download must match its pinned
-  sha256.
+- **Build budget** (`build_budget.sh`). Each of the three `kbf-server` processes must
+  print its start line within 60 s and exit 0 within 30 s of SIGTERM, and the buck2
+  download must match its pinned sha256.
 
 The controls were seen failing during the spike:
 - the OOM control failed in run `37583366334`, when it trusted Podman's `OOMKilled`
