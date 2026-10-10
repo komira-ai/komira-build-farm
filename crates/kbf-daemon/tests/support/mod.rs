@@ -353,6 +353,63 @@ impl Worker for FakeServer {
     }
 }
 
+/// Serves the fake worker service with `tls` on `listener`: every session the daemon
+/// opens arrives on the returned receiver. The task stops when the handle is aborted.
+pub fn serve_worker(
+    tls: ServerTlsConfig,
+    listener: tokio::net::TcpListener,
+) -> (mpsc::UnboundedReceiver<Peer>, JoinHandle<()>) {
+    let (sessions_tx, sessions) = mpsc::unbounded_channel();
+    let router = Server::builder()
+        .tls_config(tls)
+        .expect("server TLS config")
+        .add_service(WorkerServer::new(FakeServer {
+            sessions: sessions_tx,
+        }));
+    let server = tokio::spawn(async move {
+        router
+            .serve_with_incoming(TcpIncoming::from(listener))
+            .await
+            .expect("fake server");
+    });
+    (sessions, server)
+}
+
+/// A worker service that answers every session `UNAVAILABLE` with `message`, as a
+/// follower that knows no leader does.
+struct Unavailable(&'static str);
+
+#[tonic::async_trait]
+impl Worker for Unavailable {
+    type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
+
+    async fn session(
+        &self,
+        _: Request<Streaming<DaemonMessage>>,
+    ) -> Result<Response<Self::SessionStream>, Status> {
+        Err(Status::unavailable(self.0))
+    }
+}
+
+/// Serves, with `tls` on `listener`, a worker service that answers every session
+/// `UNAVAILABLE` with `message`.
+pub fn serve_unavailable(
+    tls: ServerTlsConfig,
+    listener: tokio::net::TcpListener,
+    message: &'static str,
+) -> JoinHandle<()> {
+    let router = Server::builder()
+        .tls_config(tls)
+        .expect("server TLS config")
+        .add_service(WorkerServer::new(Unavailable(message)));
+    tokio::spawn(async move {
+        router
+            .serve_with_incoming(TcpIncoming::from(listener))
+            .await
+            .expect("unavailable server");
+    })
+}
+
 /// A clock that runs with the test's own (uptime) clock and jumps forward on
 /// [`SuspendClock::suspend`], as a suspend-counting clock does across a suspend while
 /// the uptime clock, and every tokio timer, stands still.
