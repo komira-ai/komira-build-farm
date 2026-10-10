@@ -234,6 +234,64 @@ async fn bad_actions_are_the_clients_errors() {
     assert!(no_leases(&config));
 }
 
+/// Catches a program missing from, or not executable in, the input root answered as
+/// the farm's fault (`RuntimeError::Failed`, the client's `INTERNAL`): a relative path
+/// and a bare name on a `PATH` of relative entries name the input root only, so they
+/// are the action's result, exit 127 (not there) or 126 (there, not an executable
+/// file), with kbf's message naming the program and the `PATH`. A bare name missing
+/// from an absolute `PATH`, or the default one, may be this node's drift and stays
+/// the farm's, its message naming the `PATH` searched.
+#[tokio::test]
+async fn a_program_not_in_the_input_root_is_the_actions_failure() {
+    let dir = scratch("program");
+    let config = config(&dir);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let in_w = |argv: &[&str]| {
+        let mut spec = Spec::argv(argv);
+        spec.working_directory = "w".to_owned();
+        spec
+    };
+    let cases = [
+        (in_w(&["./missing"]), 127, "`./missing`"),
+        (
+            in_w(&["tool"]).env("PATH", "bin:tools"),
+            127,
+            "PATH \"bin:tools\"",
+        ),
+        (in_w(&["../w"]), 126, "not an executable file"),
+    ];
+    for (seq, (spec, code, says)) in (1..).zip(cases) {
+        let result = run(&rt, &cas, seq, &spec).await;
+        let result = result.unwrap_or_else(|e| panic!("{:?}: {e:?}", spec.argv));
+        let stderr = stderr(&cas, &result);
+        assert_eq!(result.exit_code, code, "{:?}: {stderr}", spec.argv);
+        assert!(stderr.starts_with("kbf: "), "{stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert_eq!(stdout(&cas, &result), "");
+    }
+    for (seq, spec, says) in [
+        (
+            8,
+            Spec::argv(&["no-such-tool-kbf"]),
+            "the default PATH \"/usr/bin:/bin\"",
+        ),
+        (
+            9,
+            Spec::argv(&["no-such-tool-kbf"]).env("PATH", "bin:/nonexistent"),
+            "PATH \"bin:/nonexistent\"",
+        ),
+    ] {
+        let outcome = run(&rt, &cas, seq, &spec).await;
+        assert!(
+            matches!(&outcome, Err(RuntimeError::Failed(why))
+                if why.contains("`no-such-tool-kbf`") && why.contains(says)),
+            "{outcome:?}"
+        );
+    }
+    assert!(no_leases(&config));
+}
+
 /// Catches: a lease directory the action locked (no permissions left on its
 /// directories, files without any) or made deep surviving the clean; and a clean
 /// failure (the scratch root made unwritable) reported as success.
