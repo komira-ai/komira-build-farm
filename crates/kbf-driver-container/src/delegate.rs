@@ -257,7 +257,7 @@ pub(crate) fn delegate_in(
 
     let actions = child(root, ACTIONS);
     make(fs, &actions)?;
-    enable(fs, &actions).map_err(io_err(
+    fs.write(&actions, "cgroup.subtree_control", "+cpu +pids").map_err(io_err(
         fs,
         "enable controllers in",
         &actions,
