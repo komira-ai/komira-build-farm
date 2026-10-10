@@ -6,11 +6,14 @@
 //!    give the overlay's directories to the container's root (a subordinate id, see
 //!    `podman::create_args`), make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
-//! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
+//! 3. **watch:** wait for the exit, the timeout, [`Runtime::kill`], or a lease that
+//!    keeps pressing its own memory cap into swap ([`SwapKill`]), which the driver
+//!    kills and reports as out of memory;
 //! 4. **collect:** the exit code from Podman's record (a container crun could not
 //!    start because the program is not there or not executable is the action's exit
-//!    127 or 126, see `program`), OOM from the lease cgroup's `memory.events`; the overlay's directories back to the daemon's user; outputs,
-//!    stdout and stderr into the CAS;
+//!    127 or 126, see `program`), an OOM kill and whose limit caused it from the lease
+//!    cgroup's `memory.events`; the overlay's directories back to the daemon's user;
+//!    outputs, stdout and stderr into the CAS;
 //! 5. **clean:** remove the container, the lease cgroup and the scratch directory;
 //! 6. **verify-clean:** neither directory may remain.
 //!
@@ -36,7 +39,7 @@ use kbf_types::LeaseId;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
-use crate::cgroup::LeaseCgroup;
+use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
@@ -74,6 +77,8 @@ pub struct PodmanConfig {
     pub outputs: OutputLimits,
     /// The pids, `/dev/shm` and ulimits each container is created with.
     pub limits: ContainerLimits,
+    /// When a lease at its own memory cap that keeps pushing into swap is killed.
+    pub swap_kill: SwapKill,
     /// Whose containers these are: each is labelled `kbf.owner=<owner>`
     /// ([`crate::podman::OWNER_LABEL`]), and at start the runtime removes every
     /// container so labelled. The daemon passes its node id. Two runtimes that share a
@@ -84,7 +89,8 @@ pub struct PodmanConfig {
 impl PodmanConfig {
     /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
     /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace,
-    /// the default [`OutputLimits`] and [`ContainerLimits::DEFAULT`].
+    /// the default [`OutputLimits`], [`ContainerLimits::DEFAULT`] and
+    /// [`SwapKill::DEFAULT`].
     #[must_use]
     pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
         Self {
@@ -96,6 +102,7 @@ impl PodmanConfig {
             kill_grace: Duration::from_secs(5),
             outputs: OutputLimits::DEFAULT,
             limits: ContainerLimits::DEFAULT,
+            swap_kill: SwapKill::DEFAULT,
             owner,
         }
     }
@@ -272,6 +279,9 @@ impl<C: Cas> PodmanRuntime<C> {
             .chown(CONTAINER_OWNER, &[&root, &upper, &overlay_work])
             .await
             .map_err(RuntimeError::Failed)?;
+        // `actions/`'s own OOM count before the lease, to say afterwards whether its
+        // limit killed the lease.
+        lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
         lease
             .cgroup
             .create(work.resources)
@@ -339,6 +349,9 @@ impl<C: Cas> PodmanRuntime<C> {
             .map_err(RuntimeError::Failed)?;
         // The lease owns `podman start` from here, so a dropped run's clean reaps it.
         let child = lease.start.insert(start);
+        let cap = memory_max(work.resources.memory_bytes);
+        let swap_kill = self.config.swap_kill;
+        let threshold = swap_kill.threshold(work.resources.memory_bytes);
 
         tokio::select! {
             // `podman start`'s own status is not the action's: Podman's record, read
@@ -355,30 +368,42 @@ impl<C: Cas> PodmanRuntime<C> {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
                 return Err(RuntimeError::Killed);
             }
+            now = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
+                let limit = cap.unwrap_or(0);
+                let why = format!(
+                    "at its memory cap of {limit} bytes and still pushing into swap, \
+                     now {} bytes (more than {threshold}); killing it",
+                    now.swap
+                );
+                tracing::warn!(lease = %lease.name, "{why}");
+                self.kill_container(&lease.name, &lease.cgroup, child).await;
+                return Err(RuntimeError::OutOfMemory {
+                    used: now.current.saturating_add(now.swap),
+                    limit,
+                });
+            }
         }
 
-        let exit_code = match self
-            .podman
-            .ended(&lease.name)
-            .await
-            .map_err(RuntimeError::Failed)?
-        {
+        let ended = self.podman.ended(&lease.name).await;
+        // SIGKILL (137): whether the kernel's OOM killer did it, and for whose limit,
+        // is read from the lease cgroup, not from Podman. The same is read when Podman
+        // recorded no exit or could not be asked: the lease cgroup's counters do not
+        // depend on Podman's record, so a kill they show is reported as one.
+        if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
+            match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
+                Ok(Some(kill)) => return Err(kill),
+                Ok(None) => {}
+                Err(e) if ended == Ok(Ended::Exited(137)) => {
+                    return Err(failed(lease.cgroup.dir(), &e));
+                }
+                // No exit code either: what Podman said is the one to report.
+                Err(_) => {}
+            }
+        }
+        let exit_code = match ended.map_err(RuntimeError::Failed)? {
             Ended::Exited(code) => code,
             Ended::NotRun(state) => program::not_run(&spec, &stderr_path, &state).await?,
         };
-        // 137 is SIGKILL. Whether the kernel's OOM killer sent it is read from the
-        // lease cgroup, not from Podman.
-        if exit_code == 137 {
-            let kills = lease
-                .cgroup
-                .oom_kills()
-                .map_err(|e| failed(lease.cgroup.dir(), &e))?;
-            if kills > 0 {
-                return Err(RuntimeError::Failed(format!(
-                    "the kernel OOM killer ended the action (oom_kill {kills} in the lease cgroup)"
-                )));
-            }
-        }
         // The container has exited: hand its files back to the daemon's user, so an
         // output the action left unreadable to others is still read, as its owner.
         self.podman
@@ -443,6 +468,22 @@ impl<C: Cas> PodmanRuntime<C> {
                 "container-image {image} names an image index; name the per-architecture \
                  manifest digest"
             ))),
+        }
+    }
+
+    /// The swap watch's kill: `cgroup.kill` at once (the lease is over its cap, so no
+    /// grace), then the grace period for Podman to notice. Returns once `podman start`
+    /// has ended.
+    async fn kill_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
+        if let Err(e) = cgroup.kill() {
+            tracing::warn!(lease = %name, "cgroup.kill: {e}");
+        }
+        if tokio::time::timeout(self.config.kill_grace, child.wait())
+            .await
+            .is_err()
+        {
+            // The container is removed by force in the clean step either way.
+            let _ = child.kill().await;
         }
     }
 
@@ -577,6 +618,8 @@ struct Lease {
     /// The scratch directory.
     dir: PathBuf,
     cgroup: LeaseCgroup,
+    /// `actions/`'s own OOM count when the lease cgroup was made, if it could be read.
+    backstop_ooms: Option<u64>,
     /// Whether a container may exist.
     created: bool,
     /// `podman start --attach`, once started. Reaped before anything is removed.
@@ -600,6 +643,7 @@ impl Lease {
             podman: podman.clone(),
             dir: config.scratch.join(&name),
             cgroup: LeaseCgroup::at(&config.cgroup_root, &config.cgroup_parent, &name),
+            backstop_ooms: None,
             name,
             created: false,
             start: None,

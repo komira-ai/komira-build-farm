@@ -13,6 +13,10 @@ use kbf_types::{Digest, DigestFunction, FarmTime};
 pub const HOUR: Duration = Duration::from_secs(60 * 60);
 pub const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The log index for commands in tests that read no loss-mark generation. A test that
+/// does names each entry's index itself ([`mark_at`]).
+pub const ANY_INDEX: u64 = 1;
+
 /// A distinct digest per `n`, of size `n`.
 pub fn digest(n: u8) -> Digest {
     Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n))
@@ -45,16 +49,27 @@ pub fn at(d: Duration) -> FarmTime {
 /// [`EPOCH`] allocated.
 pub fn meta() -> MetaState {
     let mut m = MetaState::new(Retention::default());
-    assert_eq!(m.execute(Command::AllocEpoch), Applied::Epoch(EPOCH));
+    assert_eq!(
+        m.execute(ANY_INDEX, Command::AllocEpoch),
+        Applied::Epoch(EPOCH)
+    );
     m
 }
 
 /// Marks segment `segment` unreachable for `reason`.
 pub fn mark(meta: &mut MetaState, segment: u64, reason: UnreachableReason) {
-    let applied = meta.execute(Command::ObjectUnreachable {
-        object: object(segment),
-        reason,
-    });
+    mark_at(meta, ANY_INDEX, segment, reason);
+}
+
+/// Marks segment `segment` unreachable for `reason`, as the entry at log index `index`.
+pub fn mark_at(meta: &mut MetaState, index: u64, segment: u64, reason: UnreachableReason) {
+    let applied = meta.execute(
+        index,
+        Command::ObjectUnreachable {
+            object: object(segment),
+            reason,
+        },
+    );
     assert_eq!(applied, Applied::Marked(Ok(())));
 }
 
@@ -63,18 +78,30 @@ pub fn mark_missing(meta: &mut MetaState, segment: u64) {
     mark(meta, segment, UnreachableReason::Missing);
 }
 
-/// Marks segment `segment` reachable again.
+/// Marks segment `segment` reachable again, as a prober that read its mark's
+/// generation and then found the object. The segment must be marked.
 pub fn mark_reachable(meta: &mut MetaState, segment: u64) {
-    let applied = meta.execute(Command::ObjectReachable(object(segment)));
+    let generation = meta
+        .loss_mark(object(segment))
+        .expect("a marked segment")
+        .generation;
+    let applied = meta.execute(
+        ANY_INDEX,
+        Command::ObjectReachable {
+            object: object(segment),
+            generation,
+        },
+    );
     assert_eq!(applied, Applied::Marked(Ok(())));
+    assert_eq!(meta.loss_mark(object(segment)), None);
 }
 
 pub fn tick(meta: &mut MetaState, d: Duration) {
-    meta.execute(Command::Tick(at(d)));
+    meta.execute(ANY_INDEX, Command::Tick(at(d)));
 }
 
 pub fn put(meta: &mut MetaState, digest: Digest, location: Location) -> BlobWrite {
-    match meta.execute(Command::PutBlob { digest, location }) {
+    match meta.execute(ANY_INDEX, Command::PutBlob { digest, location }) {
         Applied::Blob(Ok(write)) => write,
         other => panic!("PutBlob applied as {other:?}"),
     }
@@ -82,7 +109,7 @@ pub fn put(meta: &mut MetaState, digest: Digest, location: Location) -> BlobWrit
 
 /// Commits `touch` and returns what was lost.
 pub fn commit_touch(meta: &mut MetaState, touch: Touch) -> Touch {
-    match meta.execute(Command::Touch(touch)) {
+    match meta.execute(ANY_INDEX, Command::Touch(touch)) {
         Applied::Touched { lost } => lost,
         other => panic!("Touch applied as {other:?}"),
     }
@@ -94,18 +121,21 @@ pub fn put_action(
     action: Digest,
     record: ActionRecord,
 ) -> Result<(), kbf_meta::ActionWriteError> {
-    match meta.execute(Command::PutAction {
-        role,
-        action,
-        record,
-    }) {
+    match meta.execute(
+        ANY_INDEX,
+        Command::PutAction {
+            role,
+            action,
+            record,
+        },
+    ) {
         Applied::Action(result) => result,
         other => panic!("PutAction applied as {other:?}"),
     }
 }
 
 pub fn collect(meta: &mut MetaState) -> kbf_meta::Collected {
-    match meta.execute(Command::Collect) {
+    match meta.execute(ANY_INDEX, Command::Collect) {
         Applied::Collected(c) => c,
         other => panic!("Collect applied as {other:?}"),
     }

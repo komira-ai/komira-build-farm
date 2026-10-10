@@ -38,7 +38,8 @@ hosts; that [converged topology](#converged-topology) is supported too.
  |    ready to serve reads      |                           |
  |  everything else -> leader   |                           |
  +------------------------------+                           |
-          | gRPC over TLS (internal CA)                     |
+          | gRPC; TLS with an internal-CA                   |
+          | certificate when on another host                |
           v                                                 v
  +------------------+   +------------------+   +------------------+
  | storage host A   |   | storage host B   |   | storage host C   |
@@ -167,16 +168,15 @@ it, so the farm must look like one endpoint.
   ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)). Planned: its answers
   follow the two readiness paths, ready to serve reads and leader; which service
   name reports which is not chosen.
-- **TLS on the proxy-to-server hop, with an internal certificate.** The proxy and
-  the servers may be on different machines, so the hop between them is encrypted:
-  `kbf-server` serves its REAPI listener over TLS with a certificate issued by an
-  internal certificate authority, and the proxy verifies it against that authority
-  (issue [#226](https://github.com/komira-ai/komira-build-farm/issues/226)). A client
-  on the same private network may also dial a server directly over that TLS,
-  trusting the same authority. That is adequate for a private network; it is not
-  the client-facing front, whose certificate is the ingress's. Who may call is
-  still decided by the REAPI authentication policy
-  ([reapi-auth.md](../reapi-auth.md)), not by the TLS.
+- **The proxy-to-server hop.** TLS for the farm's client-facing name is the front's
+  job. Each server's REAPI listener serves the proxy over TLS with a certificate from
+  the farm's internal CA (`--reapi-tls-cert`, `--reapi-tls-key`; the listener's TLS
+  is built, the proxy is not), which the proxy trusts; a server whose proxy runs on the same host may serve it plain text on
+  loopback instead. The same internal-CA certificate lets a client that trusts that CA
+  dial a server directly. It is a server certificate only, so it encrypts the hop and
+  names the server but identifies no caller; the REAPI authentication policy
+  ([reapi-auth.md](../reapi-auth.md)) decides who may call, over TLS as over plain
+  text. See the [Security model](../../ARCHITECTURE.md#security-model).
 
 ### Daemons: straight to the servers, one stream to the leader
 
@@ -260,23 +260,23 @@ because there a runaway build cannot press on the farm's state. What changes:
 |---|---|---|
 | Servers | one `kbf-server` process runs every role (`--role=all`) | one server per storage host, dedicated or [converged](#converged-topology); three for HA |
 | Raft core | `kbf-raft`: a sans-IO core with election, replication, commit and learners; a single voter elects itself and commits alone (`crates/kbf-raft/tests/scripted.rs`); simulated with 3 voters and a learner. Snapshots, membership changes, PreVote and CheckQuorum are not built | the same core, with snapshots and single-server membership changes |
-| Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk, snapshots also copied to the object store; `kbf-server` applies control and metadata state from it |
+| Raft in the server | none: `kbf-server` depends on none of `kbf-raft`, `kbf-store` and `kbf-log`. Its host loop (`kbf_raft::Host`) runs over `Storage`, `Transport` and `Machine` traits, with only an in-memory `Storage`. `kbf-store` keeps a Raft log and hard state on the local disk (segmented, CRC-checked, a torn tail cut at open, fail-stop on an I/O error) but does not yet implement that trait. `kbf-log` encodes every `kbf-meta` command as a `kbf.log.v1` entry; nothing writes such entries yet | the log and its snapshots on each voter's local disk, snapshots also copied to the object store; `kbf-server` applies control and metadata state from it |
 | Metadata | `MemoryMetaLog`, in the server's memory; lost at restart. With `--store=s3` each start writes under a fresh key prefix | applied from the log, so a restart keeps it |
 | Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log, and `Welcome.epoch` names the log, so a failover keeps running leases and daemons resend their results to the new leader ([above](#daemons-straight-to-the-servers-one-stream-to-the-leader)) |
 | Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path. The REAPI listener serves `grpc.health.v1.Health` with `/readyz`'s answer, the same for every service name ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)) | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server; `grpc.health.v1` gives the same two answers ([above](#build-clients-one-name-routed-by-method)) |
 | Reads and uploads on followers | none: one server serves every call, and the cache commits its own metadata | at three servers, any synced server serves `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and `GetActionResult` from its applied state, and writes upload bytes to the object store before sending the leader the metadata commit; a read index where a stronger guarantee is needed ([above](#reads-and-uploads-on-every-server)) |
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower ends a daemon's session with a status naming the leader; one that knows no leader answers `UNAVAILABLE` |
 | Daemon's servers | one or more `--server` URLs, each host resolved again every round (a DNS name may carry a record per server); the daemon tries every address in turn, moving on at once after a refused connection, a TLS failure or `UNAVAILABLE`, and waits a jittered, doubling time, at most `--reconnect-max-ms` (30 s), between failed rounds; it never stops trying ([daemon.md](daemon.md#reaching-a-server)). No redirect is followed: there is none to follow | the daemon follows a follower's redirect and dials the leader it names |
-| Proxy-to-server hop | the REAPI listener serves plain text only | TLS with a certificate from an internal CA (#226), which clients on the private network may also use to reach a server directly |
 | Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)); it routes by nothing, as there is one server | a tailnet ingress and an HTTP/2 proxy that routes by gRPC method, after the probes below pass |
+| REAPI listener TLS | `--reapi-tls-cert` and `--reapi-tls-key` serve the REAPI listener over TLS with a server certificate only; without them it serves plain text. The `--reapi-auth-policy` layer runs on either | the proxy-to-server hop over TLS with an internal-CA certificate on every server whose proxy is on another host, which clients on the private network may also use to reach a server directly |
 | Node registry | in the server's memory: a node whose stream closed stays listed with `connected: false` until the server restarts, and gets no work once it has not been heard from for G; a restart forgets every node. `kbf-alert` exists, but nothing raises alerts yet | durable, as [above](#a-durable-node-registry) |
 | Daemons' blobs | the drivers read and write blobs with `ByteStream` on the mutual-TLS worker listener (`--cas`, `https://` only), each call checked against the node certificate and the deny list; daemons need no path through the front ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)) | the same, on the worker listener of every server: reads spread across all of them ([above](#reads-and-uploads-on-every-server)) |
 
 ## Probes before relying on the front
 
 The ingress and proxy pair is not proven. Each of these must pass through the real
-pair (ingress, then proxy, then a REAPI listener: plain text today, TLS once #226 is
-built), as the `tailscale serve` probe did for its front:
+pair (ingress, then proxy, then a REAPI listener over TLS with an internal-CA
+certificate), as the `tailscale serve` probe did for its front:
 
 1. **A Buck2 remote-only build** gets through capabilities, uploads, Execute and
    results.
@@ -304,5 +304,5 @@ what of each decision is on `main`; the rest is **planned**.
 | How the daemon is told the servers | one DNS name with a record per server, or a list of addresses | both: `--server` is repeatable, and each host is resolved again every round ([daemon.md](daemon.md#reaching-a-server)) |
 | The redirect's form | a status on the ended `Session` stream naming the leader; a follower that knows no leader answers `UNAVAILABLE` and the daemon tries the next server; daemons retry forever, with a bounded backoff | the daemon's side but the redirect: it moves to the next address on `UNAVAILABLE` and retries forever with a backoff bounded by `--reconnect-max-ms`. No server sends a redirect, and the daemon follows none |
 | Readiness on a follower | the two readiness paths, plus `grpc.health.v1` on the REAPI listener ([build clients](#build-clients-one-name-routed-by-method)) | `grpc.health.v1` on the REAPI listener, with `/readyz`'s one answer ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)); the second readiness path is not |
-| The proxy-to-server hop | TLS with a certificate from an internal CA, which clients may also use to reach the servers directly ([build clients](#build-clients-one-name-routed-by-method)) | none: the REAPI listener serves plain text |
-| Snapshots off the host | copied to the object store ([durable state](#durable-state-a-raft-log-on-local-disk)) | none: there is no Raft log in the server |
+| The proxy-to-server hop | TLS with a certificate from an internal CA, which clients may also use to reach the servers directly ([build clients](#build-clients-one-name-routed-by-method)) | the REAPI listener's TLS: `--reapi-tls-cert` and `--reapi-tls-key` serve it with a server certificate, and `grpc.health.v1` is served over that TLS too. No proxy is deployed in front of it yet |
+| Snapshots off the host | copied to the object store ([durable state](#durable-state-a-raft-log-on-local-disk)) | none: `kbf-store` keeps a log on the local disk, but no snapshots are built and the server runs no Raft log |

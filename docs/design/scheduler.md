@@ -282,7 +282,8 @@ What the code does today:
 What the code does today (`kbf_sched::MemoryRun`; the policy is
 [failure-classes.md](failure-classes.md), 6.1). A daemon's `Result` says which memory
 ran out when a lease was killed for it (`Result.memory_kill`,
-[worker-protocol.md](worker-protocol.md#result-and-resultack)); no driver sets it yet. The server
+[worker-protocol.md](worker-protocol.md#result-and-resultack)); the native and container
+drivers set it. The server
 turns it into one of two outcomes, and the scheduler decides on the committed result:
 
 - **`Failed(OutOfMemory)`: the action passed its own memory limit.** The operation is

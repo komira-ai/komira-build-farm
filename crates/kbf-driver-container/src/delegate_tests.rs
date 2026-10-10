@@ -281,7 +281,7 @@ const MIN: u64 = 256 << 20;
 /// processes left the delegated cgroup is EBUSY on a real host; enabling them in
 /// `actions/` before its parent offers them is ENOENT), a process left behind in the
 /// delegated cgroup, `actions/` without `memory` (no lease cgroup could set
-/// `memory.high`), `--supervisor-memory-min-mib` not reaching `supervisor/memory.min`
+/// `memory.max`), `--supervisor-memory-min-mib` not reaching `supervisor/memory.min`
 /// (builds could then reclaim the daemon's memory), and `--actions-memory-max-gib`
 /// not reaching `actions/memory.max`. The unit's own `memory.min` is the kernel's 0, so
 /// it caps the leaf's protection and is named.

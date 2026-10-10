@@ -28,8 +28,10 @@ metadata and every authorizer allows. A farm whose front already limits who can
 reach the REAPI listener can run that way.
 
 **What a front does.** A front (a load balancer, a mesh ingress, an HTTP/2 proxy)
-terminates TLS and balances load. To `kbf-server` it is a client on the plain-text
-REAPI listener; nothing in kbf names or trusts a particular front. The policies built
+terminates TLS and balances load. To `kbf-server` it is a client of the REAPI
+listener, over plain text or over the listener's own TLS (`--reapi-tls-cert`,
+`--reapi-tls-key`, a server certificate only); nothing in kbf names or trusts a
+particular front. The policy runs the same way over TLS and over plain text. The policies built
 so far read no header and no certificate, so a front passes nothing they need. The
 planned credential policies (below) read the call's `authorization` header or its
 TLS client certificate.
@@ -87,7 +89,7 @@ error). Every authorizer key is optional and defaults to `allow`.
 | `any` | yes | `{"policies": [...]}`. Asks each policy in order; the first that accepts answers, and the rest are not asked. See below for its refusal. |
 | `all` | yes | `{"policies": [...]}`. Every policy must accept; they are asked in order and the first refusal is the call's. Their metadata is merged in order (below). |
 | `jwt` | planned | A bearer JWT in the `authorization` header. |
-| `tlsClientCertificate` | planned | A TLS client certificate. It needs TLS on the REAPI listener, which kbf does not serve today. |
+| `tlsClientCertificate` | planned | A TLS client certificate. The REAPI listener can serve TLS, but asks clients for no certificate, so this also needs it to take a client CA. |
 | `remote` | planned | Asks a remote authentication service, with a cache. |
 | `peerCredentialsJmespathExpression` | not applicable | UNIX-socket peers; kbf has no UNIX-socket REAPI listener. |
 

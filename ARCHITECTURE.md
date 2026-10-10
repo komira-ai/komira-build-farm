@@ -48,6 +48,8 @@ role (`--role=all`). The flags are:
 
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
+- `--reapi-tls-cert` and `--reapi-tls-key` to serve the REAPI listener over TLS (both,
+  or neither for plain text, which is meant for a loopback bind);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
   listener over mutual TLS (all three, or none for plain text), and
   `--worker-deny-list` for the certificates and nodes it refuses;
@@ -92,12 +94,13 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-meta` | yes | the metadata state machine: CAS index, action cache, closure check, retention |
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
 | `kbf-caps` | yes | CPU capability parsing, ISA levels, request matching |
-| `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) |
+| `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
 | `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
-| `kbf-proto` | no | generated code for REAPI and `kbf.worker.v1` |
+| `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
+| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands to and from `kbf.log.v1`, under the log's format version |
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
@@ -111,7 +114,8 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
-| `kbf-store`, `kbf-sim-cell` | no | placeholders (**planned**: storage engine, whole-cell simulation) |
+| `kbf-store` | no | a Raft server's durable state on the local disk: a segmented append-only log of CRC-32C records and the hard state (term, vote); a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
+| `kbf-sim-cell` | no | placeholder (**planned**: whole-cell simulation) |
 
 A test in `kbf-it` reads the dependency graph and fails if a pure crate depends,
 directly or not, on an async runtime, a network crate or a random source, or if its
@@ -236,8 +240,9 @@ with what exists today and the probes still to run. In short:
   ready to serve reads, every other call to the leader. Each server reports both
   answers on two readiness paths and on `grpc.health.v1` on its REAPI listener (built
   today with `/readyz`'s one answer, [api.md](docs/api.md#grpchealthv1-on-the-reapi-listener)). The
-  proxy reaches `kbf-server` over TLS with a certificate from an internal CA (see
-  [Security model](#security-model)).
+  proxy reaches each server over TLS with a certificate from the farm's internal CA
+  (the REAPI listener's TLS is built today), or in plain text on loopback when it runs
+  on the same host (see [Security model](#security-model)).
 - **Any server serves reads; the leader does the rest.** At three servers, every
   server answers the read path (`ByteStream.Read`, `BatchReadBlobs`,
   `FindMissingBlobs`, `GetActionResult`) from its replicated state and accepts upload
@@ -275,24 +280,27 @@ own protection.
 
 **Build clients go through a front.** TLS for Bazel and Buck2 ends at a front that
 holds a real certificate for the farm's client-facing name: a load balancer, or a
-proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. Today
-`kbf-server` has no TLS of its own on the REAPI listener. It serves REAPI as
-plain-text gRPC behind the front, bound to loopback (front on the same host) or to
-the mesh interface, whose traffic WireGuard already encrypts. With several servers
-(**planned**), the front is a tailnet ingress followed by an HTTP/2 proxy that routes
-reads and uploads to any ready server and every other call to the leader
-([deployment-topology.md](docs/design/deployment-topology.md)); that pair is not yet
-probed. The proxy may run on another machine than the servers, so the hop from the
-proxy to `kbf-server` is planned to use TLS: the REAPI listener serves a certificate
-issued by an internal certificate authority, which the proxy verifies (issue
-[#226](https://github.com/komira-ai/komira-build-farm/issues/226)). Clients on the
-same private network may also reach a server directly over that TLS, trusting the
-same authority. This is adequate for a private network; it does not replace the
-front's certificate for the client-facing name, and it authenticates no caller.
+proxy on a WireGuard mesh such as `tailscale serve` in its HTTPS mode. Behind the
+front, `kbf-server` serves REAPI either as plain-text gRPC, bound to loopback (front on
+the same host) or to the mesh interface, whose traffic WireGuard already encrypts, or
+over TLS of its own (`--reapi-tls-cert`, `--reapi-tls-key`, built today) with a
+certificate from the farm's internal CA. That TLS is for the hop from the front's proxy
+to a server on another machine, and for clients that trust the internal CA and dial a
+server directly. This is adequate for a private network; it does not replace the
+front's certificate for the client-facing name, and it authenticates no caller. With
+several servers (**planned**), the front is a tailnet ingress followed by an HTTP/2
+proxy that routes reads and uploads to any ready server and every other call to the
+leader ([deployment-topology.md](docs/design/deployment-topology.md)); that pair is
+not yet probed.
 
 - **Today:** the REAPI listener (`--listen`, default `127.0.0.1:8980`) serves plain
-  text and accepts any bind address. It runs the authentication policy and the
-  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
+  text, or TLS when given a certificate and key (`--reapi-tls-cert`,
+  `--reapi-tls-key`, both or neither). Under TLS it presents a server certificate
+  only: it asks clients for none, so a client certificate identifies no caller. A key
+  that does not match its certificate stops the server before it prints its start
+  line. The listener accepts any bind address, plain text included. Over TLS as over
+  plain text, it runs the authentication policy and the per-call authorizers of
+  `--reapi-auth-policy`, in Buildbarn's model
   ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
   `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
   flag every call is accepted, and whoever reaches the port can read action inputs

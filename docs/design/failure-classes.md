@@ -350,8 +350,8 @@ These need no guessing, only keeping the reason the daemon already writes:
   Farm. A clean that fails after a good run (`kbf-driver-native/src/runtime.rs:352`)
   keeps the good result and withdraws the node's scratch capability instead of
   discarding the work.
-- **Kernel OOM.** Read the lease cgroup's `oom_kill` count for every exit, not only
-  137 (section 6.1).
+- **Kernel OOM.** The container driver reads the lease cgroup's `memory.events` on
+  exit 137 and whenever Podman recorded no exit (section 6.1).
 - **Control faults**: fence (`ABORTED`), contact lost (`UNAVAILABLE`), lease kind not
   served, the named Xcode absent, outputs not stored (`farm.rs:539-542`). Farm.
 - **Request errors**: no arguments, image by tag, output path in the input root
@@ -432,13 +432,20 @@ booking (the client's `kbf-book-mem-gib`, the default, a learned size), no longe
 change the class.
 
 **What counts as an out-of-memory kill.** The native driver's memory watch killing the
-tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), or a kernel
-OOM kill counted in the lease cgroup's `oom_kill`, read on every exit code (4.3). A
-SIGKILL kbf did not send and cannot tie to memory (a macOS memory-pressure kill with no
-record of it) stays Ambiguous (1.1). The container driver sets no per-lease
-`memory.max` ([daemon.md](daemon.md), "Cgroups and limits"), so its kills come from the
-node's `actions/` limit or the kernel; a larger booking still helps, because placement
-then keeps that much more room free on the node.
+tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), and, in the
+container driver, a lease killed at its own cap: by the driver's swap watch (between
+two samples the lease's `memory.events` `max` grew, so it pressed its cap,
+`memory.max`, and its `memory.swap.current` rose, and it now holds more than a
+threshold in swap; swap held from earlier host pressure, with no rise, never counts), or
+by the kernel's OOM killer for that cap (swap full), which the lease cgroup's
+`memory.events` shows with `oom_kill`, `oom` and `max`. The container driver reads
+those counters when the action ends with SIGKILL (137), when Podman recorded no exit,
+or when Podman could not be asked, and reports either kill as `MEMORY_KILL_OWN_LIMIT`;
+a kernel kill by the node's `actions/` limit or the host (`oom_kill` without `oom` in
+the lease) is `MEMORY_KILL_NODE_PRESSURE`, which says nothing about the booking
+([daemon.md](daemon.md), "Cgroups and limits"). A SIGKILL kbf did not send and cannot
+tie to memory (a macOS memory-pressure kill with no record of it) stays Ambiguous
+(1.1).
 
 **The ladder.** Decided: each out-of-memory rerun books more memory than the run before
 it, the raise is bounded, it stops at the largest node (the **cap**), and only a kill
@@ -480,10 +487,12 @@ floor** for the action's key, and later requests at that key book at least the f
   ([worker-protocol.md](worker-protocol.md#result-and-resultack)):
   `MEMORY_KILL_OWN_LIMIT` (the lease hit its own cap) or `MEMORY_KILL_NODE_PRESSURE`
   (a node-wide kill below the lease's cap). The server reads it on a non-OK `Result`
-  only, as `Failure::OutOfMemory` or `Failure::NodeMemoryPressure`. **No driver sets
-  it yet**: until the container driver change that reads the lease cgroup's
-  `memory.events` lands, every memory kill still ends as in section 2, and the native
-  driver's `RESOURCE_EXHAUSTED` is still answered `INTERNAL`.
+  only, as `Failure::OutOfMemory` or `Failure::NodeMemoryPressure`. The native
+  driver's memory watch reports `MEMORY_KILL_OWN_LIMIT`; the container driver reads the
+  lease cgroup's `memory.events` and reports a kill at the lease's own cap (its swap
+  watch, or the kernel's OOM killer at `memory.max`) as `MEMORY_KILL_OWN_LIMIT` and a
+  kill by the node's `actions/` limit or the host as `MEMORY_KILL_NODE_PRESSURE`
+  ("What counts as an out-of-memory kill", above).
 - An own-cap kill reruns with the booking doubled in whole GiB (at least 1 GiB), never
   past the cap: the largest live node, cordoned or not, that serves the lease kind,
   satisfies the platform and holds the CPU and GPU request (the killed run's node

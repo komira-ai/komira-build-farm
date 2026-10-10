@@ -151,6 +151,7 @@ fn start_with_prefix(prefix: &str) -> Server {
     let listeners = Listeners {
         reapi: loopback,
         worker: loopback,
+        reapi_tls: None,
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,

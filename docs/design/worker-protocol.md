@@ -302,10 +302,12 @@ in [scheduler.md](scheduler.md#memory-kills)):
 | `MEMORY_KILL_OWN_LIMIT` (1) | the action passed its own memory limit (the lease's cap) and was killed for it | runs it again with its memory booking doubled, up to the largest node, and keeps the raised booking as its action key's floor; at the largest node, answers that the action needs more memory than any node offers |
 | `MEMORY_KILL_NODE_PRESSURE` (2) | the node killed it while it was under its own limit: a node-wide out-of-memory kill, or the node's backstop | runs it again with the same booking (twice at most) and counts the kill against the node; never raises the booking |
 
-**Planned**: no driver sets `memory_kill` yet, so every daemon today sends 0. The
-native driver's memory watch still reports its kill as `RESOURCE_EXHAUSTED` alone,
-which the server answers `INTERNAL`; the container driver change that reads the lease
-cgroup's `memory.events` comes separately.
+The daemon sets `memory_kill` from its driver's error: the native driver's memory
+watch sends `RESOURCE_EXHAUSTED` with `MEMORY_KILL_OWN_LIMIT`; the container driver
+reads the lease cgroup's `memory.events` and sends `RESOURCE_EXHAUSTED` with
+`MEMORY_KILL_OWN_LIMIT` for a kill at the lease's own cap, or `UNAVAILABLE` with
+`MEMORY_KILL_NODE_PRESSURE` for a kill by the node's `actions/` limit or the host
+([failure-classes.md](failure-classes.md), 6.1). Every other `Result` sends 0.
 
 The server accepts at most one `Result` per operation, only from the node holding
 the operation's current lease, and only if the `Result` names no action other than the

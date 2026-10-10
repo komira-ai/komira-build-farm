@@ -1,7 +1,7 @@
 //! Memory kills end to end, in one process: a REAPI client, the server, and a fake
 //! daemon that reports each run killed for memory as `Result.memory_kill` names it
-//! (failure classes, 6.1). No driver sets the field yet; the fake daemon stands in for
-//! the one that will.
+//! (failure classes, 6.1). The fake daemon stands in for the real one, whose native and
+//! container drivers set the field (`kbf-daemon`, `lease::result_of`).
 //!
 //! A module of the `execute` test binary, not a binary of its own: `Farm` is generic,
 //! and coverage counts each generic function by its best-covered instantiation, so the

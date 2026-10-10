@@ -7,8 +7,8 @@ use std::time::Duration;
 use kbf_types::{Digest, Effect, FarmTime, StateMachine};
 
 use crate::model::{
-    ActionAnswer, ActionRecord, BlobAnswer, Epoch, FindMissing, Location, Miss, ObjectId,
-    Retention, Role, Touch, UnreachableReason,
+    ActionAnswer, ActionRecord, BlobAnswer, Epoch, FindMissing, Generation, Location, LossMark,
+    Miss, ObjectId, Retention, Role, Touch, UnreachableReason,
 };
 
 /// One committed change to the metadata state.
@@ -43,17 +43,25 @@ pub enum Command {
     /// Touches entries a reader is about to report or serve.
     Touch(Touch),
     /// A read could not use this object, for `reason`. An object already marked
-    /// [`UnreachableReason::Corrupt`] stays corrupt. Refused if the object names an
-    /// epoch never allocated.
+    /// [`UnreachableReason::Corrupt`] stays corrupt. The mark's [`Generation`] becomes
+    /// the log index of this entry, whether or not the reason rose. Refused if the
+    /// object names an epoch never allocated.
     ObjectUnreachable {
         /// The object.
         object: ObjectId,
         /// What the read found.
         reason: UnreachableReason,
     },
-    /// The object is reachable again, whatever its mark said. Refused if the object
-    /// names an epoch never allocated.
-    ObjectReachable(ObjectId),
+    /// The object is reachable again: its mark is cleared, whatever its reason, if the
+    /// mark's generation is still `generation`. A mark stamped since (a newer
+    /// [`Command::ObjectUnreachable`]) is kept, and so is the state: the command is then
+    /// a no-op. Refused if the object names an epoch never allocated.
+    ObjectReachable {
+        /// The object.
+        object: ObjectId,
+        /// The mark's generation the sender read before it probed the store.
+        generation: Generation,
+    },
     /// Removes every blob and action entry whose retention has run out.
     Collect,
 }
@@ -166,7 +174,7 @@ pub struct MetaState {
     now: FarmTime,
     blobs: BTreeMap<Digest, BlobEntry>,
     actions: BTreeMap<Digest, ActionEntry>,
-    unreachable: BTreeMap<ObjectId, UnreachableReason>,
+    unreachable: BTreeMap<ObjectId, LossMark>,
     next_epoch: u64,
 }
 
@@ -211,11 +219,22 @@ impl MetaState {
     /// Why `object` is marked unreachable, or `None` if it is not.
     #[must_use]
     pub fn unreachable(&self, object: ObjectId) -> Option<UnreachableReason> {
+        self.unreachable.get(&object).map(|mark| mark.reason)
+    }
+
+    /// `object`'s loss mark, or `None` if it is not marked. A prober reads the
+    /// generation here before it probes the store, and names it in the
+    /// [`Command::ObjectReachable`] it sends.
+    #[must_use]
+    pub fn loss_mark(&self, object: ObjectId) -> Option<LossMark> {
         self.unreachable.get(&object).copied()
     }
 
-    /// Applies one command and reports what it did.
-    pub fn execute(&mut self, command: Command) -> Applied {
+    /// Applies one command, the payload of the log entry at `index`, and reports what
+    /// it did. The index is an input only to [`Command::ObjectUnreachable`], which
+    /// stamps it as the mark's [`Generation`]; every caller passes the index of the
+    /// entry it applies.
+    pub fn execute(&mut self, index: u64, command: Command) -> Applied {
         match command {
             Command::Tick(t) => {
                 self.now = self.now.max(t);
@@ -241,13 +260,26 @@ impl MetaState {
             },
             Command::ObjectUnreachable { object, reason } => {
                 Applied::Marked(self.allocated(object).map(|()| {
-                    let mark = self.unreachable.entry(object).or_insert(reason);
-                    *mark = (*mark).max(reason);
+                    let generation = Generation::new(index);
+                    let mark = self
+                        .unreachable
+                        .entry(object)
+                        .or_insert(LossMark { reason, generation });
+                    mark.reason = mark.reason.max(reason);
+                    mark.generation = generation;
                 }))
             }
-            Command::ObjectReachable(object) => Applied::Marked(self.allocated(object).map(|()| {
-                self.unreachable.remove(&object);
-            })),
+            Command::ObjectReachable { object, generation } => {
+                Applied::Marked(self.allocated(object).map(|()| {
+                    if self
+                        .unreachable
+                        .get(&object)
+                        .is_some_and(|mark| mark.generation == generation)
+                    {
+                        self.unreachable.remove(&object);
+                    }
+                }))
+            }
             Command::Collect => Applied::Collected(self.collect()),
         }
     }
@@ -464,13 +496,17 @@ impl MetaState {
     }
 }
 
-impl StateMachine for MetaState {
-    type Input = Command;
+#[cfg(test)]
+mod idempotence;
 
-    /// Applies the command; its outcome goes to the caller through
+impl StateMachine for MetaState {
+    /// A log entry's index and its command.
+    type Input = (u64, Command);
+
+    /// Applies the command at its index; its outcome goes to the caller through
     /// [`MetaState::execute`], and the metadata core asks for no effects.
-    fn apply(&mut self, input: Command) -> Vec<Effect> {
-        self.execute(input);
+    fn apply(&mut self, (index, command): (u64, Command)) -> Vec<Effect> {
+        self.execute(index, command);
         Vec::new()
     }
 }

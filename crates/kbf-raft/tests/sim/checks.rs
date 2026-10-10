@@ -78,9 +78,14 @@ impl Checker {
 
     fn check_history(&mut self, node: &RaftNode) -> Result<(), Violation> {
         let server = node.id();
-        let seen = self.seen.entry(server).or_default();
-        let new = &node.history()[*seen..];
-        *seen = node.history().len();
+        let from = self.seen.get(&server).copied().unwrap_or_default();
+        node.with_history(|history| {
+            self.seen.insert(server, history.len());
+            self.check_events(server, &history[from..])
+        })
+    }
+
+    fn check_events(&mut self, server: ServerId, new: &[Observed]) -> Result<(), Violation> {
         for event in new {
             match event {
                 Observed::Persisted { prev_term, entry } => {
@@ -162,7 +167,7 @@ impl Checker {
             if *committed_by >= term {
                 continue;
             }
-            if node.log_entry(*index) != Some(entry) {
+            if node.log_entry(*index).as_ref() != Some(entry) {
                 return Err(Violation::LeaderCompleteness {
                     leader: server,
                     term,

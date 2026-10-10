@@ -37,10 +37,26 @@ pub trait MetaLog: Send + Sync + 'static {
 }
 
 /// The single-process metadata log: one [`MetaState`] behind a lock, every command
-/// applied in the order it arrives. For `--store=memory` and tests; it never fails.
+/// applied in the order it arrives, at the next index of a log that exists only in
+/// memory. For `--store=memory` and tests; it never fails.
 #[derive(Debug)]
 pub struct MemoryMetaLog {
-    state: Mutex<MetaState>,
+    state: Mutex<Applier>,
+}
+
+/// The state and the index of the last command applied to it.
+#[derive(Debug)]
+struct Applier {
+    meta: MetaState,
+    last_index: u64,
+}
+
+impl Applier {
+    /// Applies `command` as the next entry; the first is at index 1.
+    fn execute(&mut self, command: Command) -> Applied {
+        self.last_index += 1;
+        self.meta.execute(self.last_index, command)
+    }
 }
 
 impl MemoryMetaLog {
@@ -48,7 +64,10 @@ impl MemoryMetaLog {
     #[must_use]
     pub fn new(retention: Retention) -> Self {
         Self {
-            state: Mutex::new(MetaState::new(retention)),
+            state: Mutex::new(Applier {
+                meta: MetaState::new(retention),
+                last_index: 0,
+            }),
         }
     }
 
@@ -62,7 +81,7 @@ impl MemoryMetaLog {
         }
     }
 
-    fn state(&self) -> MutexGuard<'_, MetaState> {
+    fn state(&self) -> MutexGuard<'_, Applier> {
         // `MetaState::execute` and the queries do not panic midway through a change, so
         // a poisoned state is still whole.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -79,6 +98,6 @@ impl MetaLog for MemoryMetaLog {
         F: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
-        Ok(f(&self.state()))
+        Ok(f(&self.state().meta))
     }
 }
