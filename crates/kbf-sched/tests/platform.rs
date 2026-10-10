@@ -346,7 +346,13 @@ fn a_vm_image_places_on_its_digest_and_names_it_when_missing() {
     let y = format!("sha256:{}", "2".repeat(64));
     let holds = |digest: &str| {
         let image = format!("built-here@{digest}");
-        NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("vm.image", &image)]).unwrap()
+        let report = [
+            ("arch", "arm64"),
+            ("os", "macos"),
+            ("drivers", "native"),
+            ("vm.image", &image),
+        ];
+        NodeCaps::from_report(report).unwrap()
     };
     let mut h = Harness::new();
     h.worker("a-mac", holds(&y));
