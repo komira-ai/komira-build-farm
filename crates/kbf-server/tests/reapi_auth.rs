@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
@@ -296,12 +296,54 @@ async fn until(channel: &Channel, authorization: &str, code: Code) -> Status {
     }
 }
 
+/// What this test process logs, from the first call on (a global subscriber).
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        log.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn get() -> &'static Self {
+        static LOG: OnceLock<Captured> = OnceLock::new();
+        LOG.get_or_init(|| {
+            let log = Self::default();
+            let writer = log.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .init();
+            log
+        })
+    }
+
+    /// How many logged lines contain `text`.
+    fn count(&self, text: &str) -> usize {
+        let log = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&log)
+            .lines()
+            .filter(|l| l.contains(text))
+            .count()
+    }
+}
+
 /// Catches: the layer reading the token file only once (a removed line still served,
-/// an added one refused until a restart), and a file broken after start (here
-/// chmod-ed to 0644) that keeps serving the entries read before (fail open), or keeps
-/// refusing once fixed.
+/// an added one refused until a restart); a file broken after start (here chmod-ed to
+/// 0644) that keeps serving the entries read before (fail open), or keeps refusing
+/// once fixed; and the file's error not logged, or logged at every refused call
+/// rather than once while it stays broken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_file_edits_apply_without_a_restart() {
+    let log = Captured::get();
     let path = tokens_file();
     let store = TokenStore::open_with_interval(&path, Duration::from_millis(20)).expect("open");
     let cell = Cell::start_with_reapi_tokens(Arc::new(store)).await;
@@ -326,6 +368,13 @@ async fn token_file_edits_apply_without_a_restart() {
     let broken = until(&ch, &other, Code::Unauthenticated).await;
     assert_eq!(broken.message(), FILE_UNUSABLE);
     assert!(!broken.message().contains(path.to_str().expect("UTF-8")));
+    for _ in 0..5 {
+        let again = call(&ch, CAPS, &[&other]).await;
+        assert_eq!(again.message(), FILE_UNUSABLE);
+    }
+    let unusable = "--reapi-token-file is unusable: every REAPI call is refused";
+    assert_eq!(log.count(unusable), 1, "the file's error is logged once");
+    assert_eq!(log.count("0644"), 1, "the log says why");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     until(&ch, &other, Code::Ok).await;
 }

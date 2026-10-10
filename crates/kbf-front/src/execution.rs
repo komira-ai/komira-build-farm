@@ -250,11 +250,8 @@ where
         let request = request.into_inner();
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
-        tracing::info!(
-            principal = caller.as_ref().map(|c| &*c.principal),
-            action = %action,
-            "Execute"
-        );
+        let principal = caller.as_ref().map(|c| &*c.principal);
+        tracing::info!(principal, action = %action, "Execute");
         if !request.skip_cache_lookup
             && let Some(result) = self.cache.action_result(&action).await?
         {
