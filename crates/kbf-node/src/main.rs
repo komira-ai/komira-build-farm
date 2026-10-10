@@ -284,15 +284,6 @@ mod container {
 
     /// Builds the container driver, over the daemon's CAS client, and serves with it.
     pub(super) fn start(cli: &Cli, tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
-        // The checks that change nothing come first.
-        let scratch = scratch(cli)?;
-        let cas = cas_client(cli)?;
-        // Every container's ids are this user's subordinate ids (`--userns=nomap`).
-        let files = cli
-            .id_files
-            .as_deref()
-            .map_or_else(IdFiles::system, IdFiles::in_dir);
-        kbf_driver_container::check_daemon_user(&files)?;
         let mount = &cli.cgroup_root;
         let memory_max = cli
             .actions_memory_max_gib
@@ -315,6 +306,15 @@ mod container {
                 delegation.actions
             }
         };
+        // The checks that change nothing come first.
+        let scratch = scratch(cli)?;
+        let cas = cas_client(cli)?;
+        // Every container's ids are this user's subordinate ids (`--userns=nomap`).
+        let files = cli
+            .id_files
+            .as_deref()
+            .map_or_else(IdFiles::system, IdFiles::in_dir);
+        kbf_driver_container::check_daemon_user(&files)?;
         let capacity = kbf_driver_container::capacity(mount, &parent)?;
         tracing::info!(
             "leases may use {} CPUs and {} of memory (cgroup {parent})",
