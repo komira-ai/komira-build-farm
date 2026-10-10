@@ -45,6 +45,7 @@ use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
+use crate::memory;
 use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
@@ -523,6 +524,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let now = self.now();
         let (answers, accepted) = {
             let mut state = self.lock();
+            let killed_before = state.memory_runs(operation);
             let answers = state.feed(
                 now,
                 Event::Report {
@@ -535,7 +537,13 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             // at once: an accepted result is answered here, and a refused one (its lease
             // given up while its outputs were checked) never is. The replicated log will
             // answer once the record commits, carrying the result with it.
-            let accepted = answers.iter().any(|a| a.lease == lease);
+            // A memory kill the scheduler takes is answered, or records a run and runs
+            // the operation again (`crate::memory`).
+            let rerun = state.memory_runs(operation) > killed_before;
+            let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+            if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
+                memory::pressure(worker, state.sched.memory_pressure(worker));
+            }
             let settled: Vec<Settled> = answers
                 .iter()
                 .map(|a| state.settle(a, detail.take()))
@@ -562,6 +570,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         ran_on: (&WorkerId, Stamp),
         result: worker::Result,
     ) -> (Outcome, Option<Detail>) {
+        if let Some(kill) = memory::killed(&result) {
+            tracing::info!(%lease, ?kill, "lease killed for memory");
+            return (Outcome::Failed(kill), None);
+        }
         let code = result.status.as_ref().map_or(Code::Ok as i32, |s| s.code);
         match (Code::from_i32(code), result.action_result) {
             (Code::Ok, Some(mut result)) => {
@@ -671,6 +683,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
 }
 
 impl State {
+    /// How many runs of `operation` the scheduler has recorded as killed for memory.
+    fn memory_runs(&self, operation: OperationId) -> usize {
+        self.sched.memory_runs(operation).map_or(0, <[_]>::len)
+    }
+
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
     }
@@ -934,6 +951,9 @@ impl State {
                 (failed(Code::DeadlineExceeded, "the action timed out"), None)
             }
             (Some(Detail::Invalid(why)), _) => (failed(Code::InvalidArgument, &why), None),
+            (_, Outcome::Failed(kill @ (Failure::OutOfMemory | Failure::NodeMemoryPressure))) => {
+                (memory::finished(kill, &answer.memory_runs), None)
+            }
             _ => (
                 failed(Code::Internal, "the farm could not run the action"),
                 None,

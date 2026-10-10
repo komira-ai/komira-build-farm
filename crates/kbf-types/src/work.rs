@@ -144,6 +144,16 @@ pub enum Failure {
     /// is also an input): the client's error, answered INVALID_ARGUMENT. Running it
     /// elsewhere would fail the same way, so it is never retried and never cached.
     Invalid,
+    /// The lease was killed because the action passed its own memory limit. Reported
+    /// by a worker, the scheduler requeues it with its memory booking doubled, up to
+    /// the largest node that fits it. An operation that finishes with it was killed
+    /// at that largest node: the action needs more memory than any node offers.
+    OutOfMemory,
+    /// The node killed the lease for memory while the action was under its own limit
+    /// (a node-wide out-of-memory kill, or the node's backstop): the busy node's
+    /// fault, not the action's. The scheduler requeues it with the same booking while
+    /// its farm reruns last; an operation that finishes with it has used them up.
+    NodeMemoryPressure,
 }
 
 /// How an attempt ended, as its worker reports it.
@@ -157,6 +167,30 @@ pub enum Outcome {
     },
     /// The attempt failed.
     Failed(Failure),
+}
+
+/// How a run was killed for memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryKill {
+    /// The action passed its own memory limit. `cap` is the memory of the largest node
+    /// that could run it when the kill was committed, in bytes.
+    OwnLimit {
+        /// The cap, in bytes.
+        cap: u64,
+    },
+    /// The node killed it under memory pressure, below its own limit.
+    NodePressure,
+}
+
+/// One run of an operation that was killed for memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRun {
+    /// The node it ran on.
+    pub worker: WorkerId,
+    /// Its memory booking, in bytes.
+    pub booked: u64,
+    /// How it was killed.
+    pub kill: MemoryKill,
 }
 
 /// A lease grant: `operation` runs on `worker` under `lease`.
@@ -234,6 +268,9 @@ pub struct Answer {
     pub waiters: Vec<WaiterId>,
     /// The result.
     pub outcome: Outcome,
+    /// The operation's runs that were killed for memory, oldest first: what callers of
+    /// an operation finished by a memory kill are told about.
+    pub memory_runs: Vec<MemoryRun>,
 }
 
 /// Why a queued operation is waiting, when no live worker can run it now. Its callers

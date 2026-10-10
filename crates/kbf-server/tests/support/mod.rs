@@ -757,6 +757,7 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         action_result: Some(result.clone()),
         // As a daemon that predates the field sends it: the server checks no action.
         action_digest: None,
+        memory_kill: 0,
     }
 }
 
@@ -771,6 +772,7 @@ pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
         }),
         action_result: None,
         action_digest: None,
+        memory_kill: 0,
     }
 }
 

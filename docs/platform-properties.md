@@ -134,6 +134,16 @@ action whose processes together hold more than 150% of its booked memory plus 51
 `ld` step that dies at 2 GiB needs a larger booking. The container driver sets the
 lease's soft memory limit (`memory.high`) and CPU weight from the booking.
 
+The booking is where an action starts, not always where it runs. When a daemon reports
+that the action passed its own memory limit, the server runs it again with the memory
+booking doubled (1, 2, 4 GiB, ...), up to the largest node that could run it, and
+remembers the raised booking for the action (its instance name and action digest), so
+the next run of the same action starts there; only a kill at the largest node reaches
+the client, as `FAILED_PRECONDITION` saying the action needs more memory than any node
+offers. A node that kills the action under its own memory pressure reruns it with the
+same booking. See [scheduler.md](design/scheduler.md#memory-kills). No driver reports
+which memory ran out yet, so today a memory kill still ends the action as before.
+
 ```starlark
 # Bazel: a link step that needs 4 cores and 12 GiB
 cc_binary(
