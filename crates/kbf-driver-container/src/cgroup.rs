@@ -175,7 +175,8 @@ impl SwapWatch {
         // A fall comes out of the lease's own share first: the rest is what is left.
         self.not_own = self.not_own.min(now.swap);
         self.last = now;
-        self.own() > self.threshold
+        // MUTANT (probe, never merged): the absolute-swap rule.
+        pressed && now.swap > self.threshold && self.own() > 0
     }
 
     /// What the lease holds in swap now that it pushed there itself, at its cap.
