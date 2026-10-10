@@ -1,15 +1,17 @@
 //! The lease cgroup, `<actions>/kbf-lease-<term>-<seq>` (RFC 10.6).
 //!
-//! The daemon owns a delegated `actions/` cgroup. For each lease the driver makes a child
-//! with the lease's soft limits and puts the container under it (`--cgroup-parent`). The
-//! lease cgroup outlives the container, so after the action ends its `memory.events`
-//! still says whether the kernel OOM killer ran inside it: Podman's own `OOMKilled` flag
-//! is not trusted (it reads false rootless; see the hosted-runner spike).
+//! The daemon owns an `actions/` cgroup in its delegated subtree (`crate::delegate`).
+//! For each lease the driver makes a child with the lease's soft limits and puts the
+//! container under it (`--cgroup-parent`). The lease cgroup outlives the container, so
+//! after the action ends its `memory.events` still says whether the kernel OOM killer
+//! ran inside it: Podman's own `OOMKilled` flag is not trusted (it reads false
+//! rootless; see the hosted-runner spike).
 //!
 //! Memory, per the simple policy (RFC 5.7): `memory.high` = reservation x 1.5 + 512 MiB,
 //! no `memory.max` per lease and no `memory.swap.max`, so swap stays allowed. The one hard
-//! limit is `memory.max` on `actions/`, which the daemon's unit sets. CPU is compressible:
-//! `cpu.weight` from the booked CPU, never `cpu.max`.
+//! limit is `memory.max` on `actions/`, which the daemon writes from
+//! `--actions-memory-max-gib` (or the operator sets). CPU is compressible: `cpu.weight`
+//! from the booked CPU, never `cpu.max`.
 
 use std::io;
 use std::path::{Path, PathBuf};

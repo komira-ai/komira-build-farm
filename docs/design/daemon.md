@@ -173,8 +173,16 @@ Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first
 picked by `--driver`:
 
 - **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
-  runtime for Linux farm nodes, below. The binary requires `--cgroup-parent`, `--scratch`
-  and `--cas`, and checks the daemon user's subordinate ids before it starts.
+  runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
+  checks the daemon user's subordinate ids before it starts. It then sets up the cgroup
+  its systemd unit delegates (`Delegate=yes`): it moves its processes into a
+  `supervisor/` leaf, makes `actions/` with cpu, memory and pids enabled, and writes
+  `actions/memory.max` from `--actions-memory-max-gib`. It refuses to start, naming the
+  fix, on cgroup v1, from the root cgroup, or when the unit does not delegate those
+  controllers or the cgroup is not writable. `--cgroup-parent` names an `actions/`
+  cgroup set up by someone else instead (checked, not changed). The node reports at most
+  what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
+  `memory.max` above the leases, `cpus` the nearest `cpuset.cpus.effective`.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
   processes on the node, for Macs.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for

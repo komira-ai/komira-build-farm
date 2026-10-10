@@ -231,22 +231,16 @@ fn each_driver_starts_and_stops_on_sigterm() {
     if cfg!(target_os = "linux") {
         // A full range of subordinate ids for this user, whatever the host's files say.
         let ids = id_files("container-ids", "65536");
-        let container = [
+        let (unit, cgroup_flags) = cgroup_tree(&tls("container-cgroup"), "cpu memory pids");
+        let mut container = vec![
             "--driver=container".to_owned(),
             "--cas=http://127.0.0.1:1".to_owned(),
             format!("--scratch={}", scratch.display()),
-            "--cgroup-parent=/kbf.slice/actions".to_owned(),
             format!("--id-files={}", ids.display()),
+            "--actions-memory-max-gib=1".to_owned(),
         ];
-        // A `podman` that lists no container and logs its arguments: the start-up
-        // sweep asks it for this node's leftovers before the daemon connects.
-        // A symlink, not a written script: exec'ing a file this process just wrote can
-        // fail with ETXTBSY while another test thread forks.
-        let bin = tls("container-bin");
-        let log = bin.join("podman.log");
-        let _ = std::fs::remove_file(bin.join("podman"));
-        let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/podman-stub.sh");
-        std::os::unix::fs::symlink(stub, bin.join("podman")).expect("link podman");
+        container.extend(cgroup_flags);
+        let (bin, log) = podman_stub("container-bin");
         let status = runs_until_sigterm_with_path("container", &container, Some(&bin));
         assert!(status.success(), "{status}");
         let asked = read(&log);
@@ -256,6 +250,175 @@ fn each_driver_starts_and_stops_on_sigterm() {
                 .any(|a| a == "--filter=label=kbf.owner=node-1"),
             "the sweep looks for this node's containers: {asked}"
         );
+        // The daemon set up its cgroup (crates/kbf-driver-container/src/delegate.rs).
+        assert_eq!(read(&unit.join("supervisor/cgroup.procs")), "1");
+        assert_eq!(
+            read(&unit.join("cgroup.subtree_control")),
+            "+cpu +memory +pids"
+        );
+        assert_eq!(read(&unit.join("actions/memory.max")), "1073741824");
+    }
+}
+
+/// A directory put first in `PATH` holding a `podman` that lists no container and
+/// logs its arguments to the returned file: the start-up sweep asks it for this
+/// node's leftovers before the daemon connects. A symlink, not a written script:
+/// exec'ing a file this process just wrote can fail with ETXTBSY while another test
+/// thread forks.
+fn podman_stub(name: &str) -> (PathBuf, PathBuf) {
+    let bin = tls(name);
+    let log = bin.join("podman.log");
+    let _ = std::fs::remove_file(bin.join("podman"));
+    let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/podman-stub.sh");
+    std::os::unix::fs::symlink(stub, bin.join("podman")).expect("link podman");
+    (bin, log)
+}
+
+/// A stand-in cgroup v2 mount in `dir`, of plain directories, for the container
+/// driver's setup: the root, and the daemon's unit `/kbf.slice/kbf-daemon.service`,
+/// which offers `offered`, holds process 1 and has CPU 0 in its cpuset. Returns the
+/// unit's directory and the flags that point the daemon at them (`--cgroup-root`,
+/// `--self-cgroup`), so no test touches the host's cgroups.
+fn cgroup_tree(dir: &Path, offered: &str) -> (PathBuf, Vec<String>) {
+    let root = dir.join("cgroup");
+    let unit = root.join("kbf.slice/kbf-daemon.service");
+    std::fs::create_dir_all(&unit).expect("mkdir");
+    let plant = |path: PathBuf, text: &str| std::fs::write(path, text).expect("plant");
+    plant(
+        root.join("cgroup.controllers"),
+        "cpuset cpu io memory pids\n",
+    );
+    plant(unit.join("cgroup.controllers"), &format!("{offered}\n"));
+    plant(unit.join("cgroup.procs"), "1\n");
+    plant(unit.join("cpuset.cpus.effective"), "0\n");
+    let own = dir.join("self-cgroup");
+    plant(own.clone(), "0::/kbf.slice/kbf-daemon.service\n");
+    let flags = vec![
+        format!("--cgroup-root={}", root.display()),
+        format!("--self-cgroup={}", own.display()),
+    ];
+    (unit, flags)
+}
+
+/// Catches a container node that reports the node's memory and every CPU while its
+/// leases may use less (`actions/memory.max`, the cpuset): the scheduler would book
+/// past the cap on a host that also runs storage. The `Hello` the front receives says
+/// what `actions/` allows: 1 GiB (every runner has more) and CPU 0 alone.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_reports_what_its_leases_may_use() {
+    let dir = tls("capacity");
+    let front = front::Front::start(&dir);
+    let ids = id_files("capacity-ids", "65536");
+    let (_, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
+    let (bin, _) = podman_stub("capacity-bin");
+    let log = dir.join("daemon.log");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(BIN)
+        .env("PATH", path)
+        .args([
+            format!("--server=https://127.0.0.1:{}", front.worker.port()),
+            "--tls-server-name=localhost".to_owned(),
+            format!("--ca-cert={}", dir.join("ca.pem").display()),
+            format!("--cert={}", dir.join("node.pem").display()),
+            format!("--key={}", dir.join("node.key").display()),
+            "--node-id=node-1".to_owned(),
+            "--driver=container".to_owned(),
+            format!("--cas=http://{}", front.cas),
+            format!("--scratch={}", dir.join("leases").display()),
+            format!("--id-files={}", ids.display()),
+            "--actions-memory-max-gib=1".to_owned(),
+        ])
+        .args(cgroup_flags)
+        .stderr(std::fs::File::create(&log).expect("log file"))
+        .spawn()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    let hello = session.next(PROMPT);
+    let status = stop(&mut child, libc::SIGTERM);
+    let log = read(&log);
+    let Some(kbf_proto::worker::daemon_message::Message::Hello(hello)) = hello else {
+        panic!("expected a Hello, got {hello:?}: {log}");
+    };
+    let value = |key: &str| -> Vec<&str> {
+        hello
+            .capabilities
+            .iter()
+            .filter(|c| c.key == key)
+            .map(|c| c.value.as_str())
+            .collect()
+    };
+    assert_eq!(value("mem_gib"), ["1"], "{log}");
+    assert_eq!(value("cpus"), ["1"], "{log}");
+    assert_eq!(value("drivers"), ["container"], "{log}");
+    assert!(status.success(), "{status}: {log}");
+}
+
+/// Catches a container node that starts on a host or under a unit where every lease
+/// would fail to make its cgroup, instead of exiting non-zero with the fix: cgroup v1,
+/// a unit that does not delegate `memory`, and a cgroup the daemon may not write.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let ids = id_files("undelegated-ids", "65536");
+    let refused = |name: &str, offered: &str, prepare: &dyn Fn(&Path, &Path)| {
+        let dir = tls(name);
+        let (unit, flags) = cgroup_tree(&dir, offered);
+        prepare(&dir, &unit);
+        let out = Command::new(BIN)
+            .args(base(&dir))
+            .args([
+                "--driver=container".to_owned(),
+                "--cas=http://127.0.0.1:1".to_owned(),
+                format!("--scratch={}", dir.join("leases").display()),
+                format!("--id-files={}", ids.display()),
+            ])
+            .args(flags)
+            .output()
+            .expect("spawn");
+        let stderr = String::from_utf8(out.stderr).expect("UTF-8");
+        assert_eq!(out.status.code(), Some(1), "{name}: {stderr}");
+        assert!(!unit.join("actions").exists(), "{name}: actions/ made");
+        stderr
+    };
+    let v1 = |dir: &Path, _: &Path| {
+        std::fs::write(dir.join("self-cgroup"), "4:memory:/kbf.slice\n").expect("write");
+    };
+    let stderr = refused("cgroup-v1", "cpu memory pids", &v1);
+    assert!(
+        stderr.contains("systemd.unified_cgroup_hierarchy=1"),
+        "{stderr}"
+    );
+
+    let stderr = refused("no-memory", "cpu pids", &|_, _| {});
+    assert!(
+        stderr.contains("does not offer memory") && stderr.contains("Delegate=yes"),
+        "{stderr}"
+    );
+
+    // As root, the mode bits do not refuse a write.
+    // SAFETY: geteuid(2) takes nothing and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        let read_only = |_: &Path, unit: &Path| {
+            std::fs::set_permissions(unit, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        };
+        let stderr = refused("read-only", "cpu memory pids", &read_only);
+        // Writable again, so the target directory can be cleaned.
+        let unit = tls("read-only").join("cgroup/kbf.slice/kbf-daemon.service");
+        std::fs::set_permissions(unit, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(stderr.contains("may not write its cgroup"), "{stderr}");
     }
 }
 
@@ -300,13 +463,9 @@ fn a_driver_missing_its_flags_refuses_to_start() {
             "--scratch is required",
         ),
         (
-            vec![
-                "--driver=container".into(),
-                "--cas=http://127.0.0.1:1".into(),
-                scratch.clone(),
-            ],
+            vec!["--driver=container".into(), scratch.clone()],
             if cfg!(target_os = "linux") {
-                "--cgroup-parent is required"
+                "--cas is required"
             } else {
                 "runs on Linux only"
             },

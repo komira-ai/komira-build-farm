@@ -32,7 +32,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use kbf_daemon::{
-    Args, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, NodeReport, Runtime,
+    Args, Capacity, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, NodeReport,
+    Runtime,
 };
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -58,9 +59,26 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
-    /// The daemon's delegated cgroup for actions, from the cgroup root (container).
+    /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
+    /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
+    /// (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes
+    /// `actions` beside it, with cpu, memory and pids enabled. Given, it must already
+    /// enable cpu, memory and pids for its children.
     #[arg(long)]
     cgroup_parent: Option<String>,
+    /// Written to the actions cgroup's `memory.max` at start (container): the most
+    /// memory all leases together may use, in GiB, so the rest stays for what else
+    /// runs on the node. The node reports the lowest `memory.max` above its leases, or
+    /// its memory when that is less, and the CPUs of their cpuset.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    actions_memory_max_gib: Option<u64>,
+    /// Where cgroup v2 is mounted (container). For tests of the cgroup setup only.
+    #[arg(long, hide = true, default_value = "/sys/fs/cgroup")]
+    cgroup_root: PathBuf,
+    /// The file naming the daemon's own cgroup (container). For tests of the cgroup
+    /// setup only.
+    #[arg(long, hide = true, default_value = "/proc/self/cgroup")]
+    self_cgroup: PathBuf,
     /// A lease's processes are killed past this percentage of its booked memory...
     #[arg(long, default_value_t = MemoryPolicy::DEFAULT.percent)]
     memory_limit_percent: u64,
@@ -139,7 +157,18 @@ fn start(cli: &Cli) -> Result<(), Error> {
 /// The daemon with `runtime`. Its node report is the detected entries and the labels;
 /// the native driver adds its own with `Daemon::with_driver_report`.
 fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
-    let report = NodeReport::detect(&[runtime.driver()])?.with_entries(cli.daemon.label_entries());
+    daemon_within(cli, runtime, Capacity::default())
+}
+
+/// [`daemon`], its report's `cpus` and `mem_gib` no more than `capacity`.
+fn daemon_within<R: Runtime>(
+    cli: &Cli,
+    runtime: Arc<R>,
+    capacity: Capacity,
+) -> Result<Daemon<R>, Error> {
+    let report = NodeReport::detect(&[runtime.driver()])?
+        .with_entries(cli.daemon.label_entries())
+        .within(capacity);
     Ok(Daemon::new(
         DaemonConfig::from_args(&cli.daemon),
         runtime,
@@ -251,29 +280,59 @@ mod container {
 
     use kbf_driver_container::{IdFiles, OutputLimits, PodmanConfig, PodmanRuntime};
 
-    use super::{Cli, Error, cas_client, daemon, scratch, serve};
+    use super::{Cli, Error, cas_client, daemon_within, scratch, serve};
 
     /// Builds the container driver, over the daemon's CAS client, and serves with it.
     pub(super) fn start(cli: &Cli, tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
-        let parent = cli
-            .cgroup_parent
-            .clone()
-            .ok_or("--cgroup-parent is required by the container driver")?;
+        // The checks that change nothing come first.
+        let scratch = scratch(cli)?;
+        let cas = cas_client(cli)?;
         // Every container's ids are this user's subordinate ids (`--userns=nomap`).
         let files = cli
             .id_files
             .as_deref()
             .map_or_else(IdFiles::system, IdFiles::in_dir);
         kbf_driver_container::check_daemon_user(&files)?;
-        let mut config = PodmanConfig::new(scratch(cli)?, parent, cli.daemon.node_id.clone());
+        let mount = &cli.cgroup_root;
+        let memory_max = cli
+            .actions_memory_max_gib
+            .map(|gib| gib.saturating_mul(1 << 30));
+        let parent = match &cli.cgroup_parent {
+            Some(parent) => {
+                kbf_driver_container::adopt(mount, parent, memory_max)?;
+                parent.clone()
+            }
+            None => {
+                let own = std::fs::read_to_string(&cli.self_cgroup)
+                    .map_err(|e| format!("read {}: {e}", cli.self_cgroup.display()))?;
+                let delegation = kbf_driver_container::delegate(mount, &own, memory_max)?;
+                tracing::info!(
+                    "cgroup {}: this daemon in {}/supervisor, leases under {}",
+                    delegation.root,
+                    delegation.root,
+                    delegation.actions
+                );
+                delegation.actions
+            }
+        };
+        let capacity = kbf_driver_container::capacity(mount, &parent)?;
+        tracing::info!(
+            "leases may use {} CPUs and {} of memory (cgroup {parent})",
+            capacity.cpus.map_or("all".to_owned(), |n| n.to_string()),
+            capacity
+                .memory_bytes
+                .map_or("all".to_owned(), |b| format!("{} GiB", b >> 30))
+        );
+        let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        config.cgroup_root = mount.clone();
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,
             max_entries: cli.outputs.max_entries,
             max_bytes: cli.outputs.max_bytes,
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
-        let runtime = PodmanRuntime::new(config, Arc::new(cas_client(cli)?))?;
-        serve(tokio, daemon(cli, Arc::new(runtime))?)
+        let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
+        serve(tokio, daemon_within(cli, Arc::new(runtime), capacity)?)
     }
 }
 

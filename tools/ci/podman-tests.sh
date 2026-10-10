@@ -10,8 +10,8 @@
 #   index (Podman's own `.Digest` is the digest of the first pull, here the index);
 # - the tests run inside a system unit with Delegate=yes, as the runner user: the
 #   user manager alone gets no io controller and a daemon must own its subtree. The
-#   unit moves itself into a leaf and enables cpu, memory and pids for `actions`
-#   (tools/ci/podman-tests-inner.sh).
+#   tests set the unit's cgroup up with kbf-daemon's own code (a `supervisor` leaf,
+#   then `actions` with cpu, memory and pids; tools/ci/podman-tests-inner.sh).
 #
 # The test binary is built before the unit starts, so the unit only runs it.
 set -euo pipefail
