@@ -113,7 +113,7 @@ pub(crate) struct Pressure {
 /// Whether [`SwapKill`] kills a lease whose previous sample counted `before_max` `max`
 /// events and whose sample now is `now`.
 pub(crate) fn presses_its_cap_into_swap(before_max: u64, now: Pressure, threshold: u64) -> bool {
-    now.max > before_max && now.swap > threshold
+    now.swap > threshold
 }
 
 /// Returns the sample at which the lease in `cgroup`, capped at `cap`, pressed its cap
