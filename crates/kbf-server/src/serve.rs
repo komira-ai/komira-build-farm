@@ -218,10 +218,7 @@ where
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
     let reapi_routes = kbf_front::routes_with_execution(cache, Arc::clone(&farm), closing);
-    let reapi_routes = match listeners.reapi_tokens {
-        Some(tokens) => crate::reapi_auth::authenticated(reapi_routes, tokens),
-        None => reapi_routes,
-    };
+    let reapi_routes = crate::reapi_auth::guard(reapi_routes, listeners.reapi_tokens);
 
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();

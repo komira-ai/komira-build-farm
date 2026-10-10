@@ -1,7 +1,7 @@
 //! Bearer-token authentication of REAPI calls, with the token file of
 //! [`crate::principal`]: a layer over every route of the REAPI listener.
 //!
-//! [`authenticated`] wraps the whole router, its fallback included, so every method of
+//! [`guard`] wraps the whole router, its fallback included, so every method of
 //! every service on it, and any path it does not serve, needs the header; a service
 //! added to the router later is covered without a change here. A call is served only
 //! when it carries exactly one `authorization` header whose value is `Bearer <token>`
@@ -44,9 +44,13 @@ pub const HOW_TO_SEND: &str = "every call to this server needs `authorization: B
 pub const FILE_UNUSABLE: &str = "the server's REAPI token file is unusable, so every call \
     is refused until an operator fixes it; the server's log says why";
 
-/// `routes` with every call checked against `tokens` (see the module docs).
+/// `routes` with every call checked against `tokens` (see the module docs), or
+/// `routes` as they are when there is no token file.
 #[must_use]
-pub fn authenticated(routes: Routes, tokens: Arc<TokenStore>) -> Routes {
+pub fn guard(routes: Routes, tokens: Option<Arc<TokenStore>>) -> Routes {
+    let Some(tokens) = tokens else {
+        return routes;
+    };
     let gate = Arc::new(Gate {
         tokens,
         logged: Mutex::new(None),
