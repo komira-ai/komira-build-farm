@@ -338,8 +338,8 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// writing it into a pipe nobody reads) and writes a 64 MiB file into its working
 /// directory, synced, so its pages are clean. The test reclaims from the lease
 /// (`memory.reclaim`, standing in for host pressure: no `max` event): the file's
-/// pages are dropped and nearly all the buffer goes to swap, past the 96 MiB floor
-/// this cell's watch is given. It then lowers the lease's `memory.max` to 16 MiB
+/// pages are dropped and most of the buffer goes to swap (about 200 MiB on both
+/// podman jobs), past the 128 MiB floor this cell's watch is given. It then lowers the lease's `memory.max` to 16 MiB
 /// above what it holds in RAM, so the action can reach its cap. The action reads the
 /// file, over and over (its page cache hits the cap: `max` grows, and reclaim drops
 /// the clean pages), then holds a new 24 MiB buffer for 2 s: at its cap, reclaim must
@@ -350,7 +350,8 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// What the lease can push into swap itself at its cap is bounded: what it held in
 /// RAM after the reclaim, its cap's 16 MiB headroom, the 24 MiB buffer and a little
 /// for `cat` and the shell; the test asserts that bound is below the floor before the
-/// action reaches its cap, so a kill is the rule's error, never the lease's. Clean
+/// action reaches its cap (what stays in RAM after the reclaim differs: 2 MB on
+/// podman-x86, 51 MB on podman-arm), so a kill is the rule's error, never the lease's. Clean
 /// file pages for the `max` events, not written ones: a lease at so tight a cap that
 /// writes is OOM-killed by the kernel (seen on both podman jobs) before its dirty
 /// pages are written back.
@@ -358,7 +359,7 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     require_swap();
-    const FLOOR: u64 = 96 * MIB;
+    const FLOOR: u64 = 128 * MIB;
     // The buffer the action holds at its cap, and the headroom it is given there.
     const PUSH: u64 = 24 * MIB;
     const HEADROOM: u64 = 16 * MIB;
