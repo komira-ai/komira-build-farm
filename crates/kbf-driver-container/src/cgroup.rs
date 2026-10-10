@@ -77,7 +77,6 @@ impl LeaseCgroup {
         std::fs::create_dir(&self.dir)?;
         self.write("cgroup.subtree_control", SUBTREE)?;
         // Before the container exists, so nothing in the lease ever runs without it.
-        self.write("memory.oom.group", "1")?;
         if let Some(max) = memory_max(resources.memory_bytes) {
             self.write("memory.max", &max.to_string())?;
         }
