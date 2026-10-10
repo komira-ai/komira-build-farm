@@ -481,6 +481,7 @@ fn compaction_is_refused_past_applied_and_a_leader_serves_from_its_base() {
     };
     assert_eq!((*prev, entries.len()), (base, 0));
     let reply = sent_to(&empty.receive(S1, probe.clone(), 0), S1);
+    let delayed = reply.clone();
     let _ = leader.receive(S4, reply, 0);
     assert_eq!(leader.behind_base(), vec![S4]);
 
@@ -492,6 +493,11 @@ fn compaction_is_refused_past_applied_and_a_leader_serves_from_its_base() {
     let effects = restored.receive(S1, next, 0);
     assert_eq!(applied(&effects), vec![LogIndex(4)]);
     assert_eq!(restored.entries(), leader.entries());
+
+    // The empty learner's rejection, delivered again late, does not report a peer
+    // the leader has since seen hold the base.
+    let _ = leader.receive(S4, delayed, 0);
+    assert_eq!(leader.behind_base(), Vec::<ServerId>::new());
 }
 
 /// Catches: a follower whose snapshot base is past a leader's `prev` and that rejects
@@ -511,6 +517,9 @@ fn a_follower_skips_the_entries_its_snapshot_holds() {
     );
     assert!(effects.contains(&Effect::PersistEntries(vec![cmd(3, 6)])));
     assert_eq!(applied(&effects), vec![LogIndex(6)]);
+    // Entries that do not follow `prev` are dropped unanswered, even below the base.
+    let malformed = append(3, cmd(2, 2).id, vec![cmd(2, 4)], 6);
+    assert_eq!(follower.receive(S1, malformed, 0), vec![]);
     let heartbeat = follower.receive(S1, append(3, cmd(2, 2).id, vec![], 6), 0);
     assert_eq!(
         outcome(&heartbeat, S1),
