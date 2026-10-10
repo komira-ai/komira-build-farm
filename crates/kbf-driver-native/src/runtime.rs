@@ -26,6 +26,7 @@ use crate::cas::CasStore;
 use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
+use crate::program::{Refused, Resolved, resolve};
 use crate::record::Exec;
 use crate::user_folders::UserFolders;
 use crate::xcode;
@@ -81,6 +82,9 @@ struct Prepared {
     work_dir: PathBuf,
     working_directory: String,
     program: PathBuf,
+    /// The action's own failure in place of a run: its program could only have been
+    /// in the input root and is not there, or not executable ([`crate::program`]).
+    refused: Option<Refused>,
     args: Vec<String>,
     /// The lease's own directories' variables ([`crate::home`]), set before `env`.
     lease_env: Vec<(&'static str, OsString)>,
@@ -307,14 +311,18 @@ impl<C: Cas> NativeRuntime<C> {
             .iter()
             .map(|v| (v.name.clone(), v.value.clone()))
             .collect();
-        let program = resolve(program, &work_dir, &env)
-            .map_err(|e| RuntimeError::Failed(format!("{program}: {e}")))?;
+        let (program, refused) = match resolve(program, &work_dir, &env) {
+            Ok(Resolved::Program(path)) => (path, None),
+            Ok(Resolved::Refused(refused)) => (PathBuf::from(program), Some(refused)),
+            Err(why) => return Err(RuntimeError::Failed(why)),
+        };
         Ok(Prepared {
             lease,
             root,
             work_dir,
             working_directory: command.working_directory.clone(),
             program,
+            refused,
             args: args.to_vec(),
             lease_env,
             env,
@@ -434,7 +442,10 @@ impl<C: Cas> NativeRuntime<C> {
         };
         clock.input_fetch_completed_timestamp = now();
         clock.execution_start_timestamp = now();
-        let exit_code = self.execute(work, dir, &prepared, stop, killer).await?;
+        let exit_code = match &prepared.refused {
+            Some(refused) => refuse(dir, refused).await?,
+            None => self.execute(work, dir, &prepared, stop, killer).await?,
+        };
         clock.execution_completed_timestamp = now();
 
         clock.output_upload_start_timestamp = now();
@@ -721,40 +732,18 @@ async fn spawn(
     }
 }
 
-/// Where `PATH` points when the Command sets none: what `execvp` searches then.
-const DEFAULT_PATH: &str = "/usr/bin:/bin";
-
-/// The program to run, REAPI v2.3's way: a path with a slash is relative to the
-/// working directory; a bare name is looked up in the Command's `PATH` (relative
-/// entries from the working directory too). Resolved here, not by `execvp`, so the
-/// sandbox wrapper is handed a path and a missing program fails the lease the same way
-/// with or without it.
-fn resolve(program: &str, work_dir: &Path, env: &[(String, String)]) -> std::io::Result<PathBuf> {
-    if program.contains('/') {
-        let path = work_dir.join(program);
-        return executable(&path).then_some(path).ok_or_else(not_found);
+/// Answers `refused` as the action's result without running anything: empty stdout,
+/// kbf's message as stderr.
+async fn refuse(dir: &Path, refused: &Refused) -> Result<i32, RuntimeError> {
+    tracing::info!(dir = %dir.display(), "{}", refused.message);
+    for (name, text) in [
+        ("stdout", String::new()),
+        ("stderr", format!("{}\n", refused.message)),
+    ] {
+        let path = dir.join(name);
+        tokio::fs::write(&path, text).await.map_err(failed(&path))?;
     }
-    let path = env
-        .iter()
-        .rev()
-        .find(|(name, _)| name == "PATH")
-        .map_or(DEFAULT_PATH, |(_, value)| value.as_str());
-    path.split(':')
-        .map(|dir| work_dir.join(dir).join(program))
-        .find(|candidate| executable(candidate))
-        .ok_or_else(not_found)
-}
-
-fn executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-fn not_found() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no such executable file (searched as REAPI v2.3 says)",
-    )
+    Ok(refused.exit_code)
 }
 
 /// The exit status, or 128 plus the signal number for a process a signal ended (the
@@ -1279,37 +1268,6 @@ mod tests {
             source: std::io::Error::other("disk"),
         };
         assert_eq!(shown(outputs_error(io)), "Failed(\"p: disk\")");
-    }
-
-    /// Catches a bare program name not looked up in the Command's PATH (or looked up in
-    /// the daemon's), a relative PATH entry not taken from the working directory, the
-    /// default PATH not used when the Command sets none, and a path that is not an
-    /// executable file accepted.
-    #[test]
-    fn programs_resolve_as_reapi_says() {
-        let wd = Path::new("/nonexistent/wd");
-        let env = |path: &str| vec![("PATH".to_owned(), path.to_owned())];
-        assert_eq!(
-            resolve("sh", wd, &env("/nonexistent:/bin")).expect("in PATH"),
-            Path::new("/bin/sh")
-        );
-        assert_eq!(
-            resolve("env", wd, &[]).expect("default PATH"),
-            Path::new("/usr/bin/env")
-        );
-        assert!(resolve("sh", wd, &env("/nonexistent")).is_err());
-        assert!(
-            resolve("sh", wd, &env("bin")).is_err(),
-            "relative to the working directory"
-        );
-        assert_eq!(
-            resolve("/bin/sh", wd, &[]).expect("absolute"),
-            Path::new("/bin/sh")
-        );
-        assert!(resolve("./tool", wd, &[]).is_err());
-        assert!(resolve("/", wd, &[]).is_err(), "a directory");
-        let err = resolve("/etc/hosts", wd, &[]).expect_err("not executable");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     /// Catches a spawn that gives up at once on a program still open for writing (a

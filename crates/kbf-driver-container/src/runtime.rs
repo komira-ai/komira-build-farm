@@ -7,9 +7,11 @@
 //!    `podman::create_args`), make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
-//! 4. **collect:** the exit code from Podman's record, an OOM kill and whose limit
-//!    caused it from the lease cgroup's `memory.events`; the overlay's directories
-//!    back to the daemon's user; outputs, stdout and stderr into the CAS;
+//! 4. **collect:** the exit code from Podman's record (a container crun could not
+//!    start because the program is not there or not executable is the action's exit
+//!    127 or 126, see `program`), an OOM kill and whose limit caused it from the lease
+//!    cgroup's `memory.events`; the overlay's directories back to the daemon's user;
+//!    outputs, stdout and stderr into the CAS;
 //! 5. **clean:** remove the container, the lease cgroup and the scratch directory;
 //! 6. **verify-clean:** neither directory may remain.
 //!
@@ -39,8 +41,9 @@ use crate::cgroup::{LeaseCgroup, memory_max};
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
-    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, LEASE_PREFIX, Podman,
+    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
 };
+use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -344,7 +347,8 @@ impl<C: Cas> PodmanRuntime<C> {
         tokio::select! {
             // `podman start`'s own status is not the action's: Podman's record, read
             // below, is. An error waiting for it is not trusted either way, since
-            // `exit_code` fails the lease unless that record says the container exited.
+            // `ended` fails the lease unless that record says the container exited, or crun
+            // reports it could not start the program (`program::not_run`).
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
@@ -357,22 +361,27 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         }
 
-        let exit_code = self.podman.exit_code(&lease.name).await;
+        let ended = self.podman.ended(&lease.name).await;
         // SIGKILL (137), or no exit recorded (the lease's OOM group also kills the
         // container's monitor, conmon, which lives in the lease cgroup): whether the
         // kernel's OOM killer did it, and for whose limit, is read from the lease
         // cgroup, not from Podman.
-        if exit_code.as_ref().map_or(true, |&code| code == 137) {
+        if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
             let cap = memory_max(work.resources.memory_bytes);
             match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
                 Ok(Some(kill)) => return Err(kill),
                 Ok(None) => {}
-                Err(e) if exit_code.is_ok() => return Err(failed(lease.cgroup.dir(), &e)),
-                // No exit code either: Podman's error is the one to report.
+                Err(e) if ended == Ok(Ended::Exited(137)) => {
+                    return Err(failed(lease.cgroup.dir(), &e));
+                }
+                // No exit code either: what Podman said is the one to report.
                 Err(_) => {}
             }
         }
-        let exit_code = exit_code.map_err(RuntimeError::Failed)?;
+        let exit_code = match ended.map_err(RuntimeError::Failed)? {
+            Ended::Exited(code) => code,
+            Ended::NotRun(state) => program::not_run(&spec, &stderr_path, &state).await?,
+        };
         // The container has exited: hand its files back to the daemon's user, so an
         // output the action left unreadable to others is still read, as its owner.
         self.podman
@@ -749,7 +758,7 @@ fn clean_task_failed(error: tokio::task::JoinError) -> String {
     format!("clean task: {error}")
 }
 
-fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
+pub(crate) fn failed(path: &Path, error: &std::io::Error) -> RuntimeError {
     RuntimeError::Failed(format!("{}: {error}", path.display()))
 }
 

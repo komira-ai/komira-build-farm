@@ -727,6 +727,16 @@ as a shell and podman would; a spec departure, section 5); an absolute path outs
 missing on this node while peers of the same platform have it, is environment drift,
 so Farm.
 
+**Done for program not found** (#275, both drivers). Container: the image is pinned by
+digest and the environment is the Command's alone, so when crun reports it cannot find
+or execute `argv[0]` the answer is the action's exit 127 or 126, kbf's message (the
+program and the Command's `PATH`, or that it sets none) then Podman's words on stderr.
+Only crun's own lookup report counts, not Podman's wrapping, which it also puts on mount
+and cgroup faults. Native: a relative path, or a bare name on a `PATH` of relative
+entries only, is the action's 127 or 126; an absolute path, an absolute `PATH` entry or
+the default `PATH` stays Farm, its message naming the `PATH` searched. Telling drift
+from a typo by asking peers is not built.
+
 ## 7. Labelling: where the class is recorded
 
 - **Client**: section 5's status, message and `ErrorInfo`; `ExecutedActionMetadata.worker`
