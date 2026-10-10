@@ -225,6 +225,7 @@ pub(crate) fn delegate_in(
 
     let supervisor = child(root, SUPERVISOR);
     make(fs, &supervisor)?;
+    enable(fs, root).map_err(io_err(fs, "MUTANT enable early", root, ""))?;
     let mut tries = 0;
     loop {
         for pid in read(fs, root, "cgroup.procs")?.split_whitespace() {
