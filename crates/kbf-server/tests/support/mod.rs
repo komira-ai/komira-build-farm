@@ -191,7 +191,8 @@ impl Cell {
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
-        Self::serve(Self::cold_cache(&store), store, None, wait, retention).await
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, None, wait, retention).await
     }
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
@@ -202,7 +203,8 @@ impl Cell {
             token: Some(api_token()),
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(Self::cold_cache(&store), store, Some(api), wait, retention).await
+        let cache = Self::cold_cache(&store).await;
+        Self::serve(cache, store, Some(api), wait, retention).await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -236,18 +238,19 @@ impl Cell {
             .await
             .expect("the old server stops in time")
             .expect("the old server stops cleanly");
-        let cache = Self::cold_cache(&store);
+        let cache = Self::cold_cache(&store).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         Self::serve(cache, store, api_config, wait, retention).await
     }
 
-    /// A new cache over `store`: an empty metadata log, and objects under
-    /// `start-<n>/`, where `n` is new to this test process.
-    fn cold_cache(store: &SharedStore) -> Arc<Cache<GateLog, SharedStore>> {
+    /// A new cache over `store`: an empty metadata log, a writer epoch it allocates,
+    /// and objects under `start-<n>/`, where `n` is new to this test process.
+    async fn cold_cache(store: &SharedStore) -> Arc<Cache<GateLog, SharedStore>> {
         static STARTS: AtomicU32 = AtomicU32::new(0);
         let n = STARTS.fetch_add(1, Ordering::Relaxed);
         let prefix = KeyPrefix::new(format!("start-{n}/")).expect("a key prefix");
-        Arc::new(Cache::new(GateLog::new(), store.clone(), prefix))
+        let cache = Cache::open(GateLog::new(), store.clone(), prefix).await;
+        Arc::new(cache.expect("open the cache"))
     }
 
     async fn serve(

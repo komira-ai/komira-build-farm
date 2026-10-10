@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use kbf_meta::{
-    ActionRecord, Applied, BlobWrite, Closure, Command, Location, MetaState, ObjectId, Retention,
-    Role, Touch,
+    ActionRecord, Applied, BlobWrite, Closure, Command, Epoch, Location, MetaState, ObjectId,
+    Retention, Role, StoreId, Touch, UnreachableReason,
 };
 use kbf_types::{Digest, DigestFunction, FarmTime};
 
@@ -18,10 +18,20 @@ pub fn digest(n: u8) -> Digest {
     Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n))
 }
 
-/// A record at offset `n * 100` in segment `segment`.
+/// The epoch [`meta`] allocates, which every test object is written under.
+pub const EPOCH: Epoch = Epoch::new(1);
+
+/// Object `seq` of [`EPOCH`].
+pub fn object(seq: u64) -> ObjectId {
+    ObjectId::new(EPOCH, seq)
+}
+
+/// A record at offset `n * 100` in segment `segment` (of [`EPOCH`], in the configured
+/// store).
 pub fn in_segment(segment: u64, n: u8) -> Location {
-    Location::Segment {
-        segment: ObjectId::new(segment),
+    Location {
+        store: StoreId::CONFIGURED,
+        object: object(segment),
         offset: u64::from(n) * 100,
     }
 }
@@ -31,9 +41,32 @@ pub fn at(d: Duration) -> FarmTime {
     FarmTime::from_millis(0).saturating_add(d)
 }
 
-/// A state with the RFC retention: 7 days, a 1-day touch quantum, 30-day actions.
+/// A state with the RFC retention (7 days, a 1-day touch quantum, 30-day actions) and
+/// [`EPOCH`] allocated.
 pub fn meta() -> MetaState {
-    MetaState::new(Retention::default())
+    let mut m = MetaState::new(Retention::default());
+    assert_eq!(m.execute(Command::AllocEpoch), Applied::Epoch(EPOCH));
+    m
+}
+
+/// Marks segment `segment` unreachable for `reason`.
+pub fn mark(meta: &mut MetaState, segment: u64, reason: UnreachableReason) {
+    let applied = meta.execute(Command::ObjectUnreachable {
+        object: object(segment),
+        reason,
+    });
+    assert_eq!(applied, Applied::Marked(Ok(())));
+}
+
+/// Marks segment `segment` missing, as a read that got a 404 does.
+pub fn mark_missing(meta: &mut MetaState, segment: u64) {
+    mark(meta, segment, UnreachableReason::Missing);
+}
+
+/// Marks segment `segment` reachable again.
+pub fn mark_reachable(meta: &mut MetaState, segment: u64) {
+    let applied = meta.execute(Command::ObjectReachable(object(segment)));
+    assert_eq!(applied, Applied::Marked(Ok(())));
 }
 
 pub fn tick(meta: &mut MetaState, d: Duration) {
@@ -42,7 +75,7 @@ pub fn tick(meta: &mut MetaState, d: Duration) {
 
 pub fn put(meta: &mut MetaState, digest: Digest, location: Location) -> BlobWrite {
     match meta.execute(Command::PutBlob { digest, location }) {
-        Applied::Blob(write) => write,
+        Applied::Blob(Ok(write)) => write,
         other => panic!("PutBlob applied as {other:?}"),
     }
 }

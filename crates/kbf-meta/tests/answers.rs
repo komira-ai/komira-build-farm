@@ -2,8 +2,8 @@
 
 mod common;
 
-use common::{DAY, digest, in_segment, meta, put, tick};
-use kbf_meta::{BlobAnswer, BlobWrite, Command, Location, ObjectId};
+use common::{DAY, digest, in_segment, mark_missing, mark_reachable, meta, put, tick};
+use kbf_meta::{BlobAnswer, BlobWrite};
 use kbf_types::Digest;
 
 /// Catches: NOT_FOUND for a blob the farm holds. When the object holding a blob is
@@ -17,11 +17,11 @@ fn held_but_unreachable_is_unavailable_never_absent() {
     put(&mut m, held, in_segment(7, 1));
     assert_eq!(m.blob(&held), BlobAnswer::Present(in_segment(7, 1)));
 
-    m.execute(Command::ObjectUnreachable(ObjectId::new(7)));
+    mark_missing(&mut m, 7);
     assert_eq!(m.blob(&held), BlobAnswer::Unavailable);
     assert_eq!(m.blob(&digest(2)), BlobAnswer::Absent);
 
-    m.execute(Command::ObjectReachable(ObjectId::new(7)));
+    mark_reachable(&mut m, 7);
     assert_eq!(m.blob(&held), BlobAnswer::Present(in_segment(7, 1)));
 }
 
@@ -45,7 +45,7 @@ fn find_missing_lists_every_digest_not_present() {
     let (present, absent, lost) = (digest(1), digest(2), digest(3));
     put(&mut m, present, in_segment(1, 0));
     put(&mut m, lost, in_segment(2, 0));
-    m.execute(Command::ObjectUnreachable(ObjectId::new(2)));
+    mark_missing(&mut m, 2);
     tick(&mut m, DAY * 2);
 
     let answer = m.find_missing(&[absent, present, lost, absent]);
@@ -62,7 +62,7 @@ fn reupload_heals_an_unreachable_entry_and_keeps_a_reachable_one() {
     let mut m = meta();
     let d = digest(4);
     put(&mut m, d, in_segment(1, 4));
-    let big = Location::Object(ObjectId::new(9));
+    let big = in_segment(9, 0);
     assert_eq!(
         put(&mut m, d, big),
         BlobWrite::Duplicate {
@@ -71,7 +71,7 @@ fn reupload_heals_an_unreachable_entry_and_keeps_a_reachable_one() {
     );
     assert_eq!(m.blob(&d), BlobAnswer::Present(in_segment(1, 4)));
 
-    m.execute(Command::ObjectUnreachable(ObjectId::new(1)));
+    mark_missing(&mut m, 1);
     assert_eq!(
         put(&mut m, d, big),
         BlobWrite::Healed {
