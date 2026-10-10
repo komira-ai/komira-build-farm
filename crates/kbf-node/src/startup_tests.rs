@@ -33,8 +33,9 @@ const PROMPT: Duration = Duration::from_secs(30);
 /// held for 20 s, so a daemon that waits for it takes 20 s at least.
 const HELLO_WITHIN: Duration = Duration::from_secs(2);
 
-/// A CA, a client certificate (`node.pem`, `node.key`) and a server certificate for
-/// `localhost`, the client's files written into `dir`; returns the server's TLS.
+/// A CA, a client certificate for node `mac-1` (`node.pem`, `node.key`: the server
+/// takes the node id from its one DNS name) and a server certificate for `localhost`,
+/// the client's files written into `dir`; returns the server's TLS.
 fn pki(dir: &Path) -> ServerTlsConfig {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -47,7 +48,7 @@ fn pki(dir: &Path) -> ServerTlsConfig {
             .expect("sign");
         (cert.pem(), key.serialize_pem())
     };
-    let (node, node_key) = leaf(Vec::new());
+    let (node, node_key) = leaf(vec!["mac-1".to_owned()]);
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     std::fs::write(dir.join("node.pem"), node).expect("write");
     std::fs::write(dir.join("node.key"), node_key).expect("write");
@@ -218,15 +219,18 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let (daemon, mut reports) = native_with(&cli, config, &xcrun).expect("the native daemon");
     let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(daemon.with_events(events).run(pending()));
+    let mut before = Vec::new();
     let welcomed = tokio::time::timeout(PROMPT, async {
         loop {
             let event = seen.recv().await.expect("the daemon runs");
             if matches!(event, Event::Welcomed { .. }) {
                 break;
             }
+            before.push(format!("{event:?}"));
         }
     });
-    welcomed.await.expect("the daemon is welcomed");
+    let welcomed = welcomed.await;
+    assert!(welcomed.is_ok(), "not welcomed: {before:#?}");
     let hello = started.elapsed();
     eprintln!("startup_tests: welcomed {hello:.2?} after the start, the survey held");
     assert!(hello < HELLO_WITHIN, "Hello waited: {hello:?}");
