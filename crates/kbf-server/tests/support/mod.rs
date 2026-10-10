@@ -263,6 +263,7 @@ impl Cell {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
+            reapi_tls: None,
             worker_tls: None,
             heartbeat_interval: INTERVAL,
             hello_wait: HELLO_WAIT,

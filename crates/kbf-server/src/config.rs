@@ -52,9 +52,22 @@ pub struct Args {
     /// Where blob bytes are stored.
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
-    /// The REAPI listener.
+    /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
+    /// plain text, which is meant for a loopback bind behind a front on the same host.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
+    /// PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves
+    /// TLS with this server certificate only; clients present no certificate. It is meant
+    /// for a certificate from the farm's own internal CA, trusted by the front's proxy
+    /// (its hop to this server) and by clients that dial this server directly; TLS for
+    /// the farm's client-facing name still ends at the front. `--reapi-auth-policy`
+    /// applies over TLS as over plain text.
+    #[arg(long, requires = "reapi_tls_key")]
+    pub reapi_tls_cert: Option<PathBuf>,
+    /// PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the
+    /// server refuses to start.
+    #[arg(long, requires = "reapi_tls_cert")]
+    pub reapi_tls_key: Option<PathBuf>,
     /// A JSON file with the REAPI listener's authentication policy and authorizers
     /// (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy
     /// stops the server. Without it every REAPI call is accepted and allowed. The
@@ -208,8 +221,15 @@ impl Args {
             }),
             _ => None,
         };
+        let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
+            (Some(cert), Some(key)) => {
+                Some(ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)))
+            }
+            _ => None,
+        };
         Ok(Listeners {
             reapi: self.listen,
+            reapi_tls,
             worker: self.worker_listen,
             worker_tls,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),

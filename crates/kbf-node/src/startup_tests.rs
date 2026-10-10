@@ -151,6 +151,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let listeners = Listeners {
         reapi: loopback,
         worker: loopback,
+        reapi_tls: None,
         worker_tls: Some(WorkerTls {
             server: pki(&dir),
             deny_list: None,

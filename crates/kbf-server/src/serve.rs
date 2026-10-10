@@ -30,6 +30,9 @@ use crate::worker::WorkerService;
 pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
+    /// TLS for the REAPI listener (a server certificate; clients present none). `None`
+    /// serves it in plain text, which is meant for a loopback bind.
+    pub reapi_tls: Option<ServerTlsConfig>,
     /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
     /// for their blobs ([`crate::blobs`]).
     pub worker: SocketAddr,
@@ -156,7 +159,8 @@ const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, dr
 /// completes, or a listener fails.
 ///
 /// # Errors
-/// A listener cannot be bound, or the worker TLS configuration is refused.
+/// A listener cannot be bound, or a TLS configuration is refused (a key that does not
+/// match its certificate, say).
 pub fn bind_server<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -191,7 +195,8 @@ where
 /// worker listener is not drained: it stops when the future returns.
 ///
 /// # Errors
-/// A listener cannot be bound, or the worker TLS configuration is refused.
+/// A listener cannot be bound, or a TLS configuration is refused (a key that does not
+/// match its certificate, say).
 pub fn bind_server_with_api<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -212,7 +217,8 @@ where
 /// health check carries no credentials.
 ///
 /// # Errors
-/// A listener cannot be bound, or the worker TLS configuration is refused.
+/// A listener cannot be bound, or a TLS configuration is refused (a key that does not
+/// match its certificate, say).
 pub fn bind_server_with_policy<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
@@ -243,6 +249,10 @@ where
     let term = farm.term();
     tracing::warn!(term, "{STATE_IN_MEMORY}");
 
+    let mut reapi_server = Server::builder();
+    if let Some(tls) = listeners.reapi_tls {
+        reapi_server = reapi_server.tls_config(tls)?;
+    }
     let mut worker_server = Server::builder();
     let peers = match listeners.worker_tls {
         Some(tls) => {
@@ -287,7 +297,10 @@ where
     let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
-        let reapi_serve = Server::builder()
+        // `reapi_server` carries the REAPI TLS configuration when one is given, so
+        // the health service is served over the same TLS as the REAPI routes; the
+        // authenticator is already applied to those routes alone (above).
+        let reapi_serve = reapi_server
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;

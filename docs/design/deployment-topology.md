@@ -33,7 +33,8 @@ bytes, and one of them, the leader, does everything else: every metadata write,
  |    ready to serve reads      |                           |
  |  everything else -> leader   |                           |
  +------------------------------+                           |
-          | plain gRPC                                      |
+          | gRPC; TLS with an internal-CA                   |
+          | certificate when on another host                |
           v                                                 v
  +------------------+   +------------------+   +------------------+
  | storage host A   |   | storage host B   |   | storage host C   |
@@ -140,9 +141,15 @@ it, so the farm must look like one endpoint.
 
   The second path's name is not chosen. A server stops being ready to serve reads
   when it falls behind or loses touch with the leader.
-- **`kbf-server` serves plain-text gRPC behind the front**, as the
-  [Security model](../../ARCHITECTURE.md#security-model) already describes. TLS is the
-  front's job.
+- **The proxy-to-server hop.** TLS for the farm's client-facing name is the front's
+  job. Each server's REAPI listener serves the proxy over TLS with a certificate from
+  the farm's internal CA (`--reapi-tls-cert`, `--reapi-tls-key`), which the proxy
+  trusts; a server whose proxy runs on the same host may serve it plain text on
+  loopback instead. The same internal-CA certificate lets a client that trusts that CA
+  dial a server directly. It is a server certificate only, so it encrypts the hop and
+  names the server but identifies no caller; the REAPI authentication policy
+  ([reapi-auth.md](../reapi-auth.md)) decides who may call, over TLS as over plain
+  text. See the [Security model](../../ARCHITECTURE.md#security-model).
 
 ### Daemons: straight to the servers, one stream to the leader
 
@@ -190,14 +197,15 @@ The record of nodes becomes durable state in the control log:
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower answers a daemon's session with a redirect naming the leader |
 | Daemon's servers | one or more `--server` URLs, each host resolved again every round (a DNS name may carry a record per server); the daemon tries every address in turn, moving on at once after a refused connection, a TLS failure or `UNAVAILABLE`, and waits a jittered, doubling time, at most `--reconnect-max-ms` (30 s), between failed rounds; it never stops trying ([daemon.md](daemon.md#reaching-a-server)). No redirect is followed: there is none to follow | a follower's redirect names the leader, and the daemon dials it |
 | Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)); it routes by nothing, as there is one server | a tailnet ingress and an HTTP/2 proxy that routes by gRPC method, after the probes below pass |
+| REAPI listener TLS | `--reapi-tls-cert` and `--reapi-tls-key` serve the REAPI listener over TLS with a server certificate only; without them it serves plain text. The `--reapi-auth-policy` layer runs on either | the proxy-to-server hop over TLS with an internal-CA certificate on every server whose proxy is on another host |
 | Node registry | in the server's memory: a node whose stream closed stays listed with `connected: false` until the server restarts, and gets no work once it has not been heard from for G; a restart forgets every node. `kbf-alert` exists, but nothing raises alerts yet | durable, as [above](#a-durable-node-registry) |
 | Daemons' blobs | the drivers read and write blobs with `ByteStream` on the mutual-TLS worker listener (`--cas`, `https://` only), each call checked against the node certificate and the deny list; daemons need no path through the front ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)) | the same, on the leader's worker listener |
 
 ## Probes before relying on the front
 
 The ingress and proxy pair is not proven. Each of these must pass through the real
-pair (ingress, then proxy, then a plain-text REAPI listener), as the `tailscale serve`
-probe did for its front:
+pair (ingress, then proxy, then a REAPI listener over TLS with an internal-CA
+certificate), as the `tailscale serve` probe did for its front:
 
 1. **A Buck2 remote-only build** gets through capabilities, uploads, Execute and
    results.
@@ -236,12 +244,13 @@ idle timeout bounds these streams the same way.
    when the server's leader flag is clear; nothing clears it yet. It must clear as
    soon as the server stops being the leader. Decided: the REAPI listener also
    serves `grpc.health.v1` (built: [api.md](../api.md#grpchealthv1-on-the-reapi-listener));
-   it gives `/readyz`'s answer, so it follows the leader flag too.
-5. **The proxy-to-server hop.** The [Security model](../../ARCHITECTURE.md#security-model)
-   has `kbf-server` serve plain-text REAPI on loopback or on a mesh interface whose
-   traffic is already encrypted, and plans a bind guard that allows only the front's
-   hop. When the proxy runs on another machine than the storage hosts, that hop must
-   travel over the mesh, or the guard and the model need another answer.
+   it gives `/readyz`'s answer, so it follows the leader flag too, and it is served
+   over the listener's TLS when `--reapi-tls-cert` and `--reapi-tls-key` are given.
+5. **The proxy-to-server hop. Decided:** it uses TLS with a certificate from the
+   farm's internal CA, which clients may also use to reach a server directly
+   ([above](#build-clients-one-name-routed-by-method)). The REAPI listener's TLS is
+   built; the planned bind guard refuses only a plain-text, unauthenticated bind that
+   other machines could reach, so it does not refuse this hop.
 6. **Snapshots off the host.** With a single voter, losing that host's disk loses the
    log. Whether snapshots are also copied to the object store, so a replacement host
    can rebuild, is not decided.
