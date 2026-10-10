@@ -410,6 +410,47 @@ fn a_later_submission_of_the_key_starts_at_the_remembered_ask() {
     );
 }
 
+/// Catches a floor kept by action digest alone rather than by instance and digest:
+/// the same action under another instance name would start at the first instance's
+/// raised ask instead of its own, and its floor would be shared.
+#[test]
+fn two_instances_with_the_same_action_keep_separate_floors() {
+    let mut f = Farm::new();
+    f.node("large", 16, linux());
+    f.submit(1, request(1, GIB));
+    let first = f.start();
+    let second = f.killed(&first, OOM);
+    assert_eq!(second.resources.memory_bytes, 2 * GIB);
+    f.finishes(&second, ok());
+    assert_eq!(f.s.memory_floor(&key(1)), Some(2 * GIB));
+
+    let mut other = request(1, GIB);
+    other.key.instance = "other".to_owned();
+    assert_eq!(other.key.action, key(1).action);
+    assert_eq!(
+        f.s.memory_floor(&other.key),
+        None,
+        "a floor from another instance"
+    );
+    f.submit(2, other.clone());
+    let elsewhere = f.start();
+    assert_ne!(elsewhere.operation, first.operation);
+    assert_eq!(
+        elsewhere.resources.memory_bytes, GIB,
+        "booked at another instance's floor"
+    );
+    let raised = f.killed(&elsewhere, OOM);
+    let raised = f.killed(&raised, OOM);
+    assert_eq!(raised.resources.memory_bytes, 4 * GIB);
+    f.finishes(&raised, ok());
+    assert_eq!(f.s.memory_floor(&other.key), Some(4 * GIB));
+    assert_eq!(
+        f.s.memory_floor(&key(1)),
+        Some(2 * GIB),
+        "raised by another instance"
+    );
+}
+
 /// Catches: a busy node's kill that raises the booking or the floor (the mutant: it
 /// is the node's fault, not the action's), one that is answered at once or rerun
 /// without end, a node whose pressure is not counted (or counted against another
