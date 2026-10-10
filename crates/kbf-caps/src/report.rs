@@ -61,6 +61,13 @@ impl NodeCaps {
     where
         I: IntoIterator<Item = (&'r str, &'r str)>,
     {
+        Self::from_each(&mut entries.into_iter())
+    }
+
+    /// [`Self::from_report`], compiled once rather than once per caller's iterator type.
+    fn from_each<'r>(
+        entries: &mut dyn Iterator<Item = (&'r str, &'r str)>,
+    ) -> Result<Self, ReportError> {
         let mut arch = None;
         let mut features = BTreeSet::new();
         let mut exact = BTreeMap::new();

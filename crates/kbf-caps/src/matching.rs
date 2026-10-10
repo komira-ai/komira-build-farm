@@ -252,6 +252,13 @@ impl Request {
     where
         I: IntoIterator<Item = (&'p str, &'p str)>,
     {
+        Self::parse_each(&mut properties.into_iter())
+    }
+
+    /// [`Self::parse`], compiled once rather than once per caller's iterator type.
+    fn parse_each<'p>(
+        properties: &mut dyn Iterator<Item = (&'p str, &'p str)>,
+    ) -> Result<Self, RequestError> {
         let mut req = Self::default();
         for (key, value) in properties {
             let bad = || RequestError::BadValue {
