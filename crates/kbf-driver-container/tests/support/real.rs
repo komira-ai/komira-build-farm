@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError, Work};
@@ -34,6 +34,26 @@ pub struct Cell {
 }
 
 static TERMS: AtomicU64 = AtomicU64::new(1);
+
+/// The cgroup v2 mount.
+pub const MOUNT: &str = "/sys/fs/cgroup";
+/// What the test setup writes to `actions/memory.max`: room for every test here, and
+/// below a hosted runner's memory, so the capacity test sees the cap and not MemTotal.
+pub const ACTIONS_MEMORY_MAX: u64 = 4 << 30;
+
+/// The unit's cgroup, set up by the code `kbf-daemon` runs, once per test process.
+/// Each test binary sets it up again: the second finds itself in `supervisor/`
+/// already, as a restarted daemon does.
+pub fn delegation() -> &'static kbf_driver_container::Delegation {
+    static DELEGATION: OnceLock<kbf_driver_container::Delegation> = OnceLock::new();
+    DELEGATION.get_or_init(|| {
+        let own = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+        kbf_driver_container::delegate(Path::new(MOUNT), &own, Some(ACTIONS_MEMORY_MAX))
+            .unwrap_or_else(|e| {
+                panic!("set up the delegated cgroup (run through tools/ci/podman-tests.sh): {e}")
+            })
+    })
+}
 
 /// Each cgroup under `dir` with the processes in it, for a failure message.
 pub fn describe(dir: &Path) -> String {
@@ -73,8 +93,8 @@ impl Cell {
     pub fn with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
         trace();
         let term = TERMS.fetch_add(1, Ordering::Relaxed);
-        let parent = format!("{}/{name}", var("KBF_TEST_CGROUP"));
-        let cgroup = Path::new("/sys/fs/cgroup").join(parent.trim_start_matches('/'));
+        let parent = format!("{}/{name}", delegation().actions);
+        let cgroup = Path::new(MOUNT).join(parent.trim_start_matches('/'));
         if exists(&cgroup) {
             std::fs::remove_dir(&cgroup).expect("remove a stale test cgroup");
         }

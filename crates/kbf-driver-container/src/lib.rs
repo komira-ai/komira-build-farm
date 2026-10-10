@@ -16,7 +16,9 @@
 //!   `containers.conf` says;
 //! - no id of the daemon's user (`--userns=nomap`: the container's ids are the user's
 //!   subordinate ids, which [`check_daemon_user`] requires at startup);
-//! - a lease cgroup under the daemon's delegated `actions/` cgroup, with
+//! - a lease cgroup under the daemon's `actions/` cgroup, which the daemon makes in
+//!   its delegated cgroup at start ([`delegate`]; [`adopt`] checks one given instead)
+//!   and whose limits ([`capacity`]) bound what the node reports, with
 //!   `memory.high` = reservation x 1.5 + 512 MiB, swap allowed, no per-lease hard cap,
 //!   `cpu.weight` from the booked CPU, and `memory.oom.group=1` on the container;
 //! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
@@ -41,6 +43,8 @@
 //! - [`tree`]: writing an input root (with `kbf_daemon::tree`) and reading outputs
 //!   back;
 //! - [`subids`]: the daemon user's subordinate id ranges, checked at startup;
+//! - [`delegate`](mod@delegate): the daemon's delegated cgroup subtree, set up at
+//!   startup, and what leases may use of the node;
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease),
@@ -49,6 +53,7 @@
 
 pub mod cas;
 mod cgroup;
+pub mod delegate;
 pub mod image;
 mod outputs;
 mod podman;
@@ -59,6 +64,7 @@ pub mod tree;
 
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
+pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};

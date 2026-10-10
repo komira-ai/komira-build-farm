@@ -54,6 +54,16 @@ pub enum DetectError {
     UnsupportedOs(&'static str),
 }
 
+/// What a driver lets its leases use of the node, where that is less than the node
+/// has. `None` is no limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capacity {
+    /// The CPUs leases may run on.
+    pub cpus: Option<u64>,
+    /// The memory all leases together may use, in bytes.
+    pub memory_bytes: Option<u64>,
+}
+
 /// A node report: sorted, de-duplicated `(key, value)` entries and their hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeReport {
@@ -96,6 +106,27 @@ impl NodeReport {
         let mine = self.capabilities.into_iter().map(|c| (c.key, c.value));
         let more = entries.into_iter().map(|(k, v)| (k.into(), v.into()));
         Self::new(mine.chain(more))
+    }
+
+    /// This report with its `cpus` and `mem_gib` lowered to `capacity`: each becomes the
+    /// smaller of what was detected and the limit, memory in whole GiB rounded down. A
+    /// driver whose leases run under a limit (the container driver's `actions/` cgroup)
+    /// reports what they may use, so the scheduler books no more than that.
+    #[must_use]
+    pub fn within(self, capacity: Capacity) -> Self {
+        let lower = |value: String, limit: Option<u64>| match (value.parse::<u64>(), limit) {
+            (Ok(detected), Some(limit)) => detected.min(limit).to_string(),
+            _ => value,
+        };
+        let entries = self.capabilities.into_iter().map(|c| {
+            let value = match c.key.as_str() {
+                "cpus" => lower(c.value, capacity.cpus),
+                "mem_gib" => lower(c.value, capacity.memory_bytes.map(|b| b >> 30)),
+                _ => c.value,
+            };
+            (c.key, value)
+        });
+        Self::new(entries)
     }
 
     /// The entries, sorted by key, then value.
@@ -535,6 +566,42 @@ mod tests {
             ]
         );
         assert_ne!(more.hash(), r.hash());
+    }
+
+    /// Catches a node that reports MemTotal and every CPU while its leases may use less
+    /// (the scheduler would overbook a host that also runs storage), a limit that raises
+    /// what was detected, and a cap read as GiB rounded up. The fixture has 2 CPUs and
+    /// 376 GiB.
+    #[test]
+    fn a_capacity_lowers_cpus_and_memory_to_what_leases_may_use() {
+        let r = linux_report(SKYLAKE, MEMINFO, SMAPS, 0, &["container"]).expect("report");
+        assert_eq!(
+            (values(&r, "cpus"), values(&r, "mem_gib")),
+            (vec!["2"], vec!["376"])
+        );
+        let capped = r.clone().within(Capacity {
+            cpus: Some(1),
+            memory_bytes: Some((200 << 30) + (1 << 29)),
+        });
+        assert_eq!(values(&capped, "cpus"), ["1"]);
+        assert_eq!(values(&capped, "mem_gib"), ["200"]);
+        assert_ne!(capped.hash(), r.hash());
+        // Every other entry is unchanged.
+        let others = |r: &NodeReport| -> Vec<(String, String)> {
+            r.capabilities()
+                .iter()
+                .filter(|c| c.key != "cpus" && c.key != "mem_gib")
+                .map(|c| (c.key.clone(), c.value.clone()))
+                .collect()
+        };
+        assert_eq!(others(&capped), others(&r));
+        // A limit above the node is the node.
+        let above = r.clone().within(Capacity {
+            cpus: Some(1000),
+            memory_bytes: Some(1 << 50),
+        });
+        assert_eq!(above, r);
+        assert_eq!(r.clone().within(Capacity::default()), r);
     }
 
     /// Catches: a report whose order or hash depends on the order entries were added,

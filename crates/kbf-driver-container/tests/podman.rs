@@ -2,8 +2,11 @@
 //!
 //! These need what a hosted runner has once `tools/ci/podman-tests.sh` has set it up
 //! (the T4 spike, `docs/spikes/hosted-runners.md`): rootless Podman, a system unit with
-//! `Delegate=yes` whose `actions` cgroup enables cpu, memory and pids, and a busybox
-//! image pulled by its index digest. So each test is `#[ignore]` with that reason, and
+//! `Delegate=yes` that the tests run in, and a busybox image pulled by its index
+//! digest. The first test to start sets the unit's cgroup up the way `kbf-daemon` does
+//! ([`kbf_driver_container::delegate`]: this process into `supervisor/`, `actions/`
+//! with cpu, memory and pids, and `actions/memory.max` = [`ACTIONS_MEMORY_MAX`]), and
+//! every test's cgroup is made under that `actions/`. So each test is `#[ignore]` with that reason, and
 //! the script runs them with `--include-ignored`. Run that way without the setup, a
 //! test fails (it never skips silently). The marker walk's own test needs only GNU
 //! find, which those runners have, and runs the same way. The variables the script
@@ -11,8 +14,7 @@
 //!
 //! - `KBF_TEST_IMAGE`: `docker://<repo>@sha256:<per-architecture manifest digest>`;
 //! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest (pulled by it,
-//!   so the store holds the index too);
-//! - `KBF_TEST_CGROUP`: the delegated cgroup, relative to `/sys/fs/cgroup`.
+//!   so the store holds the index too).
 
 mod support;
 
@@ -24,7 +26,7 @@ use std::time::Duration;
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_driver_container::PodmanRuntime;
 use kbf_types::{LeaseId, Resources};
-use support::real::{Cell, describe, podman, sh, var};
+use support::real::{ACTIONS_MEMORY_MAX, Cell, MOUNT, delegation, describe, podman, sh, var};
 use support::{Spec, blob, exists, store_action};
 
 /// Catches the action not seeing its inputs, environment, working directory or the
@@ -385,6 +387,52 @@ async fn tags_and_index_digests_are_refused() {
     );
     cell.assert_clean(1);
     cell.assert_clean(2);
+}
+
+/// Catches the daemon's cgroup setup failing on a real kernel, whose rules the unit
+/// tests' fake only imitates: enabling controllers before the move is EBUSY there, and
+/// `actions/` without `memory` fails every test's cgroup. Then the capacity `kbf-daemon`
+/// reports: `actions/memory.max` as written (below the runner's memory), and the CPUs
+/// this process may run on (its affinity is the unit's cpuset).
+#[test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+fn the_daemons_cgroup_setup_holds_on_the_kernel() {
+    let delegation = delegation();
+    let own = std::fs::read_to_string("/proc/self/cgroup").expect("read");
+    assert_eq!(own.trim(), format!("0::{}/supervisor", delegation.root));
+    let dir = |cgroup: &str| Path::new(MOUNT).join(cgroup.trim_start_matches('/'));
+    let read = |cgroup: &str, file: &str| {
+        std::fs::read_to_string(dir(cgroup).join(file))
+            .expect(file)
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(read(&delegation.root, "cgroup.procs"), "");
+    for cgroup in [&delegation.root, &delegation.actions] {
+        let enabled = read(cgroup, "cgroup.subtree_control");
+        for c in ["cpu", "memory", "pids"] {
+            assert!(enabled.split(' ').any(|e| e == c), "{cgroup}: {enabled}");
+        }
+    }
+    assert_eq!(
+        read(&delegation.actions, "memory.max"),
+        ACTIONS_MEMORY_MAX.to_string()
+    );
+    let mem_total_kib: u64 = std::fs::read_to_string("/proc/meminfo")
+        .expect("meminfo")
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.trim().strip_suffix("kB")?.trim().parse().ok())
+        .expect("MemTotal");
+    assert!(
+        mem_total_kib << 10 > ACTIONS_MEMORY_MAX,
+        "the premise: the cap is below the node"
+    );
+    let capacity =
+        kbf_driver_container::capacity(Path::new(MOUNT), &delegation.actions).expect("capacity");
+    assert_eq!(capacity.memory_bytes, Some(ACTIONS_MEMORY_MAX));
+    let allowed = rustix::thread::sched_getaffinity(None).expect("affinity");
+    assert_eq!(capacity.cpus, Some(u64::from(allowed.count())));
 }
 
 /// Catches the soft-limit policy not reaching the kernel: `memory.high` from the
