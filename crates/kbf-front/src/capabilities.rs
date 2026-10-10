@@ -32,13 +32,6 @@ impl CapabilitiesService {
         Self::new(false, Arc::new(Authorizers::allow_all()))
     }
 
-    /// Capabilities of a front that serves the cache and `Execution`, every call
-    /// allowed.
-    #[must_use]
-    pub fn with_execution() -> Self {
-        Self::new(true, Arc::new(Authorizers::allow_all()))
-    }
-
     /// Capabilities of a front that serves `Execution` too if `execution`, each call
     /// authorized by `authorizers`.
     #[must_use]

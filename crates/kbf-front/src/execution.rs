@@ -223,13 +223,7 @@ const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExe
 
 impl<M, O, D> ExecutionService<M, O, D> {
     /// The service over `cache` and `dispatch`, whose streams end when `closing` does,
-    /// every call allowed.
-    #[must_use]
-    pub fn new(cache: Arc<Cache<M, O>>, dispatch: Arc<D>, closing: Closing) -> Self {
-        Self::with_authorizers(cache, dispatch, closing, Arc::new(Authorizers::allow_all()))
-    }
-
-    /// [`Self::new`], each call authorized by `authorizers`.
+    /// each call authorized by `authorizers`.
     #[must_use]
     pub const fn with_authorizers(
         cache: Arc<Cache<M, O>>,

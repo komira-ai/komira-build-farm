@@ -22,12 +22,6 @@ pub struct ActionCacheService<M, O> {
 }
 
 impl<M, O> ActionCacheService<M, O> {
-    /// The service over `cache`, every lookup allowed.
-    #[must_use]
-    pub fn new(cache: Arc<Cache<M, O>>) -> Self {
-        Self::with_authorizers(cache, Arc::new(Authorizers::allow_all()))
-    }
-
     /// The service over `cache`, each lookup authorized by `authorizers`.
     #[must_use]
     pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {

@@ -78,6 +78,20 @@ async fn each_key_configures_its_own_authorizer() {
     }
 }
 
+/// Catches: an empty `contentAddressableStorage` or `actionCache` object that leaves
+/// a slot at anything but allow.
+#[tokio::test]
+async fn empty_store_objects_leave_every_slot_at_allow() {
+    let policy = parse(&json!({
+        "authenticationPolicy": {"allow": {}},
+        "contentAddressableStorage": {},
+        "actionCache": {},
+    }));
+    for key in SLOTS {
+        assert!(allowed(slot(&policy.authorizers, key), "x").await, "{key}");
+    }
+}
+
 /// Catches: prefixes not passed through, and an `allow` authorizer that refuses.
 #[tokio::test]
 async fn instance_name_prefixes_and_allow_parse() {
