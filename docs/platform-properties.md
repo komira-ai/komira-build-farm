@@ -132,8 +132,10 @@ The booking also sets the memory the action may use. The native driver (Macs) ki
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
 2 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
 `ld` step that dies at 2 GiB needs a larger booking. The container driver gives the
-lease the same limit as a hard cap (`memory.max`, swap allowed), and its CPU weight,
-from the booking.
+lease the same limit as a hard cap on its RAM (`memory.max`, swap allowed), and its
+CPU weight, from the booking; a lease that keeps pressing that cap while it holds more
+than 512 MiB or 25% of its booking in swap, whichever is more (the node's defaults),
+is killed as out of memory.
 
 ```starlark
 # Bazel: a link step that needs 4 cores and 12 GiB

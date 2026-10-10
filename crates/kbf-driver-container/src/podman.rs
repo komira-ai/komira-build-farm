@@ -442,11 +442,13 @@ pub(crate) mod tests {
         assert_eq!(args.last(), Some(&spec().image));
     }
 
-    /// Catches a hard per-lease memory cap or a missing OOM group: the policy is soft
-    /// limits on the lease cgroup, and one OOM kill ends the whole action. Also an
-    /// action left with the daemon's lowered `oom_score_adj`.
+    /// Catches a memory or CPU limit given to Podman (`--memory`, `--memory-swap`,
+    /// `--cpus`, `--cpu-quota`) or a missing OOM group: the lease's limits are the lease
+    /// cgroup's, which the driver writes itself (its `memory.max`, no swap limit, its
+    /// `cpu.weight`), and one OOM kill ends the whole action. Also an action left with
+    /// the daemon's lowered `oom_score_adj`.
     #[test]
-    fn no_hard_memory_cap_and_one_oom_group() {
+    fn no_podman_limits_and_one_oom_group() {
         let args = strings(&create_args(&spec()));
         assert!(args.contains(&"--cgroup-conf=memory.oom.group=1".to_owned()));
         assert!(args.contains(&"--oom-score-adj=0".to_owned()));

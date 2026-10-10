@@ -11,7 +11,10 @@
 //! 512 MiB (the native driver's limit), with `memory.oom.group=1` on the lease, so an
 //! OOM kill takes every process in the lease and none outside it. No `memory.high` and
 //! no `memory.swap.max`: swap stays allowed, so reclaim under host pressure moves a
-//! lease's pages to swap rather than killing it. The node's backstop is `memory.max`
+//! lease's pages to swap rather than killing it. At its own cap a lease is reclaimed
+//! into swap too, and the kernel kills it only once swap is full; so the driver
+//! watches each lease ([`SwapKill`]) and kills one that keeps pressing its own cap
+//! while it holds more than a threshold in swap. The node's backstop is `memory.max`
 //! on `actions/`, which the daemon writes from `--actions-memory-max-gib` (or the
 //! operator sets). CPU is compressible: `cpu.weight` from the booked CPU, never
 //! `cpu.max`.
@@ -50,6 +53,94 @@ pub fn memory_max(memory_bytes: u64) -> Option<u64> {
 #[must_use]
 pub fn cpu_weight(cpu_millis: u64) -> Option<u64> {
     (cpu_millis > 0).then(|| (cpu_millis / 10).clamp(1, 10_000))
+}
+
+/// When the driver kills a lease that keeps pushing into swap at its own cap.
+///
+/// Every `every`, the driver reads the lease cgroup's `memory.events` `max` (times
+/// usage reached the lease's `memory.max`) and `memory.swap.current`. It kills the
+/// lease (`cgroup.kill`, every process in it) when `max` grew since the previous
+/// sample and `memory.swap.current` is above [`SwapKill::threshold`]: the lease is at
+/// its own cap now, and what reclaim moved out of it no longer fits in RAM by a margin.
+/// The kill is reported as the lease's own out-of-memory kill. A lease swapped by host
+/// pressure while below its cap counts no `max` events, so it is never killed by this
+/// rule; nor is a lease that booked no memory (it has no cap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapKill {
+    /// The least swap a lease at its cap may hold before it is killed, in bytes.
+    pub floor_bytes: u64,
+    /// The swap a lease at its cap may hold, as a percentage of its booked memory, when
+    /// that is more than `floor_bytes`.
+    pub percent: u64,
+    /// How often each lease is sampled.
+    pub every: Duration,
+}
+
+impl SwapKill {
+    /// 512 MiB or 25 % of the booking, whichever is more, sampled every second. The
+    /// floor keeps a small action that brushes its cap (its cap already carries
+    /// 512 MiB of headroom above 1.5 x the booking) from being killed for a few cold
+    /// pages; the percentage scales it for large bookings, where 512 MiB of swap is a
+    /// small share of the working set. A second is short against a build step and long
+    /// against the cost of two file reads per lease.
+    pub const DEFAULT: Self = Self {
+        floor_bytes: 512 << 20,
+        percent: 25,
+        every: Duration::from_secs(1),
+    };
+
+    /// The swap above which a lease that booked `memory_bytes` and is at its cap is
+    /// killed: the larger of the floor and the percentage of the booking.
+    #[must_use]
+    pub fn threshold(&self, memory_bytes: u64) -> u64 {
+        let share = u64::try_from(u128::from(memory_bytes) * u128::from(self.percent) / 100)
+            .unwrap_or(u64::MAX);
+        share.max(self.floor_bytes)
+    }
+}
+
+/// One sample of a lease cgroup for [`SwapKill`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Pressure {
+    /// `memory.events` `max`.
+    pub max: u64,
+    /// `memory.current`: what the lease holds in RAM.
+    pub current: u64,
+    /// `memory.swap.current`: what the lease holds in swap.
+    pub swap: u64,
+}
+
+/// Whether [`SwapKill`] kills a lease whose previous sample counted `before_max` `max`
+/// events and whose sample now is `now`.
+pub(crate) fn presses_its_cap_into_swap(before_max: u64, now: Pressure, threshold: u64) -> bool {
+    now.max > before_max && now.swap > threshold
+}
+
+/// Returns the sample at which the lease in `cgroup`, capped at `cap`, pressed its cap
+/// into swap past `threshold` ([`SwapKill`]); sampled every `every`. Never returns for
+/// a lease with no cap. A sample that cannot be read is skipped: the kernel's own OOM
+/// kill at the cap still ends such a lease once swap is full.
+pub(crate) async fn presses_into_swap(
+    cgroup: &LeaseCgroup,
+    cap: Option<u64>,
+    threshold: u64,
+    every: Duration,
+) -> Pressure {
+    if cap.is_none() {
+        return std::future::pending().await;
+    }
+    // The lease cgroup is new, so its `max` events count from 0.
+    let mut before = 0;
+    loop {
+        tokio::time::sleep(every).await;
+        let Ok(now) = cgroup.pressure() else {
+            continue;
+        };
+        if presses_its_cap_into_swap(before, now, threshold) {
+            return now;
+        }
+        before = now.max;
+    }
 }
 
 /// One lease's cgroup.
@@ -107,6 +198,23 @@ impl LeaseCgroup {
         let events = std::fs::read_to_string(self.dir.join("memory.events"))
             .map_err(|e| io::Error::new(e.kind(), format!("read memory.events: {e}")))?;
         MemoryEvents::parse(&events)
+    }
+
+    /// The lease's `max` events, memory and swap now, for [`SwapKill`].
+    pub(crate) fn pressure(&self) -> io::Result<Pressure> {
+        Ok(Pressure {
+            max: self.events()?.max,
+            current: self.read_u64("memory.current")?,
+            swap: self.read_u64("memory.swap.current")?,
+        })
+    }
+
+    fn read_u64(&self, file: &str) -> io::Result<u64> {
+        let text = std::fs::read_to_string(self.dir.join(file))
+            .map_err(|e| io::Error::new(e.kind(), format!("read {file}: {e}")))?;
+        text.trim()
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("{file} {text:?}")))
     }
 
     /// The most memory the cgroup has held at once (`memory.peak`).
@@ -465,16 +573,58 @@ mod tests {
     }
 
     /// Catches a counter read from the wrong line (`oom` from `oom_kill` or
-    /// `oom_group_kill`, which share its prefix) and a missing count read as zero.
+    /// `oom_group_kill`, which share its prefix) and a missing count read as zero. The
+    /// second text puts `oom_kill` and `oom_group_kill` before `oom`, so a key matched as
+    /// a bare prefix finds `oom_kill`'s line first and fails to parse `oom`; the
+    /// kernel's own order (the first text) would hide that.
     #[test]
     fn memory_events_are_parsed_by_whole_key() {
         let text = "low 0\nhigh 9\nmax 4\noom 2\noom_kill 7\noom_group_kill 1\n";
+        assert_eq!(MemoryEvents::parse(text).expect("parsed"), events(4, 2, 7));
+        let text = "oom_group_kill 1\noom_kill 7\nmax 4\noom 2\n";
         assert_eq!(MemoryEvents::parse(text).expect("parsed"), events(4, 2, 7));
         let text = "oom_kill 7\noom_group_kill 1\nmax 4\n";
         let err = MemoryEvents::parse(text).expect_err("no oom line");
         assert!(err.to_string().contains("no oom count"), "{err}");
         let err = MemoryEvents::parse("max 1\noom 1\noom_kill many\n").expect_err("garbled");
         assert!(err.to_string().contains("no oom_kill count"), "{err}");
+    }
+
+    /// Catches a threshold that drops the floor (a small booking killed for a few cold
+    /// pages) or the share of the booking (a large one killed at 512 MiB of swap), and
+    /// a share that overflows for a huge booking.
+    #[test]
+    fn the_swap_threshold_is_the_floor_or_a_share_of_the_booking() {
+        let policy = SwapKill::DEFAULT;
+        assert_eq!(policy.threshold(0), 512 << 20);
+        assert_eq!(policy.threshold(1 << 30), 512 << 20);
+        assert_eq!(policy.threshold(2 << 30), 512 << 20);
+        assert_eq!(policy.threshold(8 << 30), 2 << 30);
+        assert_eq!(policy.threshold(u64::MAX), u64::MAX / 4);
+        let flat = SwapKill {
+            floor_bytes: 7,
+            percent: 0,
+            every: Duration::ZERO,
+        };
+        assert_eq!(flat.threshold(1 << 40), 7);
+    }
+
+    /// Catches the watch killing on swap alone (host pressure moves a lease below its
+    /// cap into swap: no new `max` events), on `max` events alone (a lease at its cap
+    /// that reclaim keeps in RAM), at the threshold rather than above it, and on `max`
+    /// events counted before the previous sample (a lease that touched its cap once,
+    /// then was swapped by host pressure).
+    #[test]
+    fn the_watch_kills_only_a_lease_pressing_its_cap_into_swap() {
+        let at = |max, swap| Pressure {
+            max,
+            current: 0,
+            swap,
+        };
+        assert!(presses_its_cap_into_swap(3, at(4, 101), 100));
+        assert!(!presses_its_cap_into_swap(3, at(3, 1 << 40), 100));
+        assert!(!presses_its_cap_into_swap(0, at(9, 0), 100));
+        assert!(!presses_its_cap_into_swap(3, at(4, 100), 100));
     }
 
     /// Catches CPU booked as a hard cap's units, or a weight outside the kernel's range.

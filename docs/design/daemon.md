@@ -313,29 +313,42 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   every process in the lease and none outside it. The lease cgroup sets no
   `memory.high` and no `memory.swap.max`: swap stays allowed, so reclaim under host
   pressure moves a lease's pages to swap instead of killing it. The same holds at the
-  cap: while swap is free, a lease at its cap is reclaimed into swap; the kernel kills
-  it there only when reclaim cannot free enough (swap full, or none). The node's
-  backstop is `memory.max` on `actions/`, set from `--actions-memory-max-gib` (or by
-  whoever runs the daemon's unit). Nothing is capped when no memory was booked.
+  cap: while swap is free, a lease at its cap is reclaimed into swap, and the kernel
+  kills it there only when reclaim cannot free enough (swap full, or none). So the
+  driver watches each lease (`SwapKill`): every `--lease-swap-poll-ms` (default 1000)
+  it reads the lease cgroup's `memory.events` `max` and `memory.swap.current`, and
+  kills the lease (`cgroup.kill`, every process in it) when `max` grew since the
+  previous sample, so the lease is pressing its own cap now, and it holds more in swap
+  than the larger of `--lease-swap-kill-mib` (default 512) and
+  `--lease-swap-kill-percent` (default 25) of its booking. The floor spares a small
+  action that brushes its cap for a few cold pages; the share scales the margin for
+  large bookings. A lease swapped by host pressure while below its cap counts no `max`
+  events and is never killed by this rule, nor is one that booked no memory (no cap).
+  The node's backstop is `memory.max` on `actions/`, set from
+  `--actions-memory-max-gib` (or by whoever runs the daemon's unit). Nothing is capped
+  when no memory was booked.
 - **CPU** is compressible: `cpu.weight` = booked millicores / 10, clamped to 1..10000
   (one core is the kernel's default weight of 100). The driver never sets `cpu.max`,
   because throttling distorts wall time.
-- **OOM detection** reads the lease cgroup's `memory.events`, which outlives the
-  container, when the action ends with SIGKILL (137) or Podman recorded no exit (the
-  lease's OOM group also kills conmon, which runs in the lease cgroup). Podman's own
-  OOM flag is not trusted (it reads false when rootless). The kernel counts an event
-  at the cgroup whose limit caused it and at that cgroup's ancestors, so the lease's
-  counters say whose limit it was:
-  - `oom_kill` with `oom` and `max` in the lease: the OOM killer ran for the lease's own
-    cap. The lease fails `RESOURCE_EXHAUSTED` with `MEMORY_KILL_OUT_OF_MEMORY`
-    (`RuntimeError::OutOfMemory`, with `memory.peak` and the cap): the action needs
-    more memory than it booked.
-  - `oom_kill` without `oom` in the lease: the OOM killer ran for a limit above it
-    (`actions/`'s backstop, or the host). The lease fails `UNAVAILABLE` with
-    `MEMORY_KILL_BUSY_NODE` (`RuntimeError::BusyNode`); its message says whether
-    `oom` in `actions/memory.events.local` grew during the lease. The booking was not
-    the cause.
-  - No `oom_kill`: an exit 137 is the action's own result.
+- **Memory kills** are reported in `Result.memory_kill`:
+  - The swap watch's kill: `RESOURCE_EXHAUSTED` with `MEMORY_KILL_OWN_LIMIT`
+    (`RuntimeError::OutOfMemory`, with what the lease held in RAM and swap and its
+    cap).
+  - A kernel OOM kill is read from the lease cgroup's `memory.events`, which outlives
+    the container, when the action ends with SIGKILL (137), when Podman recorded no
+    exit, or when Podman could not be asked: the counters do not depend on Podman's
+    record. Podman's own OOM flag is not trusted (it reads false when rootless). The
+    kernel counts an event at the cgroup whose limit caused it and at that cgroup's
+    ancestors, so the lease's counters say whose limit it was:
+    - `oom_kill` with `oom` and `max` in the lease: the OOM killer ran for the lease's
+      own cap (swap was full). `RESOURCE_EXHAUSTED` with `MEMORY_KILL_OWN_LIMIT`
+      (`RuntimeError::OutOfMemory`, with `memory.peak` and the cap).
+    - `oom_kill` without `oom` in the lease: the OOM killer ran for a limit above it
+      (`actions/`'s backstop, or the host). `UNAVAILABLE` with
+      `MEMORY_KILL_NODE_PRESSURE` (`RuntimeError::BusyNode`); its message says whether
+      `oom` in `actions/memory.events.local` grew during the lease. The booking was not
+      the cause.
+    - No `oom_kill`: an exit 137 is the action's own result.
 - **Removal** of a lease cgroup that is still busy (a process still exiting) writes
   `cgroup.kill` and retries.
 

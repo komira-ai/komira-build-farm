@@ -333,8 +333,8 @@ These need no guessing, only keeping the reason the daemon already writes:
   Farm. A clean that fails after a good run (`kbf-driver-native/src/runtime.rs:352`)
   keeps the good result and withdraws the node's scratch capability instead of
   discarding the work.
-- **Kernel OOM.** Read the lease cgroup's `oom_kill` count for every exit, not only
-  137 (section 6.1).
+- **Kernel OOM.** The container driver reads the lease cgroup's `memory.events` on
+  exit 137 and whenever Podman recorded no exit (section 6.1).
 - **Control faults**: fence (`ABORTED`), contact lost (`UNAVAILABLE`), lease kind not
   served, the named Xcode absent, outputs not stored (`farm.rs:539-542`). Farm.
 - **Request errors**: no arguments, image by tag, output path in the input root
@@ -415,14 +415,18 @@ booking (the client's `kbf-book-mem-gib`, the default, a learned size), no longe
 change the class.
 
 **What counts as an out-of-memory kill.** The native driver's memory watch killing the
-tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), or a kernel
-OOM kill counted in the lease cgroup's `oom_kill`, read on every exit code (4.3). A
-SIGKILL kbf did not send and cannot tie to memory (a macOS memory-pressure kill with no
-record of it) stays Ambiguous (1.1). The container driver caps each lease at the
-native driver's limit (`memory.max`, [daemon.md](daemon.md), "Cgroups and limits") and
-tells a kill at that cap (`MEMORY_KILL_OUT_OF_MEMORY`) from a kill by the node's
-`actions/` limit or the host (`MEMORY_KILL_BUSY_NODE`, which says nothing about the
-booking) by the lease cgroup's `memory.events`.
+tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), and, in the
+container driver, a lease killed at its own cap: by the driver's swap watch (the lease
+kept pressing its cap, `memory.max`, while it held more than a threshold in swap), or
+by the kernel's OOM killer for that cap (swap full), which the lease cgroup's
+`memory.events` shows with `oom_kill`, `oom` and `max`. The container driver reads
+those counters when the action ends with SIGKILL (137), when Podman recorded no exit,
+or when Podman could not be asked, and reports either kill as `MEMORY_KILL_OWN_LIMIT`;
+a kernel kill by the node's `actions/` limit or the host (`oom_kill` without `oom` in
+the lease) is `MEMORY_KILL_NODE_PRESSURE`, which says nothing about the booking
+([daemon.md](daemon.md), "Cgroups and limits"). A SIGKILL kbf did not send and cannot
+tie to memory (a macOS memory-pressure kill with no record of it) stays Ambiguous
+(1.1).
 
 **The ladder.** Decided: each out-of-memory rerun books more memory than the run before
 it, the raise is bounded, it stops at the largest node (the **cap**), and only a kill
