@@ -1,27 +1,31 @@
 //! The lease cgroup, `<actions>/kbf-lease-<term>-<seq>` (RFC 10.6).
 //!
 //! The daemon owns an `actions/` cgroup in its delegated subtree (`crate::delegate`).
-//! For each lease the driver makes a child with the lease's soft limits and puts the
+//! For each lease the driver makes a child with the lease's limits and puts the
 //! container under it (`--cgroup-parent`). The lease cgroup outlives the container, so
 //! after the action ends its `memory.events` still says whether the kernel OOM killer
-//! ran inside it: Podman's own `OOMKilled` flag is not trusted (it reads false
-//! rootless; see the hosted-runner spike).
+//! ran inside it, and whose limit made it run: Podman's own `OOMKilled` flag is not
+//! trusted (it reads false rootless; see the hosted-runner spike).
 //!
-//! Memory, per the simple policy (RFC 5.7): `memory.high` = reservation x 1.5 + 512 MiB,
-//! no `memory.max` per lease and no `memory.swap.max`, so swap stays allowed. The one hard
-//! limit is `memory.max` on `actions/`, which the daemon writes from
-//! `--actions-memory-max-gib` (or the operator sets). CPU is compressible: `cpu.weight`
-//! from the booked CPU, never `cpu.max`.
+//! Memory (the build-host policy): a hard cap per lease, `memory.max` = booking x 1.5 +
+//! 512 MiB (the native driver's limit), with `memory.oom.group=1` on the lease, so an
+//! OOM kill takes every process in the lease and none outside it. No `memory.high` and
+//! no `memory.swap.max`: swap stays allowed, so reclaim under host pressure moves a
+//! lease's pages to swap rather than killing it. The node's backstop is `memory.max`
+//! on `actions/`, which the daemon writes from `--actions-memory-max-gib` (or the
+//! operator sets). CPU is compressible: `cpu.weight` from the booked CPU, never
+//! `cpu.max`.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kbf_daemon::RuntimeError;
 use kbf_types::Resources;
 
 /// Controllers the lease hands to the container's cgroup.
 const SUBTREE: &str = "+cpu +memory +pids";
-/// 512 MiB, the soft limit's headroom above 1.5 x the reservation.
+/// 512 MiB, the cap's headroom above 1.5 x the booking.
 const HEADROOM: u64 = 512 << 20;
 /// How often, and how long apart, removal retries a lease cgroup that is still busy:
 /// a process still exiting, or Podman's exit hook (`podman container cleanup`, which
@@ -29,10 +33,11 @@ const HEADROOM: u64 = 512 << 20;
 const REMOVE_TRIES: u32 = 100;
 const REMOVE_PAUSE: Duration = Duration::from_millis(50);
 
-/// The soft memory limit for a lease that booked `memory_bytes`; `None` (no limit) when
-/// nothing was booked.
+/// The hard memory cap (`memory.max`) for a lease that booked `memory_bytes`: 150% of
+/// the booking plus 512 MiB, the native driver's limit. `None` (no cap) when nothing
+/// was booked, as there.
 #[must_use]
-pub fn memory_high(memory_bytes: u64) -> Option<u64> {
+pub fn memory_max(memory_bytes: u64) -> Option<u64> {
     (memory_bytes > 0).then(|| {
         memory_bytes
             .saturating_add(memory_bytes / 2)
@@ -71,8 +76,10 @@ impl LeaseCgroup {
     pub(crate) fn create(&self, resources: Resources) -> io::Result<()> {
         std::fs::create_dir(&self.dir)?;
         self.write("cgroup.subtree_control", SUBTREE)?;
-        if let Some(high) = memory_high(resources.memory_bytes) {
-            self.write("memory.high", &high.to_string())?;
+        // Before the container exists, so nothing in the lease ever runs without it.
+        self.write("memory.oom.group", "1")?;
+        if let Some(max) = memory_max(resources.memory_bytes) {
+            self.write("memory.max", &max.to_string())?;
         }
         if let Some(weight) = cpu_weight(resources.cpu_millis) {
             self.write("cpu.weight", &weight.to_string())?;
@@ -95,20 +102,73 @@ impl LeaseCgroup {
             .map_err(|e| io::Error::new(e.kind(), format!("write {file}: {e}")))
     }
 
-    /// How many processes the kernel OOM killer has killed in this cgroup and below.
-    pub(crate) fn oom_kills(&self) -> io::Result<u64> {
+    /// The counters of this cgroup's `memory.events` (this cgroup and below).
+    pub(crate) fn events(&self) -> io::Result<MemoryEvents> {
         let events = std::fs::read_to_string(self.dir.join("memory.events"))
             .map_err(|e| io::Error::new(e.kind(), format!("read memory.events: {e}")))?;
-        events
-            .lines()
-            .find_map(|line| line.strip_prefix("oom_kill "))
-            .and_then(|n| n.trim().parse().ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("memory.events has no oom_kill count: {events:?}"),
-                )
-            })
+        MemoryEvents::parse(&events)
+    }
+
+    /// The most memory the cgroup has held at once (`memory.peak`).
+    pub(crate) fn peak(&self) -> io::Result<u64> {
+        let peak = std::fs::read_to_string(self.dir.join("memory.peak"))?;
+        peak.trim().parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("memory.peak {peak:?}"))
+        })
+    }
+
+    /// How many times the OOM killer has run for the parent's (`actions/`) own limit:
+    /// `oom` in its `memory.events.local`, which counts no child's limit.
+    pub(crate) fn parent_ooms(&self) -> io::Result<u64> {
+        let parent = self.dir.parent().unwrap_or(&self.dir);
+        let events = std::fs::read_to_string(parent.join("memory.events.local"))?;
+        count(&events, "oom").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no oom count: {events:?}"),
+            )
+        })
+    }
+
+    /// What the daemon reports when the kernel's OOM killer ended this lease; `None`
+    /// when it killed nothing here. `cap` is the lease's `memory.max`, and
+    /// `backstop_before` the parent's [`LeaseCgroup::parent_ooms`] when the lease
+    /// started, for the busy-node message.
+    pub(crate) fn oom_outcome(
+        &self,
+        cap: Option<u64>,
+        backstop_before: Option<u64>,
+    ) -> io::Result<Option<RuntimeError>> {
+        let events = self.events()?;
+        Ok(match classify(events) {
+            None => None,
+            Some(OomKill::OwnCap) => {
+                let limit = cap.unwrap_or(0);
+                // The usage reached the cap, so the cap is the least it used.
+                let used = self.peak().unwrap_or(limit);
+                Some(RuntimeError::OutOfMemory { used, limit })
+            }
+            Some(OomKill::BusyNode) => {
+                let backstop = match (backstop_before, self.parent_ooms().ok()) {
+                    (Some(before), Some(now)) if now > before => format!(
+                        "the OOM killer ran {} time(s) for the actions/ cgroup's own limit \
+                         during the lease",
+                        now - before
+                    ),
+                    (Some(_), Some(_)) => "the OOM killer did not run for the actions/ \
+                                           cgroup's own limit during the lease: a limit \
+                                           above it, or the host, ran short"
+                        .to_owned(),
+                    _ => "the actions/ cgroup's memory.events.local could not be read".to_owned(),
+                };
+                Some(RuntimeError::BusyNode(format!(
+                    "the kernel OOM killer killed {} process(es) in the lease cgroup, \
+                     whose own limit did not run it (memory.events: oom {}, max {}); \
+                     {backstop}",
+                    events.oom_kill, events.oom, events.max
+                )))
+            }
+        })
     }
 
     /// Kills every process in the cgroup (`cgroup.kill`).
@@ -120,6 +180,73 @@ impl LeaseCgroup {
     /// emptying is retried for up to five seconds. Blocking: run it off the async threads.
     pub(crate) fn remove(&self) -> io::Result<()> {
         remove_tree(&self.dir)
+    }
+}
+
+/// The `memory.events` counters that say whether, and why, the kernel's OOM killer
+/// ended a lease. On cgroup v2 they count this cgroup and every cgroup below it; an
+/// event is counted at the cgroup whose limit caused it, and in that cgroup's
+/// ancestors, never in its children.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemoryEvents {
+    /// Times usage reached a `memory.max`: the lease's own cap (nothing below it has
+    /// one). Reclaim (swap) may have resolved them, so on its own this is no kill.
+    pub max: u64,
+    /// Times the OOM killer was invoked because a limit at or below this cgroup could
+    /// not be met: here, the lease's own cap.
+    pub oom: u64,
+    /// Processes in this cgroup or below that any OOM killer killed: the lease's own,
+    /// `actions/`'s, or the host's.
+    pub oom_kill: u64,
+}
+
+impl MemoryEvents {
+    fn parse(events: &str) -> io::Result<Self> {
+        let get = |key| {
+            count(events, key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("memory.events has no {key} count: {events:?}"),
+                )
+            })
+        };
+        Ok(Self {
+            max: get("max")?,
+            oom: get("oom")?,
+            oom_kill: get("oom_kill")?,
+        })
+    }
+}
+
+/// The value of `key` in a flat-keyed cgroup file (`<key> <n>` per line).
+fn count(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// How the kernel's OOM killer ended a lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OomKill {
+    /// The lease reached its own cap and the OOM killer ran for that cap (`oom` and
+    /// `max` counted in the lease): the action needs more memory than it booked.
+    OwnCap,
+    /// Processes of the lease were OOM-killed while the lease's own cap never made the
+    /// OOM killer run (no `oom` in the lease): `actions/`'s backstop or the host ran
+    /// short. The action's booking was not the cause.
+    BusyNode,
+}
+
+/// How the OOM killer ended the lease whose `memory.events` read `events`; `None` when
+/// it killed nothing there. The exit code plays no part: a busy node's kill and a kill
+/// at the lease's cap both end the action with SIGKILL (137).
+pub(crate) fn classify(events: MemoryEvents) -> Option<OomKill> {
+    if events.oom_kill == 0 {
+        None
+    } else if events.oom > 0 && events.max > 0 {
+        Some(OomKill::OwnCap)
+    } else {
+        Some(OomKill::BusyNode)
     }
 }
 
@@ -278,13 +405,73 @@ mod tests {
         assert!(!dir.join("sub").exists());
     }
 
-    /// Catches a soft limit that drifts from the RFC formula, and a zero booking read
-    /// as "512 MiB for everything".
+    /// Catches a cap that drifts from the native driver's limit (the "cap = booking"
+    /// mutant: no buffer above the booking), and a zero booking read as "512 MiB for
+    /// everything".
     #[test]
-    fn memory_high_is_one_and_a_half_times_plus_headroom() {
-        assert_eq!(memory_high(1 << 30), Some((3 << 29) + (512 << 20)));
-        assert_eq!(memory_high(0), None);
-        assert_eq!(memory_high(u64::MAX), Some(u64::MAX));
+    fn memory_max_is_one_and_a_half_times_plus_headroom() {
+        assert_eq!(memory_max(1 << 30), Some((3 << 29) + (512 << 20)));
+        assert_eq!(memory_max(0), None);
+        assert_eq!(memory_max(u64::MAX), Some(u64::MAX));
+    }
+
+    /// Catches a cgroup made without its hard cap or its OOM group, and a swap limit
+    /// or soft limit written (the policy leaves swap allowed and sets no
+    /// `memory.high`). A plain directory stands in for cgroupfs: `create` writes the
+    /// files it sets and no others.
+    #[test]
+    fn create_writes_the_cap_and_the_oom_group_and_no_swap_limit() {
+        let root = scratch("create");
+        let lease = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-1");
+        std::fs::create_dir(root.join("actions")).expect("mkdir");
+        lease
+            .create(Resources::new(2000, 1 << 30))
+            .expect("created");
+        let read = |f: &str| std::fs::read_to_string(lease.dir().join(f)).ok();
+        assert_eq!(
+            read("memory.max"),
+            Some(((3u64 << 29) + (512 << 20)).to_string())
+        );
+        assert_eq!(read("memory.oom.group").as_deref(), Some("1"));
+        assert_eq!(read("cpu.weight").as_deref(), Some("200"));
+        assert_eq!(read("memory.swap.max"), None);
+        assert_eq!(read("memory.high"), None);
+
+        let unbooked = LeaseCgroup::at(&root, "/actions", "kbf-lease-1-2");
+        unbooked.create(Resources::default()).expect("created");
+        let read = |f: &str| std::fs::read_to_string(unbooked.dir().join(f)).ok();
+        assert_eq!(read("memory.max"), None);
+        assert_eq!(read("memory.oom.group").as_deref(), Some("1"));
+    }
+
+    fn events(max: u64, oom: u64, oom_kill: u64) -> MemoryEvents {
+        MemoryEvents { max, oom, oom_kill }
+    }
+
+    /// Catches a kill classified by anything but the lease's own counters: a lease
+    /// that hit its own cap and was killed for it is `OwnCap`; one killed while its
+    /// own cap never made the OOM killer run is `BusyNode`, even after it touched the
+    /// cap once and reclaim resolved it (`max` without `oom`); no kill is `None`.
+    #[test]
+    fn a_kill_is_the_leases_only_when_its_own_cap_ran_the_oom_killer() {
+        assert_eq!(classify(events(3, 1, 2)), Some(OomKill::OwnCap));
+        assert_eq!(classify(events(0, 0, 1)), Some(OomKill::BusyNode));
+        assert_eq!(classify(events(5, 0, 1)), Some(OomKill::BusyNode));
+        assert_eq!(classify(events(5, 1, 0)), None);
+        assert_eq!(classify(events(0, 0, 0)), None);
+    }
+
+    /// Catches a counter read from the wrong line (`oom` from `oom_kill` or
+    /// `oom_group_kill`, which share its prefix) and a missing count read as zero.
+    #[test]
+    fn memory_events_are_parsed_by_whole_key() {
+        let text = "low 0\nhigh 9\nmax 4\noom 2\noom_kill 7\noom_group_kill 1\n";
+        assert_eq!(MemoryEvents::parse(text).expect("parsed"), events(4, 2, 7));
+        let text = "oom_kill 7\noom_group_kill 1\nmax 4\n";
+        let err = MemoryEvents::parse(text).expect_err("no oom line");
+        assert!(err.to_string().contains("no oom count"), "{err}");
+        let err = MemoryEvents::parse("max 1\noom 1\noom_kill many\n").expect_err("garbled");
+        assert!(err.to_string().contains("no oom_kill count"), "{err}");
     }
 
     /// Catches CPU booked as a hard cap's units, or a weight outside the kernel's range.

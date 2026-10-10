@@ -7,9 +7,9 @@
 //!    `podman::create_args`), make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
-//! 4. **collect:** the exit code from Podman's record, OOM from the lease cgroup's
-//!    `memory.events`; the overlay's directories back to the daemon's user; outputs,
-//!    stdout and stderr into the CAS;
+//! 4. **collect:** the exit code from Podman's record, an OOM kill and whose limit
+//!    caused it from the lease cgroup's `memory.events`; the overlay's directories
+//!    back to the daemon's user; outputs, stdout and stderr into the CAS;
 //! 5. **clean:** remove the container, the lease cgroup and the scratch directory;
 //! 6. **verify-clean:** neither directory may remain.
 //!
@@ -35,7 +35,7 @@ use kbf_types::LeaseId;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
-use crate::cgroup::LeaseCgroup;
+use crate::cgroup::{LeaseCgroup, memory_max};
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
@@ -270,6 +270,9 @@ impl<C: Cas> PodmanRuntime<C> {
             .chown(CONTAINER_OWNER, &[&root, &upper, &overlay_work])
             .await
             .map_err(RuntimeError::Failed)?;
+        // `actions/`'s own OOM count before the lease, to say afterwards whether its
+        // limit killed the lease.
+        lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
         lease
             .cgroup
             .create(work.resources)
@@ -354,24 +357,22 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         }
 
-        let exit_code = self
-            .podman
-            .exit_code(&lease.name)
-            .await
-            .map_err(RuntimeError::Failed)?;
-        // 137 is SIGKILL. Whether the kernel's OOM killer sent it is read from the
-        // lease cgroup, not from Podman.
-        if exit_code == 137 {
-            let kills = lease
-                .cgroup
-                .oom_kills()
-                .map_err(|e| failed(lease.cgroup.dir(), &e))?;
-            if kills > 0 {
-                return Err(RuntimeError::Failed(format!(
-                    "the kernel OOM killer ended the action (oom_kill {kills} in the lease cgroup)"
-                )));
+        let exit_code = self.podman.exit_code(&lease.name).await;
+        // SIGKILL (137), or no exit recorded (the lease's OOM group also kills the
+        // container's monitor, conmon, which lives in the lease cgroup): whether the
+        // kernel's OOM killer did it, and for whose limit, is read from the lease
+        // cgroup, not from Podman.
+        if exit_code.as_ref().map_or(true, |&code| code == 137) {
+            let cap = memory_max(work.resources.memory_bytes);
+            match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
+                Ok(Some(kill)) => return Err(kill),
+                Ok(None) => {}
+                Err(e) if exit_code.is_ok() => return Err(failed(lease.cgroup.dir(), &e)),
+                // No exit code either: Podman's error is the one to report.
+                Err(_) => {}
             }
         }
+        let exit_code = exit_code.map_err(RuntimeError::Failed)?;
         // The container has exited: hand its files back to the daemon's user, so an
         // output the action left unreadable to others is still read, as its owner.
         self.podman
@@ -570,6 +571,8 @@ struct Lease {
     /// The scratch directory.
     dir: PathBuf,
     cgroup: LeaseCgroup,
+    /// `actions/`'s own OOM count when the lease cgroup was made, if it could be read.
+    backstop_ooms: Option<u64>,
     /// Whether a container may exist.
     created: bool,
     /// `podman start --attach`, once started. Reaped before anything is removed.
@@ -593,6 +596,7 @@ impl Lease {
             podman: podman.clone(),
             dir: config.scratch.join(&name),
             cgroup: LeaseCgroup::at(&config.cgroup_root, &config.cgroup_parent, &name),
+            backstop_ooms: None,
             name,
             created: false,
             start: None,

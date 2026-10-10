@@ -44,10 +44,17 @@ pub enum RuntimeError {
     #[error("timed out")]
     TimedOut,
     /// The action's processes together used more memory than the lease allows, and
-    /// the runtime killed them. Reported as RESOURCE_EXHAUSTED: the farm's to retry
-    /// with more memory, not the client's to fix.
+    /// the runtime killed them. Reported as RESOURCE_EXHAUSTED with
+    /// `MEMORY_KILL_OUT_OF_MEMORY`: the farm's to retry with more memory, not the
+    /// client's to fix.
     #[error("out of memory: the action used {used} bytes, past the lease's limit of {limit}")]
     OutOfMemory { used: u64, limit: u64 },
+    /// The kernel's OOM killer ended the action although it stayed within its lease's
+    /// limit: the node ran short of memory (its cap on all actions, or the host). The
+    /// string says which counters showed it. Reported as UNAVAILABLE with
+    /// `MEMORY_KILL_BUSY_NODE`: the farm's to run again with the same booking.
+    #[error("killed on a busy node: {0}")]
+    BusyNode(String),
 }
 
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it

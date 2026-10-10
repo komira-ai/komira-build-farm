@@ -131,8 +131,9 @@ for the lease until the lease ends, as it does for the default booking.
 The booking also sets the memory the action may use. The native driver (Macs) kills an
 action whose processes together hold more than 150% of its booked memory plus 512 MiB:
 2 GiB for the default booking, 12.5 GiB for `kbf-book-mem-gib=8`. A large `swiftc` or
-`ld` step that dies at 2 GiB needs a larger booking. The container driver sets the
-lease's soft memory limit (`memory.high`) and CPU weight from the booking.
+`ld` step that dies at 2 GiB needs a larger booking. The container driver gives the
+lease the same limit as a hard cap (`memory.max`, swap allowed), and its CPU weight,
+from the booking.
 
 ```starlark
 # Bazel: a link step that needs 4 cores and 12 GiB

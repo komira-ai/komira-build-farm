@@ -19,7 +19,7 @@ use std::sync::Arc;
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::{self, Start};
+use kbf_proto::worker::{self, MemoryKill, Start};
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
@@ -165,6 +165,7 @@ pub(crate) fn result_of(
             action_result: Some(action_result),
             // The daemon fills in the action its Start named.
             action_digest: None,
+            memory_kill: MemoryKill::Unspecified as i32,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -175,9 +176,14 @@ pub(crate) fn result_of(
             Code::DeadlineExceeded,
             "the action ran past its timeout",
         ),
-        Err(oom @ RuntimeError::OutOfMemory { .. }) => {
-            failure(id, Code::ResourceExhausted, oom.to_string())
-        }
+        Err(oom @ RuntimeError::OutOfMemory { .. }) => worker::Result {
+            memory_kill: MemoryKill::OutOfMemory as i32,
+            ..failure(id, Code::ResourceExhausted, oom.to_string())
+        },
+        Err(busy @ RuntimeError::BusyNode(_)) => worker::Result {
+            memory_kill: MemoryKill::BusyNode as i32,
+            ..failure(id, Code::Unavailable, busy.to_string())
+        },
     }
 }
 
@@ -203,6 +209,7 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         }),
         action_result: None,
         action_digest: None,
+        memory_kill: MemoryKill::Unspecified as i32,
     }
 }
 
@@ -217,6 +224,7 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         }),
         action_result: None,
         action_digest: None,
+        memory_kill: MemoryKill::Unspecified as i32,
     }
 }
 
@@ -420,8 +428,10 @@ mod tests {
     /// still runs (no fence took it; the runtime stopped it) as anything but ABORTED,
     /// the farm's failure as the client's, or the reverse (a client error reported as
     /// INTERNAL would be retried as an infrastructure failure), and a timeout reported
-    /// as OK, which would be cached. Every arm in one test, so each code is checked
-    /// against the others.
+    /// as OK, which would be cached; and the two memory kills not told apart (a busy
+    /// node's kill read as the action's own would grow its booking for nothing), or
+    /// any other outcome marked as a memory kill. Every arm in one test, so each code
+    /// is checked against the others.
     #[test]
     fn each_outcome_has_its_status() {
         let id = LeaseId::new(3, 4);
@@ -434,6 +444,7 @@ mod tests {
         );
         assert_eq!(ok.lease_id, Some(proto_lease_id(id)));
         assert_eq!(ok.status, Some(Status::default()));
+        assert_eq!(ok.memory_kill(), MemoryKill::Unspecified);
         assert_eq!(ok.action_result.map(|r| r.exit_code), Some(2));
         let codes = [
             (RuntimeError::Killed, Code::Aborted),
@@ -454,14 +465,26 @@ mod tests {
                 },
                 Code::ResourceExhausted,
             ),
+            (
+                RuntimeError::BusyNode("actions/ ran short".to_owned()),
+                Code::Unavailable,
+            ),
         ];
         for (error, code) in codes {
             let why = error.to_string();
+            // Only the two memory kills say so, each with its own kind.
+            let kill = match error {
+                RuntimeError::OutOfMemory { .. } => MemoryKill::OutOfMemory,
+                RuntimeError::BusyNode(_) => MemoryKill::BusyNode,
+                _ => MemoryKill::Unspecified,
+            };
             let result = result_of(id, Err(error));
             assert_eq!(result.lease_id, Some(proto_lease_id(id)), "{why}");
             assert!(result.action_result.is_none(), "{why}");
+            assert_eq!(result.memory_kill(), kill, "{why}");
             assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
         }
+
         // The OOM status says how much was used and what the limit was.
         let oom = RuntimeError::OutOfMemory { used: 7, limit: 5 };
         let message = result_of(id, Err(oom)).status.map(|s| s.message);

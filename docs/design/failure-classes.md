@@ -418,10 +418,11 @@ change the class.
 tree past the lease's limit (`kbf-driver-native/src/runtime.rs:247-249`), or a kernel
 OOM kill counted in the lease cgroup's `oom_kill`, read on every exit code (4.3). A
 SIGKILL kbf did not send and cannot tie to memory (a macOS memory-pressure kill with no
-record of it) stays Ambiguous (1.1). The container driver sets no per-lease
-`memory.max` ([daemon.md](daemon.md), "Cgroups and limits"), so its kills come from the
-node's `actions/` limit or the kernel; a larger booking still helps, because placement
-then keeps that much more room free on the node.
+record of it) stays Ambiguous (1.1). The container driver caps each lease at the
+native driver's limit (`memory.max`, [daemon.md](daemon.md), "Cgroups and limits") and
+tells a kill at that cap (`MEMORY_KILL_OUT_OF_MEMORY`) from a kill by the node's
+`actions/` limit or the host (`MEMORY_KILL_BUSY_NODE`, which says nothing about the
+booking) by the lease cgroup's `memory.events`.
 
 **The ladder.** Decided: each out-of-memory rerun books more memory than the run before
 it, the raise is bounded, it stops at the largest node (the **cap**), and only a kill

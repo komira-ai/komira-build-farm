@@ -221,8 +221,9 @@ never reused. Each lease goes through six steps.
    written to files in the scratch directory.
 3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`.
 4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
-   (SIGKILL) and the lease cgroup's `memory.events` counts an `oom_kill`, the lease
-   fails as an infrastructure failure. Otherwise give the overlay's directories back
+   (SIGKILL), or there is none, and the lease cgroup's `memory.events` counts an
+   `oom_kill`, the lease fails as out of memory or as killed on a busy node (see
+   Cgroups and limits). Otherwise give the overlay's directories back
    to the daemon's user, read the outputs (below) and store stdout and stderr in the
    CAS.
 5. **Clean.** Remove the container, the lease cgroup and the scratch directory.
@@ -303,17 +304,35 @@ The daemon owns a delegated cgroup v2 subtree, `actions/`, whose
 `cgroup.subtree_control` enables `cpu`, `memory` and `pids`. For each lease the driver
 makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 
-- **Memory** follows a soft-limit policy. `memory.high` = booked memory x 1.5 + 512 MiB,
-  so an action that needs a little more than booked slows down rather than dies. There
-  is no per-lease `memory.max` and no `memory.swap.max`, so swap stays allowed. The one
-  hard limit is `memory.max` on `actions/`, set by whoever runs the daemon's unit, which
-  keeps the node itself safe. `memory.oom.group=1` makes a kernel OOM kill take the whole
-  action, not part of it. Nothing is set when no memory was booked.
+- **Memory** follows the build-host policy. Each lease has a hard cap, `memory.max` =
+  booked memory x 1.5 + 512 MiB (the native driver's limit), with
+  `memory.oom.group=1` on the lease cgroup (and on the container), so an OOM kill takes
+  every process in the lease and none outside it. The lease cgroup sets no
+  `memory.high` and no `memory.swap.max`: swap stays allowed, so reclaim under host
+  pressure moves a lease's pages to swap instead of killing it. The same holds at the
+  cap: while swap is free, a lease at its cap is reclaimed into swap; the kernel kills
+  it there only when reclaim cannot free enough (swap full, or none). The node's
+  backstop is `memory.max` on `actions/`, set from `--actions-memory-max-gib` (or by
+  whoever runs the daemon's unit). Nothing is capped when no memory was booked.
 - **CPU** is compressible: `cpu.weight` = booked millicores / 10, clamped to 1..10000
   (one core is the kernel's default weight of 100). The driver never sets `cpu.max`,
   because throttling distorts wall time.
 - **OOM detection** reads the lease cgroup's `memory.events`, which outlives the
-  container. Podman's own OOM flag is not trusted (it reads false when rootless).
+  container, when the action ends with SIGKILL (137) or Podman recorded no exit (the
+  lease's OOM group also kills conmon, which runs in the lease cgroup). Podman's own
+  OOM flag is not trusted (it reads false when rootless). The kernel counts an event
+  at the cgroup whose limit caused it and at that cgroup's ancestors, so the lease's
+  counters say whose limit it was:
+  - `oom_kill` with `oom` and `max` in the lease: the OOM killer ran for the lease's own
+    cap. The lease fails `RESOURCE_EXHAUSTED` with `MEMORY_KILL_OUT_OF_MEMORY`
+    (`RuntimeError::OutOfMemory`, with `memory.peak` and the cap): the action needs
+    more memory than it booked.
+  - `oom_kill` without `oom` in the lease: the OOM killer ran for a limit above it
+    (`actions/`'s backstop, or the host). The lease fails `UNAVAILABLE` with
+    `MEMORY_KILL_BUSY_NODE` (`RuntimeError::BusyNode`); its message says whether
+    `oom` in `actions/memory.events.local` grew during the lease. The booking was not
+    the cause.
+  - No `oom_kill`: an exit 137 is the action's own result.
 - **Removal** of a lease cgroup that is still busy (a process still exiting) writes
   `cgroup.kill` and retries.
 
@@ -369,8 +388,7 @@ runtime reports usage; the container driver does not yet.
 - **Re-adopting leases across a daemon restart:** each lease runs as its own systemd
   unit, so work continues while the daemon restarts, and the daemon lists every
   re-adopted lease in its first heartbeat.
-- **Raising `memory.high`** while the node has room, so an action that outgrew its
-  booking keeps full speed; pausing new leases under memory pressure.
+- **Pausing new leases** under memory pressure.
 - **Image import:** images copied from farm storage into the node's store once, by
   digest, with layers verified; a node never pulls from a public registry at action
   time.

@@ -275,7 +275,7 @@ const SELF: &str = "0::/system.slice/kbf-daemon.service\n";
 /// processes left the delegated cgroup is EBUSY on a real host; enabling them in
 /// `actions/` before its parent offers them is ENOENT), a process left behind in the
 /// delegated cgroup, `actions/` without `memory` (no lease cgroup could set
-/// `memory.high`), and `--actions-memory-max-gib` not reaching `actions/memory.max`.
+/// `memory.max`), and `--actions-memory-max-gib` not reaching `actions/memory.max`.
 #[test]
 fn a_fresh_unit_gets_its_leaf_its_controllers_and_its_actions_cgroup() {
     let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41, 42]);

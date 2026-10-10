@@ -148,6 +148,7 @@ fn worker_messages_round_trip() {
                 hash: "cd".repeat(32),
                 size_bytes: 9,
             }),
+            memory_kill: worker::MemoryKill::BusyNode as i32,
         })),
     };
     let back = DaemonMessage::decode(result.encode_to_vec().as_slice()).expect("decode");

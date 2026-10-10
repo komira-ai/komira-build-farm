@@ -298,6 +298,23 @@ message Result {
   // operation it granted the lease for. Unset: not checked (a daemon that predates
   // this field, or a lease whose Start the daemon never saw).
   build.bazel.remote.execution.v2.Digest action_digest = 4;
+  // Whether the action was killed for memory, and whose memory ran short. Set only
+  // with a non-OK status; unset from a daemon that predates this field.
+  MemoryKill memory_kill = 5;
+}
+
+// Why the kernel's OOM killer (or the native driver's memory watch) ended a lease. The
+// scheduler grows an action's memory ask only for OUT_OF_MEMORY.
+enum MemoryKill {
+  // Not killed for memory, or a daemon that does not say.
+  MEMORY_KILL_UNSPECIFIED = 0;
+  // The action reached its lease's own memory limit and was killed there (status
+  // RESOURCE_EXHAUSTED). It needs more memory than it was given.
+  MEMORY_KILL_OUT_OF_MEMORY = 1;
+  // The action was killed without reaching its lease's own limit: the node ran short
+  // (its limit on all actions, or the host's memory) (status UNAVAILABLE). The
+  // action's ask was not the cause.
+  MEMORY_KILL_BUSY_NODE = 2;
 }
 
 // The server's answer to a Result: it has decided that Result, so the daemon may forget
