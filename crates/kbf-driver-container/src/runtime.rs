@@ -377,10 +377,10 @@ impl<C: Cas> PodmanRuntime<C> {
                     now.swap
                 );
                 self.kill_container(&lease.name, &lease.cgroup, child).await;
-                return Err(RuntimeError::OutOfMemory {
-                    used: now.current.saturating_add(now.swap),
-                    limit,
-                });
+                return Err(RuntimeError::BusyNode(format!(
+                    "used {} past {limit}",
+                    now.current.saturating_add(now.swap)
+                )));
             }
         }
 
