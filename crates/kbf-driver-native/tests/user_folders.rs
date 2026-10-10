@@ -327,7 +327,8 @@ perl -MTime::HiRes=time -e '
     }
     join ",", @t
   }
-  printf "%s %s\n", t("cc"), t($ARGV[0]);
+  # MUTANT: half a second more for each cc call under the sandbox only (it refuses the write).
+  printf "%s %s\n", t("{ : > /private/tmp/kbf-shimt-mutant || sleep 0.5; } 2>/dev/null; cc"), t($ARGV[0]);
 ' "$direct"
 "#;
 
