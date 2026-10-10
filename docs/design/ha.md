@@ -189,7 +189,10 @@ closing needs to be replicated either.
 does not move into the machine. It stays on the leader and proposes small records
 (a step started, a step done, a rollout paused) that the machine applies. From
 [PR 25b](#16-pull-request-plan), in phase 2, a failover pauses a rollout, and the new
-leader resumes it from the committed records. Before PR 25b (phase 1) the records are
+leader resumes it from the committed records: from the next step not yet started, if
+every started step is recorded done. A step recorded as started but not done is not
+run again automatically, because it may have run in part; the rollout stays paused on
+it until an operator marks it done or failed. Before PR 25b (phase 1) the records are
 in memory, and a restart of the single server abandons a running rollout; it is started
 again by hand.
 
@@ -259,8 +262,14 @@ dependencies (`kbf-meta` keeps only `kbf-types` and `thiserror`).
   `PutBlob` of a held, reachable blob is `Duplicate { kept }` and changes only the
   touch time; `Touch` is idempotent; `ObjectUnreachable` never downgrades `Corrupt`;
   `PutAction` replaces with the same record; a retried `AllocEpoch` wastes an epoch,
-  which is harmless. A test applies every forwardable variant twice and compares
-  states, and the forwarder treats `Duplicate` as success.
+  which is harmless. The rule is exact but for one field: **applying a forwardable
+  command twice leaves the same state as applying it once, except the loss mark's
+  generation (below), which only rises.** A retried `ObjectUnreachable` lands at a
+  later log index, so it stamps a later generation; that is safe, because a newer
+  generation can only make a late `ObjectReachable` do nothing. A test applies every
+  forwardable variant twice, at two log indices, and compares the states with the
+  generations left out, then checks that every generation is at least its value after
+  the first apply. The forwarder treats `Duplicate` as success.
 - **Idempotence does not cover reordering.** A forward can be delayed or retried across
   a leader change and land after a newer command. For every forwardable command but
   one, landing late is harmless: it is a write the sender saw succeed, or a mark that
@@ -272,9 +281,11 @@ dependencies (`kbf-meta` keeps only `kbf-types` and `thiserror`).
   index, its **generation**, whether or not it raised the reason. `ObjectReachable
   { object, generation }` names the generation the sender read before it probed the
   store, and it clears the mark only if that is still the mark's generation. Otherwise
-  it is a no-op. The generation is part of the snapshot section. PR 2 adds it, with a
-  test that applies a delayed `ObjectReachable` after a newer `ObjectUnreachable` and
-  finds the mark still there.
+  it is a no-op. The generation is part of the snapshot section. `MetaState::execute`
+  takes only the command today (`crates/kbf-meta/src/state.rs:218`); it gains the
+  entry's log index as a second input, which every caller passes from the entry it
+  applies. PR 2 adds the index and the generation, with a test that applies a delayed
+  `ObjectReachable` after a newer `ObjectUnreachable` and finds the mark still there.
 
 ### 4.7 Versions and upgrades
 
@@ -292,7 +303,9 @@ versions gate that:
   `n + 1`. A node being added is checked at `add-learner`: the leader asks it over the
   peer listener which versions it supports, and the tool refuses a node that cannot
   apply the committed format and machine version ([section 6](#6-membership)). While a
-  change is pending, the leader proposes no `MachineVersion`.
+  membership change is pending, the leader proposes no `MachineVersion`, and while a
+  `MachineVersion` is uncommitted, the tool refuses every membership change; so a
+  node is never added against a version that is about to change under it.
 
 Two checks keep an ungated change from shipping:
 
@@ -421,7 +434,9 @@ constants are checked against each other at compile time.
   the transfer fails, and an unplanned election follows two election timeouts later.
   Only a node that received TimeoutNow sets the flag, and only the current leader
   sends TimeoutNow, so the flag gives a partitioned node no way to depose a healthy
-  leader.
+  leader. A TimeoutNow from an older term than the receiver's is ignored, by the
+  ordinary term check, so a delayed one cannot start a flagged election against a
+  newer leader.
 - **CheckQuorum**: a leader that has not heard from a quorum within an election
   timeout steps down. Stepping down clears `set_leader`, ends every `Execute` and
   worker stream `UNAVAILABLE` through the existing `Closer`
@@ -506,9 +521,11 @@ TimeoutNow (dissertation 3.10). `SIGTERM` on the leader:
 
 1. stop accepting new proposals (forwarded commits and worker inputs answer
    `UNAVAILABLE`; the daemon's next try reaches the new leader);
-2. pick the voter with the highest match index, bring it up to the commit index, send
-   it TimeoutNow; its election is exempt from stickiness
-   ([section 5.1](#51-election));
+2. pick the voter with the highest match index, bring it up to the leader's last log
+   index (not only the commit index: an entry appended but uncommitted when step 1
+   stopped proposals could leave another voter more up to date than the target, and
+   that voter would refuse it), send it TimeoutNow; its election is exempt from
+   stickiness ([section 5.1](#51-election));
 3. wait for step-down, at most two maximum election timeouts;
 4. `Closer`: end `Execute` and worker streams `UNAVAILABLE` (worker streams with the
    redirect naming the new leader);
@@ -527,13 +544,17 @@ acknowledge.
   being static: the membership is the newest config entry in the log or snapshot.
 - **Addresses live in the config entry**: `Member { id, peer_addr, worker_addr,
   reapi_addr, role }`. Every server names the same leader address in a redirect, and no
-  per-host file can drift. Server ids are never reused.
+  per-host file can drift. Server ids are never reused: the config entry also carries
+  the set of retired ids (every id ever removed), so every replica knows them, and a
+  snapshot holds them with the membership.
 - **Operations**, through the operator API and an admin command (its name is chosen
-  in PR 31): `status`, `add-learner`, `promote`, `remove`, `transfer`. Production changes run from a reviewed script that
-  defaults to a dry run. The tool's refusals, all of them:
-  - any change while another change is uncommitted;
+  in PR 32): `status`, `add-learner`, `promote`, `remove`, `transfer`. Production
+  changes run from a reviewed script that defaults to a dry run. The tool's refusals,
+  all of them:
+  - any change while another change, or a `MachineVersion` entry, is uncommitted;
   - `add-learner` of a node that cannot apply the committed format and machine version
-    ([section 4.7](#47-versions-and-upgrades)), or under a server id used before;
+    ([section 4.7](#47-versions-and-upgrades)), or under a server id that is a member or
+    in the config entry's retired set;
   - `promote` unless the learner is serving reads and its match index has stayed within
     1 000 entries of the commit index for 60 s;
   - `promote` while any voter is unhealthy (it would raise the quorum with no healthy
@@ -548,7 +569,8 @@ acknowledge.
 
   While a voter is unhealthy, the tool therefore still allows `status`, `transfer` to a
   healthy caught-up voter, `add-learner`, `remove` of a learner, and `remove` of the
-  unhealthy voter: everything the replacement paths below need. A learner does not
+  unhealthy voter (in a 3-voter group, only once a learner passes the `promote` test,
+  by the rule above): everything the replacement paths below need. A learner does not
   count toward the quorum, so adding one never reduces the slack.
 - **A leader removing itself** steps down after the removal commits. A removed node
   exits after it applies its own removal.
@@ -931,50 +953,50 @@ first, because phase 1 needs no multi-node mechanism.
 |---|---|---|---|---|---|---|
 | 0 | Probe, no code: how Buck2 and Bazel react to a dropped `Execute` stream (reset and `UNAVAILABLE`) and to `NOT_FOUND` from `WaitExecution`, through the real front | — | S | n/a | n/a | n/a |
 | 1 | This document; ADR 0001 status | — | S | n/a | n/a | n/a |
-| 2 | `log.proto` and the `Command` codec; the loss mark's generation in `kbf-meta` ([section 4.6](#46-encoding)) | 1 | M | golden bytes; round trip of every variant; every forwardable command applied twice equals once; a delayed `ObjectReachable` applied after a newer `ObjectUnreachable` leaves the mark | swap two field tags; default an unknown value; clear the mark whatever its generation | n/a |
+| 2 | `log.proto` and the `Command` codec; the loss mark's generation in `kbf-meta`, and the log index as an input of `MetaState::execute` ([section 4.6](#46-encoding)) | 1 | M | golden bytes; round trip of every variant; every forwardable command applied twice, at two log indices, leaves the state of one apply except loss-mark generations, which only rise; a delayed `ObjectReachable` applied after a newer `ObjectUnreachable`, of the same reason or a higher one, leaves the mark | swap two field tags; default an unknown value; clear the mark whatever its generation; stamp the generation only when the reason rises | n/a |
 | 3 | `kbf-store`: segmented log, hard state, CRC, torn tail, fail-stop on fsync error | 1 | M | a fault-injecting filesystem: a torn write at every byte offset, a crash between write and fsync, an fsync error | return before fsync; skip the directory fsync; accept a bad CRC in the middle | n/a |
 | 4 | Raft host loop over `Storage` and `Transport` traits | 3 | M | crash at every effect boundary recovers to a log that satisfies the Figure 3 checks | send before persist; apply before commit | crash seeds on the existing Raft sim |
-| 5 | `RaftMetaLog`, one voter, behind `--meta-log=raft --raft-dir`; `Bootstrap` with log id and stable `<prefix><log_id>/`; farm time from the committed base; leader-only `Tick` | 2, 4 | M | `cold_restart` keeps blobs and action-cache entries | start-time prefix; farm time from the process `Instant` | n/a |
+| 5 | `RaftMetaLog`, one voter, behind `--meta-log=raft --raft-dir`; `Bootstrap` with log id and stable `<prefix><log_id>/`; farm time from the committed base; leader-only `Tick` | 2, 4 | M | `cold_restart` keeps blobs and action-cache entries; farm time after a restart continues from the committed base and never goes back | start-time prefix; farm time from the process `Instant` | n/a |
 | 6a | `FarmMachine`, step 1: waiter records and the `started` table move into a pure struct; no behavior change | 1 | M | two machines fed the same inputs are equal; existing `kbf-server` tests stay green | a hashed map in the struct (clippy and the equality test) | n/a |
 | 6b | `FarmMachine`, step 2: node registry and node status | 6a | S | registry survives in the machine; equality | drop a field from equality | n/a |
 | 6c | `FarmMachine`, step 3: memory floors and the doubled-booking requeue | 6a, #284 | S | equality over generated OOM sequences | forget the floor on requeue | n/a |
 | 7 | Control codec: every `FarmInput`, `Takeover`, `Report`, `Checkpoint`, `MachineVersion` | 2, 6a, 6b, 6c | M | golden bytes; round trip | as PR 2 | n/a |
-| 8 | `kbf-sim-cell` skeleton: one server over PRs 3 to 7, fake daemons, store and clients; properties 1 to 7 | 4, 7 | M | n/a (new harness) | the section 15 mutants that apply to one node | crash and restart seeds |
+| 8 | `kbf-sim-cell` skeleton: one server over PRs 3 to 7, fake daemons, store and clients; properties 1 to 7 (in crash and restart seeds, property 3 is enforced from PR 11 and property 4 from PR 12, the PRs that make them hold) | 4, 5, 7 | M | n/a (new harness) | the section 15 mutants that apply to one node | crash and restart seeds |
 | 9 | `LeaseOffer` only after the grant commits | 1, 8 | S | a `FakeDaemon` sees no offer for a grant whose commit was refused (`GateLog`) | send the offer before commit | sim-cell: offer for an uncommitted grant |
-| 10 | Control inputs through the log: `Submit` committed before the name is returned; heartbeats and `WorkerUp` batched; R-ack for `Welcome`, `HeartbeatAck`, `ResultAck`; `Effect::Commit` fed back at apply; `Takeover` on restart | 5, 6b, 6c, 7, 8, 9 | L | **a server restart mid-lease: the daemon reconnects, its lease keeps running, its result is accepted** (red today: `STATE_IN_MEMORY`) | acknowledge before commit; skip the `Takeover` reset | sim-cell restart seeds |
-| 11 | `Welcome.epoch` = log id (non-zero); `LeaseId.term` from Raft; duplicate `Result` acknowledged | 10 | S | the restart test with the epoch check; a resent, already-committed result is acked accepted | epoch = term; refuse the duplicate | sim-cell: property 3 |
-| 12 | `Report` entry: result and `PutAction` atomic | 10 | S | a crash between the two today leaves an accepted result with no action-cache entry; after, a crash at every point leaves both or neither | commit the two separately | sim-cell: property 4 |
-| 13 | Operation names `operations/<log_id>-<waiter>`; the existing finished-operation window (`FINISHED_RETENTION`, `farm.rs`'s `finished`) replicated and lengthened | 10 | S | `WaitExecution` after a restart finds the operation (`NOT_FOUND` today), and a finished one returns its result | parse under the wrong log id; drop the kept answer | n/a |
-| 14 | Snapshot codec for both machines; local snapshots; compaction; store copy with the manifest last; S1 | 5, 6b, 6c, 10 | M | `restore(snapshot at k) + replay(k..n)` equals `replay(0..n)`; a fresh server restores from the store copy after compaction | write the manifest first; compact past the copy; drop `next_epoch` from the snapshot | sim-cell: snapshot-copy failures |
-| 15 | Checkpoint digests and fail-stop on mismatch | 14 | S | a planted divergence stops the node and pages | compare at the wrong index | sim-cell: divergence seeds |
-| 16 | Phase-1 metrics and alerts (section 13, single-node subset) | 10 | S | each alert fires on its planted condition | n/a | n/a |
+| 10 | `Welcome.epoch` = log id (non-zero); `LeaseId.term` from the Raft term; `process_term()` goes. Under `--meta-log=raft` only, which nothing outside tests runs before PR 11: until then a restart keeps the daemon's epoch but not the server's leases, so their runs are wasted (`not_held` names no lease of another term, and their results are refused), never doubled | 5 | S | two starts of one server over the same `--raft-dir` send the same non-zero `Welcome.epoch` (two different epochs today); a lease's `LeaseId.term` is the Raft term of the leader that granted it | epoch = term; `LeaseId.term` from `process_term()` | n/a |
+| 11 | Control inputs through the log: `Submit` committed before the name is returned; heartbeats and `WorkerUp` batched; R-ack for `Welcome`, `HeartbeatAck`, `ResultAck`; `Effect::Commit` fed back at apply; `Takeover` on restart | 5, 6b, 6c, 7, 8, 9, 10 | L | **a server restart mid-lease: the daemon reconnects, its lease keeps running, its result is accepted** (red today: `STATE_IN_MEMORY`; needs PR 10's epoch) | acknowledge before commit; skip the `Takeover` reset | sim-cell restart seeds, property 3 |
+| 12 | `Report` entry: result and `PutAction` atomic; a duplicate `Result` acknowledged `accepted: true` with no second record | 11 | S | a crash between the two today leaves an accepted result with no action-cache entry; after, a crash at every point leaves both or neither; a result resent after a restart, already committed, is acknowledged accepted | commit the two separately; refuse the duplicate | sim-cell: property 4 |
+| 13 | Operation names `operations/<log_id>-<waiter>`; the existing finished-operation window (`--finished-retention-secs`, default `FINISHED_RETENTION`; `farm.rs`'s `finished`) replicated, with a longer default | 11 | S | `WaitExecution` after a restart finds the operation (`NOT_FOUND` today), and a finished one returns its result | parse under the wrong log id; drop the kept answer | n/a |
+| 14 | Snapshot codec for both machines (everything the machines hold as of PR 13: waiters, `started`, finished operations, registry, floors, loss-mark generations); local snapshots; compaction; store copy with the manifest last; S1 | 5, 6b, 6c, 11, 13 | M | `restore(snapshot at k) + replay(k..n)` equals `replay(0..n)`; a fresh server restores from the store copy after compaction | write the manifest first; compact past the copy; drop `next_epoch` from the snapshot | sim-cell: snapshot-copy failures |
+| 15 | Checkpoint digests and fail-stop on mismatch | 14 | S | a replay whose state differs from the digest a committed `Checkpoint` names (a planted divergence, after a restart) stops the node and records a checkpoint mismatch; the page is PR 16's alert | compare at the wrong index | sim-cell: divergence seeds |
+| 16 | Phase-1 metrics and alerts (section 13, single-node subset: persist fail-stop, checkpoint mismatch, store copy, Raft partition, fsync, self-fenced run) | 15 | S | each alert fires on its planted condition | n/a | n/a |
 
 **Phase 2: three voters.**
 
 | # | PR | Depends on | Size | Red without | Mutant | Sim |
 |---|---|---|---|---|---|---|
 | 17 | Core: PreVote and stickiness, with the exemption for a transfer-flagged election ([section 5.1](#51-election)) | 1 | S | scripted: a rejoining node does not raise the term; a vote request flagged as a transfer is granted inside the stickiness window, an unflagged one is refused | skip the stickiness check; apply stickiness to a flagged request | partition-heal sweep |
-| 18 | Core: CheckQuorum | 17 | S | scripted: an isolated leader steps down within one election timeout | never step down | minority-leader seeds |
+| 18 | Core: CheckQuorum | 17 | S | scripted: an isolated leader steps down within two maximum election timeouts of its last contact with a quorum (the bound `READ_BEHIND_BOUND` assumes) | never step down | minority-leader seeds |
 | 19 | Core: single-server membership, learner promotion, addresses in the config entry | 1 | M | scripted add, promote, remove; the errata scenario has two leaders without the `Blank`-first rule | drop `Blank`-first; allow two pending changes; apply config on commit | random changes under faults with the Figure 3 checks |
 | 20 | Core: InstallSnapshot by reference | 14 | M | a follower behind the base catches up; `compaction_floor` is lifted | accept a snapshot older than the applied index; skip the digest check | snapshot-install seeds |
 | 21 | Core: ReadIndex | 18 | S | a read token from a deposed leader never resolves | resolve without a heartbeat round; before an own-term commit | linearizable-read checker |
-| 22 | Core: leadership transfer (TimeoutNow); the target campaigns with the transfer flag of PR 17 | 18 | S | the target wins within one election timeout, with every voter inside its stickiness window, and no committed entry lost; a lagging target is caught up first | transfer to a lagging voter without catch-up; drop the transfer flag (the transfer fails and an unplanned election follows) | transfer under drops |
+| 22 | Core: leadership transfer (TimeoutNow); the target campaigns with the transfer flag of PR 17 | 18 | S | the target wins within one election timeout, with every voter inside its stickiness window, and no committed entry lost; a lagging target is caught up to the leader's last index first; a TimeoutNow of an older term is ignored | transfer to a lagging voter without catch-up; catch up to the commit index only; drop the transfer flag (the transfer fails and an unplanned election follows) | transfer under drops |
 | 23 | Peer transport `kbf.peer.v1`: own listener, internal-CA mutual TLS, id bound to the certificate name | 4 | M | 3 in-process servers elect and replicate over loopback; a wrong-name peer is refused | skip the name check | n/a |
-| 24 | Multi-server harness: N real `Cell`s over PR 23, a shared store, kill, partition, transfer | 23 | M | n/a (harness) | n/a | n/a |
-| 25 | Follower inert; leader-only acting; `Takeover` after election; `set_leader` from the role; workers unplaceable until `WorkerUp`; `Closer` on step-down | 10, 18, 24 | M | 3 `Cell`s: kill the leader; leases kept, results accepted | placement on a stale session; `leader` defaulting to true | sim-cell failover seeds, N = 3 and 5 + 1 |
-| 25b | Rollout records through the log: the leader's rollout driver proposes step started, step done and paused; the records replace `MemoryRolloutStore`; a failover pauses a rollout and the new leader resumes it | 7, 25 | S | 3 `Cell`s: kill the leader mid-rollout; the new leader resumes it from the next undone step, and no step runs twice | keep the records leader-local; resume from the first step | sim-cell failover seeds with a rollout |
-| 26 | Follower reads and forwarded commits; `Cache::open` split; lazy `AllocEpoch` | 21, 25 | M | a follower answers `FindMissingBlobs`; an upload to a follower is visible on the leader; with no leader, `UNAVAILABLE`, never absent | resolve at the leader's apply instead of the local one; map `Unavailable` to missing | no-false-present checker |
-| 27 | The read gate; `READ_STALENESS` and `READ_BEHIND_BOUND` with their constant checks; two readiness paths; health services `kbf.leader` and `kbf.reads` | 26, #299 | S | a follower is serving reads and not leader-ready; a lagging follower is not serving reads; with no leader for `READ_STALENESS`, no server is serving reads | one status for both; gate on "knows a leader" only; serve reads with no leader | n/a |
-| 28 | Worker redirect on the server; the daemon follows it; 2 s backoff while holding leases; admission limit | 19, 25, #300 | M | a daemon dialing only a follower reaches the leader in one round; 50 daemons reconnect without a refused commit | redirect counted as a failure; follow an address outside the membership | daemon-reconnect seeds |
+| 24 | Multi-server harness: N real `Cell`s over PR 23, a shared store, kill, partition, transfer | 22, 23 | M | n/a (harness) | n/a | n/a |
+| 25 | Follower inert; leader-only acting; `Takeover` after election; `set_leader` from the role; workers unplaceable until `WorkerUp`; `Closer` on step-down; sim-cell grows to N servers | 12, 13, 18, 24, #300 | M | 3 `Cell`s: kill the leader; leases kept, results accepted (a result the old leader committed is acknowledged as a duplicate, PR 12), and a `WaitExecution` on the new leader finds its operation (PR 13); daemons find the new leader by #300's retry over every address | placement on a stale session; `leader` defaulting to true | sim-cell failover seeds, N = 3 and 5 + 1 |
+| 25b | Rollout records through the log, in the snapshot section: the leader's rollout driver proposes step started, step done and paused; the records replace `MemoryRolloutStore`; a failover pauses a rollout and the new leader resumes it ([section 4.2](#rollouts-and-mdm)) | 7, 14, 25 | S | 3 `Cell`s: kill the leader mid-rollout between steps: the new leader resumes it from the next step not started; kill it while a step is started but not done: the rollout stays paused on that step for an operator, and no step runs twice; snapshot equality with records present | keep the records leader-local; resume from the first step; rerun a started step | sim-cell failover seeds with a rollout |
+| 26 | Follower reads and forwarded commits; `Cache::open` split; lazy `AllocEpoch` | 21, 25 | M | a follower answers `FindMissingBlobs`; an upload to a follower is visible on that follower's `FindMissingBlobs` as soon as the upload answers, and on the leader; with no leader, `UNAVAILABLE`, never absent | resolve at the leader's apply instead of the local one; map `Unavailable` to missing | no-false-present checker |
+| 27 | The read gate (its checkpoint condition is PR 15's); `READ_STALENESS` and `READ_BEHIND_BOUND`, with the start check against `min_ttl`; two readiness paths; health services `kbf.leader` and `kbf.reads` | 15, 26, #299 | S | a follower is serving reads and not leader-ready; a lagging follower is not serving reads; a follower whose checkpoint digest differs is not serving reads; with no leader for `READ_STALENESS`, no server is serving reads; a retention with `min_ttl` under 1 000 × `READ_BEHIND_BOUND` is refused at start | one status for both; gate on "knows a leader" only; serve reads with no leader; drop the checkpoint condition | n/a |
+| 28 | Worker redirect on the server; the daemon follows it; 2 s backoff while holding leases; admission limit | 19, 25, #300 | M | a daemon dialing only a follower reaches the leader in one round; a redirect naming an address the daemon was not configured with (or that does not verify under the CA) is not followed; 50 daemons reconnect without a refused commit | redirect counted as a failure; follow an address outside the membership | daemon-reconnect seeds |
 | 29 | Daemon ack timeout | 28 | S | a daemon facing a black-holed leader reconnects before T | no timeout | black-hole seeds |
 | 30 | Daemon `--cas` spread with the `NOT_FOUND` fallback ending at the leader | 26 | S | an input missing on a stale follower is still fetched; reads go on when one server dies | no fallback; always the first address | n/a |
-| 31 | Membership admin API and its admin command, with the refusals of section 6 | 19, 25, 27 | M | 1 → 3 in the `Cell` harness while a fake build runs; a dead voter of 3 replaced by the add-learner-first path; each refusal tested, and each allowed step of both replacement paths accepted | promote an un-caught-up learner; open a 2-voter window with an unhealthy node; refuse `add-learner` while a voter is dead | sim-cell rollout path |
-| 32 | `SIGTERM`: transfer, wait, `Closer`, exit | 22, 25, 28 | S | a graceful leader stop with an open `Execute`; `WaitExecution` on the new leader completes | `Closer` before the transfer | n/a |
-| 33 | Format and machine versions; golden-log replay test in CI | 7, 23 | M | a mixed-version cluster never sees an entry it cannot apply; an ungated behavior change fails the replay | propose before every member supports it | n/a |
-| 34 | Leader-only collection with the deletion order of section 4.10 (retained copies pin their objects) and the constant checks | 14, 26, 27 | M | restoring the newest copy after a collection references no deleted object; restoring the oldest retained copy does not either; an `InstallSnapshot` whose copy is deleted mid-fetch is retried from the newest copy | delete before the snapshot copy; delete while an older retained copy references the object | property 5 with GC on |
-| 35 | Phase-2 metrics and alerts (the rest of section 13) | 25 | S | each alert on its planted condition | n/a | n/a |
+| 31 | Format and machine versions; golden-log replay test in CI | 15, 25 | M | a mixed-version cluster never sees an entry it cannot apply; an ungated behavior change fails the replay (which compares PR 15's checkpoint digests) | propose before every member supports it | n/a |
+| 32 | Membership admin API and its admin command, with the refusals of section 6 | 19, 20, 25, 27, 31 | M | 1 → 3 in the `Cell` harness while a fake build runs, starting from a voter that has compacted its log (the learners catch up by InstallSnapshot, PR 20); a dead voter of 3 replaced by the add-learner-first path; each refusal tested (a node without the committed versions, PR 31; a retired id; any change while a `MachineVersion` is uncommitted), and each allowed step of both replacement paths accepted | promote an un-caught-up learner; open a 2-voter window with an unhealthy node; refuse `add-learner` while a voter is dead; accept a retired id | sim-cell rollout path |
+| 33 | `SIGTERM`: transfer, wait, `Closer`, exit | 22, 25, 28 | S | a graceful leader stop with an open `Execute`; `WaitExecution` on the new leader completes | `Closer` before the transfer | n/a |
+| 34 | Leader-only collection with the deletion order of section 4.10 (retained copies pin their objects), the condemn delay D and its compile-time check against `READ_BEHIND_BOUND` | 14, 20, 26, 27 | M | restoring the newest copy after a collection references no deleted object; restoring the oldest retained copy does not either; an `InstallSnapshot` whose copy is deleted mid-fetch is retried from the newest copy (PR 20) | delete before the snapshot copy; delete while an older retained copy references the object | property 5 with GC on |
+| 35 | Phase-2 metrics and alerts (the rest of section 13) | 16, 27, 28, 30 | S | each alert on its planted condition | n/a | n/a |
 | 36 | Front configuration in the deploy kit: method routing, both health checks, the TLS hop (#226), idle timeout; per-server policy digest check | 27, #226 | S | `kbf-it` through a real front: the 64 MiB round trip, the 300 s silent stream | n/a | n/a |
-| 37 | `kbf-it` m3 cell and the acceptance script | 20, 25b, 28 to 36 | M | section 17 | the negative control of section 17 | n/a |
+| 37 | `kbf-it` m3 cell and the acceptance script | 0, 12, 13, 15, 16, 20, 25b, 28 to 36 | M | section 17 | the negative control of section 17 | n/a |
 | 38 | Docs: the corrections of section 19 | 37 | S | n/a | n/a | n/a |
 
 **Phase 3** adds no mechanism: the 5 + 1 profile in the simulation and the harness,
@@ -1025,8 +1047,8 @@ once, and each at a moment with at least 4 leases running:
    reads every blob any server answered "present" for.
 
 **Negative control.** Run B again with the daemon built to drop leases on any
-`Welcome` (the PR 11 mutant). The test must fail on criterion 2. A gate is proven only
-by a red run.
+`Welcome` (the effect of PR 10's mutant, `Welcome.epoch` = the Raft term). The test
+must fail on criterion 2. A gate is proven only by a red run.
 
 ## 18. Open decisions
 
@@ -1060,9 +1082,11 @@ Each lists the options and the lean.
     **Lean (a).**
 11. **Replacing a dead voter in a 3-voter group.** (a) Learner caught up first, then
     remove, then promote; (b) remove first. **Lean (a).**
-12. **Retention of finished operations.** Today a finished operation is kept for
-    `FINISHED_RETENTION` (60 s), in memory. (a) 1 h; (b) 24 h; (c) keep 60 s. **Lean
-    (a):** a client reconnecting after a failover must still find it.
+12. **Retention of finished operations.** Today a finished operation is kept, in
+    memory, for the server flag `--finished-retention-secs`
+    (`crates/kbf-server/src/config.rs:121-122`), whose default is `FINISHED_RETENTION`
+    (60 s). The decision is the flag's default: (a) 1 h; (b) 24 h; (c) keep 60 s.
+    **Lean (a):** a client reconnecting after a failover must still find it.
 13. **Routing of `QueryWriteStatus`, `GetTree` and `GetCapabilities`.** **Lean:**
     `QueryWriteStatus` and `GetCapabilities` to the leader, `GetTree` to the read
     cluster.
