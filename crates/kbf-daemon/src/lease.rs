@@ -165,7 +165,7 @@ pub(crate) fn result_of(
             action_result: Some(action_result),
             // The daemon fills in the action its Start named.
             action_digest: None,
-            memory_kill: MemoryKill::Unspecified as i32,
+            memory_kill: worker::MemoryKill::Unspecified as i32,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -177,11 +177,11 @@ pub(crate) fn result_of(
             "the action ran past its timeout",
         ),
         Err(oom @ RuntimeError::OutOfMemory { .. }) => worker::Result {
-            memory_kill: MemoryKill::OutOfMemory as i32,
+            memory_kill: MemoryKill::OwnLimit as i32,
             ..failure(id, Code::ResourceExhausted, oom.to_string())
         },
         Err(busy @ RuntimeError::BusyNode(_)) => worker::Result {
-            memory_kill: MemoryKill::BusyNode as i32,
+            memory_kill: MemoryKill::NodePressure as i32,
             ..failure(id, Code::Unavailable, busy.to_string())
         },
     }
@@ -209,7 +209,8 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         }),
         action_result: None,
         action_digest: None,
-        memory_kill: MemoryKill::Unspecified as i32,
+        // Planned: no driver reports which memory ran out yet (failure classes 6.1).
+        memory_kill: worker::MemoryKill::Unspecified as i32,
     }
 }
 
@@ -224,7 +225,8 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         }),
         action_result: None,
         action_digest: None,
-        memory_kill: MemoryKill::Unspecified as i32,
+        // Planned: no driver reports which memory ran out yet (failure classes 6.1).
+        memory_kill: worker::MemoryKill::Unspecified as i32,
     }
 }
 
@@ -474,8 +476,8 @@ mod tests {
             let why = error.to_string();
             // Only the two memory kills say so, each with its own kind.
             let kill = match error {
-                RuntimeError::OutOfMemory { .. } => MemoryKill::OutOfMemory,
-                RuntimeError::BusyNode(_) => MemoryKill::BusyNode,
+                RuntimeError::OutOfMemory { .. } => MemoryKill::OwnLimit,
+                RuntimeError::BusyNode(_) => MemoryKill::NodePressure,
                 _ => MemoryKill::Unspecified,
             };
             let result = result_of(id, Err(error));
