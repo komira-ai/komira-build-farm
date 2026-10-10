@@ -43,7 +43,6 @@ pub const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// What `/readyz` reads besides the store: whether a stop signal has come, and
 /// whether this server holds the scheduler role. Shared by the serving future, which
 /// sets it, and the route, which reads it.
-#[derive(Debug)]
 pub struct Readiness {
     stopping: AtomicBool,
     leader: AtomicBool,
@@ -86,7 +85,7 @@ impl Readiness {
 }
 
 /// One failing check of `/readyz`.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct Failing {
     /// `stopping`, `leader` or `store`.
     pub check: &'static str,
@@ -95,7 +94,7 @@ pub struct Failing {
 }
 
 /// The body of `/readyz`.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct ReadyBody {
     ready: bool,
     version: &'static str,
@@ -104,7 +103,7 @@ struct ReadyBody {
 }
 
 /// The body of `/healthz`.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct AliveBody {
     status: &'static str,
     version: &'static str,
