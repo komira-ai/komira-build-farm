@@ -324,6 +324,9 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
                 Effect::PersistEntries(entries) => {
                     self.stop_on_error(|s| s.write_entries(&entries))?;
                     unsynced = true;
+                    for e in &entries {
+                        self.machine.apply(e);
+                    }
                 }
                 Effect::Send { to, msg } => {
                     if std::mem::take(&mut unsynced) {
@@ -331,11 +334,10 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
                     }
                     self.transport.send(to, msg);
                 }
-                Effect::Apply(entry) => {
+                Effect::Apply(_) => {
                     if std::mem::take(&mut unsynced) {
                         self.stop_on_error(S::sync)?;
                     }
-                    self.machine.apply(&entry);
                 }
             }
         }
