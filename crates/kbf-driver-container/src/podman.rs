@@ -372,10 +372,10 @@ impl Podman {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn spec() -> ContainerSpec {
+    pub(crate) fn spec() -> ContainerSpec {
         ContainerSpec {
             name: "kbf-lease-1-2".to_owned(),
             owner: "node-1".to_owned(),

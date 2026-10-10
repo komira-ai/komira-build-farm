@@ -107,19 +107,29 @@ pub(crate) async fn not_run(
     stderr: &Path,
     state: &str,
 ) -> Result<i32, RuntimeError> {
-    let said = said(stderr).await.map_err(|e| failed(stderr, &e))?;
+    match answer(spec, stderr).await.map_err(|e| failed(stderr, &e))? {
+        Ok(why) => Ok(why.exit_code()),
+        Err(said) => Err(RuntimeError::Failed(format!(
+            "the container did not run to an exit: podman reports {state:?}; podman start: {said}"
+        ))),
+    }
+}
+
+/// Reads what `podman start` said into `stderr` and, when crun reports its lookup of
+/// the program, rewrites it as the action's stderr: why, or Podman's words if not.
+async fn answer(
+    spec: &ContainerSpec,
+    stderr: &Path,
+) -> std::io::Result<Result<Unstartable, String>> {
+    let said = said(stderr).await?;
     let program = spec.argv.first().map_or("", String::as_str);
     let Some(why) = classify(program, &said) else {
-        return Err(RuntimeError::Failed(format!(
-            "the container did not run to an exit: podman reports {state:?}; podman start: {said}"
-        )));
+        return Ok(Err(said));
     };
     let message = message(why, program, &spec.env, &spec.working_directory);
     tracing::info!(container = %spec.name, "{message}");
-    tokio::fs::write(stderr, format!("{message}\npodman start: {said}\n"))
-        .await
-        .map_err(|e| failed(stderr, &e))?;
-    Ok(why.exit_code())
+    tokio::fs::write(stderr, format!("{message}\npodman start: {said}\n")).await?;
+    Ok(Ok(why))
 }
 
 #[cfg(test)]
@@ -150,6 +160,19 @@ mod tests {
         }
         assert_eq!(Unstartable::NotFound.exit_code(), 127);
         assert_eq!(Unstartable::NotExecutable.exit_code(), 126);
+    }
+
+    /// Catches a Podman report the driver cannot read back taken for anything but the
+    /// farm's failure, naming the file.
+    #[tokio::test]
+    async fn a_report_that_cannot_be_read_is_the_farms() {
+        let stderr = Path::new("/nonexistent/kbf-lease/stderr");
+        let outcome = not_run(&crate::podman::tests::spec(), stderr, "created 0").await;
+        assert!(
+            matches!(&outcome, Err(RuntimeError::Failed(why))
+                if why.starts_with("/nonexistent/kbf-lease/stderr: ")),
+            "{outcome:?}"
+        );
     }
 
     /// Catches the message not naming the program, or naming the wrong place it was
