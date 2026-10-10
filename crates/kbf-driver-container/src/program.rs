@@ -168,10 +168,9 @@ mod tests {
     async fn a_report_that_cannot_be_read_is_the_farms() {
         let stderr = Path::new("/nonexistent/kbf-lease/stderr");
         let outcome = not_run(&crate::podman::tests::spec(), stderr, "created 0").await;
-        assert!(
-            matches!(&outcome, Err(RuntimeError::Failed(why))
-                if why.starts_with("/nonexistent/kbf-lease/stderr: ")),
-            "{outcome:?}"
+        assert_eq!(
+            format!("{outcome:?}"),
+            "Err(Failed(\"/nonexistent/kbf-lease/stderr: No such file or directory (os error 2)\"))"
         );
     }
 
