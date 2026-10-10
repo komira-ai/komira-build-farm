@@ -96,9 +96,8 @@ impl Floors {
         });
         self.asks.insert(key.clone(), (before.max(ask), stamp));
         self.order.insert(stamp, key.clone());
-        while self.asks.len() > self.bound
-            && let Some((_, oldest)) = self.order.pop_first()
-        {
+        while self.asks.len() > self.bound {
+            let (_, oldest) = self.order.pop_first().expect("every floor is in the order");
             self.asks.remove(&oldest);
         }
     }

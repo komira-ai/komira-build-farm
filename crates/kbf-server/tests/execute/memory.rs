@@ -2,17 +2,19 @@
 //! daemon that reports each run killed for memory as `Result.memory_kill` names it
 //! (failure classes, 6.1). No driver sets the field yet; the fake daemon stands in for
 //! the one that will.
-
-mod support;
+//!
+//! A module of the `execute` test binary, not a binary of its own: `Farm` is generic,
+//! and coverage counts each generic function by its best-covered instantiation, so the
+//! memory paths of `Farm::report` must run in the same binary as its other paths.
 
 use std::io::Write;
 use std::sync::{Mutex, Once, PoisonError};
 use std::time::Duration;
 
+use crate::support::{Cell, FakeDaemon, Job, done, failed, output, ran, response};
 use kbf_proto::google::rpc::ErrorInfo;
 use kbf_proto::worker::{self, MemoryKill};
 use prost::Message;
-use support::{Cell, FakeDaemon, Job, done, failed, output, ran, response};
 use tonic::Code;
 
 const GIB: u64 = 1 << 30;
