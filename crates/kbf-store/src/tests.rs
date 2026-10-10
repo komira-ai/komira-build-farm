@@ -324,7 +324,8 @@ fn segment_bytes(entries: &[Entry]) -> Vec<u8> {
 
 /// Catches: an open that accepts files that do not form one log: a first segment not
 /// at index 1, a gap between segments, an entry out of order or undecodable behind a
-/// good CRC, a segment name that does not parse, a hard state with trailing bytes.
+/// good CRC, a segment name that does not parse, a hard state with trailing bytes or
+/// one whose CRC holds but whose vote byte is unknown.
 #[test]
 fn open_refuses_files_that_do_not_form_one_log() {
     type Files = Vec<(String, Vec<u8>)>;
@@ -358,6 +359,10 @@ fn open_refuses_files_that_do_not_form_one_log() {
         (
             "short first index",
             vec![(format!("{:020}-1.log", 1), Vec::new())],
+        ),
+        (
+            "hard state with an unknown vote byte",
+            vec![(HARD_STATE.to_owned(), record(&[0, 0, 0, 0, 0, 0, 0, 0, 2]))],
         ),
         (
             "hard state trailing bytes",
