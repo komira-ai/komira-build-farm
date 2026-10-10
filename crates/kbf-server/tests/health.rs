@@ -1,5 +1,6 @@
-//! `GET /healthz` and `GET /readyz` on the operator API listener: in-process servers
-//! over a fault-injecting store, and the binary across a SIGTERM.
+//! `GET /healthz` and `GET /readyz` on the operator API listener, and
+//! `grpc.health.v1.Health` on the REAPI listener: in-process servers over a
+//! fault-injecting store, and the binary across a SIGTERM.
 
 mod support;
 
@@ -9,17 +10,25 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::{Epoch, Retention};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
+use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
+use kbf_proto::grpc::health::v1::health_client::HealthClient;
+use kbf_proto::grpc::health::v1::health_server::Health;
+use kbf_proto::grpc::health::v1::{HealthCheckRequest, HealthCheckResponse, HealthListRequest};
+use kbf_server::grpc_health::{HealthService, SERVICES};
 use kbf_server::{Api, BUILD_COMMIT, Listeners, Readiness, SERVER_VERSION, bind_server_with_api};
 use serde_json::{Value, json};
 use support::{HELLO_WAIT, INTERVAL, PROMPT};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tonic::transport::Channel;
 
 /// How the [`FaultStore`] answers reads.
 const ANSWERS: u8 = 0;
@@ -105,10 +114,15 @@ impl ObjectStore for FaultStore {
 /// stopped when the test's runtime ends.
 struct Server {
     api: SocketAddr,
+    reapi: SocketAddr,
     /// The bucket behind the [`FaultStore`], written to without counting.
     bucket: Arc<MemoryStore>,
     faults: Arc<Faults>,
     readiness: Arc<Readiness>,
+    /// Completes the server's shutdown future (a stop signal).
+    stop: Option<oneshot::Sender<()>>,
+    /// The serving future: its result once it returns.
+    serving: tokio::task::JoinHandle<Result<(), kbf_server::ServeError>>,
 }
 
 /// The store probe timeout of [`start`]'s servers.
@@ -145,22 +159,29 @@ fn start_with_prefix(prefix: &str) -> Server {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        store_probe_timeout: PROBE_TIMEOUT,
     };
     let api = Api {
         listen: loopback,
         token: None,
-        store_probe_timeout: PROBE_TIMEOUT,
     };
-    let bound =
-        bind_server_with_api(cache, listeners, Some(api), std::future::pending()).expect("bind");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let shutdown = async move {
+        let _ = stopped.await;
+    };
+    let bound = bind_server_with_api(cache, listeners, Some(api), shutdown).expect("bind");
     let api = bound.api.expect("an API address");
     let readiness = Arc::clone(&bound.readiness);
-    tokio::spawn(async move { bound.serving.await.expect("serve") });
+    let reapi = bound.reapi;
+    let serving = tokio::spawn(bound.serving);
     Server {
         api,
+        reapi,
         bucket,
         faults,
         readiness,
+        stop: Some(stop),
+        serving,
     }
 }
 
@@ -331,6 +352,283 @@ async fn readyz_is_503_once_the_server_is_stopping() {
     assert_eq!(failing(&body), ["stopping"], "{body}");
     let (code, body) = get_within(server.api, "/healthz", PROMPT).await;
     assert_eq!(code, 200, "{body}");
+}
+
+/// A health client of `server`'s REAPI listener.
+async fn health(reapi: SocketAddr) -> HealthClient<Channel> {
+    HealthClient::connect(format!("http://{reapi}"))
+        .await
+        .expect("connect to the REAPI listener")
+}
+
+/// One `Check` of `service`, failing the test if it takes longer than [`PROMPT`].
+async fn check(reapi: SocketAddr, service: &str) -> Result<ServingStatus, tonic::Status> {
+    let request = HealthCheckRequest {
+        service: service.to_owned(),
+    };
+    let mut client = health(reapi).await;
+    let answer = tokio::time::timeout(PROMPT, client.check(request))
+        .await
+        .unwrap_or_else(|_| panic!("Check({service:?}): no answer within {PROMPT:?}"))?;
+    Ok(answer.into_inner().status())
+}
+
+/// The next message of a Watch stream, failing the test if none comes within
+/// [`PROMPT`].
+async fn next_status(
+    watch: &mut (impl futures::Stream<Item = Result<HealthCheckResponse, tonic::Status>> + Unpin),
+) -> Option<Result<ServingStatus, tonic::Status>> {
+    tokio::time::timeout(PROMPT, watch.next())
+        .await
+        .expect("a Watch message within PROMPT")
+        .map(|m| m.map(|r| r.status()))
+}
+
+/// Catches: a health service that is missing from the REAPI listener, that answers
+/// SERVING whatever `/readyz` would say (here a stopping server), or that does not
+/// know the REAPI services by name. The stop signal's path to [`Readiness::stop`] is
+/// proven by the Watch test below; once the signal has come the listener refuses new
+/// calls, so this test sets the stop directly to ask Check what it then answers.
+#[tokio::test]
+async fn grpc_check_is_serving_then_not_serving_once_stopping() {
+    let server = start();
+    for service in SERVICES {
+        assert_eq!(
+            check(server.reapi, service).await.expect("Check"),
+            ServingStatus::Serving,
+            "{service:?}"
+        );
+    }
+    server.readiness.stop();
+    for service in SERVICES {
+        assert_eq!(
+            check(server.reapi, service).await.expect("Check"),
+            ServingStatus::NotServing,
+            "{service:?}"
+        );
+    }
+}
+
+/// Catches: a Check that does not ask the store (no read per call), that ignores a
+/// failing store or the scheduler role, or that stays NOT_SERVING once the fault is
+/// gone; that is, a Check that does not give `/readyz`'s answer.
+#[tokio::test]
+async fn grpc_check_follows_the_store_and_the_leader() {
+    let server = start();
+    assert_eq!(
+        check(server.reapi, "").await.expect("Check"),
+        ServingStatus::Serving
+    );
+    assert_eq!(
+        server.faults.counts(),
+        [1, 0, 0, 0],
+        "one store read per Check"
+    );
+    server.faults.set(FAILS);
+    assert_eq!(
+        check(server.reapi, "").await.expect("Check"),
+        ServingStatus::NotServing
+    );
+    server.faults.set(ANSWERS);
+    server.readiness.set_leader(false);
+    assert_eq!(
+        check(server.reapi, "").await.expect("Check"),
+        ServingStatus::NotServing
+    );
+    server.readiness.set_leader(true);
+    assert_eq!(
+        check(server.reapi, "").await.expect("Check"),
+        ServingStatus::Serving
+    );
+    assert_eq!(server.faults.counts(), [4, 0, 0, 0], "a probe never writes");
+}
+
+/// Catches: a Check of a name the listener does not serve that answers a status
+/// (the protocol says NOT_FOUND), and a List that leaves out a REAPI service.
+#[tokio::test]
+async fn grpc_check_of_an_unknown_service_is_not_found_and_list_names_every_service() {
+    let server = start();
+    let e = check(server.reapi, "kbf.worker.v1.Worker")
+        .await
+        .expect_err("not served on the REAPI listener");
+    assert_eq!(e.code(), tonic::Code::NotFound, "{e:?}");
+
+    let listed = health(server.reapi)
+        .await
+        .list(HealthListRequest {})
+        .await
+        .expect("List")
+        .into_inner()
+        .statuses;
+    let mut names: Vec<&str> = listed.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let mut want = SERVICES.to_vec();
+    want.sort_unstable();
+    assert_eq!(names, want);
+    assert!(
+        listed
+            .values()
+            .all(|r| r.status() == ServingStatus::Serving),
+        "{listed:?}"
+    );
+}
+
+/// Catches: a stop signal that does not flip the health service before the REAPI
+/// listener stops (an open Watch would see its connection drop at the shutdown
+/// timeout instead of NOT_SERVING), and a Watch that stays open while the server
+/// stops, holding the drain to its 10 s timeout: the serving future must return
+/// within [`PROMPT`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_watch_sends_not_serving_on_the_stop_signal_and_ends() {
+    let mut server = start();
+    let request = HealthCheckRequest {
+        service: String::new(),
+    };
+    let mut watch = health(server.reapi)
+        .await
+        .watch(request)
+        .await
+        .expect("Watch")
+        .into_inner();
+    let first = next_status(&mut watch).await.expect("a first message");
+    assert_eq!(first.expect("a status"), ServingStatus::Serving);
+
+    server
+        .stop
+        .take()
+        .expect("not stopped yet")
+        .send(())
+        .expect("stop");
+    let flipped = next_status(&mut watch).await.expect("a second message");
+    assert_eq!(flipped.expect("a status"), ServingStatus::NotServing);
+    let end = next_status(&mut watch).await.expect("the stream's end");
+    let e = end.expect_err("ends with a status");
+    assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+
+    let served = tokio::time::timeout(PROMPT, server.serving)
+        .await
+        .expect("the drain did not wait for the Watch");
+    served.expect("join").expect("serve");
+}
+
+/// Catches: a Watch that sends only its first status (never the store's change in
+/// either direction), that resends an unchanged status at every probe, or that
+/// answers a change of the scheduler role only at its next probe. The service is
+/// called in process with a 50 ms probe interval, so the test does not wait out the
+/// listener's [`kbf_server::grpc_health::WATCH_INTERVAL`].
+#[tokio::test]
+async fn grpc_watch_streams_each_change() {
+    let faults = Arc::new(Faults::default());
+    let store = FaultStore {
+        inner: Arc::new(MemoryStore::new(Capabilities::default())),
+        faults: Arc::clone(&faults),
+    };
+    let cache = Arc::new(Cache::new(
+        MemoryMetaLog::new(Retention::default()),
+        store,
+        KeyPrefix::new("kbf/1/").expect("a prefix"),
+        Epoch::new(1),
+    ));
+    let readiness = Arc::new(Readiness::default());
+    let service = HealthService::new(
+        cache,
+        Arc::clone(&readiness),
+        PROBE_TIMEOUT,
+        Duration::from_millis(50),
+    );
+    let request = tonic::Request::new(HealthCheckRequest {
+        service: String::new(),
+    });
+    let mut watch = Health::watch(&service, request)
+        .await
+        .expect("Watch")
+        .into_inner();
+    let status =
+        |m: Option<Result<ServingStatus, tonic::Status>>| m.expect("a message").expect("a status");
+    assert_eq!(
+        status(next_status(&mut watch).await),
+        ServingStatus::Serving
+    );
+    faults.set(FAILS);
+    assert_eq!(
+        status(next_status(&mut watch).await),
+        ServingStatus::NotServing
+    );
+    faults.set(ANSWERS);
+    assert_eq!(
+        status(next_status(&mut watch).await),
+        ServingStatus::Serving
+    );
+    // Several probes, no change: nothing is sent.
+    let quiet = tokio::time::timeout(Duration::from_millis(300), watch.next()).await;
+    assert!(
+        quiet.is_err(),
+        "an unchanged status was sent again: {quiet:?}"
+    );
+
+    // A probe interval longer than the test's bound: only the change notice can wake
+    // the stream in time.
+    let readiness = Arc::new(Readiness::default());
+    let cache = Arc::new(Cache::memory());
+    let service = HealthService::new(
+        cache,
+        Arc::clone(&readiness),
+        PROBE_TIMEOUT,
+        Duration::from_secs(3600),
+    );
+    let request = tonic::Request::new(HealthCheckRequest {
+        service: String::new(),
+    });
+    let mut watch = Health::watch(&service, request)
+        .await
+        .expect("Watch")
+        .into_inner();
+    assert_eq!(
+        status(next_status(&mut watch).await),
+        ServingStatus::Serving
+    );
+    readiness.set_leader(false);
+    assert_eq!(
+        status(next_status(&mut watch).await),
+        ServingStatus::NotServing
+    );
+    readiness.set_leader(true);
+    assert_eq!(
+        status(next_status(&mut watch).await),
+        ServingStatus::Serving
+    );
+}
+
+/// Catches: a Watch of a name the listener does not serve that ends at once or
+/// answers a status other than SERVICE_UNKNOWN (the protocol keeps it open), and
+/// one that stays open after a stop.
+#[tokio::test]
+async fn grpc_watch_of_an_unknown_service_is_service_unknown_until_the_stop() {
+    let readiness = Arc::new(Readiness::default());
+    let service = HealthService::new(
+        Arc::new(Cache::memory()),
+        Arc::clone(&readiness),
+        PROBE_TIMEOUT,
+        Duration::from_millis(50),
+    );
+    let request = tonic::Request::new(HealthCheckRequest {
+        service: "no.such.Service".to_owned(),
+    });
+    let mut watch = Health::watch(&service, request)
+        .await
+        .expect("Watch")
+        .into_inner();
+    let first = next_status(&mut watch).await.expect("a message");
+    assert_eq!(first.expect("a status"), ServingStatus::ServiceUnknown);
+    let quiet = tokio::time::timeout(Duration::from_millis(200), watch.next()).await;
+    assert!(quiet.is_err(), "the stream did not stay open: {quiet:?}");
+    readiness.stop();
+    let end = next_status(&mut watch).await.expect("the stream's end");
+    assert_eq!(
+        end.expect_err("ends with a status").code(),
+        tonic::Code::Unavailable
+    );
+    assert!(next_status(&mut watch).await.is_none());
 }
 
 /// The binary across a SIGTERM.

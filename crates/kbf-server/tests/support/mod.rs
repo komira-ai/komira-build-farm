@@ -201,7 +201,6 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
-            store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store).await;
@@ -272,6 +271,7 @@ impl Cell {
             unservable_wait: wait,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
+            store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
@@ -758,6 +758,7 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         action_result: Some(result.clone()),
         // As a daemon that predates the field sends it: the server checks no action.
         action_digest: None,
+        memory_kill: 0,
     }
 }
 
@@ -772,6 +773,7 @@ pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
         }),
         action_result: None,
         action_digest: None,
+        memory_kill: 0,
     }
 }
 

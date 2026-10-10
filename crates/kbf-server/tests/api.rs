@@ -90,6 +90,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let shutdown = async move {
@@ -98,7 +99,6 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
-        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -339,11 +339,11 @@ async fn an_api_address_in_use_is_refused() {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let api = Api {
         listen: addr,
         token: None,
-        store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {

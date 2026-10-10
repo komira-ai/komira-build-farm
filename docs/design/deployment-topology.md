@@ -192,7 +192,7 @@ The record of nodes becomes durable state in the control log:
 | Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk; `kbf-server` applies control and metadata state from it |
 | Metadata | `MemoryMetaLog`, in the server's memory; lost at restart. With `--store=s3` each start writes under a fresh key prefix | applied from the log, so a restart keeps it |
 | Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log (see [Open questions](#open-questions)) |
-| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path, and no `grpc.health.v1` service | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server ([above](#build-clients-one-name-routed-by-method)) |
+| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path. The REAPI listener serves `grpc.health.v1.Health` with `/readyz`'s answer ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)) | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server ([above](#build-clients-one-name-routed-by-method)) |
 | Reads and uploads on followers | none: one server serves every call, and the cache commits its own metadata | at three servers, any synced server serves `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and `GetActionResult` from its applied state, and writes upload bytes to the object store before sending the leader the metadata commit; a read index where a stronger guarantee is needed ([above](#reads-and-uploads-on-every-server)) |
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower answers a daemon's session with a redirect naming the leader |
 | Daemon's servers | one `--server` URL; on a broken stream the daemon waits `--reconnect-ms` and dials the same URL again | the daemon is given the servers' names and follows a redirect to the leader |
@@ -242,8 +242,10 @@ idle timeout bounds these streams the same way.
 4. **Readiness on a follower.** `/readyz` is served on the operator API listener
    ([api.md](../api.md#get-healthz-and-get-readyz)) and fails its `leader` check
    when the server's leader flag is clear; nothing clears it yet. It must clear as
-   soon as the server stops being the leader. Whether a `grpc.health.v1` service on
-   the REAPI listener is also wanted is not decided.
+   soon as the server stops being the leader. Decided: the REAPI listener also
+   serves `grpc.health.v1` (built: [api.md](../api.md#grpchealthv1-on-the-reapi-listener));
+   it gives `/readyz`'s answer, so it follows the leader flag too, and it is served
+   over the listener's TLS when `--reapi-tls-cert` and `--reapi-tls-key` are given.
 5. **The proxy-to-server hop. Decided:** it uses TLS with a certificate from the
    farm's internal CA, which clients may also use to reach a server directly
    ([above](#build-clients-one-name-routed-by-method)). The REAPI listener's TLS is

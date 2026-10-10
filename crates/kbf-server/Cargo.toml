@@ -20,6 +20,7 @@ kbf-objstore.workspace = true
 kbf-proto.workspace = true
 kbf-sched.workspace = true
 kbf-types.workspace = true
+prost.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true

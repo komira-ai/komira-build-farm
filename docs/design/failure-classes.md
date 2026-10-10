@@ -34,6 +34,23 @@ them as **open within the decision**, each with its options, pros and cons, and 
    node out of service. An Xcode left out is reported with its reason and fix,
    re-checked, and alerted.
 
+## Decisions of 2026-10-10: memory on build hosts
+
+The memory ladder of 6.1 was settled further on 2026-10-10:
+
+- **Attribution.** "Needs more memory" applies only when the lease was killed because
+  it hit its **own** memory cap. A node-wide out-of-memory kill, or the node's backstop
+  killing a lease that never hit its own cap, is the **busy node's** fault: the
+  operation is requeued with the **same** booking and the node gets a memory-pressure
+  report. That kill never raises the booking. This settles O5.
+- **The ladder.** On an own-cap kill the memory request **doubles**, bounded by the
+  largest node (live or cordoned) that fits the action, and the raised request is
+  remembered per action key; past the largest node the client is told the action needs
+  more memory than any node has. Tuning from measurements comes later. This settles
+  O7 as its leans (A, A, A).
+
+What the code does with this today is in 6.1, "What the code does today".
+
 ## 1. The classes
 
 | Class | Meaning | Whose to fix | Example |
@@ -456,6 +473,38 @@ floor** for the action's key, and later requests at that key book at least the f
   out-of-memory run per key, never a wrong answer. With the replicated control log
   (scheduler.md, "More than one server") floors are committed records like any other.
 
+**What the code does today** (`kbf_sched::MemoryRun`, the rules in
+[scheduler.md](scheduler.md#memory-kills)):
+
+- The daemon says which memory ran out in `Result.memory_kill`
+  ([worker-protocol.md](worker-protocol.md#result-and-resultack)):
+  `MEMORY_KILL_OWN_LIMIT` (the lease hit its own cap) or `MEMORY_KILL_NODE_PRESSURE`
+  (a node-wide kill below the lease's cap). The server reads it on a non-OK `Result`
+  only, as `Failure::OutOfMemory` or `Failure::NodeMemoryPressure`. **No driver sets
+  it yet**: until the container driver change that reads the lease cgroup's
+  `memory.events` lands, every memory kill still ends as in section 2, and the native
+  driver's `RESOURCE_EXHAUSTED` is still answered `INTERNAL`.
+- An own-cap kill reruns with the booking doubled in whole GiB (at least 1 GiB), never
+  past the cap: the largest live node, cordoned or not, that serves the lease kind,
+  satisfies the platform and holds the CPU and GPU request (the killed run's node
+  always counts). A kill of a run at the cap is answered as below (O1 A).
+- A busy node's kill reruns with the same booking, counts against the node
+  (`Scheduler::memory_pressure`, and a warning on the `kbf_server::attention` log
+  target), and never raises the booking or a floor. It uses the farm budget:
+  `FARM_RERUNS` = 2 reruns (3 runs), then `INTERNAL` naming the node.
+- **The budgets do not mix** (O7 A, bound): the ladder never counts against the farm
+  reruns and busy-node kills never count as rungs, so neither can starve the other. An
+  operation runs at most `1 + ceil(log2(cap / first booking)) + 2` times. The excluded
+  nodes of 6.5 are not built: a busy node's rerun may land on the same node.
+- **The action key** (O2, still open) is today the scheduler's dedup key, the instance
+  name and action digest. A floor therefore helps every later run of the same digest
+  (a rebuild after a cache miss, a client retry), not yet the next commit's new digest;
+  a key that survives a code change (O2 A or B) is a follow-up.
+- **Floors** (O3, still open) never fall and are not decayed; they live in the
+  scheduler's memory (a restart forgets them) and at most 65 536 are kept, the one
+  raised longest ago forgotten first. There is no over-cap memo (O4): a repeat starts
+  at its floor, the cap, and runs once (O4 C's behaviour).
+
 **When the cap is not enough.** A kill at the cap is the action's (decided). Its
 `status.message` carries the text of section 5 and the last run's stderr tail goes
 into `server_logs`; the status code is open (O1).
@@ -528,7 +577,8 @@ rebuild of the same digest would climb the ladder again.
 
 **Lean: A**, sharing the 6.5 memo's clearing rules.
 
-**O5, open: a kill below the run's own booking.** A run killed while using less than it
+**O5, decided 2026-10-10: a kill below the run's own limit** is the busy node's
+(above). The options as they were drafted: A run killed while using less than it
 booked means the node ran out, not the action.
 
 - **A. Count it as a farm fault on that node** (section 8's alert). Pro: finds nodes
@@ -539,7 +589,8 @@ booked means the node ran out, not the action.
 
 **Lean: A** where the peak is measured, B elsewhere.
 
-**O7, open: the ladder's step, cap and bound.** The decision fixes that the ask is
+**O7, decided 2026-10-10 as its leans: the ladder's step, cap and bound.** The
+options as they were drafted: The decision fixes that the ask is
 raised, bounded, and stops at the largest node; not by how much each rung raises it,
 which nodes set the cap, or how the ladder counts.
 
@@ -682,7 +733,8 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
   given up for silence, replacement, reconnection or not starting (`requeue.rs`) are
   not results and do not use the budget, as today; bounding those is a separate
   question (#22). Out-of-memory reruns have their own bound, the ladder of 6.1, and
-  do not use this budget either (the lean of 6.1, O7).
+  do not use this budget either (decided 2026-10-10). Today the budget is built for one
+  Farm result only, a busy node's memory kill (`FARM_RERUNS`, 6.1).
 - **Excluded nodes.** The operation records the nodes whose runs ended Farm or
   Ambiguous and is not placed on them again. If no node outside that set can serve it,
   the answer is given at once, by the class of the last run, with no wait.

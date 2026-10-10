@@ -8,6 +8,9 @@ use clap::Parser;
 use futures::channel::mpsc::unbounded;
 use kbf_auth::Policy;
 use kbf_front::Cache;
+use kbf_proto::grpc::health::v1::HealthCheckRequest;
+use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
+use kbf_proto::grpc::health::v1::health_client::HealthClient;
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_proto::worker::{
@@ -291,6 +294,60 @@ async fn the_auth_policy_applies_on_the_tls_reapi_listener() {
         .expect_err("a denied call was answered over TLS");
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
     assert_eq!(status.message(), "no TLS callers");
+}
+
+/// Calls `grpc.health.v1.Health/Check` for the server as a whole on `endpoint`, and
+/// returns its status, or `None` if the call was not answered.
+async fn health_checked(endpoint: Endpoint) -> Option<ServingStatus> {
+    let channel = endpoint.connect().await.ok()?;
+    let request = HealthCheckRequest {
+        service: String::new(),
+    };
+    let answer = tokio::time::timeout(Duration::from_secs(10), {
+        let mut client = HealthClient::new(channel);
+        async move { client.check(request).await }
+    })
+    .await
+    .ok()?
+    .ok()?;
+    Some(answer.into_inner().status())
+}
+
+/// Catches: the health service served off the REAPI TLS configuration (a server
+/// builder of its own, say: the TLS client would not be answered and the plain-text
+/// client would be), and the authentication layer applied to the health service as
+/// well when the listener serves TLS (the policy denies every call, so the Check
+/// would be refused `UNAUTHENTICATED` instead of answered `SERVING`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_health_check_is_served_over_the_tls_reapi_listener() {
+    let pki = pki("reapi-health");
+    let listeners = reapi_tls_args(&pki, "server.pem", "server.key")
+        .listeners()
+        .expect("listeners");
+    let policy = Policy::from_json(r#"{"authenticationPolicy": {"deny": "no TLS callers"}}"#)
+        .expect("a policy");
+    let bound = bind_server_with_policy(
+        Arc::new(Cache::memory()),
+        listeners,
+        None,
+        policy,
+        pending(),
+    )
+    .expect("bind");
+    let addr = bound.reapi;
+    tokio::spawn(async move { bound.serving.await.expect("serve") });
+
+    assert_eq!(
+        health_checked(reapi_tls_endpoint(addr, &pki)).await,
+        Some(ServingStatus::Serving),
+        "a TLS health check was not answered SERVING"
+    );
+    let plain = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+    assert_eq!(
+        health_checked(plain).await,
+        None,
+        "a plain-text health check was answered on the TLS listener"
+    );
 }
 
 /// Catches: a REAPI listener that wants TLS when no REAPI TLS flag is given; plain

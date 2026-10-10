@@ -1,5 +1,6 @@
 //! The REAPI listener's policy (`--reapi-auth-policy`, `docs/reapi-auth.md`) on a whole
-//! server: it reaches the REAPI listener, and only that listener.
+//! server: it reaches the REAPI listener, and only that listener, and not the
+//! listener's `grpc.health.v1` service.
 
 mod support;
 
@@ -13,6 +14,11 @@ use kbf_auth::{AuthenticationMetadata, Authorizer, Authorizers, Policy};
 use kbf_front::Cache;
 use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use kbf_proto::google::longrunning::GetOperationRequest;
+use kbf_proto::google::longrunning::operations_client::OperationsClient;
+use kbf_proto::grpc::health::v1::HealthCheckRequest;
+use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;
+use kbf_proto::grpc::health::v1::health_client::HealthClient;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_proto::reapi::{GetCapabilitiesRequest, WaitExecutionRequest};
 use kbf_server::{Args, Bound, ConfigError, bind_server_with_policy};
@@ -109,6 +115,50 @@ async fn the_policy_file_runs_on_the_reapi_listener_alone() {
         .expect_err("plain text refuses blob calls");
     assert_eq!(e.code(), Code::Unauthenticated);
     assert!(e.message().contains("mutual TLS"), "{e:?}");
+}
+
+/// Catches: a policy that blocks the REAPI listener's health service (a proxy's
+/// health check carries no credentials, so every server would look down), and a
+/// change that, to exempt it, also leaves calls of unknown paths unauthenticated:
+/// `google.longrunning.Operations` is not served on the REAPI listener, and under a
+/// deny policy it is refused UNAUTHENTICATED, not answered UNIMPLEMENTED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_checks_are_answered_whatever_the_policy() {
+    let path = policy_file(
+        "deny-health",
+        r#"{"authenticationPolicy": {"deny": "no REAPI callers today"}}"#,
+    );
+    let args = args(&["--reapi-auth-policy", path.to_str().expect("UTF-8 path")]);
+    let (reapi, _) = serve(&args, args.reapi_auth_policy().expect("a policy"));
+
+    let e = capabilities(reapi).await.expect_err("refused");
+    assert_eq!(e.code(), Code::Unauthenticated);
+    let mut health = HealthClient::connect(format!("http://{reapi}"))
+        .await
+        .expect("connect");
+    let answer = health
+        .check(HealthCheckRequest::default())
+        .await
+        .expect("Check is not authenticated")
+        .into_inner();
+    assert_eq!(answer.status(), ServingStatus::Serving);
+    let mut watch = health
+        .watch(HealthCheckRequest::default())
+        .await
+        .expect("Watch is not authenticated")
+        .into_inner();
+    let first = watch.message().await.expect("a message").expect("a status");
+    assert_eq!(first.status(), ServingStatus::Serving);
+
+    let e = OperationsClient::connect(format!("http://{reapi}"))
+        .await
+        .expect("connect")
+        .get_operation(GetOperationRequest {
+            name: "operations/x".to_owned(),
+        })
+        .await
+        .expect_err("refused");
+    assert_eq!(e.code(), Code::Unauthenticated, "{e:?}");
 }
 
 /// Catches: a server without `--reapi-auth-policy` that refuses anything (the

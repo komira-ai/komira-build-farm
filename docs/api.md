@@ -2,7 +2,8 @@
 
 `kbf-server` serves an HTTP/JSON API under `/v1` for the Fleet UI, scripts and
 clients ([fleet-updates.md](design/fleet-updates.md) section 11.4), and
-[`/healthz` and `/readyz`](#get-healthz-and-get-readyz) for a front's health check. It listens on its
+[`/healthz` and `/readyz`](#get-healthz-and-get-readyz) for a front's health check (the REAPI
+listener answers the same readiness over [`grpc.health.v1`](#grpchealthv1-on-the-reapi-listener)). It listens on its
 own address, given with `--api-listen`; without the flag there is no API. The start
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
@@ -166,10 +167,43 @@ otherwise; the body lists each failing check and why:
 |---|---|
 | `stopping` | the server has received SIGTERM or SIGINT. It answers `503` from that moment, before its REAPI streams are ended, and for the rest of its drain (`--shutdown-timeout-secs`) |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
-| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
+| `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
 makes one read of the store, so poll it at the interval the front needs, not faster.
+
+## `grpc.health.v1` on the REAPI listener
+
+For a proxy that health-checks its backends over gRPC (Envoy's `grpc_health_check`, a
+gRPC load balancer), the REAPI listener (`--listen`) serves the standard
+[gRPC health checking protocol](https://github.com/grpc/grpc-proto/blob/master/grpc/health/v1/health.proto),
+`grpc.health.v1.Health`, whether or not `--api-listen` is given, and over the
+listener's TLS when `--reapi-tls-cert` and `--reapi-tls-key` are given. Its answer is
+`/readyz`'s: `SERVING` when every check of the [table above](#get-healthz-and-get-readyz)
+passes, `NOT_SERVING` when one fails. It gives no reason; `/readyz` names the failing
+checks.
+
+It answers for these service names, all with the same status: `""` (the server as a
+whole), `build.bazel.remote.execution.v2.Capabilities`,
+`build.bazel.remote.execution.v2.ContentAddressableStorage`,
+`google.bytestream.ByteStream`, `build.bazel.remote.execution.v2.ActionCache` and
+`build.bazel.remote.execution.v2.Execution`.
+
+| Method | Answer |
+|---|---|
+| `Check` | the status, after one store probe (as one `/readyz`). Another service name is `NOT_FOUND` |
+| `List` | every name above with the status, after one store probe |
+| `Watch` | the status at once, then each time it changes. It evaluates again as soon as a stop signal arrives or the scheduler role changes, and probes the store every 5 s. Once the server is stopping it sends `NOT_SERVING` (if that was not its last message) and ends the stream `UNAVAILABLE`, so an open Watch does not hold up the drain. Another service name is sent `SERVICE_UNKNOWN`, and the stream stays open until the server stops |
+
+On SIGTERM or SIGINT the status turns `NOT_SERVING` before the REAPI streams are
+ended and the listener stops accepting. After that the listener takes no new calls,
+so a `Check` during the drain fails or times out instead of answering; either way the
+proxy marks the server down.
+
+The REAPI authentication policy (`--reapi-auth-policy`, [reapi-auth.md](reapi-auth.md))
+does not run on these calls: a health check needs no credentials, whatever the policy.
+Every other call on the listener, a path it does not serve included, still runs it.
+The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
 
 ## Planned
 
