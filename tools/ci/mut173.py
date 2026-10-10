@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Run from the checkout root.
 """Mutants for PR #173: each is an exact replacement that must match once; runs the
 given cargo command, records the failing tests, restores the file."""
 import subprocess, sys, re, pathlib
