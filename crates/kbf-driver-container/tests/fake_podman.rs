@@ -3,6 +3,7 @@
 //! mount. These run on any Linux machine; `podman.rs` runs the same promises against
 //! real rootless Podman.
 
+mod fake_memory;
 mod support;
 
 use std::path::{Path, PathBuf};

@@ -3,16 +3,20 @@
 //! the action script writes the lease cgroup's `memory.events`, `memory.current` and
 //! `memory.swap.current` as the kernel would. `podman_memory.rs` runs the same promises
 //! against a real kernel.
-
-mod support;
+//!
+//! A module of `fake_podman.rs`, not a test binary of its own. The coverage job counts
+//! the lines of the driver's generic `PodmanRuntime` per build of it; split across two
+//! test binaries, the swap watch's paths (run here) and the timeout and kill paths (run
+//! in `fake_podman.rs`) each counted as missed in the other binary's build.
 
 use std::time::{Duration, Instant};
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_container::SwapKill;
 use kbf_types::Resources;
-use support::fake::{Fake, image};
-use support::{Spec, store_action, work};
+
+use crate::support::fake::{Fake, image};
+use crate::support::{Spec, store_action, work};
 
 /// The cap `Fake::run`'s 1 GiB booking gets: 1.5 GiB + 512 MiB.
 const CAP: u64 = (3 << 29) + (512 << 20);
