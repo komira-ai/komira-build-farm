@@ -235,15 +235,6 @@ impl<R: Runtime> Daemon<R> {
             return Err(ConfigError::NoServer);
         }
         let tls = config.tls.load()?;
-        // A URL the transport refuses fails here, not on every attempt.
-        for server in &servers {
-            Endpoint::from_shared(server.url.clone())
-                .and_then(|e| e.tls_config(tls.clone()))
-                .map_err(|source| ConfigError::Server {
-                    url: server.url.clone(),
-                    source,
-                })?;
-        }
         let (done_tx, done) = mpsc::unbounded_channel();
         let contact = Contact::new(config.fence_after);
         Ok(Self {
@@ -407,12 +398,8 @@ impl<R: Runtime> Daemon<R> {
         if self.config.tls.server_name.is_none() {
             tls = tls.domain_name(target.server.host.clone());
         }
-        let origin =
-            target.server.url.parse().map_err(|_| {
-                SessionError::Protocol(format!("server URL {:?}", target.server.url))
-            })?;
         Ok(Endpoint::from_shared(format!("https://{}", target.addr))?
-            .origin(origin)
+            .origin(target.server.uri.clone())
             .tls_config(tls)?)
     }
 

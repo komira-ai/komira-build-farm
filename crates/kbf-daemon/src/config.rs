@@ -106,12 +106,6 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("server URL {url:?}: {source}")]
-    Server {
-        url: String,
-        #[source]
-        source: tonic::transport::Error,
-    },
     #[error("server URL {0:?} is not https; the daemon connects only over mutual TLS")]
     NotHttps(String),
     #[error("server URL {url:?}: {reason}")]

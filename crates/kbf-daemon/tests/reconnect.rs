@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use kbf_daemon::config::ConfigError;
 use kbf_daemon::connect::Resolve;
 use kbf_daemon::{Daemon, DaemonConfig, Event, FakeRuntime, NodeReport};
 use support::{PROMPT, Peer, Pki, pki, serve_unavailable, serve_worker};
@@ -125,9 +126,11 @@ impl Running {
         }
     }
 
-    /// Every `Retrying` wait until the `rounds`th failed round in a row.
+    /// The waits of the next `rounds` `Retrying` events, checking that they count
+    /// the failed rounds one by one.
     async fn retried(&mut self, rounds: u32, within: Duration) -> Vec<Duration> {
         let mut waits = Vec::new();
+        let mut previous = None;
         while waits.len() < rounds as usize {
             let (n, wait) = self
                 .event(within, |e| match e {
@@ -140,7 +143,10 @@ impl Running {
                 .await
                 .unwrap_or_else(|| panic!("the daemon stopped retrying after {waits:?}"));
             waits.push(wait);
-            assert_eq!(n as usize, waits.len(), "rounds counted one by one");
+            if let Some(previous) = previous {
+                assert_eq!(n, previous + 1, "rounds counted one by one");
+            }
+            previous = Some(n);
         }
         waits
     }
@@ -247,17 +253,28 @@ async fn every_address_of_a_name_is_tried_in_turn() {
 }
 
 /// Catches: a daemon that resolves its servers' names once, at start (a server that
-/// moved, or came up under the name later, is never reached without a restart).
+/// moved, or came up under the name later, is never reached without a restart), and
+/// a name that resolves to nothing not reported as a failed attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_round_resolves_the_names_again() {
     let pki = pki("reconnect-resolve");
-    let dead: SocketAddr = format!("127.0.0.1:{}", dead_port()).parse().expect("addr");
-    let resolver = Switchable::new(vec![dead]);
+    let resolver = Switchable::new(Vec::new());
     let urls = ["https://farm.test:7070".to_owned()];
     let resolve: Arc<dyn Resolve> = resolver.clone();
     let ms = Duration::from_millis;
     let mut d = Running::start(&pki, &urls, ms(5), ms(20), Some(resolve), true);
-    d.retried(3, PROMPT).await;
+    let failure = d
+        .event(PROMPT, |e| match e {
+            Event::ConnectFailed { server, reason } => Some(format!("{server}: {reason}")),
+            _ => None,
+        })
+        .await
+        .expect("a name with no address is reported");
+    assert_eq!(failure, "https://farm.test:7070: resolved to no address");
+    d.retried(2, PROMPT).await;
+    let dead: SocketAddr = format!("127.0.0.1:{}", dead_port()).parse().expect("addr");
+    resolver.set(vec![dead]);
+    d.retried(2, PROMPT).await;
 
     let (listener, addr) = listener().await;
     let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
@@ -327,4 +344,22 @@ async fn a_session_resets_the_wait() {
         ended.elapsed()
     );
     server.abort();
+}
+
+/// Catches: a daemon built with no server to dial (it would spin through empty rounds
+/// for ever), or with a plain-text URL among several.
+#[test]
+fn a_daemon_needs_https_servers() {
+    let pki = pki("reconnect-config");
+    let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
+    let report = NodeReport::new([("cpus", "1"), ("drivers", "fake"), ("mem_gib", "1")]);
+    let build = |servers: &[&str]| {
+        let mut config = DaemonConfig::new(String::new(), pki.client.clone(), "node-1".into());
+        config.servers = servers.iter().map(|s| (*s).to_owned()).collect();
+        Daemon::new(config, Arc::clone(&runtime), report.clone()).err()
+    };
+    assert!(matches!(build(&[]), Some(ConfigError::NoServer)));
+    let mixed = build(&["https://a.test:1", "http://b.test:1"]);
+    assert!(matches!(mixed, Some(ConfigError::NotHttps(url)) if url == "http://b.test:1"));
+    assert!(build(&["https://a.test:1", "https://b.test:1"]).is_none());
 }

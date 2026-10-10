@@ -40,11 +40,12 @@ pub const RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// While connection attempts keep failing, at most one is logged at WARN this often.
 pub const WARN_EVERY: Duration = Duration::from_secs(60);
 
-/// One `--server` URL: an `https` URL, its host (an address or a DNS name, without
-/// the brackets of an IPv6 address) and its port (443 when the URL names none).
+/// One `--server` URL: an `https` URL, parsed, its host (an address or a DNS name,
+/// without the brackets of an IPv6 address) and its port (443 when the URL names none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Server {
     pub url: String,
+    pub uri: Uri,
     pub host: String,
     pub port: u16,
 }
@@ -65,17 +66,20 @@ impl Server {
             .host()
             .filter(|h| !h.is_empty())
             .ok_or_else(|| bad("no host"))?;
-        if uri.path() != "/" && !uri.path().is_empty() {
+        if !matches!(uri.path(), "" | "/") {
             return Err(bad("a server URL names no path"));
         }
         let host = host
             .strip_prefix('[')
             .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host);
+            .unwrap_or(host)
+            .to_owned();
+        let port = uri.port_u16().unwrap_or(443);
         Ok(Self {
             url: url.to_owned(),
-            host: host.to_owned(),
-            port: uri.port_u16().unwrap_or(443),
+            uri,
+            host,
+            port,
         })
     }
 }
@@ -313,7 +317,7 @@ mod tests {
         assert_eq!(b.failed(0.0), ms(100), "the count started over");
         // Jitter takes off up to half: the second round's 200 ms, nearly halved.
         let low = b.failed(0.999_999);
-        assert!(low >= ms(100) && low < ms(101), "{low:?}");
+        assert!((ms(100)..ms(101)).contains(&low), "{low:?}");
         assert_eq!(Backoff::new(ms(100), ms(1000)).failed(0.5), ms(75));
         // A maximum below the base is the base.
         assert_eq!(Backoff::new(ms(100), ms(10)).failed(0.0), ms(100));
@@ -390,9 +394,19 @@ mod tests {
         }
     }
 
+    /// A resolver that never answers.
+    struct Silent;
+
+    impl Resolve for Silent {
+        fn resolve(&self, _: String, _: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     /// Catches: an address two names share tried twice in a round, a name that fails
-    /// to resolve not reported (or taken for an empty round silently), and the
-    /// system resolver not taking an address literal.
+    /// to resolve, resolves to nothing or gets no answer not reported (or a resolver
+    /// that never answers stalling the round), and the system resolver not taking an
+    /// address literal.
     #[tokio::test]
     async fn every_name_is_resolved_and_each_address_kept_once() {
         let servers = [
@@ -423,6 +437,24 @@ mod tests {
         assert!(targets.is_empty());
         assert_eq!(failed.len(), 2);
         assert!(failed[0].1.contains("no such host"), "{failed:?}");
+
+        let empty: Arc<dyn Resolve> = Arc::new(Fixed(Ok(Vec::new())));
+        let (targets, failed) = resolve_all(&empty, &servers[..1], Duration::from_secs(1)).await;
+        assert!(targets.is_empty());
+        assert_eq!(
+            failed,
+            [(
+                "https://a.test:1".to_owned(),
+                "resolved to no address".to_owned()
+            )]
+        );
+
+        let silent: Arc<dyn Resolve> = Arc::new(Silent);
+        let (targets, failed) =
+            resolve_all(&silent, &servers[..1], Duration::from_millis(10)).await;
+        assert!(targets.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].1.contains("no answer within 10ms"), "{failed:?}");
 
         let system: Arc<dyn Resolve> = Arc::new(SystemResolver);
         let literal = [Server::parse("https://127.0.0.1:7070").expect("literal")];
