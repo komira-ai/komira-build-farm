@@ -52,7 +52,9 @@ Set `--actions-memory-max-gib` to the host's RAM minus 4 to 8 GiB: on a 256 GiB 
 248 to 252. The rest stays for the kernel, systemd, sshd, the daemon (whose own
 `memory.min` sits outside `actions/`) and Podman's processes. The node reports the
 lower of this cap and its memory as `mem_gib`, so the scheduler books no more than
-leases may use.
+leases may use. On a host that also runs a `kbf-server` and a node of the object
+store (the [converged topology](../design/deployment-topology.md#converged-topology)),
+also subtract what those two use at their peak.
 
 ### CPUs: uncapped
 

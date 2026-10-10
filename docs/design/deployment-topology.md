@@ -12,13 +12,18 @@ availability (three servers) every server serves the read path and accepts uploa
 bytes, and one of them, the leader, does everything else: every metadata write,
 `Execute` and `WaitExecution`, scheduling and the daemons' worker streams.
 
+The preferred layout gives each role its own hosts: servers on storage hosts, build
+work on build hosts. Servers, the object store and daemons may also share the same
+hosts; that [converged topology](#converged-topology) is supported too.
+
 ## The shape
 
 ```
  build clients (Bazel, Buck2)                     worker nodes (kbf-daemon)
           |                                                 |
           | REAPI over TLS, to one constant name            | kbf.worker.v1 over mutual TLS,
-          v                                                 | straight to the servers' names
+          v                                                 | straight to the servers (one
+                                                            | DNS name or a list)
  +------------------------------+                           | (never through the front)
  | tailnet ingress              |                           |
  | constant name, automatic     |                           |
@@ -33,7 +38,7 @@ bytes, and one of them, the leader, does everything else: every metadata write,
  |    ready to serve reads      |                           |
  |  everything else -> leader   |                           |
  +------------------------------+                           |
-          | plain gRPC                                      |
+          | gRPC over TLS (internal CA)                     |
           v                                                 v
  +------------------+   +------------------+   +------------------+
  | storage host A   |   | storage host B   |   | storage host C   |
@@ -59,11 +64,12 @@ Today only host A's role exists, in one process, with its state in memory (see
 [Built and planned](#built-and-planned)). The first deployment (v0) is that single
 server; the split between reads and the leader applies from three servers on.
 
-### Servers on dedicated storage hosts
+### Servers on storage hosts
 
-Each `kbf-server` runs on a dedicated storage host with a fixed address and a stable
-DNS name. Worker nodes do not run servers. The set of servers changes only when an
-operator changes it.
+Each `kbf-server` runs on a storage host with a fixed address and a stable DNS name.
+In the preferred layout these hosts are dedicated: build hosts run daemons and no
+server. The [converged topology](#converged-topology) runs both on the same hosts.
+The set of servers changes only when an operator changes it.
 
 ### Durable state: a Raft log on local disk
 
@@ -80,6 +86,13 @@ the action cache, farm time) are applied from a Raft log
   other client call and no daemon session, and it takes over when it is elected. The
   voter set grows from one to three through learners (add a learner, let it catch up,
   promote it), one server at a time.
+
+- **Snapshots go to the object store too.** Each snapshot of the log is written on
+  the server's local disk and also copied to the object store, so a host whose disk is
+  lost can be rebuilt from the newest snapshot there. With a single voter this is what
+  stands between a lost disk and a lost farm state: what the log committed after the
+  newest copied snapshot is still lost with the disk. With three voters a replacement
+  catches up from the leader as a learner, and the copy is a further backstop.
 
 Blob bytes stay in the object store, as today ([storage.md](storage.md)).
 
@@ -116,6 +129,12 @@ open question, followers and blob traffic; the maintainers decided it on 2026-10
   - where a stronger guarantee is needed, a follower first asks the leader for its
     commit index and waits until it has applied up to it (a read index), then answers.
 
+- **Daemons' blob reads too.** A daemon's input reads go to any server, not only the
+  leader: the daemon spreads its `ByteStream.Read` calls across every server it is
+  given, on each server's worker listener ([below](#daemons-straight-to-the-servers-one-stream-to-the-leader)).
+  The same staleness rule holds for them. A daemon's output writes are upload bytes,
+  and follow the upload rule above.
+
 ### Build clients: one name, routed by method
 
 Bazel and Buck2 are configured with one remote address, and Buck2 sends everything to
@@ -139,32 +158,59 @@ it, so the farm must look like one endpoint.
     server that holds the leader role, for writes and `Execute`.
 
   The second path's name is not chosen. A server stops being ready to serve reads
-  when it falls behind or loses touch with the leader.
-- **`kbf-server` serves plain-text gRPC behind the front**, as the
-  [Security model](../../ARCHITECTURE.md#security-model) already describes. TLS is the
-  front's job.
+  when it falls behind or loses touch with the leader. A server's `leader` check
+  fails as soon as it stops being the leader, not at its next election.
+- **`grpc.health.v1` on the REAPI listener.** Beside the two readiness paths, each
+  server serves the standard gRPC health service on its REAPI listener, so a proxy
+  can health-check a server over gRPC on the port it routes to. Its answers follow
+  the two readiness paths, ready to serve reads and leader; which service name
+  reports which is not chosen.
+- **TLS on the proxy-to-server hop, with an internal certificate.** The proxy and
+  the servers may be on different machines, so the hop between them is encrypted:
+  `kbf-server` serves its REAPI listener over TLS with a certificate issued by an
+  internal certificate authority, and the proxy verifies it against that authority
+  (issue [#226](https://github.com/komira-ai/komira-build-farm/issues/226)). A client
+  on the same private network may also dial a server directly over that TLS,
+  trusting the same authority. That is adequate for a private network; it is not
+  the client-facing front, whose certificate is the ingress's. Who may call is
+  still decided by the REAPI authentication policy
+  ([reapi-auth.md](../reapi-auth.md)), not by the TLS.
 
 ### Daemons: straight to the servers, one stream to the leader
 
 Daemons do not go through the client front.
 
-- A daemon knows the servers' DNS names and dials them directly, over the worker
-  listener's mutual TLS ([worker-protocol.md](worker-protocol.md)).
+- **How a daemon is given the servers.** Either one DNS name with an address record
+  per server, or a list of addresses (or names). The daemon dials them directly,
+  over the worker listener's mutual TLS ([worker-protocol.md](worker-protocol.md)).
 - It holds **one** worker stream, to the leader.
-- A follower that receives a daemon's session does not serve it: it answers with a
-  redirect naming the leader, and the daemon dials that server.
-- **On failover** the stream to the old leader ends. The daemon reconnects, reaches
-  the new leader (directly, or through a follower's redirect), and registers again.
-  Lease ids carry the granting server's term, and the scheduler refuses results from
-  leases it does not hold, so leases a stale leader granted cannot be confused with
-  the new leader's (issues
-  [#137](https://github.com/komira-ai/komira-build-farm/issues/137) and
+- **The redirect.** A follower that receives a daemon's session does not serve it:
+  it ends the `Session` stream with a status that names the leader, and the daemon
+  dials that server. A follower that knows no leader (an election in progress) has
+  nothing to name: it answers `UNAVAILABLE`, and the daemon tries the next server.
+- **Retry forever.** A daemon never gives up on the farm. When a dial fails, a
+  stream ends, or no server names a leader, it tries the next server, and after a
+  pass over all of them it waits and starts again, with a backoff that grows to a
+  bound and stays there. Only a stop signal ends the daemon.
+- **A failover keeps running leases.** `Welcome.epoch` names the replicated log,
+  which outlives leaders and their terms, so a change of leader does not change the
+  epoch, and the daemon keeps its running leases. It reconnects, reaches the new
+  leader (directly, or through a follower's redirect), registers again, and resends
+  the results the old leader did not acknowledge; the new leader knows the committed
+  grants from the log and accepts them. Lease ids carry the granting leader's term,
+  and the scheduler refuses results from leases it does not hold, so a lease a stale
+  leader granted but never committed cannot be confused with the new leader's
+  (issues [#137](https://github.com/komira-ai/komira-build-farm/issues/137) and
   [#140](https://github.com/komira-ai/komira-build-farm/issues/140); see
-  [scheduler.md](scheduler.md#leases)).
+  [scheduler.md](scheduler.md#leases)). A restart of a single server keeps its
+  leases the same way once its log is on disk.
 - While no stream is acknowledged, the daemon's fence clock runs as it does today:
   self-fenced work stops T = 40 s after the newest acknowledged heartbeat was sent. A
   failover that takes longer than that, from the daemon's point of view, stops its
   self-fenced work.
+- **Blob calls on every server.** A daemon's blob calls go to the worker listeners
+  of all the servers it is given, not only the leader's; its reads are spread across
+  them ([above](#reads-and-uploads-on-every-server)).
 
 ### A durable node registry
 
@@ -176,28 +222,54 @@ The record of nodes becomes durable state in the control log:
 - a node that reconnects recovers its place: its report, labels and placement state
   (cordoned, draining) are as they were.
 
+## Converged topology
+
+Servers, the object store and daemons may run on the same hosts: each host runs a
+`kbf-server`, a node of the object store and a `kbf-daemon`. This is a supported
+topology, not only a stopgap; the layout with dedicated roles above is preferred,
+because there a runaway build cannot press on the farm's state. What changes:
+
+- **The memory split.** On a dedicated build host, `--actions-memory-max-gib` is the
+  host's RAM minus 4 to 8 GiB ([linux-build-host.md](../deploy/linux-build-host.md#headroom---actions-memory-max-gib)).
+  On a converged host it must also leave room for the object store's node and
+  `kbf-server`: RAM minus what those two use at their peak, minus the same headroom
+  for the OS and the daemon. The cap is set per host. The node reports the lower of
+  this cap and its memory, so the scheduler books only what builds may use.
+- **The Raft log on its own partition.** The log's disk is not shared with build
+  scratch, swap or the object store's data, so builds that fill a disk cannot stop
+  the log from being written, and the log's writes to disk do not queue behind
+  build I/O.
+- **What else changes against dedicated roles.** A host's failure takes a server, a
+  share of the object store and a worker at once, so the three-server shape needs
+  three converged hosts to keep a quorum through one loss. Placement may put work on
+  the leader's host; the leader's own processes are protected only by the memory
+  split above. Everything else is the same: the client front, the daemons' direct
+  dials, the redirect, the readiness paths and the read path do not depend on which
+  host runs what.
+
 ## Built and planned
 
 | Part | Today (on `main`) | Planned |
 |---|---|---|
-| Servers | one `kbf-server` process runs every role (`--role=all`) | one server per dedicated storage host; three for HA |
+| Servers | one `kbf-server` process runs every role (`--role=all`) | one server per storage host, dedicated or [converged](#converged-topology); three for HA |
 | Raft core | `kbf-raft`: a sans-IO core with election, replication, commit and learners; a single voter elects itself and commits alone (`crates/kbf-raft/tests/scripted.rs`); simulated with 3 voters and a learner. Snapshots, membership changes, PreVote and CheckQuorum are not built | the same core, with snapshots and single-server membership changes |
-| Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk; `kbf-server` applies control and metadata state from it |
+| Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk, snapshots also copied to the object store; `kbf-server` applies control and metadata state from it |
 | Metadata | `MemoryMetaLog`, in the server's memory; lost at restart. With `--store=s3` each start writes under a fresh key prefix | applied from the log, so a restart keeps it |
-| Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log (see [Open questions](#open-questions)) |
-| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path, and no `grpc.health.v1` service | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server ([above](#build-clients-one-name-routed-by-method)) |
+| Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log, and `Welcome.epoch` names the log, so a failover keeps running leases and daemons resend their results to the new leader ([above](#daemons-straight-to-the-servers-one-stream-to-the-leader)) |
+| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path, and no `grpc.health.v1` service | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server; `grpc.health.v1` on the REAPI listener with the same two answers ([above](#build-clients-one-name-routed-by-method)) |
 | Reads and uploads on followers | none: one server serves every call, and the cache commits its own metadata | at three servers, any synced server serves `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and `GetActionResult` from its applied state, and writes upload bytes to the object store before sending the leader the metadata commit; a read index where a stronger guarantee is needed ([above](#reads-and-uploads-on-every-server)) |
-| Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower answers a daemon's session with a redirect naming the leader |
-| Daemon's servers | one `--server` URL; on a broken stream the daemon waits `--reconnect-ms` and dials the same URL again | the daemon is given the servers' names and follows a redirect to the leader |
+| Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower ends a daemon's session with a status naming the leader; one that knows no leader answers `UNAVAILABLE` |
+| Daemon's servers | one `--server` URL; whenever a session ends the daemon waits `--reconnect-ms` (a fixed wait, default 1000) and dials the same URL again, without end | one DNS name with a record per server, or a list; the daemon tries the next server on `UNAVAILABLE` or a failed dial, follows a redirect to the leader, and retries forever with a bounded backoff |
+| Proxy-to-server hop | the REAPI listener serves plain text only | TLS with a certificate from an internal CA (#226), which clients on the private network may also use to reach a server directly |
 | Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)); it routes by nothing, as there is one server | a tailnet ingress and an HTTP/2 proxy that routes by gRPC method, after the probes below pass |
 | Node registry | in the server's memory: a node whose stream closed stays listed with `connected: false` until the server restarts, and gets no work once it has not been heard from for G; a restart forgets every node. `kbf-alert` exists, but nothing raises alerts yet | durable, as [above](#a-durable-node-registry) |
-| Daemons' blobs | the drivers read and write blobs with `ByteStream` on the mutual-TLS worker listener (`--cas`, `https://` only), each call checked against the node certificate and the deny list; daemons need no path through the front ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)) | the same, on the leader's worker listener |
+| Daemons' blobs | the drivers read and write blobs with `ByteStream` on the mutual-TLS worker listener (`--cas`, `https://` only), each call checked against the node certificate and the deny list; daemons need no path through the front ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)) | the same, on the worker listener of every server: reads spread across all of them ([above](#reads-and-uploads-on-every-server)) |
 
 ## Probes before relying on the front
 
 The ingress and proxy pair is not proven. Each of these must pass through the real
-pair (ingress, then proxy, then a plain-text REAPI listener), as the `tailscale serve`
-probe did for its front:
+pair (ingress, then proxy, then a REAPI listener: plain text today, TLS once #226 is
+built), as the `tailscale serve` probe did for its front:
 
 1. **A Buck2 remote-only build** gets through capabilities, uploads, Execute and
    results.
@@ -214,33 +286,16 @@ the unservable wait, 300 s by default, for work no live node can run) or its who
 run (the container driver's default action timeout is one hour). The ingress's own
 idle timeout bounds these streams the same way.
 
-## Open questions
+## Decided questions
 
-1. **What a failover keeps.** [worker-protocol.md](worker-protocol.md#server-restarts-and-the-lease-epoch)
-   plans for `Welcome.epoch` to name the replicated log, which outlives leaders, so a
-   change of leader drops nothing: a daemon keeps its running leases and resends
-   their results to the new leader, which knows the committed grants from the log.
-   The alternative is for the epoch to name the leader's term, so every failover
-   drops every running lease, as a server restart does today. The first keeps work
-   across a failover; the second is what is built. Not decided.
-2. **How the daemon is told the servers.** A repeated `--server` flag, one DNS name
-   with a record per server, or a list learned from committed state after the first
-   connection. Not decided.
-3. **The redirect's form.** A status on the ended `Session` stream carrying the
-   leader's name, or a message within `kbf.worker.v1`. Either is an addition to
-   version 1. A follower that knows no leader (an election in progress) has nothing
-   to name; whether it answers `UNAVAILABLE` and the daemon tries the next name is
-   not decided.
-4. **Readiness on a follower.** `/readyz` is served on the operator API listener
-   ([api.md](../api.md#get-healthz-and-get-readyz)) and fails its `leader` check
-   when the server's leader flag is clear; nothing clears it yet. It must clear as
-   soon as the server stops being the leader. Whether a `grpc.health.v1` service on
-   the REAPI listener is also wanted is not decided.
-5. **The proxy-to-server hop.** The [Security model](../../ARCHITECTURE.md#security-model)
-   has `kbf-server` serve plain-text REAPI on loopback or on a mesh interface whose
-   traffic is already encrypted, and plans a bind guard that allows only the front's
-   hop. When the proxy runs on another machine than the storage hosts, that hop must
-   travel over the mesh, or the guard and the model need another answer.
-6. **Snapshots off the host.** With a single voter, losing that host's disk loses the
-   log. Whether snapshots are also copied to the object store, so a replacement host
-   can rebuild, is not decided.
+These were open; the maintainers decided them on 2026-10-10. Each is **planned**:
+none is built.
+
+| Question | Decision |
+|---|---|
+| What a failover keeps | running leases: `Welcome.epoch` names the replicated log, and daemons resend their results to the new leader ([daemons](#daemons-straight-to-the-servers-one-stream-to-the-leader)) |
+| How the daemon is told the servers | one DNS name with a record per server, or a list of addresses |
+| The redirect's form | a status on the ended `Session` stream naming the leader; a follower that knows no leader answers `UNAVAILABLE` and the daemon tries the next server; daemons retry forever, with a bounded backoff |
+| Readiness on a follower | the two readiness paths, plus `grpc.health.v1` on the REAPI listener ([build clients](#build-clients-one-name-routed-by-method)) |
+| The proxy-to-server hop | TLS with a certificate from an internal CA, which clients may also use to reach the servers directly ([build clients](#build-clients-one-name-routed-by-method)) |
+| Snapshots off the host | copied to the object store ([durable state](#durable-state-a-raft-log-on-local-disk)) |

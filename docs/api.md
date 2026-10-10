@@ -171,6 +171,12 @@ otherwise; the body lists each failing check and why:
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
 makes one read of the store, so poll it at the interval the front needs, not faster.
 
+**Planned:** the standard gRPC health service (`grpc.health.v1.Health`) on the REAPI
+listener, so a proxy can health-check a server over gRPC on the port it routes to,
+with the same two answers as the two readiness paths
+([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)).
+It is not served today.
+
 ## Planned
 
 `/v1/software`, `/v1/rollouts` and the per-node update state of

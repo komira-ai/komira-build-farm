@@ -317,7 +317,9 @@ hosts later, and the scheduler runs on its leader:
 - `Commit` effects become log proposals; `Committed` inputs come from the log's apply
   path, on every replica in the same order.
 - A new leader starts a new term, so its lease ids order after every earlier lease,
-  and the log decides which result of an operation wins.
+  and the log decides which result of an operation wins. A failover keeps the leases
+  committed before it: `Welcome.epoch` names the log, not the leader, and daemons
+  resend their results to the new leader.
 - Submissions are committed too, so a new leader inherits the queue (not yet: today a
   leader change would lose queued work).
 - Only the leader schedules. At three servers any server serves the read path and
