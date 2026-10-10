@@ -64,6 +64,21 @@ struct Cli {
     /// The daemon's delegated cgroup for actions, from the cgroup root (container).
     #[arg(long)]
     cgroup_parent: Option<String>,
+    /// Each container's `pids.max`: its tasks, threads included (container).
+    #[arg(long, default_value_t = 8192)]
+    container_pids_limit: u64,
+    /// The size of each container's `/dev/shm`, in MiB (container).
+    #[arg(long, default_value_t = 64)]
+    container_shm_mib: u64,
+    /// Each container's open-file limit, soft and hard (container). Rootless, it cannot
+    /// exceed the daemon's own hard limit.
+    #[arg(long, default_value_t = 65_536)]
+    container_nofile: u64,
+    /// The process limit, soft and hard, of each container's user (container). Every
+    /// container's root is the same host id, so it bounds all the node's actions
+    /// together.
+    #[arg(long, default_value_t = 32_768)]
+    container_nproc: u64,
     /// A lease's processes are killed past this percentage of its booked memory...
     #[arg(long, default_value_t = MemoryPolicy::DEFAULT.percent)]
     memory_limit_percent: u64,
@@ -272,7 +287,9 @@ fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
 mod container {
     use std::sync::Arc;
 
-    use kbf_driver_container::{IdFiles, OutputLimits, PodmanConfig, PodmanRuntime};
+    use kbf_driver_container::{
+        ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime,
+    };
 
     use super::{Cli, Error, cas_client, daemon, scratch, serve};
 
@@ -295,8 +312,19 @@ mod container {
             max_bytes: cli.outputs.max_bytes,
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
+        config.limits = limits(cli);
         let runtime = PodmanRuntime::new(config, Arc::new(cas_client(cli)?))?;
         serve(tokio, daemon(cli, Arc::new(runtime))?)
+    }
+
+    /// The `--container-*` limits.
+    pub(super) fn limits(cli: &Cli) -> ContainerLimits {
+        ContainerLimits {
+            pids: cli.container_pids_limit,
+            shm_mib: cli.container_shm_mib,
+            nofile: cli.container_nofile,
+            nproc: cli.container_nproc,
+        }
     }
 }
 
@@ -394,6 +422,34 @@ mod tests {
         assert!(native_config(&relative).is_err());
         let missing = parse(&["--driver=native"]).expect("flags");
         assert!(native_config(&missing).is_err());
+    }
+
+    /// Catches a `--container-*` flag that does not reach the driver's limits, and a
+    /// flag default that differs from the driver's documented
+    /// `ContainerLimits::DEFAULT`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_limit_flags_reach_the_configuration() {
+        use kbf_driver_container::ContainerLimits;
+        let cli = parse(&[
+            "--driver=container",
+            "--container-pids-limit=11",
+            "--container-shm-mib=12",
+            "--container-nofile=13",
+            "--container-nproc=14",
+        ])
+        .expect("flags");
+        assert_eq!(
+            container::limits(&cli),
+            ContainerLimits {
+                pids: 11,
+                shm_mib: 12,
+                nofile: 13,
+                nproc: 14,
+            }
+        );
+        let defaults = parse(&["--driver=container"]).expect("flags");
+        assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
     }
 
     /// A fresh directory for one test, under the test binary's directory.
