@@ -5,11 +5,12 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
+use clap::Parser;
 use futures::StreamExt;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_meta::{Epoch, Retention};
@@ -22,7 +23,9 @@ use kbf_proto::grpc::health::v1::health_client::HealthClient;
 use kbf_proto::grpc::health::v1::health_server::Health;
 use kbf_proto::grpc::health::v1::{HealthCheckRequest, HealthCheckResponse, HealthListRequest};
 use kbf_server::grpc_health::{HealthService, SERVICES};
-use kbf_server::{Api, BUILD_COMMIT, Listeners, Readiness, SERVER_VERSION, bind_server_with_api};
+use kbf_server::{
+    Api, Args, BUILD_COMMIT, Listeners, Readiness, SERVER_VERSION, bind_server_with_api,
+};
 use serde_json::{Value, json};
 use support::{HELLO_WAIT, INTERVAL, PROMPT};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,6 +46,8 @@ struct Faults {
     writes: AtomicUsize,
     deletes: AtomicUsize,
     lists: AtomicUsize,
+    /// The key of every read, in order.
+    read_keys: Mutex<Vec<String>>,
 }
 
 impl Faults {
@@ -53,6 +58,11 @@ impl Faults {
     /// Reads, writes, deletes and lists so far.
     fn counts(&self) -> [usize; 4] {
         [&self.reads, &self.writes, &self.deletes, &self.lists].map(|n| n.load(Ordering::SeqCst))
+    }
+
+    /// The keys read so far, in order.
+    fn read_keys(&self) -> Vec<String> {
+        self.read_keys.lock().expect("read_keys lock").clone()
     }
 }
 
@@ -83,6 +93,11 @@ impl ObjectStore for FaultStore {
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
         self.faults.reads.fetch_add(1, Ordering::SeqCst);
+        self.faults
+            .read_keys
+            .lock()
+            .expect("read_keys lock")
+            .push(key.as_str().to_owned());
         match self.faults.mode.load(Ordering::SeqCst) {
             FAILS => Err(ObjectStoreError::Service {
                 status: 503,
@@ -135,6 +150,25 @@ fn start() -> Server {
 /// [`start`], with the cache's keys under `prefix`.
 fn start_with_prefix(prefix: &str) -> Server {
     let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+    let listeners = Listeners {
+        reapi: loopback,
+        worker: loopback,
+        worker_tls: None,
+        heartbeat_interval: INTERVAL,
+        hello_wait: HELLO_WAIT,
+        tick: Duration::from_millis(50),
+        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        finished_retention: kbf_sched::FINISHED_RETENTION,
+        shutdown_timeout: Duration::from_secs(10),
+        store_probe_timeout: PROBE_TIMEOUT,
+    };
+    start_on(prefix, listeners)
+}
+
+/// A server with the cache's keys under `prefix`, on `listeners`, with the operator
+/// API on a loopback port.
+fn start_on(prefix: &str, listeners: Listeners) -> Server {
+    let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
     let faults = Arc::new(Faults::default());
     let bucket = Arc::new(MemoryStore::new(Capabilities::default()));
     let store = FaultStore {
@@ -148,18 +182,6 @@ fn start_with_prefix(prefix: &str) -> Server {
         prefix,
         Epoch::new(1),
     ));
-    let listeners = Listeners {
-        reapi: loopback,
-        worker: loopback,
-        worker_tls: None,
-        heartbeat_interval: INTERVAL,
-        hello_wait: HELLO_WAIT,
-        tick: Duration::from_millis(50),
-        unservable_wait: kbf_sched::UNSERVABLE_WAIT,
-        finished_retention: kbf_sched::FINISHED_RETENTION,
-        shutdown_timeout: Duration::from_secs(10),
-        store_probe_timeout: PROBE_TIMEOUT,
-    };
     let api = Api {
         listen: loopback,
         token: None,
@@ -311,18 +333,75 @@ async fn readyz_is_503_while_the_store_fails() {
     assert_eq!(code, 200, "{body}");
 }
 
-/// Catches: a probe without a timeout. The store never answers; `/readyz` must say
-/// 503 within the probe timeout (300 ms here), well inside the 2 s bound, instead of
-/// hanging the front's health check.
-#[tokio::test]
-async fn readyz_is_503_when_the_store_does_not_answer_in_time() {
-    let server = start();
+/// Asks `/readyz` of a server whose store never answers; the body, and how long the
+/// answer took. Fails the test unless the answer is a 503 naming the store, whose
+/// reason quotes `timeout`, that comes no sooner than `timeout` and within three
+/// times it.
+async fn readyz_on_a_hung_store(server: &Server, timeout: Duration) -> Duration {
     server.faults.set(HANGS);
-    let (code, body) = get_within(server.api, "/readyz", Duration::from_secs(2)).await;
+    let asked = Instant::now();
+    let (code, body) = get_within(server.api, "/readyz", timeout * 3).await;
+    let took = asked.elapsed();
     assert_eq!(code, 503, "{body}");
     assert_eq!(failing(&body), ["store"], "{body}");
     let reason = body["failing"][0]["reason"].as_str().expect("a reason");
-    assert!(reason.contains("no answer within 300 ms"), "{reason}");
+    let quoted = format!("no answer within {} ms", timeout.as_millis());
+    assert!(reason.contains(&quoted), "{reason}");
+    assert!(
+        took >= timeout,
+        "answered after {took:?}, before {timeout:?}"
+    );
+    took
+}
+
+/// Catches: a probe without a timeout, one that waits longer than the configured
+/// timeout (a 4x wait, 1200 ms, misses the 900 ms bound), and one that gives up
+/// before it. The store never answers; `/readyz` must say 503 after the probe timeout
+/// (300 ms here) and well before three times it, instead of hanging the front's
+/// health check.
+#[tokio::test]
+async fn readyz_is_503_when_the_store_does_not_answer_in_time() {
+    let server = start();
+    readyz_on_a_hung_store(&server, PROBE_TIMEOUT).await;
+}
+
+/// Catches: a server that ignores `--readyz-store-timeout-ms` (such as one that
+/// always waits [`kbf_server::health::STORE_PROBE_TIMEOUT`], 2000 ms): the flag's
+/// 450 ms must be the wait the store probe of `/readyz` gives a store that never
+/// answers, on listeners built from the parsed flags. A 2000 ms wait misses the
+/// 1350 ms bound and quotes another timeout.
+#[tokio::test]
+async fn readyz_store_timeout_flag_bounds_the_store_probe() {
+    let args = Args::try_parse_from([
+        "kbf-server",
+        "--listen",
+        "127.0.0.1:0",
+        "--worker-listen",
+        "127.0.0.1:0",
+        "--readyz-store-timeout-ms",
+        "450",
+    ])
+    .expect("the flags parse");
+    let listeners = args.listeners().expect("the listeners");
+    let server = start_on("kbf/1/", listeners);
+    readyz_on_a_hung_store(&server, Duration::from_millis(450)).await;
+}
+
+/// Catches: a probe that reads another key than the documented `<prefix>readyz-probe`
+/// (docs/api.md), such as the bare `readyz-probe` outside the cache's prefix, or a
+/// renamed key. An absent key passes the probe, so only the key read can tell.
+#[tokio::test]
+async fn readyz_reads_the_probe_key_under_the_cache_prefix() {
+    for prefix in ["kbf/1/", "other/7/"] {
+        let server = start_with_prefix(prefix);
+        let (code, body) = get_within(server.api, "/readyz", PROMPT).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            server.faults.read_keys(),
+            [format!("{prefix}readyz-probe")],
+            "prefix {prefix}"
+        );
+    }
 }
 
 /// Catches: a `/readyz` that ignores the scheduler role, so a front would send
