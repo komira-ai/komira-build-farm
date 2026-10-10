@@ -40,8 +40,9 @@ pub(crate) const DAEMON_OWNER: &str = "0:0";
 pub(crate) const CONTAINER_USER: &str = "0:0";
 
 /// The per-container limits every action's container is created with. Each is passed
-/// explicitly, so neither the image nor a node's `containers.conf` (Podman's defaults:
-/// 2048 pids, a 64 MiB `/dev/shm`, the ulimits it names) changes what an action gets.
+/// explicitly, so neither Podman's defaults nor a node's `containers.conf` changes what
+/// an action gets. (Without `--pids-limit`, rootless Podman 4.9 on the hosted runners
+/// left `pids.max` at `max`: no limit.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContainerLimits {
     /// `--pids-limit`: the container's `pids.max`, its tasks (threads included).

@@ -91,9 +91,9 @@ fn expected(limits: ContainerLimits) -> String {
 }
 
 /// Catches a limit left to Podman or the node's `containers.conf` (the "drop
-/// `--pids-limit`" mutant: `pids.max` reads the override's 999; likewise its 3 MiB
-/// `/dev/shm` and 777 and 888 ulimits), a limit that is not the configured one, and
-/// the action not running as the container's root.
+/// `--pids-limit`" mutant: on the hosted runners' Podman 4.9 `pids.max` then reads
+/// `max`, no limit at all, override or not), a limit that is not the configured one,
+/// and the action not running as the container's root.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn the_configured_limits_hold_inside_the_container() {
