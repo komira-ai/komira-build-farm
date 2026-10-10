@@ -11,6 +11,7 @@
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::google::longrunning::operations_server::OperationsServer;
 use kbf_proto::google::rpc::Status;
+use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::reapi::{
     self, ActionResult, Digest, FindMissingBlobsRequest, action_cache_server::ActionCacheServer,
     capabilities_server::CapabilitiesServer,
@@ -90,6 +91,10 @@ fn services_have_their_upstream_names() {
     assert_eq!(
         <WorkerServer<()> as NamedService>::NAME,
         "kbf.worker.v1.Worker"
+    );
+    assert_eq!(
+        <HealthServer<()> as NamedService>::NAME,
+        "grpc.health.v1.Health"
     );
 }
 
