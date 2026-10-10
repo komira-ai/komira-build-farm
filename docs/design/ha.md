@@ -5,7 +5,7 @@ farm survives losing a server: a replicated Raft log, a failover that keeps runn
 leases, reads and uploads on every server, membership changes, and snapshots copied to
 the object store. **Everything in it is planned.** Section 1 names what exists on
 `main` today; nothing else here does. File and line references are to `main` at the
-commit this document was written against (the merge of #280).
+commit this document was last refreshed against (the merge of #300).
 
 The shape of the deployment (storage hosts, the client front, daemons dialing servers
 directly) is in [deployment-topology.md](deployment-topology.md). The CAS, the action
@@ -27,21 +27,23 @@ Only the Raft core exists, and nothing outside its own tests calls it.
 | Log storage | none: `kbf-store` is an empty stub |
 | Peer transport | none: `kbf-proto` has only `kbf.worker.v1` |
 | Metadata | `MemoryMetaLog`, a `MetaState` behind a lock (`crates/kbf-server/src/main.rs:62-63`); its contract says `query` runs "on the leader" (`crates/kbf-front/src/meta_log.rs:6-7, 33`) |
-| Control log | the farm's own loop: `Effect::Commit` is fed straight back as `Event::Committed` ("Single node: appended is committed", `crates/kbf-server/src/farm.rs:727`). The `LeaseOffer` for a grant is sent before that, at `farm.rs:723-725`; the daemon only logs an offer (`crates/kbf-daemon/src/daemon.rs:471-476`) |
-| Scheduler | a pure, deterministic `StateMachine` (`crates/kbf-types/src/state.rs`); submissions are not committed, so a new leader would not inherit the queue (`crates/kbf-sched/src/lib.rs:41-44`); `OperationId` is a counter local to the scheduler (`scheduler.rs:231, 453`); a finished operation is kept for `FINISHED_RETENTION` (60 s, `scheduler.rs:44`) so that a `WaitExecution` gets its result |
-| Term and epoch | `process_term()` is wall-clock milliseconds times 2^16 plus 16 random bits (`farm.rs:50-67`); `Welcome.epoch` is that term (`worker.rs:133`); a daemon kills and forgets every lease of another epoch (`daemon.rs:426-461`) |
-| Farm state outside the scheduler | waiters, `started` (the `Sent` that `holder()` requires, `farm.rs:685-700`), finished operations' callers (`finished`, `farm.rs:196-198`), links, node status, the node registry, rollouts (`MemoryRolloutStore`): all in memory. Every start logs `STATE_IN_MEMORY` (`serve.rs:146-148`) |
-| Farm time | milliseconds since the process built its `Farm` (`farm.rs:257-260`); `Cache::tick` and `Cache::collect` are never called by the server |
-| Object prefix | `--store=s3` writes under `<prefix><start time>/` on every start (`config.rs:138, 290-292`) |
-| Readiness | `/readyz` with a `leader` flag that defaults to true; `set_leader` has no caller (`health.rs:46-78`) |
+| Control log | the farm's own loop: `Effect::Commit` is fed straight back as `Event::Committed` ("Single node: appended is committed", `crates/kbf-server/src/farm.rs:760`). The `LeaseOffer` for a grant is sent before that, at `farm.rs:757-759`; the daemon only logs an offer (`crates/kbf-daemon/src/daemon.rs:573-578`) |
+| Scheduler | a pure, deterministic `StateMachine` (`crates/kbf-types/src/state.rs`); submissions are not committed, so a new leader would not inherit the queue (`crates/kbf-sched/src/lib.rs:48-53`); `OperationId` is a counter local to the scheduler (`scheduler.rs:178, 404`); a finished operation is kept for `FINISHED_RETENTION` (60 s, `scheduler.rs:50`); the memory floors of #284 live in the scheduler alone, and a restart forgets them (`scheduler/memory.rs:29-31`) so that a `WaitExecution` gets its result |
+| Term and epoch | `process_term()` is wall-clock milliseconds times 2^16 plus 16 random bits (`farm.rs:51-68`); `Welcome.epoch` is that term (`worker.rs:133`); a daemon kills and forgets every lease of another epoch (`daemon.rs:528-563`) |
+| Farm state outside the scheduler | waiters, `started` (the `Sent` that `holder()` requires, `farm.rs:718-733`), finished operations' callers (`finished`, `farm.rs:197-199`), links, node status, the node registry, rollouts (`MemoryRolloutStore`): all in memory. Every start logs `STATE_IN_MEMORY` (`serve.rs:150-152`) |
+| Farm time | milliseconds since the process built its `Farm` (`farm.rs:258-261`); `Cache::tick` and `Cache::collect` are never called by the server |
+| Object prefix | `--store=s3` writes under `<prefix><start time>/` on every start (`config.rs:139, 288-290`) |
+| Readiness | `/readyz` with a `leader` flag that defaults to true; `set_leader` has no caller (`health.rs:50-86`). `grpc.health.v1` on the REAPI listener (#299) gives `""` and the five REAPI service names `/readyz`'s one answer (`grpc_health.rs:44-53`) |
 | Fencing constants | G = 60 s, T = 40 s, `LEADER_LEASE_MARGIN` = 5 s, `T + margin < G` checked at compile time (`crates/kbf-sched/src/fence.rs:23-45`); the same margin sets `HANDOVER_GRACE` (`fence.rs:54`) and enters the `START_VALIDITY` assertion (`fence.rs:74-77`). The header assumes "leaders acknowledge only inside their leader lease" (`fence.rs:13-14`), which nothing provides |
-| Daemon | one `--server` URL, a fixed reconnect wait (`--reconnect-ms`), one `--cas` URL |
+| Daemon | one or more `--server` URLs; every round resolves each name again and tries every address, and only a round in which every address failed waits: `--reconnect-ms` doubled per failed round, capped at `--reconnect-max-ms` (30 s), jittered (#300, `crates/kbf-daemon/src/connect.rs:1-18`). No redirect is followed. One `--cas` URL (`crates/kbf-node/src/main.rs:303-320`) |
 
-Open pull requests this design builds on: #300 (the daemon retries forever across every
-address of every `--server`), #299 (`grpc.health.v1` on the REAPI listener), #298 (the
-deployment decisions in the docs), #226 (REAPI TLS, for the proxy-to-server hop), and
-#284/#283 (memory kills and the doubled booking, whose per-action floors are state this
-design replicates).
+Merged since this design was first written, and built on here: #300 (the daemon
+retries forever across every address of every `--server`), #299 (`grpc.health.v1` on
+the REAPI listener) and #284 (memory kills and the doubled booking, whose per-action
+floors are scheduler state this design replicates). Still open: #298 (the deployment
+decisions in the docs), #226 (REAPI TLS, for the proxy-to-server hop) and #283 (the
+container driver's memory cap). Of these, only #226 is a dependency of a pull request
+in [section 16](#16-pull-request-plan).
 
 ## 2. What the maintainers decided
 
@@ -101,10 +103,10 @@ Two facts about the code make this the cheapest correct choice:
    (`crates/kbf-types/src/state.rs`). If the input that caused an `Effect::Commit` is
    itself committed, the record is a function of the committed prefix, so it is
    committed too. At apply time every replica feeds `Effect::Commit` back as
-   `Event::Committed`, which is what `farm.rs:727` does today; under input replication
+   `Event::Committed`, which is what `farm.rs:760` does today; under input replication
    that comment becomes true. No second consensus round per lease.
 2. The daemon needs no protocol change to keep leases. It compares the epoch stored
-   with each grant against the newest `Welcome`'s (`daemon.rs:455-461`). With
+   with each grant against the newest `Welcome`'s (`daemon.rs:557-563`). With
    `Welcome.epoch` = the log id, fixed for the life of the log, a failover is the same
    epoch and nothing is superseded.
 
@@ -119,7 +121,8 @@ Five rules carry the safety argument; each has a test that fails without it
 - **R-takeover. A new leader commits a `Takeover` entry before it acts.** Applying it
   resets every worker's last-heard time, so G counts from the takeover.
 - **R-epoch. `Welcome.epoch` is the log id**, a random non-zero 64-bit value
-  committed in the log's first entry.
+  committed in the log's first command
+  ([section 4.11](#411-bootstrapping-a-log)).
 - **R-local. A commit resolves only after the entry has applied on the server that
   asked**, so a server's answers always reflect its own write.
 - **R-fail-stop. Anything that would break durability or determinism stops the node**:
@@ -152,7 +155,7 @@ Payload::Command(bytes) = LogCommand, encoded:
 ### 4.2 The farm machine
 
 `FarmMachine` is a pure state machine, in `kbf-sched` or a new pure crate, holding
-everything a new leader needs that lives today in `farm.rs:187-206` or beside it:
+everything a new leader needs that lives today in `farm.rs:188-207` or beside it:
 
 | Moves into `FarmMachine` (replicated) | Stays leader-local |
 |---|---|
@@ -205,9 +208,18 @@ R-ack, made concrete:
   the cost is one commit on every `Execute`, which is measured
   (`execute_submit_commit_seconds`).
 - **`LeaseOffer`** moves to after the grant commits. Today it is sent before
-  (`farm.rs:723-725`); a minority leader would offer leases that never commit. The
-  daemon only logs offers, so this is cheap, and it gets its own pull request and
-  mutant.
+  (`farm.rs:757-759`); a minority leader would offer leases that never commit. The
+  daemon only logs offers, so this is cheap, and it gets its own pull request (PR 9)
+  and mutant. PR 9 also adds the **control-log seam**: `Effect::Commit` hands the record
+  to a `ControlLog`, and the farm feeds `Event::Committed` back only when the
+  `ControlLog` reports the record committed. The first implementation reports it at
+  once, which is today's behavior; PR 11's is the Raft log. A test double,
+  `HeldControlLog`, holds every record until the test releases it, so a test can see
+  what the farm sends while a grant is appended but not committed. The seam comes
+  with PR 9, rather than PR 9 moving after PR 11, because without it nothing can hold
+  a commit open: a single voter commits as soon as its fsync returns, so PR 11 would
+  need the same seam for the same test, and with it PR 11 plugs the log into an
+  interface whose ordering rule is already tested.
 - **`HeartbeatAck`, `Welcome`** go out only after the `FarmBatch` that carries the
   heartbeat or the `WorkerUp` has committed.
 - **A `Result`** is committed as one `Report` entry carrying both the scheduler input
@@ -229,15 +241,20 @@ The leader stamps `now` into every `FarmBatch` and `Meta` entry. Apply takes
 reads the applied `now` as its base and stamps `base + (monotonic now − takeover
 instant)` from then on. Farm time therefore never goes backwards across leaders, and it
 stands still during an election, which can only push a deadline later: the safe
-direction for G. `Farm::now()` counted from the process start (`farm.rs:257-260`) goes.
+direction for G. `Farm::now()` counted from the process start (`farm.rs:258-261`) goes.
 The leader commits a `Tick` every second.
 
 ### 4.5 Ids and names
 
-- **Log id.** A random non-zero `u64` in the `Bootstrap` command. Zero is refused,
-  because the daemon reads epoch 0 as "no epoch named" (`daemon.rs:423`).
+- **Log id.** A random non-zero `u64`, drawn once when the log is created and
+  committed in its `Bootstrap` command ([section 4.11](#411-bootstrapping-a-log)). Zero
+  is refused, because the daemon reads epoch 0 as "no epoch named" (`daemon.rs:525`).
 - **Raft term.** `LeaseId.term` becomes the Raft term; `seq` is per term, from the
-  machine. One leader per term makes `(term, seq)` unique. `process_term()` goes.
+  machine. One leader per term makes `(term, seq)` unique. This holds under
+  `--meta-log=raft` from PR 10. Under `--meta-log=memory`, the term and `Welcome.epoch`
+  stay `process_term()`, as today; `process_term()` goes with that mode, one release
+  after the Raft log becomes the default
+  ([section 14](#14-rollout-beside-an-existing-farm)).
 - **Operation names** become `operations/<log_id>-<waiter>`, parsed under any leader
   of the log. A name from another log (a disaster restore, or today's process-term
   names after the first upgrade) is `NOT_FOUND` once.
@@ -258,18 +275,36 @@ dependencies (`kbf-meta` keeps only `kbf-types` and `thiserror`).
 - Golden bytes are committed for every variant; a round trip `decode(encode(x)) == x`
   runs over generated values.
 - **Forwarded commands are idempotent**, so a forward retried across a leader change
-  needs no session table. Checked against `crates/kbf-meta/src/state.rs`: a second
-  `PutBlob` of a held, reachable blob is `Duplicate { kept }` and changes only the
-  touch time; `Touch` is idempotent; `ObjectUnreachable` never downgrades `Corrupt`;
-  `PutAction` replaces with the same record; a retried `AllocEpoch` wastes an epoch,
-  which is harmless. The rule is exact but for one field: **applying a forwardable
-  command twice leaves the same state as applying it once, except the loss mark's
-  generation (below), which only rises.** A retried `ObjectUnreachable` lands at a
-  later log index, so it stamps a later generation; that is safe, because a newer
-  generation can only make a late `ObjectReachable` do nothing. A test applies every
-  forwardable variant twice, at two log indices, and compares the states with the
-  generations left out, then checks that every generation is at least its value after
-  the first apply. The forwarder treats `Duplicate` as success.
+  needs no session table. The forwardable commands are `AllocEpoch`, `PutBlob`,
+  `PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable` and `ObjectReachable`; `Tick`
+  and `Collect` are proposed by the leader alone and never forwarded. Checked against
+  `crates/kbf-meta/src/state.rs`: a second `PutBlob` of a held, reachable blob is
+  `Duplicate { kept }` and sets only the entry's touch time; `Touch` sets touch times
+  only; `ObjectUnreachable` never downgrades `Corrupt`; `PutAction` replaces the entry
+  with the same record. **The rule, exactly:** applying a forwardable command twice,
+  as two entries stamped with the same farm time and with nothing applied between them,
+  leaves the same state as applying it once, except for these two fields, each of
+  which only rises:
+  - **the loss mark's generation** (below): a retried `ObjectUnreachable` lands at a
+    later log index, so it stamps a later generation. That is safe, because a newer
+    generation can only make a late `ObjectReachable` do nothing;
+  - **`next_epoch`, after `AllocEpoch`**: each apply allocates an epoch
+    (`state.rs:224-228`), so a retry wastes one. The forwarder takes the epoch of the
+    entry its `(term, index)` names ([section 8](#8-reads-and-uploads-on-every-server)),
+    so no writer ever names the other; and `allocated()` only widens, so the wasted
+    epoch refuses nothing that was accepted before.
+
+  The touch times (a blob's `last_touch`, an action's `last_hit`) are set to the
+  applying entry's farm time (`state.rs:359-366, 392-398, 402-421`), so a copy applied
+  at a later farm time moves them later, which only delays collection. They are not an
+  exception at equal farm times, and the test pins the farm time to make that exact.
+  PR 2's test, for every forwardable command `c` over generated states: apply `c` at
+  index i, then again at index j > i with no `Tick` between, and compare the two states
+  on every field but the two above; check that each loss-mark generation `c` stamped
+  is j and every other is unchanged, and that `next_epoch` rose by exactly one more for
+  `AllocEpoch` and is unchanged otherwise. A second case applies the copy after a `Tick`
+  and checks that the only further difference is the touch times of the entries `c`
+  names, now the later time. The forwarder treats `Duplicate` as success.
 - **Idempotence does not cover reordering.** A forward can be delayed or retried across
   a leader change and land after a newer command. For every forwardable command but
   one, landing late is harmless: it is a write the sender saw succeed, or a mark that
@@ -414,6 +449,43 @@ object is deleted about 7 days after its `Collect`.
 D must be far longer than the longest time a server may serve reads while behind,
 `READ_BEHIND_BOUND` ([section 8](#8-reads-and-uploads-on-every-server)); the two
 constants are checked against each other at compile time.
+
+### 4.11 Bootstrapping a log
+
+A log is created once. Every later start of a server opens it from its `--raft-dir`.
+
+- **Creating a log.** The log id is drawn when the log is created, before its first
+  entry, and recorded in the `--raft-dir` beside the hard state, with the initial
+  membership. A single voter draws it itself (PR 5): a server started with an empty
+  `--raft-dir` and no `--raft-join` creates a log whose only voter is itself. For N
+  members at once, voters and learners (PR 24), the `Cell` harness and the simulation
+  draw the id and give every member the same id and the same set, through the library
+  API. The binary has no flag for that, so a production log always starts as one voter.
+  Every later start reads the id and the set from the directory, never from flags.
+- **The first command.** The log's first leader commits its term's `Blank`, applies
+  everything before it and, if its applied state holds no `Bootstrap`, proposes
+  `Bootstrap { log_id, ... }` with the recorded id. Apply takes the first committed
+  `Bootstrap` and logs any later one as a no-op: a leader that died with its
+  `Bootstrap` uncommitted may have left it in a log that the next leader commits. Until
+  a server has applied `Bootstrap`, it is not leader-ready and sends no `Welcome`.
+- **The membership before and after PR 19.** Before PR 19 the core's membership is fixed
+  at construction, and the host gives it the recorded set. From PR 19 the host gives the
+  recorded set as the initial membership, and the newest `Config` entry in the log or
+  snapshot replaces it. No server proposes a `Config` before PR 32's admin API, so
+  until then every log's membership is its recorded set, phase-1 logs included.
+- **Growing from one voter** (production, phases 2 and 3). A new server is started with
+  `--raft-join` and an empty `--raft-dir`. It creates nothing and never campaigns, and
+  it waits until a leader's append or InstallSnapshot carries a `Config` that names it,
+  as the learner `add-learner` added ([section 6](#6-membership)). Before it persists
+  anything from that leader, it records the log id the leader's handshake named; it
+  then catches up like any learner, and the `Bootstrap` it applies, or the snapshot
+  that holds it, names the same id. The join mode and the 1 → 3 test are in PR 32.
+- **One log per peer stream.** From PR 24 the peer handshake names the sender's log
+  id, or none for a joining server that has recorded none (so holds no entry), and a
+  server refuses a stream from a peer that names another id. Without the check, a server
+  started by mistake without `--raft-join` creates a second log, and its term-1 entries,
+  at the same indices as the real log's, would pass a leader's `(prevIndex, prevTerm)`
+  check: Log Matching would no longer hold.
 
 ## 5. Election, fencing and reads
 
@@ -582,7 +654,7 @@ acknowledge.
 
 | From | Steps | Window |
 |---|---|---|
-| 1 voter (phase 1) to 3 | add B and C as learners; let them catch up; promote B; promote C | 2 voters, quorum 2, for the minutes between the promotions; the tool measures it and refuses to open it unless A and B are healthy |
+| 1 voter (phase 1) to 3 | start B and C with `--raft-join` ([section 4.11](#411-bootstrapping-a-log)) and add them as learners; let them catch up; promote B; promote C | 2 voters, quorum 2, for the minutes between the promotions; the tool measures it and refuses to open it unless A and B are healthy |
 | 3 to 5 + 1 (phase 3) | add D, E, F as learners; promote D, then E; F stays a learner | none: quorum 3 of 4, then 3 of 5 |
 | replace a dead voter, 5 + 1 | remove the dead voter (4 voters, quorum 3); promote F (5 voters); add a new learner | slack 1, then 2 |
 | replace a dead voter, 3 voters | add the new node as a learner while the dead voter is still a member, and wait until it is caught up; remove the dead voter (2 voters, quorum 2); promote the new node | the 2-voter window lasts one commit, because the new node is already caught up |
@@ -953,18 +1025,18 @@ first, because phase 1 needs no multi-node mechanism.
 |---|---|---|---|---|---|---|
 | 0 | Probe, no code: how Buck2 and Bazel react to a dropped `Execute` stream (reset and `UNAVAILABLE`) and to `NOT_FOUND` from `WaitExecution`, through the real front | — | S | n/a | n/a | n/a |
 | 1 | This document; ADR 0001 status | — | S | n/a | n/a | n/a |
-| 2 | `log.proto` and the `Command` codec; the loss mark's generation in `kbf-meta`, and the log index as an input of `MetaState::execute` ([section 4.6](#46-encoding)) | 1 | M | golden bytes; round trip of every variant; every forwardable command applied twice, at two log indices, leaves the state of one apply except loss-mark generations, which only rise; a delayed `ObjectReachable` applied after a newer `ObjectUnreachable`, of the same reason or a higher one, leaves the mark | swap two field tags; default an unknown value; clear the mark whatever its generation; stamp the generation only when the reason rises | n/a |
+| 2 | `log.proto` and the `Command` codec; the loss mark's generation in `kbf-meta`, and the log index as an input of `MetaState::execute` ([section 4.6](#46-encoding)) | 1 | M | golden bytes; round trip of every variant; the idempotence test of section 4.6: every forwardable command applied at index i and again at j > i with no `Tick` between leaves the state of one apply on every field but loss-mark generations (each one it stamped is j, every other unchanged) and `next_epoch` (exactly one higher for `AllocEpoch`, unchanged otherwise), and with a `Tick` between differs further only in the touch times of the entries it names, now the later time; a delayed `ObjectReachable` applied after a newer `ObjectUnreachable` leaves the mark, in two cases, a newer mark of the same reason and one of a higher reason (only the same-reason case catches the last mutant, which still restamps when the reason rises) | swap two field tags; default an unknown value; clear the mark whatever its generation; stamp the generation only when the reason rises | n/a |
 | 3 | `kbf-store`: segmented log, hard state, CRC, torn tail, fail-stop on fsync error | 1 | M | a fault-injecting filesystem: a torn write at every byte offset, a crash between write and fsync, an fsync error | return before fsync; skip the directory fsync; accept a bad CRC in the middle | n/a |
 | 4 | Raft host loop over `Storage` and `Transport` traits | 3 | M | crash at every effect boundary recovers to a log that satisfies the Figure 3 checks | send before persist; apply before commit | crash seeds on the existing Raft sim |
-| 5 | `RaftMetaLog`, one voter, behind `--meta-log=raft --raft-dir`; `Bootstrap` with log id and stable `<prefix><log_id>/`; farm time from the committed base; leader-only `Tick` | 2, 4 | M | `cold_restart` keeps blobs and action-cache entries; farm time after a restart continues from the committed base and never goes back | start-time prefix; farm time from the process `Instant` | n/a |
+| 5 | `RaftMetaLog`, one voter, behind `--meta-log=raft --raft-dir`; a new log's id and voter set recorded in the `--raft-dir` ([section 4.11](#411-bootstrapping-a-log)); `Bootstrap` with log id and stable `<prefix><log_id>/`; farm time from the committed base; leader-only `Tick` | 2, 4 | M | `cold_restart` keeps blobs and action-cache entries, and the log id: the restart reads it from the directory and commits no second `Bootstrap`; farm time after a restart continues from the committed base and never goes back | start-time prefix; farm time from the process `Instant`; draw a new log id on every start | n/a |
 | 6a | `FarmMachine`, step 1: waiter records and the `started` table move into a pure struct; no behavior change | 1 | M | two machines fed the same inputs are equal; existing `kbf-server` tests stay green | a hashed map in the struct (clippy and the equality test) | n/a |
 | 6b | `FarmMachine`, step 2: node registry and node status | 6a | S | registry survives in the machine; equality | drop a field from equality | n/a |
-| 6c | `FarmMachine`, step 3: memory floors and the doubled-booking requeue | 6a, #284 | S | equality over generated OOM sequences | forget the floor on requeue | n/a |
+| 6c | `FarmMachine`, step 3: the memory state #284 put in the scheduler (per-key memory floors and their eviction order, each operation's memory runs, each node's busy-kill count; `kbf-sched/src/scheduler/memory.rs`) is part of the machine's equality, so its snapshot section (PR 14) holds it | 6a | S | equality over generated OOM sequences: two machines fed the same sequence are equal, and two whose sequences differ in one kill, or only in the order floors were raised past `MEMORY_FLOORS`, are not | leave the floors out of equality; leave the eviction order out | n/a |
 | 7 | Control codec: every `FarmInput`, `Takeover`, `Report`, `Checkpoint`, `MachineVersion` | 2, 6a, 6b, 6c | M | golden bytes; round trip | as PR 2 | n/a |
 | 8 | `kbf-sim-cell` skeleton: one server over PRs 3 to 7, fake daemons, store and clients; properties 1 to 7 (in crash and restart seeds, property 3 is enforced from PR 11 and property 4 from PR 12, the PRs that make them hold) | 4, 5, 7 | M | n/a (new harness) | the section 15 mutants that apply to one node | crash and restart seeds |
-| 9 | `LeaseOffer` only after the grant commits | 1, 8 | S | a `FakeDaemon` sees no offer for a grant whose commit was refused (`GateLog`) | send the offer before commit | sim-cell: offer for an uncommitted grant |
-| 10 | `Welcome.epoch` = log id (non-zero); `LeaseId.term` from the Raft term; `process_term()` goes. Under `--meta-log=raft` only, which nothing outside tests runs before PR 11: until then a restart keeps the daemon's epoch but not the server's leases, so their runs are wasted (`not_held` names no lease of another term, and their results are refused), never doubled | 5 | S | two starts of one server over the same `--raft-dir` send the same non-zero `Welcome.epoch` (two different epochs today); a lease's `LeaseId.term` is the Raft term of the leader that granted it | epoch = term; `LeaseId.term` from `process_term()` | n/a |
-| 11 | Control inputs through the log: `Submit` committed before the name is returned; heartbeats and `WorkerUp` batched; R-ack for `Welcome`, `HeartbeatAck`, `ResultAck`; `Effect::Commit` fed back at apply; `Takeover` on restart | 5, 6b, 6c, 7, 8, 9, 10 | L | **a server restart mid-lease: the daemon reconnects, its lease keeps running, its result is accepted** (red today: `STATE_IN_MEMORY`; needs PR 10's epoch) | acknowledge before commit; skip the `Takeover` reset | sim-cell restart seeds, property 3 |
+| 9 | `LeaseOffer` only after the grant commits; the control-log seam of [section 4.3](#43-committed-before-answered): `ControlLog`, which commits at once in production until PR 11, and its test double `HeldControlLog` | 1, 8 | M | with `HeldControlLog` holding a grant's record, a `FakeDaemon` sees neither a `LeaseOffer` nor a `Start` for it; once the test releases the record, the daemon sees the offer, then the `Start`; over the production `ControlLog`, every existing `kbf-server` test stays green | send the offer before commit; feed `Event::Committed` back at append instead of at the `ControlLog`'s report | sim-cell: offer for an uncommitted grant |
+| 10 | `Welcome.epoch` = log id (non-zero); `LeaseId.term` from the Raft term. Under `--meta-log=raft` only, which nothing outside tests runs before PR 11; under `--meta-log=memory`, the default until then, the term and the epoch stay `process_term()` ([section 4.5](#45-ids-and-names)). Until PR 11, a restart over one `--raft-dir` keeps the daemon's epoch but not the server's leases, so the old runs go on as orphans: `not_held` never names a lease of another term (`scheduler.rs:338-344`), so nothing cancels them, and their results are refused. **Results are never doubled; runs may be.** A client's re-`Execute` can run the same action beside its orphan, and the server, which counts that daemon's capacity as free, can book new work beside the orphans. The overbooking on a node is at most the bookings of the leases it held at the restart, and lasts at most each orphan's action timeout (the driver's default, 1 h in the container driver, when the action names none) | 5 | S | two starts of one server over the same `--raft-dir` send the same non-zero `Welcome.epoch` (two different epochs today); a lease's `LeaseId.term` is the Raft term of the leader that granted it; under `--meta-log=memory`, two starts send two different epochs, as today | epoch = term; `LeaseId.term` from `process_term()` | n/a |
+| 11 | Control inputs through the log, as PR 9's `ControlLog` over the Raft log: `Submit` committed before the name is returned; heartbeats and `WorkerUp` batched; R-ack for `Welcome`, `HeartbeatAck`, `ResultAck`; `Effect::Commit` fed back at apply; `Takeover` on restart | 5, 6b, 6c, 7, 8, 9, 10 | L | **a server restart mid-lease: the daemon reconnects, its lease keeps running, its result is accepted** (red today: `STATE_IN_MEMORY`; needs PR 10's epoch) | acknowledge before commit; skip the `Takeover` reset | sim-cell restart seeds, property 3 |
 | 12 | `Report` entry: result and `PutAction` atomic; a duplicate `Result` acknowledged `accepted: true` with no second record | 11 | S | a crash between the two today leaves an accepted result with no action-cache entry; after, a crash at every point leaves both or neither; a result resent after a restart, already committed, is acknowledged accepted | commit the two separately; refuse the duplicate | sim-cell: property 4 |
 | 13 | Operation names `operations/<log_id>-<waiter>`; the existing finished-operation window (`--finished-retention-secs`, default `FINISHED_RETENTION`; `farm.rs`'s `finished`) replicated, with a longer default | 11 | S | `WaitExecution` after a restart finds the operation (`NOT_FOUND` today), and a finished one returns its result | parse under the wrong log id; drop the kept answer | n/a |
 | 14 | Snapshot codec for both machines (everything the machines hold as of PR 13: waiters, `started`, finished operations, registry, floors, loss-mark generations); local snapshots; compaction; store copy with the manifest last; S1 | 5, 6b, 6c, 11, 13 | M | `restore(snapshot at k) + replay(k..n)` equals `replay(0..n)`; a fresh server restores from the store copy after compaction | write the manifest first; compact past the copy; drop `next_epoch` from the snapshot | sim-cell: snapshot-copy failures |
@@ -982,16 +1054,16 @@ first, because phase 1 needs no multi-node mechanism.
 | 21 | Core: ReadIndex | 18 | S | a read token from a deposed leader never resolves | resolve without a heartbeat round; before an own-term commit | linearizable-read checker |
 | 22 | Core: leadership transfer (TimeoutNow); the target campaigns with the transfer flag of PR 17 | 18 | S | the target wins within one election timeout, with every voter inside its stickiness window, and no committed entry lost; a lagging target is caught up to the leader's last index first; a TimeoutNow of an older term is ignored | transfer to a lagging voter without catch-up; catch up to the commit index only; drop the transfer flag (the transfer fails and an unplanned election follows) | transfer under drops |
 | 23 | Peer transport `kbf.peer.v1`: own listener, internal-CA mutual TLS, id bound to the certificate name | 4 | M | 3 in-process servers elect and replicate over loopback; a wrong-name peer is refused | skip the name check | n/a |
-| 24 | Multi-server harness: N real `Cell`s over PR 23, a shared store, kill, partition, transfer | 22, 23 | M | n/a (harness) | n/a | n/a |
-| 25 | Follower inert; leader-only acting; `Takeover` after election; `set_leader` from the role; workers unplaceable until `WorkerUp`; `Closer` on step-down; sim-cell grows to N servers | 12, 13, 18, 24, #300 | M | 3 `Cell`s: kill the leader; leases kept, results accepted (a result the old leader committed is acknowledged as a duplicate, PR 12), and a `WaitExecution` on the new leader finds its operation (PR 13); daemons find the new leader by #300's retry over every address | placement on a stale session; `leader` defaulting to true | sim-cell failover seeds, N = 3 and 5 + 1 |
+| 24 | Multi-server harness and N-member bootstrap ([section 4.11](#411-bootstrapping-a-log)): N real `Cell`s, each over `RaftMetaLog` (PR 5) and PR 23's transport, created together through the library API from one log id and one voter and learner set; the log id in the peer handshake, and a peer of another log refused; a shared store; kill, partition, transfer | 5, 22, 23 | M | 3 `Cell`s created together elect a leader that commits one `Bootstrap`, and every member applies the same non-zero log id; after the leader is killed, the next leader commits no second `Bootstrap`, and one committed by hand is a no-op on every member; a `Cell` that created its own log is refused as a peer by every member, and so is one whose handshake names another log id; the 5 + 1 profile forms, and its learner never votes | each `Cell` draws its own log id; apply a later `Bootstrap`; skip the handshake's log-id check | n/a |
+| 25 | Follower inert; leader-only acting; `Takeover` after election; `set_leader` from the role; workers unplaceable until `WorkerUp`; `Closer` on step-down; sim-cell grows to N servers | 12, 13, 18, 24 | M | 3 `Cell`s: kill the leader; leases kept, results accepted (a result the old leader committed is acknowledged as a duplicate, PR 12), and a `WaitExecution` on the new leader finds its operation (PR 13); daemons find the new leader by #300's retry over every address | placement on a stale session; `leader` defaulting to true | sim-cell failover seeds, N = 3 and 5 + 1 |
 | 25b | Rollout records through the log, in the snapshot section: the leader's rollout driver proposes step started, step done and paused; the records replace `MemoryRolloutStore`; a failover pauses a rollout and the new leader resumes it ([section 4.2](#rollouts-and-mdm)) | 7, 14, 25 | S | 3 `Cell`s: kill the leader mid-rollout between steps: the new leader resumes it from the next step not started; kill it while a step is started but not done: the rollout stays paused on that step for an operator, and no step runs twice; snapshot equality with records present | keep the records leader-local; resume from the first step; rerun a started step | sim-cell failover seeds with a rollout |
 | 26 | Follower reads and forwarded commits; `Cache::open` split; lazy `AllocEpoch` | 21, 25 | M | a follower answers `FindMissingBlobs`; an upload to a follower is visible on that follower's `FindMissingBlobs` as soon as the upload answers, and on the leader; with no leader, `UNAVAILABLE`, never absent | resolve at the leader's apply instead of the local one; map `Unavailable` to missing | no-false-present checker |
-| 27 | The read gate (its checkpoint condition is PR 15's); `READ_STALENESS` and `READ_BEHIND_BOUND`, with the start check against `min_ttl`; two readiness paths; health services `kbf.leader` and `kbf.reads` | 15, 26, #299 | S | a follower is serving reads and not leader-ready; a lagging follower is not serving reads; a follower whose checkpoint digest differs is not serving reads; with no leader for `READ_STALENESS`, no server is serving reads; a retention with `min_ttl` under 1 000 × `READ_BEHIND_BOUND` is refused at start | one status for both; gate on "knows a leader" only; serve reads with no leader; drop the checkpoint condition | n/a |
-| 28 | Worker redirect on the server; the daemon follows it; 2 s backoff while holding leases; admission limit | 19, 25, #300 | M | a daemon dialing only a follower reaches the leader in one round; a redirect naming an address the daemon was not configured with (or that does not verify under the CA) is not followed; 50 daemons reconnect without a refused commit | redirect counted as a failure; follow an address outside the membership | daemon-reconnect seeds |
+| 27 | The read gate (its checkpoint condition is PR 15's); `READ_STALENESS` and `READ_BEHIND_BOUND`, with the start check against `min_ttl`; two readiness paths; health services `kbf.leader` and `kbf.reads` | 15, 26 | S | a follower is serving reads and not leader-ready; a lagging follower is not serving reads; a follower whose checkpoint digest differs is not serving reads; with no leader for `READ_STALENESS`, no server is serving reads; a retention with `min_ttl` under 1 000 × `READ_BEHIND_BOUND` is refused at start | one status for both; gate on "knows a leader" only; serve reads with no leader; drop the checkpoint condition | n/a |
+| 28 | Worker redirect on the server; the daemon follows it; 2 s backoff while holding leases; admission limit | 19, 25 | M | a daemon dialing only a follower reaches the leader in one round; a redirect naming an address the daemon was not configured with (or that does not verify under the CA) is not followed; 50 daemons reconnect without a refused commit | redirect counted as a failure; follow an address outside the membership | daemon-reconnect seeds |
 | 29 | Daemon ack timeout | 28 | S | a daemon facing a black-holed leader reconnects before T | no timeout | black-hole seeds |
 | 30 | Daemon `--cas` spread with the `NOT_FOUND` fallback ending at the leader | 26 | S | an input missing on a stale follower is still fetched; reads go on when one server dies | no fallback; always the first address | n/a |
 | 31 | Format and machine versions; golden-log replay test in CI | 15, 25 | M | a mixed-version cluster never sees an entry it cannot apply; an ungated behavior change fails the replay (which compares PR 15's checkpoint digests) | propose before every member supports it | n/a |
-| 32 | Membership admin API and its admin command, with the refusals of section 6 | 19, 20, 25, 27, 31 | M | 1 → 3 in the `Cell` harness while a fake build runs, starting from a voter that has compacted its log (the learners catch up by InstallSnapshot, PR 20); a dead voter of 3 replaced by the add-learner-first path; each refusal tested (a node without the committed versions, PR 31; a retired id; any change while a `MachineVersion` is uncommitted), and each allowed step of both replacement paths accepted | promote an un-caught-up learner; open a 2-voter window with an unhealthy node; refuse `add-learner` while a voter is dead; accept a retired id | sim-cell rollout path |
+| 32 | Membership admin API and its admin command, with the refusals of section 6; the `--raft-join` mode of [section 4.11](#411-bootstrapping-a-log) | 19, 20, 25, 27, 31 | M | 1 → 3 in the `Cell` harness while a fake build runs, starting from a single voter that has compacted its log, with B and C started by `--raft-join` (the learners catch up by InstallSnapshot, PR 20, and record the voter's log id); a `--raft-join` server that no config names never campaigns and holds no log id; a dead voter of 3 replaced by the add-learner-first path; each refusal tested (a node without the committed versions, PR 31; a retired id; any change while a `MachineVersion` is uncommitted), and each allowed step of both replacement paths accepted | promote an un-caught-up learner; open a 2-voter window with an unhealthy node; refuse `add-learner` while a voter is dead; accept a retired id; a `--raft-join` server that creates a log | sim-cell rollout path |
 | 33 | `SIGTERM`: transfer, wait, `Closer`, exit | 22, 25, 28 | S | a graceful leader stop with an open `Execute`; `WaitExecution` on the new leader completes | `Closer` before the transfer | n/a |
 | 34 | Leader-only collection with the deletion order of section 4.10 (retained copies pin their objects), the condemn delay D and its compile-time check against `READ_BEHIND_BOUND` | 14, 20, 26, 27 | M | restoring the newest copy after a collection references no deleted object; restoring the oldest retained copy does not either; an `InstallSnapshot` whose copy is deleted mid-fetch is retried from the newest copy (PR 20) | delete before the snapshot copy; delete while an older retained copy references the object | property 5 with GC on |
 | 35 | Phase-2 metrics and alerts (the rest of section 13) | 16, 27, 28, 30 | S | each alert on its planted condition | n/a | n/a |
@@ -1009,9 +1081,12 @@ A `kbf-it` cell (`m3`) on real processes and hosts.
 **Setup.** Three storage nodes in the converged profile, each running a voter; the
 shared object store with kbf in its own buckets and a **fresh log id**, so the cache is
 cold and actions really run; the front with both clusters, the TLS hop and peer mutual
-TLS; at least two daemons on other hosts as well as the converged ones. Before run C,
-the object store's layout is checked to survive the loss of one host; if it cannot, run
-C is reported BLOCKED rather than skipped.
+TLS; at least two daemons on other hosts as well as the converged ones. The log is
+created as production creates one: a single voter, then two servers started with
+`--raft-join`, added as learners and promoted with PR 32's tool ([section
+4.11](#411-bootstrapping-a-log)). Before run C, the object store's layout is checked to
+survive the loss of one host; if it cannot, run C is reported BLOCKED rather than
+skipped.
 
 **Workload.** A cold build of a named set of komira targets through kbf, running at
 least 10 minutes, including the long-running real Buck2 sleep test action, so leases are
@@ -1084,7 +1159,7 @@ Each lists the options and the lean.
     remove, then promote; (b) remove first. **Lean (a).**
 12. **Retention of finished operations.** Today a finished operation is kept, in
     memory, for the server flag `--finished-retention-secs`
-    (`crates/kbf-server/src/config.rs:121-122`), whose default is `FINISHED_RETENTION`
+    (`crates/kbf-server/src/config.rs:122-123`), whose default is `FINISHED_RETENTION`
     (60 s). The decision is the flag's default: (a) 1 h; (b) 24 h; (c) keep 60 s.
     **Lean (a):** a client reconnecting after a failover must still find it.
 13. **Routing of `QueryWriteStatus`, `GetTree` and `GetCapabilities`.** **Lean:**
