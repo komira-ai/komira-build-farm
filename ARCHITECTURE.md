@@ -21,6 +21,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
 | [deployment-topology.md](docs/design/deployment-topology.md) | where servers run, the Raft log on local disk, the client front that routes to the leader, daemons dialling the servers directly, what is built and what is planned, the probes the front must pass (**planned**) |
 | [mdm-backend.md](docs/design/mdm-backend.md) | MDM as a pluggable backend behind `kbf-mdm-gate`: the three operations the server uses, erase only by an operator's hardware-key-signed request, macOS 27 update progress, network reachability, moving the MDM, kbf's own configuration management (**planned**) |
+| [egress-cache.md](docs/design/egress-cache.md) | pinned downloads served by the farm: fetch lists, the mirror store and its re-index, adopting client uploads, the one fetcher with egress, verification, failure states and alerts (**planned**) |
 
 Decision records live in [docs/adr](docs/adr).
 
