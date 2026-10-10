@@ -13,6 +13,9 @@
 //!   open.
 //! - **A write or sync error stops the store.** It returns the error and then refuses
 //!   every later call; it never acknowledges anything it could not make durable.
+//!   That stop lasts as long as the process: a reopen after a failed sync, before
+//!   the machine restarts, can read bytes that never reached the disk
+//!   ([`StoreError::Io`] says why).
 //!
 //! All disk access goes through the [`Fs`] trait. [`StdFs`] is the local disk;
 //! [`FaultFs`] is an in-memory directory that fails or crashes at any chosen

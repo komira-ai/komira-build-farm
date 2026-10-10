@@ -38,8 +38,13 @@ impl Default for Options {
 #[derive(Debug, Error)]
 pub enum StoreError {
     /// A filesystem call failed. If it was a write or a sync, the store has stopped:
-    /// every later call returns [`StoreError::Failed`], and the process must exit
-    /// and reopen the store, which reads back only what is on the disk.
+    /// every later call returns [`StoreError::Failed`].
+    ///
+    /// The stop holds only inside this process. A reopen after a failed sync, before
+    /// the machine restarts, can read back bytes that are not on the disk: on Linux a
+    /// failed fsync can leave the unwritten pages in the page cache marked clean, so
+    /// [`Store::open`] reads them and its own sync returns `Ok`. The store has no way
+    /// to tell those bytes from durable ones.
     #[error("storage I/O failed: {0}")]
     Io(#[from] io::Error),
     /// An earlier write or sync failed; the store writes nothing more.
@@ -104,7 +109,9 @@ fn corrupt(file: &str, offset: usize, reason: &'static str) -> StoreError {
 /// Every successful persist is durable when it returns. The first write or sync
 /// error stops the store for good ([`StoreError::Failed`] from then on): after a
 /// failed sync what reached the disk is unknown, and a retried sync can report success
-/// for bytes that were dropped, so the store never acknowledges anything again.
+/// for bytes that were dropped, so the store never acknowledges anything again. A
+/// new process that reopens the store before the machine restarts is not covered by
+/// this (see [`StoreError::Io`]).
 #[derive(Debug)]
 pub struct Store<F: Fs> {
     fs: F,
@@ -131,8 +138,9 @@ impl<F: Fs> Store<F> {
     ///
     /// Before returning, the last segment and the directory are synced, so what open
     /// returns is durable even if the process that wrote it died before its own
-    /// sync; then the skipped segments are removed and a leftover
-    /// [`HARD_STATE_TMP`] is removed.
+    /// sync. That holds only if no sync on this directory has failed since the
+    /// machine started (see [`StoreError::Io`]). Then the skipped segments are
+    /// removed and a leftover [`HARD_STATE_TMP`] is removed.
     ///
     /// # Errors
     ///
