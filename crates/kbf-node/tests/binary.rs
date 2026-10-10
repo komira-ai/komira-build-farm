@@ -130,6 +130,28 @@ fn runs_until_sigterm(name: &str, extra: &[String]) -> std::process::ExitStatus 
     runs_until_sigterm_with_path(name, extra, None)
 }
 
+/// The native daemon's line saying its first survey of the Xcodes ended, with how long
+/// it took (`took=`).
+const SURVEYED: &str = "Xcodes surveyed";
+
+/// How long a native daemon's first survey is waited for, for the CI log only: a
+/// survey still running then is logged as such, never failed on (the daemon says
+/// Hello without waiting for it, and a cold `xcrun` cache can make it take long).
+const SURVEY_LOGGED_WITHIN: Duration = Duration::from_secs(60);
+
+/// Writes to stderr (which tests do not capture), for the CI log, how long the daemon
+/// `name` took from its start to `what`, and its first survey's line from `log`.
+fn log_start(name: &str, what: &str, took: Duration, log: &[String]) {
+    let survey = log
+        .iter()
+        .find(|l| l.contains(SURVEYED))
+        .map_or("no survey ended yet", String::as_str);
+    let _ = writeln!(
+        std::io::stderr(),
+        "binary.rs: the {name} daemon {what} {took:.2?} after it started; {survey}"
+    );
+}
+
 /// [`runs_until_sigterm`], with `path` searched first for programs (`podman`).
 fn runs_until_sigterm_with_path(
     name: &str,
@@ -169,18 +191,18 @@ fn runs_until_sigterm_with_path(
             Err(e) => panic!("no session attempt ({e}): {log:#?}"),
         }
     }
-    // How long the daemon took to try its first session (the native driver surveys its
-    // Xcodes before, and logs how long that took), for the CI log: written to stderr,
-    // which tests do not capture.
-    let survey = log
-        .iter()
-        .find(|l| l.contains("Xcodes"))
-        .map_or("", |l| l.as_str());
-    let _ = writeln!(
-        std::io::stderr(),
-        "binary.rs: the {name} daemon tried its first session {:.1?} after it started; {survey}",
-        started.elapsed()
-    );
+    // The first attempt is where Hello would go: the native driver does not survey its
+    // Xcodes first (its survey runs in the background).
+    let tried = started.elapsed();
+    let surveying = extra.iter().any(|f| f == "--driver=native");
+    let until = Instant::now() + SURVEY_LOGGED_WITHIN;
+    while surveying && !log.iter().any(|l| l.contains(SURVEYED)) {
+        let Ok(line) = seen.recv_timeout(until.saturating_duration_since(Instant::now())) else {
+            break;
+        };
+        log.push(line);
+    }
+    log_start(name, "tried its first session", tried, &log);
     let pid = i32::try_from(child.id()).expect("pid");
     // SAFETY: kill(2) on the child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
@@ -424,6 +446,15 @@ fn ended(pid: i32) -> bool {
     stat.is_empty() || stat.starts_with('Z')
 }
 
+/// Waits until the daemon logging to `log` says its first survey ended, for at most
+/// [`SURVEY_LOGGED_WITHIN`], and never fails: the line is for the CI log only.
+fn wait_logged(log: &Path) {
+    let until = Instant::now() + SURVEY_LOGGED_WITHIN;
+    while !read(log).contains(SURVEYED) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Polls `read` until it returns a value, for at most [`PROMPT`].
 fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + PROMPT;
@@ -464,9 +495,11 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         format!("--scratch={}", scratch.display()),
     ];
 
+    let spawned = Instant::now();
     let mut first = daemon(&flags, &dir.join("first.log"));
     let session = front.session(PROMPT);
     session.hello();
+    let first_hello = spawned.elapsed();
     session.welcome();
     session.start(1, 1, action);
     let pid_file = scratch.join("lease-1-1/root/pid");
@@ -475,6 +508,9 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         text.strip_suffix('\n')?.parse().ok()
     });
     assert!(!ended(pid), "the action runs");
+    // Its first survey's line, for the CI log (this daemon's is the job's first survey
+    // of the runner's Xcodes): waited for, never failed on.
+    wait_logged(&dir.join("first.log"));
     assert_eq!(
         stop(&mut first, libc::SIGKILL).signal(),
         Some(libc::SIGKILL)
@@ -483,12 +519,15 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(!ended(pid), "the action outlived its daemon");
 
+    let spawned = Instant::now();
     let mut second = daemon(&flags, &dir.join("second.log"));
     let session = front.session(PROMPT);
     session.hello();
+    let second_hello = spawned.elapsed();
     // What holds as the new session begins.
     let action_ended = ended(pid);
     let lease_dir_left = scratch.join("lease-1-1").exists();
+    wait_logged(&dir.join("second.log"));
     let status = stop(&mut second, libc::SIGTERM);
     if !action_ended {
         // A red run must not leave the sleep behind. It was alive a moment ago and is
@@ -496,6 +535,9 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         // SAFETY: kill(2) takes plain integers.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
+    let lines = |file: &str| read(&dir.join(file)).lines().map(str::to_owned).collect::<Vec<_>>();
+    log_start("restart test's first", "said Hello", first_hello, &lines("first.log"));
+    log_start("restart test's second", "said Hello", second_hello, &lines("second.log"));
     let log = read(&dir.join("second.log"));
     assert!(
         action_ended,

@@ -9,7 +9,9 @@
 //!
 //! **Attention.** What a node needs a human for is listed in its `needs_attention`:
 //! today, each installed Xcode that is not ready, with why and the command that fixes
-//! it (issue #164). kbf has no alert delivery yet, so the server also logs each item
+//! it (issue #164). An Xcode its node has not surveyed yet (`not_surveyed`: the daemon
+//! says Hello before its first survey ends) is listed in `xcodes` with that state but
+//! needs no one: its node reports it again when the survey ends. kbf has no alert delivery yet, so the server also logs each item
 //! once, at `WARN` under the target `kbf_server::attention`, when it first appears, and
 //! at `INFO` when it clears ([`attention_changes`]); a status that repeats the same
 //! items (each new stream sends one) logs nothing. An item is the same while its
@@ -94,8 +96,8 @@ pub struct XcodeView {
     /// Its build; empty when not known.
     pub build: String,
     /// `ready`, `license_not_accepted`, `first_launch_not_run`,
-    /// `metal_toolchain_missing`, `failed`, or `unknown` (a state this server does not
-    /// know).
+    /// `metal_toolchain_missing`, `failed`, `not_surveyed` (found, not asked yet; never
+    /// advertised), or `unknown` (a state this server does not know).
     pub state: &'static str,
     /// Why it is not ready; empty when ready.
     pub reason: String,
@@ -111,6 +113,7 @@ impl XcodeView {
             Ok(XcodeState::FirstLaunchNotRun) => "first_launch_not_run",
             Ok(XcodeState::MetalToolchainMissing) => "metal_toolchain_missing",
             Ok(XcodeState::Failed) => "failed",
+            Ok(XcodeState::NotSurveyed) => "not_surveyed",
             Ok(XcodeState::Unspecified) | Err(_) => "unknown",
         };
         Self {
@@ -122,9 +125,9 @@ impl XcodeView {
         }
     }
 
-    /// What an operator must do about it, unless it is ready.
+    /// What an operator must do about it, unless it is ready or not surveyed yet.
     fn attention(&self) -> Option<String> {
-        if self.state == "ready" {
+        if matches!(self.state, "ready" | "not_surveyed") {
             return None;
         }
         let named = match self.build.as_str() {
@@ -258,8 +261,9 @@ mod tests {
     }
 
     /// Catches: a not-ready Xcode not listed for attention or listed without its reason
-    /// or fix, a ready one listed, a state shown under another name, a state number
-    /// this server does not know shown as ready, and an unknown build or fix left blank.
+    /// or fix, a ready one or one not surveyed yet listed (nothing for a human to do),
+    /// a state shown under another name, a state number this server does not know
+    /// shown as ready, and an unknown build or fix left blank.
     #[test]
     fn every_xcode_not_ready_needs_attention() {
         let status = NodeStatus {
@@ -289,6 +293,7 @@ mod tests {
                     ..xcode("9Z", XcodeState::Ready, "new", "")
                 },
                 xcode("8Y", XcodeState::Unspecified, "", ""),
+                xcode("", XcodeState::NotSurveyed, "not surveyed yet", ""),
             ],
             ..NodeStatus::default()
         };
@@ -303,7 +308,8 @@ mod tests {
                 "metal_toolchain_missing",
                 "failed",
                 "unknown",
-                "unknown"
+                "unknown",
+                "not_surveyed"
             ]
         );
         assert_eq!(

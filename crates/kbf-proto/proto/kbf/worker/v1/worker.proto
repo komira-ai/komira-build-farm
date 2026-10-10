@@ -161,6 +161,10 @@ enum XcodeState {
   XCODE_STATE_METAL_TOOLCHAIN_MISSING = 4;
   // Another check failed (no build, no compiler, no answer in time).
   XCODE_STATE_FAILED = 5;
+  // Found, not asked yet: the daemon says Hello before its first survey of the Xcodes
+  // ends, and sends Hello and NodeStatus again when it does. Not advertised; nothing
+  // for an administrator to do.
+  XCODE_STATE_NOT_SURVEYED = 6;
 }
 
 // The server's answer to Hello.

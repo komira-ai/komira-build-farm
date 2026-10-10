@@ -257,17 +257,22 @@ const WITHIN: Duration = Duration::from_secs(2);
 /// Catches (CEO decision on issue #164): a question of the survey, `xcrun`'s lookup
 /// above all (it reads and fills a cache leases can write), run outside the sandbox,
 /// with the network on, without the user-folder rules, in another lease directory or
-/// `TMPDIR`, or with `--no-cache` (the fake `xcrun` refuses it); an Xcode asked again
-/// through a link to it (`Xcode.app`), or the link not reported; the survey's
-/// directory left behind; and an Xcode asked, or reported as anything but failed with
-/// why, when that directory cannot be made. The sandbox program is a fake that logs
-/// what it runs and how, then runs it.
+/// `TMPDIR`, or with `--no-cache` (the fake `xcrun` refuses it); the same of the Metal
+/// questions a node that requires the toolchain asks, `xcodebuild -showComponent
+/// MetalToolchain` (which starts `xcrun` and reads and writes its cache) and, for an
+/// Xcode before 26 (`Xcode_old`, which refuses it), `xcrun --find metal`; an Xcode
+/// asked again through a link to it (`Xcode.app`), or the link not reported; the
+/// survey's directory left behind; and an Xcode asked, or reported as anything but
+/// failed with why, when that directory cannot be made. The sandbox program is a fake
+/// that logs what it runs and how, then runs it: a question asked outside it is
+/// missing from its log.
 #[test]
 fn the_survey_asks_every_question_under_its_sandbox() {
     let dir = scratch("sandboxed");
     let apps = dir.join("Applications");
     let xcodebuild = fake_xcodebuild(&dir);
     link_xcodebuild(&xcodebuild, &apps.join("Xcode_good.app"));
+    link_xcodebuild(&xcodebuild, &apps.join("Xcode_old.app"));
     std::os::unix::fs::symlink(apps.join("Xcode_good.app"), apps.join("Xcode.app")).expect("link");
     let log = dir.join("sandbox-log");
     let sandbox_exec = fake(
@@ -291,38 +296,48 @@ fn the_survey_asks_every_question_under_its_sandbox() {
         xcrun: fake_xcrun(&dir),
         within: WITHIN,
         sandbox: Some(sandbox.clone()),
-        ..Probe::system(false)
+        ..Probe::system(true)
     };
     let surveyed = survey(&apps, &probe);
     let real_apps = std::fs::canonicalize(&apps).expect("real");
-    let developer_dir = real_apps.join("Xcode_good.app/Contents/Developer");
-    let good = Xcode {
-        app: apps.join("Xcode_good.app"),
-        developer_dir: Some(developer_dir.clone()),
-        build: Some("16C5032a".to_owned()),
+    let ready = |name: &str, build: &str| Xcode {
+        app: apps.join(name),
+        developer_dir: Some(real_apps.join(name).join("Contents/Developer")),
+        build: Some(build.to_owned()),
         state: State::Ready,
         reason: String::new(),
     };
+    let good = ready("Xcode_good.app", "16C5032a");
     let link = Xcode {
         app: apps.join("Xcode.app"),
         ..good.clone()
     };
-    assert_eq!(surveyed, [link, good]);
+    assert_eq!(surveyed, [link, good, ready("Xcode_old.app", "15A1")]);
     let real = std::fs::canonicalize(&dir)
         .expect("real")
         .join("scratch/lease-survey");
     let how = format!("KBF_LEASE={0} TMPDIR={0} net=off", real.display());
-    let own = developer_dir.join(XCODEBUILD);
-    // In any order: an Xcode's questions are asked at once.
-    let want: BTreeSet<String> = [
-        format!("{} -version", own.display()),
-        format!("{} -license check", own.display()),
-        format!("{} -checkFirstLaunchStatus", own.display()),
-        format!("{} --find clang", probe.xcrun.display()),
-    ]
-    .iter()
-    .map(|ran| format!("{how} {ran}"))
-    .collect();
+    let xcrun = probe.xcrun.display();
+    // In any order: an Xcode's questions are asked at once, and both Xcodes at once.
+    let mut want: BTreeSet<String> = ["Xcode_good.app", "Xcode_old.app"]
+        .iter()
+        .flat_map(|name| {
+            let own = real_apps.join(name).join("Contents/Developer").join(XCODEBUILD);
+            [
+                format!("{} -version", own.display()),
+                format!("{} -license check", own.display()),
+                format!("{} -checkFirstLaunchStatus", own.display()),
+                format!("{} -showComponent MetalToolchain", own.display()),
+                format!("{xcrun} --find clang"),
+            ]
+        })
+        .map(|ran| format!("{how} {ran}"))
+        .collect();
+    // Two lines alike (each Xcode's clang lookup) are one in the set; the count below
+    // takes them as two.
+    assert_eq!(want.len(), 9);
+    // Only the Xcode before 26 is asked for its bundled Metal.
+    want.insert(format!("{how} {xcrun} --find metal"));
     let read = || -> Vec<String> {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
@@ -331,7 +346,7 @@ fn the_survey_asks_every_question_under_its_sandbox() {
             .collect()
     };
     let ran = read();
-    assert_eq!(ran.len(), want.len(), "a question asked twice: {ran:#?}");
+    assert_eq!(ran.len(), 11, "a question asked twice, or not at all: {ran:#?}");
     assert_eq!(ran.into_iter().collect::<BTreeSet<_>>(), want);
     assert!(!real.exists(), "the survey's directory stays");
 
@@ -344,7 +359,7 @@ fn the_survey_asks_every_question_under_its_sandbox() {
         ..probe
     };
     let refused = survey(&apps, &unmakeable);
-    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert_eq!(refused.len(), 3, "{refused:?}");
     for xcode in &refused {
         assert_eq!((xcode.state, xcode.build.as_deref()), (State::Failed, None));
         assert!(xcode.reason.contains("under-a-file"), "{}", xcode.reason);
@@ -533,7 +548,7 @@ fn every_xcode_that_answers_is_found() {
 /// time taken as an Xcode before 26 or as missing Metal, an `Xcode` before 26 (no
 /// `-showComponent`) taken as missing Metal when `xcrun` finds it, or as having Metal
 /// when `xcrun` does not, the Xcodes asked one after another (then each Xcode's
-/// questions are paid in turn before the node says `Hello`), and
+/// questions are paid in turn before any Xcode is ready), and
 /// `xcrun` asked with `--no-cache` (the survey's lookups use the cache, under the
 /// sandbox: without it each takes seconds).
 #[test]
@@ -723,6 +738,7 @@ fn a_fix_runs_the_xcodes_own_xcodebuild() {
     );
     assert_eq!(fix(State::Ready), None);
     assert_eq!(fix(State::Failed), None);
+    assert_eq!(fix(State::NotSurveyed), None);
     let spaced = at(
         "/Applications/Xcode 16 'b'.app/Contents/Developer",
         State::LicenseNotAccepted,
@@ -759,6 +775,7 @@ fn a_fix_runs_the_xcodes_own_xcodebuild() {
             XcodeState::MetalToolchainMissing,
         ),
         (State::Failed, XcodeState::Failed),
+        (State::NotSurveyed, XcodeState::NotSurveyed),
     ] {
         assert_eq!(at(plain, state).status().state(), want);
     }

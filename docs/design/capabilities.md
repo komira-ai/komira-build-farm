@@ -289,8 +289,10 @@ naming no `container-image`.
   `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
   clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0, each
   asked under the actions' sandbox with the network off, as an action runs. It runs an
-  action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. It asks
-  again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
+  action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. Its first
+  survey runs in the background: the daemon says `Hello` at once with no `xcode`
+  entry, each Xcode listed as not surveyed in its status, until the survey ends. It
+  asks again every `--xcode-recheck-secs`, and a change resends the `Hello` (so placement
   sees it) and the `NodeStatus` (which lists every installed Xcode, ready or not, with
   the fix).
 
