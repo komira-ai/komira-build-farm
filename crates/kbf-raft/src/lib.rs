@@ -8,6 +8,13 @@
 //! send messages, apply committed entries. A process may hold any number of cores,
 //! one per group.
 //!
+//! [`Host`] is that caller, over three traits: a [`Storage`] for the vote, the log and
+//! the newest snapshot, a [`Transport`] for messages, and a [`Machine`] for the state
+//! the log replicates. It carries out effects in order and makes every persist durable
+//! before the next send or apply; a storage error stops it. [`MemStorage`] is an
+//! in-memory storage whose crash keeps only what was synced (and a prefix of what was
+//! not), for tests and simulations.
+//!
 //! In scope here: leader election with randomized timeouts, log replication with the
 //! append consistency check, commit by a majority of voters for entries of the current
 //! term only, learners that receive and apply the log without voting, and a snapshot
@@ -26,10 +33,15 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod host;
 mod log;
+mod mem;
 mod message;
 mod raft;
 mod types;
+
+pub use host::{Host, HostError, Machine, OpenError, Snapshot, Storage, Stored, Transport};
+pub use mem::MemStorage;
 
 pub use message::{AppendOutcome, Effect, Message, MessageKind};
 pub use raft::{CompactError, NotLeader, Proposed, Raft, Role};
