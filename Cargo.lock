@@ -1238,6 +1238,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-guest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "libc",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [
