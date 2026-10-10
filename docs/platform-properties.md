@@ -168,7 +168,10 @@ it holds none). Until that survey ends, the node's status lists each `Xcode*.app
 found as `not_surveyed`, and its node report advertises no Xcode, so nothing that
 names one is placed on it; when the survey ends the daemon sends its `Hello` and
 status again, with the Xcodes' states, without a restart. An Xcode not surveyed yet
-needs no one, so it is not under `needs_attention`.
+keeps whatever item its node's previous status gave it under `needs_attention` (a
+restarted daemon's broken Xcode stays listed, and is neither logged as resolved nor
+raised again by the survey that finds it unchanged); one with no previous item has
+none.
 
 An Xcode that is not ready is **not hidden**: the node's status lists every installed
 Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
@@ -176,8 +179,9 @@ Xcode with its state (`license_not_accepted`, `first_launch_not_run`,
 command that fixes it (for example `sudo
 /Applications/Xcode_16.2.app/Contents/Developer/usr/bin/xcodebuild -license accept`),
 and `GET /v1/nodes` lists it under the node's `needs_attention`
-([api.md](api.md#get-v1nodes)). The daemon and the server each log it at `WARN` once
-when it appears, and again only when its build, state or fix changes: a reason that
+([api.md](api.md#get-v1nodes)). The daemon (once per start) and the server each log
+it at `WARN` once when it appears, and again only when its build, state or fix
+changes: a reason that
 changes alone (`xcodebuild` starts its NSLog lines with the time and its pid) is not
 logged again, and is not by itself a change the daemon sends.
 The daemon asks again every three minutes (`--xcode-recheck-secs`), so an Xcode fixed

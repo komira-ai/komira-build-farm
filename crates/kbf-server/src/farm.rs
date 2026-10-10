@@ -360,8 +360,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was
     /// replaced (a newer stream sends its own after its `Welcome`). Each attention item
-    /// it raises or clears against the node's previous status is logged once
-    /// (`crate::fleet`); returns those lines, `true` for each raised.
+    /// it raises or clears against the node's previous status, from any stream, is
+    /// logged once; an Xcode it lists not surveyed yet keeps its previous item
+    /// (`crate::fleet`). Returns those lines, `true` for each raised.
     pub fn node_status(
         &self,
         worker: &WorkerId,
@@ -373,8 +374,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         if !state.is_current(worker, stream) {
             return Vec::new();
         }
-        let view = SoftwareView::new(status, received);
+        let mut view = SoftwareView::new(status, received);
         let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
+        // An Xcode not surveyed yet (a restarted daemon's first status) keeps the item
+        // it had: neither cleared now nor raised again by the survey (`crate::fleet`).
+        view.hold_unsurveyed(before);
         let changes = attention_changes(worker.as_str(), before, &view.xcodes);
         for (raise, line) in &changes {
             if *raise {
