@@ -79,7 +79,7 @@ async fn a_refused_blob_call_is_logged_as_a_warning_with_its_call_code_and_reaso
         panic!("one refusal line expected: {text}");
     };
     for part in [
-        "WARN kbf_server::blobs: blob call refused on the worker listener",
+        "WARN kbf_server::blobs: blob call refused",
         "call=\"Read\"",
         "code=Unauthenticated",
         "need mutual TLS",

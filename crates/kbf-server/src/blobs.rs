@@ -39,18 +39,11 @@ impl<M, O> WorkerBlobs<M, O> {
     async fn admit<T>(&self, request: &Request<T>, call: &'static str) -> Result<(), Status> {
         let certs = request.peer_certs();
         let leaf = certs.as_deref().and_then(|chain| chain.first());
-        match self.peers.admit_call(leaf.map(AsRef::as_ref)).await {
-            Ok(_) => Ok(()),
-            Err(refused) => {
-                tracing::warn!(
-                    call,
-                    code = ?refused.code(),
-                    reason = refused.message(),
-                    "blob call refused on the worker listener"
-                );
-                Err(refused)
-            }
-        }
+        let admitted = self.peers.admit_call(leaf.map(AsRef::as_ref)).await;
+        admitted.map(drop).inspect_err(|refused| {
+            let (code, reason) = (refused.code(), refused.message());
+            tracing::warn!(call, ?code, reason, "blob call refused");
+        })
     }
 }
 
