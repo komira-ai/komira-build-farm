@@ -152,6 +152,7 @@ fn hello(node: &str) -> daemon_message::Message {
             entry("arch", "x86_64"),
             entry("cpus", "1"),
             entry("mem_gib", "1"),
+            entry("drivers", "fake"),
         ],
         ..Hello::default()
     })

@@ -9,7 +9,7 @@ These properties change how kbf schedules an action today:
 
 | Property | Values | Default | Effect |
 |---|---|---|---|
-| `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under. |
+| `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
 | `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `1` | GiB of memory the lease books. |
@@ -100,6 +100,24 @@ cc_test(
 )
 ```
 
+## `kbf-lease`
+
+An `action` lease (the default) books a share of a worker: one core and 1 GiB, or what
+`kbf-book-cpus` and `kbf-book-mem-gib` name, plus its `gpu` GPUs. A `whole_machine`
+lease books every core, byte of memory and GPU of its worker, and runs there alone.
+
+A lease goes only to a worker whose daemon runs a driver for its kind: `container`,
+`native` or `fake` (or the test-only `local`) for `action`, `native-whole-machine` for
+`whole_machine` (see
+[capabilities.md](design/capabilities.md#driver-entries)). No daemon runs
+`native-whole-machine` yet, so today a `whole_machine` action waits with the reason
+and then fails, as described under [Where an action runs](#where-an-action-runs).
+
+A `whole_machine` lease waits for a worker that holds no lease. While it waits it holds
+one worker that could run it, and work queued after it at the same or a lower QoS is
+not placed there, so that worker empties as its leases end. More urgent work is still
+placed there. Running leases are never stopped for it.
+
 ## `kbf-book-cpus` and `kbf-book-mem-gib`
 
 Every action books one core and 1 GiB of memory on the worker it runs on, unless it
@@ -126,8 +144,8 @@ cc_binary(
 ```
 
 A value that is not a whole number of at least 1 is refused with `INVALID_ARGUMENT`,
-as is either key on a `kbf-lease=whole_machine` lease, which is planned to book the
-whole worker. A booking larger than any worker that satisfies the platform waits and
+as is either key on a `kbf-lease=whole_machine` lease, which books the whole
+worker. A booking larger than any worker that satisfies the platform waits and
 then fails, as described under [Where an action runs](#where-an-action-runs).
 
 Like every platform property, the two keys are part of the action digest: the same

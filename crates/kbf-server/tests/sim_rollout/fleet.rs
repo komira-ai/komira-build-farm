@@ -48,7 +48,9 @@ pub fn node_caps(i: usize) -> NodeCaps {
         1 => &[("arch", "arm64"), ("os", "macos")],
         _ => &[("arch", "x86_64"), ("os", "linux")],
     };
-    NodeCaps::from_report(report.iter().copied()).expect("a valid report")
+    NodeCaps::from_report(report.iter().copied())
+        .expect("a valid report")
+        .with_drivers(["container"])
 }
 
 /// The world the driver acts on: the scheduler, the workers and their work.
@@ -295,6 +297,7 @@ impl Cell {
                 action: digest(n),
             },
             qos: Qos::Ci,
+            kind: kbf_types::LeaseKind::Action,
             resources: Resources::new(1_000 * rng.between(1, 2), GIB),
             needs: kbf_caps::Request::from_platform(PLATFORMS[p].iter().copied()).expect("valid"),
             hermetic: true,

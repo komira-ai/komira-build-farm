@@ -257,6 +257,7 @@ pub fn request(n: u64) -> Request {
             action: action(n),
         },
         qos: Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
         needs: kbf_caps::Request::default(),
         hermetic: !n.is_multiple_of(3),

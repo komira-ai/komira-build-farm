@@ -60,17 +60,23 @@ pub const WORKERS: [&str; 4] = ["arm", "mac", "x86-a", "x86-b"];
 pub fn mac_caps(xcodes: &[&str]) -> NodeCaps {
     let mut report = vec![("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")];
     report.extend(xcodes.iter().map(|x| ("xcode", *x)));
-    NodeCaps::from_report(report).expect("a valid report")
+    NodeCaps::from_report(report)
+        .expect("a valid report")
+        .with_drivers(["container"])
 }
 
 fn caps(name: &str) -> NodeCaps {
     match name {
-        "arm" => NodeCaps::from_report([("arch", "arm64"), ("os", "linux")]).expect("valid"),
+        "arm" => NodeCaps::from_report([("arch", "arm64"), ("os", "linux")])
+            .expect("valid")
+            .with_drivers(["container"]),
         _ => {
             let mut report = vec![("arch", "x86_64"), ("os", "linux")];
             let v3 = kbf_caps::X86Level::ALL.iter().take(3);
             report.extend(v3.flat_map(|l| l.adds().iter().map(|f| ("cpu.features", *f))));
-            NodeCaps::from_report(report).expect("valid")
+            NodeCaps::from_report(report)
+                .expect("valid")
+                .with_drivers(["container"])
         }
     }
 }
@@ -322,6 +328,7 @@ impl World {
                         action: digest(id.0),
                     },
                     qos,
+                    kind: kbf_types::LeaseKind::Action,
                     resources: Resources::new(cpu, mem),
                     needs: kbf_caps::Request::from_platform(PLATFORMS[*platform].iter().copied())
                         .expect("a valid platform"),

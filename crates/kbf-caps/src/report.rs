@@ -8,8 +8,9 @@
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` (once each) | countable capacity |
 //! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` (once each) | exact values |
 //! | `xcode` (repeated: one per installed build) | a set, matched by membership |
+//! | `drivers` (repeated: one per driver the daemon runs) | the drivers; placement reads them for the lease kind, no request key names them |
 //!
-//! Every other entry (`isa_level`, `drivers`, ...) is not matched on and is skipped.
+//! Every other entry (`isa_level`, ...) is not matched on and is skipped.
 //! The reported `isa_level` list is not read: the level is computed from the features,
 //! so it can never disagree with them.
 
@@ -55,6 +56,7 @@ impl NodeCaps {
         let mut exact = BTreeMap::new();
         let mut members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut consumables = BTreeMap::new();
+        let mut drivers = BTreeSet::new();
         let repeated = |key: &str| ReportError::Repeated(key.to_owned());
         for (key, value) in entries {
             if key == "arch" {
@@ -63,6 +65,8 @@ impl NodeCaps {
                 }
             } else if key == "cpu.features" {
                 features.insert(value.to_owned());
+            } else if key == "drivers" {
+                drivers.insert(value.to_owned());
             } else if is_member_key(key) {
                 members
                     .entry(key.to_owned())
@@ -87,6 +91,7 @@ impl NodeCaps {
             exact,
             members,
             consumables,
+            drivers,
         })
     }
 }

@@ -358,7 +358,9 @@ fn register(
     mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>,
 ) {
     let (outbound, responses) = mpsc::unbounded_channel();
-    let caps = NodeCaps::from_report([("arch", "x86_64")]).expect("caps");
+    let caps = NodeCaps::from_report([("arch", "x86_64")])
+        .expect("caps")
+        .with_drivers(["container"]);
     let resources = Resources::new(8_000, 16 << 30);
     let stream = farm.register(
         &WorkerId::new(node),

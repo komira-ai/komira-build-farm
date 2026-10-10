@@ -1,4 +1,4 @@
-//! Lease identifiers.
+//! Lease identifiers and lease kinds.
 
 use std::fmt;
 
@@ -31,6 +31,66 @@ impl fmt::Display for LeaseId {
     }
 }
 
+/// What a lease takes on its worker, named by an action's `kbf-lease` platform property.
+///
+/// Placement gives a lease only to a worker whose node report lists a driver that
+/// serves its kind ([`LeaseKind::drivers`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeaseKind {
+    /// A share of a machine: the cores, memory and GPUs its request books. The default.
+    #[default]
+    Action,
+    /// The whole machine: every core, byte and GPU of the worker, with no other lease
+    /// beside it.
+    WholeMachine,
+    /// A macOS guest VM. Planned: no front accepts it and no driver reports `vm` yet.
+    Vm,
+}
+
+impl LeaseKind {
+    /// Every kind, in order.
+    pub const ALL: [Self; 3] = [Self::Action, Self::WholeMachine, Self::Vm];
+
+    /// Its name, as `kbf-lease` and the worker protocol's `Start.kind` spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Action => "action",
+            Self::WholeMachine => "whole_machine",
+            Self::Vm => "vm",
+        }
+    }
+
+    /// The kind named `name`, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// The node report `drivers` values that serve this kind. `local` is
+    /// `kbf-daemon`'s test-only runtime, which runs actions as child processes.
+    #[must_use]
+    pub const fn drivers(self) -> &'static [&'static str] {
+        match self {
+            Self::Action => &["container", "native", "fake", "local"],
+            Self::WholeMachine => &["native-whole-machine"],
+            Self::Vm => &["vm"],
+        }
+    }
+
+    /// Whether a worker that reports driver `driver` serves this kind.
+    #[must_use]
+    pub fn served_by(self, driver: &str) -> bool {
+        self.drivers().contains(&driver)
+    }
+}
+
+impl fmt::Display for LeaseKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +114,28 @@ mod tests {
         ids.sort();
         let want = [(1, 7), (1, 9), (2, 0), (2, 1)].map(|(t, s)| LeaseId::new(t, s));
         assert_eq!(ids, want);
+    }
+
+    /// Catches: a kind spelt differently from `kbf-lease` and `Start.kind`, a name that
+    /// does not read back, and a driver serving a kind it does not run (a container
+    /// worker offered a whole-machine lease, or a whole-machine driver offered actions).
+    #[test]
+    fn kinds_name_and_drivers() {
+        for kind in LeaseKind::ALL {
+            assert_eq!(LeaseKind::from_name(kind.name()), Some(kind));
+        }
+        assert_eq!(LeaseKind::from_name("whole-machine"), None);
+        assert_eq!(LeaseKind::default(), LeaseKind::Action);
+        assert_eq!(LeaseKind::WholeMachine.to_string(), "whole_machine");
+        for driver in ["container", "native", "fake", "local"] {
+            assert!(LeaseKind::Action.served_by(driver));
+            assert!(!LeaseKind::WholeMachine.served_by(driver));
+            assert!(!LeaseKind::Vm.served_by(driver));
+        }
+        assert!(LeaseKind::WholeMachine.served_by("native-whole-machine"));
+        assert!(!LeaseKind::Action.served_by("native-whole-machine"));
+        assert!(LeaseKind::Vm.served_by("vm"));
+        assert!(!LeaseKind::Action.served_by("vm"));
     }
 
     /// Catches: a text form that drops or swaps a field, which makes logs ambiguous.

@@ -37,8 +37,9 @@ use kbf_proto::worker::{
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
+    OperationId, Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting,
+    WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
@@ -136,7 +137,7 @@ pub enum NodeAction {
 struct Waiter {
     name: String,
     key: kbf_types::ActionKey,
-    kind: String,
+    kind: LeaseKind,
     do_not_cache: bool,
     stage: watch::Sender<Stage>,
     /// When it was submitted, on the wall clock.
@@ -627,7 +628,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             Waiter {
                 name: name.clone(),
                 key: submission.request.key.clone(),
-                kind: submission.kind,
+                kind: submission.request.kind,
                 do_not_cache: submission.request.do_not_cache,
                 stage,
                 queued: SystemTime::now(),
@@ -820,7 +821,7 @@ impl State {
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
-                kind: w.kind.clone(),
+                kind: w.kind.name().to_owned(),
                 action_digest: Some(kbf_front::digest_to_proto(&w.key.action)),
             })
         });
@@ -831,10 +832,10 @@ impl State {
     /// after it in which the daemon may still act on the `Start` (issue #23).
     fn start(&mut self, start: StartLease) {
         let heartbeat_seq = self.links.get(&start.worker).map_or(0, |l| l.newest_beat);
-        self.send_for(&start.worker, start.operation, |w| {
+        self.send_for(&start.worker, start.operation, |_| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
-                kind: w.kind.clone(),
+                kind: start.kind.name().to_owned(),
                 action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
                 millicpus: start.resources.cpu_millis,
                 memory_bytes: start.resources.memory_bytes,
