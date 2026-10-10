@@ -7,8 +7,9 @@
 //!    `podman::create_args`), make the lease cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, or [`Runtime::kill`];
-//! 4. **collect:** the exit code from Podman's record, OOM from the lease cgroup's
-//!    `memory.events`; the overlay's directories back to the daemon's user; outputs,
+//! 4. **collect:** the exit code from Podman's record (a container crun could not
+//!    start because the program is not there or not executable is the action's exit
+//!    127 or 126, see `program`), OOM from the lease cgroup's `memory.events`; the overlay's directories back to the daemon's user; outputs,
 //!    stdout and stderr into the CAS;
 //! 5. **clean:** remove the container, the lease cgroup and the scratch directory;
 //! 6. **verify-clean:** neither directory may remain.
@@ -39,8 +40,9 @@ use crate::cgroup::LeaseCgroup;
 use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
-    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, LEASE_PREFIX, Podman,
+    CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
 };
+use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
     TreeError, check_relative, collect, fetch_message, materialize, output_paths,
@@ -341,7 +343,8 @@ impl<C: Cas> PodmanRuntime<C> {
         tokio::select! {
             // `podman start`'s own status is not the action's: Podman's record, read
             // below, is. An error waiting for it is not trusted either way, since
-            // `exit_code` fails the lease unless that record says the container exited.
+            // `ended` fails the lease unless that record says the container exited, or crun
+            // reports it could not start the program (`program::not_run`).
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
@@ -354,11 +357,15 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         }
 
-        let exit_code = self
+        let exit_code = match self
             .podman
-            .exit_code(&lease.name)
+            .ended(&lease.name)
             .await
-            .map_err(RuntimeError::Failed)?;
+            .map_err(RuntimeError::Failed)?
+        {
+            Ended::Exited(code) => code,
+            Ended::NotRun(state) => program::not_run(&spec, &stderr_path, &state).await?,
+        };
         // 137 is SIGKILL. Whether the kernel's OOM killer sent it is read from the
         // lease cgroup, not from Podman.
         if exit_code == 137 {

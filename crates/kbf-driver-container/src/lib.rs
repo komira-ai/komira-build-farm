@@ -52,6 +52,7 @@ mod cgroup;
 pub mod image;
 mod outputs;
 mod podman;
+mod program;
 mod remove;
 mod runtime;
 pub mod subids;

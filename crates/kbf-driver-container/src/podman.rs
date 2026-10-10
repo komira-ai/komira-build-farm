@@ -168,6 +168,15 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     args
 }
 
+/// How a started container ended ([`Podman::ended`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// It ran and exited with this code.
+    Exited(i32),
+    /// It did not run to an exit: Podman's `<status> <exit code>` for it.
+    NotRun(String),
+}
+
 /// A Podman program.
 #[derive(Clone, Debug)]
 pub(crate) struct Podman {
@@ -261,9 +270,10 @@ impl Podman {
             .map_err(|e| format!("run {}: {e}", self.program.display()))
     }
 
-    /// The exit code of a container that has exited. Read from Podman's record, not
-    /// from `podman start`'s own status, which also reports Podman's errors.
-    pub(crate) async fn exit_code(&self, name: &str) -> Result<i32, String> {
+    /// How the container ended, from Podman's record, not from `podman start`'s own
+    /// status, which also reports Podman's errors: its exit code, or the state of a
+    /// container that did not run to an exit.
+    pub(crate) async fn ended(&self, name: &str) -> Result<Ended, String> {
         let args = [
             "inspect",
             "--type=container",
@@ -279,11 +289,9 @@ impl Podman {
         match text.split_whitespace().collect::<Vec<_>>()[..] {
             ["exited", code] => code
                 .parse()
+                .map(Ended::Exited)
                 .map_err(|_| format!("podman inspect: exit code {code:?}")),
-            _ => Err(format!(
-                "the container did not run to an exit: podman reports {:?}",
-                text.trim()
-            )),
+            _ => Ok(Ended::NotRun(text.trim().to_owned())),
         }
     }
 
