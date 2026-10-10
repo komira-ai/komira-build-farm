@@ -434,6 +434,24 @@ mod tests {
     }
 
     #[test]
+    fn design_citations_on_one_line_are_reported_in_order() {
+        // Catches: the file-name matches reported before the acronym matches whatever
+        // their place in the line (the two are found in separate passes), or a second
+        // citation on a line dropped.
+        let a = acronym();
+        let file = format!("farm_{}.md", a.to_ascii_lowercase());
+        let f = scan(&format!("{a} 5.8, see {file}"));
+        let got: Vec<_> = f.into_iter().map(|x| x.kind).collect();
+        assert_eq!(
+            got,
+            vec![
+                Kind::DesignCitation(format!("{a} 5.8, see far")),
+                Kind::DesignCitation(file),
+            ]
+        );
+    }
+
+    #[test]
     fn ietf_numbers_and_longer_words_are_not_design_citations() {
         // Catches: a scan that refuses the IETF citations the code relies on (RFC 1918,
         // RFC 3339, RFC 5737, ...), at the end of a sentence or hyphenated, or a word
