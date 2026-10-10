@@ -314,9 +314,9 @@ probed.
   the action. That front did not cut them. Another front whose idle timeout is shorter
   than the longest queue wait would cut these streams.
 
-**Daemons do not go through the front.** A daemon's `--server` (the flag's help calls
-it "the kbf-server front") and its `--cas` both name the worker listener, not the
-client front above. The worker listener keeps its own mutual TLS end to end. With
+**Daemons do not go through the front.** A daemon's `--server` (repeatable; each
+host resolved again on every round of connection attempts, which never stop) and its
+`--cas` both name the worker listener, not the client front above. The worker listener keeps its own mutual TLS end to end. With
 several servers (**planned**), daemons dial the servers' own names, with no balancer
 in between, and a follower redirects them to the leader
 ([deployment-topology.md](docs/design/deployment-topology.md)).

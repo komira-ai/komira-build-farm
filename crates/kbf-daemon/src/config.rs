@@ -18,9 +18,12 @@ pub const RECHECK_EVERY: Duration = Duration::from_secs(1);
 /// how this node is labelled. The binary (crate `kbf-node`) adds the driver flags.
 #[derive(Clone, Debug, clap::Args)]
 pub struct Args {
-    /// The kbf-server front to connect to, as an `https://host:port` URL.
-    #[arg(long)]
-    pub server: String,
+    /// A kbf-server worker listener to connect to, as an `https://host:port` URL;
+    /// repeatable, or several separated by commas. The host may be a DNS name with a
+    /// record per server: every round of attempts resolves it again and tries each
+    /// address. The daemon never stops trying (see `--reconnect-max-ms`).
+    #[arg(long = "server", required = true, value_delimiter = ',')]
+    pub servers: Vec<String>,
     /// PEM file of the CA certificates that sign server certificates.
     #[arg(long)]
     pub ca_cert: PathBuf,
@@ -36,9 +39,14 @@ pub struct Args {
     /// A stable name for this node, unique within the cell.
     #[arg(long)]
     pub node_id: String,
-    /// How long to wait between connection attempts, in milliseconds.
+    /// The wait, in milliseconds, after a session ends and after the first round of
+    /// connection attempts that all failed. It doubles with each further failed round.
     #[arg(long, default_value_t = 1000)]
     pub reconnect_ms: u64,
+    /// The longest wait between rounds of connection attempts, in milliseconds. Each
+    /// wait is jittered down by up to half.
+    #[arg(long, default_value_t = 30_000)]
+    pub reconnect_max_ms: u64,
     /// A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in
     /// komira's pool runs with `--label pool=darwin-sized`.
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
@@ -106,6 +114,10 @@ pub enum ConfigError {
     },
     #[error("server URL {0:?} is not https; the daemon connects only over mutual TLS")]
     NotHttps(String),
+    #[error("server URL {url:?}: {reason}")]
+    BadServer { url: String, reason: String },
+    #[error("no server URL given")]
+    NoServer,
 }
 
 impl TlsFiles {
@@ -132,14 +144,18 @@ fn read(path: &Path) -> Result<Vec<u8>, ConfigError> {
 /// Everything a [`crate::Daemon`] needs besides its runtime and node report.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
-    /// The server front, an `https` URL.
-    pub server: String,
+    /// The servers' worker listeners, each an `https` URL (see [`crate::connect`]).
+    pub servers: Vec<String>,
     pub tls: TlsFiles,
     pub node_id: String,
     /// T, normally [`FENCE_AFTER`]. Tests shorten it.
     pub fence_after: Duration,
-    /// The wait between connection attempts.
+    /// The wait after a session ends, and the first wait after a failed round of
+    /// connection attempts.
     pub reconnect_after: Duration,
+    /// The longest wait between rounds of connection attempts, normally
+    /// [`crate::connect::RECONNECT_MAX`].
+    pub reconnect_max: Duration,
     /// How long to wait for Welcome after opening a stream.
     pub welcome_timeout: Duration,
     /// The longest wait before the fence is checked again, normally
@@ -148,15 +164,16 @@ pub struct DaemonConfig {
 }
 
 impl DaemonConfig {
-    /// A configuration with the production fence time.
+    /// A configuration for one server URL, with the production fence time.
     #[must_use]
     pub fn new(server: String, tls: TlsFiles, node_id: String) -> Self {
         Self {
-            server,
+            servers: vec![server],
             tls,
             node_id,
             fence_after: FENCE_AFTER,
             reconnect_after: Duration::from_secs(1),
+            reconnect_max: crate::connect::RECONNECT_MAX,
             welcome_timeout: Duration::from_secs(10),
             recheck_every: RECHECK_EVERY,
         }
@@ -171,8 +188,10 @@ impl DaemonConfig {
             key: args.key.clone(),
             server_name: args.tls_server_name.clone(),
         };
-        let mut config = Self::new(args.server.clone(), tls, args.node_id.clone());
+        let mut config = Self::new(String::new(), tls, args.node_id.clone());
+        config.servers.clone_from(&args.servers);
         config.reconnect_after = Duration::from_millis(args.reconnect_ms);
+        config.reconnect_max = Duration::from_millis(args.reconnect_max_ms);
         config
     }
 }
@@ -218,13 +237,20 @@ mod tests {
         }
     }
 
-    /// Catches: flags that do not reach the configuration (a reconnect wait ignored,
-    /// TLS files swapped).
+    /// Catches: flags that do not reach the configuration (a reconnect wait or its
+    /// maximum ignored, TLS files swapped), and a server list that keeps only one of
+    /// several `--server` flags or comma-separated URLs.
     #[test]
     fn the_flags_reach_the_configuration() {
-        let args = parse(&["--reconnect-ms=250", "--tls-server-name=front"]).expect("flags");
+        let args = parse(&[
+            "--reconnect-ms=250",
+            "--reconnect-max-ms=9000",
+            "--tls-server-name=front",
+        ])
+        .expect("flags");
         let config = DaemonConfig::from_args(&args);
-        assert_eq!(config.server, "https://front:7070");
+        assert_eq!(config.servers, ["https://front:7070"]);
+        assert_eq!(config.reconnect_max, Duration::from_millis(9000));
         assert_eq!(config.node_id, "mac-1");
         assert_eq!(config.reconnect_after, Duration::from_millis(250));
         assert_eq!(config.tls.ca_cert, PathBuf::from("ca.pem"));
@@ -233,5 +259,25 @@ mod tests {
         assert_eq!(config.tls.server_name.as_deref(), Some("front"));
         assert_eq!(config.fence_after, FENCE_AFTER);
         assert_eq!(config.recheck_every, RECHECK_EVERY);
+
+        let defaults = DaemonConfig::from_args(&parse(&[]).expect("defaults"));
+        assert_eq!(defaults.reconnect_after, Duration::from_secs(1));
+        assert_eq!(defaults.reconnect_max, Duration::from_secs(30));
+
+        let several = parse(&[
+            "--server=https://b:1,https://c:2",
+            "--server",
+            "https://d:3",
+        ])
+        .expect("several servers");
+        assert_eq!(
+            DaemonConfig::from_args(&several).servers,
+            [
+                "https://front:7070",
+                "https://b:1",
+                "https://c:2",
+                "https://d:3"
+            ]
+        );
     }
 }
