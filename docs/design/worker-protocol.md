@@ -480,8 +480,10 @@ daemon restarts and server restarts:
   stream to the leader. A follower does not serve or relay the session: it ends the
   `Session` stream with a status naming the leader, and the daemon dials that server.
   A follower that knows no leader answers `UNAVAILABLE`, and the daemon tries the next
-  server. The daemon retries forever, with a backoff that grows to a bound (today it
-  retries forever with a fixed `--reconnect-ms` wait, against its one `--server`). On
+  server. The daemon retries forever, with a backoff that grows to a bound. This part
+  is built: `--server` is repeatable, each host is resolved again every round, and the
+  wait doubles with jitter up to `--reconnect-max-ms` (see
+  [daemon.md](daemon.md#reaching-a-server)); the redirect is planned. On
   failover the daemon reconnects to the new leader and keeps its running leases (the
   epoch names the log, above). Its blob calls go to the worker listeners of all the
   servers, with reads spread across them.

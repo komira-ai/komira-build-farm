@@ -163,7 +163,7 @@ it, so the farm must look like one endpoint.
 - **`grpc.health.v1` on the REAPI listener.** Beside the two readiness paths, each
   server serves the standard gRPC health service on its REAPI listener, so a proxy
   can health-check a server over gRPC on the port it routes to. This is built: today
-  every service name gives `/readyz`'s one answer
+  every service name it serves gives `/readyz`'s one answer (an unknown name is answered as [api.md](../api.md) describes)
   ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)). Planned: its answers
   follow the two readiness paths, ready to serve reads and leader; which service
   name reports which is not chosen.
