@@ -362,8 +362,11 @@ fn fastest(times: &[f64]) -> f64 {
 
 /// How much slower than twice its reference the fastest sandboxed `cc` call may be.
 /// The defect costs at least 0.31 s a call (issue #163, with an older cache still
-/// readable), 1.2 s with the cache lost (PR #172) and 5.3 s with none; a healthy
-/// sandboxed call costs well under 0.1 s on the runner (the times this test prints).
+/// readable), 1.2 s with the cache lost (PR #172) and 5.3 s with none. On the hosted
+/// runner the fastest healthy `cc` call took 0.016 to 0.023 s, sandboxed or not, and
+/// `clang` 0.008 to 0.012 s (PR #322; this test prints its times on every run), so
+/// the bounds come to 0.12 to 0.15 s: several times a healthy call, under half the
+/// smallest defect's.
 const SHIM_MARGIN: f64 = 0.1;
 
 /// Catches the `/usr/bin` compiler shims failing to write `xcrun`'s cache in the
