@@ -185,15 +185,13 @@ impl Peers {
     /// PERMISSION_DENIED: the certificate names no node or several, or it (or its
     /// node) is denied. UNAVAILABLE: the deny list cannot be read or parsed.
     pub async fn admit_call(&self, leaf: Option<&[u8]>) -> Result<String, Status> {
-        if matches!(self, Self::Unauthenticated) {
+        // Under mutual TLS a missing certificate is an error already; `None` is plain text.
+        let Some(peer) = self.peer(leaf)? else {
             return Err(Status::unauthenticated(
                 "blob calls on the worker listener need mutual TLS, which this server \
                  does not serve there",
             ));
-        }
-        let peer = self
-            .peer(leaf)?
-            .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
+        };
         let node = peer.node()?.to_owned();
         self.admit(Some(&peer), &node).await?;
         Ok(node)
@@ -210,14 +208,6 @@ pub struct DenyList {
 
 /// The file's metadata at a good read, and what that read gave.
 type LastRead = (FileKey, Arc<Denied>);
-
-impl PartialEq for DenyList {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-    }
-}
-
-impl Eq for DenyList {}
 
 /// Why the deny list cannot be used.
 #[derive(Debug, thiserror::Error)]

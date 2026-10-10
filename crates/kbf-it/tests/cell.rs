@@ -250,6 +250,7 @@ fn the_daemon_refuses_bad_flags() {
     ];
     for (cas, why) in [
         ("not a uri", "must be an https:// URL"),
+        ("https://not a uri", "--cas"),
         ("http://127.0.0.1:1", "must be an https:// URL"),
         ("https://127.0.0.1:1", "missing.pem"),
     ] {
