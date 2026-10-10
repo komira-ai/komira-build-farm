@@ -265,8 +265,10 @@ impl MetaState {
                         .unreachable
                         .entry(object)
                         .or_insert(LossMark { reason, generation });
+                    if reason > mark.reason {
+                        mark.generation = generation;
+                    }
                     mark.reason = mark.reason.max(reason);
-                    mark.generation = generation;
                 }))
             }
             Command::ObjectReachable { object, generation } => {
