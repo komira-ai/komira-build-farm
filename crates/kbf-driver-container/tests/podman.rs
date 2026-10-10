@@ -825,8 +825,8 @@ async fn the_action_owns_its_files_and_its_private_outputs_are_collected() {
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn probe_nproc_is_node_wide() {
-    let cell = Cell::with("nproc-probe", |config| config.limits.nproc = 4);
-    let action = store_action(&cell.cas, &sh("sleep 60 & sleep 60 & exec sleep 60"));
+    let cell = Cell::with("nproc-probe", |config| config.limits.nproc = 8);
+    let action = store_action(&cell.cas, &sh("sleep 60 & sleep 60 & sleep 60 & sleep 60 & exec sleep 60"));
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
     let first = tokio::spawn(async move { runtime.run(work).await });
@@ -834,7 +834,7 @@ async fn probe_nproc_is_node_wide() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let ps = podman(&["top", &cell.name(1), "user,pid,comm"]);
     let second = cell
-        .run(2, &sh("sleep 1 & sleep 1 & wait; echo forked-two"))
+        .run(2, &sh("sleep 1 & sleep 1 & sleep 1 & sleep 1 & wait; echo forked-two"))
         .await
         .expect("ran");
     let out = cell.stdout(&second);
@@ -852,9 +852,9 @@ async fn probe_nproc_is_node_wide() {
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn probe_nproc_holds_in_one_container() {
-    let cell = Cell::with("nproc-control", |config| config.limits.nproc = 4);
+    let cell = Cell::with("nproc-control", |config| config.limits.nproc = 8);
     let result = cell
-        .run(1, &sh("for i in 1 2 3 4 5 6; do sleep 2 & done; wait; echo forked-six"))
+        .run(1, &sh("for i in 1 2 3 4 5 6 7 8 9 10; do sleep 2 & done; wait; echo forked-six"))
         .await
         .expect("ran");
     let out = cell.stdout(&result);
