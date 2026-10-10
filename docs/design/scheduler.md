@@ -221,7 +221,7 @@ What the code does today:
   its `gpu` count, and what its platform asks of a worker (`Request::needs`).
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the
-  kind (`container`, `native` or `fake` for `action`, `native-whole-machine` for
+  kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
   `whole_machine`; see [capabilities.md](capabilities.md#driver-entries)).
 - A placement round walks the queue in order and gives each operation to the first
   live, feasible worker, in name order, whose capabilities satisfy its platform and

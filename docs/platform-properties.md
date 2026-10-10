@@ -107,7 +107,8 @@ An `action` lease (the default) books a share of a worker: one core and 1 GiB, o
 lease books every core, byte of memory and GPU of its worker, and runs there alone.
 
 A lease goes only to a worker whose daemon runs a driver for its kind: `container`,
-`native` or `fake` for `action`, `native-whole-machine` for `whole_machine` (see
+`native` or `fake` (or the test-only `local`) for `action`, `native-whole-machine` for
+`whole_machine` (see
 [capabilities.md](design/capabilities.md#driver-entries)). No daemon runs
 `native-whole-machine` yet, so today a `whole_machine` action waits with the reason
 and then fails, as described under [Where an action runs](#where-an-action-runs).

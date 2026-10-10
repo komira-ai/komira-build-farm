@@ -67,11 +67,12 @@ impl LeaseKind {
         Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 
-    /// The node report `drivers` values that serve this kind.
+    /// The node report `drivers` values that serve this kind. `local` is
+    /// `kbf-daemon`'s test-only runtime, which runs actions as child processes.
     #[must_use]
     pub const fn drivers(self) -> &'static [&'static str] {
         match self {
-            Self::Action => &["container", "native", "fake"],
+            Self::Action => &["container", "native", "fake", "local"],
             Self::WholeMachine => &["native-whole-machine"],
             Self::Vm => &["vm"],
         }
@@ -126,7 +127,7 @@ mod tests {
         assert_eq!(LeaseKind::from_name("whole-machine"), None);
         assert_eq!(LeaseKind::default(), LeaseKind::Action);
         assert_eq!(LeaseKind::WholeMachine.to_string(), "whole_machine");
-        for driver in ["container", "native", "fake"] {
+        for driver in ["container", "native", "fake", "local"] {
             assert!(LeaseKind::Action.served_by(driver));
             assert!(!LeaseKind::WholeMachine.served_by(driver));
             assert!(!LeaseKind::Vm.served_by(driver));

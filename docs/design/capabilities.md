@@ -80,6 +80,7 @@ daemon also refuses a `Start` for a lease kind its driver does not serve.
 | `container` | `action` | exists (Linux, rootless Podman) |
 | `native` | `action` | exists (Macs, plain processes) |
 | `fake` | `action` | exists, for bring-up only: runs nothing |
+| `local` | `action` | exists, in tests only: `kbf-daemon`'s child-process runtime |
 | `vm` | `vm` | **planned**: listed only when a check that boots no VM passes, at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
 | `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
 
