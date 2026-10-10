@@ -99,6 +99,7 @@ kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-log = { path = "crates/kbf-log" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-mdm = { path = "crates/kbf-mdm" }
 kbf-mdm-api = { path = "crates/kbf-mdm-api" }

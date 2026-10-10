@@ -1,15 +1,18 @@
-//! Writer epochs, batched blob records and unreachable marks with a reason.
+//! Writer epochs, batched blob records, and unreachable marks with a reason and a
+//! generation.
 
 mod common;
 
-use common::{DAY, EPOCH, digest, in_segment, mark, mark_missing, meta, object, put, tick};
+use common::{
+    ANY_INDEX, DAY, EPOCH, digest, in_segment, mark, mark_at, mark_missing, meta, object, put, tick,
+};
 use kbf_meta::{
-    Applied, BlobAnswer, BlobWrite, Command, Epoch, Location, MetaState, ObjectId, Retention,
-    StoreId, UnallocatedEpoch, UnreachableReason,
+    Applied, BlobAnswer, BlobWrite, Command, Epoch, Generation, Location, LossMark, MetaState,
+    ObjectId, Retention, StoreId, UnallocatedEpoch, UnreachableReason,
 };
 
 fn alloc(m: &mut MetaState) -> Epoch {
-    match m.execute(Command::AllocEpoch) {
+    match m.execute(ANY_INDEX, Command::AllocEpoch) {
         Applied::Epoch(e) => e,
         other => panic!("AllocEpoch applied as {other:?}"),
     }
@@ -37,7 +40,7 @@ fn alloc_epoch_strictly_increases_and_collect_does_not_reset_it() {
         last = e;
         if n % 10 == 0 {
             tick(&mut m, DAY * (n / 10 + 1));
-            m.execute(Command::Collect);
+            m.execute(ANY_INDEX, Command::Collect);
         }
     }
     assert_eq!(last, Epoch::new(1000));
@@ -52,10 +55,13 @@ fn objects_of_an_unallocated_epoch_are_refused_and_change_nothing() {
     let mut fresh = MetaState::new(Retention::default());
     let before = fresh.clone();
     assert_eq!(
-        fresh.execute(Command::PutBlob {
-            digest: digest(1),
-            location: at_epoch(1, 1),
-        }),
+        fresh.execute(
+            ANY_INDEX,
+            Command::PutBlob {
+                digest: digest(1),
+                location: at_epoch(1, 1),
+            }
+        ),
         Applied::Blob(Err(UnallocatedEpoch(ObjectId::new(Epoch::new(1), 1))))
     );
     assert_eq!(fresh, before);
@@ -66,21 +72,33 @@ fn objects_of_an_unallocated_epoch_are_refused_and_change_nothing() {
         let location = at_epoch(epoch, 3);
         let refused = Err(UnallocatedEpoch(location.object));
         assert_eq!(
-            m.execute(Command::PutBlob {
-                digest: digest(1),
-                location,
-            }),
+            m.execute(
+                ANY_INDEX,
+                Command::PutBlob {
+                    digest: digest(1),
+                    location,
+                }
+            ),
             Applied::Blob(refused)
         );
         assert_eq!(
-            m.execute(Command::ObjectUnreachable {
-                object: location.object,
-                reason: UnreachableReason::Missing,
-            }),
+            m.execute(
+                ANY_INDEX,
+                Command::ObjectUnreachable {
+                    object: location.object,
+                    reason: UnreachableReason::Missing,
+                }
+            ),
             Applied::Marked(refused.map(|_| ()))
         );
         assert_eq!(
-            m.execute(Command::ObjectReachable(location.object)),
+            m.execute(
+                ANY_INDEX,
+                Command::ObjectReachable {
+                    object: location.object,
+                    generation: Generation::new(ANY_INDEX),
+                }
+            ),
             Applied::Marked(refused.map(|_| ()))
         );
     }
@@ -95,11 +113,14 @@ fn put_blobs_with_one_unallocated_location_records_nothing() {
     let mut m = meta();
     let before = m.clone();
     let bad = at_epoch(EPOCH.get() + 1, 0);
-    let applied = m.execute(Command::PutBlobs(vec![
-        (digest(1), in_segment(1, 1)),
-        (digest(2), in_segment(1, 2)),
-        (digest(3), bad),
-    ]));
+    let applied = m.execute(
+        ANY_INDEX,
+        Command::PutBlobs(vec![
+            (digest(1), in_segment(1, 1)),
+            (digest(2), in_segment(1, 2)),
+            (digest(3), bad),
+        ]),
+    );
     assert_eq!(applied, Applied::Blobs(Err(UnallocatedEpoch(bad.object))));
     assert_eq!(m, before);
     assert_eq!(m.blob_count(), 0);
@@ -143,8 +164,14 @@ fn put_blobs_is_the_fold_of_put_blob() {
                     mark(&mut single, segment, reason);
                 }
                 1 => {
-                    let c = Command::ObjectReachable(object(rng.below(4)));
-                    assert_eq!(batched.execute(c.clone()), single.execute(c));
+                    let c = Command::ObjectReachable {
+                        object: object(rng.below(4)),
+                        generation: Generation::new(ANY_INDEX),
+                    };
+                    assert_eq!(
+                        batched.execute(ANY_INDEX, c.clone()),
+                        single.execute(ANY_INDEX, c)
+                    );
                 }
                 2 => {
                     let t = DAY * u32::try_from(step).expect("step");
@@ -160,7 +187,7 @@ fn put_blobs_is_the_fold_of_put_blob() {
                         })
                         .collect();
                     let Applied::Blobs(Ok(outcomes)) =
-                        batched.execute(Command::PutBlobs(blobs.clone()))
+                        batched.execute(ANY_INDEX, Command::PutBlobs(blobs.clone()))
                     else {
                         panic!("seed {seed} step {step}: PutBlobs refused");
                     };
@@ -205,8 +232,101 @@ fn a_corrupt_mark_is_never_downgraded_to_missing() {
     assert_eq!(m.unreachable(object(2)), Some(UnreachableReason::Corrupt));
     assert_eq!(m.blob(&digest(2)), BlobAnswer::Unavailable);
 
-    m.execute(Command::ObjectReachable(object(2)));
+    m.execute(
+        ANY_INDEX,
+        Command::ObjectReachable {
+            object: object(2),
+            generation: Generation::new(ANY_INDEX),
+        },
+    );
     assert_eq!(m.unreachable(object(2)), None);
     assert_eq!(m.blob(&digest(2)), BlobAnswer::Present(in_segment(2, 2)));
     assert_eq!(m.unreachable(object(3)), None);
+}
+
+fn reachable(m: &mut MetaState, segment: u64, generation: Generation) {
+    let applied = m.execute(
+        ANY_INDEX,
+        Command::ObjectReachable {
+            object: object(segment),
+            generation,
+        },
+    );
+    assert_eq!(applied, Applied::Marked(Ok(())));
+}
+
+/// Catches: an `ObjectUnreachable` that does not stamp its own log index as the mark's
+/// generation, and one that stamps it only when the reason rises: a second mark of the
+/// same reason must restamp too, or a reachable-again read before it clears it.
+#[test]
+fn every_applied_mark_stamps_its_log_index_whether_or_not_the_reason_rises() {
+    let mut m = meta();
+    let mark_of = |m: &MetaState| m.loss_mark(object(1));
+    mark_at(&mut m, 5, 1, UnreachableReason::Missing);
+    let missing = UnreachableReason::Missing;
+    let at = |n| {
+        Some(LossMark {
+            reason: missing,
+            generation: Generation::new(n),
+        })
+    };
+    assert_eq!(mark_of(&m), at(5));
+    mark_at(&mut m, 9, 1, missing);
+    assert_eq!(mark_of(&m), at(9));
+    mark_at(&mut m, 12, 1, UnreachableReason::Corrupt);
+    mark_at(&mut m, 14, 1, missing);
+    assert_eq!(
+        mark_of(&m),
+        Some(LossMark {
+            reason: UnreachableReason::Corrupt,
+            generation: Generation::new(14),
+        })
+    );
+    assert_eq!(m.loss_mark(object(2)), None);
+}
+
+/// Catches: an `ObjectReachable` that clears the mark whatever its generation, and a mark
+/// that keeps its first generation when a later mark of the same reason applies (the
+/// mutant that stamps only when the reason rises). A reachable-again delayed past a newer
+/// loss mark would clear it, and every server would answer present for bytes that are
+/// gone. Two cases: the newer mark has the same reason as the one the prober read (only
+/// this case catches the stamp-on-rise mutant), and it has a higher one.
+#[test]
+fn a_delayed_object_reachable_leaves_a_newer_mark() {
+    for (newer, name) in [
+        (UnreachableReason::Missing, "same reason"),
+        (UnreachableReason::Corrupt, "higher reason"),
+    ] {
+        let mut m = meta();
+        put(&mut m, digest(1), in_segment(1, 1));
+        mark_at(&mut m, 5, 1, UnreachableReason::Missing);
+        // A prober reads the generation, finds the object, and sends ObjectReachable;
+        // before it commits, a newer read marks the object again.
+        let read = m.loss_mark(object(1)).expect("marked").generation;
+        mark_at(&mut m, 9, 1, newer);
+        let before = m.clone();
+        reachable(&mut m, 1, read);
+        assert_eq!(
+            m, before,
+            "{name}: the delayed ObjectReachable changed the state"
+        );
+        assert_eq!(
+            m.loss_mark(object(1)),
+            Some(LossMark {
+                reason: newer,
+                generation: Generation::new(9),
+            }),
+            "{name}"
+        );
+        assert_eq!(m.blob(&digest(1)), BlobAnswer::Unavailable, "{name}");
+
+        // One that names the current generation clears it.
+        reachable(&mut m, 1, Generation::new(9));
+        assert_eq!(m.loss_mark(object(1)), None, "{name}");
+        assert_eq!(
+            m.blob(&digest(1)),
+            BlobAnswer::Present(in_segment(1, 1)),
+            "{name}"
+        );
+    }
 }

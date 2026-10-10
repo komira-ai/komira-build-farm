@@ -118,9 +118,44 @@ pub enum UnreachableReason {
     /// The store produced bytes that fail their digest, including an object that ends
     /// inside the record. A later read of the same object cannot be trusted: no read
     /// clears this mark, and a re-upload heals the blobs in it by moving them to a new
-    /// object. [`Command::ObjectReachable`](crate::Command::ObjectReachable) clears any
-    /// mark, so whoever issues it vouches for the bytes.
+    /// object. [`Command::ObjectReachable`](crate::Command::ObjectReachable) clears a
+    /// mark of either reason, so whoever issues it vouches for the bytes.
     Corrupt,
+}
+
+/// The generation of a loss mark: the log index of the last
+/// [`Command::ObjectUnreachable`](crate::Command::ObjectUnreachable) applied to the
+/// object, whether or not it raised the reason.
+///
+/// [`Command::ObjectReachable`](crate::Command::ObjectReachable) names the generation
+/// its sender read before it probed the store, and clears the mark only while that is
+/// still the mark's generation. So a reachable-again that is delayed or retried past a
+/// newer loss mark does nothing, instead of clearing the newer mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Generation(u64);
+
+impl Generation {
+    /// The generation stamped by the entry at log index `index`.
+    #[must_use]
+    pub const fn new(index: u64) -> Self {
+        Self(index)
+    }
+
+    /// The log index that stamped it.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// An object's loss mark: why it is unreachable, and the generation that last stamped
+/// the mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LossMark {
+    /// The highest reason any applied mark gave.
+    pub reason: UnreachableReason,
+    /// The log index of the last mark applied.
+    pub generation: Generation,
 }
 
 /// Who is asking to write the action cache.

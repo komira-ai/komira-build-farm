@@ -99,7 +99,8 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
-| `kbf-proto` | no | generated code for REAPI and `kbf.worker.v1` |
+| `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
+| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands to and from `kbf.log.v1`, under the log's format version |
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
