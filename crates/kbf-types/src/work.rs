@@ -65,7 +65,9 @@ pub struct ActionKey {
 ///
 /// GPUs are whole and exclusive: a request books whole GPUs, and a booked GPU is
 /// another lease's only once the lease holding it ends. VM slots are counted the same
-/// way: a node's `vms` is how many VMs may run on it at once, and a VM lease books one.
+/// way: a node's `vms` is how many VMs may run on it at once. Nothing books or fills
+/// `vms` yet: the VM lease kind (`kbf-lease=vm`) is planned and refused today, and no
+/// node's capacity carries VM slots.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Resources {
     /// CPU in thousandths of a core (1000 = one core).

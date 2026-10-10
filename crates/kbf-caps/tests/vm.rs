@@ -183,8 +183,7 @@ fn report_only_keys_are_refused_in_a_request() {
     }
     assert_eq!(
         RequestError::ReportOnly("vm.slots".to_owned()).to_string(),
-        "\"vm.slots\" is reported by a node and cannot be requested; VM slots are booked \
-         through kbf-lease=vm"
+        "\"vm.slots\" is reported by a node and cannot be requested"
     );
 }
 

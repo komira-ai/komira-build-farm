@@ -21,8 +21,9 @@
 //!
 //! The report-only keys ([`REPORT_ONLY_KEYS`]: `vm.slots`, `vm.max_cpus`,
 //! `vm.max_mem_gib`) are whole numbers a node reports about what it can run; a request
-//! that names one is refused ([`RequestError::ReportOnly`]): VM slots are booked through
-//! the lease kind, never asked for by count.
+//! that names one is refused ([`RequestError::ReportOnly`]): a request never asks for VM
+//! slots by count. Nothing books VM slots yet: the planned VM lease kind
+//! (`kbf-lease=vm`) is refused as an unknown kind.
 //!
 //! The reserved keys ([`RESERVED_KEYS`]: `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`,
 //! `kbf-book-cpus`, `kbf-book-mem-gib`) ask for a kind or a size of capacity, not a
@@ -196,10 +197,7 @@ pub enum RequestError {
     )]
     NoImageDigest(String),
     /// The key is one a node reports and a request may not name.
-    #[error(
-        "{0:?} is reported by a node and cannot be requested; VM slots are booked through \
-         kbf-lease=vm"
-    )]
+    #[error("{0:?} is reported by a node and cannot be requested")]
     ReportOnly(String),
 }
 

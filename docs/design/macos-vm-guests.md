@@ -208,7 +208,7 @@ names:
   and the simulator devices to create. Two images built from one recipe are the same
   image to a client.
 - `vm.image` carries the recipe digest: `<name>@sha256:<recipe digest>`, matched by
-  membership on the digest, as [macos-vms.md](macos-vms.md#51-platform-properties-planned)
+  membership on the digest, as [macos-vms.md](macos-vms.md#51-platform-properties-partly-planned)
   plans. The recipe digest is in the action's platform and therefore in its action
   digest, so a result from one node's build of a recipe is a cache hit for another
   node's build of the same recipe. That is the deliberate trade, the same one the farm
