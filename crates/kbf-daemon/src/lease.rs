@@ -165,6 +165,7 @@ pub(crate) fn result_of(
             action_result: Some(action_result),
             // The daemon fills in the action its Start named.
             action_digest: None,
+            memory_kill: worker::MemoryKill::Unspecified as i32,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -203,6 +204,8 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         }),
         action_result: None,
         action_digest: None,
+        // Planned: no driver reports which memory ran out yet (failure classes 6.1).
+        memory_kill: worker::MemoryKill::Unspecified as i32,
     }
 }
 
@@ -217,6 +220,8 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         }),
         action_result: None,
         action_digest: None,
+        // Planned: no driver reports which memory ran out yet (failure classes 6.1).
+        memory_kill: worker::MemoryKill::Unspecified as i32,
     }
 }
 

@@ -148,6 +148,7 @@ fn worker_messages_round_trip() {
                 hash: "cd".repeat(32),
                 size_bytes: 9,
             }),
+            memory_kill: worker::MemoryKill::NodePressure as i32,
         })),
     };
     let back = DaemonMessage::decode(result.encode_to_vec().as_slice()).expect("decode");
@@ -171,4 +172,33 @@ fn worker_messages_round_trip() {
     };
     let back = worker::ResourceUsage::decode(usage.encode_to_vec().as_slice()).expect("decode");
     assert_eq!(back, usage);
+}
+
+/// Catches a renumbered `Result.memory_kill` field or `MemoryKill` value: a daemon and
+/// a server built from different revisions would read an own-limit kill as a busy
+/// node's (or the reverse), and the server would raise the booking for the wrong one.
+#[test]
+fn memory_kill_keeps_its_wire_numbers() {
+    let only = |kill: worker::MemoryKill| WorkerResult {
+        memory_kill: kill as i32,
+        ..WorkerResult::default()
+    };
+    // Field 5, varint: tag 5 << 3 = 0x28.
+    assert_eq!(
+        only(worker::MemoryKill::OwnLimit).encode_to_vec(),
+        [0x28, 1]
+    );
+    assert_eq!(
+        only(worker::MemoryKill::NodePressure).encode_to_vec(),
+        [0x28, 2]
+    );
+    assert!(
+        only(worker::MemoryKill::Unspecified)
+            .encode_to_vec()
+            .is_empty()
+    );
+    assert_eq!(
+        worker::MemoryKill::try_from(2),
+        Ok(worker::MemoryKill::NodePressure)
+    );
 }

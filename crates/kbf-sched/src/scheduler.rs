@@ -1,13 +1,18 @@
 //! The scheduler state machine.
 
+pub(crate) mod memory;
+mod state;
+
+pub use state::OpState;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId,
-    LeaseKind, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
+    ActionKey, Answer, ControlRecord, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
+    MemoryRun, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
     StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
@@ -16,6 +21,7 @@ use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
+use memory::{Floors, MEMORY_FLOORS};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
 pub const PLACEMENT_ROUND: usize = 256;
@@ -43,73 +49,6 @@ pub const UNSERVABLE_WAIT: Duration = Duration::from_secs(300);
 /// memory: at the pilot's rate of about 4 operations a second, a minute is about 240.
 pub const FINISHED_RETENTION: Duration = Duration::from_secs(60);
 
-/// Where an operation is.
-///
-/// `Queued -> Leased -> Running -> Completed | Failed`. A lease that expires sends its
-/// operation back to `Queued`, to be granted again under a new lease.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OpState {
-    /// Waiting for room.
-    Queued,
-    /// Granted to `worker` under `lease`. Until `committed`, the grant is only proposed
-    /// and no `Start` has been sent.
-    Leased {
-        /// The lease.
-        lease: LeaseId,
-        /// Where it runs.
-        worker: WorkerId,
-        /// Whether the grant is committed (and its `Start` emitted).
-        committed: bool,
-    },
-    /// The worker holding `lease` has started it.
-    Running {
-        /// The lease.
-        lease: LeaseId,
-        /// Where it runs.
-        worker: WorkerId,
-    },
-    /// Finished: the result of `lease` was committed.
-    Completed {
-        /// The lease whose result was accepted.
-        lease: LeaseId,
-        /// The digest of its `ActionResult`.
-        action_result: Digest,
-    },
-    /// Failed: the failure of `lease` was committed.
-    Failed {
-        /// The lease whose outcome was accepted.
-        lease: LeaseId,
-        /// Why.
-        failure: Failure,
-    },
-    /// Refused without running: no live worker could run it for the unservable wait,
-    /// and the refusal was committed.
-    Refused {
-        /// Why no worker could run it.
-        reason: String,
-    },
-}
-
-impl OpState {
-    fn holding(&self) -> Option<(LeaseId, &WorkerId)> {
-        match self {
-            Self::Leased { lease, worker, .. } | Self::Running { lease, worker } => {
-                Some((*lease, worker))
-            }
-            _ => None,
-        }
-    }
-
-    /// Whether the operation is finished.
-    #[must_use]
-    pub fn is_done(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed { .. } | Self::Failed { .. } | Self::Refused { .. }
-        )
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Operation {
     request: Request,
@@ -124,6 +63,10 @@ struct Operation {
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
+    /// Its runs killed for memory, oldest first ([`memory`]).
+    memory_runs: Vec<MemoryRun>,
+    /// How many times it was run again after a busy node's memory kill.
+    farm_reruns: u32,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -176,6 +119,8 @@ pub(crate) struct Worker {
     /// Until when leases whose `Start` went to an earlier process are kept: by then that
     /// process has fenced ([`HANDOVER_GRACE`] after it was last heard).
     handover_ends: FarmTime,
+    /// How many leases it killed for memory below the action's own limit.
+    memory_pressure: u64,
 }
 
 impl Worker {
@@ -215,7 +160,9 @@ impl Worker {
 ///   the operation currently holds under a committed grant, at most once per holding.
 ///   A committed result is accepted only if its lease is the operation's newest
 ///   committed grant (log order decides) and the operation is not finished. Results
-///   from an expired lease, duplicates and late arrivals are dropped.
+///   from an expired lease, duplicates and late arrivals are dropped. A committed
+///   memory kill that runs the operation again ([`memory`]) finishes nothing: the
+///   operation is queued again, and only a later run's result can finish it.
 ///
 /// A lease is given up, and its operation requeued, when its worker is silent for G,
 /// and when a worker it still hears from does not list it as running (see
@@ -253,6 +200,9 @@ pub struct Scheduler {
     /// Queued whole-machine operations that fit nowhere, and the worker each holds:
     /// work after it in queue order is not placed there (see [`Scheduler::place`]).
     reservations: BTreeMap<OperationId, WorkerId>,
+    /// The memory floor of each action key that passed its own memory limit. Boxed:
+    /// most schedulers hold none, and the scheduler is moved by value.
+    floors: Box<Floors>,
 }
 
 impl Scheduler {
@@ -275,6 +225,7 @@ impl Scheduler {
             finished: VecDeque::new(),
             requeues: None,
             reservations: BTreeMap::new(),
+            floors: Box::new(Floors::new(MEMORY_FLOORS)),
         }
     }
 
@@ -452,6 +403,7 @@ impl Scheduler {
         }
         let id = OperationId(self.next_op);
         self.next_op += 1;
+        let request = self.floored(request);
         if request.joinable() {
             self.in_flight.insert(request.key.clone(), id);
         }
@@ -465,6 +417,8 @@ impl Scheduler {
                 committed_lease: None,
                 result_proposed: false,
                 unservable: None,
+                memory_runs: Vec::new(),
+                farm_reruns: 0,
             },
         );
         Vec::new()
@@ -830,6 +784,12 @@ impl Scheduler {
         if op.state.is_done() || op.committed_lease != Some(record.lease) {
             return Vec::new();
         }
+        if let Outcome::Failed(kill @ (Failure::OutOfMemory | Failure::NodeMemoryPressure)) =
+            record.outcome
+            && self.rerun_after_memory_kill(record, kill)
+        {
+            return Vec::new();
+        }
         self.release(id);
         let op = self.ops.get_mut(&id).expect("checked above");
         op.state = match record.outcome {
@@ -853,6 +813,7 @@ impl Scheduler {
             lease: record.lease,
             waiters: op.waiters.clone(),
             outcome: record.outcome,
+            memory_runs: op.memory_runs.clone(),
         })]
     }
 }
@@ -898,6 +859,7 @@ impl StateMachine for Scheduler {
                                 instance,
                                 process: 0,
                                 handover_ends: FarmTime::default(),
+                                memory_pressure: 0,
                             },
                         );
                     }

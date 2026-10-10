@@ -44,6 +44,7 @@ pub mod fleet;
 pub mod health;
 pub mod identity;
 pub mod mdm;
+mod memory;
 pub mod rollout;
 pub mod serve;
 mod stamp;

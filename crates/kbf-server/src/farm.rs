@@ -45,6 +45,7 @@ use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
+use crate::memory;
 use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
@@ -523,19 +524,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let now = self.now();
         let (answers, accepted) = {
             let mut state = self.lock();
-            let answers = state.feed(
-                now,
-                Event::Report {
-                    operation,
-                    lease,
-                    outcome,
-                },
-            );
-            // Only a report leads to an answer, and the in-process log commits its record
-            // at once: an accepted result is answered here, and a refused one (its lease
-            // given up while its outputs were checked) never is. The replicated log will
-            // answer once the record commits, carrying the result with it.
-            let accepted = answers.iter().any(|a| a.lease == lease);
+            let (answers, accepted) = state.take_report(now, worker, operation, lease, outcome);
             let settled: Vec<Settled> = answers
                 .iter()
                 .map(|a| state.settle(a, detail.take()))
@@ -562,6 +551,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         ran_on: (&WorkerId, Stamp),
         result: worker::Result,
     ) -> (Outcome, Option<Detail>) {
+        if let Some(kill) = memory::killed(&result) {
+            tracing::info!(%lease, ?kill, "lease killed for memory");
+            return (Outcome::Failed(kill), None);
+        }
         let code = result.status.as_ref().map_or(Code::Ok as i32, |s| s.code);
         match (Code::from_i32(code), result.action_result) {
             (Code::Ok, Some(mut result)) => {
@@ -674,6 +667,46 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
 }
 
 impl State {
+    /// How many runs of `operation` the scheduler has recorded as killed for memory.
+    fn memory_runs(&self, operation: OperationId) -> usize {
+        self.sched.memory_runs(operation).map_or(0, <[_]>::len)
+    }
+
+    /// Feeds `worker`'s report that `lease` of `operation` ended with `outcome`, and
+    /// returns the answers it led to and whether the scheduler took it. A busy node's
+    /// memory kill the scheduler took is logged for operators (`crate::memory`).
+    ///
+    /// Only a report leads to an answer, and the in-process log commits its record at
+    /// once: an accepted result is answered here, and a refused one (its lease given up
+    /// while its outputs were checked) never is. A memory kill the scheduler takes is
+    /// answered, or records a run and runs the operation again. The replicated log will
+    /// answer once the record commits, carrying the result with it.
+    ///
+    /// Not generic, unlike `Farm::report`, so every test binary's runs count toward the
+    /// same function's coverage.
+    fn take_report(
+        &mut self,
+        now: FarmTime,
+        worker: &WorkerId,
+        operation: OperationId,
+        lease: LeaseId,
+        outcome: Outcome,
+    ) -> (Vec<Answer>, bool) {
+        let killed_before = self.memory_runs(operation);
+        let event = Event::Report {
+            operation,
+            lease,
+            outcome,
+        };
+        let answers = self.feed(now, event);
+        let rerun = self.memory_runs(operation) > killed_before;
+        let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
+            memory::pressure(worker, self.sched.memory_pressure(worker));
+        }
+        (answers, accepted)
+    }
+
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
     }
@@ -937,6 +970,9 @@ impl State {
                 (failed(Code::DeadlineExceeded, "the action timed out"), None)
             }
             (Some(Detail::Invalid(why)), _) => (failed(Code::InvalidArgument, &why), None),
+            (_, Outcome::Failed(kill @ (Failure::OutOfMemory | Failure::NodeMemoryPressure))) => {
+                (memory::finished(kill, &answer.memory_runs), None)
+            }
             _ => (
                 failed(Code::Internal, "the farm could not run the action"),
                 None,

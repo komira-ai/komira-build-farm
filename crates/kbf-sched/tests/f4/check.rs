@@ -593,6 +593,8 @@ impl Checker {
             lease: record.lease,
             waiters,
             outcome: record.outcome,
+            // The model's runs are never killed for memory.
+            memory_runs: Vec::new(),
         })]
     }
 

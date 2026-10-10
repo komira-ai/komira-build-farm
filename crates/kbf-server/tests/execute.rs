@@ -1,6 +1,8 @@
 //! The Execute join end to end, in one process: a REAPI client, the server, and a fake
 //! daemon on the worker stream. Each test drives the wire on both sides.
 
+#[path = "execute/memory.rs"]
+mod memory;
 mod support;
 
 use std::time::Duration;
