@@ -295,7 +295,7 @@ fn work_larger_than_every_matching_worker_is_unservable() {
     };
     h.submit(1, big);
     let reason = "the 1 live worker(s) that satisfy the action's platform are all smaller \
-                  than its request (1000 millicores, 1073741824 bytes of memory, 2 GPU(s))";
+                  than its request (1000 millicores, 1073741824 bytes of memory, 2 GPU(s), 0 VM slot(s))";
     assert_eq!(h.tick(), [waiting(0, Some(reason))]);
 
     // Work that only waits for room says nothing.
@@ -308,6 +308,68 @@ fn work_larger_than_every_matching_worker_is_unservable() {
     let (grants, rest) = h.grants();
     assert_eq!((grants.len(), rest.as_slice()), (1, &[][..]));
     assert_eq!(h.s.waiting(OperationId(2)), None);
+}
+
+/// Catches: a VM slot left out of placement's fit (a VM lease placed on a Mac that runs
+/// no VM) or out of the why-not text, which would then read as if the Mac were large
+/// enough.
+#[test]
+fn a_vm_lease_waits_for_a_node_with_a_vm_slot() {
+    let mut h = Harness::new();
+    h.worker("a-mac", mac());
+    let vm = Request {
+        resources: Resources::new(1_000, GIB).with_vms(1),
+        ..request(1, &[("OSFamily", "Darwin")])
+    };
+    h.submit(1, vm);
+    let reason = "the 1 live worker(s) that satisfy the action's platform are all smaller \
+                  than its request (1000 millicores, 1073741824 bytes of memory, 0 GPU(s), 1 VM slot(s))";
+    assert_eq!(h.tick(), [waiting(0, Some(reason))]);
+    let event = Event::WorkerUp {
+        worker: w("b-mac"),
+        instance: DaemonInstance::new("b-mac"),
+        capacity: Resources::new(4_000, 8 * GIB).with_vms(1),
+        caps: mac(),
+    };
+    h.feed(event);
+    let (grants, _) = h.grants();
+    let placed: Vec<&str> = grants.iter().map(|g| g.worker.as_str()).collect();
+    assert_eq!(placed, ["b-mac"]);
+}
+
+/// Catches: a `vm.image` request matched on the whole value, or a why-not text that
+/// names the digest alone: a Mac holding the image under another name must take the
+/// action, and one holding another image is named with the image as requested.
+#[test]
+fn a_vm_image_places_on_its_digest_and_names_it_when_missing() {
+    let x = format!("sha256:{}", "1".repeat(64));
+    let y = format!("sha256:{}", "2".repeat(64));
+    let holds = |digest: &str| {
+        let image = format!("built-here@{digest}");
+        let report = [
+            ("arch", "arm64"),
+            ("os", "macos"),
+            ("drivers", "native"),
+            ("vm.image", &image),
+        ];
+        NodeCaps::from_report(report).unwrap()
+    };
+    let mut h = Harness::new();
+    h.worker("a-mac", holds(&y));
+    let wanted = format!("macos-26@{x}");
+    h.submit(
+        1,
+        request(1, &[("OSFamily", "Darwin"), ("vm.image", &wanted)]),
+    );
+    let reason = format!(
+        "none of the 1 live worker(s) satisfies the action's platform; the closest, a-mac, \
+         lacks vm.image={wanted}"
+    );
+    assert_eq!(h.tick(), [waiting(0, Some(&reason))]);
+    h.worker("b-mac", holds(&x));
+    let (grants, _) = h.grants();
+    let placed: Vec<&str> = grants.iter().map(|g| g.worker.as_str()).collect();
+    assert_eq!(placed, ["b-mac"]);
 }
 
 /// Catches: a caller that joins a waiting twin and is never told why it waits.

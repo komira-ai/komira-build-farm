@@ -282,22 +282,21 @@ strongly discouraged"
 
 The action says so, the node says what it can do, and the scheduler books it.
 
-### 5.1 Platform properties (planned)
+### 5.1 Platform properties (partly planned)
 
-| Key | Kind | Values | Meaning |
-|---|---|---|---|
-| `kbf-lease` | reserved | `vm` (new; beside `action` and `whole_machine`) | run in a fresh macOS VM |
-| `vm.image` | capability, membership | `<name>@sha256:<recipe digest>` | the golden image, named by the digest of its pinned inputs ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)); a value without a digest is refused, as for container images |
-| `kbf-book-cpus` | reserved | whole cores (named like `cpus` and `vm.max_cpus`) | what the lease books. For `kbf-lease=vm` it is also the guest's vCPU count: 4-12, default 6 |
-| `kbf-book-mem-gib` | reserved | GiB | what the lease books. For `kbf-lease=vm`: 9-33, default 17, and the guest's `memorySize` is this minus 1 GiB for the helper (8-32 GiB, default 16) |
+| Key | Kind | Values | Meaning | On `main` |
+|---|---|---|---|---|
+| `kbf-lease` | reserved | `vm` (new; beside `action` and `whole_machine`) | run in a fresh macOS VM | **planned**: `vm` is refused as an unknown lease kind |
+| `vm.image` | capability, membership | `<name>@sha256:<recipe digest>` | the golden image, named by the digest of its pinned inputs ([macos-vm-guests.md](macos-vm-guests.md#5-image-identity)); a value without a digest is refused, as for container images | matched on the digest; no daemon reports one yet, so a request naming one matches no worker |
+| `kbf-book-cpus` | reserved | whole cores (named like `cpus` and `vm.max_cpus`) | what the lease books. For `kbf-lease=vm` it is also the guest's vCPU count: 4-12, default 6 | booked on an `action` lease; the VM bounds are planned |
+| `kbf-book-mem-gib` | reserved | GiB | what the lease books. For `kbf-lease=vm`: 9-33, default 17, and the guest's `memorySize` is this minus 1 GiB for the helper (8-32 GiB, default 16) | booked on an `action` lease; the VM bounds are planned |
 
 **One size convention for every lease kind.** `kbf-book-cpus` and `kbf-book-mem-gib`
 are what a lease books, on bare metal and in a VM alike: on an `action` lease they
 replace the 1 core and 1 GiB every action books today (and so raise the native
 driver's memory kill, which is 150% + 512 MiB of the booking); on a `vm` lease they
-size the guest. A `whole_machine` lease is planned to book the whole node
-([section 5.3](#53-booking-and-placement-planned)), so the front will refuse either key
-on it; today the front books 1 core and 1 GiB for every lease, whatever its kind
+size the guest. A `whole_machine` lease books the whole node, so the front refuses
+either key on it; without the keys an `action` lease books 1 core and 1 GiB
 (`DEFAULT_RESOURCES`, `crates/kbf-front/src/execution.rs`) **[V]**. They are not `cpus`
 and `mem_gib`: those two are capability keys that
 ask for a node whose *whole machine* has at least that much, and they book nothing.
@@ -323,9 +322,9 @@ image rule of its own.
 
 All of these are part of the action digest, which is wanted: a result from a VM and
 one from bare metal never share a cache entry. `kbf-book-cpus` and `kbf-book-mem-gib`
-join the reserved keys the matcher skips (`kbf-lease`, `kbf-cpu`, `kbf-mac-admin`
-today, `crates/kbf-caps/src/matching.rs` **[V]**). The front checks the bounds and
-turns them into a booking.
+are among the reserved keys the matcher skips (`RESERVED_KEYS`,
+`crates/kbf-caps/src/matching.rs` **[V]**). The front checks them and turns them into a
+booking.
 
 ### 5.2 Node report (planned)
 
@@ -354,23 +353,26 @@ phase, or any other native daemon, never looks able to serve `whole_machine`. On
 
 ### 5.3 Booking and placement (planned)
 
-On `main`, `Resources` has three dimensions (`cpu_millis`, `memory_bytes`, `gpus`,
-`crates/kbf-types/src/work.rs`), every action books 1 core and 1 GiB
-(`crates/kbf-front/src/execution.rs`), the lease kind is not in the scheduler's request,
-and placement is first fit in worker-name order with no reservation **[V]**. The
-changes:
+On `main`, `Resources` has four dimensions (`cpu_millis`, `memory_bytes`, `gpus`,
+`vms`, `crates/kbf-types/src/work.rs`), with `vms` checked by `fits` but booked and
+filled by nothing yet (`kbf-lease=vm` is refused). An `action` lease books 1 core and
+1 GiB, or its `kbf-book-cpus` and `kbf-book-mem-gib` (`crates/kbf-front/src/execution.rs`).
+The lease kind is in the scheduler's request: a worker is feasible only if its `drivers`
+serve the kind, and a `whole_machine` lease books the whole worker and, when it fits
+nowhere, holds one worker in queue order ([scheduler.md](scheduler.md#placement)).
+Otherwise placement is first fit in worker-name order **[V]**. The changes still
+planned:
 
 1. **A `vms` dimension** in `Resources`, filled from `vm.slots`, checked by `fits` like
    `gpus`. A VM lease books `vms=1`, `kbf-book-cpus` and `kbf-book-mem-gib`. The
    scheduler therefore never asks for a third VM, and the driver still maps
    `VZErrorVirtualMachineLimitExceeded` to an infrastructure failure that is retried
    elsewhere.
-2. **The kind in the request.** A node is feasible only if its `drivers` include one
-   that serves the kind: `native` or `container` for `action`, `vm` for `vm`, and
-   `native-whole-machine` for `whole_machine`. This stops `whole_machine` reaching a
-   daemon that refuses it. A `whole_machine` lease books the node's full cores,
-   memory, `gpus` and `vms`, so
-   nothing else is placed there while it runs.
+2. **The `vm` kind in the request.** For `action` and `whole_machine` this is on
+   `main` (above); what remains is the `vm` kind, feasible only on a node whose
+   `drivers` include `vm`. A `whole_machine` lease books the node's full capacity, so
+   once `vm.slots` fills `vms` it books the node's `vms` too, and no VM is placed
+   beside it.
 3. **Image locality is a hard requirement.** `vm.image` matches only nodes that report
    the digest. An image is tens of gigabytes; it is never fetched at action time.
    Images are placed on nodes ahead of time ([section 7](#7-images)).
@@ -645,7 +647,7 @@ the node id checked against the certificate ([#79](https://github.com/komira-ai/
 
 | Crate | Change |
 |---|---|
-| `kbf-front`, `kbf-caps` | the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-planned)): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
+| `kbf-front`, `kbf-caps` | the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-partly-planned)): every action books 1 GiB today and the native driver kills it at 150% + 512 MiB = 2 GiB (`crates/kbf-driver-native/src/config.rs`) **[V]**, which large `swiftc` and `ld` steps exceed |
 | `kbf-caps` | `xcode` becomes a set the node reports, matched by membership (today an exact key, and a repeated entry is refused) |
 | `kbf-driver-native` | deny file writes outside the lease, `TMPDIR` and a per-lease `HOME`; set `HOME`, `TMPDIR`, the module cache paths and the per-user cache folder per lease; per-lease user; fill usage |
 | `kbf-daemon` | report each Xcode build (several `xcode` entries) and SDKs; set `DEVELOPER_DIR` from the action |
