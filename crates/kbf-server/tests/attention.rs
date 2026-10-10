@@ -7,9 +7,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, MemoryMetaLog};
-use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_front::Cache;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus};
 use kbf_server::Farm;
 use kbf_types::{Resources, WorkerId};
@@ -82,11 +80,7 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
 
-    let cache = Arc::new(Cache::new(
-        MemoryMetaLog::new(Retention::default()),
-        MemoryStore::new(Capabilities::default()),
-        KeyPrefix::default(),
-    ));
+    let cache = Arc::new(Cache::memory());
     let farm = Farm::new(
         cache,
         kbf_sched::UNSERVABLE_WAIT,

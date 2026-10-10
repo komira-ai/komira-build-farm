@@ -28,13 +28,15 @@ const CONDITIONAL: Capabilities = Capabilities {
 };
 
 /// A cache over a fresh faulty bucket, and a handle on that bucket.
-fn cache(capabilities: Capabilities) -> (Arc<FaultyCache>, FaultyStore) {
+async fn cache(capabilities: Capabilities) -> (Arc<FaultyCache>, FaultyStore) {
     let store = FaultyStore::new(capabilities);
-    let cache = Cache::new(
+    let cache = Cache::open(
         AuditLog::new(store.clone()),
         store.clone(),
         KeyPrefix::default(),
-    );
+    )
+    .await
+    .expect("open the cache");
     (Arc::new(cache), store)
 }
 
@@ -99,7 +101,7 @@ fn assert_audit_clean(cache: &FaultyCache) {
 /// Catches: committing `PutBlob` before (or regardless of) the PUT and the footer read.
 #[tokio::test]
 async fn a_failed_put_or_footer_read_commits_nothing() {
-    let (cache, store) = cache(Capabilities::default());
+    let (cache, store) = cache(Capabilities::default()).await;
     let b = TestBlob::new(1);
 
     store.on_put(PutFault::Fail);
@@ -129,7 +131,7 @@ async fn a_failed_put_or_footer_read_commits_nothing() {
 /// Catches: committing `PutBlob` before the PUT answers; reusing an object id on retry.
 #[tokio::test]
 async fn a_lost_put_answer_commits_nothing_and_the_retry_takes_a_new_key() {
-    let (cache, store) = cache(CONDITIONAL);
+    let (cache, store) = cache(CONDITIONAL).await;
     let b = TestBlob::new(2);
 
     store.on_put(PutFault::LoseAnswer);
@@ -155,7 +157,7 @@ async fn a_lost_put_answer_commits_nothing_and_the_retry_takes_a_new_key() {
 /// where a client would be told the blob exists while the store has no bytes).
 #[tokio::test]
 async fn a_blob_is_not_reported_while_its_put_is_in_flight() {
-    let (cache, store) = cache(Capabilities::default());
+    let (cache, store) = cache(Capabilities::default()).await;
     let b = TestBlob::new(3);
     let (entered_tx, entered) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
@@ -199,7 +201,7 @@ async fn a_put_that_stores_other_bytes_is_never_committed() {
         ("another segment", PutFault::Replace(segment_of(&[&other]))),
     ];
     for (i, (what, lie)) in lies.into_iter().enumerate() {
-        let (cache, store) = cache(Capabilities::default());
+        let (cache, store) = cache(Capabilities::default()).await;
         let b = TestBlob::new(41 + i as u64);
         store.on_put(lie);
         let err = cache.store_blobs(vec![b.verified()]).await.unwrap_err();
@@ -219,7 +221,7 @@ async fn a_put_that_stores_other_bytes_is_never_committed() {
 /// then lands on the other blob's bytes and fails its digest).
 #[tokio::test]
 async fn offsets_come_from_the_footer_the_store_holds() {
-    let (cache, store) = cache(Capabilities::default());
+    let (cache, store) = cache(Capabilities::default()).await;
     let x = TestBlob::new(5);
     let b = TestBlob::new(50);
     let sent = segment_of(&[&x, &b]);
@@ -247,7 +249,7 @@ async fn offsets_come_from_the_footer_the_store_holds() {
 #[tokio::test]
 async fn a_read_that_does_not_reach_the_store_marks_nothing() {
     for blip in [GetFault::Transport, GetFault::SlowDown] {
-        let (cache, store) = cache(Capabilities::default());
+        let (cache, store) = cache(Capabilities::default()).await;
         let b = TestBlob::new(6);
         cache.store_blobs(vec![b.verified()]).await.expect("upload");
 
@@ -279,7 +281,7 @@ async fn a_read_that_does_not_reach_the_store_marks_nothing() {
 #[tokio::test]
 async fn a_store_that_says_the_object_is_gone_marks_it_unreachable() {
     for gone in [GetFault::NotFound, GetFault::InvalidRange] {
-        let (cache, store) = cache(Capabilities::default());
+        let (cache, store) = cache(Capabilities::default()).await;
         let b = TestBlob::new(7);
         cache.store_blobs(vec![b.verified()]).await.expect("upload");
 
