@@ -9,6 +9,10 @@
 //!   holds only what the action created or changed, so an output path that is already
 //!   in the input root is refused as `INVALID_ARGUMENT` before anything runs;
 //! - no network (`--network=none`: loopback only);
+//! - the `Command`'s environment variables and no others (`--unsetenv-all`), run as
+//!   the container's root (`--user=0:0`), with the pids, `/dev/shm` and `nofile` and
+//!   `nproc` ulimits of [`ContainerLimits`], whatever the image or the node's
+//!   `containers.conf` says;
 //! - no id of the daemon's user (`--userns=nomap`: the container's ids are the user's
 //!   subordinate ids, which [`check_daemon_user`] requires at startup);
 //! - a lease cgroup under the daemon's delegated `actions/` cgroup, with
@@ -56,6 +60,6 @@ pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{cpu_weight, memory_high};
 pub use image::{ImageError, ImageRef};
 pub use outputs::OutputLimits;
-pub use podman::{EXEC_ROOT, OWNER_LABEL};
+pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};
 pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};
 pub use subids::{IdFiles, SubidError, check_daemon_user, check_subordinate_ids};
