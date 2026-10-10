@@ -162,9 +162,11 @@ it, so the farm must look like one endpoint.
   fails as soon as it stops being the leader, not at its next election.
 - **`grpc.health.v1` on the REAPI listener.** Beside the two readiness paths, each
   server serves the standard gRPC health service on its REAPI listener, so a proxy
-  can health-check a server over gRPC on the port it routes to. Its answers follow
-  the two readiness paths, ready to serve reads and leader; which service name
-  reports which is not chosen.
+  can health-check a server over gRPC on the port it routes to. This is built: today
+  every service name gives `/readyz`'s one answer
+  ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)). Planned: its answers
+  follow the two readiness paths, ready to serve reads and leader; which service
+  name reports which is not chosen.
 - **TLS on the proxy-to-server hop, with an internal certificate.** The proxy and
   the servers may be on different machines, so the hop between them is encrypted:
   `kbf-server` serves its REAPI listener over TLS with a certificate issued by an
@@ -183,6 +185,8 @@ Daemons do not go through the client front.
 - **How a daemon is given the servers.** Either one DNS name with an address record
   per server, or a list of addresses (or names). The daemon dials them directly,
   over the worker listener's mutual TLS ([worker-protocol.md](worker-protocol.md)).
+  This is built: `--server` is repeatable and each host is resolved again on every
+  round of attempts ([daemon.md](daemon.md#reaching-a-server)).
 - It holds **one** worker stream, to the leader.
 - **The redirect.** A follower that receives a daemon's session does not serve it:
   it ends the `Session` stream with a status that names the leader, and the daemon
@@ -191,7 +195,10 @@ Daemons do not go through the client front.
 - **Retry forever.** A daemon never gives up on the farm. When a dial fails, a
   stream ends, or no server names a leader, it tries the next server, and after a
   pass over all of them it waits and starts again, with a backoff that grows to a
-  bound and stays there. Only a stop signal ends the daemon.
+  bound and stays there. Only a stop signal ends the daemon. This is built
+  ([daemon.md](daemon.md#reaching-a-server)): the bound is `--reconnect-max-ms`, and
+  an `UNAVAILABLE` answer moves the daemon to the next address at once. The redirect
+  above is not.
 - **A failover keeps running leases.** `Welcome.epoch` names the replicated log,
   which outlives leaders and their terms, so a change of leader does not change the
   epoch, and the daemon keeps its running leases. It reconnects, reaches the new
@@ -256,10 +263,10 @@ because there a runaway build cannot press on the farm's state. What changes:
 | Raft in the server | none: no crate depends on `kbf-raft`, and it has no disk storage | the log and its snapshots on each voter's local disk, snapshots also copied to the object store; `kbf-server` applies control and metadata state from it |
 | Metadata | `MemoryMetaLog`, in the server's memory; lost at restart. With `--store=s3` each start writes under a fresh key prefix | applied from the log, so a restart keeps it |
 | Leases | each process picks its own term at start (wall-clock milliseconds times 2^16 plus 16 random bits); `Welcome.epoch` names it; a daemon drops leases of another epoch; leases of an earlier process are refused (#137); another daemon process's leases are kept for the handover grace (#140) | the term comes from the Raft log, and `Welcome.epoch` names the log, so a failover keeps running leases and daemons resend their results to the new leader ([above](#daemons-straight-to-the-servers-one-stream-to-the-leader)) |
-| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path, and no `grpc.health.v1` service | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server; `grpc.health.v1` on the REAPI listener with the same two answers ([above](#build-clients-one-name-routed-by-method)) |
+| Readiness | `GET /healthz` and `GET /readyz` on the operator API listener (`--api-listen`; [api.md](../api.md#get-healthz-and-get-readyz)). `/readyz` is 503 once a stop signal arrives, when a read-only store probe fails or times out, and when the server does not hold the scheduler role, a flag a single server always holds. There is one readiness path. The REAPI listener serves `grpc.health.v1.Health` with `/readyz`'s answer, the same for every service name ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)) | two readiness paths: the Raft role sets the leader flag, so `/readyz` is 200 only on the leader; a second path, not yet named, is 200 on any synced server; `grpc.health.v1` gives the same two answers ([above](#build-clients-one-name-routed-by-method)) |
 | Reads and uploads on followers | none: one server serves every call, and the cache commits its own metadata | at three servers, any synced server serves `ByteStream.Read`, `BatchReadBlobs`, `FindMissingBlobs` and `GetActionResult` from its applied state, and writes upload bytes to the object store before sending the leader the metadata commit; a read index where a stronger guarantee is needed ([above](#reads-and-uploads-on-every-server)) |
 | Follower redirect | none: there are no followers, and `kbf.worker.v1` has no redirect | a follower ends a daemon's session with a status naming the leader; one that knows no leader answers `UNAVAILABLE` |
-| Daemon's servers | one `--server` URL; whenever a session ends the daemon waits `--reconnect-ms` (a fixed wait, default 1000) and dials the same URL again, without end | one DNS name with a record per server, or a list; the daemon tries the next server on `UNAVAILABLE` or a failed dial, follows a redirect to the leader, and retries forever with a bounded backoff |
+| Daemon's servers | one or more `--server` URLs, each host resolved again every round (a DNS name may carry a record per server); the daemon tries every address in turn, moving on at once after a refused connection, a TLS failure or `UNAVAILABLE`, and waits a jittered, doubling time, at most `--reconnect-max-ms` (30 s), between failed rounds; it never stops trying ([daemon.md](daemon.md#reaching-a-server)). No redirect is followed: there is none to follow | the daemon follows a follower's redirect and dials the leader it names |
 | Proxy-to-server hop | the REAPI listener serves plain text only | TLS with a certificate from an internal CA (#226), which clients on the private network may also use to reach a server directly |
 | Client front | proven only with `tailscale serve` in its HTTPS mode, on the server's host, in front of a loopback REAPI listener (pull request [#246](https://github.com/komira-ai/komira-build-farm/pull/246); see the [Security model](../../ARCHITECTURE.md#security-model)); it routes by nothing, as there is one server | a tailnet ingress and an HTTP/2 proxy that routes by gRPC method, after the probes below pass |
 | Node registry | in the server's memory: a node whose stream closed stays listed with `connected: false` until the server restarts, and gets no work once it has not been heard from for G; a restart forgets every node. `kbf-alert` exists, but nothing raises alerts yet | durable, as [above](#a-durable-node-registry) |
@@ -288,14 +295,14 @@ idle timeout bounds these streams the same way.
 
 ## Decided questions
 
-These were open; the maintainers decided them on 2026-10-10. Each is **planned**:
-none is built.
+These were open; the maintainers decided them on 2026-10-10. The last column says
+what of each decision is on `main`; the rest is **planned**.
 
-| Question | Decision |
-|---|---|
-| What a failover keeps | running leases: `Welcome.epoch` names the replicated log, and daemons resend their results to the new leader ([daemons](#daemons-straight-to-the-servers-one-stream-to-the-leader)) |
-| How the daemon is told the servers | one DNS name with a record per server, or a list of addresses |
-| The redirect's form | a status on the ended `Session` stream naming the leader; a follower that knows no leader answers `UNAVAILABLE` and the daemon tries the next server; daemons retry forever, with a bounded backoff |
-| Readiness on a follower | the two readiness paths, plus `grpc.health.v1` on the REAPI listener ([build clients](#build-clients-one-name-routed-by-method)) |
-| The proxy-to-server hop | TLS with a certificate from an internal CA, which clients may also use to reach the servers directly ([build clients](#build-clients-one-name-routed-by-method)) |
-| Snapshots off the host | copied to the object store ([durable state](#durable-state-a-raft-log-on-local-disk)) |
+| Question | Decision | Built |
+|---|---|---|
+| What a failover keeps | running leases: `Welcome.epoch` names the replicated log, and daemons resend their results to the new leader ([daemons](#daemons-straight-to-the-servers-one-stream-to-the-leader)) | none: the epoch names the server process, so a restart drops every running lease |
+| How the daemon is told the servers | one DNS name with a record per server, or a list of addresses | both: `--server` is repeatable, and each host is resolved again every round ([daemon.md](daemon.md#reaching-a-server)) |
+| The redirect's form | a status on the ended `Session` stream naming the leader; a follower that knows no leader answers `UNAVAILABLE` and the daemon tries the next server; daemons retry forever, with a bounded backoff | the daemon's side but the redirect: it moves to the next address on `UNAVAILABLE` and retries forever with a backoff bounded by `--reconnect-max-ms`. No server sends a redirect, and the daemon follows none |
+| Readiness on a follower | the two readiness paths, plus `grpc.health.v1` on the REAPI listener ([build clients](#build-clients-one-name-routed-by-method)) | `grpc.health.v1` on the REAPI listener, with `/readyz`'s one answer ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)); the second readiness path is not |
+| The proxy-to-server hop | TLS with a certificate from an internal CA, which clients may also use to reach the servers directly ([build clients](#build-clients-one-name-routed-by-method)) | none: the REAPI listener serves plain text |
+| Snapshots off the host | copied to the object store ([durable state](#durable-state-a-raft-log-on-local-disk)) | none: there is no Raft log in the server |

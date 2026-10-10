@@ -1,5 +1,5 @@
-//! Generated protocol code: the Remote Execution API v2 and the `kbf.worker.v1`
-//! server-daemon protocol, compiled from vendored `.proto` files by `build.rs`.
+//! Generated protocol code: the Remote Execution API v2, the `kbf.worker.v1`
+//! server-daemon protocol and the gRPC health checking protocol (`grpc.health.v1`), compiled from vendored `.proto` files by `build.rs`.
 //!
 //! Modules mirror the proto packages, because generated code names other packages by
 //! relative paths (`super::super::...`). The vendored files, their licences and the
@@ -37,6 +37,15 @@ pub mod google {
     }
     pub mod rpc {
         tonic::include_proto!("google.rpc");
+    }
+}
+
+/// `grpc.*`: the gRPC health checking protocol, which load balancers and proxies poll.
+pub mod grpc {
+    pub mod health {
+        pub mod v1 {
+            tonic::include_proto!("grpc.health.v1");
+        }
     }
 }
 

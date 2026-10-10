@@ -218,7 +218,9 @@ What the code does today:
 - Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`), or the
   whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
   [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)),
-  its `gpu` count, and what its platform asks of a worker (`Request::needs`).
+  its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
+  scheduler raises the memory of a new submission to its action key's memory floor,
+  if it has one (see "Memory kills" below).
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
@@ -272,7 +274,48 @@ What the code does today:
 - **Reclaimed room.** `batch` work may use memory that is booked but unused, and is
   preempted at once when more urgent work needs it.
 - **Retries.** An infrastructure failure is retried on another worker a bounded number
-  of times before callers see `INTERNAL`.
+  of times before callers see `INTERNAL`. Today only a busy node's memory kill is
+  rerun (below).
+
+## Memory kills
+
+What the code does today (`kbf_sched::MemoryRun`; the policy is
+[failure-classes.md](failure-classes.md), 6.1). A daemon's `Result` says which memory
+ran out when a lease was killed for it (`Result.memory_kill`,
+[worker-protocol.md](worker-protocol.md#result-and-resultack)); no driver sets it yet. The server
+turns it into one of two outcomes, and the scheduler decides on the committed result:
+
+- **`Failed(OutOfMemory)`: the action passed its own memory limit.** The operation is
+  queued again with its memory booking doubled, rounded up to whole GiB (at least
+  1 GiB), and never past the **cap**: the memory of the largest node that could run it
+  when the kill is committed, one that is live (cordoned or not), serves its lease
+  kind, satisfies its platform and holds its CPU and GPU request; the node of the
+  killed run always counts. A doubling past the cap books the cap: 1, 2, 4, 8 GiB on
+  a farm whose largest node has 8 GiB. A whole-machine lease doubles what it booked,
+  the node's whole memory, so it next needs a node twice as large. A kill of a run that
+  booked the cap finishes the operation `Failed(OutOfMemory)`: the action needs more
+  memory than any node offers.
+- **The memory floor.** Each raised booking is kept as the memory floor of the
+  action's key (instance name and action digest), and a later submission of that key
+  books at least the floor; a floor never falls. The floors live in the scheduler
+  alone, so a server restart forgets them (one more killed run per key), and at most
+  `MEMORY_FLOORS` = 65 536 are kept, the one raised longest ago forgotten first.
+- **`Failed(NodeMemoryPressure)`: the node killed it while it was under its own
+  limit** (a node-wide out-of-memory kill, or the node's backstop). The busy node's
+  fault: the node's memory-pressure count (`Scheduler::memory_pressure`) goes up, and
+  the operation is queued again with the same booking, at most `FARM_RERUNS` = 2 times
+  (3 runs). It never raises the booking or the floor. After the reruns it finishes
+  `Failed(NodeMemoryPressure)`.
+- **The two budgets do not mix.** A rung of the ladder is not a farm rerun and a farm
+  rerun is not a rung, so a long ladder never takes a busy-node kill's reruns, and
+  busy-node kills never stop the ladder short of the cap. An operation runs at most
+  `1 + ceil(log2(cap / first booking)) + FARM_RERUNS` times. Leases given up for
+  silence, replacement, reconnection or not starting count against neither.
+- A memory kill committed for a lease the operation no longer holds (it was given up
+  and is queued again) changes nothing: no run is recorded and the booking stays.
+- Each rerun is a requeue the server logs with its reason ("passed its memory limit
+  with 1 GiB booked; it runs again with 2 GiB booked"); a busy node's kill is also
+  logged as a warning on the `kbf_server::attention` target with the node's count.
 
 ## Outcomes
 
@@ -285,13 +328,15 @@ to the scheduler's outcome and to what callers see:
 | `OK`, an output not stored | `Failed(Infra)` | `INTERNAL` | not written |
 | `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED` | not written |
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
+| not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again with double the memory below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
+| not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, twice | after the reruns, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
 | anything else | `Failed(Infra)` | `INTERNAL` | not written |
 | (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
 
 A run that exits non-zero (a failing test) is still `Completed`: callers get its
 result, but it is not cached. The action-cache entry is committed before the callers
 are answered, so a caller that asks again at once gets a hit. Today an infrastructure
-failure is answered at once; retrying it is planned (above).
+failure other than a memory kill is answered at once; retrying it is planned (above).
 
 ## Accounting
 

@@ -234,7 +234,8 @@ with what exists today and the probes still to run. In short:
   automatic certificate terminates the clients' TLS; an HTTP/2 proxy behind it
   health-checks the servers and routes by gRPC method: reads and uploads to any server
   ready to serve reads, every other call to the leader. Each server reports both
-  answers on two readiness paths and on `grpc.health.v1` on its REAPI listener. The
+  answers on two readiness paths and on `grpc.health.v1` on its REAPI listener (built
+  today with `/readyz`'s one answer, [api.md](docs/api.md#grpchealthv1-on-the-reapi-listener)). The
   proxy reaches `kbf-server` over TLS with a certificate from an internal CA (see
   [Security model](#security-model)).
 - **Any server serves reads; the leader does the rest.** At three servers, every
@@ -252,7 +253,8 @@ with what exists today and the probes still to run. In short:
   list, dials them over mutual TLS and holds one stream, to the leader. A follower
   ends a daemon's session with a status naming the leader, or answers `UNAVAILABLE`
   when it knows none, and the daemon tries the next server; it retries forever, with
-  a bounded backoff. A failover keeps running leases: the lease epoch names the
+  a bounded backoff (the list, the retry and the backoff are built today; the
+  redirect is not). A failover keeps running leases: the lease epoch names the
   replicated log, and the daemon resends its results to the new leader. A daemon's
   blob reads and writes go to the worker listeners too (`--cas`), not through the
   front, and its reads are spread across all the servers.
@@ -328,9 +330,9 @@ front's certificate for the client-facing name, and it authenticates no caller.
   the action. That front did not cut them. Another front whose idle timeout is shorter
   than the longest queue wait would cut these streams.
 
-**Daemons do not go through the front.** A daemon's `--server` (the flag's help calls
-it "the kbf-server front") and its `--cas` both name the worker listener, not the
-client front above. The worker listener keeps its own mutual TLS end to end. With
+**Daemons do not go through the front.** A daemon's `--server` (repeatable; each
+host resolved again on every round of connection attempts, which never stop) and its
+`--cas` both name the worker listener, not the client front above. The worker listener keeps its own mutual TLS end to end. With
 several servers (**planned**), daemons dial the servers' own names, with no balancer
 in between, a follower redirects them to the leader, and they retry forever
 ([deployment-topology.md](docs/design/deployment-topology.md)).
