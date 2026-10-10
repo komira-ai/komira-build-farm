@@ -107,3 +107,21 @@ fn std_fs_reports_errors() {
     assert!(StdFs::new(dir.join("a").join("sub")).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Catches: a directory listing that drops or mangles a file name that is not UTF-8
+/// (the store would open as if the file were not there); it must fail instead. Linux
+/// only: other filesystems refuse such names.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_name_fails_the_listing() {
+    use kbf_store::Fs;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = scratch("non-utf8");
+    let fs = StdFs::new(&dir).unwrap();
+    std::fs::write(dir.join(std::ffi::OsStr::from_bytes(b"bad\xff")), b"").unwrap();
+    assert_eq!(
+        fs.list().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

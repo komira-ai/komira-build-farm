@@ -347,6 +347,7 @@ fn open_refuses_files_that_do_not_form_one_log() {
             })],
         ),
         ("bad name", vec![("1-1.log".to_owned(), Vec::new())]),
+        ("no dash", vec![("1.log".to_owned(), Vec::new())]),
         (
             "hard state trailing bytes",
             vec![(HARD_STATE.to_owned(), {
@@ -375,9 +376,11 @@ fn name(seq: u64, first: u64) -> String {
 /// Catches: a caller's malformed batch written (or stopping the store), a truncation
 /// that leaves replaced segments behind or deletes one still in use, an open that keeps
 /// a segment a later one replaced whole or a stale temporary hard state, and a
-/// rotation that never starts a new segment.
+/// rotation that never starts a new segment, and a default segment size other than
+/// the documented 64 MiB.
 #[test]
 fn invalid_batches_rotation_and_cleanup() {
+    assert_eq!(Options::default().segment_bytes, 64 << 20);
     let fs = FaultFs::new();
     let (mut store, _) = Store::open(fs.clone(), OPTS).unwrap();
     for bad in [

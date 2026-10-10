@@ -188,7 +188,9 @@ impl<F: Fs> Store<F> {
         let mut torn_at = None;
         for (k, seg) in segments.iter().enumerate() {
             let last = entries.len() as u64;
-            if seg.first == 0 || seg.first > last + 1 || (k == 0 && seg.first != 1) {
+            // The first segment meets an empty log, so this also requires it to start
+            // at index 1.
+            if seg.first == 0 || seg.first > last + 1 {
                 return Err(corrupt(&seg.name, 0, "segment does not continue the log"));
             }
             entries.truncate(usize::try_from(seg.first - 1).map_err(io::Error::other)?);

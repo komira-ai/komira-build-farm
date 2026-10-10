@@ -399,6 +399,14 @@ mod tests {
         assert_eq!(fs.remove("q").unwrap_err().kind(), io::ErrorKind::NotFound);
         fs.flip("p", 1);
         assert_eq!(fs.crash(0).contents("p").unwrap(), [b'a', !b'b', b'c']);
+        fs.open_append("p").unwrap().append(b"d").unwrap();
+        fs.flip("p", 3);
+        assert_eq!(fs.contents("p").unwrap(), [b'a', !b'b', b'c', !b'd']);
+        assert_eq!(
+            fs.crash(9).contents("p").unwrap(),
+            [b'a', !b'b', b'c', !b'd']
+        );
+        assert_eq!(fs.crash(0).contents("p").unwrap(), [b'a', !b'b', b'c']);
         assert_eq!(fs.list().unwrap(), ["p"]);
     }
 }

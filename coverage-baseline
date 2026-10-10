@@ -31,6 +31,6 @@ kbf-segments              8      5
 kbf-server                0      0
 kbf-sim                   9      3
 kbf-sim-cell              -      -
-kbf-store                 -      -
+kbf-store                 0      0
 kbf-types                 3      2
 kbf-updater               0      0
