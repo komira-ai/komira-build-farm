@@ -13,8 +13,11 @@ kbf keeps its authoritative state in replicated logs:
 
 Both start in one Raft group, as two state machines with separate snapshots. Metadata
 moves to its own group when it needs to, so the implementation must run more than one
-group in a process. A group has 3 voters. Membership changes go through a learner: add
-the new server as a learner, let it catch up, promote it, then remove the old voter.
+group in a process. A deployment starts with a single voter, whose log is on its
+server's local disk, and grows to 3 voters on 3 hosts for high availability
+([deployment-topology.md](../design/deployment-topology.md)). Membership changes go
+through a learner: add the new server as a learner, let it catch up, promote it, then
+remove the old voter if one is being replaced.
 
 Every decision kbf makes is tested by deterministic simulation (`kbf-sim`): one seed
 names exactly one run, and a failing seed is a complete bug report. The consensus code

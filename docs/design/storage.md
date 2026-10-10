@@ -239,9 +239,12 @@ each with a plain bucket and an Object Lock bucket.
 
 ## Planned
 
-- **Replicated metadata.** `MetaState` applied from a Raft log on every server, with
-  snapshots stored in the object store. Answers that need fresh state (an action-cache
-  hit, "absent" on a read path) come from the leader; if it cannot be reached the
+- **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's
+  local disk, with its snapshots: one voter first, three on three hosts later
+  ([deployment-topology.md](deployment-topology.md)). Whether snapshots are also copied
+  to the object store, so a lost host can be rebuilt, is an open question there.
+  Every REAPI request reaches the leader, so answers that need fresh state (an
+  action-cache hit, "absent" on a read path) come from it; if it cannot be reached the
   answer is `UNAVAILABLE`, never a guess.
 - **Garbage collection.** Collection marks space dead; a segment is deleted only when no
   entry uses it, through a condemn step with a delay during which any touch revives it.
@@ -255,4 +258,4 @@ each with a plain bucket and an Object Lock bucket.
   change plus a background copy.
 - **Compression.** zstd for ByteStream, advertised only once reads and writes decode it.
 - **Locality.** Daemons keep a local cache of hot inputs and report what they hold, and
-  servers cache hot blobs above the object store.
+  the leader caches hot blobs above the object store.
