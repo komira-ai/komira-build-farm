@@ -366,6 +366,10 @@ impl<C: Cas> PodmanRuntime<C> {
         // container's monitor, conmon, which lives in the lease cgroup): whether the
         // kernel's OOM killer did it, and for whose limit, is read from the lease
         // cgroup, not from Podman.
+        if ended == Ok(Ended::Exited(137)) {
+            let limit = memory_max(work.resources.memory_bytes).unwrap_or(0);
+            return Err(RuntimeError::OutOfMemory { used: limit, limit });
+        }
         if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
             let cap = memory_max(work.resources.memory_bytes);
             match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
