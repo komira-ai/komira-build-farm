@@ -114,7 +114,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
-| `kbf-store` | no | a Raft server's durable state on the local disk: a segmented append-only log of CRC-32C records and the hard state (term, vote); a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
+| `kbf-store` | no | a Raft server's durable state on the local disk, as a `kbf_raft::Storage`: a segmented append-only log of CRC-32C records, the hard state (term, vote) and the newest snapshot, whose segments it covers are removed only once it is durable; a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
 | `kbf-sim-cell` | no | placeholder (**planned**: whole-cell simulation) |
 
 A test in `kbf-it` reads the dependency graph and fails if a pure crate depends,

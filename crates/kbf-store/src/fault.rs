@@ -7,7 +7,9 @@
 //! process there, after which every operation fails. [`FaultFs::crash`] then gives the
 //! directory a power cut would leave: the durable names, each file's durable bytes,
 //! and up to a chosen number of the bytes appended after them, which is a torn write
-//! cut at that offset.
+//! cut at that offset. [`FaultFs::crash_reordered`] also lets any chosen subset of
+//! the creates, renames and removals since the last directory sync reach the disk, in
+//! any combination: POSIX orders none of them before that sync returns.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -42,12 +44,51 @@ impl Inode {
     }
 }
 
+/// One change to the directory's names since its last sync.
+#[derive(Clone, Debug)]
+enum NameChange {
+    Link(String, u64),
+    Rename {
+        from: String,
+        to: String,
+        inode: u64,
+    },
+    Unlink(String),
+}
+
+impl NameChange {
+    fn apply(&self, names: &mut BTreeMap<String, u64>) {
+        match self {
+            Self::Link(name, inode) => {
+                names.insert(name.clone(), *inode);
+            }
+            Self::Rename { from, to, inode } => {
+                names.remove(from);
+                names.insert(to.clone(), *inode);
+            }
+            Self::Unlink(name) => {
+                names.remove(name);
+            }
+        }
+    }
+
+    /// The file the change names, if it adds a name.
+    fn inode(&self) -> Option<u64> {
+        match self {
+            Self::Link(_, inode) | Self::Rename { inode, .. } => Some(*inode),
+            Self::Unlink(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     inodes: BTreeMap<u64, Inode>,
     next_inode: u64,
     names: BTreeMap<String, u64>,
     durable_names: BTreeMap<String, u64>,
+    /// The name changes since the last directory sync, in order.
+    pending: Vec<NameChange>,
     ops: u64,
     faults: BTreeMap<u64, Fault>,
     crashed: bool,
@@ -110,32 +151,57 @@ impl FaultFs {
         self.lock().ops
     }
 
-    /// The most bytes any file that survives a crash holds past its durable ones: the
-    /// largest `keep` for which [`FaultFs::crash`] can differ from `keep - 1`.
+    /// The most bytes any file that can survive a crash holds past its durable ones:
+    /// the largest `keep` for which [`FaultFs::crash_reordered`] can differ from
+    /// `keep - 1`.
     #[must_use]
     pub fn unsynced(&self) -> usize {
         let s = self.lock();
         s.durable_names
             .values()
-            .map(|i| s.inodes[i].unsynced())
+            .copied()
+            .chain(s.pending.iter().filter_map(NameChange::inode))
+            .map(|i| s.inodes[&i].unsynced())
             .max()
             .unwrap_or(0)
+    }
+
+    /// How many creates, renames and removals ran since the last directory sync: the
+    /// bits of [`FaultFs::crash_reordered`]'s `names` that matter.
+    #[must_use]
+    pub fn pending_names(&self) -> usize {
+        self.lock().pending.len()
     }
 
     /// The directory after a power cut, as a new [`FaultFs`] with no faults: the
     /// durable names, and in each file its durable bytes followed by at most `keep` of
     /// the bytes appended after them. A file whose unsynced change was not an append
-    /// (a truncation) keeps its durable bytes.
+    /// (a truncation) keeps its durable bytes. No name change since the last directory
+    /// sync survives: `crash_reordered(keep, 0)`.
     #[must_use]
     pub fn crash(&self, keep: usize) -> Self {
+        self.crash_reordered(keep, 0)
+    }
+
+    /// [`FaultFs::crash`], where the name changes since the last directory sync whose
+    /// bit is set in `names` (bit 0 is the first change) reached the disk too, applied
+    /// in the order they ran; the others are lost. Changes past the 64th are lost.
+    #[must_use]
+    pub fn crash_reordered(&self, keep: usize, names: u64) -> Self {
         let s = self.lock();
+        let mut durable = s.durable_names.clone();
+        for (bit, change) in s.pending.iter().take(64).enumerate() {
+            if (names >> bit) & 1 == 1 {
+                change.apply(&mut durable);
+            }
+        }
         let mut next = State {
-            names: s.durable_names.clone(),
-            durable_names: s.durable_names.clone(),
+            names: durable.clone(),
+            durable_names: durable,
             next_inode: s.next_inode,
             ..State::default()
         };
-        for &i in s.durable_names.values() {
+        for &i in next.durable_names.values() {
             let inode = &s.inodes[&i];
             let kept = inode.durable.len() + inode.unsynced().min(keep);
             let data = if inode.unsynced() > 0 {
@@ -168,6 +234,7 @@ impl FaultFs {
             next_inode: s.next_inode,
             names: s.names.clone(),
             durable_names: s.durable_names.clone(),
+            pending: s.pending.clone(),
             ..State::default()
         };
         Self {
@@ -245,6 +312,7 @@ impl Fs for FaultFs {
         s.next_inode += 1;
         s.inodes.insert(inode, Inode::default());
         s.names.insert(name.to_owned(), inode);
+        s.pending.push(NameChange::Link(name.to_owned(), inode));
         Ok(FaultFile {
             state: Arc::clone(&self.state),
             inode,
@@ -264,9 +332,14 @@ impl Fs for FaultFs {
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         let mut s = self.lock();
         s.begin()?;
-        let i = s.inode_of(from)?;
-        s.names.remove(from);
-        s.names.insert(to.to_owned(), i);
+        let inode = s.inode_of(from)?;
+        let change = NameChange::Rename {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            inode,
+        };
+        change.apply(&mut s.names);
+        s.pending.push(change);
         Ok(())
     }
 
@@ -274,7 +347,9 @@ impl Fs for FaultFs {
         let mut s = self.lock();
         s.begin()?;
         s.inode_of(name)?;
-        s.names.remove(name);
+        let change = NameChange::Unlink(name.to_owned());
+        change.apply(&mut s.names);
+        s.pending.push(change);
         Ok(())
     }
 
@@ -282,6 +357,7 @@ impl Fs for FaultFs {
         let mut s = self.lock();
         s.begin()?;
         s.durable_names = s.names.clone();
+        s.pending.clear();
         Ok(())
     }
 }
@@ -374,6 +450,66 @@ mod tests {
         assert!(fs.read("c").is_err(), "nothing runs after a crash");
         assert!(fs.create("d").is_err());
         assert_eq!(fs.contents("c").unwrap(), b"on");
+    }
+
+    /// Catches: a fake whose power cut applies the name changes since the last
+    /// directory sync all or nothing (a store that removes files before the rename
+    /// that replaces them is durable would pass every crash test), keeps a change its
+    /// mask drops, loses the file a kept rename or create names, or forgets the
+    /// pending changes across a restart.
+    #[test]
+    fn a_power_cut_keeps_any_subset_of_the_name_changes() {
+        let fs = FaultFs::new();
+        for (name, bytes) in [("a", b"old"), ("b", b"bbb")] {
+            let mut f = fs.create(name).unwrap();
+            f.append(bytes).unwrap();
+            f.sync().unwrap();
+        }
+        fs.sync_dir().unwrap();
+        assert_eq!(fs.pending_names(), 0);
+        let mut t = fs.create("t").unwrap();
+        t.append(b"new").unwrap();
+        t.sync().unwrap();
+        fs.rename("t", "a").unwrap();
+        fs.remove("b").unwrap();
+        let mut u = fs.create("u").unwrap();
+        u.append(b"xyz").unwrap();
+        assert_eq!(fs.pending_names(), 4);
+        assert_eq!(fs.unsynced(), 3, "a pending create's unsynced bytes count");
+        let names = |mask: u64| {
+            let mut v: Vec<(String, Vec<u8>)> = Vec::new();
+            let cut = fs.crash_reordered(2, mask);
+            for n in cut.list().unwrap() {
+                let bytes = cut.read(&n).unwrap();
+                v.push((n, bytes));
+            }
+            v
+        };
+        let own = |pairs: &[(&str, &[u8])]| -> Vec<(String, Vec<u8>)> {
+            pairs
+                .iter()
+                .map(|(n, b)| ((*n).to_owned(), b.to_vec()))
+                .collect()
+        };
+        assert_eq!(names(0), own(&[("a", b"old"), ("b", b"bbb")]));
+        assert_eq!(
+            names(0b0001),
+            own(&[("a", b"old"), ("b", b"bbb"), ("t", b"new")])
+        );
+        assert_eq!(names(0b0010), own(&[("a", b"new"), ("b", b"bbb")]));
+        assert_eq!(names(0b0100), own(&[("a", b"old")]));
+        assert_eq!(
+            names(0b1000),
+            own(&[("a", b"old"), ("b", b"bbb"), ("u", b"xy")])
+        );
+        assert_eq!(names(0b1111), own(&[("a", b"new"), ("u", b"xy")]));
+        assert_eq!(names(0), names(1 << 63), "bits past the changes do nothing");
+        let restarted = fs.restart();
+        assert_eq!(restarted.pending_names(), 4);
+        assert_eq!(restarted.crash_reordered(0, 0b0100).contents("b"), None);
+        fs.sync_dir().unwrap();
+        assert_eq!(fs.pending_names(), 0);
+        assert_eq!(fs.crash(0).contents("a").unwrap(), b"new");
     }
 
     /// Catches: name errors that a store relies on going unreported (a create over an
