@@ -16,6 +16,7 @@
 //! - [`report`]: the node report and its hash.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
+//! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
 //! - [`cas`]: the [`Cas`] trait and the front's client.
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
 //! - [`tree`]: writing an input root from the CAS and reading outputs back.
@@ -23,9 +24,9 @@
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
 //!
-//! The `kbf-daemon` binary lives in the `kbf-node` crate: it picks a driver
-//! (`--driver fake|container|native`), and the drivers depend on this crate, so a
-//! binary here naming them would be a cycle Cargo refuses. It never offers
+//! The `kbf-daemon` binary lives in the `kbf-node` crate: it picks its drivers
+//! (`--driver fake|container|native`, once per runtime), and the drivers depend on this
+//! crate, so a binary here naming them would be a cycle Cargo refuses. It never offers
 //! [`LocalRuntime`], which isolates nothing.
 
 pub mod cas;
@@ -39,6 +40,7 @@ mod lease;
 mod local;
 pub mod report;
 pub mod runtime;
+pub mod runtimes;
 pub mod status;
 pub mod tree;
 #[cfg(target_os = "linux")]
@@ -59,6 +61,7 @@ pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError};
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
+pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
 
 #[cfg(test)]

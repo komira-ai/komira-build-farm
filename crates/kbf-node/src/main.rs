@@ -2,10 +2,13 @@
 //!
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
 //! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
-//! `native` (plain processes; for Macs). The two real drivers read and write blobs
-//! over mutual TLS through the server's worker listener named by `--cas` (normally
-//! the same address as `--server`), with the daemon's own certificate, and make lease
-//! directories under `--scratch`. A Mac in komira's pool runs, for example:
+//! `native` (plain processes; for Macs). Given more than once, the daemon has one
+//! runtime per driver (the node's own, native or container, set up first) and runs
+//! each Start on the one that serves its lease kind; it refuses to start when two
+//! serve the same kind. The two real drivers read and write blobs over mutual TLS
+//! through the server's worker listener named by `--cas` (normally the same address
+//! as `--server`), with the daemon's own certificate, and make lease directories
+//! under `--scratch`. A Mac in komira's pool runs, for example:
 //!
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
@@ -34,7 +37,7 @@ use std::time::Duration;
 use clap::Parser;
 use kbf_daemon::{
     Args, Capacity, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, NodeReport,
-    Runtime,
+    Runtime, Runtimes,
 };
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -47,9 +50,11 @@ use tonic::transport::Endpoint;
 struct Cli {
     #[command(flatten)]
     daemon: Args,
-    /// How leases run.
-    #[arg(long, value_enum)]
-    driver: Driver,
+    /// How leases run; once per runtime. The daemon runs each lease on the driver that
+    /// serves its kind and refuses to start when two serve the same kind. The node's own
+    /// driver (native or container) is set up first, whatever the order given.
+    #[arg(long = "driver", value_enum, required = true)]
+    drivers: Vec<Driver>,
     /// The server's worker listener, an `https://` URL (normally `--server`'s), that
     /// the container and native drivers read and write blobs through, over mutual TLS
     /// with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`.
@@ -182,61 +187,107 @@ fn main() -> ExitCode {
     }
 }
 
-/// Builds the driver `--driver` names and serves until a signal; returns an error that
-/// stopped the daemon from starting.
+/// Builds the runtimes `--driver` names and serves until a signal; returns an error
+/// that stopped the daemon from starting.
 fn start(cli: &Cli) -> Result<(), Error> {
     let tokio = tokio::runtime::Runtime::new()?;
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
-    match cli.driver {
-        Driver::Fake => serve(
-            &tokio,
-            daemon(cli, Arc::new(FakeRuntime::new(Duration::ZERO)))?,
-        ),
-        Driver::Native => serve(&tokio, native(cli)?),
-        Driver::Container => container::start(cli, &tokio),
+    let (daemon, _) = node(cli, || native_config(cli), Path::new(xcode::XCRUN))?;
+    serve(&tokio, daemon)
+}
+
+/// The drivers `--driver` names, each once: the node's own (native or container)
+/// first, then the others in the order given.
+fn drivers(cli: &Cli) -> Vec<Driver> {
+    let own = |d: &Driver| matches!(d, Driver::Native | Driver::Container);
+    let ordered = cli.drivers.iter().filter(|d| own(d));
+    let mut drivers: Vec<Driver> = Vec::new();
+    for driver in ordered.chain(cli.drivers.iter().filter(|d| !own(d))) {
+        if !drivers.contains(driver) {
+            drivers.push(*driver);
+        }
+    }
+    drivers
+}
+
+/// What the drivers set up so far give the daemon.
+#[derive(Default)]
+struct Node {
+    /// One runtime per driver; `None` before the first.
+    runtimes: Option<Runtimes>,
+    /// What leases may use (the container driver's `actions/` cgroup).
+    capacity: Capacity,
+    /// The native driver's Xcode reports.
+    reports: Option<Reports>,
+}
+
+impl Node {
+    /// Adds `runtime`. Fails when it serves a lease kind a runtime added before serves.
+    fn add<R: Runtime>(&mut self, runtime: Arc<R>) -> Result<(), Error> {
+        self.runtimes = Some(match self.runtimes.take() {
+            None => Runtimes::new(runtime),
+            Some(set) => set.and(runtime)?,
+        });
+        Ok(())
     }
 }
 
-/// The daemon with `runtime`. Its node report is the detected entries and the labels;
-/// the native driver adds its own with `Daemon::with_driver_report`.
-fn daemon<R: Runtime>(cli: &Cli, runtime: Arc<R>) -> Result<Daemon<R>, Error> {
-    daemon_within(cli, runtime, Capacity::default())
-}
-
-/// [`daemon`], its report's `cpus` and `mem_gib` no more than `capacity`.
-fn daemon_within<R: Runtime>(
+/// The daemon with a runtime for each of [`drivers`], set up in that order; the native
+/// driver with the configuration `native` makes and the `xcrun` it surveys with and
+/// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
+/// Also returns what the native driver's Xcode watch sends the daemon, for a test to
+/// follow. Its node report is the detected entries, the labels and a `drivers` entry
+/// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
+/// container driver allows; the native driver adds its own with
+/// `Daemon::with_driver_report`.
+fn node(
     cli: &Cli,
-    runtime: Arc<R>,
-    capacity: Capacity,
-) -> Result<Daemon<R>, Error> {
-    let report = NodeReport::detect(&[runtime.driver()])?
+    native: impl Fn() -> Result<NativeConfig, Error>,
+    xcrun: &Path,
+) -> Result<(Daemon, Option<Reports>), Error> {
+    let mut node = Node::default();
+    for driver in drivers(cli) {
+        match driver {
+            Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
+            Driver::Native => {
+                let (runtime, reports) = native_runtime(cli, native()?, xcrun)?;
+                node.add(runtime)?;
+                node.reports = Some(reports);
+            }
+            Driver::Container => container::add(cli, &mut node)?,
+        }
+    }
+    let runtimes = node.runtimes.ok_or("no --driver given")?;
+    // `Daemon::new` adds every runtime's driver.
+    let report = NodeReport::detect(&[])?
         .with_entries(cli.daemon.label_entries())
-        .within(capacity);
-    Ok(Daemon::new(
-        DaemonConfig::from_args(&cli.daemon),
-        runtime,
-        report,
-    )?)
+        .within(node.capacity);
+    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?;
+    Ok(match node.reports {
+        Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
+        None => (daemon, None),
+    })
 }
 
-/// The daemon with the native driver, which surveys the Xcodes in `--xcode-apps` in
-/// the background, at once and again every `--xcode-recheck-secs`, and hands each
-/// changed survey to the daemon (`Daemon::with_driver_report`): without it the node
-/// reports no Xcode, ready or not. It does not wait for the first survey: until that
-/// ends, the daemon reports every Xcode found as not surveyed yet, and none as ready.
-fn native(cli: &Cli) -> Result<Daemon<NativeRuntime<CasClient>>, Error> {
-    Ok(native_with(cli, native_config(cli)?, Path::new(xcode::XCRUN))?.0)
+/// [`node`] with the native driver alone, its configuration `config`.
+#[cfg(test)]
+fn native_with(cli: &Cli, config: NativeConfig, xcrun: &Path) -> Result<(Daemon, Reports), Error> {
+    let (daemon, reports) = node(cli, || Ok(config.clone()), xcrun)?;
+    Ok((daemon, reports.ok_or("no native driver")?))
 }
 
-/// [`native`] with `config` and the `xcrun` it surveys with and warms (a test names
-/// its own user folders and sandbox, and an `xcrun` of its own); also returns what the
-/// watch sends the daemon, for a test to follow.
-fn native_with(
+/// The native driver with `config` and the `xcrun` it surveys with and warms. It
+/// surveys the Xcodes in `--xcode-apps` in the background, at once and again every
+/// `--xcode-recheck-secs`, and returns each changed survey for the daemon
+/// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or
+/// not. It does not wait for the first survey: until that ends, the daemon reports
+/// every Xcode found as not surveyed yet, and none as ready.
+fn native_runtime(
     cli: &Cli,
     config: NativeConfig,
     xcrun: &Path,
-) -> Result<(Daemon<NativeRuntime<CasClient>>, Reports), Error> {
+) -> Result<(Arc<NativeRuntime<CasClient>>, Reports), Error> {
     let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
@@ -261,16 +312,15 @@ fn native_with(
         report
     };
     // Returns at once: the survey runs on the watch's thread.
-    let (driver, _) = xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
-    let daemon = daemon(cli, runtime)?.with_driver_report(driver.clone());
-    Ok((daemon, driver))
+    let (reports, _) = xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
+    Ok((runtime, reports))
 }
 
 /// What the native driver's Xcode watch sends the daemon.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
 /// Runs `daemon` until SIGTERM or SIGINT.
-fn serve<R: Runtime>(tokio: &tokio::runtime::Runtime, daemon: Daemon<R>) -> Result<(), Error> {
+fn serve(tokio: &tokio::runtime::Runtime, daemon: Daemon) -> Result<(), Error> {
     let term = signal(SignalKind::terminate())?;
     let int = signal(SignalKind::interrupt())?;
     tokio.block_on(daemon.run(shutdown(term, int)));
@@ -345,10 +395,11 @@ mod container {
         ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
     };
 
-    use super::{Cli, Error, cas_client, daemon_within, scratch, serve};
+    use super::{Cli, Error, Node, cas_client, scratch};
 
-    /// Builds the container driver, over the daemon's CAS client, and serves with it.
-    pub(super) fn start(cli: &Cli, tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
+    /// Builds the container driver, over the daemon's CAS client, and adds it to `node`
+    /// with what its leases may use.
+    pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
         // The checks that change nothing come first.
         let scratch = scratch(cli)?;
         let cas = cas_client(cli)?;
@@ -410,7 +461,9 @@ mod container {
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
-        serve(tokio, daemon_within(cli, Arc::new(runtime), capacity)?)
+        node.add(Arc::new(runtime))?;
+        node.capacity = capacity;
+        Ok(())
     }
 
     /// The `--lease-swap-*` flags.
@@ -435,9 +488,9 @@ mod container {
 
 #[cfg(not(target_os = "linux"))]
 mod container {
-    use super::{Cli, Error};
+    use super::{Cli, Error, Node};
 
-    pub(super) fn start(_cli: &Cli, _tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
+    pub(super) fn add(_cli: &Cli, _node: &mut Node) -> Result<(), Error> {
         Err("the container driver runs on Linux only; use --driver native".into())
     }
 }
@@ -496,7 +549,7 @@ mod tests {
             "--xcode-apps=/var/kbf/apps",
         ])
         .expect("flags");
-        assert_eq!(cli.driver, Driver::Native);
+        assert_eq!(cli.drivers, [Driver::Native]);
         let config = native_config(&cli).expect("config");
         assert_eq!(config.scratch, PathBuf::from("/var/kbf/leases"));
         assert_eq!(config.memory.limit(1 << 20), Some((2 << 20) + (64 << 20)));
@@ -836,6 +889,66 @@ mod tests {
             .collect();
         assert_eq!(unsandboxed, Vec::<&str>::new(), "{ran}");
         drop((daemon, reports));
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches: `--driver` taken once only (a node could not run two runtimes), not
+    /// required, a driver given twice set up twice, and the node's own driver set up
+    /// after another (native always comes first).
+    #[test]
+    fn drivers_come_once_each_with_the_nodes_own_first() {
+        let cli = parse(&["--driver=fake", "--driver=native", "--driver=fake"]).expect("flags");
+        assert_eq!(drivers(&cli), [Driver::Native, Driver::Fake]);
+        let cli = parse(&["--driver=fake", "--driver=container"]).expect("flags");
+        assert_eq!(drivers(&cli), [Driver::Container, Driver::Fake]);
+        assert!(parse(&[]).is_err(), "no --driver");
+    }
+
+    /// Catches: a daemon that starts with two drivers serving one lease kind (each
+    /// Start of that kind would run on whichever comes first, silently), and one whose
+    /// refusal does not name both drivers and the kind. Native and fake both serve
+    /// `action`.
+    #[tokio::test]
+    async fn two_drivers_serving_one_kind_refuse_to_start() {
+        let dir = scratch("two-drivers");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = |drivers: &[&str]| {
+            let flags = [
+                "kbf-daemon".to_owned(),
+                "--server=https://127.0.0.1:1".to_owned(),
+                flag("ca-cert", &dir.join("ca.pem")),
+                flag("cert", &dir.join("node.pem")),
+                flag("key", &dir.join("node.key")),
+                "--node-id=mac-1".to_owned(),
+                "--cas=https://127.0.0.1:1".to_owned(),
+                flag("scratch", &dir.join("leases")),
+                flag("xcode-apps", &dir.join("Applications")),
+            ];
+            let drivers = drivers.iter().map(|d| format!("--driver={d}"));
+            Cli::try_parse_from(flags.into_iter().chain(drivers)).expect("flags")
+        };
+        let both = cli(&["fake", "native"]);
+        let native = || {
+            let mut config = native_config(&both)?;
+            // Not the runner's own (on macOS): the start sweeps them.
+            config.user_folders = None;
+            Ok(config)
+        };
+        let why = node(&both, native, &dir.join("no-xcrun"))
+            .err()
+            .expect("two drivers serve action")
+            .to_string();
+        assert_eq!(
+            why,
+            "drivers \"native\" and \"fake\" both serve lease kind action: each kind must \
+             have one driver on a node"
+        );
+        let fakes = cli(&["fake", "fake"]);
+        let (daemon, reports) =
+            node(&fakes, || Err("not native".into()), Path::new("none")).expect("one fake runtime");
+        assert!(reports.is_none());
+        drop(daemon);
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

@@ -29,7 +29,7 @@ What a Linux daemon reports today:
 | `gpu` | NVIDIA and AMD display and 3D controllers | `/sys/bus/pci/devices` (`kbf_caps::gpu`) |
 | `isa_level` (repeated) | **every** level the CPU reaches, lowest first | computed from the features |
 | `cpu.features` (repeated) | every CPU feature flag, in the kernel's names | `/proc/cpuinfo` |
-| `drivers` (repeated) | the execution driver this daemon runs: `container`, `native` or `fake` | `kbf-daemon --driver` |
+| `drivers` (repeated) | every execution driver this daemon runs, one per runtime: `container`, `native` or `fake` | `kbf-daemon --driver`, once per driver |
 | `label.<k>` | an operator's label, `--label k=v` | the daemon's flags |
 
 A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
