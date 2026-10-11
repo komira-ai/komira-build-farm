@@ -959,7 +959,7 @@ impl State {
             (Some(Detail::Ran(pending)), _) => {
                 let Pending { result, record } = *pending;
                 let cacheable =
-                    result.exit_code == 0 && waiters.first().is_some_and(|w| !w.do_not_cache);
+                    false && result.exit_code == 0 && waiters.first().is_some_and(|w| !w.do_not_cache);
                 let write = waiters
                     .first()
                     .filter(|_| cacheable)
