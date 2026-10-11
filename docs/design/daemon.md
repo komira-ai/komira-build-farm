@@ -339,20 +339,27 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   kills it there only when reclaim cannot free enough (swap full, or none). So the
   driver watches each lease (`SwapKill`): every `--lease-swap-poll-ms` (default 1000)
   it reads the lease cgroup's `memory.events` `max` and `memory.swap.current`, and
-  kills the lease (`cgroup.kill`, every process in it) only when all three hold at
-  once: `max` grew since the previous sample (the lease is pressing its own cap now);
-  `memory.swap.current` rose since the previous sample, by any positive amount
-  (reclaim at that cap is still moving it into swap); and `memory.swap.current` is
-  above the larger of `--lease-swap-kill-mib` (default 512) and
-  `--lease-swap-kill-percent` (default 25) of its booking. The floor spares a small
-  action that brushes its cap for a few cold pages; the share scales the margin for
-  large bookings. The previous sample is the last one the driver could read: a sample
-  it cannot read is skipped and changes nothing, and the first is compared with zeros
-  (a new lease cgroup's counts). A lease swapped by host pressure while below its cap
-  counts no `max` events and is never killed by this rule. Nor is a lease that holds
-  swap from earlier (host pressure, or pages read back in that keep their swap slot)
-  and then touches its cap without its swap rising, nor one that booked no memory (no
-  cap).
+  splits the lease's swap into what the lease pushed there itself at its cap and the
+  rest. A rise in swap between two samples across which `max` grew is the lease's own
+  (reclaim at its cap moved it); a rise across which `max` did not grow is not (host
+  pressure, or the `actions/` limit, moved it while the lease was below its cap: a
+  limit above the lease counts no `max` event in it); a fall (pages read back, a
+  process exiting) comes out of the lease's own share first. The split runs over the
+  lease's whole life: a pause in its `max` events does not reset it. The driver kills
+  the lease (`cgroup.kill`, every process in it) when its own share is above the
+  larger of `--lease-swap-kill-mib` (default 512) and `--lease-swap-kill-percent`
+  (default 25) of its booking. The share grows only at a sample where `max` grew and
+  swap rose, so the kill comes only while the lease is pressing its cap into swap.
+  The floor spares a small action that brushes its cap for a few cold pages; the
+  share scales the margin for large bookings. The previous sample is the last one the
+  driver could read: a sample it cannot read is skipped and changes nothing, and the
+  first is compared with zeros (a new lease cgroup's counts). So swap that host
+  pressure moves while a lease is below its cap is never counted against it, even
+  when it later reaches its cap and pushes a few pages more (only those count). Swap
+  that host pressure moves in a sample in which the lease's `max` events also grew
+  counts as the lease's own: the two counters cannot tell them apart, so a lease that
+  sits at its cap (page cache counts toward `memory.max`) can be killed for it.
+  Nor is one that booked no memory (no cap).
   The node's backstop is `memory.max` on `actions/`, set from
   `--actions-memory-max-gib` (or by whoever runs the daemon's unit). Nothing is capped
   when no memory was booked.

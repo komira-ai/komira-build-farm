@@ -361,11 +361,15 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
     });
     // The lease cgroup goes read-only before its `max` events start to grow, and
     // writable again 300 ms later, after the watch's kill and before the grace ends.
-    let script = r#"echo 5000 > "$CG/memory.current"; echo 1048576 > "$CG/memory.swap.current"
+    // The swap goes out while the `max` events grow (from the second step on), so it
+    // is the lease's own at any sampling: swap already out before the cap is pressed
+    // is the host's and kills nothing.
+    let script = r#"echo 5000 > "$CG/memory.current"; echo 0 > "$CG/memory.swap.current"
         printf 'max 0\noom 0\noom_kill 0\n' > "$CG/memory.events"
         chmod a-w "$CG"
         for i in 1 2 3 4 5 6 7 8 9 10; do
-            printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events"; sleep 0.01
+            printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events"
+            [ $i -eq 2 ] && echo 1048576 > "$CG/memory.swap.current"; sleep 0.01
         done
         sleep 0.2; chmod u+w "$CG"; exec sleep 30"#;
     let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;

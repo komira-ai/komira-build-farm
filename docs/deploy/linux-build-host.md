@@ -29,16 +29,20 @@ must not keep. No lease gets `memory.swap.max`, so leases may swap.
 With 128 GB of swap the kernel would kill a lease at its cap only once swap is full,
 long after the build has slowed to a crawl. So the daemon watches each lease: every
 `--lease-swap-poll-ms` (default 1000) it reads the lease's `memory.events` `max` and
-`memory.swap.current`, and kills the whole lease only when, since the last sample it
-could read, its `max` events grew (it is pressing its own cap now) and its
-`memory.swap.current` rose by a positive amount (it is still pushing into swap), and
-it now holds more in swap than the larger of `--lease-swap-kill-mib` (default 512)
-and `--lease-swap-kill-percent` (default 25) of its booking. It reports that kill,
-like the kernel's own OOM kill at the lease's cap, as the action's out-of-memory kill
-(`MEMORY_KILL_OWN_LIMIT`). A job is never killed for host pressure: a lease that host
-pressure moves into swap while it is below its cap counts no `max` events, and a
-lease that holds swap from earlier and then touches its cap without its swap rising
-fails the second condition, so neither is killed by this rule. A kernel OOM kill by
+`memory.swap.current`, and counts as the lease's own only the swap that rose across
+a sample in which its `max` events grew (it was pressing its own cap); a fall comes
+out of that share first. It kills the whole lease when its own share is more than
+the larger of `--lease-swap-kill-mib` (default 512) and `--lease-swap-kill-percent`
+(default 25) of its booking, which can happen only at a sample where it is pushing
+into swap at its cap. It reports that kill, like the kernel's own OOM kill at the
+lease's cap, as the action's out-of-memory kill (`MEMORY_KILL_OWN_LIMIT`). Swap
+that host pressure moves out of a lease while it is below its cap counts no `max`
+events, so it is never the lease's own, even when the lease later reaches its cap and
+pushes a few pages more. One case is not told apart: swap that host pressure moves in
+the same sample in which the lease's `max` events grow counts as the lease's own (the
+two counters the watch reads cannot separate them). A lease that sits at its cap, for
+example one reading many files into page cache, can be killed for such swap once it
+adds up past the threshold. A kernel OOM kill by
 `actions/memory.max` or the host is reported as the node's
 (`MEMORY_KILL_NODE_PRESSURE`).
 
