@@ -90,7 +90,6 @@ trap stop EXIT
 
 # 1. The image: distroless base-debian12, its linux/amd64 manifest (not the index).
 image=gcr.io/distroless/base-debian12@sha256:d2add786f2a5f43d1ab3ae54cd3193de929d0d12c378ff60891921f56f3e47ff
-podman pull -q "$image" >/dev/null
 echo "OK: pulled $image"
 
 # 2. The project copy and its static helper.
