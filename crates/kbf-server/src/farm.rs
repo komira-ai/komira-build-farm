@@ -736,7 +736,8 @@ impl State {
 
     /// Forgets the callers, and their channels, of every finished operation the
     /// scheduler has dropped ([`FarmMachine::forget_dropped`]): a WaitExecution on one
-    /// is NOT_FOUND from now on.
+    /// is NOT_FOUND from now on. Every input ends here, so debug builds check here
+    /// that each caller the machine keeps has one channel and no other caller has.
     fn forget_dropped(&mut self) {
         let sched = &self.sched;
         let forgotten = self
@@ -745,6 +746,11 @@ impl State {
         for id in forgotten {
             self.stages.remove(&id);
         }
+        debug_assert_eq!(
+            self.stages.len(),
+            self.machine.waiters_kept(),
+            "a caller's channel outlives its record, or a record has no channel"
+        );
     }
 
     /// The REAPI name of `operation`, its first waiter's, as the log names it; empty

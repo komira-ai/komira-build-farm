@@ -117,6 +117,11 @@ impl FarmMachine {
         self.waiters.get(&id)
     }
 
+    /// How many callers are kept.
+    pub(crate) fn waiters_kept(&self) -> usize {
+        self.waiters.len()
+    }
+
     /// The REAPI name of the operation caller `id` waits on.
     pub(crate) fn name(&self, id: WaiterId) -> String {
         operation_name(self.term, id)
@@ -372,6 +377,7 @@ mod tests {
         let forgotten = m.forget_dropped(|operation| operation == OperationId(2));
         assert_eq!(forgotten, vec![ids[0], ids[1]]);
         assert_eq!(m.waiter(ids[0]), None);
+        assert_eq!(m.waiters_kept(), 2);
         assert_eq!(m.waiter(ids[3]), Some(&waiter(3)));
         assert_eq!(m.forget_dropped(|_| false), vec![ids[2], ids[3]]);
         assert!(m.waiters.is_empty() && m.finished.is_empty());
