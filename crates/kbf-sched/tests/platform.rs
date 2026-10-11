@@ -144,6 +144,36 @@ fn an_action_goes_only_to_a_worker_that_satisfies_its_platform() {
     );
 }
 
+/// Catches: a device request placed before devices are booked (an unknown property is
+/// ignored, so `ios.device=1` would match every node, Linux included). Until booking
+/// exists the request is refused when it is read; should it ever be read as a request,
+/// a node whose report has no `ios.device` entry must still not be offered it: an old
+/// daemon never reports one, and would run the action with no device.
+#[test]
+fn a_node_without_ios_device_entries_is_never_offered_a_device_lease() {
+    let mut h = Harness::new();
+    h.worker("a-mac", mac());
+    h.worker("b-linux", linux());
+    let platforms: [&[(&str, &str)]; 2] = [
+        &[("ios.device", "1")],
+        &[("OSFamily", "Darwin"), ("ios.device.os", "26.0")],
+    ];
+    for (n, platform) in (1..).zip(platforms) {
+        let Ok(needs) = kbf_caps::Request::from_platform(platform.iter().copied()) else {
+            continue;
+        };
+        h.submit(
+            n,
+            Request {
+                needs,
+                ..request(n, &[])
+            },
+        );
+    }
+    let (grants, _) = h.grants();
+    assert!(grants.is_empty(), "{grants:?}");
+}
+
 /// Catches: an action no live worker satisfies run elsewhere, left queued forever
 /// without a word, refused before the wait is up, or answered before its refusal is
 /// committed. Also: a refused key left in the in-flight table, which would join the

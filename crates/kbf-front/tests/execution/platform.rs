@@ -312,3 +312,47 @@ async fn property_names_are_read_in_any_case() {
     }
     assert_eq!(script.submitted().len(), 1);
 }
+
+/// Catches: an `ios.device` request accepted before the scheduler books devices. An
+/// unknown property is ignored, so `ios.device=1` would match every worker, Linux
+/// included, and a device test would run with no device; so would an attribute key
+/// (`ios.device.os`, `ios.device.os_version`) in any case. Also catches a refusal that
+/// does not name the key, and names that only begin like a device key (`ios.devices`,
+/// `ios.simulator`, `iosx`) refused instead of left alone.
+#[tokio::test]
+async fn ios_device_keys_are_refused_until_devices_are_booked() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    for (key, props) in [
+        (
+            "ios.device",
+            vec![("OSFamily", "darwin"), ("ios.device", "1")],
+        ),
+        ("ios.device.os", vec![("ios.device.os", "26.0")]),
+        (
+            "ios.device.os_version",
+            vec![("IOS.Device.OS_Version", "26.0")],
+        ),
+    ] {
+        let bad = job(key, &props, false);
+        farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &bad.action).await.expect_err(key);
+        assert_eq!(status.code(), Code::InvalidArgument, "{key}: {status:?}");
+        assert!(
+            status.message().contains(&format!("{key:?}")),
+            "{key}: {status:?}"
+        );
+    }
+    assert!(script.submitted().is_empty());
+
+    for name in ["ios.devices", "ios.simulator", "iosx"] {
+        let other = job(name, &[(name, "1")], false);
+        farm.upload(&other.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &other.action).await.expect(name);
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted.len(), 3);
+    for submission in &submitted {
+        assert_eq!(submission.request.needs, kbf_caps::Request::default());
+    }
+}
