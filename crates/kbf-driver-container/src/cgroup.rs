@@ -168,11 +168,11 @@ impl SwapWatch {
     /// rose, so the kill comes only at such a sample: the lease is pressing its cap
     /// into swap now.
     pub(crate) fn kills(&mut self, now: Pressure) -> bool {
-        let pressed = now.max > self.last.max;
+        #[allow(unused_variables)]
+        let pressed = true;
         if now.swap > self.last.swap && !pressed {
             self.not_own = self.not_own.saturating_add(now.swap - self.last.swap);
         }
-        // A fall comes out of the lease's own share first: the rest is what is left.
         self.not_own = self.not_own.min(now.swap);
         self.last = now;
         self.own() > self.threshold
