@@ -319,3 +319,27 @@ pub fn sandbox_denials() -> String {
     lines.dedup();
     format!("sandbox denials:\n{}", lines.join("\n"))
 }
+
+/// Whether the unified log holds, from the last ten minutes, the sandbox's report that
+/// it refused `process` (by name and pid) the operation `what` (`mach-lookup
+/// <service>`): the reason a sandboxed tool failed, not just that it did. Waits up to
+/// [`PROMPT`] for the kernel's report to reach the log.
+pub fn sandbox_denied(process: &str, pid: u32, what: &str) -> bool {
+    let wanted = format!("Sandbox: {process}({pid}) deny(1) {what}");
+    let predicate = format!("eventMessage CONTAINS \"deny(1) {what}\"");
+    let deadline = std::time::Instant::now() + PROMPT;
+    loop {
+        let out = std::process::Command::new("/usr/bin/log")
+            .args(["show", "--last", "10m", "--style", "compact", "--predicate"])
+            .arg(&predicate)
+            .output()
+            .expect("log show");
+        if String::from_utf8_lossy(&out.stdout).contains(&wanted) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
