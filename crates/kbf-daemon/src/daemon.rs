@@ -180,6 +180,8 @@ pub struct Daemon<R> {
     driver: Option<watch::Receiver<DriverReport>>,
     /// Every Xcode the driver's newest report names, ready or not.
     xcodes: Vec<worker::XcodeStatus>,
+    /// The container images `NodeStatus` lists; see [`Self::with_container_images`].
+    container_images: Vec<String>,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases<R>,
     done: mpsc::UnboundedReceiver<Done>,
@@ -248,6 +250,7 @@ impl<R: Runtime> Daemon<R> {
             software: Software::detect(),
             driver: None,
             xcodes: Vec::new(),
+            container_images: Vec::new(),
             events: None,
             leases: Leases::new(runtime, done_tx),
             done,
@@ -291,12 +294,22 @@ impl<R: Runtime> Daemon<R> {
         changed
     }
 
-    /// The `NodeStatus` this node sends now: its software, and every Xcode the
-    /// driver's newest report names, ready or not.
+    /// Lists `images` in every `NodeStatus`, sorted and each once: the container
+    /// images the driver checked present at start. Status only; they route no work.
+    #[must_use]
+    pub fn with_container_images(mut self, images: impl IntoIterator<Item = String>) -> Self {
+        let images: std::collections::BTreeSet<String> = images.into_iter().collect();
+        self.container_images = images.into_iter().collect();
+        self
+    }
+
+    /// The `NodeStatus` this node sends now: its software, every Xcode the driver's
+    /// newest report names, ready or not, and the container images it was given.
     #[must_use]
     pub fn node_status(&self) -> worker::NodeStatus {
         worker::NodeStatus {
             xcodes: self.xcodes.clone(),
+            container_images: self.container_images.clone(),
             ..self.software.status(&self.report)
         }
     }

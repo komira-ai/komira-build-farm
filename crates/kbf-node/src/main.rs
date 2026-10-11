@@ -148,6 +148,15 @@ struct Cli {
     /// installed (`xcodebuild -showComponent MetalToolchain`) is not ready.
     #[arg(long)]
     require_metal_toolchain: bool,
+    /// A container image this node is pinned to, as an action names it:
+    /// `docker://<repo>@sha256:<digest>`, one architecture's manifest digest
+    /// (container; repeatable). At start the daemon checks each is in its user's image
+    /// store, as the prepare step of every lease does, and exits with status 2 if one
+    /// is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`).
+    /// The node's status lists them (`GET /v1/nodes`, `software.container_images`).
+    /// No work is placed by image yet: an action may still name another image.
+    #[arg(long = "image", value_name = "IMAGE")]
+    images: Vec<String>,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
@@ -167,6 +176,38 @@ enum Driver {
 
 type Error = Box<dyn std::error::Error>;
 
+/// The daemon's exit status when an `--image` cannot run on this node.
+const IMAGE_UNUSABLE: u8 = 2;
+
+/// An `--image` this node cannot run: missing from the image store, an index, or not
+/// an image by digest. The daemon exits with [`IMAGE_UNUSABLE`].
+#[derive(Debug)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "only the container driver, Linux-only, checks images"
+    )
+)]
+struct ImageUnusable(String);
+
+impl std::fmt::Display for ImageUnusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "--image: {}", self.0)
+    }
+}
+
+impl std::error::Error for ImageUnusable {}
+
+/// The exit status for an error that stopped the daemon from starting.
+fn exit_code(e: &Error) -> ExitCode {
+    if e.is::<ImageUnusable>() {
+        ExitCode::from(IMAGE_UNUSABLE)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
@@ -177,7 +218,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-daemon: {e}");
-            ExitCode::FAILURE
+            exit_code(&e)
         }
     }
 }
@@ -188,6 +229,9 @@ fn start(cli: &Cli) -> Result<(), Error> {
     let tokio = tokio::runtime::Runtime::new()?;
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
+    if !cli.images.is_empty() && cli.driver != Driver::Container {
+        return Err("--image names container images: only --driver container runs them".into());
+    }
     match cli.driver {
         Driver::Fake => serve(
             &tokio,
@@ -342,10 +386,11 @@ mod container {
     use std::time::Duration;
 
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
+        ContainerLimits, IdFiles, ImageRef, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
     };
 
-    use super::{Cli, Error, cas_client, daemon_within, scratch, serve};
+    use super::{Cli, Error, ImageUnusable, cas_client, daemon_within, scratch, serve};
+    use kbf_daemon::CasClient;
 
     /// Builds the container driver, over the daemon's CAS client, and serves with it.
     pub(super) fn start(cli: &Cli, tokio: &tokio::runtime::Runtime) -> Result<(), Error> {
@@ -410,7 +455,28 @@ mod container {
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
-        serve(tokio, daemon_within(cli, Arc::new(runtime), capacity)?)
+        tokio.block_on(check_images(&runtime, &cli.images))?;
+        let daemon = daemon_within(cli, Arc::new(runtime), capacity)?
+            .with_container_images(cli.images.iter().cloned());
+        serve(tokio, daemon)
+    }
+
+    /// Checks each `--image` as a lease's prepare step would: named by digest, in this
+    /// node's image store, one architecture's manifest. The first that is not stops the
+    /// start, with its fix.
+    async fn check_images(
+        runtime: &PodmanRuntime<CasClient>,
+        images: &[String],
+    ) -> Result<(), ImageUnusable> {
+        for value in images {
+            let image = ImageRef::parse(value).map_err(|e| ImageUnusable(e.to_string()))?;
+            runtime
+                .check_pinned(&image)
+                .await
+                .map_err(|e| ImageUnusable(e.to_string()))?;
+            tracing::info!("image {image}: in this node's image store");
+        }
+        Ok(())
     }
 
     /// The `--lease-swap-*` flags.

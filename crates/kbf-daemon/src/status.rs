@@ -70,6 +70,8 @@ impl Software {
                 .collect(),
             // The driver's, which the daemon adds (`DriverReport`).
             xcodes: Vec::new(),
+            // The daemon's own (`Daemon::with_container_images`).
+            container_images: Vec::new(),
         }
     }
 }

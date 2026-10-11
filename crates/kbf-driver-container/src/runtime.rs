@@ -40,7 +40,9 @@ use tokio::process::Child;
 use tokio::sync::oneshot;
 
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
+use crate::image::{
+    ImageCheckError, ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind,
+};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
@@ -441,34 +443,41 @@ impl<C: Cas> PodmanRuntime<C> {
     /// Checks that this node's image store holds `image` and that its digest names one
     /// image, not an index: by reading the manifest the store keeps under that digest.
     async fn check_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        self.check_pinned(image).await.map_err(|e| match e {
+            ImageCheckError::Index(_) => RuntimeError::Invalid(e.to_string()),
+            ImageCheckError::Missing(_) | ImageCheckError::Failed(_) => {
+                RuntimeError::Failed(e.to_string())
+            }
+        })
+    }
+
+    /// Checks, as each lease's prepare step does, that this node's image store holds
+    /// `image` and that its digest names one architecture's manifest, not an index. The
+    /// daemon checks each image it is pinned to (`--image`) once at start with it.
+    pub async fn check_pinned(&self, image: &ImageRef) -> Result<(), ImageCheckError> {
         let Some(id) = self
             .podman
             .image_id(&image.to_string())
             .await
-            .map_err(RuntimeError::Failed)?
+            .map_err(ImageCheckError::Failed)?
         else {
-            return Err(RuntimeError::Failed(format!(
-                "image {image} is not in this node's image store"
-            )));
+            return Err(ImageCheckError::Missing(image.clone()));
         };
         let images = self
             .images
             .get_or_try_init(|| self.podman.images_dir())
             .await
-            .map_err(RuntimeError::Failed)?;
+            .map_err(ImageCheckError::Failed)?;
         let path = images.join(&id).join(manifest_file(image.digest()));
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            RuntimeError::Failed(format!(
+            ImageCheckError::Failed(format!(
                 "the image store holds no manifest {} for image {id}: {e}",
                 image.digest()
             ))
         })?;
-        match manifest_kind(&bytes, image.digest()).map_err(RuntimeError::Failed)? {
+        match manifest_kind(&bytes, image.digest()).map_err(ImageCheckError::Failed)? {
             ManifestKind::Image => Ok(()),
-            ManifestKind::Index => Err(RuntimeError::Invalid(format!(
-                "container-image {image} names an image index; name the per-architecture \
-                 manifest digest"
-            ))),
+            ManifestKind::Index => Err(ImageCheckError::Index(image.clone())),
         }
     }
 

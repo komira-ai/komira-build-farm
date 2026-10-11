@@ -137,6 +137,7 @@ module), and the server shows it in `GET /v1/nodes` ([api.md](../api.md#get-v1no
 | `daemon_version` | the `kbf-daemon` version | the same |
 | `xcode_builds` | the report's `xcode` entries (the ready Xcodes), sorted | empty |
 | `xcodes` | every installed Xcode: app, build, state (`ready` or why not), reason, fix command | empty |
+| `container_images` | empty | the `--image` values (container driver), sorted, each checked present at start ([daemon.md](daemon.md#the-container-driver)); no work is placed by image |
 
 A field that cannot be read is empty; status never stops a node from joining.
 

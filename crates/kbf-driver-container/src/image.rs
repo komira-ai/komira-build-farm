@@ -85,6 +85,23 @@ impl fmt::Display for ImageRef {
     }
 }
 
+/// Why this node cannot run an image named by digest.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ImageCheckError {
+    /// The node's image store does not hold it. Nodes never pull at action time; the
+    /// daemon's user pulls it once, by digest.
+    #[error(
+        "image {0} is not in this node's image store; as the daemon's user, run: podman pull {0}"
+    )]
+    Missing(ImageRef),
+    /// Its digest names an image index (a multi-architecture list).
+    #[error("container-image {0} names an image index; name the per-architecture manifest digest")]
+    Index(ImageRef),
+    /// Podman could not be asked, or the store cannot vouch for the manifest.
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// What a manifest digest names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestKind {

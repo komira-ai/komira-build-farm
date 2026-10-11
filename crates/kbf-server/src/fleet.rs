@@ -90,6 +90,9 @@ pub struct SoftwareView {
     pub xcode_builds: Vec<String>,
     /// Every installed Xcode, ready or not (Mac; empty from a daemon that predates it).
     pub xcodes: Vec<XcodeView>,
+    /// The container images the node checked present at its start (`--image`),
+    /// sorted. Status only: no work is placed by image.
+    pub container_images: Vec<String>,
     /// When the server received it: milliseconds since the Unix epoch, server clock.
     pub received_at_unix_ms: u64,
 }
@@ -175,6 +178,7 @@ impl SoftwareView {
             daemon_version: status.daemon_version,
             xcode_builds: status.xcode_builds,
             xcodes: status.xcodes.into_iter().map(XcodeView::new).collect(),
+            container_images: status.container_images,
             received_at_unix_ms,
         }
     }

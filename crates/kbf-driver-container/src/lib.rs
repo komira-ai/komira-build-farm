@@ -70,7 +70,7 @@ pub mod tree;
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
-pub use image::{ImageError, ImageRef};
+pub use image::{ImageCheckError, ImageError, ImageRef};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};
 pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};

@@ -129,6 +129,12 @@ message NodeStatus {
   // ready and how to make it so (issue #164). Empty from a daemon that predates this
   // field, and on Linux. The daemon sends NodeStatus again when this changes.
   repeated XcodeStatus xcodes = 7;
+  // The container images the daemon was pinned to (`--image`, container driver), as
+  // `docker://<repo>@sha256:<digest>`, sorted, each checked present in the node's
+  // image store, as one architecture's manifest, when the daemon started. A daemon that
+  // finds one missing does not start. Status only: no work is placed by image. Empty
+  // when none is pinned, and from a daemon that predates this field.
+  repeated string container_images = 8;
 }
 
 // One Xcode installed on a Mac, as the daemon last found it.

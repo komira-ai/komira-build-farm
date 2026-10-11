@@ -254,6 +254,19 @@ never reused. Each lease goes through six steps.
 5. **Clean.** Remove the container, the lease cgroup and the scratch directory.
 6. **Verify clean.** Neither directory may remain.
 
+**Pinned images.** `kbf-daemon --driver container --image docker://<repo>@sha256:<d>`
+(repeatable) names images the node is set up to run. At start, after its cgroup is
+set up and before it connects, the daemon checks each as the prepare step checks a
+lease's image (`PodmanRuntime::check_pinned`): named by digest, in its user's image
+store, and one architecture's manifest. The first that is not stops the daemon with
+exit status 2 and the fix: for a missing image, `podman pull <repo>@sha256:<d>`, to
+run as the daemon's user; for an index digest, to name the per-architecture manifest
+digest. The images are listed, sorted and each once, in the node's `NodeStatus`
+(`container_images`), which `GET /v1/nodes` shows as `software.container_images`. They
+route no work: placement does not match an action's image against them, and an action
+may still name an image the node was not pinned to (it is checked at prepare as
+always). Another driver given `--image` refuses to start (exit status 1).
+
 Cleaning runs on every path out of a lease: success, failure, timeout and kill. If the
 daemon drops a lease's future instead, the lease's destructor cleans up before the
 future is gone. A clean that fails turns the lease into a failure: a dirty node must be

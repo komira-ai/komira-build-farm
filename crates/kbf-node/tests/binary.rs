@@ -520,8 +520,9 @@ fn id_files(name: &str, count: &str) -> PathBuf {
 }
 
 /// Catches: a driver started without what it needs (a plain-text `--cas` among
-/// them), or a configuration error that does not stop the daemon with a message and a
-/// non-zero exit.
+/// them), a configuration error that does not stop the daemon with a message and a
+/// non-zero exit, and an `--image` that a driver other than the container driver
+/// takes and ignores (the node would list images no lease of it can run).
 #[test]
 fn a_driver_missing_its_flags_refuses_to_start() {
     let dir = tls("refused");
@@ -542,6 +543,17 @@ fn a_driver_missing_its_flags_refuses_to_start() {
                 scratch.clone(),
             ],
             "must be an https:// URL",
+        ),
+        (
+            vec![
+                "--driver=native".into(),
+                format!("--image={}", image_by("0")),
+            ],
+            "only --driver container runs them",
+        ),
+        (
+            vec!["--driver=fake".into(), format!("--image={}", image_by("0"))],
+            "only --driver container runs them",
         ),
         (
             vec!["--driver=container".into(), scratch.clone()],
@@ -847,4 +859,168 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "the lease directory was still there at Hello:\n{log}"
     );
     assert!(status.success(), "{status}: {log}");
+}
+
+/// The per-architecture manifest the stub's image store holds for a pinned image.
+#[cfg(target_os = "linux")]
+const MANIFEST: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+/// An image index (a multi-architecture list).
+#[cfg(target_os = "linux")]
+const INDEX: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+
+/// `--image`'s value for the busybox image whose manifest is `bytes`.
+#[cfg(target_os = "linux")]
+fn image_of(bytes: &[u8]) -> String {
+    image_by(&kbf_daemon::cas::digest_of(bytes).hash)
+}
+
+/// `--image`'s value for the busybox image with manifest digest `sha256:<hex>`.
+fn image_by(hex: &str) -> String {
+    format!("docker://registry.test/tools/busybox@sha256:{hex}")
+}
+
+/// Puts `bytes` in the stub's image store (see `fixtures/podman-stub.sh`) as image
+/// `img1`'s manifest, under the digest of `bytes`, and makes the stub know `img1`.
+#[cfg(target_os = "linux")]
+fn store_manifest(bin: &Path, bytes: &[u8]) {
+    let digest = format!("sha256:{}", kbf_daemon::cas::digest_of(bytes).hash);
+    let dir = bin.join("store/img1");
+    std::fs::create_dir_all(&dir).expect("mkdir store");
+    let file = kbf_driver_container::image::manifest_file(&digest);
+    std::fs::write(dir.join(file), bytes).expect("write manifest");
+    std::fs::write(bin.join("image-id"), "img1\n").expect("image id");
+}
+
+/// The container driver's flags for the daemon in `dir`, against the server `base`
+/// names, with a delegated stand-in cgroup and `--image` once per entry of `images`.
+#[cfg(target_os = "linux")]
+fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
+    let (_, cgroup_flags) = cgroup_tree(dir, "cpu memory pids");
+    let mut flags = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", dir.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+    ];
+    flags.extend(cgroup_flags);
+    flags.extend(images.iter().map(|i| format!("--image={i}")));
+    flags
+}
+
+/// Catches a container node that starts while an image it is pinned to (`--image`)
+/// cannot run on it, instead of exiting with status 2 and the fix: an image missing
+/// from its store started anyway (warned about and continued), its refusal without the
+/// `podman pull <repo>@sha256:<digest>` that fixes it, an image index digest taken for
+/// one architecture's manifest (`manifest_kind` not asked), and a tag accepted. Each
+/// daemon still running after 30 s has started, and fails the test. Linux only, as
+/// the driver is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
+    let ids = id_files("image-refused-ids", "65536");
+    let digest = kbf_daemon::cas::digest_of(MANIFEST).hash;
+    let tagged = format!("docker://registry.test/tools/busybox:1@sha256:{digest}");
+    // (name, the image, what the stub's store holds, what the refusal says)
+    let cases: [(&str, String, Option<&[u8]>, String); 3] = [
+        (
+            "image-missing",
+            image_of(MANIFEST),
+            None,
+            format!("podman pull registry.test/tools/busybox@sha256:{digest}"),
+        ),
+        (
+            "image-index",
+            image_of(INDEX),
+            Some(INDEX),
+            "names an image index; name the per-architecture manifest digest".to_owned(),
+        ),
+        (
+            "image-tag",
+            tagged,
+            Some(MANIFEST),
+            "names a tag".to_owned(),
+        ),
+    ];
+    for (name, image, stored, says) in cases {
+        let dir = tls(name);
+        let (bin, _) = podman_stub(&format!("{name}-bin"));
+        if let Some(bytes) = stored {
+            store_manifest(&bin, bytes);
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let log = dir.join("daemon.log");
+        let mut child = Command::new(BIN)
+            .env("PATH", path)
+            .args(base(&dir))
+            .args(container_flags(&dir, &ids, &[image]))
+            .stderr(std::fs::File::create(&log).expect("log file"))
+            .spawn()
+            .expect("spawn");
+        let status = refused_within(&mut child, name, &log);
+        let log = read(&log);
+        assert_eq!(status.code(), Some(2), "{name}: {log}");
+        assert!(log.contains(&says), "{name}: {log}");
+        assert!(
+            !log.contains(FIRST_ATTEMPT),
+            "{name}: it tried a session: {log}"
+        );
+    }
+}
+
+/// Catches the images a container node is pinned to (`--image`) missing from the
+/// `NodeStatus` it sends after the Welcome (`GET /v1/nodes` would not show what the
+/// node can run), listed unsorted or more than once, and a node whose images are all
+/// in its store, as manifests, refusing to start. Given out of order, one of them
+/// twice.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_node_lists_its_pinned_images_in_its_status() {
+    let dir = tls("image-listed");
+    let front = front::Front::start(&dir);
+    let ids = id_files("image-listed-ids", "65536");
+    let (bin, _) = podman_stub("image-listed-bin");
+    let other = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+    store_manifest(&bin, MANIFEST);
+    store_manifest(&bin, other);
+    let mut images = [image_of(MANIFEST), image_of(other)];
+    images.sort();
+    let given = [images[1].clone(), images[0].clone(), images[1].clone()];
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let log = dir.join("daemon.log");
+    let mut flags = vec![
+        format!("--server=https://127.0.0.1:{}", front.worker.port()),
+        "--tls-server-name=localhost".to_owned(),
+        format!("--ca-cert={}", dir.join("ca.pem").display()),
+        format!("--cert={}", dir.join("node.pem").display()),
+        format!("--key={}", dir.join("node.key").display()),
+        "--node-id=node-1".to_owned(),
+    ];
+    flags.extend(container_flags(&dir, &ids, &given));
+    let mut child = Command::new(BIN)
+        .env("PATH", path)
+        .args(flags)
+        .stderr(std::fs::File::create(&log).expect("log file"))
+        .spawn()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    let status = session.next(PROMPT);
+    let stopped = stop(&mut child, libc::SIGTERM);
+    let log = read(&log);
+    let Some(kbf_proto::worker::daemon_message::Message::NodeStatus(status)) = status else {
+        panic!("expected a NodeStatus, got {status:?}: {log}");
+    };
+    assert_eq!(status.container_images, images, "{log}");
+    assert!(stopped.success(), "{stopped}: {log}");
 }
