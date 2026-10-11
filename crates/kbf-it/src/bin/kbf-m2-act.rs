@@ -194,6 +194,20 @@ mod tests {
         ));
     }
 
+    /// Catches: `pause` or `hog` that writes nothing, or writes other than its salt or
+    /// size (the sample's outputs, and run.sh's check of `//:hog`'s, would differ).
+    #[test]
+    fn pause_and_hog_write_their_salt_and_size() {
+        let dir = std::env::temp_dir().join(format!("kbf-m2-act-ph-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let out = dir.join("out").display().to_string();
+        run(&args(&["pause", &out, "0", "a-salt"])).expect("pause");
+        assert_eq!(std::fs::read(&out).expect("out"), b"a-salt\n");
+        run(&args(&["hog", &out, "16"])).expect("hog");
+        assert_eq!(std::fs::read(&out).expect("out"), b"16\n");
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
     /// Catches: a xorshift step that returns its input or zero (every page the hog
     /// touches would be the same, so a kernel could share or compress them and the
     /// lease would never pass its cap).

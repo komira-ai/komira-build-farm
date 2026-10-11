@@ -38,7 +38,7 @@ impl Write for SharedLog {
 }
 
 /// Installs the subscriber that writes to [`LOG`], once.
-fn capture() {
+pub(crate) fn capture() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         let subscriber = tracing_subscriber::fmt()
@@ -51,7 +51,7 @@ fn capture() {
 }
 
 /// The logged lines that contain every one of `parts`.
-fn lines_with(parts: &[&str]) -> Vec<String> {
+pub(crate) fn lines_with(parts: &[&str]) -> Vec<String> {
     let log = LOG.lock().unwrap_or_else(PoisonError::into_inner);
     String::from_utf8_lossy(&log)
         .lines()

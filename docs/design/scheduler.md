@@ -331,7 +331,7 @@ to the scheduler's outcome and to what callers see:
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
 | not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again with double the memory below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
 | not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, twice | after the reruns, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
-| anything else | `Failed(Infra)` | `INTERNAL` | not written |
+| anything else | `Failed(Infra)` | `INTERNAL`: "the farm could not run the action"; the daemon's reason goes only to the server's log, a WARN `lease failed` line with the lease, the node, the code and the reason | not written |
 | (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
 
 A run that exits non-zero (a failing test) is still `Completed`: callers get its
