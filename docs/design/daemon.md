@@ -392,9 +392,9 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 
 The `m2-container` CI job (`tools/ci/m2-container.sh`, then `crates/kbf-it/m2/run.sh`)
 runs the driver behind the real server and a real client, on a hosted x86_64 runner.
-It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the
-`container_image` value of `crates/kbf-it/m2/buck2/.buckconfig`, which the sample's
-execution platform passes on as `container-image`), starts one `kbf-server` and one
+It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
+`crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
+its execution platform passes on as `container-image`), starts one `kbf-server` and one
 `kbf-daemon --driver container` as a `Delegate=yes` system service with
 `--actions-memory-max-gib 8`, and builds the sample project with pinned buck2:
 

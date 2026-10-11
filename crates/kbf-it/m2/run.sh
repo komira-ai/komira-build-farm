@@ -10,9 +10,11 @@
 # lease cgroup under `actions` for each container.
 #
 # What is checked, in order; any failure exits non-zero after printing the cell's logs:
-# 1. The image `container_image` in m2/buck2/.buckconfig names is pulled, by its
-#    linux/amd64 manifest digest, into this user's image store before the daemon
-#    starts (nodes never pull at action time).
+# 1. The image is pulled, by its linux/amd64 manifest digest, into this user's image
+#    store before the daemon starts (nodes never pull at action time). As on a farm,
+#    the node's pre-pull ($image below) and the client's `container-image` (the
+#    `container_image` value in m2/buck2/.buckconfig) are separate settings: a
+#    client that names no image, or one the node did not pull, fails its build.
 # 2. The sample project (a copy, with the static `kbf-m2-act` from --bin-dir in
 #    tools/) is built remote-only, cleaned, and built again; `kbf-cell check` then
 #    requires that the first build ran every action on the farm and the second
@@ -36,7 +38,7 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-bin_dir='' work='' buck2='' build_timeout=600
+bin_dir='' work='' buck2='' build_timeout=300
 while [ $# -gt 0 ]; do
     case $1 in
         --bin-dir) bin_dir=$2 ;;
@@ -86,14 +88,10 @@ stop() {
 }
 trap stop EXIT
 
-# 1. The image, from the project's .buckconfig (the one value the actions name).
-image=$(sed -n 's/^ *container_image *= *//p' "$here/buck2/.buckconfig")
-case $image in
-docker://*@sha256:*) ;;
-*) echo "FAIL: .buckconfig names no container_image by digest: '$image'" >&2; exit 1 ;;
-esac
-podman pull -q "${image#docker://}" >/dev/null
-echo "OK: pulled ${image#docker://}"
+# 1. The image: distroless base-debian12, its linux/amd64 manifest (not the index).
+image=gcr.io/distroless/base-debian12@sha256:d2add786f2a5f43d1ab3ae54cd3193de929d0d12c378ff60891921f56f3e47ff
+podman pull -q "$image" >/dev/null
+echo "OK: pulled $image"
 
 # 2. The project copy and its static helper.
 [ ! -e "$project" ] || { echo "run.sh: $project exists; give a fresh --work" >&2; exit 2; }
