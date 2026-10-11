@@ -3,7 +3,11 @@
 //! a restart, and one that stops being ready (an update whose new licence is not
 //! accepted) stops being advertised (issue #164).
 //!
-//! [`watch`] returns at once, without asking anything: what it hands the daemon first
+//! [`watch`] sends what it reports through its part ([`SOURCE`]) of the daemon's driver
+//! watch ([`kbf_daemon::DriverWatch`]), so another source's part (the iOS devices,
+//! later) never overwrites the Xcodes' entries, nor they its.
+//!
+//! [`watch`] returns at once, without asking anything: what it sends the daemon first
 //! is every Xcode found in the directory as not surveyed yet ([`xcode::not_surveyed`]),
 //! none ready, so the daemon says `Hello` at once and advertises no Xcode. On a thread
 //! of its own it then surveys the Xcodes, at once and again every `every`; a survey can
@@ -26,8 +30,7 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use kbf_daemon::DriverReport;
-use tokio::sync::watch;
+use kbf_daemon::{DriverPart, DriverReport};
 
 use crate::xcode::{self, Probe, State, Xcode};
 
@@ -36,30 +39,34 @@ use crate::xcode::{self, Probe, State, Xcode};
 /// each under the sandbox) cost little.
 pub const EVERY: Duration = Duration::from_secs(180);
 
+/// The name of the Xcodes' part of the daemon's driver watch.
+pub const SOURCE: &str = "xcode";
+
 /// What [`watch`] calls with each survey that differs from the last: makes its ready
 /// Xcodes the ones actions may name and returns what the daemon reports.
 pub type Apply = Box<dyn Fn(&[Xcode]) -> DriverReport + Send>;
 
 /// Applies the Xcodes in `apps` as not surveyed yet, then, on a thread of its own,
 /// surveys them as `probe` says at once and every `every` after, applying each survey
-/// that differs from the last (see the module documentation). Returns what to hand the
-/// daemon, and the thread, which ends before its next survey once every receiver is
-/// gone.
+/// that differs from the last (see the module documentation). Sends each application's
+/// report through `part`. Returns the thread, which ends before its next survey once
+/// every receiver of the daemon's channel is gone.
 #[must_use]
 pub fn watch(
+    part: DriverPart,
     apps: PathBuf,
     probe: Probe,
     every: Duration,
     apply: Apply,
-) -> (watch::Receiver<DriverReport>, JoinHandle<()>) {
+) -> JoinHandle<()> {
     let mut last = xcode::not_surveyed(&apps);
     tracing::info!(
         apps = %apps.display(),
         found = last.len(),
         "Xcodes not surveyed yet: surveying in the background"
     );
-    let (send, receive) = watch::channel(apply(&last));
-    let thread = std::thread::spawn(move || {
+    part.send(apply(&last));
+    std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let mut now = xcode::survey(&apps, &probe);
         let took = started.elapsed();
@@ -67,17 +74,16 @@ pub fn watch(
         loop {
             if !same(&last, &now) {
                 log(&changes(&last, &now));
-                send.send_replace(apply(&now));
+                part.send(apply(&now));
                 last = now;
             }
             std::thread::sleep(every);
-            if send.is_closed() {
+            if part.is_closed() {
                 return;
             }
             now = xcode::survey(&apps, &probe);
         }
-    });
-    (receive, thread)
+    })
 }
 
 /// Whether a change wants a human (`WARN`) or is news (`INFO`), and what it says.
@@ -149,14 +155,46 @@ fn log(changes: &[Change]) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
+    use kbf_daemon::DriverWatch;
     use kbf_proto::worker::XcodeState;
+    use tokio::sync::watch;
 
     use super::*;
     use crate::xcode::tests::{NOT_AGREED, fake, link_xcodebuild, scratch};
+
+    /// [`super::watch`] as the node starts it, its part the only one of its driver
+    /// watch: returns what the daemon takes, and the thread. The tests below read the
+    /// daemon's channel as one that starts with the not-surveyed report already seen,
+    /// so the thread's first application waits until that report is marked seen (the
+    /// thread could otherwise send its first survey before, and the mark would hide
+    /// it).
+    fn watch(
+        apps: PathBuf,
+        probe: Probe,
+        every: Duration,
+        apply: Apply,
+    ) -> (watch::Receiver<DriverReport>, JoinHandle<()>) {
+        let (driver, mut reports) = DriverWatch::new();
+        let part = driver.part(SOURCE).expect("the xcode part");
+        let (seen, wait) = std::sync::mpsc::channel::<()>();
+        let applied = Cell::new(0);
+        let gated: Apply = Box::new(move |xcodes| {
+            applied.set(applied.get() + 1);
+            if applied.get() == 2 {
+                let _ = wait.recv();
+            }
+            apply(xcodes)
+        });
+        let thread = super::watch(part, apps, probe, every, gated);
+        reports.borrow_and_update();
+        let _ = seen.send(());
+        (reports, thread)
+    }
 
     /// The next report the watch sends, waited for up to 20 s.
     fn next(reports: &mut watch::Receiver<DriverReport>) -> DriverReport {

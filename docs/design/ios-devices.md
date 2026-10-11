@@ -340,12 +340,15 @@ restart) is issue #189.
   a state file, written atomically. A device that disappears is `gone`, with an
   attention item, until it returns or an operator runs `kbf-node device forget <id>`.
   A state file that does not parse is itself an attention item; the daemon starts.
-- In PR #173 the driver report is one watch channel whose only producer is the Xcode
-  watch, and its payload holds the whole report's driver entries. A second producer
-  would overwrite the first's entries, and a device's state depends on which Xcodes
-  are ready. So the device survey and the Xcode survey become one driver watch, or
-  that channel is split into one part per source. If PR #173 changes in review, this
-  section follows it.
+- The driver report is one channel to the daemon with one part per source
+  (`DriverWatch`, `crates/kbf-daemon/src/driver_watch.rs`). The Xcode watch sends
+  through the part named `xcode`; the device survey will take a part of its own. A
+  part's send replaces that part's report alone, and the daemon gets the merge of every
+  part's newest report (entries and Xcodes, part by part in the order of the sources'
+  names), so a device change never drops an Xcode's entry or its attention item, nor
+  an Xcode change a device's. A source has at most one part. A device's state still
+  depends on which Xcodes are ready: the device survey is to read that from the native
+  runtime's ready Xcodes, not from the channel.
 
 ## 8. The lease lifecycle
 
@@ -433,7 +436,7 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 
 ## 12. Phased plan
 
-All planned; each is its own pull request.
+All planned but the driver watch; each is its own pull request.
 
 | Phase | What | Needs |
 |---|---|---|
@@ -441,7 +444,7 @@ All planned; each is its own pull request.
 | D1 | Probe kit: P-D0 and P-D1 fixtures, with a lint that refuses a fixture carrying a real-looking UDID, ECID, serial, CoreDevice id or device name | a device and a person (P-D1) |
 | D1 | Sandbox rule: leases without a device cannot reach CoreDevice or `usbmuxd`; tested on the hosted macOS runner | none |
 | D2 | Survey parser in `kbf-driver-native`: `devicectl` JSON to device states, tested against the D1 fixtures | D1 |
-| D2 | One driver watch for Xcodes and devices (generalizes PR #173's channel) | PR #173 |
+| D2 | One driver watch for Xcodes and devices, a part per source: done, the Xcodes' part only ([section 7.5](#75-recover)) | PR #173 |
 | D2 | `NodeStatus.devices`, attention lines, the state file, `forget` and `release`, `Hello` resent on change | the watch |
 | D3 | `kbf-caps` device matching (one device satisfies every key) with scheduler booking and `Start.device_id`, landed together, then the front's refusals and messages | none |
 | D3 | Device lease runtime: precheck, baseline, run, cleanup, quarantine, audit | D2, D3, P-D3, P-D4 |
