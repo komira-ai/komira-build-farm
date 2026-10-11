@@ -57,7 +57,7 @@ pub const MEMORY_FLOORS: usize = 65_536;
 #[must_use]
 pub fn raised(booked: u64, cap: u64) -> Option<u64> {
     (booked < cap).then(|| {
-        let doubled = booked.saturating_mul(2).max(GIB);
+        let doubled = booked.max(GIB);
         doubled.div_ceil(GIB).saturating_mul(GIB).min(cap)
     })
 }
