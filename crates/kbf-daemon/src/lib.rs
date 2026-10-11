@@ -15,6 +15,7 @@
 //!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
+//! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`cas`]: the [`Cas`] trait and the front's client.
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
@@ -34,6 +35,7 @@ pub mod config;
 pub mod connect;
 mod contact;
 mod daemon;
+pub mod driver_watch;
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;
@@ -55,6 +57,7 @@ pub use cas::{Cas, CasClient, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{Args, DaemonConfig, FENCE_AFTER, RECHECK_EVERY, TlsFiles};
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError};
+pub use driver_watch::{DriverPart, DriverWatch};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use report::{Capacity, NodeReport};

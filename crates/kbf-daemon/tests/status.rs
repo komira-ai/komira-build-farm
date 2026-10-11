@@ -4,8 +4,8 @@ mod support;
 
 use std::time::Duration;
 
-use kbf_daemon::DriverReport;
 use kbf_daemon::status::{Software, linux_software};
+use kbf_daemon::{DriverReport, DriverWatch};
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus, daemon_message};
 use support::{Harness, PROMPT, Peer, scratch};
 use tokio::sync::watch;
@@ -219,4 +219,76 @@ async fn a_driver_report_change_resends_hello_and_status() {
     // A gone driver ends nothing: the stream goes on.
     peer.heartbeat().await;
     peer.heartbeat().await;
+}
+
+/// The capability entries of a Hello under `key`.
+fn entries(m: &daemon_message::Message, key: &str) -> Vec<String> {
+    let daemon_message::Message::Hello(hello) = m else {
+        panic!("expected a Hello: {m:?}");
+    };
+    hello
+        .capabilities
+        .iter()
+        .filter(|c| c.key == key)
+        .map(|c| c.value.clone())
+        .collect()
+}
+
+/// Catches (`docs/design/ios-devices.md` section 7.5): with two sources feeding the
+/// driver report (the Xcode survey and a second one, here a fake device survey), one
+/// source's change replacing the whole report, so the resent Hello loses the other's
+/// entries (placement no longer sees that Xcode build, or that device); and the
+/// second source's change dropping the first's Xcodes from `NodeStatus`, so the server
+/// takes the not-ready Xcode as gone and clears its attention item while it is still
+/// not ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_driver_sources_share_the_hello_and_the_status() {
+    let (watch, reports) = DriverWatch::new();
+    let xcodes = watch.part("xcode").expect("the xcode part");
+    let devices = watch.part("devices").expect("the devices part");
+    let ready = xcode("16B40", XcodeState::Ready, "");
+    let licence = xcode("17A1", XcodeState::LicenseNotAccepted, "not agreed");
+    xcodes.send(driver(&["16B40"], vec![ready.clone(), licence.clone()]));
+    let mut h = Harness::with_driver("driver-parts", reports).await;
+    let mut peer = h.session().await;
+    let first = daemon_message::Message::Hello(peer.hello().await);
+    assert_eq!(entries(&first, "xcode"), ["16B40"]);
+    peer.welcome();
+    let before = status(next(&mut peer).await);
+    assert_eq!(before.xcodes, [ready.clone(), licence.clone()]);
+
+    let phone = "00008110-001A";
+    devices.send(DriverReport {
+        entries: vec![("ios.device".to_owned(), phone.to_owned())],
+        xcodes: Vec::new(),
+    });
+    let resent = next(&mut peer).await.expect("a resent Hello");
+    assert_eq!(entries(&resent, "ios.device"), [phone], "{resent:?}");
+    assert_eq!(
+        entries(&resent, "xcode"),
+        ["16B40"],
+        "the Xcode's entry kept"
+    );
+    let after = status(next(&mut peer).await);
+    assert_eq!(
+        after.xcodes,
+        [ready.clone(), licence.clone()],
+        "the not-ready Xcode, which the server raises, kept"
+    );
+
+    // The licence is accepted: the Xcode part changes alone.
+    let accepted = xcode("17A1", XcodeState::Ready, "");
+    xcodes.send(driver(
+        &["16B40", "17A1"],
+        vec![ready.clone(), accepted.clone()],
+    ));
+    let resent = next(&mut peer).await.expect("a resent Hello");
+    assert_eq!(entries(&resent, "xcode"), ["16B40", "17A1"]);
+    assert_eq!(
+        entries(&resent, "ios.device"),
+        [phone],
+        "the device's entry kept"
+    );
+    assert_eq!(status(next(&mut peer).await).xcodes, [ready, accepted]);
+    peer.close();
 }

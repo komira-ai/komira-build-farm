@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use kbf_daemon::{
-    Args, Capacity, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, FakeRuntime, NodeReport,
-    Runtime,
+    Args, Capacity, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime,
+    NodeReport, Runtime,
 };
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -260,13 +260,25 @@ fn native_with(
         }
         report
     };
+    // One part per survey, so none overwrites another's entries; the Xcodes' is the
+    // only one yet.
+    let (driver, reports) = DriverWatch::new();
+    let xcodes = driver
+        .part(xcode_watch::SOURCE)
+        .ok_or("the Xcode part of the driver watch is taken")?;
     // Returns at once: the survey runs on the watch's thread.
-    let (driver, _) = xcode_watch::watch(cli.xcode_apps.clone(), probe, every, Box::new(apply));
-    let daemon = daemon(cli, runtime)?.with_driver_report(driver.clone());
-    Ok((daemon, driver))
+    let _ = xcode_watch::watch(
+        xcodes,
+        cli.xcode_apps.clone(),
+        probe,
+        every,
+        Box::new(apply),
+    );
+    let daemon = daemon(cli, runtime)?.with_driver_report(reports.clone());
+    Ok((daemon, reports))
 }
 
-/// What the native driver's Xcode watch sends the daemon.
+/// What the native driver's surveys send the daemon, merged.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
 /// Runs `daemon` until SIGTERM or SIGINT.
