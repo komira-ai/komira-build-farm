@@ -16,7 +16,7 @@ pub const EXEC_ROOT: &str = "/kbf/root";
 /// The label naming the daemon a container belongs to: every container is created with
 /// `kbf.owner=<owner>` ([`crate::PodmanConfig::owner`]), so the next daemon on the
 /// node finds what its predecessor left.
-pub const OWNER_LABEL: &str = "kbf.owner";
+pub const OWNER_LABEL: &str = "kbf.owner2";
 
 /// How every lease's container, lease cgroup and scratch directory are named:
 /// `kbf-lease-<term>-<seq>`.
