@@ -21,4 +21,3 @@
 # distroless base-debian12 by its linux/amd64 manifest digest (not the index's).
 # run.sh pulls the same image into the node's image store before the daemon starts.
 [kbf_m2]
-  container_image = docker://gcr.io/distroless/base-debian12@sha256:d2add786f2a5f43d1ab3ae54cd3193de929d0d12c378ff60891921f56f3e47ff
