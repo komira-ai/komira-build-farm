@@ -202,6 +202,7 @@ See [scheduler.md](docs/design/scheduler.md) and
 | CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
+| Callers and started leases | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, and the leases whose `Start` was sent; each caller's channel stays beside it in the farm core | the same machine fed from the replicated control log |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
 
 Because the index is in memory today, a restarted server forgets every blob. With
@@ -216,6 +217,8 @@ replicated log changes the implementation behind the seam, not its callers:
   implements the same two calls.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
+- `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
+  no clock and holds no hashed map, which clippy checks for the module.
 - `StateMachine` (in `kbf-types`): inputs in, effects out. The server carries out the
   scheduler's `Commit`, `Start` and `Answer` effects. The one place a control record
   is appended and fed straight back as committed is the step a replicated log

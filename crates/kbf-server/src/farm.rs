@@ -37,14 +37,14 @@ use kbf_proto::worker::{
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
-    OperationId, Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting,
-    WorkerId,
+    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
+    Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
+use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
 use crate::stamp::Stamp;
 
@@ -65,35 +65,6 @@ pub fn process_term() -> u64 {
     // A `RandomState` is keyed from the operating system's random source.
     let random = RandomState::new().hash_one(start) & 0xffff;
     (start << 16) | random
-}
-
-/// The REAPI name of the operation `waiter` waits on, in the process of `term`:
-/// `operations/{term}-{waiter}`.
-///
-/// Waiter ids count from 0 in every process, so the term is what keeps a name from
-/// naming two operations: without it, a client's `WaitExecution` with a name from the
-/// process before a restart attaches to whichever operation of the new process got
-/// the same number, and hands it that action's result (issue #154).
-fn operation_name(term: u64, waiter: WaiterId) -> String {
-    format!("operations/{term}-{}", waiter.0)
-}
-
-/// The waiter an operation name of the process of `term` names: the inverse of
-/// [`operation_name`]. `None` for a name of another term, and for any spelling
-/// [`operation_name`] does not write (signs, leading zeros, other prefixes).
-fn parse_operation_name(name: &str, term: u64) -> Option<WaiterId> {
-    let (named_term, waiter) = name.strip_prefix("operations/")?.split_once('-')?;
-    if canonical_u64(named_term)? != term {
-        return None;
-    }
-    canonical_u64(waiter).map(WaiterId)
-}
-
-/// `text` as a `u64`, if it is that number's decimal spelling exactly (`u64`'s
-/// `FromStr` also takes a `+` sign and leading zeros).
-fn canonical_u64(text: &str) -> Option<u64> {
-    let n: u64 = text.parse().ok()?;
-    (n.to_string() == text).then_some(n)
 }
 
 /// Where the server sends a worker's messages: the outbound half of its stream.
@@ -133,18 +104,6 @@ pub enum NodeAction {
     Uncordon,
 }
 
-/// A caller waiting on an operation.
-#[derive(Debug)]
-struct Waiter {
-    name: String,
-    key: kbf_types::ActionKey,
-    kind: LeaseKind,
-    do_not_cache: bool,
-    stage: watch::Sender<Stage>,
-    /// When it was submitted, on the wall clock.
-    queued: SystemTime,
-}
-
 /// A worker's newest stream.
 #[derive(Debug)]
 struct Link {
@@ -156,16 +115,6 @@ struct Link {
     /// `Start` names it, and the daemon acts on the `Start` only within
     /// [`START_VALIDITY`] of having sent that heartbeat (or, for 0, its `Hello`).
     newest_beat: u64,
-}
-
-/// A lease whose `Start` was sent.
-#[derive(Clone, Copy, Debug)]
-struct Sent {
-    operation: OperationId,
-    /// The action the `Start` named.
-    action: Digest,
-    /// When the operation was queued and the `Start` sent.
-    stamp: Stamp,
 }
 
 /// An OK result and its action-cache record, from the report to the answer.
@@ -187,19 +136,13 @@ enum Detail {
 #[derive(Debug)]
 struct State {
     sched: Scheduler,
-    next_waiter: u64,
+    /// The callers' records, the finished operations whose callers are kept, and the
+    /// leases whose `Start` was sent.
+    machine: FarmMachine,
+    /// The channel of each caller the machine keeps, forgotten with its record.
+    stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
     next_stream: u64,
-    /// The callers of operations the scheduler holds: unfinished ones, and finished
-    /// ones for the scheduler's finished retention, so that a WaitExecution on one
-    /// gets its result (issue #165). A caller's operation name is [`operation_name`]
-    /// of the term and its id, so a name is looked up by parsing it.
-    waiters: BTreeMap<WaiterId, Waiter>,
-    /// Finished operations whose callers are still kept, in the order they finished,
-    /// with those callers. Each leaves once the scheduler has dropped its operation.
-    finished: VecDeque<(OperationId, Vec<WaiterId>)>,
     links: BTreeMap<WorkerId, Link>,
-    /// Leases whose `Start` was sent.
-    started: BTreeMap<LeaseId, Sent>,
     /// Each node's newest `NodeStatus`, kept across its streams.
     software: BTreeMap<WorkerId, SoftwareView>,
     /// Nodes whose drain has paused, once logged.
@@ -237,12 +180,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
                 sched,
-                next_waiter: 0,
+                machine: FarmMachine::new(term),
+                stages: BTreeMap::new(),
                 next_stream: 0,
-                waiters: BTreeMap::new(),
-                finished: VecDeque::new(),
                 links: BTreeMap::new(),
-                started: BTreeMap::new(),
                 software: BTreeMap::new(),
                 paused: BTreeSet::new(),
             }),
@@ -611,23 +552,17 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
         let mut state = self.lock();
-        let waiter = WaiterId(state.next_waiter);
-        state.next_waiter += 1;
-        let name = operation_name(self.term, waiter);
-        let (stage, receiver) = watch::channel(Stage::Queued);
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
-        state.waiters.insert(
-            waiter,
-            Waiter {
-                name: name.clone(),
-                key: submission.request.key.clone(),
-                kind: submission.request.kind,
-                do_not_cache: submission.request.do_not_cache,
-                stage,
-                queued: SystemTime::now(),
-            },
-        );
+        let waiter = state.machine.submit(Waiter {
+            key: submission.request.key.clone(),
+            kind: submission.request.kind,
+            do_not_cache: submission.request.do_not_cache,
+            queued: SystemTime::now(),
+        });
+        let name = state.machine.name(waiter);
+        let (stage, receiver) = watch::channel(Stage::Queued);
+        state.stages.insert(waiter, stage);
         state.feed_quiet(
             now,
             Event::Submit {
@@ -636,14 +571,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             },
         );
         // A caller that joined a twin already started sees it executing.
-        let joined_started = state.started.values().any(|sent| {
+        let joined_started = state.machine.started_operations().any(|operation| {
             state
                 .sched
-                .waiters(sent.operation)
+                .waiters(operation)
                 .is_some_and(|w| w.contains(&waiter))
         });
-        if let Some(w) = state.waiters.get(&waiter).filter(|_| joined_started) {
-            w.stage.send_replace(Stage::Executing);
+        if let Some(stage) = state.stages.get(&waiter).filter(|_| joined_started) {
+            stage.send_replace(Stage::Executing);
         }
         Ok(Ticket {
             name,
@@ -654,14 +589,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     }
 
     fn wait(&self, name: &str) -> Option<Ticket> {
-        let waiter = parse_operation_name(name, self.term)?;
         let state = self.lock();
-        let waiter = state.waiters.get(&waiter)?;
+        let (id, waiter) = state.machine.named(name)?;
+        let stage = state.stages.get(&id)?;
         Some(Ticket {
-            name: waiter.name.clone(),
+            name: name.to_owned(),
             instance: waiter.key.instance.clone(),
             action: waiter.key.action,
-            stage: waiter.stage.subscribe(),
+            stage: stage.subscribe(),
         })
     }
 }
@@ -713,10 +648,10 @@ impl State {
 
     /// The operation whose current lease is `lease`, the action its `Start` named,
     /// and the server's times for the run, if `worker` holds it. Only this process's
-    /// leases are in `started`, so a lease of an earlier process (another term) is
-    /// never one.
+    /// leases are in the machine's started table, so a lease of an earlier process
+    /// (another term) is never one.
     fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<(OperationId, Digest, Stamp)> {
-        let sent = *self.started.get(&lease)?;
+        let sent = self.machine.sent(lease)?;
         let operation = sent.operation;
         let current = match self.sched.state(operation)? {
             OpState::Leased {
@@ -795,35 +730,40 @@ impl State {
     /// Keeps the callers of `operation`, which has just finished, until the scheduler
     /// drops it.
     fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
-        self.finished.push_back((operation, waiters));
+        self.machine.keep_finished(operation, waiters);
         self.forget_dropped();
     }
 
-    /// Forgets the callers of every finished operation the scheduler has dropped: a
-    /// WaitExecution on one is NOT_FOUND from now on. The scheduler drops them in the
-    /// order they finished, and only those that finished at one farm time can be kept
-    /// here in another order, so stopping at the first it still holds leaves none
-    /// behind for longer than the input that drops it.
+    /// Forgets the callers, and their channels, of every finished operation the
+    /// scheduler has dropped ([`FarmMachine::forget_dropped`]): a WaitExecution on one
+    /// is NOT_FOUND from now on. Every input ends here, so debug builds check here
+    /// that each caller the machine keeps has one channel and no other caller has.
     fn forget_dropped(&mut self) {
-        while let Some((operation, _)) = self.finished.front()
-            && self.sched.state(*operation).is_none()
-        {
-            let (_, waiters) = self.finished.pop_front().expect("checked above");
-            for id in waiters {
-                self.waiters.remove(&id);
-            }
+        let sched = &self.sched;
+        let forgotten = self
+            .machine
+            .forget_dropped(|operation| sched.state(operation).is_some());
+        for id in forgotten {
+            self.stages.remove(&id);
         }
+        debug_assert_eq!(
+            self.stages.len(),
+            self.machine.waiters_kept(),
+            "a caller's channel outlives its record, or a record has no channel"
+        );
     }
 
-    /// The REAPI name of `operation`, its first waiter's, as the log names it.
-    fn operation_name(&self, operation: OperationId) -> &str {
-        self.first_waiter(operation).map_or("", |w| w.name.as_str())
+    /// The REAPI name of `operation`, its first waiter's, as the log names it; empty
+    /// for an operation without one.
+    fn operation_name(&self, operation: OperationId) -> String {
+        self.first_waiter(operation)
+            .map_or_else(String::new, |(id, _)| self.machine.name(id))
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
-    fn first_waiter(&self, operation: OperationId) -> Option<&Waiter> {
-        let first = self.sched.waiters(operation)?.first()?;
-        self.waiters.get(first)
+    fn first_waiter(&self, operation: OperationId) -> Option<(WaiterId, &Waiter)> {
+        let first = *self.sched.waiters(operation)?.first()?;
+        self.machine.waiter(first).map(|waiter| (first, waiter))
     }
 
     /// Sends `worker` the message `build` makes from `operation`'s first waiter.
@@ -838,7 +778,9 @@ impl State {
         operation: OperationId,
         build: impl FnOnce(&Waiter) -> server_message::Message,
     ) {
-        let message = self.first_waiter(operation).map(build);
+        let message = self
+            .first_waiter(operation)
+            .map(|(_, waiter)| build(waiter));
         let _ = self.links.get(worker).zip(message).map(|(link, message)| {
             link.outbound.send(Ok(ServerMessage {
                 message: Some(message),
@@ -880,12 +822,14 @@ impl State {
             })
         });
         let waiters = self.sched.waiters(start.operation).unwrap_or_default();
-        for w in waiters.iter().filter_map(|id| self.waiters.get(id)) {
-            w.stage.send_replace(Stage::Executing);
+        for stage in waiters.iter().filter_map(|id| self.stages.get(id)) {
+            stage.send_replace(Stage::Executing);
         }
         let now = SystemTime::now();
         // An operation with a `Start` has its first waiter (see `send_for`).
-        let queued = self.first_waiter(start.operation).map_or(now, |w| w.queued);
+        let queued = self
+            .first_waiter(start.operation)
+            .map_or(now, |(_, w)| w.queued);
         let sent = Sent {
             operation: start.operation,
             action: start.key.action,
@@ -894,7 +838,7 @@ impl State {
                 started: now,
             },
         };
-        self.started.insert(start.lease, sent);
+        self.machine.start(start.lease, sent);
     }
 
     /// Tells an operation's callers why it waits, or that it no longer waits for a
@@ -914,8 +858,8 @@ impl State {
         // A caller that joins a waiting operation is told again; the others, who
         // already know, see no repeated update.
         let waiters = self.sched.waiters(operation).unwrap_or_default();
-        for w in waiters.iter().filter_map(|id| self.waiters.get(id)) {
-            w.stage.send_if_modified(|now| {
+        for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
+            channel.send_if_modified(|now| {
                 let changed = *now != stage;
                 if changed {
                     now.clone_from(&stage);
@@ -925,11 +869,6 @@ impl State {
         }
     }
 
-    /// Forgets every lease of a finished `operation` whose `Start` was sent.
-    fn forget_leases(&mut self, operation: OperationId) {
-        self.started.retain(|_, sent| sent.operation != operation);
-    }
-
     /// Answers the callers of an operation the scheduler refused FAILED_PRECONDITION
     /// with the reason, and keeps them for the finished retention. Nothing is cached,
     /// so nothing is awaited.
@@ -937,9 +876,9 @@ impl State {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
         let finished = failed(Code::FailedPrecondition, &refusal.reason);
         // A lease given up before the operation was refused may still be listed.
-        self.forget_leases(refusal.operation);
-        for w in refusal.waiters.iter().filter_map(|id| self.waiters.get(id)) {
-            w.stage.send_replace(Stage::Done(finished.clone()));
+        self.machine.forget_leases(refusal.operation);
+        for stage in refusal.waiters.iter().filter_map(|id| self.stages.get(id)) {
+            stage.send_replace(Stage::Done(finished.clone()));
         }
         self.keep_finished(refusal.operation, refusal.waiters.clone());
     }
@@ -948,13 +887,17 @@ impl State {
     /// finished retention. `detail` is what the accepted report carried beyond its
     /// outcome, if anything.
     fn settle(&mut self, answer: &Answer, detail: Option<Detail>) -> Settled {
-        self.forget_leases(answer.operation);
+        self.machine.forget_leases(answer.operation);
         let waiters: Vec<&Waiter> = answer
             .waiters
             .iter()
-            .filter_map(|id| self.waiters.get(id))
+            .filter_map(|id| self.machine.waiter(*id))
             .collect();
-        let stages = waiters.iter().map(|w| w.stage.clone()).collect();
+        let stages = answer
+            .waiters
+            .iter()
+            .filter_map(|id| self.stages.get(id).cloned())
+            .collect();
         let (finished, write) = match (detail, answer.outcome) {
             (Some(Detail::Ran(pending)), _) => {
                 let Pending { result, record } = *pending;
@@ -1028,54 +971,5 @@ mod tests {
         let second = process_term();
         assert!(second > first, "{second} does not order after {first}");
         assert!(first >> 16 > 0, "{first} could be a pre-fix term");
-    }
-
-    /// Catches a name parser that is not the exact inverse of [`operation_name`]: one
-    /// that ignores the term or accepts another (issue #154), and one that accepts a
-    /// spelling the server never writes, which would give one operation several names.
-    #[test]
-    fn operation_names_parse_only_as_this_term_writes_them() {
-        let term = 0x0199_8a6b_2c3d_4e5f;
-        for n in [0, 1, 42, u64::MAX] {
-            let name = operation_name(term, WaiterId(n));
-            assert_eq!(
-                parse_operation_name(&name, term),
-                Some(WaiterId(n)),
-                "{name}"
-            );
-            for other in [0, term - 1, term + 1, u64::MAX] {
-                assert_eq!(
-                    parse_operation_name(&name, other),
-                    None,
-                    "{name} as {other}"
-                );
-            }
-        }
-        assert_eq!(operation_name(7, WaiterId(3)), "operations/7-3");
-        for refused in [
-            "",
-            "operations/",
-            "operations/7",
-            "operations/7-",
-            "operations/-3",
-            "operations/7--3",
-            "operations/7-3-1",
-            "operations/07-3",
-            "operations/7-03",
-            "operations/+7-3",
-            "operations/7-+3",
-            "operations/7-3 ",
-            " operations/7-3",
-            "operations/7-18446744073709551616",
-            "Operations/7-3",
-            "operation/7-3",
-            "operations/7_3",
-            "7-3",
-            "operations/3",
-            "operations/cached/7-3",
-        ] {
-            assert_eq!(parse_operation_name(refused, 7), None, "{refused:?}");
-        }
-        assert_eq!(parse_operation_name("operations/7-0", 7), Some(WaiterId(0)));
     }
 }

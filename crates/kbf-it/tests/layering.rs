@@ -12,7 +12,9 @@
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
-//!   pass vacuously.
+//!   pass vacuously;
+//! - a pure module of an impure crate (`PURE_MODULES`) whose file no longer denies
+//!   the `clippy.toml` lists, or that was moved or removed.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -41,6 +43,11 @@ const FORBIDDEN: &[&str] = &[
     "mio",
     "socket2",
 ];
+
+/// Modules of impure crates that hold state every server of a replicated farm must
+/// hold alike, so they are kept pure as the pure crates are. Paths are from the
+/// workspace's `crates` directory.
+const PURE_MODULES: &[&str] = &["kbf-server/src/machine.rs"];
 
 const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_types)]";
 
@@ -183,6 +190,20 @@ fn pure_crates_deny_the_clippy_lists() {
         assert!(
             src.lines().any(|l| l.trim() == DENY_ATTR),
             "{pure} ({lib}) must carry `{DENY_ATTR}`"
+        );
+    }
+}
+
+#[test]
+fn pure_modules_deny_the_clippy_lists() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for &module in PURE_MODULES {
+        let path = crates.join(module);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            src.lines().any(|l| l.trim() == DENY_ATTR),
+            "{module} must carry `{DENY_ATTR}`"
         );
     }
 }

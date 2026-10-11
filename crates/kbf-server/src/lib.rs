@@ -46,6 +46,7 @@ pub mod fleet;
 pub mod grpc_health;
 pub mod health;
 pub mod identity;
+mod machine;
 pub mod mdm;
 mod memory;
 pub mod rollout;
