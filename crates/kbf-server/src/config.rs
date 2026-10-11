@@ -2,7 +2,7 @@
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
 //! never goes on the command line).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -53,9 +53,18 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
-    /// plain text, which is meant for a loopback bind behind a front on the same host.
+    /// plain text, which is meant for a loopback bind behind a front on the same host:
+    /// a plain-text bind on any other address stops the server unless
+    /// `--reapi-plaintext-bind` is given.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
+    /// Serve the REAPI listener in plain text on a `--listen` address that is not
+    /// loopback (a wildcard, or an interface other machines reach, such as a mesh
+    /// interface the front's hop arrives on). Without it that bind stops the server.
+    /// The start line then ends ` warning=reapi-plaintext-bind`. It does not apply to
+    /// the worker listener.
+    #[arg(long, conflicts_with = "reapi_tls_cert")]
+    pub reapi_plaintext_bind: bool,
     /// PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves
     /// TLS with this server certificate only; clients present no certificate. It is meant
     /// for a certificate from the farm's own internal CA, trusted by the front's proxy
@@ -74,7 +83,9 @@ pub struct Args {
     /// worker listener and the operator API do not read it.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
-    /// The `kbf.worker.v1` listener.
+    /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
+    /// `--worker-tls-key`, `--worker-client-ca`) it must be a loopback address, or the
+    /// server stops.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
     /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
@@ -160,6 +171,19 @@ pub struct Args {
 /// Why the flags do not make a working server.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// A plain-text REAPI listener on an address that is not loopback, without
+    /// `--reapi-plaintext-bind`.
+    #[error(
+        "--listen {0} is not a loopback address: serve it over TLS (--reapi-tls-cert and \
+         --reapi-tls-key), or pass --reapi-plaintext-bind to serve plain text there"
+    )]
+    PlainTextReapi(SocketAddr),
+    /// A plain-text worker listener on an address that is not loopback.
+    #[error(
+        "--worker-listen {0} is not a loopback address: serve it over mutual TLS \
+         (--worker-tls-cert, --worker-tls-key and --worker-client-ca)"
+    )]
+    PlainTextWorker(SocketAddr),
     /// A TLS file could not be read.
     #[error("read {path}: {source}")]
     Read {
@@ -202,8 +226,19 @@ impl Args {
     /// The listeners these flags describe.
     ///
     /// # Errors
-    /// A TLS file cannot be read.
+    /// A listener would serve plain text on an address that is not loopback (the
+    /// worker listener without mutual TLS; the REAPI listener without TLS or
+    /// `--reapi-plaintext-bind`), or a TLS file cannot be read.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
+        if self.worker_tls_cert.is_none() && !loopback_only(self.worker_listen.ip()) {
+            return Err(ConfigError::PlainTextWorker(self.worker_listen));
+        }
+        if self.reapi_tls_cert.is_none()
+            && !self.reapi_plaintext_bind
+            && !loopback_only(self.listen.ip())
+        {
+            return Err(ConfigError::PlainTextReapi(self.listen));
+        }
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -240,6 +275,14 @@ impl Args {
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
         })
+    }
+
+    /// Whether the REAPI listener serves plain text on an address that is not
+    /// loopback, which [`Args::listeners`] allows only with `--reapi-plaintext-bind`.
+    /// The binary's start line then carries a warning.
+    #[must_use]
+    pub fn reapi_plaintext_off_loopback(&self) -> bool {
+        self.reapi_tls_cert.is_none() && !loopback_only(self.listen.ip())
     }
 
     /// The REAPI listener's policy: the file `--reapi-auth-policy` names, or
@@ -312,9 +355,40 @@ impl Args {
     }
 }
 
+/// Whether a listener bound to `ip` is reachable only from this host: a loopback
+/// address, an IPv4-mapped one (`::ffff:127.0.0.1`) included. A wildcard (`0.0.0.0`,
+/// `::`) and every other address can be reached from other machines.
+#[must_use]
+pub fn loopback_only(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
     std::fs::read(path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loopback_only;
+
+    /// Catches: a bind guard that refuses only wildcards (`is_unspecified`), so a
+    /// plain-text listener on one interface other machines reach (`192.0.2.10`, a
+    /// documentation address standing in for a LAN or mesh one) passes; and one that
+    /// drops `to_canonical`, so the IPv4-mapped loopback address is refused.
+    #[test]
+    fn only_loopback_addresses_are_loopback_only() {
+        for (ip, want) in [
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("0.0.0.0", false),
+            ("::", false),
+            ("192.0.2.10", false),
+        ] {
+            assert_eq!(loopback_only(ip.parse().expect("an address")), want, "{ip}");
+        }
+    }
 }

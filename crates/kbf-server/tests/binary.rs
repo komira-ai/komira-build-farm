@@ -181,6 +181,9 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
         "{line}"
     );
     assert!(line.contains(" worker=127.0.0.1:"), "{line}");
+    // Catches: the plain-text warning printed on a loopback bind, where nothing is
+    // exposed (scripts would learn to ignore it).
+    assert!(!line.contains(" warning="), "{line}");
     assert!(
         !line.contains(" api="),
         "no operator API unless asked: {line}"

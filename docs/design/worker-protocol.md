@@ -121,7 +121,10 @@ therefore impersonate only that node. With OpenSSL, the client certificate's ext
 is `subjectAltName = DNS:<node id>`.
 
 In plain text (no TLS flags; for tests and trials on one machine) there is no
-certificate and no binding; a resent `Hello` must still carry the stream's `node_id`.
+certificate and no binding. `kbf-server` serves the worker listener in plain text only
+on a loopback `--worker-listen`; any other address without the three TLS flags stops
+it at start (exit 2, naming them). In plain text a resent `Hello` must still carry
+the stream's `node_id`.
 
 **The deny list** (`kbf-server --worker-deny-list FILE`, mutual TLS only) refuses
 certificates and nodes. Each line is blank, a `#` comment, or one entry:
