@@ -1,5 +1,7 @@
-//! The lease manager: starts work on `Start` and only on `Start`, turns each outcome
-//! into one `Result`, and fences (kills) running work when contact is lost.
+//! The lease manager: starts work on `Start` and only on `Start`, through the runtime
+//! that serves the Start's kind, turns each outcome into one `Result`, and fences
+//! (kills) running work when contact is lost. A lease is killed through the runtime it
+//! runs on.
 //!
 //! A `LeaseOffer` is the scheduler placing a lease before it commits it; running on an
 //! offer could run a lease the scheduler never commits, or run it twice beside the
@@ -25,25 +27,32 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{Runtime, RuntimeError, Work};
+use crate::runtime::{RuntimeError, Work};
+use crate::runtimes::{AnyRuntime, Runtimes};
 
 /// A finished run: its lease and outcome.
 pub(crate) type Done = (LeaseId, Result<ActionResult, RuntimeError>);
 
 /// The leases a daemon is running.
-pub(crate) struct Leases<R> {
-    runtime: Arc<R>,
-    running: BTreeMap<LeaseId, JoinHandle<()>>,
+pub(crate) struct Leases {
+    runtimes: Runtimes,
+    running: BTreeMap<LeaseId, Running>,
     /// Running leases being killed on the server's `Cancel`.
     cancelled: BTreeSet<LeaseId>,
     done: mpsc::UnboundedSender<Done>,
 }
 
-impl<R: Runtime> Leases<R> {
-    /// A manager whose runs report on `done`.
-    pub(crate) fn new(runtime: Arc<R>, done: mpsc::UnboundedSender<Done>) -> Self {
+/// A running lease: its run's task and the runtime it runs on.
+struct Running {
+    task: JoinHandle<()>,
+    runtime: Arc<dyn AnyRuntime>,
+}
+
+impl Leases {
+    /// A manager that runs leases through `runtimes`, whose runs report on `done`.
+    pub(crate) fn new(runtimes: Runtimes, done: mpsc::UnboundedSender<Done>) -> Self {
         Self {
-            runtime,
+            runtimes,
             running: BTreeMap::new(),
             cancelled: BTreeSet::new(),
             done,
@@ -55,9 +64,10 @@ impl<R: Runtime> Leases<R> {
         self.running.keys().copied().collect()
     }
 
-    /// Handles a Start. Returns a Result to send at once when the lease is refused; a
-    /// started lease reports through `done`. A Start for a lease already running is a
-    /// resend and changes nothing.
+    /// Handles a Start: runs it on the runtime that serves its kind. Returns a Result to
+    /// send at once when the lease is refused (no runtime serves its kind, or it names
+    /// no action); a started lease reports through `done`. A Start for a lease already
+    /// running is a resend and changes nothing.
     pub(crate) fn start(&mut self, start: Start) -> Option<worker::Result> {
         let Some(id) = start.lease_id.map(lease_id) else {
             tracing::warn!("Start without a lease id ignored");
@@ -66,13 +76,14 @@ impl<R: Runtime> Leases<R> {
         if self.running.contains_key(&id) {
             return None;
         }
-        if !self.runtime.serves(&start.kind) {
+        let Some(runtime) = self.runtimes.serving(&start.kind) else {
             return Some(failure(
                 id,
                 Code::FailedPrecondition,
                 format!("no driver here serves lease kind {:?}", start.kind),
             ));
-        }
+        };
+        let runtime = Arc::clone(runtime);
         let Some(work) = work(id, start) else {
             return Some(failure(
                 id,
@@ -80,15 +91,15 @@ impl<R: Runtime> Leases<R> {
                 "Start has no action digest",
             ));
         };
-        let runtime = Arc::clone(&self.runtime);
         let done = self.done.clone();
+        let run = Arc::clone(&runtime);
         let task = tokio::spawn(async move {
-            let outcome = runtime.run(work).await;
+            let outcome = run.run(work).await;
             // The receiver lives as long as the daemon.
             let _ = done.send((id, outcome));
         });
-        tracing::info!(lease = %id, "lease started");
-        self.running.insert(id, task);
+        tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
+        self.running.insert(id, Running { task, runtime });
         None
     }
 
@@ -96,10 +107,13 @@ impl<R: Runtime> Leases<R> {
     /// Returns whether a kill began: not for a lease that is not running or is already
     /// being cancelled. The run reports through `done` once it has stopped.
     pub(crate) fn cancel(&mut self, id: LeaseId) -> bool {
-        if !self.running.contains_key(&id) || !self.cancelled.insert(id) {
+        let Some(running) = self.running.get(&id) else {
+            return false;
+        };
+        if !self.cancelled.insert(id) {
             return false;
         }
-        let runtime = Arc::clone(&self.runtime);
+        let runtime = Arc::clone(&running.runtime);
         tokio::spawn(async move { runtime.kill(id).await });
         tracing::warn!(lease = %id, "lease cancelled: the server no longer holds it here");
         true
@@ -126,8 +140,8 @@ impl<R: Runtime> Leases<R> {
     pub(crate) async fn fence(&mut self) -> Vec<worker::Result> {
         let fenced = std::mem::take(&mut self.running);
         self.cancelled.clear();
-        let runtime = &*self.runtime;
-        let kills = fenced.into_iter().map(|(id, task)| async move {
+        let kills = fenced.into_iter().map(|(id, running)| async move {
+            let Running { task, runtime } = running;
             runtime.kill(id).await;
             // The run reports Killed on `done`; `finished` drops it, since the lease is
             // no longer running. Waiting for the task proves the work has ended.
@@ -246,6 +260,7 @@ mod tests {
     use kbf_proto::reapi::Digest;
 
     use super::*;
+    use crate::runtime::Runtime;
 
     fn id() -> LeaseId {
         LeaseId::new(3, 4)
@@ -319,7 +334,7 @@ mod tests {
             runs: std::sync::atomic::AtomicUsize::new(0),
         });
         let (done, _done_rx) = mpsc::unbounded_channel();
-        let mut leases = Leases::new(runtime, done);
+        let mut leases = Leases::new(Runtimes::new(runtime), done);
         let ids = [LeaseId::new(1, 1), LeaseId::new(1, 2)];
         for id in ids {
             let start = Start {
@@ -351,9 +366,9 @@ mod tests {
             runs: std::sync::atomic::AtomicUsize::new(0),
         });
         // Rendezvous is only a stand-in; its name is not under test.
-        assert_eq!(runtime.driver(), "rendezvous");
+        assert_eq!(Runtime::driver(&*runtime), "rendezvous");
         let (done, _done_rx) = mpsc::unbounded_channel();
-        let mut leases = Leases::new(Arc::clone(&runtime), done);
+        let mut leases = Leases::new(Runtimes::new(Arc::clone(&runtime)), done);
         let start = Start {
             lease_id: Some(proto_lease_id(id())),
             kind: "action".to_owned(),
@@ -396,7 +411,7 @@ mod tests {
     async fn a_cancel_kills_a_running_lease_once() {
         let runtime = Arc::new(crate::FakeRuntime::new(std::time::Duration::from_secs(60)));
         let (done, mut done_rx) = mpsc::unbounded_channel();
-        let mut leases = Leases::new(Arc::clone(&runtime), done);
+        let mut leases = Leases::new(Runtimes::new(Arc::clone(&runtime)), done);
         let start = Start {
             lease_id: Some(proto_lease_id(id())),
             kind: "action".to_owned(),

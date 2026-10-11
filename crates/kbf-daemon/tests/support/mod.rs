@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
     Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, Runtime,
-    TlsFiles,
+    Runtimes, TlsFiles,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -476,6 +476,7 @@ impl Harness<FakeRuntime> {
         let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
         Self::build(
             name,
+            Runtimes::new(Arc::clone(&runtime)),
             runtime,
             Duration::from_secs(40),
             |config| config.recheck_every = Duration::from_millis(20),
@@ -499,7 +500,35 @@ impl<R: Runtime> Harness<R> {
     /// Starts a server and a daemon running leases through `runtime`, whose fence time
     /// is `fence_after`. `name` keeps each test's TLS files apart.
     pub async fn with_runtime(name: &str, runtime: Arc<R>, fence_after: Duration) -> Self {
-        Self::build(name, runtime, fence_after, |_| {}, None, None).await
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        Self::build(name, runtimes, runtime, fence_after, |_| {}, None, None).await
+    }
+
+    /// Starts a server and a daemon running leases through `runtimes`, of which
+    /// `runtime` is the one [`Harness::runtime`] names and whose driver the report the
+    /// daemon is given lists (the daemon adds the others'). Its fence time is
+    /// `fence_after` and it checks the fence every 20 ms; its driver reports what
+    /// `driver` sends, if anything.
+    pub async fn with_runtimes(
+        name: &str,
+        runtime: Arc<R>,
+        runtimes: Runtimes,
+        fence_after: Duration,
+        driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
+    ) -> Self {
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build(
+            name,
+            runtimes,
+            runtime,
+            fence_after,
+            configure,
+            None,
+            driver,
+        )
+        .await
     }
 
     /// Starts a server and a daemon running leases through `runtime`, whose fence time
@@ -514,6 +543,7 @@ impl<R: Runtime> Harness<R> {
         let clock = SuspendClock::new();
         let h = Self::build(
             name,
+            Runtimes::new(Arc::clone(&runtime)),
             runtime,
             fence_after,
             |config| config.recheck_every = recheck_every,
@@ -526,6 +556,7 @@ impl<R: Runtime> Harness<R> {
 
     async fn build(
         name: &str,
+        runtimes: Runtimes,
         runtime: Arc<R>,
         fence_after: Duration,
         configure: impl FnOnce(&mut DaemonConfig),
@@ -570,7 +601,7 @@ impl<R: Runtime> Harness<R> {
         config.reconnect_after = Duration::from_millis(100);
         configure(&mut config);
         let (events_tx, events) = mpsc::unbounded_channel();
-        let mut daemon = Daemon::new(config, Arc::clone(&runtime), report.clone())
+        let mut daemon = Daemon::new(config, runtimes, report.clone())
             .expect("daemon config")
             .with_events(events_tx);
         if let Some(clock) = clock {
