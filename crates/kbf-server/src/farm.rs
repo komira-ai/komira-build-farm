@@ -585,7 +585,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 )
             }
             (code, _) => {
-                tracing::info!(%lease, ?code, "lease failed");
+                // The client is told only that the farm could not run the action: the
+                // daemon's reason (a missing image, a full disk) is in this line alone.
+                let why = result.status.map(|s| s.message).unwrap_or_default();
+                tracing::warn!(%lease, node = %ran_on.0, ?code, reason = %why, "lease failed");
                 (Outcome::Failed(Failure::Infra), None)
             }
         }

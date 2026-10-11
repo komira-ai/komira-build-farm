@@ -1,0 +1,48 @@
+# The M1 sample's chain, without a shell (the image has none): `words` sorts a source
+# file, `shout` upper-cases it, `joined` reads two outputs of earlier actions. `pause`
+# sleeps, so a test can hold a lease in flight; `hog` passes its first memory cap, so
+# the farm must double its booking (run.sh says what is checked).
+load(":defs.bzl", "act")
+
+act(
+    name = "words",
+    srcs = ["data/words.txt"],
+    verb = "sort",
+)
+
+act(
+    name = "shout",
+    srcs = [":words"],
+    verb = "upper",
+)
+
+act(
+    name = "joined",
+    srcs = [
+        ":words",
+        ":shout",
+    ],
+    verb = "join",
+)
+
+# Sleeps `-c kbf_m2.sleep_secs=N` seconds (0 by default, so `//...` stays quick and its
+# second build is a cache hit) and writes `-c kbf_m2.salt=S` (empty by default). A
+# fresh salt makes it a new action, so it runs instead of being answered from the cache.
+act(
+    name = "pause",
+    args = [
+        read_config("kbf_m2", "sleep_secs", "0"),
+        read_config("kbf_m2", "salt", ""),
+    ],
+    verb = "pause",
+)
+
+# Touches 3072 MiB. Its first run books the default 1 GiB, so its cap is 2 GiB
+# (1.5 x 1 GiB + 512 MiB): it presses that cap into swap until the daemon kills it for
+# its own limit, and the server runs it again with 2 GiB booked (cap 3.5 GiB), where it
+# fits.
+act(
+    name = "hog",
+    args = ["3072"],
+    verb = "hog",
+)
