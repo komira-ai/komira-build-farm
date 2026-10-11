@@ -1,0 +1,24 @@
+# The M2 sample project for buck2: built remote-only against kbf-server and the
+# container driver (crates/kbf-it/m2/run.sh starts both). No prelude: the rules are in
+# this project.
+[cells]
+  root = .
+
+[buck2]
+  digest_algorithms = SHA256
+
+[buck2_re_client]
+  engine_address = grpc://127.0.0.1:8980
+  action_cache_address = grpc://127.0.0.1:8980
+  cas_address = grpc://127.0.0.1:8980
+  tls = false
+  instance_name = kbf-m2
+
+[build]
+  execution_platforms = root//platforms:remote
+
+# The image every action runs in, as the `container-image` platform property:
+# distroless base-debian12 by its linux/amd64 manifest digest (not the index's).
+# run.sh pulls this value into the node's image store before the daemon starts.
+[kbf_m2]
+  container_image = docker://gcr.io/distroless/base-debian12@sha256:d2add786f2a5f43d1ab3ae54cd3193de929d0d12c378ff60891921f56f3e47ff

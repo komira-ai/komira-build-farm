@@ -388,6 +388,26 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 - **Removal** of a lease cgroup that is still busy (a process still exiting) writes
   `cgroup.kill` and retries.
 
+### End to end (the M2 test)
+
+The `m2-container` CI job (`tools/ci/m2-container.sh`, then `crates/kbf-it/m2/run.sh`)
+runs the driver behind the real server and a real client, on a hosted x86_64 runner.
+It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the
+`container_image` value of `crates/kbf-it/m2/buck2/.buckconfig`, which the sample's
+execution platform passes on as `container-image`), starts one `kbf-server` and one
+`kbf-daemon --driver container` as a `Delegate=yes` system service with
+`--actions-memory-max-gib 8`, and builds the sample project with pinned buck2:
+
+- every target remote-only, then again after `buck2 clean`, every action answered from
+  the action cache (`kbf-cell check`, as in M1). The image has no shell, so each action
+  runs `kbf-m2-act`, a statically linked helper that is an input file of the action;
+- `//:hog`, which touches 3 GiB slowly: its first run books the default 1 GiB, presses
+  its 2 GiB cap into swap until the swap watch kills it, and the server's log must
+  hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
+- `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running
+  container labelled with the node id; afterwards no labelled container and no lease
+  directory is left.
+
 ## Output collection
 
 Outputs are read from the overlay's upper directory, which holds only what the action
