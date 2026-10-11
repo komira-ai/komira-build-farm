@@ -505,6 +505,88 @@ fn startup_failures_exit_2() {
     assert_eq!(code, Some(2), "a zero heartbeat interval accepted");
 }
 
+/// Catches: a plain-text REAPI listener other machines can reach (`--listen` on a
+/// wildcard address, IPv4 or IPv6, with no `--reapi-tls-cert` and `--reapi-tls-key`)
+/// started instead of refused with exit 2 and a message naming the flags that fix it.
+#[test]
+fn a_plain_text_reapi_listener_off_loopback_is_refused() {
+    for listen in ["0.0.0.0:0", "[::]:0"] {
+        let (code, stderr) = fails(server(&[
+            "--listen",
+            listen,
+            "--worker-listen",
+            "127.0.0.1:0",
+        ]));
+        assert_eq!(code, Some(2), "{listen}: {stderr}");
+        for flag in [
+            "--listen",
+            "--reapi-tls-cert",
+            "--reapi-tls-key",
+            "--reapi-plaintext-bind",
+        ] {
+            assert!(
+                stderr.contains(flag),
+                "{listen}: {flag} not named in {stderr}"
+            );
+        }
+    }
+}
+
+/// Catches: `--reapi-plaintext-bind` ignored (the plain-text bind it allows refused as
+/// if it were not given), and a server that takes it without a warning on its start
+/// line.
+#[cfg(unix)]
+#[test]
+fn reapi_plaintext_bind_serves_plain_text_off_loopback_with_a_warning() {
+    let (child, line, reapi) = started(server(&[
+        "--listen",
+        "0.0.0.0:0",
+        "--worker-listen",
+        "127.0.0.1:0",
+        "--reapi-plaintext-bind",
+    ]));
+    assert!(reapi.ip().is_unspecified(), "{line}");
+    assert!(line.ends_with(" warning=reapi-plaintext-bind"), "{line}");
+    let local = SocketAddr::from(([127, 0, 0, 1], reapi.port()));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            CapabilitiesClient::connect(format!("http://{local}"))
+                .await
+                .expect("connect in plain text")
+                .get_capabilities(GetCapabilitiesRequest::default())
+                .await
+                .expect("GetCapabilities");
+        });
+    interrupt(child);
+}
+
+/// Catches: the bind guard checking only the REAPI listener, so a plain-text worker
+/// listener other machines can reach (where any of them could say `Hello` as any node
+/// and be sent work) started; and `--reapi-plaintext-bind` letting it through too.
+#[test]
+fn a_plain_text_worker_listener_off_loopback_is_refused() {
+    for escape in [&[][..], &["--reapi-plaintext-bind"][..]] {
+        let mut c = server(&["--listen", "127.0.0.1:0", "--worker-listen", "[::]:0"]);
+        c.args(escape);
+        let (code, stderr) = fails(c);
+        assert_eq!(code, Some(2), "{escape:?}: {stderr}");
+        for flag in [
+            "--worker-listen",
+            "--worker-tls-cert",
+            "--worker-tls-key",
+            "--worker-client-ca",
+        ] {
+            assert!(
+                stderr.contains(flag),
+                "{escape:?}: {flag} not named in {stderr}"
+            );
+        }
+    }
+}
+
 /// Catches: a `--reapi-auth-policy` the binary does not run on its REAPI listener, and
 /// a policy file that is not a policy but does not stop the start (exit 2, with the
 /// flag and the mistake on stderr).
