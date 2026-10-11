@@ -8,8 +8,12 @@
 //! An entry's payload is its index and term (`u64` each, little endian), a kind byte
 //! (0 blank, 1 command) and, for a command, its bytes. The hard state's payload is the
 //! term (`u64`), a vote byte (0 none, 1 some) and, with a vote, the server (`u64`).
+//!
+//! A snapshot file is a header record, whose payload is the base's index and term and
+//! the state's length in bytes (`u64` each, little endian), followed by the state in
+//! records of at most [`SNAPSHOT_CHUNK`] bytes each (none for an empty state).
 
-use kbf_raft::{Entry, HardState, LogId, LogIndex, Payload, ServerId, Term};
+use kbf_raft::{Entry, HardState, LogId, LogIndex, Payload, ServerId, Snapshot, Term};
 
 use crate::crc::crc32c;
 
@@ -21,6 +25,12 @@ pub const MAX_PAYLOAD: usize = 64 << 20;
 
 /// The fixed part of an entry's payload: index, term, kind.
 const ENTRY_FIXED: usize = 17;
+
+/// The most state bytes one record of a snapshot file carries: 1 MiB.
+pub const SNAPSHOT_CHUNK: usize = 1 << 20;
+
+/// A snapshot header's payload: base index, base term, state length.
+const SNAPSHOT_HEADER: usize = 24;
 
 /// Appends one record carrying `payload` to `out`.
 ///
@@ -114,6 +124,45 @@ pub fn decode_hard(payload: &[u8]) -> Result<HardState, &'static str> {
     })
 }
 
+/// The bytes of a snapshot file holding `snapshot`.
+pub fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    let state = &snapshot.state;
+    let mut head = Vec::with_capacity(SNAPSHOT_HEADER);
+    head.extend_from_slice(&snapshot.base.index.0.to_le_bytes());
+    head.extend_from_slice(&snapshot.base.term.0.to_le_bytes());
+    head.extend_from_slice(&(state.len() as u64).to_le_bytes());
+    let chunks = state.len().div_ceil(SNAPSHOT_CHUNK);
+    let mut out = Vec::with_capacity(HEADER * (chunks + 1) + SNAPSHOT_HEADER + state.len());
+    put_record(&mut out, &head);
+    for chunk in state.chunks(SNAPSHOT_CHUNK) {
+        put_record(&mut out, chunk);
+    }
+    out
+}
+
+/// The snapshot a snapshot file's `bytes` hold, or where and why they do not hold
+/// one. Every record must be whole with a matching CRC and the state as long as the
+/// header says: the file was synced before it was renamed into place, so any damage
+/// is damage, never a torn tail.
+pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, (usize, &'static str)> {
+    let damaged = |at| (at, "damaged snapshot record");
+    let (head, mut off) = get_record(bytes).ok_or(damaged(0))?;
+    if head.len() != SNAPSHOT_HEADER {
+        return Err((0, "malformed snapshot header"));
+    }
+    let base = LogId::new(Term(u64_at(head, 8)), LogIndex(u64_at(head, 0)));
+    let mut state = Vec::new();
+    while off < bytes.len() {
+        let (chunk, used) = get_record(&bytes[off..]).ok_or(damaged(off))?;
+        state.extend_from_slice(chunk);
+        off += used;
+    }
+    if state.len() as u64 != u64_at(head, 16) {
+        return Err((off, "snapshot state length does not match its header"));
+    }
+    Ok(Snapshot { base, state })
+}
+
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
     let mut b = [0u8; 8];
     b.copy_from_slice(&bytes[at..at + 8]);
@@ -194,6 +243,68 @@ mod tests {
         assert!(decode_hard(&[0; 8]).is_err());
         assert!(decode_hard(&[0; 9].map(|_| 1)).is_err());
         assert!(decode_hard(&[0; 17]).is_err());
+    }
+
+    /// Catches: a change to the snapshot file's layout (the golden bytes pin the
+    /// header's fields and the chunking), a state split at the wrong size or put back
+    /// out of order, and a decoder that accepts a header of the wrong size, a state
+    /// shorter or longer than its header says (a file cut at a record boundary), or
+    /// a damaged chunk.
+    #[test]
+    fn snapshot_golden_bytes_chunks_and_refusals() {
+        let small = Snapshot {
+            base: LogId::new(Term(3), LogIndex(2)),
+            state: vec![0xCD],
+        };
+        assert_eq!(
+            hex(&encode_snapshot(&small)),
+            "18000000ef346cdb020000000000000003000000000000000100000000000000010000008e73c601cd"
+        );
+        assert_eq!(decode_snapshot(&encode_snapshot(&small)), Ok(small));
+        let empty = Snapshot::default();
+        let bytes = encode_snapshot(&empty);
+        assert_eq!(
+            bytes.len(),
+            HEADER + SNAPSHOT_HEADER,
+            "no chunk for no state"
+        );
+        assert_eq!(decode_snapshot(&bytes), Ok(empty));
+
+        let state: Vec<u8> = (0..2 * SNAPSHOT_CHUNK + 5)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let big = Snapshot {
+            base: LogId::new(Term(1), LogIndex(9)),
+            state,
+        };
+        let bytes = encode_snapshot(&big);
+        let chunk = HEADER + SNAPSHOT_CHUNK;
+        let first = HEADER + SNAPSHOT_HEADER;
+        assert_eq!(bytes.len(), first + 2 * chunk + HEADER + 5, "three chunks");
+        assert_eq!(decode_snapshot(&bytes), Ok(big));
+        assert_eq!(
+            decode_snapshot(&bytes[..first + chunk]),
+            Err((
+                first + chunk,
+                "snapshot state length does not match its header"
+            ))
+        );
+        let mut longer = bytes.clone();
+        put_record(&mut longer, b"x");
+        assert!(decode_snapshot(&longer).is_err(), "a chunk past the length");
+        let mut bad = bytes;
+        bad[first + chunk + HEADER] ^= 1;
+        assert_eq!(
+            decode_snapshot(&bad),
+            Err((first + chunk, "damaged snapshot record"))
+        );
+        let mut short = Vec::new();
+        put_record(&mut short, &[0; SNAPSHOT_HEADER - 1]);
+        assert_eq!(
+            decode_snapshot(&short),
+            Err((0, "malformed snapshot header"))
+        );
+        assert_eq!(decode_snapshot(&[]), Err((0, "damaged snapshot record")));
     }
 
     fn hex(b: &[u8]) -> String {
