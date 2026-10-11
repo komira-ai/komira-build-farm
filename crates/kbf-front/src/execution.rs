@@ -47,8 +47,9 @@
 //!
 //! The rest of the platform says which workers may run the action
 //! (`kbf_caps::Request::from_platform`: `OSFamily`, `ISA`, `Arch` and kbf's capability
-//! keys). A malformed one is INVALID_ARGUMENT. One no kbf daemon can ever run (an OS
-//! other than Linux or macOS, an architecture other than x86-64 or arm64) is
+//! keys). A malformed one is INVALID_ARGUMENT, and so is one naming `ios.device` or an
+//! `ios.device.<attribute>` key until devices are booked. One no kbf daemon can ever
+//! run (an OS other than Linux or macOS, an architecture other than x86-64 or arm64) is
 //! FAILED_PRECONDITION at once, with no `PreconditionFailure` detail: there is nothing
 //! for the client to upload, and Bazel and Buck2 do not retry it.
 //!

@@ -28,6 +28,11 @@
 //! The reserved keys ([`RESERVED_KEYS`]: `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`,
 //! `kbf-book-cpus`, `kbf-book-mem-gib`) ask for a kind or a size of capacity, not a
 //! capability; [`Request::parse`] skips them for the scheduler.
+//!
+//! The iOS device keys, `ios.device` and every `ios.device.<attribute>` key, are
+//! planned (`docs/design/ios-devices.md`). Until the scheduler books devices,
+//! [`Request::parse`] refuses each of them ([`RequestError::IosDevice`]): ignored, as an
+//! unknown property is, `ios.device=1` would match every node, Linux included.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -94,6 +99,16 @@ pub const RESERVED_KEYS: [&str; 5] = [
     "kbf-book-mem-gib",
 ];
 
+/// The iOS device key; every `ios.device.<attribute>` key begins with it and a `.`.
+const IOS_DEVICE_KEY: &str = "ios.device";
+
+/// Whether `key` is `ios.device` or `ios.device.<anything>`: planned, and refused until
+/// the scheduler books devices. `ios.devices` and `ios.simulator` are not device keys.
+pub(crate) fn is_ios_device_key(key: &str) -> bool {
+    key.strip_prefix(IOS_DEVICE_KEY)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 /// Whether `key` is compared as an exact string: one of the exact keys, or
 /// `label.<k>` with a non-empty `<k>`.
 pub(crate) fn is_exact_key(key: &str) -> bool {
@@ -126,9 +141,12 @@ fn image_digest(value: &str) -> Option<&str> {
 }
 
 /// Whether `key` is one of kbf's own platform keys: a capability key, a reserved key
-/// [`Request::parse`] skips, or a report-only key it refuses.
+/// [`Request::parse`] skips, or a report-only or iOS device key it refuses.
 pub(crate) fn is_own_key(key: &str) -> bool {
-    is_capability_key(key) || RESERVED_KEYS.contains(&key) || REPORT_ONLY_KEYS.contains(&key)
+    is_capability_key(key)
+        || RESERVED_KEYS.contains(&key)
+        || REPORT_ONLY_KEYS.contains(&key)
+        || is_ios_device_key(key)
 }
 
 /// Whether [`Request::parse`] reads `key` as a capability (reserved keys are not).
@@ -199,6 +217,13 @@ pub enum RequestError {
     /// The key is one a node reports and a request may not name.
     #[error("{0:?} is reported by a node and cannot be requested")]
     ReportOnly(String),
+    /// An iOS device key (`ios.device`, `ios.device.<attribute>`), refused until the
+    /// scheduler books devices.
+    #[error(
+        "{0:?} is refused until kbf books iOS devices; the planned design is \
+         docs/design/ios-devices.md#55-rollout-order"
+    )]
+    IosDevice(String),
 }
 
 /// What an action requires of a node.
@@ -258,7 +283,7 @@ impl Request {
     ///
     /// `cpu.feature` may repeat; every other key may appear once. A membership key
     /// (`xcode`, `vm.image`) names one non-empty value; a `vm.image` value carries a
-    /// digest. A report-only key is refused.
+    /// digest. A report-only key, and an iOS device key, is refused.
     pub fn parse<'p, I>(properties: I) -> Result<Self, RequestError>
     where
         I: IntoIterator<Item = (&'p str, &'p str)>,
@@ -282,6 +307,9 @@ impl Request {
             }
             if REPORT_ONLY_KEYS.contains(&key) {
                 return Err(RequestError::ReportOnly(key.to_owned()));
+            }
+            if is_ios_device_key(key) {
+                return Err(RequestError::IosDevice(key.to_owned()));
             }
             if key == "arch" {
                 let arch = value.parse().map_err(|_| bad())?;

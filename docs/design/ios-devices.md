@@ -164,10 +164,14 @@ the closest device and the key it fails.
 
 Two facts on `main` decide the order in which these pieces may ship:
 
-- **An unknown platform property is ignored today**
+- **An unknown platform property is ignored**
   ([capabilities.md](capabilities.md#unknown-keys)), so `ios.device=1` sent to a server
   that does not know it matches every node, Linux included. The server must know
-  `ios.device` (and refuse it until booking exists) before any client sends it.
+  `ios.device` (and refuse it until booking exists) before any client sends it. That
+  step is on `main`: `kbf_caps::Request::from_platform` refuses `ios.device` and every
+  `ios.device.<attribute>` key, in any case (`RequestError::IosDevice`), and Execute
+  answers `INVALID_ARGUMENT` naming the key and this section. A name that only begins
+  like one (`ios.devices`, `ios.simulator`) is an unknown property, ignored.
 - **An old daemon would drop `device_id` silently.** `Start` is proto3; a daemon that
   predates field 8 decodes the message without it and would run the action without
   knowing its device. The guard is the report: only a daemon that reports
@@ -175,8 +179,8 @@ Two facts on `main` decide the order in which these pieces may ship:
   one. The test for this is "a node whose report has no `ios.device` entry is never
   placed a device lease".
 
-So: matching and booking land together (or matching lands with the front refusing
-`ios.device` until booking is in), then the server, then daemons.
+So: the refusal first (done), then matching and booking together (or matching with
+the refusal kept until booking is in), then the server, then daemons.
 
 ### 5.6 Caching
 

@@ -1,7 +1,7 @@
 //! The planned iOS device keys: `ios.device` and every `ios.device.<attribute>` key are
 //! refused until the scheduler books devices.
 
-use kbf_caps::{FromPlatformError, Request, property_name};
+use kbf_caps::{FromPlatformError, NodeCaps, Request, RequestError, property_name};
 
 fn from(props: &[(&str, &str)]) -> Result<Request, FromPlatformError> {
     Request::from_platform(props.iter().copied())
@@ -36,7 +36,27 @@ fn ios_device_keys_are_refused_in_any_case() {
             message.contains("ios-devices.md#55-rollout-order"),
             "{sent}: {message}"
         );
+        assert_eq!(
+            err,
+            FromPlatformError::Invalid(RequestError::IosDevice(key.to_owned()))
+        );
+        assert_eq!(
+            Request::parse([(key, "1")]),
+            Err(RequestError::IosDevice(key.to_owned()))
+        );
     }
+}
+
+/// Catches: the refusal applied to a node report too. A newer daemon's report may carry
+/// `ios.device` entries; refused, it would stop the node registering. Skipped, as every
+/// report entry the server does not know is, it matches nothing.
+#[test]
+fn a_report_with_ios_device_entries_is_read_and_the_entries_skipped() {
+    let device = "class=iPhone,id=00008110-0001,os_build=23A341,os_version=26.0";
+    let with = NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("ios.device", device)]);
+    let without = NodeCaps::from_report([("arch", "arm64"), ("os", "macos")]);
+    assert_eq!(with, without);
+    assert!(with.is_ok(), "{with:?}");
 }
 
 /// Catches: the refusal matched on too short a prefix (`ios.device` with no `.` after

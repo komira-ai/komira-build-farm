@@ -262,9 +262,11 @@ it waits and then fails as described under [Where an action runs](#where-an-acti
 
 ## `ios.device` (planned)
 
-**Planned, not on `main`:** today `ios.device` is a name kbf does not know, so it is not
-acted on and an action that sends it may run on any worker, Linux included. The design
-is in [ios-devices.md](design/ios-devices.md):
+**Planned, not on `main`:** today an action that names `ios.device` or any
+`ios.device.<attribute>` key, in any case, is refused with `INVALID_ARGUMENT` naming the
+key, because kbf does not book devices yet; ignored, the key would let the action run
+on any worker, Linux included. The design is in
+[ios-devices.md](design/ios-devices.md):
 
 | Property | Values | Effect (planned) |
 |---|---|---|
