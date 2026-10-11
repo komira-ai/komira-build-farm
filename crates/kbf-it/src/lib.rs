@@ -13,6 +13,13 @@
 //! - `kbf-cell daemon` runs the test-only daemon ([`daemon`], Linux only);
 //! - `kbf-cell check` reads both builds' summaries and applies the exit rule
 //!   ([`summary`]).
+//!
+//! And the M2 harness: `m2/run.sh` builds the sample project in `m2/` with pinned buck2
+//! through one `kbf-server` to one `kbf-daemon --driver container` (every action in a
+//! rootless Podman container of a pinned distroless image), twice, then checks an
+//! own-limit memory kill's doubled rerun and a lease held in a container (`m2/run.sh`
+//! says what it checks; docs/design/daemon.md, "End to end"). The image has no shell,
+//! so every action runs the `kbf-m2-act` binary.
 
 #[cfg(target_os = "linux")]
 pub mod daemon;

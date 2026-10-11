@@ -434,6 +434,62 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  # The M2 test: pinned buck2 builds the sample project in crates/kbf-it/m2 remote-only
+  # through kbf-server to kbf-daemon --driver container, every action in a rootless
+  # Podman container of distroless base-debian12 pinned by its amd64 manifest digest
+  # (crates/kbf-it/m2/run.sh says what is checked). x86_64 only: the image digest is
+  # the amd64 one.
+  m2-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: cargo build -p kbf-server -p kbf-node -p kbf-it --bin kbf-server --bin kbf-daemon --bin kbf-cell --locked
+      # The image's glibc is Debian 12's, older than the runner's, so the helper every
+      # action runs is linked statically (run.sh refuses a dynamic one).
+      - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked -- -C target-feature=+crt-static
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$tools/buck2.zst" \
+            "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst"
+          echo "$BUCK2_SHA256  $tools/buck2.zst" | sha256sum --check --strict
+          zstd -q -d "$tools/buck2.zst" -o "$tools/buck2"
+          chmod +x "$tools/buck2"
+      - run: bash tools/ci/m2-container.sh "$RUNNER_TEMP/tools/buck2" "$RUNNER_TEMP/m2"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: m2-container-logs
+          path: ${{ runner.temp }}/m2/logs
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   podman-arm:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30

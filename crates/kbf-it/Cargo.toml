@@ -14,6 +14,12 @@ publish.workspace = true
 name = "kbf-cell"
 path = "src/bin/kbf-cell.rs"
 
+# `kbf-m2-act`, the program every action of the M2 sample project runs (`m2/`): the
+# M2 image has no shell. Standard library only, so CI can link it statically.
+[[bin]]
+name = "kbf-m2-act"
+path = "src/bin/kbf-m2-act.rs"
+
 [dependencies]
 clap.workspace = true
 kbf-daemon.workspace = true

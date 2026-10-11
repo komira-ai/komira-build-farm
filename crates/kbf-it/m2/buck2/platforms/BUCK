@@ -1,0 +1,6 @@
+load(":defs.bzl", "remote_platform")
+
+remote_platform(
+    name = "remote",
+    container_image = read_config("kbf_m2", "container_image", ""),
+)
