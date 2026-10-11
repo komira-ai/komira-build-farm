@@ -18,7 +18,8 @@
 //! a capability and is left to whoever reads it (`kbf-lease`, `container-image`, ...).
 //! A report-only key (`vm.slots`, `vm.max_cpus`, `vm.max_mem_gib`, in any case) is
 //! refused as [`FromPlatformError::Invalid`]: an action cannot ask for a count of VM
-//! slots.
+//! slots. So is an iOS device key (`ios.device`, `ios.device.<attribute>`, in any case)
+//! until the scheduler books devices: ignored, it would match every node.
 //!
 //! Property names are read without regard to ASCII case ([`property_name`]): a client
 //! that sends `osfamily=darwin` or `OS=macos` asks for a Mac exactly as one that sends
@@ -53,8 +54,9 @@ const LABEL_PREFIX: &str = "label.";
 ///
 /// Names are matched without regard to ASCII case against the names kbf reads:
 /// [`REAPI_KEYS`], and kbf's own keys (the capability keys [`Request::parse`] reads,
-/// `gpu` among them, the reserved keys, [`crate::RESERVED_KEYS`], and the report-only
-/// keys it refuses, [`crate::REPORT_ONLY_KEYS`]). A name
+/// `gpu` among them, the reserved keys, [`crate::RESERVED_KEYS`], and the keys it
+/// refuses: the report-only keys, [`crate::REPORT_ONLY_KEYS`], and the iOS device
+/// keys, `ios.device` and `ios.device.<attribute>`). A name
 /// kbf reads comes back in its canonical spelling: `osfamily` is `OSFamily`, `OS` is
 /// `os`, `GPU` is `gpu`, and `Label.Pool` is `label.Pool` (a label's own name keeps its
 /// case: labels are compared exactly). kbf's own spelling of one of its keys is that
