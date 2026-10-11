@@ -410,6 +410,48 @@ fn reapi_tls_flags_come_together() {
     }
 }
 
+/// Catches: a bind guard that refuses every address but loopback whatever the TLS
+/// flags (the REAPI listener over the internal CA's TLS, and the worker listener over
+/// mutual TLS, are how a server is reached from other machines), and
+/// `--reapi-plaintext-bind` accepted alongside REAPI TLS, where it would claim a plain
+/// text the listener does not serve.
+#[test]
+fn tls_listeners_may_bind_off_loopback() {
+    let pki = pki("off-loopback");
+    let (cert, key, ca) = (
+        path(&pki.dir, "server.pem"),
+        path(&pki.dir, "server.key"),
+        path(&pki.dir, "ca.pem"),
+    );
+    let mut argv = vec![
+        "kbf-server",
+        "--listen",
+        "0.0.0.0:0",
+        "--worker-listen",
+        "[::]:0",
+        "--reapi-tls-cert",
+        &cert,
+        "--reapi-tls-key",
+        &key,
+        "--worker-tls-cert",
+        &cert,
+        "--worker-tls-key",
+        &key,
+        "--worker-client-ca",
+        &ca,
+    ];
+    let args = Args::parse_from(&argv);
+    assert!(!args.reapi_plaintext_off_loopback());
+    let listeners = args.listeners().expect("TLS listeners off loopback");
+    assert!(listeners.reapi_tls.is_some() && listeners.worker_tls.is_some());
+
+    argv.push("--reapi-plaintext-bind");
+    assert!(
+        Args::try_parse_from(&argv).is_err(),
+        "--reapi-plaintext-bind accepted with --reapi-tls-cert"
+    );
+}
+
 /// Catches: the binary printing its start line (and serving) with a REAPI key that
 /// does not match its certificate, instead of exiting 2 before it.
 #[test]

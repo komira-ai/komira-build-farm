@@ -4,7 +4,9 @@
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
 //! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
-//! when the operator API listens. On Unix the SIGINT and SIGTERM handlers are installed
+//! when the operator API listens, then ` warning=reapi-plaintext-bind` at its very end
+//! when `--reapi-plaintext-bind` let the REAPI listener serve plain text on an address
+//! that is not loopback. On Unix the SIGINT and SIGTERM handlers are installed
 //! before that line is printed, so either signal any time after it stops the server
 //! with exit 0: open Execute and WaitExecution streams end UNAVAILABLE, REAPI
 //! connections are sent GOAWAY, and the server exits once they close or
@@ -13,6 +15,9 @@
 //!
 //! The REAPI listener runs the policy `--reapi-auth-policy` names; a policy file that
 //! cannot be read or is not a policy exits 2 before anything is bound.
+//!
+//! A listener that would serve plain text on an address that is not loopback exits 2
+//! before anything is bound, naming the flags that fix it (see [`Args::listeners`]).
 
 use std::error::Error;
 use std::future::Future;
@@ -64,15 +69,30 @@ async fn run<O: ObjectStore + 'static>(
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
-    println!("{}", start_line(bound.reapi, bound.worker, bound.api));
+    let warning = args.reapi_plaintext_off_loopback();
+    println!(
+        "{}",
+        start_line(bound.reapi, bound.worker, bound.api, warning)
+    );
     bound.serving.await?;
     Ok(())
 }
 
-/// The start line: the version and the addresses bound.
-fn start_line(reapi: SocketAddr, worker: SocketAddr, api: Option<SocketAddr>) -> String {
+/// The start line: the version and the addresses bound, and a warning when the REAPI
+/// listener serves plain text on an address that is not loopback.
+fn start_line(
+    reapi: SocketAddr,
+    worker: SocketAddr,
+    api: Option<SocketAddr>,
+    reapi_plaintext_off_loopback: bool,
+) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
-    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}")
+    let warning = if reapi_plaintext_off_loopback {
+        " warning=reapi-plaintext-bind"
+    } else {
+        ""
+    };
+    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{warning}")
 }
 
 /// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on

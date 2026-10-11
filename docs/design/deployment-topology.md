@@ -172,7 +172,10 @@ it, so the farm must look like one endpoint.
   job. Each server's REAPI listener serves the proxy over TLS with a certificate from
   the farm's internal CA (`--reapi-tls-cert`, `--reapi-tls-key`; the listener's TLS
   is built, the proxy is not), which the proxy trusts; a server whose proxy runs on the same host may serve it plain text on
-  loopback instead. The same internal-CA certificate lets a client that trusts that CA
+  loopback instead. A plain-text REAPI bind on any other address stops the server at
+  start unless `--reapi-plaintext-bind` is given (built; the start line then carries
+  a warning), and a worker listener off loopback needs mutual TLS
+  ([Security model](../../ARCHITECTURE.md#security-model)). The same internal-CA certificate lets a client that trusts that CA
   dial a server directly. It is a server certificate only, so it encrypts the hop and
   names the server but identifies no caller; the REAPI authentication policy
   ([reapi-auth.md](../reapi-auth.md)) decides who may call, over TLS as over plain
