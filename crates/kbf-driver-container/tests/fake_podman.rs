@@ -179,6 +179,42 @@ async fn an_index_digest_is_refused() {
     fake.assert_clean(1);
 }
 
+/// Catches the start-up check of a pinned image (`PodmanRuntime::check_pinned`, which
+/// `kbf-daemon --image` runs) passing an image the store does not hold, or refusing it
+/// without the exact `podman pull <repo>@sha256:<digest>` that fixes it; passing an
+/// index digest (the manifest's kind not asked); refusing an image that is there; and
+/// pulling or running anything while it checks.
+#[tokio::test]
+async fn a_pinned_image_is_checked_as_a_lease_checks_it() {
+    use kbf_driver_container::{ImageCheckError, ImageRef};
+
+    let fake = Fake::new("pinned");
+    let present = ImageRef::parse(&image()).expect("an image by digest");
+    assert_eq!(fake.runtime.check_pinned(&present).await, Ok(()));
+
+    let index = sha256(INDEX);
+    fake.store_manifest(&index, INDEX);
+    let listed = ImageRef::parse(&image_by(&index)).expect("an image by digest");
+    let refused = fake.runtime.check_pinned(&listed).await;
+    assert_eq!(refused, Err(ImageCheckError::Index(listed.clone())));
+    let why = refused.expect_err("an index").to_string();
+    assert!(
+        why.contains("name the per-architecture manifest digest"),
+        "{why}"
+    );
+
+    std::fs::remove_file(fake.state.join("image-id")).expect("rm");
+    let missing = fake.runtime.check_pinned(&present).await;
+    assert_eq!(missing, Err(ImageCheckError::Missing(present.clone())));
+    let why = missing.expect_err("missing").to_string();
+    let pull = format!(
+        "podman pull registry.test/tools/busybox@{}",
+        sha256(MANIFEST)
+    );
+    assert!(why.ends_with(&pull), "{why}");
+    assert_eq!(fake.calls(), ["image", "info", "image", "image"]);
+}
+
 /// Catches a missing image being pulled or run anyway (nodes never pull at action
 /// time; a node without the image is the farm's failure, not the client's), and an
 /// image store that cannot vouch for the manifest being trusted.

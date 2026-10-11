@@ -221,8 +221,14 @@ fn mac_status() -> NodeStatus {
                 fix: String::new(),
             },
         ],
+        container_images: Vec::new(),
     }
 }
+
+/// The container image the Linux node of `get_nodes_lists_each_nodes_newest_software`
+/// was pinned to (`--image`).
+const LINUX_IMAGE: &str = "docker://registry.test/tools/busybox@sha256:\
+    bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
 
 /// What `/v1/nodes` and the log say of `mac_status`'s Xcode 16.1.
 const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not \
@@ -233,8 +239,9 @@ const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed bu
 /// server drops (the worker stream ignores it), fields mapped to the wrong JSON keys,
 /// a node without status left out of the list or listed with an empty object instead
 /// of `null`, an older status kept over a newer one, a node still listed as connected
-/// after its stream ended, and an installed Xcode that is not ready missing from
-/// `xcodes` or from `needs_attention` (issue #164).
+/// after its stream ended, an installed Xcode that is not ready missing from
+/// `xcodes` or from `needs_attention` (issue #164), and a node's pinned container
+/// images (`NodeStatus.container_images`) not listed as `software.container_images`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
@@ -253,9 +260,10 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     let linux = FakeDaemon::connect_without_status(worker, hello("linux-1", 8, 16))
         .await
         .expect("registered");
-    linux.send(daemon_message::Message::NodeStatus(linux_status(
-        "6.8.0-45-generic",
-    )));
+    linux.send(daemon_message::Message::NodeStatus(NodeStatus {
+        container_images: vec![LINUX_IMAGE.to_owned()],
+        ..linux_status("6.8.0-45-generic")
+    }));
     let mac = FakeDaemon::connect_without_status(worker, hello("mac-1", 8, 16))
         .await
         .expect("registered");
@@ -288,7 +296,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             { "node_id": "linux-1", "connected": true, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
-                "xcode_builds": [], "xcodes": [] },
+                "xcode_builds": [], "xcodes": [],
+                "container_images": [LINUX_IMAGE] },
               "needs_attention": [],
               "placement": { "state": "serving" } },
             { "node_id": "mac-1", "connected": true, "software": {
@@ -300,7 +309,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                       "state": "license_not_accepted", "reason": "not agreed",
                       "fix": "sudo x -license accept" },
                     { "app": "/Applications/Xcode_16.2.app", "build": "16C5032a",
-                      "state": "ready", "reason": "", "fix": "" } ] },
+                      "state": "ready", "reason": "", "fix": "" } ],
+                "container_images": [] },
               "needs_attention": [NOT_READY],
               "placement": { "state": "serving" } },
             { "node_id": "old-1", "connected": true, "software": null,
