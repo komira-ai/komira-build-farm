@@ -35,10 +35,14 @@ out of that share first. It kills the whole lease when its own share is more tha
 the larger of `--lease-swap-kill-mib` (default 512) and `--lease-swap-kill-percent`
 (default 25) of its booking, which can happen only at a sample where it is pushing
 into swap at its cap. It reports that kill, like the kernel's own OOM kill at the
-lease's cap, as the action's out-of-memory kill (`MEMORY_KILL_OWN_LIMIT`). A job is
-never killed for host pressure: swap that host pressure moves out of a lease below
-its cap counts no `max` events, so it is never the lease's own, even when the lease
-later reaches its cap and pushes a few pages more. A kernel OOM kill by
+lease's cap, as the action's out-of-memory kill (`MEMORY_KILL_OWN_LIMIT`). Swap
+that host pressure moves out of a lease while it is below its cap counts no `max`
+events, so it is never the lease's own, even when the lease later reaches its cap and
+pushes a few pages more. One case is not told apart: swap that host pressure moves in
+the same sample in which the lease's `max` events grow counts as the lease's own (the
+two counters the watch reads cannot separate them). A lease that sits at its cap, for
+example one reading many files into page cache, can be killed for such swap once it
+adds up past the threshold. A kernel OOM kill by
 `actions/memory.max` or the host is reported as the node's
 (`MEMORY_KILL_NODE_PRESSURE`).
 

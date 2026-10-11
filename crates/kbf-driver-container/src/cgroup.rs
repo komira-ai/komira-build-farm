@@ -72,9 +72,10 @@ pub fn cpu_weight(cpu_millis: u64) -> Option<u64> {
 /// there itself is past the margin. The kill is reported as the lease's own
 /// out-of-memory kill.
 ///
-/// So a lease that host pressure swapped out is never killed for that swap: not while
-/// below its cap (no `max` events), and not when it later reaches its cap and pushes
-/// a few pages more (only those pages count). Nor is a lease that booked no memory
+/// So swap that host pressure moves while the lease is below its cap (no `max`
+/// events) is never counted against it, even when it later reaches its cap and pushes
+/// a few pages more (only those pages count). Swap host pressure moves in a sample in
+/// which `max` also grew is counted as the lease's own (see below). Nor is a lease that booked no memory
 /// (it has no cap). The previous sample is the last one read: a sample that cannot be
 /// read is skipped and changes nothing. The first sample is compared with zeros,
 /// which is what a new lease cgroup counts.

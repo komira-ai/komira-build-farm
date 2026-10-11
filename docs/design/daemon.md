@@ -353,9 +353,12 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   The floor spares a small action that brushes its cap for a few cold pages; the
   share scales the margin for large bookings. The previous sample is the last one the
   driver could read: a sample it cannot read is skipped and changes nothing, and the
-  first is compared with zeros (a new lease cgroup's counts). So a lease that host
-  pressure swapped out is never killed for that swap: not while below its cap, and
-  not when it later reaches its cap and pushes a few pages more (only those count).
+  first is compared with zeros (a new lease cgroup's counts). So swap that host
+  pressure moves while a lease is below its cap is never counted against it, even
+  when it later reaches its cap and pushes a few pages more (only those count). Swap
+  that host pressure moves in a sample in which the lease's `max` events also grew
+  counts as the lease's own: the two counters cannot tell them apart, so a lease that
+  sits at its cap (page cache counts toward `memory.max`) can be killed for it.
   Nor is one that booked no memory (no cap).
   The node's backstop is `memory.max` on `actions/`, set from
   `--actions-memory-max-gib` (or by whoever runs the daemon's unit). Nothing is capped
