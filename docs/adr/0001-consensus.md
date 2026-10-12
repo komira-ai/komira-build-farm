@@ -1,6 +1,8 @@
 # ADR 0001: Consensus
 
-Status: proposed; accepted when merged.
+Status: accepted. Its scope is extended by the high-availability design
+([ha.md](../design/ha.md)), which adds the items listed under
+[Scope extended](#scope-extended).
 
 ## Context
 
@@ -144,3 +146,20 @@ is a few thousand lines, and kbf's simulator is built to find its mistakes.
 - **Reversible.** The core's interface is the same shape as raft-rs's. If raft-rs
   releases an injectable random source and drops protobuf 2, or openraft ships a
   stable deterministic runtime, swapping stays inside `kbf-raft`.
+
+## Scope extended
+
+The high-availability design ([ha.md](../design/ha.md)) settles what this record left
+open ("anything beyond the scope above needs its own decision"). Three additions to the
+core, all still sans-IO and simulated like the rest:
+
+- **ReadIndex** (dissertation section 6.4), for the few reads a follower must answer
+  linearizably. No lease reads: they would put a clock assumption back in the core.
+- **Leadership transfer** (TimeoutNow, dissertation section 3.10), for a planned stop.
+- **InstallSnapshot by reference**: the message names a snapshot copy in the object
+  store and its SHA-256 instead of carrying the bytes; the core emits an effect for the
+  caller to fetch and restore it.
+
+Unchanged: one group with two state machines, single-server membership changes, and
+PreVote and CheckQuorum as listed above. Fencing does not use a leader lease
+([ha.md](../design/ha.md#53-fencing-without-a-leader-lease)).
