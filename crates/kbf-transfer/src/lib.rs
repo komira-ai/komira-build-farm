@@ -16,7 +16,7 @@
 //!   stores of tests), with [`digest_of`], [`fetch`] and [`label`].
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
-//! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams`.
+//! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.
 //! - [`Spool`]: an action's outputs gathered in one local file, which
 //!   [`Cas::put_spool`] stores; the engine sends them as whole segments over
 //!   `kbf.worker.v1.Segments` (`docs/design/write-path.md`, section 4), blob by blob
@@ -41,7 +41,9 @@ mod stats;
 mod wire;
 
 pub use cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, fetch, label};
-pub use config::{DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, TransferConfig};
+pub use config::{
+    DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, DEFAULT_SEGMENT_UPLOADS, TransferConfig,
+};
 pub use engine::{Scope, Transfers};
 pub use segments::{
     COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SEGMENT_UPLOAD_BYTES,

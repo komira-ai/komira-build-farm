@@ -11,6 +11,12 @@ pub const DEFAULT_IN_FLIGHT: usize = 64;
 /// (`--segment-upload-streams`): HTTP/2 streams on the engine's one connection.
 pub const DEFAULT_SEGMENT_STREAMS: usize = 16;
 
+/// Segment uploads in flight at once for one spool (`--segment-uploads-in-flight`): while
+/// one upload's `Commit` is checked and staged by the server, the next ones are sending.
+/// Their `PutRange` calls still take permits of the uploads' share, so this is a bound on
+/// the buffers of uploads begun, not a way past `--transfer-in-flight`.
+pub const DEFAULT_SEGMENT_UPLOADS: usize = 4;
+
 /// The engine's limits. Every field is a flag of `kbf-daemon` (crate `kbf-node`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
@@ -39,6 +45,9 @@ pub struct TransferConfig {
     /// The most `PutRange` (or `ReadRange`) calls one segment upload (or read) has in
     /// flight at once (`--segment-upload-streams`).
     pub segment_streams: usize,
+    /// The most segment uploads of one spool in flight at once
+    /// (`--segment-uploads-in-flight`); 1 sends them one after another.
+    pub segment_uploads: usize,
 }
 
 impl Default for TransferConfig {
@@ -52,6 +61,7 @@ impl Default for TransferConfig {
             stream_window_bytes: 8 << 20,
             retries: 3,
             segment_streams: DEFAULT_SEGMENT_STREAMS,
+            segment_uploads: DEFAULT_SEGMENT_UPLOADS,
         }
     }
 }

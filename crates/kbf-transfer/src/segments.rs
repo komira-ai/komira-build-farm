@@ -6,8 +6,9 @@
 //! [`MAX_SEGMENT_BYTES`] (a larger blob is a segment of its own), and the segments
 //! into uploads of at most [`SEGMENT_UPLOAD_BYTES`] and [`MAX_UPLOAD_RECORDS`], both
 //! under the smallest cap a server may run with, so every server admits every upload.
-//! An upload commits or fails whole, and the uploads of a spool go one after another,
-//! so a failed one costs its own blobs, not the ones committed before it.
+//! An upload commits or fails whole, and up to `--segment-uploads-in-flight` of a
+//! spool's uploads are in flight together (the server checks and stages one while the
+//! next ones send), so a failed one costs its own blobs, not the ones committed.
 //! Each upload is one `Begin` (the footers), `PutRange` calls of at most
 //! [`MAX_RANGE_BYTES`], `--segment-upload-streams` at once, cut from the spool file,
 //! and one `Commit`. A failed upload is tried once more; then its blobs go one
@@ -243,15 +244,21 @@ impl Scope {
             .zip(present)
             .filter_map(|(r, present)| (!present).then_some(r))
             .collect();
-        for upload in plan(
+        let uploads = plan(
             &missing,
             MAX_SEGMENT_BYTES,
             SEGMENT_UPLOAD_BYTES,
             MAX_UPLOAD_RECORDS,
-        ) {
-            self.upload_or_fall_back(&spool, &upload).await?;
-        }
-        Ok(())
+        );
+        // Owned items, as for the ranges below. The first failure stops the rest.
+        stream::iter(uploads)
+            .map(|upload| {
+                let spool = Arc::clone(&spool);
+                async move { self.upload_or_fall_back(&spool, &upload).await }
+            })
+            .buffer_unordered(self.inner.config.segment_uploads.max(1))
+            .try_for_each(|()| future::ready(Ok(())))
+            .await
     }
 
     /// One upload, tried twice, then blob by blob.
@@ -340,6 +347,10 @@ impl Scope {
         start: u64,
         end: u64,
     ) -> Result<(), Failed> {
+        // The permit first: a range read into memory waits for one no longer than the
+        // permits allow, so the ranges buffered stay within the uploads' share however
+        // many uploads are in flight.
+        let _permit = self.inner.upload_request().await;
         let mut bytes = Vec::with_capacity(usize::try_from(end - start).unwrap_or(0));
         for (offset, len) in segment.pieces(start, end) {
             bytes.extend(spool.read(offset, len).await.map_err(Failed::Spool)?);
@@ -350,7 +361,6 @@ impl Scope {
             offset: start,
             bytes,
         };
-        let _permit = self.inner.upload_request().await;
         add(&self.counts.write_calls, 1);
         self.segments()
             .put_range(request)

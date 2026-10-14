@@ -5,7 +5,9 @@
 //! writes blobs through the same one, so the in-flight limit and the byte budget hold
 //! for the whole process, over one HTTP/2 connection to `--cas`.
 
-use kbf_transfer::{DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, TransferConfig, Transfers};
+use kbf_transfer::{
+    DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, DEFAULT_SEGMENT_UPLOADS, TransferConfig, Transfers,
+};
 use tonic::transport::Endpoint;
 
 use super::{Cli, Error};
@@ -47,6 +49,12 @@ pub(crate) struct TransferArgs {
     /// of a segment-range read.
     #[arg(long, default_value_t = DEFAULT_SEGMENT_STREAMS as u64, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_streams: u64,
+    /// How many segment uploads of one action's outputs are in flight at once: the
+    /// server checks and stages one upload while the next are sending
+    /// (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take
+    /// permits of `--transfer-in-flight`'s uploads' share.
+    #[arg(long, default_value_t = DEFAULT_SEGMENT_UPLOADS as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    pub segment_uploads_in_flight: u64,
 }
 
 impl TransferArgs {
@@ -62,6 +70,7 @@ impl TransferArgs {
             stream_window_bytes: self.transfer_stream_window_bytes,
             retries: self.transfer_retries,
             segment_streams: size(self.segment_upload_streams),
+            segment_uploads: size(self.segment_uploads_in_flight),
         }
     }
 }
@@ -127,6 +136,7 @@ mod tests {
             "--transfer-stream-window-bytes=100000",
             "--transfer-retries=5",
             "--segment-upload-streams=9",
+            "--segment-uploads-in-flight=6",
         ])
         .expect("flags");
         let expected = TransferConfig {
@@ -138,6 +148,7 @@ mod tests {
             stream_window_bytes: 100_000,
             retries: 5,
             segment_streams: 9,
+            segment_uploads: 6,
         };
         assert_eq!(cli.transfer.config(), expected);
         for refused in [
@@ -145,6 +156,7 @@ mod tests {
             "--transfer-chunk-bytes=0",
             "--transfer-stream-window-bytes=100",
             "--segment-upload-streams=0",
+            "--segment-uploads-in-flight=0",
         ] {
             assert!(parse(&[refused]).is_err(), "{refused} accepted");
         }

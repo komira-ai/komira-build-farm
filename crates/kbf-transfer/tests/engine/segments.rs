@@ -32,7 +32,7 @@ enum Mode {
     /// Every Commit fails UNAVAILABLE.
     FailCommits,
     /// The second and third Commits fail UNAVAILABLE: the second upload and its one
-    /// retry (uploads go one after another).
+    /// retry (with `segment_uploads: 1`, uploads go one after another).
     FailSecondUpload,
     /// Every Begin is UNIMPLEMENTED, as a server without the service answers.
     Unimplemented,
@@ -382,7 +382,12 @@ async fn a_failing_commit_is_retried_once_then_blobs_go_one_by_one() {
 /// (mutant: `SEGMENT_UPLOAD_BYTES` back at 1 GiB + 1 MiB, one upload, no fall back).
 #[tokio::test]
 async fn a_failed_upload_keeps_the_ones_committed_before_it() {
-    let front = Front::start(Mode::FailSecondUpload).await;
+    // One upload at a time: which Commit is "the second" is only defined then.
+    let config = TransferConfig {
+        segment_uploads: 1,
+        ..TransferConfig::default()
+    };
+    let front = Front::with(Mode::FailSecondUpload, config).await;
     let (spool, digests) = spooled("second-fails", (0..10).map(|i| patterned(i, 10 << 20))).await;
     front.engine.put_spool(spool).await.expect("put spool");
     assert_eq!(
@@ -583,4 +588,44 @@ async fn held_ranges_leave_a_permit_for_another_leases_read() {
     front.range_gate.send_replace(true);
     upload.await.expect("upload").expect("put spool");
     assert!(front.all_present(&digests).await);
+}
+
+/// The 17.5 s of a cold unpack, step 6: the uploads of a spool went one after another,
+/// so the server's check of one never overlapped the sending of the next. With the
+/// server holding every `PutRange` and `--segment-uploads-in-flight` 4, the four uploads
+/// of ten 10 MiB blobs all `Begin` while none has committed; with 1 only the first does
+/// (the test then opens the gate, so it ends). After the gate opens every blob is
+/// present and each upload committed once. Mutant seen red: the `for` loop over uploads
+/// back (2 Begins at most, the wait below times out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_of_one_spool_are_in_flight_together() {
+    for (uploads, want_begins) in [(1, 1), (4, 4)] {
+        let config = TransferConfig {
+            segment_uploads: uploads,
+            ..TransferConfig::default()
+        };
+        let front = Arc::new(Front::with(Mode::Serve, config).await);
+        let (spool, digests) =
+            spooled("uploads-together", (0..10).map(|i| patterned(i, 10 << 20))).await;
+        front.range_gate.send_replace(false);
+        let sending = {
+            let front = Arc::clone(&front);
+            tokio::spawn(async move { front.engine.put_spool(spool).await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        // Ranges are held: nothing commits, so Begins counted are uploads in flight.
+        while front.begins.load(Ordering::SeqCst) < want_begins
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let begun = front.begins.load(Ordering::SeqCst);
+        assert_eq!(begun, want_begins, "{uploads} in flight allowed");
+        assert_eq!(front.commits.load(Ordering::SeqCst), 0);
+        front.range_gate.send_replace(true);
+        sending.await.expect("join").expect("put spool");
+        assert_eq!(front.commits.load(Ordering::SeqCst), 4);
+        assert!(front.all_present(&digests).await);
+    }
 }
