@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
 use kbf_proto::reapi::Digest;
@@ -39,7 +40,7 @@ use tonic::{Code, Status};
 use crate::cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, label};
 use crate::engine::Scope;
 use crate::spool::{Spool, Spooled, to_proto};
-use crate::stats::add;
+use crate::stats::{add, add_since};
 use crate::wire::MAX_MESSAGE_BYTES;
 
 /// The most bytes one upload declares, a blob larger than this being an upload of its
@@ -231,6 +232,13 @@ impl Scope {
 
     /// Stores every blob of `spool` the server lacks, as [`Cas::put_spool`] says.
     pub(crate) async fn upload_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
+        let started = Instant::now();
+        let stored = self.upload_spool_inner(spool).await;
+        add_since(&self.counts.upload_us, started);
+        stored
+    }
+
+    async fn upload_spool_inner(&self, spool: Arc<Spool>) -> Result<(), CasError> {
         let records = spool.records();
         let present = future::join_all(
             records
@@ -301,12 +309,12 @@ impl Scope {
                 })
                 .collect(),
         };
-        let id = client
-            .begin(begin)
-            .await
-            .map_err(Failed::Call)?
-            .into_inner()
-            .upload;
+        add(&self.counts.uploads, 1);
+        add(&self.counts.segments, upload.len() as u64);
+        let began = Instant::now();
+        let id = client.begin(begin).await;
+        add_since(&self.counts.begin_us, began);
+        let id = id.map_err(Failed::Call)?.into_inner().upload;
         // Owned items: a stream of borrowed ones is not `Send` for every lifetime.
         let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
         for (i, segment) in upload.iter().enumerate() {
@@ -318,10 +326,10 @@ impl Scope {
             .buffer_unordered(self.inner.config.segment_streams.max(1))
             .try_for_each(|()| future::ready(Ok(())))
             .await?;
-        client
-            .commit(CommitRequest { upload: id })
-            .await
-            .map_err(Failed::Call)?;
+        let committing = Instant::now();
+        let committed = client.commit(CommitRequest { upload: id }).await;
+        add_since(&self.counts.commit_us, committing);
+        committed.map_err(Failed::Call)?;
         let (blobs, bytes) = upload.iter().fold((0, 0), |(n, b), s| {
             (n + s.records.len() as u64, b + s.records_len)
         });
@@ -350,13 +358,15 @@ impl Scope {
             offset: start,
             bytes,
         };
+        let waiting = Instant::now();
         let _permit = self.inner.upload_request().await;
+        add_since(&self.counts.permit_wait_us, waiting);
         add(&self.counts.write_calls, 1);
-        self.segments()
-            .put_range(request)
-            .await
-            .map(drop)
-            .map_err(Failed::Call)
+        add(&self.counts.put_range_calls, 1);
+        let sending = Instant::now();
+        let sent = self.segments().put_range(request).await;
+        add_since(&self.counts.put_range_us, sending);
+        sent.map(drop).map_err(Failed::Call)
     }
 
     /// Sends each of `records` with its own ByteStream write, `--transfer-in-flight`

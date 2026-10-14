@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use kbf_types::LeaseId;
 
@@ -54,6 +55,33 @@ impl fmt::Display for TransferStats {
     }
 }
 
+/// Where a lease's output upload spent its time, for the driver's `outputs phases:`
+/// line. Milliseconds marked "summed" add up the durations of calls that run at once,
+/// so they can exceed the wall time; `upload_ms` is wall time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadStats {
+    /// FindMissing calls this lease's [`crate::Cas::missing`] made, each attempt counted.
+    pub find_missing_calls: u64,
+    /// Those calls' durations, summed, a wait for a request permit included.
+    pub find_missing_call_ms: u64,
+    /// Segment uploads attempted (Begin to Commit; a retried upload counts twice).
+    pub uploads: u64,
+    /// Segments those attempts declared.
+    pub segments: u64,
+    /// `PutRange` calls made.
+    pub put_range_calls: u64,
+    /// `Begin` calls' durations, summed.
+    pub begin_ms: u64,
+    /// `PutRange` calls' durations, summed (the wait for a permit is not in it).
+    pub put_range_ms: u64,
+    /// `Commit` calls' durations, summed.
+    pub commit_ms: u64,
+    /// Time `PutRange` calls waited for a share of the engine's request permits, summed.
+    pub permit_wait_ms: u64,
+    /// Wall time of [`crate::Cas::put_spool`] calls.
+    pub upload_ms: u64,
+}
+
 /// [`TransferStats`] as they are counted, and the lease they are logged for.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
@@ -67,6 +95,16 @@ pub(crate) struct Counts {
     pub written_bytes: AtomicU64,
     pub written_blobs: AtomicU64,
     pub retries: AtomicU64,
+    pub find_missing_calls: AtomicU64,
+    pub find_missing_us: AtomicU64,
+    pub uploads: AtomicU64,
+    pub segments: AtomicU64,
+    pub put_range_calls: AtomicU64,
+    pub begin_us: AtomicU64,
+    pub put_range_us: AtomicU64,
+    pub commit_us: AtomicU64,
+    pub permit_wait_us: AtomicU64,
+    pub upload_us: AtomicU64,
 }
 
 impl Counts {
@@ -92,6 +130,25 @@ impl Counts {
     }
 }
 
+impl Counts {
+    pub fn upload_stats(&self) -> UploadStats {
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let ms = |counter: &AtomicU64| get(counter) / 1000;
+        UploadStats {
+            find_missing_calls: get(&self.find_missing_calls),
+            find_missing_call_ms: ms(&self.find_missing_us),
+            uploads: get(&self.uploads),
+            segments: get(&self.segments),
+            put_range_calls: get(&self.put_range_calls),
+            begin_ms: ms(&self.begin_us),
+            put_range_ms: ms(&self.put_range_us),
+            commit_ms: ms(&self.commit_us),
+            permit_wait_ms: ms(&self.permit_wait_us),
+            upload_ms: ms(&self.upload_us),
+        }
+    }
+}
+
 impl Drop for Counts {
     fn drop(&mut self) {
         if let Some(lease) = &self.lease {
@@ -104,6 +161,14 @@ impl Drop for Counts {
 /// Adds `n` to `counter`.
 pub(crate) fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Adds the microseconds since `start` to `counter`.
+pub(crate) fn add_since(counter: &AtomicU64, start: Instant) {
+    add(
+        counter,
+        u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+    );
 }
 
 /// The process's transfers, now.

@@ -42,7 +42,7 @@ use crate::config::TransferConfig;
 use crate::find::Finder;
 use crate::flights::{Flights, Outcome, Publish};
 use crate::spool::Spool;
-use crate::stats::{Counts, EngineStats, TransferStats, add};
+use crate::stats::{Counts, EngineStats, TransferStats, UploadStats, add};
 use crate::wire::{Wire, WriteFailed, call_error, committed, retryable};
 
 /// The shared transfer engine of one daemon process
@@ -247,6 +247,10 @@ impl Cas for Scope {
         missing
     }
 
+    fn upload_stats(&self) -> UploadStats {
+        self.counts.upload_stats()
+    }
+
     fn in_flight(&self) -> usize {
         self.inner.config.in_flight
     }
@@ -342,6 +346,10 @@ impl Cas for Transfers {
 
     async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
         self.unscoped.put_spool(spool).await
+    }
+
+    fn upload_stats(&self) -> UploadStats {
+        self.unscoped.upload_stats()
     }
 
     fn in_flight(&self) -> usize {

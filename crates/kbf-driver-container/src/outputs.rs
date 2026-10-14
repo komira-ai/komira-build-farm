@@ -41,6 +41,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use kbf_daemon::cas::{Cas, digest_of};
 use kbf_proto::reapi::{
@@ -52,7 +53,7 @@ use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use crate::cas::FileBlob;
-use crate::pending::{FileAt, Pending};
+use crate::pending::{FileAt, Pending, Timings, millis};
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -361,6 +362,22 @@ pub(crate) async fn collect(
     limits: OutputLimits,
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
+    collect_timed(cas, upper, spools, working_directory, paths, limits, result)
+        .await
+        .map(drop)
+}
+
+/// [`collect`], returning where its time went.
+pub(crate) async fn collect_timed(
+    cas: &impl Cas,
+    upper: &Path,
+    spools: &Path,
+    working_directory: &str,
+    paths: &[String],
+    limits: OutputLimits,
+    result: &mut ActionResult,
+) -> Result<Timings, TreeError> {
+    let started = Instant::now();
     check_relative("working directory", working_directory)?;
     let base = upper.join(working_directory);
     let upper_fd = {
@@ -389,6 +406,7 @@ pub(crate) async fn collect(
         result,
     )
     .await?;
+    pending.timings.walk_ms = millis(started);
     pending.store_missing(cas, &upper_fd, spools).await
 }
 
@@ -433,9 +451,12 @@ async fn record(
             Some(Kind::File { .. }) => {
                 budget.entries(1, &shown)?;
                 let max = budget.bytes_left();
+                let started = Instant::now();
                 let read =
                     blocking(&shown, move || read_file(&parent, name.as_os_str(), max)).await?;
+                pending.timings.hashed(started);
                 let hashed = budget.file(read, &shown)?;
+                pending.timings.hash_bytes += hashed.blob.size();
                 let (digest, executable) = found_file(pending, hashed, &dirs, node_name, shown);
                 result.output_files.push(OutputFile {
                     path: path.clone(),
@@ -593,9 +614,12 @@ async fn walk(
             Kind::Other => {}
             Kind::File { .. } => {
                 let max = budget.bytes_left();
+                let started = Instant::now();
                 let read =
                     blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
+                pending.timings.hashed(started);
                 let hashed = budget.file(read, &path)?;
+                pending.timings.hash_bytes += hashed.blob.size();
                 let (digest, executable) =
                     found_file(pending, hashed, &top.parts, name.clone(), path);
                 top.directory.files.push(FileNode {

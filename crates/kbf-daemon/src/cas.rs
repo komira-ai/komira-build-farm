@@ -8,4 +8,4 @@
 //! `kbf.worker.v1` stream; they go over the engine's own connection.
 
 pub use kbf_transfer::cas::*;
-pub use kbf_transfer::{Spool, Spooled};
+pub use kbf_transfer::{Spool, Spooled, UploadStats};

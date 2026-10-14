@@ -28,9 +28,10 @@ use std::collections::HashSet;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
-use kbf_daemon::cas::{Cas, Spool, digest_of, label};
+use kbf_daemon::cas::{Cas, Spool, UploadStats, digest_of, label};
 use kbf_proto::reapi::Digest;
 use rustix::fs::Mode;
 
@@ -38,9 +39,81 @@ use crate::cas::FileBlob;
 use crate::outputs::{FILE, Identity, blocking, descend, identity};
 use crate::tree::TreeError;
 
+/// Where an action's output collection spent its time (the `outputs phases:` line).
+/// Each phase is one after the other, so these are wall times, except `hash_ms`, a
+/// part of `walk_ms`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Timings {
+    /// The walk, hashing included.
+    pub walk_ms: u64,
+    /// Hashing output files (a file at a time, on the blocking pool), within the walk.
+    pub hash_ms: u64,
+    /// Bytes of output files hashed.
+    pub hash_bytes: u64,
+    /// Output files hashed.
+    pub hash_files: u64,
+    /// `Cas::missing` over every digest.
+    pub find_missing_ms: u64,
+    /// Copying the missing blobs into the spool.
+    pub spool_ms: u64,
+    /// Bytes copied into the spool (the missing blobs').
+    pub spool_bytes: u64,
+    /// Blobs copied into the spool.
+    pub spool_blobs: u64,
+    /// `Cas::put_spool`, wall.
+    pub upload_ms: u64,
+}
+
+impl Timings {
+    /// Counts one file hashed since `started`.
+    pub(crate) fn hashed(&mut self, started: Instant) {
+        self.hash_ms += millis(started);
+        self.hash_files += 1;
+    }
+}
+
+/// The fields of the `outputs phases:` line: `t` (the driver's own steps, wall times
+/// one after another; `hash_ms` is inside `walk_ms`), `u` (what the transfer engine
+/// counted: `fm_ms`, `begin_ms`, `put_range_ms` and `commit_ms` add up calls that run at
+/// once, so they can exceed the wall time; `put_range_ms` leaves out `permit_wait_ms`,
+/// the wait for the engine's upload share of permits) and `logs_ms`, stdout and stderr.
+pub(crate) fn phases_line(t: &Timings, u: &UploadStats, logs_ms: u64) -> String {
+    format!(
+        "walk_ms={} hash_ms={} hash_bytes={} hash_files={} hash_threads=1 \
+         fm_calls={} fm_ms={} fm_wall_ms={} spool_ms={} spool_bytes={} spool_blobs={} \
+         upload_ms={} uploads={} segments={} put_range_calls={} begin_ms={} \
+         put_range_ms={} commit_ms={} permit_wait_ms={} logs_ms={}",
+        t.walk_ms,
+        t.hash_ms,
+        t.hash_bytes,
+        t.hash_files,
+        u.find_missing_calls,
+        u.find_missing_call_ms,
+        t.find_missing_ms,
+        t.spool_ms,
+        t.spool_bytes,
+        t.spool_blobs,
+        t.upload_ms,
+        u.uploads,
+        u.segments,
+        u.put_range_calls,
+        u.begin_ms,
+        u.put_range_ms,
+        u.commit_ms,
+        u.permit_wait_ms,
+        logs_ms,
+    )
+}
+
+/// Whole milliseconds since `started`.
+pub(crate) fn millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The distinct blobs of one action's outputs, in the order the walk found them.
 #[derive(Default)]
 pub(crate) struct Pending {
+    pub timings: Timings,
     blobs: Vec<(Digest, Blob)>,
     found: HashSet<String>,
 }
@@ -107,18 +180,34 @@ impl Pending {
     /// [`Cas::in_flight`] at a time ([`Pending::copy_missing`]). Fails with the first
     /// blob that cannot be copied or stored.
     pub(crate) async fn store_missing(
-        self,
+        mut self,
         cas: &impl Cas,
         upper: &Arc<OwnedFd>,
         spools: &Path,
-    ) -> Result<(), TreeError> {
+    ) -> Result<Timings, TreeError> {
         let digests: Vec<Digest> = self.blobs.iter().map(|(d, _)| d.clone()).collect();
+        let asked = Instant::now();
         let missing: HashSet<String> = cas.missing(&digests).await.iter().map(label).collect();
+        self.timings.find_missing_ms = millis(asked);
+        for (digest, _) in self
+            .blobs
+            .iter()
+            .filter(|(d, _)| missing.contains(&label(d)))
+        {
+            self.timings.spool_blobs += 1;
+            self.timings.spool_bytes += u64::try_from(digest.size_bytes).unwrap_or(0);
+        }
+        let mut timings = self.timings;
         let dir = spools.to_owned();
         let spool = Arc::new(blocking(spools, move || Spool::create(&dir)).await?);
+        let copying = Instant::now();
         self.copy_missing(&missing, &*spool, upper, cas.in_flight())
             .await?;
-        Ok(cas.put_spool(spool).await?)
+        timings.spool_ms = millis(copying);
+        let uploading = Instant::now();
+        cas.put_spool(spool).await?;
+        timings.upload_ms = millis(uploading);
+        Ok(timings)
     }
 
     /// Stores the blobs `missing` names (labels) into `into`, at most `in_flight` at a

@@ -47,5 +47,5 @@ pub use segments::{
     COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SEGMENT_UPLOAD_BYTES,
 };
 pub use spool::{Spool, Spooled};
-pub use stats::{EngineStats, TransferStats};
+pub use stats::{EngineStats, TransferStats, UploadStats};
 pub use wire::MAX_MESSAGE_BYTES;

@@ -23,6 +23,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use kbf_proto::reapi::Digest;
 use tokio::sync::oneshot;
@@ -30,7 +31,7 @@ use tonic::Code;
 
 use crate::cas::label;
 use crate::engine::Inner;
-use crate::stats::{Counts, add};
+use crate::stats::{Counts, add, add_since};
 
 /// The questions waiting for the next FindMissing call.
 #[derive(Debug, Default)]
@@ -119,7 +120,10 @@ impl Inner {
         let calls = digests
             .chunks(self.config.find_missing_chunk)
             .map(|chunk| async move {
+                let asked = Instant::now();
                 let missing = self.find_missing(chunk.to_vec()).await;
+                add(&counts.find_missing_calls, 1);
+                add_since(&counts.find_missing_us, asked);
                 chunk
                     .iter()
                     .filter(|d| missing.as_ref().is_none_or(|m| m.contains(&label(d))))

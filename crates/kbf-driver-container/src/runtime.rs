@@ -48,15 +48,16 @@ use crate::image::{
     ImageCheckError, ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind,
 };
 use crate::keeper::Keeper;
-use crate::outputs::{OutputLimits, collect_log};
+use crate::outputs::{OutputLimits, collect_log, collect_timed};
+use crate::pending::{millis, phases_line};
 use crate::podman::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
 };
 use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, materialize_cached,
-    output_paths, prepare_outputs, refuse_hidden_working_directory,
+    TreeError, check_relative, fetch_message, materialize, materialize_cached, output_paths,
+    prepare_outputs, refuse_hidden_working_directory,
 };
 
 /// The driver name in the node report.
@@ -532,7 +533,7 @@ impl<C: Cas> PodmanRuntime<C> {
         let upload = async {
             // The outputs the server lacks go through a spool in the lease's scratch
             // directory (the daemon's, outside the container) as whole segments.
-            collect(
+            let timings = collect_timed(
                 cas,
                 &spec.upper,
                 &lease.dir,
@@ -544,12 +545,18 @@ impl<C: Cas> PodmanRuntime<C> {
             .await
             .map_err(outputs_error)?;
             let max = self.config.outputs.max_stdio_bytes;
+            let logs = Instant::now();
             for (path, slot) in [
                 (&stdout_path, &mut result.stdout_digest),
                 (&stderr_path, &mut result.stderr_digest),
             ] {
                 *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
             }
+            tracing::info!(
+                lease = %lease.name,
+                "outputs phases: {}",
+                phases_line(&timings, &cas.upload_stats(), millis(logs))
+            );
             Ok(())
         };
         upload_within(self.config.upload_deadline, upload).await?;

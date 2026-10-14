@@ -19,6 +19,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::config::DEFAULT_IN_FLIGHT;
 use crate::spool::Spool;
+use crate::stats::UploadStats;
 
 /// The most bytes one ByteStream `WriteRequest` carries by default
 /// (`--transfer-chunk-bytes`): the front's read chunk size, well under its message
@@ -136,6 +137,12 @@ pub trait Cas: Send + Sync + 'static {
         async move { crate::segments::put_each(self, &spool).await }
     }
 
+    /// Where this lease's uploads spent their time so far. The transfer engine's
+    /// [`crate::Scope`] counts it; this default is a store with nothing to count.
+    fn upload_stats(&self) -> UploadStats {
+        UploadStats::default()
+    }
+
     /// How many requests this store runs at once, for the whole process. A caller that
     /// queues work ahead of the store (a tree walk holding files open for upload) keeps
     /// no more than this many items queued, so it holds that many, not the whole tree.
@@ -183,6 +190,10 @@ impl<C: Cas> Cas for Arc<C> {
 
     fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
         C::put_spool(self, spool)
+    }
+
+    fn upload_stats(&self) -> UploadStats {
+        C::upload_stats(self)
     }
 
     fn in_flight(&self) -> usize {
