@@ -299,8 +299,14 @@ that call and the daemon falls back to per-blob reads.
 ## 5. Capabilities (REAPI clients)
 
 - `max_batch_total_size_bytes` is **already** advertised as `MAX_BATCH_TOTAL_BYTES`
-  (4 MiB, `kbf-front/src/capabilities.rs`). Whether buck2 sizes its `BatchUpdateBlobs`
-  calls by it or by its own setting is to be checked on the pilot.
+  (1 GiB, `kbf-front/src/capabilities.rs`). buck2 sends batches of the smaller of this
+  and its own `max_total_batch_size`, so a client's setting is the batch size and this is
+  the ceiling; blobs at or over that size go through ByteStream in messages of that size
+  (buck2 allocates a buffer of that size per upload in flight). A setting of 64 MiB
+  (`[buck2_re_client] max_total_batch_size = 67108864`) keeps a batch to a few streams'
+  worth of work: one batch is one call on one stream, so a very large one serialises
+  what several calls would carry in parallel. buck2 sizes its decode limit as twice the
+  batch size, so the server's message limit must stay at least that.
 - **zstd.** Advertise `supported_compressors` and `supported_batch_update_compressors`
   = `[ZSTD]`, and serve `compressed-blobs/zstd/...` on ByteStream (refused today in
   `kbf-front/src/wire.rs`), in the same change that decodes it, since a client that

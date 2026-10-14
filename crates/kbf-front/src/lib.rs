@@ -70,7 +70,8 @@ pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError,
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, MAX_ADMISSION_BYTES,
-    MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, TierStartError,
+    MAX_CONCURRENT_STREAMS, MESSAGE_BYTES_IN_FLIGHT, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
+    READ_BYTES_IN_FLIGHT, READ_COPIES, ResponseHold, STREAM_WINDOW_BYTES, TierStartError,
     TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
@@ -96,12 +97,21 @@ pub use crate::segments::{
 };
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
-/// advertised in the capabilities. Larger blobs go through ByteStream.
-pub const MAX_BATCH_TOTAL_BYTES: usize = 4 << 20;
+/// advertised in the capabilities. Larger blobs go through ByteStream. A client takes
+/// the smaller of this and its own setting, so this is a ceiling, not a batch size:
+/// what a batch of this size holds in memory is bounded by [`MESSAGE_BYTES_IN_FLIGHT`]
+/// and [`READ_BYTES_IN_FLIGHT`], not by this.
+pub const MAX_BATCH_TOTAL_BYTES: usize = 1 << 30;
 
-/// The largest gRPC message the cache services accept or send: a full batch plus room
-/// for the digests and statuses around it.
+/// The largest gRPC message the cache services (CAS and ByteStream) accept or send: a
+/// full batch plus room for the digests and statuses around it. It stays under the
+/// 2 GiB a protobuf message cannot reach.
 pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
+
+/// The largest gRPC message the services that carry no blob batches (Execution, Worker,
+/// Segments) accept or send. Their messages are small; a limit of the cache's size here
+/// would let a stream of one of them make the server hold a gigabyte for nothing.
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = (4 << 20) + (1 << 20);
 
 /// The largest blob the cache accepts. A ByteStream Write is held in memory until it
 /// is verified, so without a cap a client could make the front buffer whatever size
@@ -184,8 +194,8 @@ where
         )
         .recording(recorder.clone()),
     )
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
     cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
 }

@@ -230,6 +230,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 "batch asks for {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
+        // Held until the response has been sent, not only until this function returns:
+        // the response and its encoding are copies of the data too.
+        let hold = self.cache.admit_read(total).await;
         let parsed: Vec<Result<Digest, Status>> = request
             .digests
             .iter()
@@ -277,7 +280,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
             .call(&metadata, &caller, &request.instance_name, &|| {
                 CallKind::Downloaded(downloaded as u64)
             });
-        Ok(Response::new(BatchReadBlobsResponse { responses }))
+        let mut response = Response::new(BatchReadBlobsResponse { responses });
+        response.extensions_mut().insert(hold);
+        Ok(response)
     }
 
     type GetTreeStream = Stream<GetTreeResponse>;

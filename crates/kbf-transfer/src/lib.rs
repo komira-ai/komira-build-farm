@@ -48,4 +48,4 @@ pub use segments::{
 };
 pub use spool::{Spool, Spooled};
 pub use stats::{EngineStats, TransferStats};
-pub use wire::MAX_MESSAGE_BYTES;
+pub use wire::{MAX_CONTROL_MESSAGE_BYTES, MAX_MESSAGE_BYTES};

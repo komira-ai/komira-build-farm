@@ -31,6 +31,10 @@ async fn front() -> Arc<Transfers> {
 #[test]
 fn the_decode_limit_is_the_fronts_message_limit() {
     assert_eq!(MAX_MESSAGE_BYTES, kbf_front::MAX_MESSAGE_BYTES);
+    assert_eq!(
+        kbf_transfer::MAX_CONTROL_MESSAGE_BYTES,
+        kbf_front::MAX_CONTROL_MESSAGE_BYTES
+    );
 }
 
 /// Catches an engine that loses or reorders bytes on the way in or out: an empty blob,

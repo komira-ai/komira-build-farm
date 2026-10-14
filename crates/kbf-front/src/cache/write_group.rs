@@ -54,12 +54,30 @@ pub const PUT_BACKOFF_FACTOR: u32 = 4;
 /// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over this.
 pub const MAX_ADMISSION_BYTES: u64 = u32::MAX as u64;
 
+/// The most bytes batch reads hold at once ([`Cache::admit_read`]): a read of `n` bytes
+/// of blobs holds the blobs, the response's copy of them and the encoded message, so it
+/// counts [`READ_COPIES`] times `n`, until its response has been sent. At 1 GiB per
+/// batch that is two full batches at a time.
+pub const READ_BYTES_IN_FLIGHT: u64 = 6 << 30;
+
+/// How many copies of a batch read's data the server holds while answering it.
+pub const READ_COPIES: u64 = 3;
+
+/// The most bytes of gRPC messages the server's listeners hold decoded or being
+/// decoded for one call each at once (`kbf-server`'s in-flight layer, which counts the
+/// length a message's own prefix declares): without it, [`MAX_CONCURRENT_STREAMS`]
+/// calls of [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES) each could make the server
+/// hold that many gigabytes before [`Cache::admit`] sees any. A call holds its share
+/// until its response is sent.
+pub const MESSAGE_BYTES_IN_FLIGHT: u64 = 4 << 30;
+
 /// The most HTTP/2 streams one connection may have open on either of the server's
 /// listeners. A `BatchUpdateBlobs` request is decoded (up to
 /// [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES)) before [`Cache::admit`] sees it,
-/// and so is a ByteStream `Write`'s first message, so what one connection can make the
-/// server hold outside the admission bound is this many messages, plus this many
-/// [`STREAM_WINDOW_BYTES`] of data received but not yet read.
+/// and so is a ByteStream `Write`'s first message; [`MESSAGE_BYTES_IN_FLIGHT`] bounds
+/// the sum of those messages across all streams and connections (the server's
+/// in-flight layer), so what is held outside the admission bound is at most that, plus
+/// this many [`STREAM_WINDOW_BYTES`] of data received but not yet read.
 pub const MAX_CONCURRENT_STREAMS: u32 = 200;
 
 /// The HTTP/2 flow-control window of each stream on either listener: how much a
@@ -125,6 +143,15 @@ pub struct Admitted {
     _permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
+/// Bytes admitted for a batch read ([`Cache::admit_read`]), freed when the last clone
+/// is dropped. Put in a response's extensions, it is held until the response body has
+/// been sent: `kbf-server`'s in-flight layer moves it onto the body.
+#[derive(Clone, Debug)]
+pub struct ResponseHold {
+    /// Held for its drop, which releases the bytes.
+    _permit: Arc<Option<OwnedSemaphorePermit>>,
+}
+
 /// The open segment, the bounds, and the ByteStream buffer gauge of one cache.
 #[derive(Debug)]
 pub(super) struct Group {
@@ -132,6 +159,8 @@ pub(super) struct Group {
     /// What [`Cache::admit`] takes, in bytes; the bound clamped to what a semaphore holds.
     admission: Arc<Semaphore>,
     bound: u64,
+    /// What [`Cache::admit_read`] takes.
+    read_admission: Arc<Semaphore>,
     puts: Semaphore,
     state: Mutex<State>,
     buffered: AtomicU64,
@@ -194,6 +223,7 @@ impl Group {
             // `bound` is at most `MAX_PERMITS`, a `usize`.
             admission: Arc::new(Semaphore::new(bound as usize)),
             bound,
+            read_admission: Arc::new(Semaphore::new(READ_BYTES_IN_FLIGHT as usize)),
             puts: Semaphore::new(config.puts_in_flight.get()),
             state: Mutex::new(State::default()),
             buffered: AtomicU64::new(0),
@@ -299,6 +329,32 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Admitted {
             _permit: permit.map(Arc::new),
         }
+    }
+
+    /// Waits until a batch read of `bytes` of blobs fits under [`READ_BYTES_IN_FLIGHT`]
+    /// ([`READ_COPIES`] times `bytes`, at most what one semaphore call takes) and takes
+    /// it. The returned hold frees the bytes when its last clone is dropped, which the
+    /// caller hands to the response ([`ResponseHold`]) so it lasts until the message is
+    /// sent.
+    pub async fn admit_read(&self, bytes: u64) -> ResponseHold {
+        let n = bytes
+            .saturating_mul(READ_COPIES)
+            .min(READ_BYTES_IN_FLIGHT)
+            .min(u64::from(u32::MAX));
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        let permit = Arc::clone(&self.group.read_admission)
+            .acquire_many_owned(n)
+            .await
+            .ok();
+        ResponseHold {
+            _permit: Arc::new(permit),
+        }
+    }
+
+    /// The bytes [`Cache::admit_read`] has handed out and not had back.
+    #[must_use]
+    pub fn read_bytes_admitted(&self) -> u64 {
+        READ_BYTES_IN_FLIGHT - self.group.read_admission.available_permits() as u64
     }
 
     /// The bytes [`Cache::admit`] has handed out and not yet had back: what uploads

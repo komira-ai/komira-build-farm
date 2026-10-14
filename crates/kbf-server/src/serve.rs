@@ -12,8 +12,9 @@ use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    MAX_CONCURRENT_STREAMS, MAX_CONTROL_MESSAGE_BYTES, MAX_MESSAGE_BYTES, MetaLog,
+    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig,
+    SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -357,16 +358,19 @@ where
         SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
         peers.clone(),
     ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES);
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
     ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES);
+    // One budget for the message bytes both listeners hold, so a client of either
+    // counts against the same memory.
+    let inflight = crate::inflight::InFlightLayer::new(kbf_front::MESSAGE_BYTES_IN_FLIGHT);
     let (closer, closing) = kbf_front::closing();
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -400,11 +404,13 @@ where
         // the health service is served over the same TLS as the REAPI routes; the
         // authenticator is already applied to those routes alone (above).
         let reapi_serve = reapi_server
+            .layer(inflight.clone())
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
             });
         let worker_serve = worker_server
+            .layer(inflight)
             .add_service(worker_service)
             .add_service(worker_blobs)
             .add_service(worker_cas)

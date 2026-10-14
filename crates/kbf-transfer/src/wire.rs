@@ -17,10 +17,13 @@ use tonic::{Code, Status, Streaming};
 
 use crate::cas::{CasError, Chunks, label};
 
-/// The largest gRPC message the engine decodes: kbf-front's `MAX_MESSAGE_BYTES`, a full
-/// 4 MiB batch plus room for the digests and statuses around it. tonic's default of
-/// 4 MiB would refuse a full batch once framing is added.
-pub const MAX_MESSAGE_BYTES: usize = (4 << 20) + (1 << 20);
+/// The largest gRPC message the engine decodes from the cache services: kbf-front's
+/// `MAX_MESSAGE_BYTES`, a full 1 GiB batch plus room for the digests and statuses
+/// around it. tonic's default of 4 MiB would refuse a full batch once framing is added.
+pub const MAX_MESSAGE_BYTES: usize = (1 << 30) + (1 << 20);
+
+/// The largest `Segments` message: kbf-front's `MAX_CONTROL_MESSAGE_BYTES`.
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = (4 << 20) + (1 << 20);
 
 /// The clients over the engine's one connection. The server serves one cache per cell,
 /// so resource names carry no instance name.

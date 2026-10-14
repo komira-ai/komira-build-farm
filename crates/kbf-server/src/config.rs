@@ -247,10 +247,11 @@ pub struct Args {
     /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
     /// total, a segment upload's Begin for its whole length; a caller over the bound
     /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
-    /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
-    /// stream's message as tonic decodes it, before the handler runs, up to 5 MiB per
-    /// stream and 200 streams per connection on either listener
-    /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
+    /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered
+    /// here: each HTTP/2 stream's message as tonic decodes it, before the handler runs,
+    /// up to 1 GiB per stream and 200 streams per connection on either listener
+    /// (`kbf_front::MAX_CONCURRENT_STREAMS`); the in-flight layer counts those against
+    /// one budget of `kbf_front::MESSAGE_BYTES_IN_FLIGHT`.
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,

@@ -55,6 +55,7 @@ pub mod health;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
+pub mod inflight;
 pub mod machine;
 pub mod mdm;
 mod memory;

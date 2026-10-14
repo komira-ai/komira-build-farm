@@ -38,7 +38,7 @@ use crate::cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, label};
 use crate::engine::Scope;
 use crate::spool::{Spool, Spooled, to_proto};
 use crate::stats::add;
-use crate::wire::MAX_MESSAGE_BYTES;
+use crate::wire::MAX_CONTROL_MESSAGE_BYTES;
 
 /// The most bytes one upload declares: one largest blob (1 GiB) and its footer, with
 /// room to spare. kbf-server refuses to start with a smaller
@@ -466,8 +466,8 @@ impl Scope {
 /// message limit.
 pub(crate) fn client(channel: Channel) -> SegmentsClient<Channel> {
     SegmentsClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
 }
 
 /// The bytes of the spooled blob `r`, `chunk` bytes at a time, read when asked for.

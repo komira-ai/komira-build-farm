@@ -312,7 +312,7 @@ capabilities.
 | digest functions | SHA-256 only |
 | `action_cache_update_capabilities.update_enabled` | `false`: only the daemon path writes the action cache ([The closure check](#the-closure-check)) |
 | cache priorities | one range, `[0, 0]`: retention follows the last touch alone ([Retention and touches](#retention-and-touches)), so a priority is accepted and changes nothing |
-| `max_batch_total_size_bytes` | 4 MiB (`MAX_BATCH_TOTAL_BYTES`) |
+| `max_batch_total_size_bytes` | 1 GiB (`MAX_BATCH_TOTAL_BYTES`); a client sends the smaller of this and its own setting |
 | symlink absolute path strategy | `ALLOWED` |
 | compressors | none (zstd is **planned**, below) |
 | API versions | 2.0 to 2.3 |

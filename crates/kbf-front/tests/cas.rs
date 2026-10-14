@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Blob, Farm, days};
-use kbf_front::MAX_BATCH_TOTAL_BYTES;
+use kbf_front::{MAX_BATCH_TOTAL_BYTES, MAX_MESSAGE_BYTES};
 use kbf_meta::Command;
 use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::reapi::{
@@ -264,6 +264,120 @@ async fn batch_update_verifies_each_blob_and_batch_read_answers_each() {
         })
         .await
         .expect_err("over the limit");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+}
+
+/// One blob of `len` bytes all equal to `fill`, as an upload entry and its digest.
+fn flat_blob(len: usize, fill: u8) -> (reapi::batch_update_blobs_request::Request, reapi::Digest) {
+    let data = vec![fill; len];
+    let digest = kbf_segments::sha256(&data);
+    let proto = reapi::Digest {
+        hash: digest.hash_hex(),
+        size_bytes: i64::try_from(len).expect("size"),
+    };
+    let request = reapi::batch_update_blobs_request::Request {
+        digest: Some(proto.clone()),
+        data,
+        ..Default::default()
+    };
+    (request, proto)
+}
+
+/// Catches: a message limit that stops below the batch limit the capabilities
+/// advertise, so a client that sizes its batches by the advertisement (buck2 takes the
+/// smaller of that and its own setting) gets a transport error instead of a batch:
+/// - a `BatchUpdateBlobs` of exactly `MAX_BATCH_TOTAL_BYTES` (four blobs) must store
+///   every blob and a `BatchReadBlobs` of the same total must return them intact;
+/// - the limit must be the 1 GiB the farm is run with, not a number a later edit
+///   lowers unseen;
+/// - a batch one byte over the limit is refused INVALID_ARGUMENT (not decoded into a
+///   store call, not a transport failure) for both calls, and a refused batch stores
+///   nothing.
+#[tokio::test]
+async fn a_batch_of_the_limit_round_trips_and_one_byte_more_is_refused() {
+    assert_eq!(MAX_BATCH_TOTAL_BYTES, 1 << 30);
+    const {
+        assert!(
+            MAX_MESSAGE_BYTES < (2 << 30),
+            "protobuf cannot encode 2 GiB"
+        );
+    }
+    let farm = Farm::start().await;
+    let part = MAX_BATCH_TOTAL_BYTES / 4;
+    let (requests, digests): (Vec<_>, Vec<_>) = (1u8..=4).map(|i| flat_blob(part, i)).unzip();
+    let sent = farm
+        .cas()
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests,
+            ..Default::default()
+        })
+        .await
+        .expect("a batch of the limit")
+        .into_inner();
+    assert!(
+        sent.responses
+            .iter()
+            .all(|r| r.status.as_ref().expect("status").code == 0)
+    );
+    let read = farm
+        .cas()
+        .batch_read_blobs(BatchReadBlobsRequest {
+            digests: digests.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("a read of the limit")
+        .into_inner();
+    let back: Vec<(i32, usize, u8)> = read
+        .responses
+        .iter()
+        .map(|r| {
+            (
+                r.status.as_ref().expect("status").code,
+                r.data.len(),
+                r.data[part / 2],
+            )
+        })
+        .collect();
+    assert_eq!(
+        back,
+        [(0, part, 1), (0, part, 2), (0, part, 3), (0, part, 4)]
+    );
+    drop(read);
+
+    let (over, over_digest) = flat_blob(MAX_BATCH_TOTAL_BYTES + 1, 9);
+    let refused = farm
+        .cas()
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests: vec![over],
+            ..Default::default()
+        })
+        .await
+        .expect_err("one byte over the limit");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    let missing = farm
+        .cas()
+        .find_missing_blobs(FindMissingBlobsRequest {
+            blob_digests: vec![over_digest.clone()],
+            ..Default::default()
+        })
+        .await
+        .expect("FindMissingBlobs")
+        .into_inner()
+        .missing_blob_digests;
+    assert_eq!(
+        missing,
+        std::slice::from_ref(&over_digest),
+        "a refused batch stores nothing"
+    );
+    let refused = farm
+        .cas()
+        .batch_read_blobs(BatchReadBlobsRequest {
+            digests: vec![over_digest],
+            ..Default::default()
+        })
+        .await
+        .expect_err("a read one byte over the limit");
     assert_eq!(refused.code(), Code::InvalidArgument);
 }
 
