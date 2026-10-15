@@ -231,7 +231,16 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("--output-upload-deadline-secs"), "{why}");
-        assert!(why.contains("stopped after 5"), "{why}");
+        // How long it ran: never less than the deadline, and not "never". An upper bound
+        // tighter than that fails on a loaded runner whose timer fires late (61 ms on
+        // macOS for a 50 ms deadline).
+        let tail = why
+            .rsplit("stopped after ")
+            .next()
+            .expect("a split has an item");
+        let ran = tail.trim_end_matches("\")").trim_end_matches("ms");
+        let ms: f64 = ran.parse().expect("the elapsed time is in milliseconds");
+        assert!((50.0..10_000.0).contains(&ms), "{why}");
     }
 
     /// Catches an upload that finishes in time being failed or changed.
