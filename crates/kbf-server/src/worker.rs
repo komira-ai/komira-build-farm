@@ -34,12 +34,17 @@
 //!   unless a newer stream of the node has registered since;
 //! - after the server ends a stream, nothing more is read from it;
 //! - an `Offer` is not read yet.
+//!
+//! [`LocalWorker`] opens the same session by a call, for a daemon in the server's own
+//! process: no listener, TLS or encoding, and no certificate, so it is admitted as on a
+//! plain-text listener.
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{Stream, stream};
+use futures::future::BoxFuture;
+use futures::{Stream, StreamExt as _, stream};
 use kbf_caps::NodeCaps;
 use kbf_front::MetaLog;
 use kbf_objstore::ObjectStore;
@@ -109,8 +114,28 @@ where
         let certs = request.peer_certs();
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
-        let mut inbound = request.into_inner();
-        let first = timeout(self.hello_wait, inbound.message())
+        let inbound = Box::pin(request.into_inner());
+        self.open(peer, inbound).await.map(Response::new)
+    }
+}
+
+/// What a daemon sends on a session: its messages, or the error that ended its stream.
+pub type DaemonStream = Pin<Box<dyn Stream<Item = Result<DaemonMessage, Status>> + Send>>;
+
+impl<M, O> WorkerService<M, O>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    /// A session over `inbound`, whose certificate is `peer`, from its first `Hello` on,
+    /// as the module docs say: what a `Session` call on the worker listener runs, and
+    /// what a daemon in this process opens ([`crate::LocalWorker`]).
+    async fn open(
+        &self,
+        peer: Option<PeerCert>,
+        mut inbound: DaemonStream,
+    ) -> Result<SessionStream, Status> {
+        let first = timeout(self.hello_wait, next_message(&mut inbound))
             .await
             .map_err(|_| Status::deadline_exceeded("no Hello within the wait"))??;
         let Some(daemon_message::Message::Hello(hello)) = first.and_then(|m| m.message) else {
@@ -158,10 +183,50 @@ where
             stream,
         };
         tokio::spawn(session.serve(inbound, outbound));
-        Ok(Response::new(Box::pin(stream::unfold(
+        Ok(Box::pin(stream::unfold(
             responses,
             |mut responses| async move { responses.recv().await.map(|m| (m, responses)) },
-        ))))
+        )))
+    }
+}
+
+/// The `Worker` service as calls in this process: what a daemon run in the server's own
+/// process (`kbf-all-in-one`) opens its sessions through, with no listener, TLS or
+/// encoding between them. A session opened here is the one a `Session` call on the
+/// worker listener opens, with no certificate: admitted as on a plain-text listener,
+/// with no deny list. Clones share the service.
+#[derive(Clone)]
+pub struct LocalWorker {
+    inner: Arc<dyn Open>,
+}
+
+/// [`LocalWorker`]'s one call over a service of any metadata log and object store.
+trait Open: Send + Sync {
+    fn open(&self, inbound: DaemonStream) -> BoxFuture<'_, Result<SessionStream, Status>>;
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> Open for WorkerService<M, O> {
+    fn open(&self, inbound: DaemonStream) -> BoxFuture<'_, Result<SessionStream, Status>> {
+        Box::pin(Self::open(self, None, inbound))
+    }
+}
+
+impl LocalWorker {
+    /// Sessions opened through `service`.
+    pub fn new<M: MetaLog, O: ObjectStore + 'static>(service: WorkerService<M, O>) -> Self {
+        Self {
+            inner: Arc::new(service),
+        }
+    }
+
+    /// Opens a session over `inbound`, the daemon's messages, as a `Session` call does:
+    /// its first message must be a `Hello` the service accepts. Returns the server's
+    /// messages, `Welcome` first.
+    ///
+    /// # Errors
+    /// The status a `Session` call would end with before its `Welcome`.
+    pub async fn session(&self, inbound: DaemonStream) -> Result<SessionStream, Status> {
+        self.inner.open(inbound).await
     }
 }
 
@@ -177,9 +242,9 @@ struct Session<M, O> {
 
 impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
     /// Handles the stream's messages until it ends, or one of them ends it.
-    async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
+    async fn serve(self, mut inbound: DaemonStream, outbound: Outbound) {
         let worker = &self.worker;
-        while let Ok(Some(received)) = inbound.message().await {
+        while let Ok(Some(received)) = next_message(&mut inbound).await {
             // The response stream outlives this loop unless the stream is gone.
             match self.handle(received.message, &outbound).await {
                 Ok(None) => {}
@@ -274,6 +339,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
         };
         Ok(reply)
     }
+}
+
+/// The daemon's next message: `None` once its stream has ended, an error if it failed.
+async fn next_message(inbound: &mut DaemonStream) -> Result<Option<DaemonMessage>, Status> {
+    inbound.next().await.transpose()
 }
 
 fn message(message: server_message::Message) -> ServerMessage {

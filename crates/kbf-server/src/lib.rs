@@ -90,7 +90,7 @@ pub use serve::{
     bind_server_with_policy,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
-pub use worker::WorkerService;
+pub use worker::{DaemonStream, LocalWorker, SessionStream, WorkerService};
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build
 /// had no git checkout. `build.rs` embeds it (`src/build_commit.rs` has the rule,

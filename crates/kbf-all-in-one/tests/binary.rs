@@ -48,14 +48,18 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// A CA, the node's certificate (`node-1`, its one DNS name) and the server's
-/// (`localhost`), written into `dir`.
+/// A CA, the node's certificate (`node-1`, its one DNS name), a remote daemon's
+/// (`remote-1`) and the server's (`localhost`), written into `dir`.
 fn pki(dir: &Path) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
-    for (name, dns) in [("node", "node-1"), ("server", "localhost")] {
+    for (name, dns) in [
+        ("node", "node-1"),
+        ("remote", "remote-1"),
+        ("server", "localhost"),
+    ] {
         let key = KeyPair::generate().expect("key");
         let cert = CertificateParams::new(vec![dns.to_owned()])
             .expect("params")
@@ -485,3 +489,172 @@ const PASS_DONE: &str = "start-up pass over the cold store directory done";
 
 /// What a round of eviction that evicted logs (`kbf-front`'s `Cache::evict_round`).
 const EVICTED: &str = "evicted the least recently used objects";
+
+/// The binary on a one-node farm in a fresh directory `name` whose stand-in `podman`
+/// runs `steps` as each action, once its start line is out: the process, the REAPI
+/// address the line names, the worker listener's port, the image an action names and
+/// the directory.
+fn start_farm(name: &str, steps: &[&str]) -> (Running, SocketAddr, u16, String, PathBuf) {
+    let dir = scratch(name);
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let image = podman(&bin, steps);
+    let port = free_port();
+    let mut child = farm(&dir, &bin, &image_path(&bin), farm_flags(&dir, port))
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("a start line");
+    // The rest of stdout is drained, so a later line never meets a closed pipe.
+    std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+    let reapi: SocketAddr = line
+        .trim_end()
+        .split(' ')
+        .find_map(|field| field.strip_prefix("reapi="))
+        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
+        .parse()
+        .expect("an address");
+    (Running(child), reapi, port, image, dir)
+}
+
+/// Runs an action whose command is `true` and whose platform is `properties` through
+/// the REAPI listener at `reapi`; returns its result.
+async fn run_action(reapi: SocketAddr, properties: Vec<Property>) -> ActionResult {
+    let channel = Endpoint::from_shared(format!("http://{reapi}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let cas = Transfers::over(channel.clone(), TransferConfig::default());
+    let command = ReapiCommand {
+        arguments: vec!["true".to_owned()],
+        ..ReapiCommand::default()
+    };
+    let action = Action {
+        command_digest: Some(put(&cas, command.encode_to_vec()).await),
+        input_root_digest: Some(put(&cas, Directory::default().encode_to_vec()).await),
+        platform: Some(Platform { properties }),
+        ..Action::default()
+    };
+    let action = put(&cas, action.encode_to_vec()).await;
+    tokio::time::timeout(PROMPT, execute(channel, action))
+        .await
+        .expect("the action ran in time")
+}
+
+/// The node that ran `result`'s action, as the server records it.
+fn ran_on(result: &ActionResult) -> &str {
+    let metadata = result.execution_metadata.as_ref().expect("metadata");
+    &metadata.worker
+}
+
+/// Process `pid`'s TCP sockets, from its descriptors (`/proc/<pid>/fd`) and the rows
+/// of `/proc/<pid>/net/tcp` and `tcp6` they own: each one's local port, remote port and
+/// state (`0A` LISTEN, `01` ESTABLISHED, ...).
+fn tcp_sockets(pid: u32) -> Vec<(u16, u16, String)> {
+    let mut inodes = std::collections::BTreeSet::new();
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("list fds") {
+        let Ok(target) = std::fs::read_link(fd.expect("an fd").path()) else {
+            continue; // closed since it was listed
+        };
+        let target = target.to_string_lossy().into_owned();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|t| t.strip_suffix(']'))
+        {
+            inodes.insert(inode.to_owned());
+        }
+    }
+    let port = |address: &str| {
+        let hex = address.rsplit(':').next().expect("a port");
+        u16::from_str_radix(hex, 16).expect("a hex port")
+    };
+    let mut sockets = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")).expect("read");
+        for row in text.lines().skip(1) {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            let (Some(local), Some(remote), Some(state), Some(inode)) =
+                (fields.get(1), fields.get(2), fields.get(3), fields.get(9))
+            else {
+                continue;
+            };
+            if inodes.contains(*inode) {
+                sockets.push((port(local), port(remote), (*state).to_owned()));
+            }
+        }
+    }
+    sockets
+}
+
+/// Catches the node's own daemon reaching its server half over the network (dialled
+/// to `--server` over mutual TLS, as a remote daemon does) rather than by calls: one
+/// action runs on the own daemon (`node-1`, the container driver), and afterwards the
+/// process holds no TCP connection with the worker listener's port at either end,
+/// while the listener itself is still bound for remote daemons.
+#[test]
+fn the_own_daemon_reaches_the_server_half_by_calls_alone() {
+    let (running, reapi, port, image, _dir) = start_farm("own-daemon", &["echo", "ran"]);
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    let image = Property {
+        name: "container-image".to_owned(),
+        value: image,
+    };
+    let result = tokio.block_on(run_action(reapi, vec![image]));
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(ran_on(&result), "node-1");
+    let sockets = tcp_sockets(running.0.id());
+    let on_worker: Vec<_> = sockets
+        .iter()
+        .filter(|(local, remote, state)| state != "0A" && (*local == port || *remote == port))
+        .collect();
+    assert!(
+        on_worker.is_empty(),
+        "connections on the worker port {port}: {on_worker:?}"
+    );
+    assert!(
+        sockets
+            .iter()
+            .any(|(local, _, state)| *local == port && state == "0A"),
+        "the worker listener on {port} is not bound: {sockets:?}"
+    );
+}
+
+/// Catches the worker listener dropped, or not serving a remote daemon beside the
+/// node's own: a daemon in this test (`remote-1`, the fake driver, labelled
+/// `pool=remote`) dials the process's worker listener over mutual TLS with its own
+/// certificate, registers, and runs an action that only it can take (its platform
+/// names `label.pool=remote`); the server records `remote-1` as the node that ran it.
+#[test]
+fn a_remote_daemon_registers_through_the_worker_listener_and_runs_an_action() {
+    let (_running, reapi, port, _image, dir) = start_farm("remote-daemon", &["echo", "ran"]);
+    let tls = kbf_daemon::TlsFiles {
+        ca_cert: dir.join("ca.pem"),
+        cert: dir.join("remote.pem"),
+        key: dir.join("remote.key"),
+        server_name: Some("localhost".to_owned()),
+    };
+    let server = format!("https://127.0.0.1:{port}");
+    let config = kbf_daemon::DaemonConfig::new(server, tls, "remote-1".to_owned());
+    let report = kbf_daemon::NodeReport::detect(&[])
+        .expect("detect")
+        .with_entries([("label.pool", "remote")]);
+    let runtime = std::sync::Arc::new(kbf_daemon::FakeRuntime::new(Duration::ZERO));
+    let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    let remote = {
+        let _context = tokio.enter();
+        kbf_daemon::Daemon::new(config, runtime, report).expect("a remote daemon")
+    };
+    let remote = tokio.spawn(remote.run(std::future::pending()));
+    let pool = Property {
+        name: "label.pool".to_owned(),
+        value: "remote".to_owned(),
+    };
+    let result = tokio.block_on(run_action(reapi, vec![pool]));
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(ran_on(&result), "remote-1");
+    remote.abort();
+}

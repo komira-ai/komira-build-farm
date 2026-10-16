@@ -30,6 +30,7 @@ use kbf_threads::disk::Statvfs;
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
+use crate::worker::LocalWorker;
 use crate::write_tier::FLUSH_EVERY;
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
 
@@ -50,6 +51,7 @@ pub struct ServerHandle {
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     local: LocalStore,
+    local_worker: LocalWorker,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
@@ -69,6 +71,14 @@ impl ServerHandle {
     #[must_use]
     pub fn local(&self) -> LocalStore {
         self.local.clone()
+    }
+
+    /// The server's `kbf.worker.v1` service as calls in this process: what a daemon run
+    /// beside the server in one process opens its sessions through ([`LocalWorker`]),
+    /// while remote daemons reach the worker listener.
+    #[must_use]
+    pub fn local_worker(&self) -> LocalWorker {
+        self.local_worker.clone()
     }
 
     /// Serves every listener until the shutdown future ends and its connections close
@@ -235,6 +245,7 @@ where
         worker: bound.worker,
         api: bound.api,
         local,
+        local_worker: bound.local,
         start_line: start_line(
             bound.reapi,
             bound.worker,

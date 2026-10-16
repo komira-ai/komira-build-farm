@@ -1,9 +1,10 @@
 # kbf-all-in-one
 
 The farm server and a worker daemon in one process, for a one-node Linux farm. The
-daemon's blobs move through calls into the server's cache instead of over the network;
-everything else is what `kbf-server` and `kbf-daemon` do on one host today. The design
-is in komira-build-farm#657.
+process's own daemon moves its sessions and blobs through calls into the server half
+instead of over the network; the worker listener still serves remote daemons (Macs,
+daemon-only nodes) as `kbf-server`'s does. Everything else is what `kbf-server` and
+`kbf-daemon` do on one host today. The design is in komira-build-farm#657.
 
 Linux only, the container driver only. Elsewhere the binary exits 2 and says to run
 `kbf-server` and `kbf-daemon`.
@@ -20,11 +21,14 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    server half sizes itself as `kbf-server` does when none is given. Refused: a
    `--driver` other than `container`, and `--cas`.
 3. **The server half.** It starts as `kbf-server` starts (`kbf_server::start`), on an
-   async runtime of its own, and prints the same start line on stdout.
+   async runtime of its own, and prints the same start line on stdout. Its worker
+   listener serves remote daemons as `kbf-server`'s does.
 4. **The daemon half.** It starts as `kbf-daemon` starts (`kbf_node::start_with`), on an
    async runtime of its own, with `LocalDataPlane` as its data plane in place of the
-   transfer engine. Its control plane is a remote daemon's: `--server` names the server
-   half's worker listener, over mutual TLS with the node's certificate, as any node's.
+   transfer engine and `LocalControlPlane` as its control plane in place of the dial to
+   `--server`: each of its sessions (`Hello`, leases, heartbeats, results) is opened
+   through calls into the server half's worker service, with no TLS, encoding or
+   socket, and it never connects to the worker listener.
 5. **Stopping.** SIGTERM or SIGINT stops the server half as it stops `kbf-server`; the
    daemon half stops once the server half has, abandoning the leases still running, and
    the process exits 0. A server half that stops serving on its own stops the daemon too,
@@ -61,6 +65,21 @@ server's own code:
 
 No message a remote daemon sends changes: `kbf-daemon` still uses the transfer engine.
 
+## The in-process control plane
+
+`LocalControlPlane` implements `kbf_node::ControlPlane` (the trait `kbf-daemon` opens its
+sessions through; a dialled daemon's is the `Session` call over mutual TLS) over the
+server's `LocalWorker` (`ServerHandle::local_worker`). Each session is opened on the
+server half's runtime, by the server's own session code: the same `Hello` checks,
+registration, heartbeats, `Start`s, `Cancel`s and results as a remote daemon's session on
+the worker listener. It carries no certificate, so it is admitted as on a plain-text
+worker listener, with no deny list. A session the server refuses, or one on a server
+half whose runtime is gone (UNAVAILABLE), is followed by the daemon's reconnect wait, as
+a dialled daemon's failed attempt is; a session the server ends is opened again.
+
+No message a remote daemon sends changes: `kbf-daemon`, and any remote daemon of this
+process, still dials `--server`.
+
 ## How it is tested
 
 - `tests/conformance.rs`: every check of `kbf-cas-conformance` against `LocalDataPlane`,
@@ -71,9 +90,14 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   `kbf-driver-container`'s source, which runs the action as a plain process) and a cgroup
   tree of plain directories; its output file, output directory, stdout and stderr are
   read back over REAPI; SIGTERM ends the process with 0. The binary is given no `--cas`,
-  so a daemon half wired to the transfer engine would not start. Also the starts each
-  half refuses, with their exit statuses, and the binary run with keeper arguments,
-  which answers as the keeper before it reads a flag and starts no server.
+  so a daemon half wired to the transfer engine would not start. After an action runs
+  on the own daemon, the process holds no TCP connection with the worker listener's
+  port at either end, and the listener is still bound (its sockets in `/proc/<pid>/fd`
+  against the rows of `/proc/<pid>/net/tcp` and `tcp6`). A remote daemon in the test
+  (`kbf_daemon::Daemon`, the fake driver, its own certificate) registers through the
+  worker listener over mutual TLS and runs an action only it can take. Also the starts
+  each half refuses, with their exit statuses, and the binary run with keeper
+  arguments, which answers as the keeper before it reads a flag and starts no server.
 - `tests/one_read.rs`: the container driver's output collection over a lease of the
   plane, with a write tier and without: an inotify watch counts the opens of each output
   file, which must be one each, and every blob reads back as the file.
@@ -83,7 +107,13 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   count), the wait for room among the batches in flight, one digest stored once, a
   file left unfinished storing nothing, a file over the largest blob not taken, and a
   server half that is gone.
+- `src/control_tests.rs`: a session through the plane is the server's own (a first
+  message that is not `Hello` refused, a `Hello` welcomed and a heartbeat acknowledged),
+  and a server half whose runtime is gone refuses each session UNAVAILABLE.
 - `src/cli_tests.rs`: each flag reaches its half, once; the refusals.
+- `kbf-daemon`'s `tests/in_process.rs`: a daemon given an in-process plane and no
+  usable server URL or TLS file opens every session through it, retries one refused,
+  runs a lease on one welcomed, and opens another when the server ends it.
 
 ## Not done yet
 
@@ -91,8 +121,12 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   the process loses every lease and operation (the cache's index is kept: the server's
   metadata log is on disk, under `--meta-dir` or the hot store). Until the
   scheduler's state is durable, all-in-one is a development shape.
-- **The in-process plane's admission.** A remote daemon's blob calls are admitted by its
-  certificate and the deny list; this plane's calls are not admitted.
+- **The in-process planes' admission.** A remote daemon's calls are admitted by its
+  certificate and the deny list; the own daemon's calls through the in-process planes
+  are not admitted.
+- **The own daemon's dial flags.** `--server`, `--ca-cert`, `--cert` and `--key` are
+  still required, as `kbf-daemon` requires them, though the own daemon reads none of
+  them: it neither dials nor opens a TLS file.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as
   `kbf-daemon` does; the server half uses every CPU, as `kbf-server` does.
 - **Crash and panic behaviour** (the next change): the whole-process crash mode of the

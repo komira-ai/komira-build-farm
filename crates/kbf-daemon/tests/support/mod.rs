@@ -147,6 +147,9 @@ pub fn pki(name: &str) -> Pki {
 
 type Outbound = Arc<Mutex<Option<mpsc::UnboundedSender<Result<ServerMessage, Status>>>>>;
 
+/// What the fake server sends a daemon on one session.
+pub type ToDaemon = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
+
 /// The server's side of one daemon session.
 pub struct Peer {
     from_daemon: mpsc::UnboundedReceiver<(Instant, DaemonMessage)>,
@@ -337,38 +340,52 @@ impl Worker for FakeServer {
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let outbound: Outbound = Arc::new(Mutex::new(Some(tx)));
-        let acking = Arc::new(AtomicBool::new(true));
-        let (seen_tx, from_daemon) = mpsc::unbounded_channel();
-        let mut inbound = request.into_inner();
-        let (out, ack) = (Arc::clone(&outbound), Arc::clone(&acking));
-        tokio::spawn(async move {
-            while let Ok(Some(msg)) = inbound.message().await {
-                if let Some(daemon_message::Message::Heartbeat(h)) = &msg.message
-                    && ack.load(Ordering::SeqCst)
-                    && let Some(tx) = out.lock().expect("outbound lock").as_ref()
-                {
-                    let _ = tx.send(Ok(ServerMessage {
-                        message: Some(server_message::Message::HeartbeatAck(HeartbeatAck {
-                            seq: h.seq,
-                        })),
-                    }));
-                }
-                if seen_tx.send((Instant::now(), msg)).is_err() {
-                    break;
-                }
-            }
-        });
-        let _ = self.sessions.send(Peer {
-            from_daemon,
-            outbound,
-            acking,
-        });
-        let stream =
-            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|m| (m, rx)) });
-        Ok(Response::new(Box::pin(stream)))
+        // Read until the stream ends or fails, as the server reads it.
+        let inbound = request
+            .into_inner()
+            .take_while(|msg| std::future::ready(msg.is_ok()))
+            .filter_map(|msg| std::future::ready(msg.ok()));
+        let (peer, stream) = peer_over(inbound);
+        let _ = self.sessions.send(peer);
+        Ok(Response::new(stream))
     }
+}
+
+/// The server's side of a session over `inbound`, the daemon's messages ([`Peer`]),
+/// and what it sends the daemon. Every heartbeat is acknowledged while
+/// [`Peer::acking`] is set.
+pub fn peer_over(inbound: impl Stream<Item = DaemonMessage> + Send + 'static) -> (Peer, ToDaemon) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let outbound: Outbound = Arc::new(Mutex::new(Some(tx)));
+    let acking = Arc::new(AtomicBool::new(true));
+    let (seen_tx, from_daemon) = mpsc::unbounded_channel();
+    let (out, ack) = (Arc::clone(&outbound), Arc::clone(&acking));
+    tokio::spawn(async move {
+        let mut inbound = std::pin::pin!(inbound);
+        while let Some(msg) = inbound.next().await {
+            if let Some(daemon_message::Message::Heartbeat(h)) = &msg.message
+                && ack.load(Ordering::SeqCst)
+                && let Some(tx) = out.lock().expect("outbound lock").as_ref()
+            {
+                let _ = tx.send(Ok(ServerMessage {
+                    message: Some(server_message::Message::HeartbeatAck(HeartbeatAck {
+                        seq: h.seq,
+                    })),
+                }));
+            }
+            if seen_tx.send((Instant::now(), msg)).is_err() {
+                break;
+            }
+        }
+    });
+    let peer = Peer {
+        from_daemon,
+        outbound,
+        acking,
+    };
+    let stream =
+        futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|m| (m, rx)) });
+    (peer, Box::pin(stream))
 }
 
 /// Serves the fake worker service with `tls` on `listener`: every session the daemon

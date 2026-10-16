@@ -34,7 +34,7 @@ use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
-use crate::worker::WorkerService;
+use crate::worker::{LocalWorker, WorkerService};
 
 /// How the server listens and paces its daemons.
 #[derive(Clone, Debug)]
@@ -139,6 +139,9 @@ pub struct Bound<F> {
     /// The invocation records the serving future builds, which the build pages read
     /// ([`crate::http_invocations`]); tests feed it events.
     pub recorder: Recorder,
+    /// The worker service as calls in this process, for a daemon run in it, beside the
+    /// worker listener's remote daemons.
+    pub local: LocalWorker,
 }
 
 /// Aborts its task when dropped.
@@ -366,6 +369,14 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    // Sessions opened in this process carry no certificate: admitted as on a
+    // plain-text listener, with no deny list.
+    let local = LocalWorker::new(WorkerService::new(
+        Arc::clone(&farm),
+        Peers::Unauthenticated,
+        listeners.heartbeat_interval,
+        listeners.hello_wait,
+    ));
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -462,5 +473,6 @@ where
         readiness,
         serving,
         recorder,
+        local,
     })
 }

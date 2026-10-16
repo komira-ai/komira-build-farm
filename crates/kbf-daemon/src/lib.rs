@@ -1,6 +1,7 @@
 //! `kbf-daemon`: the worker daemon.
 //!
-//! It holds one outbound mutual-TLS `kbf.worker.v1` stream to a server, reports
+//! It holds one outbound mutual-TLS `kbf.worker.v1` stream to a server (or, run in the
+//! server's own process, one stream through a [`ControlPlane`] of that process), reports
 //! its node (detected through `kbf-caps`), sends heartbeats, and runs a lease manager:
 //! work starts only on `Start`, and only while the `Start` is inside the window it
 //! names (issue #23); each lease reports one `Result`, kept until the server
@@ -12,6 +13,8 @@
 //! front.
 //!
 //! - [`config`]: command-line flags and TLS files.
+//! - [`control`]: the [`ControlPlane`] trait, how the daemon opens a session: over the
+//!   connection it dialled, or through calls into a server in its own process.
 //! - [`connect`]: which server to try next, and the wait between rounds of attempts;
 //!   the daemon never stops trying.
 //! - [`report`]: the node report and its hash.
@@ -48,6 +51,7 @@ pub mod clock;
 pub mod config;
 pub mod connect;
 mod contact;
+pub mod control;
 pub mod cpu_pool;
 mod daemon;
 pub mod driver_watch;
@@ -82,8 +86,9 @@ pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
 pub use contact::{Acked, Contact};
+pub use control::{ControlPlane, DaemonMessages, ServerMessages};
 pub use cpu_pool::CpuPool;
-pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
+pub use daemon::{Daemon, Event, IN_PROCESS, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
