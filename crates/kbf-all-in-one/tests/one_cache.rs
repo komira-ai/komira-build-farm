@@ -142,6 +142,15 @@ impl Storage for Watched {
         self.inner.stream(size)
     }
 
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        claim: futures::future::BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        self.inner.put_streamed(size, bytes, claim)
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         self.inner.segments()
     }

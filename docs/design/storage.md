@@ -188,7 +188,7 @@ store:
    upload with a blob in it is acknowledged after that; a segment that fails answers
    its own blobs with its error and no others.
 
-Uploads are admitted under `--write-bytes-in-flight` (2 GiB) before they buffer, and
+Uploads are admitted under `--write-bytes-in-flight` (2 GiB) for what they hold in memory, and
 at most `--write-puts-in-flight` (4) segment PUTs run at once.
 
 **Planned** ([write-path.md](write-path.md)): daemon uploads of an action's outputs as
@@ -202,9 +202,13 @@ So a blob is never reported present before its bytes are durable in the store.
 are verified, become durable, and only then is the write acknowledged. There is no
 partial resume; a broken stream starts again from 0. `QueryWriteStatus` reports a
 blob's full size once it is durable and 0 before, never bytes a live stream has merely
-buffered. An upload of a blob already durable is answered at once. Until chunked
-uploads exist, a ByteStream write is held in memory until verified, so blobs over
-1 GiB (`MAX_BLOB_BYTES`) are refused before any byte is buffered. Batch calls carry at
+buffered. An upload of a blob already durable is answered at once. No blob is too
+large: a ByteStream write of at most 16 MiB (`MAX_UNSTAGED_BLOB_BYTES`) is held in
+memory until verified; a larger one is handed to the store as its messages arrive (a
+multipart upload on S3), hashed as it passes, and the object is completed only if the
+bytes hash to the digest (else it is aborted, nothing stored). A ByteStream read is
+served in windows of 8 MiB (`READ_WINDOW_BYTES`), each hashed, the last sent only once
+the digest checked. Batch calls carry at
 most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 MiB).
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
@@ -363,8 +367,13 @@ normalisation between kbf and a store can turn one key into another.
 - `S3Store`: the S3 REST API with path-style addressing and SigV4 signing of every
   payload. A ranged read answered with anything but the exact range is refused. On a
   store with Object Lock, delete names the exact object version, so a retained object
-  is refused rather than hidden behind a delete marker. Not built yet: TLS endpoints and
-  multipart upload (one PUT carries up to 5 GiB; segments are at most 128 MiB).
+  is refused rather than hidden behind a delete marker. `put_stream` of an object over
+  16 MiB (`MULTIPART_THRESHOLD`) is a multipart upload, a part at a time (16 MiB parts,
+  or the least whole MiB that fits the object in 10,000 parts, at most 5 GiB, so the
+  largest object is about 48.8 TiB; a larger one is refused `Unsupported` before a byte
+  is sent: the only size ceiling on any path), aborted on any failure,
+  so no incomplete upload is left behind (a bucket lifecycle rule is the backstop for a
+  crash). Not built yet: TLS endpoints.
 
 **Conformance suite.** `kbf_objstore::conformance::run` checks a store's base contract
 (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list

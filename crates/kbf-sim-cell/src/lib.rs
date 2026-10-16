@@ -15,11 +15,16 @@
 //! of its [`StorePlan`]: it hangs, is slow, fails PUTs, or loses their answers. The
 //! server can be taken down at a named point of its write path ([`CrashPlan`]).
 //!
+//! **All-in-one** ([`Kind::WholeProcess`]): one daemon is the daemon half of the
+//! server's process (`kbf-all-in-one`; its design, komira-build-farm#657, section 8).
+//! It stores each run's output in the server before it reports, and a kill of the
+//! process takes both halves down together, mid-build, and starts both again.
+//!
 //! [`run`] runs a [`Scenario`] step by step and checks properties 1 to 7 of ha.md
-//! section 15, and the write path's 8 and 9 (docs/design/write-tier-scenarios.md),
-//! after every step ([`check`]); a violation panics with the scenario, the seed and the
-//! property. A seed replays to the same trace. [`sweep`] runs a scenario per seed and
-//! reports every failing seed.
+//! section 15, the write path's 8 and 9 (docs/design/write-tier-scenarios.md), and
+//! all-in-one's 14, after every step ([`check`]); a violation panics with the
+//! scenario, the seed and the property. A seed replays to the same trace. [`sweep`]
+//! runs a scenario per seed and reports every failing seed.
 
 mod cell;
 pub mod check;
@@ -48,11 +53,12 @@ pub use sweep::{Failure, Sweep, sweep};
 /// stream: a daemon numbers its streams, and a new one replaces the old.
 #[derive(Clone, Debug)]
 pub enum Msg {
-    /// Client to server: store this blob (the bytes travel with it).
+    /// Client (or the in-process daemon half, an action's output) to server: store
+    /// this blob (the bytes travel with it).
     Upload {
         digest: Digest,
     },
-    /// Server to client: the blob is stored and indexed.
+    /// Server to client (or daemon half): the blob is stored and indexed.
     Uploaded {
         digest: Digest,
     },
@@ -193,6 +199,15 @@ pub fn content(digest: &Digest) -> Vec<u8> {
     (0..len)
         .map(|i| digest.hash[i % 32] ^ u8::try_from(i % 251).unwrap_or(0))
         .collect()
+}
+
+/// The output blob a run of `action` by the in-process daemon half stores, which its
+/// result names as its `ActionResult`.
+#[must_use]
+pub fn output_of(action: &Digest) -> Digest {
+    let mut output = *action;
+    output.hash[0] = 0x0B;
+    output
 }
 
 fn numbered(tag: u8, n: u64) -> Digest {

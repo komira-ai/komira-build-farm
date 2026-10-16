@@ -53,6 +53,7 @@ mod daemon;
 pub mod driver_watch;
 pub mod keeper;
 mod lease;
+mod lease_panic;
 #[cfg(target_os = "linux")]
 mod local;
 #[cfg(target_os = "linux")]

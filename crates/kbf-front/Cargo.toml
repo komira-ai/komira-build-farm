@@ -32,6 +32,8 @@ tower-layer.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The loopback S3 service (`s3::fake`) the large-blob tests flush to.
+kbf-objstore = { workspace = true, features = ["testkit"] }
 # The REAPI service definitions, read from kbf-proto's vendored files, so the
 # authorization test (tests/auth.rs) covers every method the routes serve.
 protox.workspace = true

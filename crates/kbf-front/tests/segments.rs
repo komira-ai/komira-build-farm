@@ -439,21 +439,24 @@ async fn begin_refuses_what_it_cannot_take() {
     let empty = client.begin(BeginRequest { segments: vec![] }).await;
     assert_eq!(empty.expect_err("no segment").code(), Code::InvalidArgument);
 
-    let huge = support::declared_only(2 * (kbf_front::MAX_BLOB_BYTES + 1) + footer_len(2));
+    // No record is too large; without a write tier one over the in-memory limit is
+    // sent back to ByteStream (FAILED_PRECONDITION, which the client falls back at),
+    // not refused as too large.
+    let huge = support::declared_only(2 * ((5 << 30) + 1) + footer_len(2));
     let refused = client
         .begin(BeginRequest {
             segments: vec![huge],
         })
         .await
-        .expect_err("records over the largest blob");
-    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        .expect_err("records too large to hold in memory, and no tier");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
     assert!(
-        refused.message().contains("larger than the largest blob"),
+        refused.message().contains("send it by a ByteStream Write"),
         "{refused:?}"
     );
 
     let cap = SegmentsConfig::DEFAULT.max_bytes;
-    let over = support::declared_only(cap + 1);
+    let over = support::declared_small(cap + 1);
     let refused = client
         .begin(BeginRequest {
             segments: vec![over],
@@ -461,7 +464,7 @@ async fn begin_refuses_what_it_cannot_take() {
         .await
         .expect_err("over the cap");
     assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
-    let at_cap = support::declared_only(cap);
+    let at_cap = support::declared_small(cap);
     client
         .begin(BeginRequest {
             segments: vec![at_cap],
@@ -792,8 +795,8 @@ async fn an_uploads_segment_puts_take_the_put_slots() {
 /// commit that asks for admission again while its `Begin` still holds it (mutant:
 /// `commit_task` admits one more byte before storing), which waits forever when the
 /// upload is as large as the bound. With the tightest bound `kbf-server`
-/// starts with (`--write-bytes-in-flight` equal to the default 1 GiB + 1 MiB cap), a
-/// `Begin` of the whole cap is admitted; with a 64 KiB bound and cap, one record that
+/// starts with (`--write-bytes-in-flight` equal to the default 5 GiB + 1 MiB cap), a
+/// `Begin` of the whole cap (in records a server without a tier may hold) is admitted; with a 64 KiB bound and cap, one record that
 /// fills the whole upload is sent and commits, and the bytes come back. Sending 1 GiB
 /// would hash and hold gigabytes in every run of the suite.
 #[tokio::test]
@@ -807,7 +810,7 @@ async fn an_upload_as_large_as_the_bound_is_admitted_and_commits() {
     let begun = tokio::time::timeout(
         Duration::from_secs(10),
         client.begin(BeginRequest {
-            segments: vec![support::declared_only(MIN_SEGMENT_UPLOAD_BYTES)],
+            segments: vec![support::declared_small(MIN_SEGMENT_UPLOAD_BYTES)],
         }),
     )
     .await

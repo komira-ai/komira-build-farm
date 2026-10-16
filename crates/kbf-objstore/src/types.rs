@@ -317,6 +317,10 @@ pub enum ObjectStoreError {
     /// reader that prints the chain does not print it twice.
     #[error("request to the store failed: {}", Causes(.0.as_ref()))]
     Transport(std::sync::Arc<dyn std::error::Error + Send + Sync>),
+    /// The body of a [`put_stream`](crate::ObjectStore::put_stream) failed, or gave more
+    /// or fewer bytes than declared: nothing was stored. The text says which.
+    #[error("the body of a streamed write failed: {0}")]
+    Body(String),
 }
 
 /// An error and each of its sources, joined by `: `.

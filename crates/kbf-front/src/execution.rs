@@ -111,13 +111,13 @@ use tracing::Instrument as _;
 use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, ExecuteAnswer};
 
-use crate::cache::{Cache, CacheError};
 use crate::described::Described;
-use crate::meta_log::MetaLog;
 use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
-use crate::wire;
+use kbf_storage::MetaLog;
+use kbf_storage::wire;
+use kbf_storage::{Cache, CacheError};
 
 /// The reserved platform key that names the lease kind
 /// (`docs/platform-properties.md#kbf-lease`).

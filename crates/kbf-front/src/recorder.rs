@@ -37,7 +37,7 @@ use prost::Message;
 use tokio::sync::{Notify, mpsc};
 
 use crate::request_metadata::{CallMetadata, Text};
-use crate::wire;
+use kbf_storage::wire;
 
 /// The default memory bound of the records, `--invocation-memory` (section 3.5).
 pub const DEFAULT_INVOCATION_MEMORY: usize = 256 << 20;

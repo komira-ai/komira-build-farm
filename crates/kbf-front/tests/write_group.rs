@@ -19,8 +19,8 @@ use bytes::Bytes;
 use common::faulty::{AuditLog, CommitFault, FaultyStore, PutFault};
 use common::pseudo_random;
 use kbf_front::{
-    Cache, CacheError, CasService, MAX_ADMISSION_BYTES, MetaLog, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
-    VerifiedBlob, WriteConfig,
+    Cache, CacheError, CasService, MAX_ADMISSION_BYTES, MIN_SEGMENT_UPLOAD_BYTES, MetaLog,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, VerifiedBlob, WriteConfig,
 };
 use kbf_meta::BlobAnswer;
 use kbf_objstore::{Capabilities, KeyPrefix, ObjectKey};
@@ -613,27 +613,58 @@ async fn a_caller_that_goes_away_keeps_its_bytes_admitted_until_they_are_written
     assert_audit_clean(&cache);
 }
 
-/// One admission of [`MAX_ADMISSION_BYTES`] is counted in full under a larger bound,
-/// and one asking for more is counted as that much: what `kbf-server`'s upper limit on
-/// `--segment-upload-max-bytes` relies on, so no `Begin` holds more than it is counted
-/// for. Takes no memory: admission counts bytes, it does not allocate them.
+/// One admission of the largest upload (a 5 GiB blob and its footer, over the
+/// `u32::MAX` permits a semaphore hands out at once) is counted in full, and one asking
+/// for more than the bound is counted as the bound: what `kbf-server`'s check of
+/// `--segment-upload-max-bytes` against `--write-bytes-in-flight` relies on, so no
+/// `Begin` holds more than it is counted for. Takes no memory: admission counts bytes,
+/// it does not allocate them. [`MAX_ADMISSION_BYTES`] is what the semaphore holds.
 ///
-/// Catches: [`MAX_ADMISSION_BYTES`] raised past what one admission counts (the server
-/// would then start with a cap whose `Begin` holds more than the bound sees). Mutant
-/// seen red: `MAX_ADMISSION_BYTES = 8 << 30`.
+/// Catches: an admission clamped to `u32::MAX` (a 5 GiB upload counted as 4 GiB).
 #[tokio::test]
-async fn one_admission_counts_up_to_max_admission_bytes() {
+async fn one_admission_counts_all_its_bytes() {
+    assert_eq!(
+        MAX_ADMISSION_BYTES,
+        tokio::sync::Semaphore::MAX_PERMITS as u64
+    );
     let (cache, _) = cache(
         config(|c| c.bytes_in_flight = 16 << 30),
         kbf_segments::MAX_SEGMENT_BYTES,
     )
     .await;
-    let full = cache.admit(MAX_ADMISSION_BYTES).await;
-    assert_eq!(cache.bytes_admitted(), MAX_ADMISSION_BYTES);
+    let full = cache.admit(MIN_SEGMENT_UPLOAD_BYTES).await;
+    assert_eq!(cache.bytes_admitted(), MIN_SEGMENT_UPLOAD_BYTES);
     drop(full);
-    let over = cache.admit(8 << 30).await;
-    assert_eq!(cache.bytes_admitted(), MAX_ADMISSION_BYTES);
+    let over = cache.admit(20 << 30).await;
+    assert_eq!(cache.bytes_admitted(), 16 << 30);
     drop(over);
+    assert_eq!(cache.bytes_admitted(), 0);
+}
+
+/// Catches two admissions taken in parts each holding a part the other waits for
+/// (mutant: no lock around an admission over `u32::MAX`): under an 8 GiB bound, two
+/// admissions of the largest upload asked at once would each take 4 GiB - 1 and wait
+/// forever for the rest; both are admitted, one after the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_large_admissions_do_not_wait_on_each_other() {
+    let (cache, _) = cache(
+        config(|c| c.bytes_in_flight = 8 << 30),
+        kbf_segments::MAX_SEGMENT_BYTES,
+    )
+    .await;
+    let cache = Arc::new(cache);
+    let both = (0..2).map(|_| {
+        let cache = Arc::clone(&cache);
+        tokio::spawn(async move {
+            let admitted = cache.admit(MIN_SEGMENT_UPLOAD_BYTES).await;
+            tokio::task::yield_now().await;
+            drop(admitted);
+        })
+    });
+    let joined = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(both))
+        .await
+        .expect("both admitted");
+    assert!(joined.iter().all(Result::is_ok));
     assert_eq!(cache.bytes_admitted(), 0);
 }
 

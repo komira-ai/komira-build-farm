@@ -25,7 +25,7 @@ kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                42      8
+kbf-front                43      8
 kbf-guest                15      6
 kbf-host                  0      0
 kbf-invocation            0      0

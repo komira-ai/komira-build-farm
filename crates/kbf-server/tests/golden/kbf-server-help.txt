@@ -15,7 +15,7 @@ Options:
           The durable object store, where every blob ends up: `file:///absolute/path` (a directory, `kbf_objstore::FsStore`: locked while the server runs, a second server on it is refused; a write that would leave its filesystem with less free than it keeps, 5% of its size and at least 1 GiB, is refused and wakes the evictor, which forgets the least recently used objects (never one used in the last minute) and deletes their files while less than twice that is free) or `s3://bucket/prefix?endpoint=http://host:port` (MinIO, RustFS; the key pair is `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; query keys `region`, `conditional-put=true` for a store that refuses to overwrite a key, and `min-put-rate=BYTES_PER_SEC`, the slowest rate a PUT body may reach the store at: a PUT is cut after 60 seconds plus its body's length at that rate, 1 MiB/s by default). Objects are keyed under `<prefix><log id>/` (`kbf/` for a directory and for an S3 URI without a path), the id of the metadata log. A directory is checked against the index by a start-up pass in the background; a lost or damaged object is also found when it is read, or before an action-cache hit that needs it is served (a miss). There is no `memory:` store: a `file://` path on a tmpfs is one
 
       --hot-store <URI>
-          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
+          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. A daemon's outputs (a segment upload, or the in-process plane) and a ByteStream Write over 16 MiB are written through to it as they arrive, so a large one is never held in memory. Without it, or when it has no room, a daemon's blob over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it arrives (a ByteStream Write, or the in-process plane's own stream), never held whole and never refused for its size. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
 
       --hot-store-max-bytes <BYTES>
           The most bytes the hot store's block files may hold before they are flushed, lower than its automatic budget
@@ -142,9 +142,9 @@ Options:
           [default: 268435456]
 
       --segment-upload-max-bytes <BYTES>
-          The most bytes, records and footers together, one segment upload on the worker listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held in memory until their upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least one 1 GiB blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most 4 GiB - 1 (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
+          The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
           
-          [default: 1074790400]
+          [default: 34603008]
 
       --segment-upload-idle-secs <SEGMENT_UPLOAD_IDLE_SECS>
           How long, in seconds, a segment upload may go without a call before it is dropped and its memory returned. An upload is also dropped when the connection that began it closes; one that is committing is kept until its commit ends
@@ -162,9 +162,19 @@ Options:
           [default: 16777216]
 
       --write-bytes-in-flight <WRITE_BYTES_IN_FLIGHT>
-          The most bytes uploads may hold at once. A ByteStream Write is admitted for its blob's size before it reads past its first message, a BatchUpdateBlobs for its total, a segment upload's Begin for its whole length; a caller over the bound waits, nothing is refused for load. At least the largest blob (1 GiB), so one can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener (`kbf_front::MAX_CONCURRENT_STREAMS`)
+          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open (each listener's `-max-streams` flag)
           
           [default: 2147483648]
+
+      --reapi-max-streams <REAPI_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
+          
+          [default: 10000]
+
+      --worker-max-streams <WORKER_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
+          
+          [default: 200]
 
       --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
           The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment

@@ -43,20 +43,12 @@
 
 mod action_cache;
 mod bytestream;
-mod cache;
 mod capabilities;
 mod cas;
-mod cpu;
 mod described;
 mod execution;
-mod input_tree;
-mod meta_log;
-pub mod metrics;
 mod recorder;
 mod request_metadata;
-mod segments;
-mod storage;
-mod wire;
 
 use std::sync::Arc;
 
@@ -71,14 +63,6 @@ use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
-pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
-pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError, EVICT_BATCH,
-    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
-    FLUSHES_PER_ROUND, FlushRound, HeldObject, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS,
-    NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, STREAM_WINDOW_BYTES,
-    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
-};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::described::Described;
@@ -88,8 +72,6 @@ pub use crate::execution::{
     OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing, missing_status,
     progress,
 };
-pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
-pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     listing, owner, wall_now,
@@ -99,30 +81,27 @@ pub use crate::request_metadata::{
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
     call_metadata,
 };
-pub use crate::segments::{
+pub use kbf_storage::CacheStorage;
+pub use kbf_storage::HIT_CHECKS_IN_FLIGHT;
+pub use kbf_storage::metrics;
+pub use kbf_storage::{
+    Admitted, BATCH_READS_IN_FLIGHT, BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS,
+    DEFAULT_WORKER_STREAMS, EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound,
+    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+    HeldObject, MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, PASS_OPENS_PER_SEC,
+    PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES, RecordStream,
+    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
+    WriteConfig,
+};
+pub use kbf_storage::{
     Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
     SegmentsConfig, SegmentsService, Tracked,
 };
-pub use crate::storage::CacheStorage;
-
-/// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
-/// advertised in the capabilities. Larger blobs go through ByteStream. A request is
-/// decoded whole before its handler runs, so one stream may hold up to
-/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: 200 concurrent streams bound the
-/// decode memory at about 3.4 GiB, which `--write-bytes-in-flight` does not cover
-/// (`docs/design/write-path.md`).
-pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
-
-/// The largest gRPC message the cache services accept or send: a full batch plus room
-/// for the digests and statuses around it.
-pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
-
-/// The largest blob the cache accepts. A ByteStream Write is held in memory until it
-/// is verified, so without a cap a client could make the front buffer whatever size
-/// its resource name claims. Chunked uploads (planned,
-/// `docs/design/storage.md#segments`) come later and will stream larger blobs instead;
-/// until then anything bigger is refused before a byte is buffered.
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+pub use kbf_storage::{ENTRY_OVERHEAD, InputTreeConfig};
+pub use kbf_storage::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use kbf_storage::{
+    MAX_BATCH_TOTAL_BYTES, MAX_MESSAGE_BYTES, MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal,
+};
 
 /// The most data in one ByteStream `ReadResponse`, and in one chunk of a ranged storage
 /// read.
@@ -257,11 +236,11 @@ where
 pub fn digest_from_proto(
     d: Option<&kbf_proto::reapi::Digest>,
 ) -> Result<kbf_types::Digest, tonic::Status> {
-    wire::digest(d)
+    kbf_storage::wire::digest(d)
 }
 
 /// kbf's [`kbf_types::Digest`] as a REAPI digest.
 #[must_use]
 pub fn digest_to_proto(d: &kbf_types::Digest) -> kbf_proto::reapi::Digest {
-    wire::digest_to_proto(d)
+    kbf_storage::wire::digest_to_proto(d)
 }

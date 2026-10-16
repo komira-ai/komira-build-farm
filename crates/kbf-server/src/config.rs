@@ -78,8 +78,14 @@ pub struct Args {
     /// (5% of its size, at least 1 GiB, and never more than half of what is free), at
     /// most `--hot-store-max-bytes`; at the budget, writes
     /// take the direct path to the cold store. Without it, uploads go straight to the
-    /// cold store. The first start with a hot store raises the metadata log to machine
-    /// version 2, once; a binary that runs only version 1 no longer reads it.
+    /// cold store. A daemon's outputs (a segment upload, or the in-process plane) and a
+    /// ByteStream Write over 16 MiB are written through to it as they arrive, so a
+    /// large one is never held in memory.
+    /// Without it, or when it has no room, a daemon's blob over 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it
+    /// arrives (a ByteStream Write, or the in-process plane's own stream), never held
+    /// whole and never refused for its size. The first start with a hot store raises
+    /// the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
     pub hot_store: Option<StoreUri>,
@@ -290,14 +296,20 @@ pub struct Args {
     )]
     pub invocation_memory: u64,
     /// The most bytes, records and footers together, one segment upload on the worker
-    /// listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held
-    /// in memory until their upload commits, admitted under `--write-bytes-in-flight`
-    /// with every other upload: a `Begin` waits while that is spent. At least one 1 GiB
-    /// blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be
-    /// uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be
-    /// admitted; the server refuses to start otherwise. At most 4 GiB - 1
-    /// (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin`
-    /// never holds more than it is counted for under the bound.
+    /// listener may hold in memory (`docs/design/write-path.md`, section 4.2): the
+    /// segments it declares that are not written to the hot store as they arrive (all
+    /// of them, without one). Not a limit on a blob's size: a segment held in memory
+    /// holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload
+    /// with a larger one and no room on the hot store is answered FAILED_PRECONDITION,
+    /// so the daemon sends its records by ByteStream, which streams a large blob to the
+    /// cold store. Those ranges are held until the upload commits, admitted
+    /// under `--write-bytes-in-flight` with every other upload: a `Begin` waits while
+    /// that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a
+    /// daemon's upload of small files with room to spare, and at most
+    /// `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server
+    /// refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most
+    /// one admission counts, so a `Begin` never holds more than it is counted for under
+    /// the bound.
     #[arg(
         long,
         value_name = "BYTES",
@@ -325,20 +337,26 @@ pub struct Args {
     /// the group, so they neither wait for the linger nor hold up small writes.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.own_segment_bytes)]
     pub write_own_segment_bytes: u64,
-    /// The most bytes uploads may hold at once. A ByteStream Write is admitted for its
-    /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
-    /// total, a segment upload's Begin for its whole length; a caller over the bound
-    /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
-    /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
+    /// The most bytes uploads may hold at once. A ByteStream Write is admitted before
+    /// it reads past its first message, for its blob's size up to 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob
+    /// is streamed onto the hot store, or to the cold store without room there, not
+    /// held); a BatchUpdateBlobs for its total; a
+    /// segment upload's Begin for what it holds in memory. A caller over the bound
+    /// waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by
+    /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
-    /// stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener
-    /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
+    /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
+    /// (each listener's `-max-streams` flag).
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
-        value_parser = clap::value_parser!(u64).range(kbf_front::MAX_BLOB_BYTES..)
+        value_parser = clap::value_parser!(u64).range(kbf_front::MIN_SEGMENT_UPLOAD_BYTES..)
     )]
     pub write_bytes_in_flight: u64,
+    /// The most HTTP/2 streams one connection may have open, per listener.
+    #[command(flatten)]
+    pub streams: crate::streams::StreamArgs,
     /// The most segment PUTs, each with its footer read-back, in flight at once. A
     /// segment sealed while all are busy waits; new blobs go to a new open segment.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
@@ -513,7 +531,7 @@ impl Args {
                 0 => Duration::MAX,
                 secs => Duration::from_secs(secs),
             },
-            streams: StreamTiming {
+            timing: StreamTiming {
                 progress_interval: Duration::from_secs(self.progress_interval_secs),
                 keepalive_interval: Duration::from_secs(self.http2_keepalive_interval_secs),
                 keepalive_timeout: Duration::from_secs(self.http2_keepalive_timeout_secs),
@@ -524,6 +542,7 @@ impl Args {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
+            streams: self.streams.limits(),
         })
     }
 

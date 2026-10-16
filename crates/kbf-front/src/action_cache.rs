@@ -10,10 +10,10 @@ use tonic::{Request, Response, Status};
 
 use kbf_invocation::CallKind;
 
-use crate::cache::Cache;
-use crate::meta_log::MetaLog;
 use crate::recorder::{Recorder, listing};
-use crate::wire;
+use kbf_storage::Cache;
+use kbf_storage::MetaLog;
+use kbf_storage::wire;
 
 /// The `ActionCache` service over a [`Cache`]. GetActionResult is authorized by
 /// [`Authorizers::ac_get`] against the request's instance name; UpdateActionResult is

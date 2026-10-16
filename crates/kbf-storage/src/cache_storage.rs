@@ -1,22 +1,24 @@
-//! [`CacheStorage`]: the cache as a [`kbf_storage::Storage`], the boundary its callers
+//! [`CacheStorage`]: the cache as a [`Storage`], the boundary its callers
 //! go through. A thin adapter: each call is the cache's own, unchanged; only the error
 //! is converted ([`StorageError`] from [`CacheError`], answering the same gRPC code and
 //! message).
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use kbf_meta::{ActionRecord, Role};
-use kbf_objstore::ObjectStore;
+use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
-use kbf_storage::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 
-use crate::cache::{Cache, CacheError, VerifiedBlob};
+use crate::cache::{Cache, CacheError, RecordStream, StreamedRecord, VerifiedBlob};
 use crate::meta_log::MetaLog;
 use crate::segments::{Connections, SegmentsConfig, SegmentsService};
+use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError, StreamedPut};
 
 /// A cache, and the `--segment-upload-*` limits its `Segments` services keep, as a
 /// [`Storage`].
@@ -43,16 +45,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         Box::pin(async move { Ok(self.cache.read_blob(digest).await?) })
     }
 
-    /// The cache reads and checks whole blobs only (its range read, `read_object_range`,
-    /// is unchecked and for segment uploads), so this is [`Cache::read_blob`] and a cut
-    /// of its answer: the blob is read and checked against its digest as a whole, for any
+    /// The cache checks a blob against its digest only after its last window
+    /// ([`Cache::read_windows`]), so this reads every window, gathers the blob, and cuts
+    /// the answer: the blob is read and checked against its digest as a whole, for any
     /// `offset` and `limit`, before the first chunk is sent.
     ///
-    /// Memory: the one blob (at most [`crate::MAX_BLOB_BYTES`]) is held once, until the
-    /// stream is dropped or read to the end; each chunk is a zero-copy slice of it, at
-    /// most [`READ_CHUNK_BYTES`], made when the stream is polled. A caller does not hold
-    /// the blob, but this store does: a read in pieces from the object store, checked
-    /// before it is sent, needs the cache to check a record in pieces, which it cannot.
+    /// Memory: the one blob is held once, until the stream is dropped or read to the
+    /// end; each chunk is a zero-copy slice of it, at most [`READ_CHUNK_BYTES`], made
+    /// when the stream is polled. A caller does not hold the blob, but this store does:
+    /// a read in pieces from the object store, checked before it is sent, needs the
+    /// cache to check a record in pieces, which it cannot.
     fn read_range<'a>(
         &'a self,
         digest: &'a Digest,
@@ -66,8 +68,15 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                     offset,
                 });
             }
-            let blob = self.cache.read_blob(digest).await?;
-            Ok(chunks(blob, offset, limit))
+            let mut read = self
+                .cache
+                .read_windows(digest, 0, digest.size_bytes)
+                .await?;
+            let mut blob = BytesMut::new();
+            while let Some(window) = read.next().await {
+                blob.extend_from_slice(&window?);
+            }
+            Ok(chunks(blob.freeze(), offset, limit))
         })
     }
 
@@ -84,12 +93,24 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         })
     }
 
-    /// Always `None` until the cache can stream a record onto its write tier: this wires
-    /// to the cache's `RecordStream` and `StreamedRecord` (`append`, `finish`, `commit`)
-    /// when they land, and a caller stores the blob whole with [`Storage::put`] until
-    /// then.
-    fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
-        None
+    /// The cache's own stream onto its write tier ([`Cache::stream`]).
+    fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
+        let stream = self.cache.stream(size)?;
+        Some(Box::new(stream))
+    }
+
+    /// The cache's own streamed write to the object store
+    /// ([`Cache::store_streamed_claimed`]), each failed piece of `bytes` a body error.
+    fn put_streamed(
+        &self,
+        size: u64,
+        bytes: BoxStream<'static, std::io::Result<Bytes>>,
+        claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        let body = bytes
+            .map(|piece| piece.map_err(|e| ObjectStoreError::Body(e.to_string())))
+            .boxed();
+        Box::pin(async move { Ok(self.cache.store_streamed_claimed(size, body, claim).await?) })
     }
 
     /// Its own uploads and connections: no other caller can name its uploads, and
@@ -125,6 +146,27 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                 .commit_action_record(role, action, record)
                 .await?)
         })
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> PutStream for RecordStream<M, O> {
+    fn append(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
+        Ok(RecordStream::append(self, chunk)?)
+    }
+
+    fn finish(
+        self: Box<Self>,
+        digest: Digest,
+        crc32c: u32,
+    ) -> Result<Box<dyn StreamedPut>, StorageError> {
+        let streamed = RecordStream::finish(*self, digest, crc32c)?;
+        Ok(Box::new(streamed))
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> StreamedPut for StreamedRecord<M, O> {
+    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+        Box::pin(async move { Ok(StreamedRecord::commit(*self).await?) })
     }
 }
 

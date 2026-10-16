@@ -325,7 +325,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// [`Cache::missing_inputs`], and how many Directory blobs the checks this call
     /// started read from the store (a check another request started and this one
     /// joined is counted for that request).
-    pub(crate) async fn walk_inputs(self: &Arc<Self>, root: Digest) -> Result<Walked, CacheError> {
+    pub async fn walk_inputs(self: &Arc<Self>, root: Digest) -> Result<Walked, CacheError> {
         let Horizon { now, until, losses } = self.retention_horizon().await?;
         let walk = Arc::new(Walk {
             cache: Arc::clone(self),
@@ -360,11 +360,11 @@ pub(crate) struct Horizon {
 
 /// What one walk of an input tree found.
 #[derive(Debug)]
-pub(crate) struct Walked {
+pub struct Walked {
     /// What [`Cache::missing_inputs`] returns.
-    pub(crate) absent: Vec<Digest>,
+    pub absent: Vec<Digest>,
     /// Directory blobs read from the store.
-    pub(crate) dirs_read: u64,
+    pub dirs_read: u64,
 }
 
 /// The check of `digest` for this request: the request's own earlier start of it, a

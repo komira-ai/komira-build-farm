@@ -13,7 +13,10 @@
 //! [`MAX_RANGE_BYTES`], `--segment-upload-streams` at once, each read from where the
 //! records' bytes are when it is sent ([`crate::Source`]: nothing is copied first), and one
 //! `Commit`. A failed upload is tried once more; then its blobs go one
-//! ByteStream write each. A server that answers UNIMPLEMENTED (one without the
+//! ByteStream write each. An upload the server answers FAILED_PRECONDITION (a record
+//! over 16 MiB it has no write tier room for, and does not hold in memory) goes one
+//! ByteStream write each at once: a `Write` of a large blob streams it to the store,
+//! so no blob is refused for its size. A server that answers UNIMPLEMENTED (one without the
 //! service) turns segment upload off for the life of the process, logged once.
 //!
 //! **Reads.** [`Scope::read_located`] asks where blobs are (`Locate`), coalesces blobs
@@ -49,8 +52,7 @@ use crate::wire::MAX_MESSAGE_BYTES;
 /// retried and falls back for at most this much, and the uploads committed before it
 /// stay committed: a cold upload of 14,244 outputs (300 MB) on a store that was busy
 /// lost every blob it had sent to one failed 1 GiB upload. Under kbf-server's smallest
-/// `--segment-upload-max-bytes` (one 1 GiB blob and its footer), so every server admits
-/// it. The server's PUT of a segment of this size is also one a slow store finishes
+/// `--segment-upload-max-bytes` (33 MiB), so every server admits it. The server's PUT of a segment of this size is also one a slow store finishes
 /// within `min-put-rate` of `kbf-server --cold-store`.
 pub const SEGMENT_UPLOAD_BYTES: u64 = 32 << 20;
 
@@ -260,7 +262,10 @@ impl Scope {
             .await
     }
 
-    /// One upload, tried twice, then blob by blob.
+    /// One upload, tried twice, then blob by blob; blob by blob at once when the server
+    /// answers FAILED_PRECONDITION (`Begin`: a record too large to hold in memory and
+    /// no write tier with room for it), whose ByteStream `Write` streams a large blob
+    /// to the store.
     async fn upload_or_fall_back(&self, upload: &[Planned]) -> Result<(), CasError> {
         let inner = &self.inner;
         for attempt in 0..2 {
@@ -271,6 +276,10 @@ impl Scope {
                 Ok(()) => return Ok(()),
                 Err(Failed::Read(e)) => {
                     return Err(CasError::Read("outputs".to_owned(), e.to_string()));
+                }
+                Err(Failed::Call(status)) if status.code() == Code::FailedPrecondition => {
+                    tracing::debug!("segment upload refused: {}; blob by blob", status.message());
+                    break;
                 }
                 Err(Failed::Call(status)) if status.code() == Code::Unimplemented => {
                     // Later uploads see the flag and do not ask; of uploads already in
@@ -534,11 +543,13 @@ fn read_error(record: &Record, e: &std::io::Error) -> CasError {
 /// Stores every blob of `records` through `cas`'s own [`Cas::put`] (or
 /// [`Cas::put_chunks`] for one over a megabyte, streamed from its source),
 /// `in_flight` at a time: what [`Cas::put_records`] does for a store without segment
-/// upload.
-pub(crate) async fn put_each<C: Cas + ?Sized>(
-    cas: &C,
-    records: Vec<Record>,
-) -> Result<(), CasError> {
+/// upload, and what one does with an upload its server refuses for want of a write
+/// tier (`kbf-all-in-one`'s plane).
+///
+/// # Errors
+/// The first record that could not be read or stored, or that `cas` stored under
+/// another digest ([`CasError::Corrupt`]).
+pub async fn put_each<C: Cas + ?Sized>(cas: &C, records: Vec<Record>) -> Result<(), CasError> {
     stream::iter(records)
         .map(|r| async move {
             let digest = to_proto(&r.digest);

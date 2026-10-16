@@ -23,7 +23,7 @@ Status: design, nothing built. It supersedes the leader-elected server cluster i
 
 ## 3. Crate mapping
 
-- **[F]** Frontend: `kbf-front` (REAPI), `kbf-auth`, `kbf-sched`, `kbf-server`. State store: the `ControlRecord` log and a new `kbf-state` trait (no SQLite or Postgres backend exists). Storage: `kbf-meta`, `kbf-tier`, `kbf-segments`, `kbf-objstore`, `kbf-front/src/cache/*`. Daemon: `kbf-daemon`, `kbf-node`, `kbf-transfer`, `kbf-driver-*`.
+- **[F]** Frontend: `kbf-front` (REAPI), `kbf-auth`, `kbf-sched`, `kbf-server`. State store: the `ControlRecord` log and a new `kbf-state` trait (no SQLite or Postgres backend exists). Storage: `kbf-meta`, `kbf-tier`, `kbf-segments`, `kbf-objstore`, `kbf-storage/src/cache/*`. Daemon: `kbf-daemon`, `kbf-node`, `kbf-transfer`, `kbf-driver-*`.
 - **[F]** `kbf-front` owns both the REAPI services and the whole cache write path (`cache.rs:182`); storage is cut out along `cache/*` (P2). Scheduler state is not in the Raft log today and `farm.rs` runs under one `Mutex<State>`.
 - **[F]** The `Blobs` trait (`kbf-server/src/local.rs:36-40`) is the in-process seam `kbf-all-in-one` uses. The storage-and-daemon plane is a `Cas` implementation over the local store, modelled on it.
 

@@ -271,6 +271,21 @@ impl Storage for RemoteStorage {
         None
     }
 
+    /// Refused: the service has no streamed write to the object store; a caller stores
+    /// the blob with [`Storage::put`].
+    fn put_streamed(
+        &self,
+        _size: u64,
+        _bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        _claim: futures::future::BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        Box::pin(async {
+            Err(StorageError::Invalid(
+                "this store takes no streamed put".to_owned(),
+            ))
+        })
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         Arc::new(self.clone())
     }

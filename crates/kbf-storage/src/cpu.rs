@@ -23,6 +23,13 @@ impl From<JobFailed> for Status {
     }
 }
 
+impl From<JobFailed> for kbf_objstore::ObjectStoreError {
+    /// A streamed write's body whose hashing failed: the write ends, storing nothing.
+    fn from(failed: JobFailed) -> Self {
+        Self::Body(failed.to_string())
+    }
+}
+
 impl From<JobFailed> for CacheError {
     fn from(failed: JobFailed) -> Self {
         CacheError::Internal(failed.to_string())
@@ -101,6 +108,17 @@ mod tests {
 
     fn two() -> NonZeroUsize {
         NonZeroUsize::MIN.saturating_add(1)
+    }
+
+    /// Catches a hashing job that panicked in a streamed write's body taken for
+    /// anything but the body's failure (the write must end, storing nothing).
+    #[test]
+    fn a_failed_job_fails_a_streamed_body() {
+        let failed = kbf_objstore::ObjectStoreError::from(JobFailed("it panicked".into()));
+        assert_eq!(
+            failed.to_string(),
+            "the body of a streamed write failed: a hashing job failed: it panicked"
+        );
     }
 
     /// Eight jobs offered at once to a pool of two run two at a time: never more (the

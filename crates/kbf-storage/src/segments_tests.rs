@@ -26,11 +26,7 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
     let bytes = writer.finish();
     let footer = Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (declared, _) = declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared, bytes[..records_len].to_vec())
 }
 
@@ -40,7 +36,7 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
 #[tokio::test]
 async fn the_check_builds_each_received_segment() {
     let (declared, records) = declared_segment();
-    let mut received = Receiving::new(&declared[0], false);
+    let mut received = Receiving::new(&declared[0], false, None);
     let (put, claimed) = received.put(&declared[0], 0, &records).expect("put");
     assert_eq!(put, Put::Written);
     advance(&claimed, |i, finished| {
@@ -68,7 +64,7 @@ async fn a_check_that_panics_answers_internal() {
         records_len: 0,
         entries: Vec::new(),
     };
-    let received = Receiving::new(&nothing, false);
+    let received = Receiving::new(&nothing, false, None);
     let failed = check_all(committing(declared), vec![received])
         .await
         .expect_err("a panicked check");
@@ -89,7 +85,7 @@ fn a_job_outliving_its_receiving_upload_sees_nothing() {
     let upload = committing(declared);
     let mut bad = records;
     bad[1] ^= 1;
-    let mut received = Receiving::new(&upload.declared[0], false);
+    let mut received = Receiving::new(&upload.declared[0], false, None);
     let (_, claimed) = received.put(&upload.declared[0], 0, &bad).expect("put");
     *lock(&upload.phase) = Phase::Receiving {
         segments: vec![received],

@@ -134,6 +134,15 @@ impl<N: Node> Sim<N> {
         self.nodes.get(id)
     }
 
+    /// Every node, in name order, to change between steps: what happens to a node
+    /// outside its inputs (a process that dies because another node's process did,
+    /// when the two are one process). Nothing a node queues leaves it until its next
+    /// input; a change made here must depend only on the run so far, so the seed still
+    /// replays.
+    pub fn nodes_mut(&mut self) -> impl Iterator<Item = (&NodeId, &mut N)> {
+        self.nodes.iter_mut()
+    }
+
     /// Every node, in name order.
     pub fn nodes(&self) -> impl Iterator<Item = (&NodeId, &N)> {
         self.nodes.iter()

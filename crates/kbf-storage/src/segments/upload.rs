@@ -10,7 +10,10 @@ use kbf_segments::{Footer, IndexEntry, RecordHasher};
 use kbf_types::Digest;
 use tonic::Status;
 
-use crate::cache::BuiltSegment;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use crate::cache::{BuiltSegment, TierRange};
 
 /// One segment as `Begin` declared it, with its footer parsed and checked.
 #[derive(Debug)]
@@ -24,22 +27,19 @@ pub(super) struct Declared {
 }
 
 /// Parses and checks `Begin`'s segments: each footer must parse for its segment's
-/// length, its records must not overlap, and every record must be at most `max_blob`
-/// bytes. Returns them with the upload's total length and record count.
+/// length, and its records must not overlap. Returns them with the upload's record
+/// count.
 ///
 /// # Errors
 /// INVALID_ARGUMENT naming the segment and why.
-pub(super) fn declare(
-    segments: &[(u64, &[u8])],
-    max_blob: u64,
-) -> Result<(Vec<Declared>, u64, usize), Status> {
+pub(super) fn declare(segments: &[(u64, &[u8])]) -> Result<(Vec<Declared>, usize), Status> {
     if segments.is_empty() {
         return Err(Status::invalid_argument(
             "an upload needs at least one segment",
         ));
     }
     let mut declared = Vec::with_capacity(segments.len());
-    let (mut total, mut records) = (0u64, 0usize);
+    let mut records = 0usize;
     for (i, &(length, footer)) in segments.iter().enumerate() {
         let parsed = Footer::parse(footer, length)
             .map_err(|e| Status::invalid_argument(format!("segment {i}: {e}")))?;
@@ -62,18 +62,6 @@ pub(super) fn declare(
                 )));
             }
         }
-        if let Some(e) = parsed
-            .entries()
-            .iter()
-            .find(|e| e.digest.size_bytes > max_blob)
-        {
-            return Err(Status::invalid_argument(format!(
-                "segment {i}: {} is larger than the largest blob the cache accepts \
-                 ({max_blob} bytes)",
-                e.digest
-            )));
-        }
-        total = total.saturating_add(length);
         records += parsed.entries().len();
         declared.push(Declared {
             length,
@@ -81,11 +69,37 @@ pub(super) fn declare(
             entries: parsed.entries().to_vec(),
         });
     }
-    Ok((declared, total, records))
+    Ok((declared, records))
 }
 
-/// The ranges of one segment received so far, and the bytes they carried, written into
-/// a buffer the segment's length (records, then room for the footer the server builds).
+/// The writes of one segment's ranges to the write tier: how many are still running,
+/// and the offsets of those that failed. Shared by the segment and the `PutRange` calls
+/// that write, which answer here without the upload's lock.
+#[derive(Debug, Default)]
+pub(super) struct TierWrites {
+    pending: AtomicUsize,
+    failed: Mutex<Vec<u64>>,
+}
+
+impl TierWrites {
+    /// Records that the write of the range at `offset` ended, and whether it wrote the
+    /// bytes (`ok`): a failed one is forgotten by [`Receiving::forget_failed`].
+    pub(super) fn done(&self, offset: u64, ok: bool) {
+        if !ok {
+            lock(&self.failed).push(offset);
+        }
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The ranges of one segment received so far, and the bytes they carried: written into
+/// a buffer the segment's length (records, then room for the footer the server builds),
+/// or, on a write tier that took the segment's records, written there as they arrive
+/// (then nothing of them is held here).
 ///
 /// Unless the upload is trusted, each record is checked as its bytes arrive: its
 /// SHA-256 and CRC-32C advance over the bytes received contiguously from its start,
@@ -94,7 +108,11 @@ pub(super) fn declare(
 /// nothing.
 #[derive(Debug)]
 pub(super) struct Receiving {
+    /// The segment's bytes, unless they go to `tier`: then empty.
     buffer: Vec<u8>,
+    /// The records' range on the write tier, when they are written there, and the
+    /// writes to it.
+    tier: Option<(Arc<TierRange>, Arc<TierWrites>)>,
     /// Received ranges, start to end; they never overlap.
     ranges: BTreeMap<u64, u64>,
     /// Indices into the declared entries, by record offset.
@@ -156,9 +174,9 @@ where
 
 impl Receiving {
     /// A segment of `declared`'s shape. With `trusted`, nothing is hashed: the records
-    /// are held as received and built into a segment [`BuiltSegment::verified`] is
-    /// false for.
-    pub(super) fn new(declared: &Declared, trusted: bool) -> Self {
+    /// are held as received (or written to `tier`, a range of the records' length, when
+    /// there is one) and built into a segment [`BuiltSegment::verified`] is false for.
+    pub(super) fn new(declared: &Declared, trusted: bool, tier: Option<TierRange>) -> Self {
         let mut by_offset: Vec<usize> = (0..declared.entries.len()).collect();
         by_offset.sort_by_key(|&i| declared.entries[i].offset);
         let mut records: Vec<Record> = declared.entries.iter().map(|_| Record::default()).collect();
@@ -174,9 +192,16 @@ impl Receiving {
                 }
             }
         }
+        let length = usize::try_from(declared.length).unwrap_or(usize::MAX);
+        // Zeroed pages are allocated lazily: memory follows the bytes received.
+        let buffer = if tier.is_some() {
+            Vec::new()
+        } else {
+            vec![0; length]
+        };
         Self {
-            // Zeroed pages are allocated lazily: memory follows the bytes received.
-            buffer: vec![0; usize::try_from(declared.length).unwrap_or(usize::MAX)],
+            buffer,
+            tier: tier.map(|range| (Arc::new(range), Arc::default())),
             ranges: BTreeMap::new(),
             by_offset,
             records,
@@ -201,6 +226,7 @@ impl Receiving {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(Put, Vec<usize>), Status> {
+        self.forget_failed();
         let records_len = declared.records_len;
         let end = offset
             .checked_add(bytes.len() as u64)
@@ -223,9 +249,14 @@ impl Receiving {
                 "range {offset}..{end} overlaps the received range {start}..{stop}"
             )));
         }
-        // `end <= records_len <= buffer.len()`, both fit in usize.
-        let (from, to) = (offset as usize, end as usize);
-        self.buffer[from..to].copy_from_slice(bytes);
+        if let Some((_, writes)) = &self.tier {
+            // The caller writes the bytes to the tier, then calls `TierWrites::done`.
+            writes.pending.fetch_add(1, Ordering::SeqCst);
+        } else {
+            // `end <= records_len <= buffer.len()`, both fit in usize.
+            let (from, to) = (offset as usize, end as usize);
+            self.buffer[from..to].copy_from_slice(bytes);
+        }
         self.ranges.insert(offset, end);
         let claimed = if self.trusted {
             Vec::new()
@@ -233,6 +264,24 @@ impl Receiving {
             self.claim(declared, offset, end)
         };
         Ok((Put::Written, claimed))
+    }
+
+    /// The range on the write tier a written range's bytes go to, and its writes, when
+    /// the records are written there: the caller of [`Receiving::put`] writes them, then
+    /// calls [`TierWrites::done`].
+    pub(super) fn tier(&self) -> Option<(Arc<TierRange>, Arc<TierWrites>)> {
+        self.tier.clone()
+    }
+
+    /// Forgets the ranges whose write to the tier failed, so they are missing at the
+    /// commit and can be sent again. Called before a range is recorded and before a
+    /// commit looks at what was received.
+    pub(super) fn forget_failed(&mut self) {
+        if let Some((_, writes)) = &self.tier {
+            for offset in std::mem::take(&mut *lock(&writes.failed)) {
+                self.ranges.remove(&offset);
+            }
+        }
     }
 
     /// Claims the records overlapping `start..end` that no task is advancing and that
@@ -319,12 +368,16 @@ impl Receiving {
     }
 
     /// Why a commit cannot go on: a refused record, or a record some task is still
-    /// checking (a client that commits before its ranges are answered).
+    /// checking or a range still being written to the tier (a client that commits
+    /// before its ranges are answered).
     pub(super) fn not_ready(&self) -> Option<Status> {
-        self.refusal().or_else(|| {
-            self.checking()
-                .then(|| Status::failed_precondition("ranges are still being checked"))
-        })
+        let writing = self
+            .tier
+            .as_ref()
+            .is_some_and(|(_, w)| w.pending.load(Ordering::SeqCst) > 0);
+        let busy = self.checking() | writing;
+        self.refusal()
+            .or_else(|| busy.then(|| Status::failed_precondition("ranges are still being checked")))
     }
 
     /// Whether a task is still checking some record.
@@ -370,6 +423,16 @@ impl Receiving {
                 crc32c,
             });
         }
+        if let Some((range, _)) = self.tier {
+            // No range is being written (`not_ready`), so this is the last reference.
+            let range = Arc::into_inner(range);
+            return Ok(BuiltSegment {
+                body: Bytes::new(),
+                entries,
+                verified: false,
+                staged: range,
+            });
+        }
         let footer = encode_footer(declared.records_len, &entries);
         // The same entry count as the declared footer, so the same length: the buffer's
         // tail after the records.
@@ -378,6 +441,7 @@ impl Receiving {
             body: Bytes::from(buffer),
             entries,
             verified: !self.trusted,
+            staged: None,
         })
     }
 }

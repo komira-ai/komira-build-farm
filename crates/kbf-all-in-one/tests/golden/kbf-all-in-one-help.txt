@@ -24,7 +24,7 @@ Options:
           PEM file of this daemon's client certificate chain
 
       --hot-store <URI>
-          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
+          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. A daemon's outputs (a segment upload, or the in-process plane) and a ByteStream Write over 16 MiB are written through to it as they arrive, so a large one is never held in memory. Without it, or when it has no room, a daemon's blob over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it arrives (a ByteStream Write, or the in-process plane's own stream), never held whole and never refused for its size. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
 
       --hot-store-max-bytes <BYTES>
           The most bytes the hot store's block files may hold before they are flushed, lower than its automatic budget
@@ -285,9 +285,9 @@ Options:
           [default: 8192]
 
       --segment-upload-max-bytes <BYTES>
-          The most bytes, records and footers together, one segment upload on the worker listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held in memory until their upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least one 1 GiB blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most 4 GiB - 1 (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
+          The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
           
-          [default: 1074790400]
+          [default: 34603008]
 
       --container-shm-mib <CONTAINER_SHM_MIB>
           The size of each container's `/dev/shm`, in MiB (container)
@@ -325,7 +325,7 @@ Options:
           [default: 512]
 
       --write-bytes-in-flight <WRITE_BYTES_IN_FLIGHT>
-          The most bytes uploads may hold at once. A ByteStream Write is admitted for its blob's size before it reads past its first message, a BatchUpdateBlobs for its total, a segment upload's Begin for its whole length; a caller over the bound waits, nothing is refused for load. At least the largest blob (1 GiB), so one can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener (`kbf_front::MAX_CONCURRENT_STREAMS`)
+          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open (each listener's `-max-streams` flag)
           
           [default: 2147483648]
 
@@ -334,15 +334,30 @@ Options:
           
           [default: 25]
 
-      --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
-          The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
+      --reapi-max-streams <REAPI_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
           
-          [default: 4]
+          [default: 10000]
 
       --memory-pressure-pause-percent <MEMORY_PRESSURE_PAUSE_PERCENT>
           The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
           
           [default: 10]
+
+      --worker-max-streams <WORKER_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
+          
+          [default: 200]
+
+      --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
+          The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
+          
+          [default: 4]
+
+      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
+          How often each lease's `max` events and swap are sampled, in milliseconds (container)
+          
+          [default: 1000]
 
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
@@ -354,30 +369,25 @@ Options:
           
           [default: 1048576]
 
-      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
-          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
-          
-          [default: 268435456]
-
-      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
-          How often each lease's `max` events and swap are sampled, in milliseconds (container)
-          
-          [default: 1000]
-
-      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
-          The most Directory blobs the input check reads from the store at once, across all Executes
-          
-          [default: 64]
-
       --memory-limit-percent <MEMORY_LIMIT_PERCENT>
           A lease's processes are killed past this percentage of its booked memory...
           
           [default: 150]
 
+      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
+          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+          
+          [default: 268435456]
+
       --memory-headroom-mib <MEMORY_HEADROOM_MIB>
           ...plus this many MiB (native). A lease that booked nothing has no limit
           
           [default: 512]
+
+      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
+          The most Directory blobs the input check reads from the store at once, across all Executes
+          
+          [default: 64]
 
       --memory-poll-ms <MEMORY_POLL_MS>
           How often a lease's memory is measured, in milliseconds (native)

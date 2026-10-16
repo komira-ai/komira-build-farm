@@ -24,11 +24,12 @@ use tonic::{Request, Response, Status, Streaming};
 
 use kbf_invocation::CallKind;
 
-use crate::cache::{Cache, CacheError, VerifiedBlob};
-use crate::meta_log::MetaLog;
+use crate::MAX_BATCH_TOTAL_BYTES;
 use crate::recorder::Recorder;
 use crate::request_metadata::call_metadata;
-use crate::{MAX_BATCH_TOTAL_BYTES, wire};
+use kbf_storage::MetaLog;
+use kbf_storage::wire;
+use kbf_storage::{Cache, CacheError, VerifiedBlob};
 
 /// Directories per `GetTreeResponse` when the client sets no smaller page size.
 const TREE_PAGE_DIRECTORIES: usize = 1_000;

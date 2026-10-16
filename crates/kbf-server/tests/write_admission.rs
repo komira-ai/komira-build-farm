@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -21,6 +22,8 @@ use kbf_proto::google::bytestream::WriteRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_server::{Listeners, bind_server};
 use kbf_types::Digest;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tonic::transport::{Channel, Endpoint};
 
 /// The size of each blob, and of each message carrying part of one.
@@ -108,10 +111,11 @@ fn listeners() -> Listeners {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
-        streams: kbf_server::StreamTiming::default(),
+        timing: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        streams: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -156,6 +160,99 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
     for d in &digests {
         assert!(cache.is_durable(d).await.expect("durable"), "{d}");
     }
+}
+
+/// Three 2 MiB Writes are admitted and held at their last message; then 1500 more
+/// Writes over the same connection to the REAPI listener, as `bind_server` sets it up
+/// (10000 streams allowed), wait for admission against the 6 MiB bound, each leaving a
+/// stream window's worth of its data unread. Only when the client has sent all of that
+/// do the admitted ones send their last message. Every Write finishes. The deadlines
+/// detect a hang, not a speed.
+///
+/// The signal that the waiting Writes' data has arrived is a count, not a pause: the
+/// connection goes through a forwarder that counts the bytes the client sends, and the
+/// test waits until the waiting Writes have sent their first message and a whole stream
+/// window each, less 5% (the most a stream can send before the server reads again is
+/// about that). Under a connection window smaller than that, the count is never reached.
+///
+/// Catches: a connection window smaller than the streams the listener allows times
+/// the stream window. 1500 waiting Writes leave 1500 x 214,748 B (about 307 MiB) unread,
+/// more than a connection window fixed at 200 MiB holds (a fixed window starves at
+/// about 977 waiting Writes), so with it the admitted ones never get their last message.
+/// Mutant: the REAPI listener's connection window fixed at 200 MiB again
+/// (`flow_windows`: `connection: 200 * STREAM_WINDOW_BYTES`). Without the admitted
+/// Writes held, they finish before the waiting ones pile up and the test passes on the
+/// old code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_waiting_writes_than_a_fixed_window_holds_all_finish() {
+    const WAITING_BLOB: usize = 2 << 20;
+    const ADMITTED: usize = 3;
+    const WAITING: usize = 1500;
+    const MANY_BOUND: u64 = (ADMITTED * WAITING_BLOB) as u64;
+    let (cache, address) = serve_at(MANY_BOUND).await;
+    let (address, sent) = count_client_bytes(address).await;
+    let channel = connect(address).await;
+
+    let mut lasts = Vec::new();
+    let mut calls = Vec::new();
+    for i in 0..ADMITTED {
+        let (_, mut messages) = upload_sized(i, WAITING_BLOB);
+        let last = messages.pop().expect("a last message");
+        let (send, receive) = mpsc::unbounded();
+        for message in messages {
+            send.unbounded_send(message).expect("queued");
+        }
+        lasts.push((send, last));
+        let mut client = ByteStreamClient::new(channel.clone());
+        calls.push(tokio::spawn(async move { client.write(receive).await }));
+    }
+    let held = (ADMITTED * (WAITING_BLOB - CHUNK)) as u64;
+    let deadline = Instant::now() + PROMPT;
+    while cache.write_buffer_peak() < held && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cache.write_buffer_peak() >= held,
+        "{}: the first Writes were not admitted",
+        cache.write_buffer_peak()
+    );
+
+    // The waiting Writes: a first message, which the server reads to find the blob's
+    // name, then data it does not read until admission, which fills each stream's window.
+    let before = sent.load(Ordering::SeqCst);
+    for i in ADMITTED..ADMITTED + WAITING {
+        let (_, messages) = upload_chunked(i, WAITING_BLOB_SMALL, SMALL_CHUNK);
+        let mut client = ByteStreamClient::new(channel.clone());
+        calls.push(tokio::spawn(async move {
+            client.write(stream::iter(messages)).await
+        }));
+    }
+    let window = u64::from(kbf_server::streams::flow_windows(10_000).stream);
+    // What the windows hold, less 5%: the streams send a little under their window (a
+    // run measured 99.7%), and the mutant's connection window stops them at 65%.
+    let held_in_windows = WAITING as u64 * (SMALL_CHUNK as u64 + window);
+    let expected = held_in_windows - held_in_windows / 20;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while sent.load(Ordering::SeqCst) - before < expected && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let arrived = sent.load(Ordering::SeqCst) - before;
+    assert!(
+        arrived >= expected,
+        "the waiting Writes sent {arrived} bytes of the {expected} their windows hold"
+    );
+
+    for (send, last) in lasts {
+        send.unbounded_send(last).expect("queued");
+    }
+    let all = async {
+        for call in calls {
+            call.await.expect("join").expect("write");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(180), all)
+        .await
+        .expect("every Write finishes");
 }
 
 /// Catches: a bound that admits one Write at a time (a lock, not a byte budget), and a
@@ -207,9 +304,21 @@ async fn two_writes_under_the_bound_buffer_at_once() {
 /// How long the test waits for what must happen.
 const PROMPT: Duration = Duration::from_secs(10);
 
+/// The blob and message size of the waiting Writes of the test above: a message over a
+/// stream window (214,748 B at 10000 streams), so a waiting Write's second message
+/// reaches the window's end, and small, so 1500 of them do not fill the test's memory.
+const SMALL_CHUNK: usize = 64 << 10;
+const WAITING_BLOB_SMALL: usize = 1 << 20;
+
 /// A cache whose Writes may hold `bytes_in_flight`, served on a REAPI listener as
 /// `bind_server` sets it up, and one connection to it.
 async fn serve(bytes_in_flight: u64) -> (Arc<Cache<MemoryMetaLog, TailStore>>, Channel) {
+    let (cache, reapi) = serve_at(bytes_in_flight).await;
+    (cache, connect(reapi).await)
+}
+
+/// As [`serve`], and the REAPI listener's address instead of a connection.
+async fn serve_at(bytes_in_flight: u64) -> (Arc<Cache<MemoryMetaLog, TailStore>>, SocketAddr) {
     let writes = WriteConfig {
         bytes_in_flight,
         ..WriteConfig::DEFAULT
@@ -224,31 +333,90 @@ async fn serve(bytes_in_flight: u64) -> (Arc<Cache<MemoryMetaLog, TailStore>>, C
     let bound = bind_server(Arc::clone(&cache), listeners(), std::future::pending()).expect("bind");
     let reapi = bound.reapi;
     tokio::spawn(bound.serving);
-    let channel = Endpoint::from_shared(format!("http://{reapi}"))
+    (cache, reapi)
+}
+
+async fn connect(address: SocketAddr) -> Channel {
+    Endpoint::from_shared(format!("http://{address}"))
         .expect("endpoint")
         .connect()
         .await
-        .expect("connect");
-    (cache, channel)
+        .expect("connect")
+}
+
+/// A forwarder to `target` and its address: what a client connects to, in place of
+/// `target`, and the number of bytes the clients have sent through it.
+async fn count_client_bytes(target: SocketAddr) -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let sent = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&sent);
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let Ok(server) = TcpStream::connect(target).await else {
+                    return;
+                };
+                let (mut from_client, mut to_client) = client.into_split();
+                let (mut from_server, mut to_server) = server.into_split();
+                let up = async {
+                    let mut buffer = vec![0u8; 64 << 10];
+                    loop {
+                        match from_client.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                counted.fetch_add(n as u64, Ordering::SeqCst);
+                                if to_server.write_all(&buffer[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+                let down = tokio::io::copy(&mut from_server, &mut to_client);
+                tokio::select! { () = up => {}, _ = down => {} }
+            });
+        }
+    });
+    (address, sent)
 }
 
 /// Blob `i` (of [`BLOB`] bytes, its own) and the Write messages that upload it, one
 /// [`CHUNK`] each.
 fn upload(i: usize) -> (Digest, Vec<WriteRequest>) {
-    let mut data = vec![0u8; BLOB];
+    upload_sized(i, BLOB)
+}
+
+/// Blob `i` of `blob` bytes and the Write messages that upload it, one [`CHUNK`] each.
+fn upload_sized(i: usize, blob: usize) -> (Digest, Vec<WriteRequest>) {
+    let (digest, messages) = upload_chunked(i, blob, CHUNK);
+    (digest, messages.collect())
+}
+
+/// Blob `i` of `blob` bytes and the Write messages that upload it, one `chunk` each,
+/// made as they are asked for.
+fn upload_chunked(
+    i: usize,
+    blob: usize,
+    chunk: usize,
+) -> (Digest, impl Iterator<Item = WriteRequest>) {
+    let mut data = vec![0u8; blob];
     data[..8].copy_from_slice(&(i as u64).to_le_bytes());
     let digest = kbf_segments::sha256(&data);
-    let name = format!("uploads/u{i}/blobs/{}/{BLOB}", digest.hash_hex());
-    let last = BLOB / CHUNK - 1;
-    let messages = data
-        .chunks(CHUNK)
-        .enumerate()
-        .map(|(j, c)| WriteRequest {
+    let name = format!("uploads/u{i}/blobs/{}/{blob}", digest.hash_hex());
+    let count = blob / chunk;
+    let messages = (0..count).map(move |j| {
+        let mut data = vec![0u8; chunk];
+        if j == 0 {
+            data[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        }
+        WriteRequest {
             resource_name: if j == 0 { name.clone() } else { String::new() },
-            write_offset: (j * CHUNK) as i64,
-            finish_write: j == last,
-            data: c.to_vec(),
-        })
-        .collect();
+            write_offset: (j * chunk) as i64,
+            finish_write: j == count - 1,
+            data,
+        }
+    });
     (digest, messages)
 }

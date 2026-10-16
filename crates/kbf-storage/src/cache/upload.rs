@@ -25,6 +25,10 @@ pub(crate) struct BuiltSegment {
     /// daemon's digests) is staged as it is, and the flusher hashes it before the PUT;
     /// one the tier does not take is hashed here before it is PUT.
     pub verified: bool,
+    /// The records' range on the write tier when they were written there as they
+    /// arrived (`body` then holds nothing): staged with the declared entries, never PUT
+    /// from here.
+    pub staged: Option<super::stream::TierRange>,
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
@@ -74,6 +78,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         segment: BuiltSegment,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
+        if let Some(range) = segment.staged {
+            let blobs = segment
+                .entries
+                .iter()
+                .map(|e| (e.digest, e.offset))
+                .collect();
+            self.stage_range(range, blobs).await?;
+            return Ok(Vec::new());
+        }
         if self.writer.stage(segment.body.clone(), true).await? {
             return Ok(Vec::new());
         }
@@ -143,6 +156,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             body: Bytes::from([records, footer.as_slice()].concat()),
             entries: found.good,
             verified: true,
+            staged: None,
         })
     }
 

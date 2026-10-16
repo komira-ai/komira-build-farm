@@ -15,9 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{
-    Applied, Command, Location, ObjectId, ServerId, StagedPut, TierId, UnreachableReason,
-};
+use kbf_meta::{Applied, Command, ObjectId, ServerId, StagedPut, TierId, UnreachableReason};
 use kbf_objstore::ObjectStore;
 use kbf_segments::{Footer, IndexEntry};
 use kbf_store::Fs;
@@ -91,15 +89,6 @@ impl Staging {
     pub(super) fn done(&self, object: ObjectId) {
         self.retries().remove(&object);
     }
-}
-
-/// What a local read found.
-enum Local {
-    Read(Bytes),
-    /// The bytes are there but fail their digest.
-    Damaged,
-    /// No local copy (never staged here, flushed and evicted, or unreadable).
-    Absent,
 }
 
 /// What [`Cache::attach_tier`] found and did at this start.
@@ -221,7 +210,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 .await?;
         }
         // A cache takes one tier: attached before it stores anything, and only once.
-        let _ = self.writer.tier.set(Staging::new(Arc::new(opened), tier));
+        let _ = self
+            .writer
+            .tier
+            .set(Arc::new(Staging::new(Arc::new(opened), tier)));
         let startup = TierStartup {
             tier,
             registered: current.is_none(),
@@ -262,41 +254,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Box::new(move || seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
-    /// Reads `digest` at `location` as the index answered it: from this server's tier
-    /// when the object is staged on it, or has a flushed copy here, else from the
-    /// store. An object staged when the query ran is never marked unreachable by a
-    /// read that does not find it in the store (it is not there yet); a staged record
-    /// that fails its digest on the local disk marks it corrupt (the local copy is the
-    /// only one): its block first takes no more ranges (a `PutStaged` into a marked
-    /// object is refused), and once the mark committed a sealed block is deleted (one
-    /// still sealing is left to the next start's sweep). A blob staged on another
-    /// server's tier is not read here.
-    pub(super) async fn fetch_answer(
-        &self,
-        digest: &Digest,
-        location: Location,
-        staged_on: Option<TierId>,
-    ) -> Result<Bytes, CacheError> {
-        self.used([location.object]);
-        if let Some(staging) = self.writer.tier.get()
-            && staged_on.is_none_or(|t| t == staging.id)
-        {
-            match self.read_local(staging, digest, location).await {
-                Local::Read(bytes) => return Ok(bytes),
-                Local::Damaged if staged_on.is_some() => {
-                    staging.tier.close(location.object);
-                    self.mark_unreachable(location.object, UnreachableReason::Corrupt)
-                        .await?;
-                    let _ = staging.tier.discard(location.object);
-                    return Err(CacheError::Unreachable(*digest));
-                }
-                Local::Damaged | Local::Absent => {}
-            }
-        }
-        self.fetch_from_store(digest, location, staged_on.is_none())
-            .await
-    }
-
     /// `len` bytes of `object` from `offset` on this tier (a staged block's committed
     /// bytes, or a flushed copy), unchecked; `None` when there is no tier or it does
     /// not hold the whole range, and the caller reads the store.
@@ -318,32 +275,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             staging.counters.local_reads.add(1);
             Bytes::from(bytes)
         })
-    }
-
-    /// `digest`'s record from the tier's block or flushed copy, checked.
-    async fn read_local(&self, staging: &Staging, digest: &Digest, at: Location) -> Local {
-        let len = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
-        let tier = Arc::clone(&staging.tier);
-        let read = blocking(
-            self.metrics(),
-            Box::new(move || tier.read(at.object, at.offset, len)),
-        )
-        .await;
-        match read {
-            Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => {
-                staging.counters.local_reads.add(1);
-                Local::Read(Bytes::from(bytes))
-            }
-            Ok(_) => {
-                tracing::error!(%digest, object = %at.object, "a record on the write tier fails its digest");
-                Local::Damaged
-            }
-            Err(TierError::UnknownBlock(_)) => Local::Absent,
-            Err(e) => {
-                tracing::warn!(%digest, error = %e, "write tier read failed; reading the store");
-                Local::Absent
-            }
-        }
     }
 }
 
@@ -389,11 +320,31 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             }
         };
         let at = |e: &IndexEntry| (e.digest, synced.offset() + e.offset);
+        let blobs = footer.entries().iter().map(at).collect();
+        self.put_staged(staging, synced, blobs, own).await?;
+        Ok(true)
+    }
+
+    /// Commits one `PutStaged` for `blobs` (each at its offset in the block) in the
+    /// synced range `synced`, sealing its block with the commit when `seal` (a block
+    /// of its own), and answers the range committed.
+    ///
+    /// # Errors
+    ///
+    /// The commit failed. The range is answered as failed unless the committed state
+    /// shows the commit applied anyway (`answer_lost_put`).
+    pub(super) async fn put_staged(
+        &self,
+        staging: &Staging,
+        synced: Synced,
+        blobs: Vec<(Digest, u64)>,
+        seal: bool,
+    ) -> Result<(), CacheError> {
         let put = StagedPut {
             object: synced.object(),
             end: synced.end(),
-            seal: own,
-            blobs: footer.entries().iter().map(at).collect(),
+            seal,
+            blobs,
         };
         let command = Command::PutStaged {
             tier: staging.id,
@@ -410,7 +361,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             Applied::Staged(Ok(_)) => {
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
-                Ok(true)
+                Ok(())
             }
             other => Err(unexpected(&other)),
         }

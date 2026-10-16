@@ -1,5 +1,5 @@
-//! A fake daemon: one process that never restarts, with the daemon's own rules for
-//! contact and epochs and a fake run of each lease.
+//! A fake daemon: one process, with the daemon's own rules for contact and epochs and
+//! a fake run of each lease.
 //!
 //! Its contact with the server is a [`Contact`], the daemon's: a heartbeat every
 //! interval the `Welcome` named, each recorded when sent and confirmed by its
@@ -10,6 +10,14 @@
 //! with a completed result; the result is kept until its `ResultAck`, listed in every
 //! heartbeat and resent with each, and on every new stream. One run in ten is long. A `Start` is taken only on
 //! the current stream, with contact confirmed, for a lease it does not hold.
+//!
+//! **The daemon half of `kbf-all-in-one`** ([`FakeDaemon::in_process`]) shares the
+//! server's process. Its run stores the action's output ([`output_of`]) in the server
+//! before it reports, and its result names that output: it reports a run only once the
+//! server has acknowledged the output's upload. The process dies with the server's
+//! ([`FakeDaemon::die`]: every run, staged output and unacknowledged result is lost)
+//! and starts again with it ([`FakeDaemon::revive`]) as a new instance, on a new stream:
+//! a message of the dead process's streams means nothing to it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -18,7 +26,7 @@ use kbf_daemon::{Contact, FENCE_AFTER, Moment, superseded};
 use kbf_sim::{Chance, Event, NodeId, NodeInput, Output, SimRng};
 use kbf_types::{Digest, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources, StateMachine};
 
-use crate::{Msg, input_of};
+use crate::{Msg, input_of, output_of};
 
 /// How often the daemon checks its runs and its contact.
 const POLL: Duration = Duration::from_secs(1);
@@ -31,6 +39,8 @@ const RUN_MS: (u64, u64) = (1_000, 6_000);
 const LONG_RUN: Duration = Duration::from_secs(80);
 /// A `Hello` not answered within this is sent again on a new stream.
 const HELLO_WAIT: Duration = Duration::from_secs(10);
+/// An output upload not acknowledged within this is sent again.
+const UPLOAD_WAIT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug)]
 struct Run {
@@ -40,11 +50,21 @@ struct Run {
     ends: FarmTime,
 }
 
+/// A finished run of the in-process half whose output is being stored: its action,
+/// and when its upload was last sent.
+#[derive(Clone, Copy, Debug)]
+struct Staging {
+    action: Digest,
+    sent: FarmTime,
+}
+
 /// The daemon node.
 #[derive(Debug)]
 pub struct FakeDaemon {
     server: NodeId,
     instance: String,
+    /// The instance's name without its incarnation, for [`FakeDaemon::revive`].
+    name: String,
     capacity: Resources,
     contact: Contact,
     stream: u64,
@@ -57,6 +77,18 @@ pub struct FakeDaemon {
     unacked: BTreeMap<LeaseId, (Digest, Outcome)>,
     /// Every lease this daemon has reported a result for.
     reported: BTreeSet<LeaseId>,
+    /// The half of an all-in-one process: it stores each run's output first.
+    in_process: bool,
+    /// The in-process half's finished runs whose output upload is not acknowledged.
+    staging: BTreeMap<LeaseId, Staging>,
+    /// Dead with its process: it ignores every input until revived.
+    dead: bool,
+    /// Revived, and connects at its next poll.
+    reviving: bool,
+    /// How many times its process has started.
+    incarnation: u64,
+    /// The runs, staged outputs and unacknowledged results lost with the process.
+    lost: usize,
     out: Vec<Output<Msg>>,
 }
 
@@ -65,11 +97,15 @@ fn moment(t: FarmTime) -> Moment {
 }
 
 impl FakeDaemon {
+    /// The tag of its poll timer, which checks its runs and its contact.
+    pub const POLL: u64 = T_POLL;
+
     /// A daemon of `capacity` that connects to `server`.
     #[must_use]
     pub fn new(server: NodeId, instance: String, capacity: Resources) -> Self {
         Self {
             server,
+            name: instance.clone(),
             instance,
             capacity,
             contact: Contact::new(FENCE_AFTER),
@@ -82,8 +118,71 @@ impl FakeDaemon {
             runs: BTreeMap::new(),
             unacked: BTreeMap::new(),
             reported: BTreeSet::new(),
+            in_process: false,
+            staging: BTreeMap::new(),
+            dead: false,
+            reviving: false,
+            incarnation: 1,
+            lost: 0,
             out: Vec::new(),
         }
+    }
+
+    /// The daemon half of an all-in-one process whose server half is `server`: its
+    /// instance is `<name>-<incarnation>`.
+    #[must_use]
+    pub fn in_process(server: NodeId, name: &str, capacity: Resources) -> Self {
+        let mut daemon = Self::new(server, format!("{name}-1"), capacity);
+        daemon.name = name.to_owned();
+        daemon.in_process = true;
+        daemon
+    }
+
+    /// The process died (the server half's did): every run, staged output and
+    /// unacknowledged result goes with it, and so does contact. It ignores every input
+    /// until [`FakeDaemon::revive`].
+    pub fn die(&mut self) {
+        self.dead = true;
+        self.reviving = false;
+        self.lost += self.runs.len() + self.staging.len() + self.unacked.len();
+        self.runs.clear();
+        self.staging.clear();
+        self.unacked.clear();
+        self.welcomed = false;
+        self.epoch = None;
+        self.contact = Contact::new(FENCE_AFTER);
+    }
+
+    /// The process started again: a new instance, which connects at its next poll on a
+    /// new stream.
+    pub fn revive(&mut self) {
+        if !self.dead {
+            return;
+        }
+        self.dead = false;
+        self.reviving = true;
+        self.incarnation += 1;
+        self.instance = format!("{}-{}", self.name, self.incarnation);
+    }
+
+    /// The server's process went down (`up` false) or started (true): the daemon half
+    /// of that process dies or starts with it; any other daemon is not touched.
+    pub fn server_process(&mut self, up: bool) {
+        if !self.in_process {
+            return;
+        }
+        if up {
+            self.revive();
+        } else {
+            self.die();
+        }
+    }
+
+    /// The runs, staged outputs and unacknowledged results lost with the process, over
+    /// every death.
+    #[must_use]
+    pub fn lost(&self) -> usize {
+        self.lost
     }
 
     /// The runs going on at `now` and not fenced: the lease of each, and the term and
@@ -102,7 +201,8 @@ impl FakeDaemon {
         &self.reported
     }
 
-    pub(crate) fn take_outputs(&mut self) -> Vec<Output<Msg>> {
+    /// What it has queued since it was last asked: messages and timers.
+    pub fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         std::mem::take(&mut self.out)
     }
 
@@ -144,6 +244,7 @@ impl FakeDaemon {
         let running = self
             .runs
             .keys()
+            .chain(self.staging.keys())
             .chain(self.unacked.keys())
             .copied()
             .collect();
@@ -160,13 +261,15 @@ impl FakeDaemon {
         if self.contact.lost(moment(now)) {
             // Fenced: every run is killed; its result is never sent.
             self.runs.clear();
+            self.staging.clear();
         }
         let gap = self.contact.check_gap(moment(now)).is_some();
         let unanswered =
             !self.welcomed && now.saturating_duration_since(self.hello_sent) >= HELLO_WAIT;
-        if gap || unanswered {
+        if std::mem::take(&mut self.reviving) || gap || unanswered {
             self.connect(now);
         }
+        self.resend_uploads(now);
         let ended: Vec<LeaseId> = self
             .runs
             .iter()
@@ -175,18 +278,62 @@ impl FakeDaemon {
             .collect();
         for lease in ended {
             let run = self.runs.remove(&lease).expect("listed above");
-            let outcome = Outcome::Completed {
-                action_result: input_of(&run.action),
-            };
-            self.unacked.insert(lease, (run.action, outcome));
-            self.reported.insert(lease);
-            let stream = self.stream;
-            self.send(Msg::Report {
-                stream,
-                lease,
-                action: run.action,
-                outcome,
-            });
+            if self.in_process {
+                let output = output_of(&run.action);
+                let staging = Staging {
+                    action: run.action,
+                    sent: now,
+                };
+                self.staging.insert(lease, staging);
+                self.send(Msg::Upload { digest: output });
+            } else {
+                self.report(lease, run.action, input_of(&run.action));
+            }
+        }
+    }
+
+    /// Reports `lease`'s run of `action` completed, its result `result`; keeps the
+    /// result until its `ResultAck`.
+    fn report(&mut self, lease: LeaseId, action: Digest, result: Digest) {
+        let outcome = Outcome::Completed {
+            action_result: result,
+        };
+        self.unacked.insert(lease, (action, outcome));
+        self.reported.insert(lease);
+        let stream = self.stream;
+        self.send(Msg::Report {
+            stream,
+            lease,
+            action,
+            outcome,
+        });
+    }
+
+    /// Sends again each output upload not acknowledged within [`UPLOAD_WAIT`].
+    fn resend_uploads(&mut self, now: FarmTime) {
+        let mut again = Vec::new();
+        for staging in self.staging.values_mut() {
+            if now.saturating_duration_since(staging.sent) >= UPLOAD_WAIT {
+                staging.sent = now;
+                again.push(output_of(&staging.action));
+            }
+        }
+        for digest in again {
+            self.send(Msg::Upload { digest });
+        }
+    }
+
+    /// The server stored `digest`: each staged run whose output it is reports now.
+    fn stored(&mut self, digest: Digest) {
+        let staged: Vec<(LeaseId, Digest)> = self
+            .staging
+            .iter()
+            .filter(|(_, s)| output_of(&s.action) == digest)
+            .map(|(lease, s)| (*lease, s.action))
+            .collect();
+        for (lease, action) in staged {
+            self.staging.remove(&lease);
+            self.report(lease, action, digest);
         }
     }
 
@@ -220,7 +367,9 @@ impl FakeDaemon {
                 operation,
                 action,
             } if stream == self.stream && self.welcomed => {
-                let held = self.runs.contains_key(&lease) || self.unacked.contains_key(&lease);
+                let held = self.runs.contains_key(&lease)
+                    || self.staging.contains_key(&lease)
+                    || self.unacked.contains_key(&lease);
                 if held || self.contact.lost(moment(now)) || self.reported.contains(&lease) {
                     return;
                 }
@@ -247,7 +396,9 @@ impl FakeDaemon {
             }
             Msg::Cancel { stream, lease } if stream == self.stream => {
                 self.runs.remove(&lease);
+                self.staging.remove(&lease);
             }
+            Msg::Uploaded { digest } => self.stored(digest),
             Msg::Reset { stream } if stream == self.stream => self.connect(now),
             _ => {}
         }
@@ -259,6 +410,9 @@ impl StateMachine for FakeDaemon {
 
     fn apply(&mut self, input: NodeInput<Msg>) -> Vec<Effect> {
         let now = input.now;
+        // A dead process does nothing; its timers keep firing, standing for the next
+        // process's.
+        let dead = self.dead;
         match input.event {
             Event::Start => {
                 self.connect(now);
@@ -272,19 +426,24 @@ impl StateMachine for FakeDaemon {
                 });
             }
             Event::Timer { tag: T_POLL } => {
-                self.poll(now);
+                if !dead {
+                    self.poll(now);
+                }
                 self.out.push(Output::Timer {
                     after: POLL,
                     tag: T_POLL,
                 });
             }
             Event::Timer { .. } => {
-                self.heartbeat(now);
+                if !dead {
+                    self.heartbeat(now);
+                }
                 self.out.push(Output::Timer {
                     after: self.interval,
                     tag: T_HEARTBEAT,
                 });
             }
+            Event::Message { .. } if dead => {}
             Event::Message { msg, .. } => self.receive(now, msg, input.entropy),
         }
         Vec::new()

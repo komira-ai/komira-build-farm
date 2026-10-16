@@ -871,3 +871,76 @@ async fn a_record_shorter_than_its_digest_fails_with_a_read_error() {
     assert!(format!("{failed:?}").starts_with("Read("), "{failed:?}");
     assert!(!front.all_present(&[digest_of(&whole)]).await);
 }
+
+/// The sparse file `name` of `size` bytes in a scratch directory, as the source a
+/// driver's walk leaves for it.
+fn sparse_source(name: &str, size: u64) -> (File, Source) {
+    let dir = scratch(name);
+    let path = dir.join("f");
+    File::create(&path)
+        .and_then(|file| file.set_len(size))
+        .expect("sparse");
+    let file = File::open(&path).expect("open");
+    let root = Arc::new(OwnedFd::from(File::open(&dir).expect("open the directory")));
+    let stamp = Stamp::of(&file).expect("stamp");
+    let source = Source::File(FileSource::new(
+        root,
+        Arc::from(Vec::<String>::new()),
+        "f".to_owned(),
+        stamp,
+    ));
+    (file, source)
+}
+
+/// The record of the sparse file `name` of `size` bytes, hashed a megabyte at a time
+/// as a driver's walk hashes it, whose bytes are read from the file when it is sent.
+fn sparse_record(name: &str, size: u64) -> Record {
+    use std::os::unix::fs::FileExt as _;
+    let (file, source) = sparse_source(name, size);
+    let mut hasher = RecordHasher::new();
+    let mut buffer = vec![0; 1 << 20];
+    let mut at = 0;
+    while at < size {
+        let read = file.read_at(&mut buffer, at).expect("read");
+        hasher.update(&buffer[..read]);
+        at += read as u64;
+    }
+    let (digest, crc32c) = hasher.finish();
+    Record {
+        digest,
+        crc32c,
+        source,
+    }
+}
+
+/// Catches a large record refused without a write tier, or the upload retried before
+/// it falls back (mutants: FAILED_PRECONDITION at `Begin` taken for a failure, or for
+/// a retry): a record one byte over 16 MiB (`MAX_UNSTAGED_BLOB_BYTES`) is sent by one
+/// ByteStream Write, which streams it to the store, and is held after; a record of
+/// exactly 16 MiB goes through the segment upload, with no ByteStream Write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_tier_a_record_over_16_mib_is_streamed_by_bytestream() {
+    let front = Front::start(Mode::Serve).await;
+    let record = sparse_record("over-16-mib", (16 << 20) + 1);
+    let digest = proto_digest(&record.digest);
+    front
+        .engine
+        .put_records(vec![record])
+        .await
+        .expect("streamed by ByteStream");
+    assert_eq!(
+        front.cache.metrics().write.total.get(),
+        1,
+        "one ByteStream write"
+    );
+    assert!(front.all_present(&[digest]).await);
+    let record = sparse_record("at-16-mib", 16 << 20);
+    let digest = proto_digest(&record.digest);
+    front
+        .engine
+        .put_records(vec![record])
+        .await
+        .expect("stored from memory");
+    assert_eq!(front.cache.metrics().write.total.get(), 1, "no other write");
+    assert!(front.all_present(&[digest]).await);
+}

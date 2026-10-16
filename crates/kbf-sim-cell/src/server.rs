@@ -160,6 +160,9 @@ pub struct Seen {
     pub cuts: Vec<Cut>,
     /// What the local write tier did.
     pub tier: TierSeen,
+    /// Each action started, and the runs of the server's process ([`Seen::starts`])
+    /// that started it.
+    pub started: BTreeMap<Digest, BTreeSet<u64>>,
 }
 
 /// A `PutBlob` commit a crash cut part-way through ([`StorePoint::InCommit`]).
@@ -308,6 +311,13 @@ impl Server {
 
     pub(crate) fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         std::mem::take(&mut self.out)
+    }
+
+    /// Whether the server's process is running (its log open, or stopped and
+    /// answering reads).
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        self.up.is_some()
     }
 
     /// The applied metadata state, while the server is up.
@@ -539,6 +549,9 @@ impl Up {
 
     fn start_lease(&mut self, now: FarmTime, start: &StartLease, cx: &mut Cx<'_>) {
         let worker = &start.worker;
+        let process = cx.seen.starts;
+        let runs = cx.seen.started.entry(start.key.action).or_default();
+        runs.insert(process);
         let stream = self.streams.get(worker).copied().unwrap_or_default();
         cx.send(
             NodeId::from(worker.as_str()),

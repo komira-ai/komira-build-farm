@@ -8,19 +8,24 @@ repository.workspace = true
 publish.workspace = true
 
 # The storage part of the farm (docs/design/architecture-v2.md, sections 3 and 13 P2):
-# the `Storage` trait and its error, which the front, the server and the combined binary
-# call the cache through, and the gRPC service that serves one (`service`) with the client
-# that calls it. Never the frontend's crates: no scheduler, no
-# authorization (crates/kbf-it/tests/layering.rs).
+# the cache (its index and action cache in a metadata log, its bytes in an object store,
+# a write tier on local disk) and the `Segments` service, the `Storage` trait and its
+# error, which the front, the server and the combined binary call the cache through, and
+# the gRPC service that serves one (`service`) with the client that calls it. Never the
+# frontend's crates: no scheduler, no authorization (crates/kbf-it/tests/layering.rs).
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
 kbf-meta.workspace = true
+kbf-objstore.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
+kbf-store.workspace = true
+kbf-tier.workspace = true
 kbf-types.workspace = true
+prost.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 # Reads the role out of a peer's certificate (service/admission.rs), as kbf-server reads

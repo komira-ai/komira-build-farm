@@ -190,10 +190,11 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
-        streams: kbf_server::StreamTiming::default(),
+        timing: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
+        streams: kbf_server::StreamLimits::DEFAULT,
     };
     let bound = bind_server(cache, listeners, pending()).expect("bind");
     let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

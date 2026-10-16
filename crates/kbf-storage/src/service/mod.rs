@@ -63,7 +63,8 @@ pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).
 pub const MAX_MESSAGE_BYTES: usize = (16 << 20) + (1 << 20);
 
-/// The largest blob a `Write` accepts, `kbf-front`'s `MAX_BLOB_BYTES` (pinned the same).
+/// The largest blob a `Write` accepts. (`kbf-front` has no largest blob since #745: its
+/// `Write` of a large blob streams to the store, which this service's does not yet.)
 pub const MAX_BLOB_BYTES: u64 = 1 << 30;
 
 /// The most digests one `FindMissingBlobs` may name. `kbf-front` sets none beyond the

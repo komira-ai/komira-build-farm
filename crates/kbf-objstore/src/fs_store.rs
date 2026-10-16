@@ -66,10 +66,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+use crate::body::{self, BodyStream};
 use crate::types::Token;
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
@@ -347,15 +349,43 @@ impl Inner {
     /// removed whether or not the object was linked.
     fn put(&self, key: &ObjectKey, body: &[u8]) -> Result<(), ObjectStoreError> {
         self.room_for(body.len() as u64)?;
+        let tmp = self.tmp_path();
+        let written = write_new(&tmp, key, body);
+        self.publish(key, &tmp, written)
+    }
+
+    /// A new name in `tmp/`.
+    fn tmp_path(&self) -> PathBuf {
+        self.tmp
+            .join(self.next.fetch_add(1, Ordering::Relaxed).to_string())
+    }
+
+    /// Links the synced file `tmp` under `key`'s name if `written` (its writing)
+    /// succeeded, removes `tmp` either way, and syncs the name's directory.
+    fn publish(
+        &self,
+        key: &ObjectKey,
+        tmp: &Path,
+        written: Result<(), ObjectStoreError>,
+    ) -> Result<(), ObjectStoreError> {
         let (dir, path) = self.place(key);
-        let tmp = self
-            .tmp
-            .join(self.next.fetch_add(1, Ordering::Relaxed).to_string());
-        let linked = write_new(&tmp, key, body).and_then(|()| link(&tmp, &path, key));
-        let removed = fs::remove_file(&tmp);
+        let linked = written.and_then(|()| link(tmp, &path, key));
+        let removed = fs::remove_file(tmp);
         linked?;
-        removed.map_err(failed("remove", &tmp))?;
+        removed.map_err(failed("remove", tmp))?;
         sync_dir(&dir).map_err(failed("sync", &dir))
+    }
+
+    /// A file in `tmp/` for an object of `len` bytes, its header written: the start of
+    /// a streamed write. Refused as `put` is when the floor leaves no room for `len`.
+    fn begin(&self, key: &ObjectKey, len: u64) -> Result<(File, PathBuf), ObjectStoreError> {
+        self.room_for(len)?;
+        let tmp = self.tmp_path();
+        let mut file = File::create_new(&tmp).map_err(failed("create", &tmp))?;
+        // A failed write leaves the file in `tmp/`, which the next open empties.
+        file.write_all(&header(key))
+            .map_err(failed("write", &tmp))?;
+        Ok((file, tmp))
     }
 
     /// The bytes free to an unprivileged writer on the store's file system, and the
@@ -686,6 +716,49 @@ impl ObjectStore for FsStore {
         }
         let (inner, key) = (Arc::clone(&self.inner), key.clone());
         blocking(move || inner.put(&key, &body)).await
+    }
+
+    /// Writes each piece to the object's file in `tmp/` as it comes (on the blocking
+    /// pool, one piece at a time), then syncs and links it as [`ObjectStore::put_new`]
+    /// does. A failed or wrong-length body removes the file. A write cut short by its
+    /// caller going away leaves the file in `tmp/`, which the next open empties.
+    async fn put_stream(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+        mut body: BodyStream,
+    ) -> Result<(), ObjectStoreError> {
+        let (inner, k) = (Arc::clone(&self.inner), key.clone());
+        let (file, tmp) = blocking(move || inner.begin(&k, len)).await?;
+        let mut written = 0u64;
+        let filled = async {
+            let mut file = file;
+            while let Some(piece) = body.next().await {
+                let piece = piece?;
+                written += piece.len() as u64;
+                if written > len {
+                    return Err(body::too_long(len));
+                }
+                let path = tmp.clone();
+                file = blocking(move || {
+                    let mut file = file;
+                    file.write_all(&piece).map_err(failed("write", &path))?;
+                    Ok(file)
+                })
+                .await?;
+            }
+            if written < len {
+                return Err(body::too_short(len, written));
+            }
+            Ok(file)
+        }
+        .await;
+        let (inner, key) = (Arc::clone(&self.inner), key.clone());
+        blocking(move || {
+            let synced = filled.and_then(|file| file.sync_all().map_err(failed("sync", &tmp)));
+            inner.publish(&key, &tmp, synced)
+        })
+        .await
     }
 
     async fn get_range(

@@ -192,17 +192,14 @@ fn the_help_shows_only_what_a_storage_node_takes() {
     }
 }
 
-/// Catches limits that drifted from the front's, which the service must match: a full
-/// batch has to fit, and the largest blob is the same.
+/// Catches a message limit that drifted from the front's, which the service must
+/// match: a full batch has to fit. (The front has no largest blob since #745; the
+/// service's `MAX_BLOB_BYTES` is its own until its `Write` streams to the store.)
 #[test]
 fn the_service_limits_are_the_fronts() {
     assert_eq!(
         kbf_storage::service::MAX_MESSAGE_BYTES,
         kbf_front::MAX_MESSAGE_BYTES
-    );
-    assert_eq!(
-        kbf_storage::service::MAX_BLOB_BYTES,
-        kbf_front::MAX_BLOB_BYTES
     );
 }
 

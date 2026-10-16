@@ -8,20 +8,24 @@
 //!   parameter. Without that key, without `invocations.getAuthorizer` (the build
 //!   pages, [`crate::http_invocations`], whose links it serves), or without a policy
 //!   file, every request is `404`. `--invocations-open` fills in `allow` for both.
-//! - **Verified bytes.** The blob is read with [`Cache::read_blob`], the read path of
-//!   ByteStream Read: the whole blob is checked against its digest before a byte is
-//!   sent, and the read is a touch.
+//! - **Verified bytes.** The blob is read in windows with [`Cache::read_windows`], the
+//!   read path of ByteStream Read, and the read is a touch. Every byte of the blob is
+//!   hashed, and its last window is sent only once the digest checked: a blob of one
+//!   window ([`kbf_front::READ_WINDOW_BYTES`]) is checked whole before a byte is sent
+//!   (its failure is an error answer); a larger one whose bytes fail the digest ends
+//!   its body early, cutting the connection.
 //! - **Never a page.** Every answer, errors included, carries
 //!   `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`. The bytes
 //!   are `application/octet-stream` with `Content-Disposition: attachment`; `?name=` is
 //!   sent only as an RFC 8187 `filename*`, percent-encoded. `?inline=text` serves a blob
 //!   of at most [`INLINE_MAX_BYTES`] as `text/plain; charset=utf-8`, `inline`.
-//! - **A memory budget.** A read holds the whole blob in memory (verification needs
-//!   all of it), and the bytes of every answer still being sent count against
-//!   [`READ_BUDGET_BYTES`]. A read waits in line (first come, first served) up to
+//! - **A memory budget.** A read holds at most one window of its blob at once, and
+//!   that window counts against [`READ_BUDGET_BYTES`] until its answer is sent or
+//!   dropped. A read waits in line (first come, first served) up to
 //!   [`READ_BUDGET_WAIT`] for its share, then is `503` with `Retry-After`, before a
-//!   byte is read; a digest larger than the largest blob the cache accepts is `404`. The cache keeps one digest per blob, so it cannot check a part of
-//!   one, and a second read to stream from would send bytes nobody checked.
+//!   byte is read; a blob not held is `404` before it waits. The cache keeps one
+//!   digest per blob, so a part is checked by reading the whole blob, sending only the
+//!   part.
 //! - **One byte range.** `Range: bytes=...` with a single range is answered `206`, one
 //!   that cannot be satisfied `416`; anything else (several ranges, another unit, a
 //!   malformed value) is ignored and the whole blob is sent, as RFC 9110 allows.
@@ -30,16 +34,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::{
-    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-    RANGE, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, RANGE, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures::StreamExt;
 use kbf_auth::{Authenticator, Authorizer, Policy, authorize};
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
@@ -53,8 +58,8 @@ use tonic::{Code, Status};
 pub const INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The most blob bytes the route holds at once, over all the answers it is reading
-/// or sending: 1 GiB, [`kbf_front::MAX_BLOB_BYTES`], so the largest blob the cache accepts can
-/// always be served when nothing else is.
+/// or sending: 1 GiB, a [`kbf_front::READ_WINDOW_BYTES`] window for each of 128 reads
+/// of large blobs at once (a smaller blob holds its size).
 pub const READ_BUDGET_BYTES: usize = 1 << 30;
 
 /// How long a read waits in line for its share of [`READ_BUDGET_BYTES`] before it is
@@ -112,11 +117,9 @@ impl BlobReaders {
 struct BlobState<M, O> {
     cache: Arc<Cache<M, O>>,
     readers: Option<BlobReaders>,
-    /// One permit per byte of [`READ_BUDGET_BYTES`]; an answer's bytes hold theirs
-    /// until the last of them is dropped.
+    /// One permit per byte of [`READ_BUDGET_BYTES`]; an answer's body holds its
+    /// share until it is read to its end or dropped.
     budget: Arc<Semaphore>,
-    /// The whole budget in bytes: the largest blob a read is admitted for.
-    largest: u64,
 }
 
 impl<M, O> BlobState<M, O> {
@@ -127,21 +130,7 @@ impl<M, O> BlobState<M, O> {
             cache,
             readers,
             budget: Arc::new(Semaphore::new(budget)),
-            largest: u64::try_from(budget).unwrap_or(u64::MAX),
         }
-    }
-}
-
-/// A blob's bytes and the budget they hold: dropped with the last `Bytes` that
-/// shares them.
-struct Held {
-    bytes: Bytes,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl AsRef<[u8]> for Held {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
     }
 }
 
@@ -208,48 +197,59 @@ where
         );
         return Err(error(StatusCode::BAD_REQUEST, &why));
     }
-    let permit = admit(Arc::clone(&state.budget), state.largest, &digest).await?;
-    let bytes = state
+    let len = digest.size_bytes;
+    let wanted = wanted(parts.headers.get(RANGE), len);
+    let (from, to) = match wanted {
+        Wanted::Whole => (0, len),
+        Wanted::Part { first, last } => (first, last + 1),
+        Wanted::Unsatisfiable => (0, 0),
+    };
+    let failed = |e: kbf_front::CacheError| refusal(&Status::from(e));
+    let mut read = state
         .cache
-        .read_blob(&digest)
+        .read_windows(&digest, from, to)
         .await
-        .map_err(|e| refusal(&Status::from(e)))?;
-    let bytes = Bytes::from_owner(Held {
-        bytes,
-        _permit: permit,
+        .map_err(failed)?;
+    let mut headers = served(&query);
+    if wanted == Wanted::Unsatisfiable {
+        headers.insert(CONTENT_RANGE, header(format!("bytes */{len}")));
+        return Ok((StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response());
+    }
+    let permit = admit(&state.budget, &digest).await?;
+    // The first window is read before the answer starts, so a blob of one window that
+    // cannot be read, or fails its digest, is an error answer.
+    let first = read.next().await.transpose().map_err(failed)?;
+    let rest = futures::stream::unfold((read, permit), |(mut read, permit)| async move {
+        let window = read.next().await?;
+        let window = window.map_err(|e| std::io::Error::other(e.to_string()));
+        Some((window, (read, permit)))
     });
-    Ok(served(&bytes, &query, parts.headers.get(RANGE)))
+    let body = futures::stream::iter(first.map(Ok)).chain(rest);
+    headers.insert(CONTENT_LENGTH, header((to - from).to_string()));
+    let code = match wanted {
+        Wanted::Part { first, last } => {
+            headers.insert(CONTENT_RANGE, header(format!("bytes {first}-{last}/{len}")));
+            StatusCode::PARTIAL_CONTENT
+        }
+        Wanted::Whole | Wanted::Unsatisfiable => StatusCode::OK,
+    };
+    Ok((code, headers, Body::from_stream(body)).into_response())
 }
 
-/// `digest`'s share of the read budget, one permit per byte, taken in the order the
-/// reads asked (the semaphore is fair: a large read at the head of the queue is not
-/// passed by smaller ones behind it).
+/// `digest`'s share of the read budget, one permit per byte of what its read holds at
+/// once (its size, or one window of a larger blob), taken in the order the reads asked
+/// (the semaphore is fair: a large read at the head of the queue is not passed by
+/// smaller ones behind it).
 ///
 /// # Errors
-/// `404` for a digest larger than the whole budget, `largest` bytes: the route's is
-/// [`kbf_front::MAX_BLOB_BYTES`], so the cache never holds such a blob;
 /// `503` with `Retry-After` and `"busy": true` when the share is not free within
 /// [`READ_BUDGET_WAIT`].
-async fn admit(
-    budget: Arc<Semaphore>,
-    largest: u64,
-    digest: &Digest,
-) -> Result<OwnedSemaphorePermit, Response> {
-    let Some(permits) = u32::try_from(digest.size_bytes)
-        .ok()
-        .filter(|&n| u64::from(n) <= largest)
-    else {
-        // INVARIANT: the cache holds no blob over MAX_BLOB_BYTES (the route's
-        // `largest`). `Cache::store_blobs`, the one way bytes are stored, refuses one;
-        // ByteStream Write refuses it before buffering and batches are capped at
-        // MAX_BATCH_TOTAL_BYTES. So this 404 is the answer a read would give.
-        let why = format!(
-            "{digest} is larger than the largest blob this cache accepts \
-             ({largest} bytes), so it is not held"
-        );
-        return Err(error(StatusCode::NOT_FOUND, &why));
-    };
-    tokio::time::timeout(READ_BUDGET_WAIT, budget.acquire_many_owned(permits))
+async fn admit(budget: &Arc<Semaphore>, digest: &Digest) -> Result<OwnedSemaphorePermit, Response> {
+    let window = digest.size_bytes.min(kbf_front::READ_WINDOW_BYTES);
+    // At most one window, 8 MiB.
+    let share = u32::try_from(window).unwrap_or(u32::MAX);
+    let acquire = Arc::clone(budget).acquire_many_owned(share);
+    tokio::time::timeout(READ_BUDGET_WAIT, acquire)
         .await
         .ok()
         .and_then(Result::ok)
@@ -272,8 +272,8 @@ fn busy(digest: &Digest) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response()
 }
 
-/// The bytes of a blob read, as the query and the `Range` header ask.
-fn served(bytes: &Bytes, query: &Query, range: Option<&HeaderValue>) -> Response {
+/// The headers of a blob's answer, as the query asks.
+fn served(query: &Query) -> HeaderMap {
     let (kind, media) = if query.inline {
         ("inline", "text/plain; charset=utf-8")
     } else {
@@ -286,21 +286,7 @@ fn served(bytes: &Bytes, query: &Query, range: Option<&HeaderValue>) -> Response
         content_disposition(kind, query.name.as_deref()),
     );
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    let len = bytes.len() as u64;
-    let (code, body) = match wanted(range, len) {
-        Wanted::Whole => (StatusCode::OK, bytes.clone()),
-        Wanted::Part { first, last } => {
-            headers.insert(CONTENT_RANGE, header(format!("bytes {first}-{last}/{len}")));
-            // Both bounds are below the blob's length, which fits in memory.
-            let part = bytes.slice(first as usize..=last as usize);
-            (StatusCode::PARTIAL_CONTENT, part)
-        }
-        Wanted::Unsatisfiable => {
-            headers.insert(CONTENT_RANGE, header(format!("bytes */{len}")));
-            (StatusCode::RANGE_NOT_SATISFIABLE, Bytes::new())
-        }
-    };
-    (code, headers, Body::from(body)).into_response()
+    headers
 }
 
 /// A header value built from visible ASCII, which is always one.

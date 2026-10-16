@@ -18,6 +18,11 @@
 //! in the middle of a slow output upload sees it only when the upload ends) must not
 //! hold up the daemon's heartbeats or its next stream. A fenced lease reports, once
 //! its run has stopped, as lost to the farm, whatever the run's own outcome.
+//!
+//! A run whose driver panics reports INTERNAL, naming the panic, once the runtime has
+//! been asked to kill what the run left: the panic ends that run's task only
+//! (the all-in-one design, komira-build-farm#657, section 7.3), and its lease does
+//! not stay running.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -31,6 +36,7 @@ use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 
+use crate::lease_panic::contained;
 use crate::phases::LeasePhases;
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
@@ -108,7 +114,7 @@ impl Leases {
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
             let started = Instant::now();
-            let outcome = run.run(work).await;
+            let outcome = contained(run.as_ref(), id, work).await;
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
             let usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
@@ -375,6 +381,10 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
         seq: id.seq,
     }
 }
+
+#[cfg(test)]
+#[path = "lease_panic_tests.rs"]
+mod panic_tests;
 
 #[cfg(test)]
 mod tests {

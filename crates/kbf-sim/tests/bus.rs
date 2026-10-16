@@ -201,3 +201,24 @@ fn unknown_receiver_is_lost_and_clock_reaches_the_bound() {
     );
     assert!(!sim.step(), "nothing left to do");
 }
+
+/// Catches a `nodes_mut` that hands out the nodes out of name order, or copies whose
+/// changes the run never sees: a change made through it between steps is what the node
+/// holds after.
+#[test]
+fn a_node_changed_between_steps_keeps_the_change() {
+    let mut sim = Sim::new(1, Faults::default());
+    sim.add_node("a", Recorder::sending([(10, "b", 7)]));
+    sim.add_node("b", Recorder::default());
+    sim.run_until(FarmTime::from_millis(5));
+    let names: Vec<String> = sim
+        .nodes_mut()
+        .map(|(id, _)| id.as_str().to_owned())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+    let (_, b) = sim.nodes_mut().nth(1).expect("b was added");
+    b.got.push((NodeId::from("outside"), 1, 5));
+    sim.run_until(FarmTime::from_millis(1_000));
+    let b = sim.node(&NodeId::from("b")).expect("b was added");
+    assert_eq!(b.msgs(), [1, 7]);
+}

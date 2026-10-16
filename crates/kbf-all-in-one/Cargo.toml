@@ -27,6 +27,7 @@ test = false
 bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
+kbf-front.workspace = true
 kbf-node.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
@@ -38,7 +39,7 @@ kbf-transfer.workspace = true
 kbf-types.workspace = true
 # The stand-in `podman`'s (kbf-fake-podman).
 rustix = { workspace = true, features = ["process"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "sync"] }
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -50,9 +51,10 @@ kbf-cas-conformance.workspace = true
 kbf-daemon.workspace = true
 # The image store layout the stand-in `podman` reads (tests/binary.rs).
 kbf-driver-container.workspace = true
-kbf-front.workspace = true
-# The storage boundary the plane is checked through (tests/storage_seam.rs).
+# The storage boundary the plane is checked through (tests/storage_seam.rs); where a
+# blob is and the store it is in, to damage one (src/plane_tests.rs).
 kbf-meta.workspace = true
+kbf-objstore.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true

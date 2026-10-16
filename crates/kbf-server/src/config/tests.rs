@@ -2,7 +2,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use clap::Parser;
-use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
+use kbf_front::{MIN_SEGMENT_UPLOAD_BYTES, WriteConfig};
 
 use kbf_threads::disk::{FreeSpace, Space};
 
@@ -173,29 +173,26 @@ fn cpu_threads_reaches_the_hashing_pool() {
 }
 
 /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
-/// other than the design's (1 GiB + 1 MiB, 60 s), and a cap below one largest blob
-/// and its footer accepted (a `Begin` for such a blob would be refused for good).
+/// other than the design's (33 MiB, 60 s), and a cap below it accepted (a daemon's
+/// upload of small files would be refused for good).
 #[test]
 fn segment_upload_flags_reach_the_listeners() {
     let defaults = Args::parse_from(["kbf-server"])
         .listeners()
         .expect("listeners");
     assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
-    assert_eq!(defaults.segments.max_bytes, (1 << 30) + (1 << 20));
+    assert_eq!(defaults.segments.max_bytes, 33 << 20);
     assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
     let set = Args::parse_from([
         "kbf-server",
-        "--segment-upload-max-bytes=2147483648",
+        "--segment-upload-max-bytes=1073741824",
         "--segment-upload-idle-secs=5",
     ])
     .listeners()
     .expect("listeners");
-    assert_eq!(set.segments.max_bytes, 1 << 31);
+    assert_eq!(set.segments.max_bytes, 1 << 30);
     assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
-    let below = format!(
-        "--segment-upload-max-bytes={}",
-        (1u64 << 30) + (1 << 20) - 1
-    );
+    let below = format!("--segment-upload-max-bytes={}", (33u64 << 20) - 1);
     for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
         assert!(
             Args::try_parse_from(["kbf-server", refused]).is_err(),
@@ -211,7 +208,7 @@ fn segment_upload_flags_reach_the_listeners() {
 /// less is refused, naming both flags.
 #[test]
 fn a_segment_upload_cap_over_the_write_bound_is_refused() {
-    let cap = kbf_front::MIN_SEGMENT_UPLOAD_BYTES;
+    let cap = kbf_front::MIN_SEGMENT_UPLOAD_BYTES + 1;
     let args = |bound: u64| {
         Args::parse_from([
             "kbf-server".to_owned(),
@@ -230,27 +227,24 @@ fn a_segment_upload_cap_over_the_write_bound_is_refused() {
 }
 
 /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
-/// admission counts (mutant: the flag's upper limit removed). `Cache::admit` takes at
-/// most `kbf_front::MAX_ADMISSION_BYTES` (4 GiB - 1) for one call, so an 8 GiB
-/// `Begin` under a 16 GiB bound would hold 8 GiB of ranges while counting 4 GiB, and
-/// other uploads could push what is held past the bound. A cap of exactly the most
-/// one admission counts starts; one byte more is refused, however large the bound.
+/// admission counts (mutant: the flag's upper limit removed). `Cache::admit` counts
+/// at most `kbf_front::MAX_ADMISSION_BYTES` (what its semaphore holds) for one call;
+/// a `Begin` over it would hold more ranges than it is counted for. A cap of exactly
+/// the most one admission counts starts; one byte more is refused.
 #[test]
 fn a_segment_upload_cap_over_one_admission_is_refused() {
-    let bound = format!("--write-bytes-in-flight={}", 16u64 << 30);
-    let cap = |cap: u64| format!("--segment-upload-max-bytes={cap}");
     let most = kbf_front::MAX_ADMISSION_BYTES;
+    let bound = format!("--write-bytes-in-flight={most}");
+    let cap = |cap: u64| format!("--segment-upload-max-bytes={cap}");
     Args::try_parse_from(["kbf-server", &cap(most), &bound])
         .expect("a cap one admission counts in full")
         .listeners()
         .expect("under the bound");
-    for over in [most + 1, 8u64 << 30] {
-        let refused = Args::try_parse_from(["kbf-server", &cap(over), &bound])
-            .map(drop)
-            .expect_err("a cap over one admission");
-        let message = refused.to_string();
-        assert!(message.contains("--segment-upload-max-bytes"), "{message}");
-    }
+    let refused = Args::try_parse_from(["kbf-server", &cap(most + 1), &bound])
+        .map(drop)
+        .expect_err("a cap over one admission");
+    let message = refused.to_string();
+    assert!(message.contains("--segment-upload-max-bytes"), "{message}");
 }
 
 /// Catches the input-tree flags not reaching the config, a zero where the check
@@ -282,8 +276,8 @@ fn input_tree_flags_make_the_input_tree_config() {
     }
 }
 
-/// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of
-/// that blob would wait for admission forever), a flag wired to the wrong field of
+/// Catches: a `--write-bytes-in-flight` below the smallest segment upload cap (a
+/// `Begin` of that cap would wait for admission forever), a flag wired to the wrong field of
 /// the write configuration, and defaults other than the design's.
 #[test]
 fn write_flags_make_the_write_config() {
@@ -303,7 +297,7 @@ fn write_flags_make_the_write_config() {
         "--write-own-segment-bytes",
         "12345",
         "--write-bytes-in-flight",
-        &MAX_BLOB_BYTES.to_string(),
+        &MIN_SEGMENT_UPLOAD_BYTES.to_string(),
         "--write-puts-in-flight",
         "9",
         "--store-put-attempts",
@@ -314,13 +308,13 @@ fn write_flags_make_the_write_config() {
     let want = WriteConfig {
         linger: Duration::from_millis(7),
         own_segment_bytes: 12345,
-        bytes_in_flight: MAX_BLOB_BYTES,
+        bytes_in_flight: MIN_SEGMENT_UPLOAD_BYTES,
         puts_in_flight: NonZeroUsize::new(9).expect("9"),
         put_attempts: NonZeroU32::new(5).expect("5"),
         cpu_threads: NonZeroUsize::new(3).expect("3"),
     };
     assert_eq!(set.write_config(), want);
-    let below = (MAX_BLOB_BYTES - 1).to_string();
+    let below = (MIN_SEGMENT_UPLOAD_BYTES - 1).to_string();
     for (flag, value) in [
         ("--write-bytes-in-flight", below.as_str()),
         ("--write-puts-in-flight", "0"),

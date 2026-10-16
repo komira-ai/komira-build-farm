@@ -91,7 +91,7 @@ Each test is red first and has a mutant that must turn it red. Tests of absence 
 
 ### 4.1 The index already exists
 
-No new blob-location index is needed. The replicated state machine holds it [F: `storage.md`, `write-path.md` section 6, `crates/kbf-front/src/cache/tier.rs`, `cache/flush.rs`]:
+No new blob-location index is needed. The replicated state machine holds it [F: `storage.md`, `write-path.md` section 6, `crates/kbf-storage/src/cache/tier.rs`, `cache/flush.rs`]:
 
 - the CAS index: digest to `Location { store, object, offset }`;
 - the staged table: object to tier, committed length and state;

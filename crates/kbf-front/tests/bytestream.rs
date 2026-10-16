@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{Blob, Farm, pseudo_random};
 use futures::channel::mpsc;
-use kbf_front::{MAX_BLOB_BYTES, READ_CHUNK_BYTES};
+use kbf_front::{MAX_UNSTAGED_BLOB_BYTES, READ_CHUNK_BYTES};
 use kbf_proto::google::bytestream::{QueryWriteStatusRequest, ReadRequest, WriteRequest};
 use tonic::Code;
 
@@ -168,6 +168,30 @@ async fn bytestream_write_refuses_wrong_bytes_and_offsets() {
         .expect_err("skewed offset");
     assert_eq!(refused.code(), Code::InvalidArgument);
 
+    let mut renamed = chunks(&name, &blob.data, 10);
+    renamed[1].resource_name = write_name(&Blob::new(pseudo_random(30, 2)));
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::iter(renamed))
+        .await
+        .expect_err("renamed");
+    assert!(
+        refused.message().contains("changed resource"),
+        "{refused:?}"
+    );
+
+    let mut long = chunks(&name, &blob.data, 10);
+    long[2].data.push(0);
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::iter(long))
+        .await
+        .expect_err("too long");
+    assert!(
+        refused.message().contains("more than the 30 bytes"),
+        "{refused:?}"
+    );
+
     let mut unfinished = chunks(&name, &blob.data, 10);
     unfinished[2].finish_write = false;
     let refused = farm
@@ -181,14 +205,17 @@ async fn bytestream_write_refuses_wrong_bytes_and_offsets() {
     assert_eq!(status(&farm, &blob).await, (0, false));
 }
 
-/// Catches: a write whose resource name claims more than `MAX_BLOB_BYTES` being
-/// accepted and buffered, so any client can make the front hold as much memory as it
-/// names. The stream is left open after its first message: a front without the cap
-/// waits for the rest and never answers; one with it refuses at once.
+/// Catches: a write whose resource name claims more than one in-memory blob being
+/// admitted for, or buffered to, the size it names (any client could make the front
+/// hold as much memory as it claims), and a large blob refused as too large. A write
+/// naming 5 GiB + 1 bytes, left open after its first message, holds one streamed
+/// write's admission ([`MAX_UNSTAGED_BLOB_BYTES`]) and no receive buffer; when its
+/// stream ends without `finish_write` it is refused, nothing is stored, and the
+/// admission is returned.
 #[tokio::test]
-async fn bytestream_write_refuses_a_blob_over_the_cap_before_buffering() {
+async fn bytestream_write_of_a_huge_blob_is_streamed_not_buffered() {
     let farm = Farm::start().await;
-    let size = MAX_BLOB_BYTES + 1;
+    let size = (5u64 << 30) + 1;
     let name = format!(
         "main/uploads/7d5e6f1a-test/blobs/{}/{size}",
         "ab".repeat(32)
@@ -202,14 +229,27 @@ async fn bytestream_write_refuses_a_blob_over_the_cap_before_buffering() {
     })
     .expect("send");
     let mut client = farm.bytestream();
-    let answer = tokio::time::timeout(Duration::from_secs(10), client.write(rx))
-        .await
-        .expect("refused without waiting for the rest of the blob");
-    assert_eq!(
-        answer.expect_err("over the cap").code(),
-        Code::InvalidArgument
-    );
+    let write = tokio::spawn(async move { client.write(rx).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while farm.cache.bytes_admitted() == 0 {
+        assert!(!write.is_finished(), "{:?}", write.await);
+        assert!(tokio::time::Instant::now() < deadline, "never admitted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(farm.cache.bytes_admitted(), MAX_UNSTAGED_BLOB_BYTES);
+    assert_eq!(farm.cache.write_buffer_peak(), 0, "nothing buffered whole");
     drop(tx);
+    let refused = tokio::time::timeout(Duration::from_secs(10), write)
+        .await
+        .expect("answered once the stream ended")
+        .expect("joined")
+        .expect_err("no finish_write");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("without finish_write"),
+        "{refused:?}"
+    );
+    assert_eq!(farm.cache.bytes_admitted(), 0);
 }
 
 /// Catches: QueryWriteStatus claiming progress that is not durable: bytes a live
@@ -259,4 +299,138 @@ async fn the_empty_blob_is_durable_without_a_write() {
     let empty = Blob::new(Vec::new());
     assert!(farm.find_missing(&[&empty]).await.is_empty());
     assert_eq!(status(&farm, &empty).await, (0, true));
+}
+
+/// A blob over [`MAX_UNSTAGED_BLOB_BYTES`], so a Write streams it to the store, and
+/// over two read windows: 20 MiB.
+fn large_blob(seed: u64) -> Blob {
+    Blob::new(pseudo_random(20 << 20, seed))
+}
+
+/// Catches a streamed Write that stores other bytes than it was sent (a piece lost or
+/// repeated between messages and parts), and a windowed Read that hands over other
+/// bytes than asked for at a window's edge, or the bytes of a range other than its
+/// own. A 20 MiB blob is written in 1 MiB messages, then read whole and across the
+/// first window's end.
+#[tokio::test]
+async fn a_large_blob_is_streamed_in_and_read_back_in_windows() {
+    let farm = Farm::start().await;
+    let blob = large_blob(31);
+    let messages = chunks(&write_name(&blob), &blob.data, 1 << 20);
+    let written = farm
+        .bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect("written")
+        .into_inner();
+    assert_eq!(written.committed_size, blob.data.len() as i64);
+    assert_eq!(farm.find_missing(&[&blob]).await, []);
+    let whole = read(&farm, &blob, 0, 0).await.expect("read").concat();
+    assert!(whole == blob.data, "the whole blob reads back");
+    let window = usize::try_from(kbf_front::READ_WINDOW_BYTES).expect("window");
+    let edge = read(&farm, &blob, (window - 5) as i64, 10)
+        .await
+        .expect("read")
+        .concat();
+    assert_eq!(edge, blob.data[window - 5..window + 5]);
+}
+
+/// Catches a streamed Write stored under a digest its bytes do not have, or answered
+/// other than INVALID_ARGUMENT: one byte of a 20 MiB blob changed in flight is
+/// refused, and the blob stays missing.
+#[tokio::test]
+async fn a_large_write_that_fails_its_digest_is_refused_and_not_stored() {
+    let farm = Farm::start().await;
+    let blob = large_blob(32);
+    let mut sent = blob.data.clone();
+    sent[17 << 20] ^= 1;
+    let messages = chunks(&write_name(&blob), &sent, 1 << 20);
+    let refused = farm
+        .bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect_err("a changed byte");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("hashes to"), "{refused:?}");
+    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches a streamed Write that takes messages the in-memory path refuses: one that
+/// skips ahead, one past the size the resource names, and one that changes the
+/// resource. Each is INVALID_ARGUMENT naming why, and nothing is stored.
+#[tokio::test]
+async fn a_large_write_out_of_order_too_long_or_renamed_is_refused() {
+    let farm = Farm::start().await;
+    let blob = large_blob(33);
+    let name = write_name(&blob);
+    let mut skipped = chunks(&name, &blob.data, 1 << 20);
+    skipped.remove(1);
+    let mut long = chunks(&name, &blob.data, 1 << 20);
+    if let Some(last) = long.last_mut() {
+        last.data.push(0);
+    }
+    let mut renamed = chunks(&name, &blob.data, 1 << 20);
+    renamed[2].resource_name = write_name(&large_blob(34));
+    for (messages, why) in [
+        (skipped, "write_offset"),
+        (long, "more than the"),
+        (renamed, "changed resource"),
+    ] {
+        let refused = farm
+            .bytestream()
+            .write(futures::stream::iter(messages))
+            .await
+            .expect_err(why);
+        assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        assert!(refused.message().contains(why), "{why}: {refused:?}");
+    }
+    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches a windowed Read that sends a damaged blob's last window, or ends without
+/// an error, or leaves the object readable: a 20 MiB blob with one bit flipped in the
+/// store ends its Read UNAVAILABLE, and FindMissing then reports it missing (marked
+/// corrupt), so a client uploads it again.
+#[tokio::test]
+async fn a_large_blob_damaged_in_the_store_ends_its_read_with_an_error() {
+    let farm = Farm::start().await;
+    let blob = large_blob(35);
+    let messages = chunks(&write_name(&blob), &blob.data, 1 << 20);
+    farm.bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect("written");
+    farm.corrupt_object_of(&blob).await;
+    assert_eq!(read(&farm, &blob, 0, 0).await, Err(Code::Unavailable));
+    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
+}
+
+/// Catches a whole read of a blob too large to decode (the server holding it whole),
+/// and a windowed read of a range outside its blob: a blob of 64 MiB + 1, streamed in,
+/// is INVALID_ARGUMENT to `read_blob` and reads back whole through ByteStream; bytes
+/// 5..3 of it, or past its end, are refused.
+#[tokio::test]
+async fn a_blob_too_large_to_decode_is_read_only_in_windows() {
+    let farm = Farm::start().await;
+    let size = kbf_front::MAX_DECODED_BLOB_BYTES as usize + 1;
+    let blob = Blob::new(pseudo_random(size, 36));
+    let messages = chunks(&write_name(&blob), &blob.data, 4 << 20);
+    farm.bytestream()
+        .write(futures::stream::iter(messages))
+        .await
+        .expect("written");
+    let whole = farm.cache.read_blob(&blob.digest).await;
+    assert!(
+        matches!(whole, Err(kbf_front::CacheError::Invalid(_))),
+        "{whole:?}"
+    );
+    let read = read(&farm, &blob, 0, 0).await.expect("read").concat();
+    assert!(read == blob.data, "read back in windows");
+    for (from, to) in [(5, 3), (0, size as u64 + 1)] {
+        let refused = farm.cache.read_windows(&blob.digest, from, to).await;
+        assert!(
+            matches!(refused, Err(kbf_front::CacheError::Invalid(_))),
+            "{from}..{to}"
+        );
+    }
 }

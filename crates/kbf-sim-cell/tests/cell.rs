@@ -2,11 +2,11 @@
 //! section 15). Each run checks properties 1 to 7 after every step and panics with
 //! the kind, seed and property on a violation; `replay` reruns one seed.
 
-use kbf_sim_cell::{Kind, Scenario, run};
+use kbf_sim_cell::{Kind, Scenario, Sweep, run};
 
 const SEEDS: u64 = 64;
 
-fn sweep(kind: Kind) {
+fn sweep(kind: Kind) -> Sweep {
     let swept = kbf_sim_cell::sweep(0..SEEDS, |seed| Scenario::new(kind, seed));
     swept.assert_clean();
     for (seed, report) in &swept.reports {
@@ -20,6 +20,7 @@ fn sweep(kind: Kind) {
             );
         }
     }
+    swept
 }
 
 /// Catches any defect that breaks a property with only the network's faults, all
@@ -58,6 +59,35 @@ fn io_error_seeds_keep_properties_1_2_5_6_7() {
 #[test]
 fn partition_seeds_keep_properties_1_2_3_5_6_7() {
     sweep(Kind::Partition);
+}
+
+/// All-in-one (its design, komira-build-farm#657, sections 7.3, 7.4 and 8): kills of
+/// the whole process, both halves, mid-build. Catches an action answered as succeeded with its
+/// output missing, now or after a kill (property 14: the mutant "the daemon half
+/// reports before the server acknowledged its output"), a log the kill does not keep
+/// (the mutant "the restarted process opens an empty log", as `--meta-log=memory`
+/// would, is caught first by 6: farm time goes back to 0 with the index), and an
+/// action whose run the kill cut never answered (7: the mutant "the client sends
+/// `Execute` once and never again"). Not vacuous: kills
+/// cut the daemon half's work (the mutant "the daemon half outlives the kill" leaves
+/// `lost` at 0), and the actions cut were run again by a later process, whose
+/// scheduler started empty.
+#[test]
+fn whole_process_seeds_keep_every_property_and_rerun_what_the_kill_cut() {
+    let swept = sweep(Kind::WholeProcess);
+    let lost: usize = swept.each().map(|r| r.lost).sum();
+    let rerun: usize = swept.each().map(|r| r.rerun).sum();
+    assert!(lost > 0, "no kill cut the daemon half's work");
+    assert!(rerun > 0, "no action was run again after a kill");
+    // The daemon half stored its outputs through the server, in every seed.
+    let tag = kbf_sim_cell::output_of(&kbf_sim_cell::action(0)).hash[0];
+    for (seed, report) in &swept.reports {
+        let outputs = report.acked.iter().filter(|(_, d, _)| d.hash[0] == tag);
+        assert!(
+            outputs.count() > 0,
+            "seed {seed} stored no output: {report:?}"
+        );
+    }
 }
 
 /// Catches a cell that reads a clock, a random source or a hashed map's order: one

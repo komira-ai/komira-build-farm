@@ -40,12 +40,22 @@ server's own code:
 
 - **Each output file, stdout and stderr, read once** (`intake`, `src/intake.rs`): the
   container driver reads each file once, one 1 MiB chunk at a time (its per-file memory
-  bound), and hands every chunk to the hasher and to the plane in that same pass. The
-  plane keeps the file's bytes and, once the file is hashed, puts it in a batch; a batch
-  of 32 MiB (or 16,384 files) is stored as below while the walk goes on, at most four at
-  once, and the rest when the walk ends, before the Directory messages and the Tree that
-  name them. A file is never read again. A file over the server's largest blob (1 GiB)
-  is not taken, and goes as a remote daemon's would.
+  bound), and hands every chunk to the hasher and to the plane in that same pass. A
+  file over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is never held in memory and
+  never refused, whatever its size. With a hot store that has room for it, it is
+  **streamed onto the write tier** (`LocalStore::stream`): each chunk is written to a
+  block of its own as it arrives, then checked (length, CRC-32C), asked FindMissing,
+  and committed as one `PutStaged`; the flusher checks its digest before the PUT. With
+  no hot store, or a full one, it is **streamed to the cold store**
+  (`LocalStore::put_streamed`), as a ByteStream `Write` of a large blob is: its chunks
+  pass through a queue of two (the walk waits when it is full), hashed as they go into
+  the store's write (a multipart upload on S3), and the store completes the object only
+  once they hash to the digest the walk names at the file's end. A file of at most
+  16 MiB is kept in memory and put in a batch; a batch of 32 MiB (or 16,384 files) is
+  stored as below while the walk goes on, at most four at once, and the rest when the
+  walk ends, before the Directory messages and the Tree that name them. A file is
+  never read again. The one ceiling is S3's: about 48.8 TiB per object (10,000 parts
+  of 5 GiB).
 - **Outputs** (`put_records`): the driver's walk has hashed each file once. The plane asks the cache which digests it lacks, packs those records into the
   segments and uploads the transfer engine plans (`kbf_transfer::plan`), and gives the
   `Segments` handlers each range of their bytes, from the intake's buffers (or read
@@ -53,9 +63,13 @@ server's own code:
   `Begin`, `PutRange`, `Commit`, as for a remote daemon, with no TLS, encoding or socket.
   Nothing is spooled and nothing is hashed on the way. With a write tier, `Commit` trusts
   the digests and the flusher hashes every record before its PUT, dropping one that does
-  not match; without one, `PutRange` hashes each record as its bytes arrive.
+  not match; without one, `PutRange` hashes each record as its bytes arrive. An upload
+  holding a record over 16 MiB that the server has no tier room for (`Begin` answers
+  FAILED_PRECONDITION) is stored record by record instead, as the transfer engine
+  falls back to ByteStream.
 - **A whole blob** (`put`, and `put_chunks` through it): hashed once, by the server,
-  under the admission a ByteStream `Write` takes.
+  under the admission a ByteStream `Write` takes; a `put_chunks` blob over 16 MiB is
+  streamed to the cold store as its chunks are read, never gathered.
 - **Reads** (`get`) and **FindMissing** (`missing`): the cache's own, which checks every
   blob it reads against its digest.
 - **Streamed reads** (`read_to`, what the input cache fills a file with): the cache's
@@ -107,7 +121,9 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   which answers as the keeper before it reads a flag and starts no server.
 - `tests/one_read.rs`: the container driver's output collection over a lease of the
   plane, with a write tier and without: an inotify watch counts the opens of each output
-  file, which must be one each, and every blob reads back as the file.
+  file, which must be one each (a file over 1 GiB too, held after with a tier and
+  without one), and every blob reads back as the file; a blob over 5 GiB is not
+  refused for its size.
 - `tests/binary.rs` also runs one action whose 3 MiB input a client uploaded: once the
   hot store is flushed, one inode under the hot store and the data directory holds the
   input (the input cache's entry) and `/metrics` counts it once; after a SIGKILL and a
@@ -120,14 +136,36 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   is gone; the hot store's staged blocks reported to the one cache as its storage
   bytes; and a server half that keeps flushed copies without the one cache and none
   with it.
+- `tests/memory.rs`: a counting allocator over the whole in-process path (the walk,
+  the plane, the server's upload until its commit): a 2 GiB output streams onto the
+  write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
+  `Segments` handlers (a remote daemon's path); without a tier, a 256 MiB output
+  streams to the cold store with under 16 MiB live.
+- `tests/helpers.rs`: the daemon's helpers run through this binary. The keeper,
+  waiting on its stdin as it does for a run's whole life, has one thread and no
+  socket, epoll, eventfd or directory open (read from `/proc`), then writes its kill
+  file and exits 0; `__chown-dirs` exits 0, 1 and 2 as the helper does, in its own
+  words.
+- Crash and panic behaviour, in the crates that hold it: `kbf-sim-cell`'s
+  `Kind::WholeProcess` kills the whole process, both halves, mid-build, and starts it
+  again (property 14: no action is answered as succeeded with its outputs missing,
+  and the index and action cache survive the kill; the actions the kill cut are run
+  again on the client's retry); `kbf-daemon`'s `lease_panic_tests.rs`: a run whose
+  driver panics reports INTERNAL and the next lease runs; the hashing pools'
+  own tests (`kbf-front`'s `HashPool`, `kbf-daemon`'s `CpuPool`): a job that panics
+  is an error to its caller and the pool keeps its size.
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
-  gone, a file changed after the walk hashed it.
+  gone, a file changed after the walk hashed it; without a tier, a `put_chunks` blob
+  over 16 MiB streamed (held, not read again once held, corrupt, unreadable) and an
+  upload with one stored record by record.
 - `src/one_cache_tests.rs`: one cache only when the hot store shares the data
   directory's filesystem, given to both halves.
 - `src/intake_tests.rs`: batches sent while the walk goes on (by bytes and by file
   count), the wait for room among the batches in flight, one digest stored once, a
-  file left unfinished storing nothing, a file over the largest blob not taken, and a
-  server half that is gone.
+  file left unfinished storing nothing, a file over 5 GiB taken, a large file
+  without a tier streamed to the store once (withdrawn when seen or held, nothing
+  stored when unfinished or when its bytes fail its digest), and a server half that
+  is gone.
 - `src/cli_tests.rs`: each flag reaches its half, once; the refusals.
 
 ## Not done yet
@@ -140,10 +178,10 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   certificate and the deny list; this plane's calls are not admitted.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as
   `kbf-daemon` does; the server half uses every CPU, as `kbf-server` does.
-- **Crash and panic behaviour** (the next change): the whole-process crash mode of the
-  simulation, a test that a panic in a driver task leaves the process serving, and the
-  rest of the helper-dispatch tests (each helper mode runs and exits with its code, with
-  no listener bound and no server directory opened).
+- **The simulation's in-process data plane.** In `kbf-sim-cell` the daemon half's
+  outputs still cross the modelled network; the design's in-process mode (bytes off
+  the network model, the control plane on it) and its property A2 (the same final
+  index in both modes) are not built, nor A3 (needs a durable scheduler).
 - **Deploying it** (the change after): the `all-in-one` shape in `kbf-deploy`, its unit
   and `check-units` rules, the ownership step that moves the state directories and keys
   between the split pair and this binary, and its place among the release artifacts.

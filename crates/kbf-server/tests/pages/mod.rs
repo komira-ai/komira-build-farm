@@ -68,10 +68,11 @@ impl Server {
             memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: kbf_sched::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
-            streams: kbf_server::StreamTiming::default(),
+            timing: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: memory,
             segments: kbf_front::SegmentsConfig::DEFAULT,
+            streams: kbf_server::StreamLimits::DEFAULT,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let shutdown = async move {

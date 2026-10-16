@@ -110,7 +110,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 .and_then(|bytes| record(bytes, run.start, &digest, at.offset));
             let read = match sliced {
                 Some(bytes) => Ok(bytes),
-                None => self.fetch(&digest, at).await,
+                None => self.fetch_answer(&digest, at, None).await,
             };
             out.push((digest, read));
         }

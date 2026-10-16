@@ -6,7 +6,6 @@ use kbf_segments::SegmentWriter;
 use tonic::Code;
 
 use super::*;
-use crate::MAX_BLOB_BYTES;
 
 /// A segment of `n` blobs of different sizes (the last one `last` bytes) as `Begin`
 /// declares it, and its record bytes.
@@ -20,18 +19,15 @@ fn segment(n: usize, last: usize) -> (Declared, Vec<u8>) {
     let bytes = writer.finish();
     let footer = kbf_segments::Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (mut declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (mut declared, _) =
+        declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared.remove(0), bytes[..records_len].to_vec())
 }
 
 /// Sends `records` in ranges of `cut` bytes in the order `order` names (indices of
 /// ranges), as `PutRange` does: write, then run the claimed checks.
 fn send(declared: &Declared, records: &[u8], cut: usize, order: &[usize]) -> Receiving {
-    let mut received = Receiving::new(declared, false);
+    let mut received = Receiving::new(declared, false, None);
     for &k in order {
         let (start, end) = (k * cut, ((k + 1) * cut).min(records.len()));
         let (_, claimed) = received
@@ -52,7 +48,7 @@ fn a_trusted_upload_hashes_nothing_and_builds_an_unverified_segment() {
     let (declared, records) = segment(5, 300);
     let mut altered = records.clone();
     altered[10] ^= 0xff;
-    let mut received = Receiving::new(&declared, true);
+    let mut received = Receiving::new(&declared, true, None);
     let (put, claimed) = received.put(&declared, 0, &altered).expect("put");
     assert_eq!(put, Put::Written);
     assert!(claimed.is_empty(), "{claimed:?}");
@@ -61,7 +57,7 @@ fn a_trusted_upload_hashes_nothing_and_builds_an_unverified_segment() {
     let built = received.check(&declared).expect("built");
     assert!(!built.verified);
     assert_eq!(built.entries, declared.entries);
-    let mut hashed = Receiving::new(&declared, false);
+    let mut hashed = Receiving::new(&declared, false, None);
     let (_, claimed) = hashed.put(&declared, 0, &records).expect("put");
     assert!(!claimed.is_empty());
     advance(&claimed, |i, f| hashed.next(&declared, i, f));
@@ -80,7 +76,7 @@ fn in_order(len: usize, cut: usize) -> Vec<usize> {
 #[test]
 fn any_cut_and_order_builds_the_same_segment() {
     let (declared, records) = segment(30, 3000);
-    let mut whole = Receiving::new(&declared, false);
+    let mut whole = Receiving::new(&declared, false, None);
     let (_, claimed) = whole.put(&declared, 0, &records).expect("put");
     advance(&claimed, |i, f| whole.next(&declared, i, f));
     let want = whole.check(&declared).expect("whole");
@@ -114,7 +110,7 @@ fn any_cut_and_order_builds_the_same_segment() {
 #[test]
 fn the_commit_has_nothing_left_to_hash() {
     let (declared, records) = segment(10, 500);
-    let mut received = Receiving::new(&declared, false);
+    let mut received = Receiving::new(&declared, false, None);
     received.put(&declared, 0, &records).expect("put");
     // Claimed but never advanced, as a commit that raced its ranges would find it.
     assert!(received.checking());
@@ -176,11 +172,8 @@ fn with_an_empty_blob() -> (Declared, Vec<u8>) {
     let bytes = writer.finish();
     let footer = kbf_segments::Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (mut declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (mut declared, _) =
+        declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared.remove(0), bytes[..records_len].to_vec())
 }
 
@@ -204,7 +197,7 @@ fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
         .position(|e| e.digest.size_bytes == 0)
         .expect("the empty record");
     lying.entries[empty].digest.hash[0] ^= 1;
-    let refused = Receiving::new(&lying, false)
+    let refused = Receiving::new(&lying, false, None)
         .refusal()
         .expect("refused at Begin");
     assert_eq!(refused.code(), Code::InvalidArgument);
@@ -214,7 +207,7 @@ fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
             .contains(&lying.entries[empty].digest.to_string()),
         "{refused:?}"
     );
-    assert!(Receiving::new(&lying, true).refusal().is_none());
+    assert!(Receiving::new(&lying, true, None).refusal().is_none());
 }
 
 /// Catches a commit that goes on while a record is still being checked (it would find
@@ -225,7 +218,7 @@ fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
 #[test]
 fn a_commit_waits_for_checks_and_stops_at_a_refusal() {
     let (declared, records) = segment(3, 500);
-    let mut received = Receiving::new(&declared, false);
+    let mut received = Receiving::new(&declared, false, None);
     let (_, claimed) = received.put(&declared, 0, &records).expect("put");
     let racing = received.not_ready().expect("records are being checked");
     assert_eq!(racing.code(), Code::FailedPrecondition);
@@ -250,7 +243,7 @@ fn a_commit_waits_for_checks_and_stops_at_a_refusal() {
 #[test]
 fn a_busy_record_is_not_claimed_again() {
     let (declared, records) = segment(1, 3000);
-    let mut received = Receiving::new(&declared, false);
+    let mut received = Receiving::new(&declared, false, None);
     let (_, first) = received.put(&declared, 0, &records[..1000]).expect("put");
     assert_eq!(first.len(), 1);
     let (_, second) = received
@@ -262,4 +255,76 @@ fn a_busy_record_is_not_claimed_again() {
     received
         .check(&declared)
         .expect("one hash over both ranges");
+}
+
+/// A cache over a memory log and store with an in-memory write tier attached, as a
+/// server with a hot store has.
+async fn tiered() -> std::sync::Arc<crate::Cache<crate::MemoryMetaLog, kbf_objstore::MemoryStore>> {
+    let cache = crate::Cache::open(
+        crate::MemoryMetaLog::new(kbf_meta::Retention::default()),
+        kbf_objstore::MemoryStore::new(kbf_objstore::Capabilities::default()),
+        kbf_objstore::KeyPrefix::default(),
+    )
+    .await
+    .expect("open");
+    let (cache, _) = cache
+        .attach_tier(
+            kbf_store::FaultFs::new(),
+            kbf_tier::TierOptions::new(1 << 30),
+            kbf_meta::ServerId::new(1),
+            None,
+        )
+        .await
+        .expect("a tier");
+    std::sync::Arc::new(cache)
+}
+
+/// Catches a segment on a write tier held here, or a range whose write failed taken
+/// for received (the commit would stage bytes that are not on the tier): its records
+/// are not kept in the buffer; while a range is being written the commit is not ready;
+/// a range whose write failed is forgotten, so it is missing until sent again; once
+/// every range is written the segment is built as its range on the tier, unverified,
+/// with nothing in its body.
+#[tokio::test]
+async fn a_segment_on_the_tier_is_written_there_and_built_as_its_range() {
+    let cache = tiered().await;
+    let (declared, records) = segment(3, 50);
+    let range = cache
+        .reserve_range(declared.records_len)
+        .await
+        .expect("a range");
+    let mut received = Receiving::new(&declared, true, Some(range));
+    assert!(format!("{received:?}").contains("TierRange"));
+    let half = records.len() / 2;
+    let (put, claimed) = received.put(&declared, 0, &records[..half]).expect("put");
+    assert_eq!((put, claimed), (Put::Written, Vec::new()));
+    let (range, writes) = received.tier().expect("on the tier");
+    assert!(received.not_ready().is_some(), "a write is running");
+    writes.done(0, false);
+    received.forget_failed();
+    assert!(received.first_missing(&declared).is_some(), "forgotten");
+    for (from, to) in [(0, half), (half, records.len())] {
+        let (put, _) = received
+            .put(&declared, from as u64, &records[from..to])
+            .expect("put");
+        assert_eq!(put, Put::Written);
+        range
+            .write(from as u64, &records[from..to])
+            .expect("written");
+        writes.done(from as u64, true);
+    }
+    drop(range);
+    assert!(received.not_ready().is_none());
+    assert!(received.first_missing(&declared).is_none());
+    let built = received.check(&declared).expect("built");
+    assert!(built.body.is_empty());
+    assert!(!built.verified);
+    assert_eq!(built.entries.len(), 3);
+    let staged = built.staged.expect("its range on the tier");
+    let blobs = built.entries.iter().map(|e| (e.digest, e.offset)).collect();
+    cache.stage_range(staged, blobs).await.expect("staged");
+    for entry in &built.entries {
+        let bytes = cache.read_blob(&entry.digest).await.expect("read");
+        assert_eq!(kbf_segments::sha256(&bytes), entry.digest);
+    }
 }

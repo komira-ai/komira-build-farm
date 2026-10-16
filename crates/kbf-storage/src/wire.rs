@@ -13,7 +13,7 @@ const SHA256_NAME: &str = "sha256";
 ///
 /// A digest that does not parse is refused, never skipped: a call that dropped it would
 /// answer for fewer digests than it was asked about.
-pub(crate) fn digest(d: Option<&reapi::Digest>) -> Result<Digest, Status> {
+pub fn digest(d: Option<&reapi::Digest>) -> Result<Digest, Status> {
     let d = d.ok_or_else(|| Status::invalid_argument("a digest is required"))?;
     let size = u64::try_from(d.size_bytes).map_err(|_| {
         Status::invalid_argument(format!("digest size {} is negative", d.size_bytes))
@@ -23,12 +23,12 @@ pub(crate) fn digest(d: Option<&reapi::Digest>) -> Result<Digest, Status> {
 }
 
 /// Every digest of a request, or INVALID_ARGUMENT naming the first bad one.
-pub(crate) fn digests(ds: &[reapi::Digest]) -> Result<Vec<Digest>, Status> {
+pub fn digests(ds: &[reapi::Digest]) -> Result<Vec<Digest>, Status> {
     ds.iter().map(|d| digest(Some(d))).collect()
 }
 
 /// kbf's [`Digest`] as a REAPI digest.
-pub(crate) fn digest_to_proto(d: &Digest) -> reapi::Digest {
+pub fn digest_to_proto(d: &Digest) -> reapi::Digest {
     reapi::Digest {
         hash: d.hash_hex(),
         // A blob's size is far below `i64::MAX`; a digest that claims more could not
@@ -39,7 +39,7 @@ pub(crate) fn digest_to_proto(d: &Digest) -> reapi::Digest {
 
 /// Accepts a request's `digest_function` if it is SHA-256 or unset (REAPI lets a client
 /// leave it unset for SHA-256, inferring it from the hash length).
-pub(crate) fn check_digest_function(f: i32) -> Result<(), Status> {
+pub fn check_digest_function(f: i32) -> Result<(), Status> {
     let unknown = reapi::digest_function::Value::Unknown as i32;
     let sha256 = reapi::digest_function::Value::Sha256 as i32;
     if f == unknown || f == sha256 {
@@ -52,7 +52,7 @@ pub(crate) fn check_digest_function(f: i32) -> Result<(), Status> {
 }
 
 /// A per-item status for batch responses, from a call-level outcome.
-pub(crate) fn rpc_status(status: &Status) -> rpc::Status {
+pub fn rpc_status(status: &Status) -> rpc::Status {
     rpc::Status {
         code: status.code() as i32,
         message: status.message().to_owned(),
@@ -61,7 +61,7 @@ pub(crate) fn rpc_status(status: &Status) -> rpc::Status {
 }
 
 /// The OK per-item status.
-pub(crate) fn rpc_ok() -> rpc::Status {
+pub fn rpc_ok() -> rpc::Status {
     rpc::Status {
         code: Code::Ok as i32,
         message: String::new(),
@@ -71,7 +71,7 @@ pub(crate) fn rpc_ok() -> rpc::Status {
 
 /// A blob a ByteStream resource name names, and the instance name before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Resource {
+pub struct Resource {
     /// Every segment before `blobs/` (a read) or `uploads/` (a write), joined by `/`;
     /// empty when there is none. Authorization reads it; the cache does not, since one
     /// cell has one cache.
@@ -84,7 +84,7 @@ pub(crate) struct Resource {
 ///
 /// Compressed reads (`compressed-blobs/...`) are refused because no compressor is
 /// advertised.
-pub(crate) fn read_resource(name: &str) -> Result<Resource, Status> {
+pub fn read_resource(name: &str) -> Result<Resource, Status> {
     let parts: Vec<&str> = name.split('/').collect();
     let at = parts
         .iter()
@@ -107,7 +107,7 @@ pub(crate) fn read_resource(name: &str) -> Result<Resource, Status> {
 
 /// The blob a ByteStream `Write` or `QueryWriteStatus` names:
 /// `{instance}/uploads/{uuid}/blobs/{sha256/}{hash}/{size}{/metadata}`.
-pub(crate) fn write_resource(name: &str) -> Result<Resource, Status> {
+pub fn write_resource(name: &str) -> Result<Resource, Status> {
     let parts: Vec<&str> = name.split('/').collect();
     let at = parts
         .iter()

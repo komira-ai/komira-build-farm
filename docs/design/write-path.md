@@ -3,7 +3,7 @@
 How bytes get from an upload into the store, and what an acknowledgement promises.
 Today's path is in [storage.md](storage.md#writes). Built: **write grouping**
 (section 3: concurrent small REAPI uploads share one segment, PUT and metadata commit;
-`kbf-front/src/cache/write_group.rs`) and the **local write tier** (section 6: segments
+`kbf-storage/src/cache/write_group.rs`) and the **local write tier** (section 6: segments
 synced to a server's NVMe or SSD, acknowledged, and flushed to the object store in the
 background; section 6.7 says how it was built and where it differs). **Planned**:
 **segment upload** (the daemon sends an action's outputs as whole segments over the
@@ -22,7 +22,7 @@ What the code does with that output today:
 - Each `Write` buffers the whole blob, verifies it, and calls `Cache::store_blobs`
   with one blob (`kbf-front/src/bytestream.rs`). `BatchUpdateBlobs` calls it once per
   request (`kbf-front/src/cas.rs`).
-- `store_blobs` (`kbf-front/src/cache.rs`) packs only **its own call's** blobs into
+- `store_blobs` (`kbf-storage/src/cache.rs`) packs only **its own call's** blobs into
   segments, so each file is a segment: one `put_new`, two `get_range` calls to read the
   trailer and footer back (`read_footer`), one `Command::PutBlobs`. Under
   the Raft metadata log commits are proposed, synced and applied one at a time under the
@@ -98,37 +98,73 @@ the committed metadata log**.
 A blob of `--write-own-segment-bytes` (default 16 MiB) or more bypasses the group and
 is written as a segment of its own (one record, settled like a grouped segment: the
 PUT with its retries, the footer read-back, one `PutBlobs`), so it neither waits for a
-linger nor holds up small writes. It is still held in memory until verified
-(`MAX_BLOB_BYTES`, 1 GiB) until the tier lets it stream to disk (section 6.2).
+linger nor holds up small writes. A ByteStream `Write` of a blob over
+`MAX_UNSTAGED_BLOB_BYTES` (16 MiB) is not held: with a write tier that has room for it,
+it is written onto the tier as its messages arrive (`Cache::stage_streamed`, section
+6.2), hashed as it passes and committed only if the bytes hash to the digest; with no
+tier, or no room, it is handed to the store as its messages arrive
+(`Cache::store_streamed`: a multipart upload on S3, hashed as it passes, completed only
+if the bytes hash to the digest), its footer read back, and one `PutBlobs` commits it. No blob is too large, on any path.
 
 ### 3.3 Bounds and backpressure
 
 - **Admission.** `--write-bytes-in-flight` (default 2 GiB) is an async semaphore
   counted in bytes. A ByteStream `Write` reads its first message (which carries the
-  resource name, and so the blob's size), then takes a permit for that size **before it
-  reads any more**, so the bytes it buffers in `received` are covered. `received` is
-  allocated at that size up front, so what is held is what was admitted, not a grown
-  buffer's capacity. `BatchUpdateBlobs` takes a permit for its total before it
-  calls `store_blobs`. Own-segment blobs count too. The server refuses to start with a
-  value below `MAX_BLOB_BYTES`, so a single legal blob can always be admitted. A caller
-  over the bound waits; nothing is refused for load.
+  resource name, and so the blob's size), then takes a permit for what it will hold
+  **before it reads any more**: the blob's size for one of at most 16 MiB, buffered in
+  `received` (allocated at that size up front, so what is held is what was admitted),
+  and 16 MiB for a larger one, which is streamed to the store (a message here, a part
+  there). `BatchUpdateBlobs` takes a permit for its total before it calls
+  `store_blobs`. Own-segment blobs count too. The server refuses to start with a value
+  below the smallest `--segment-upload-max-bytes` (33 MiB). One admission over the
+  `u32::MAX` permits a semaphore hands out at once (only under a bound configured that
+  large) is taken in parts, one such admission at a time, so two never each hold a part the
+  other waits for. A caller over the bound waits; nothing is refused for load.
 - **What it does not cover.** A `BatchUpdateBlobs` request is decoded by tonic before
   its handler runs: up to the 17 MiB message limit (`MAX_MESSAGE_BYTES`: a 16 MiB batch,
   `MAX_BATCH_TOTAL_BYTES`, and 1 MiB of digests and framing) per stream, times the
-  HTTP/2 concurrent-stream limit. That limit is set explicitly on both listeners and
-  named in the flag reference, so the total is a stated number, not "bounded": 200
-  streams per connection (`MAX_CONCURRENT_STREAMS`), 200 x 17 MiB, about 3.4 GiB of
-  decode buffer per connection, on top of the 2 GiB the flag admits. The 16 MiB limit
+  HTTP/2 concurrent-stream limit. That limit is set explicitly on both listeners, each
+  with its own flag, so the total is a stated number, not "bounded": the worker listener
+  allows 200 streams per connection (`--worker-max-streams`, `DEFAULT_WORKER_STREAMS`),
+  200 x 17 MiB, about 3.4 GiB of decode buffer per connection, on top of the 2 GiB the
+  flag admits. The REAPI listener allows 10000 (`--reapi-max-streams`,
+  `DEFAULT_REAPI_STREAMS`): buck2 holds one idle `Execute` stream per outstanding
+  action, and a small cap would hide its backlog in the client. Its stated number is
+  larger (10000 x 17 MiB, about 166 GiB) but only a client that sends 10000 simultaneous maximal
+  requests reaches it; an `Execute` request is a digest. The 16 MiB limit
   is a first setting (to be tuned later); a lower limit shrinks this bound
   in proportion. A `Write`'s first message (which names the
   blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
-  stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
-- **Flow control.** The connection's window is set to every stream's window at once
-  (200 MiB, `CONNECTION_WINDOW_BYTES`) on both listeners. With the transport's default
-  of 1 MiB, the unread data of the `Write`s waiting for admission on one connection
-  takes the whole window, and the admitted `Write`s on it, which must finish before
-  anyone else is admitted, never receive another byte: the uploads deadlock. The
-  admission test below goes red that way with the windows left at their defaults.
+  stream's flow-control window, received and unread: 1 MiB (`STREAM_WINDOW_BYTES`) on the
+  worker listener, about 209 KiB (214,748 B) on the REAPI listener.
+- **Flow control.** A `Write` waiting for admission is not read, so its stream's
+  window stays full of unread data, and that data counts against the connection's
+  window until the server reads it. The admitted `Write`s on the connection, which must
+  finish before anyone else is admitted, need that window to move: if the waiting
+  streams hold all of it, they never receive another byte and the uploads deadlock. So
+  each listener sets the connection window to the streams it allows times each stream's
+  window (`flow_windows` in `kbf-server`), and the streams together cannot hold all of
+  it unread, however many wait. The worker listener: 200 streams of 1 MiB, a 200 MiB
+  window. The REAPI listener, at its 10000 streams: HTTP/2's window cannot pass 2 GiB
+  - 1, so each stream's window is 2 GiB / 10000, 209 KiB, and the connection window is
+  their product, 2147480000 bytes. (At up to 2047 streams the stream window stays 1
+  MiB; above that it shrinks as the limit grows, and a limit over 32767, a stream window
+  under 64 KiB, is refused.) The most one connection holds unread is therefore its
+  connection window: 200 MiB on the worker listener, about 2 GiB on the REAPI listener,
+  and only a client that sends that much reaches it. This sits next to the decode
+  memory above, not inside it: a message in the middle of being decoded is read, so it
+  does not hold window, and 10000 streams of 17 MiB messages is about 166 GiB on a
+  REAPI connection, as stated there. With the windows left at the transport's defaults the
+  same deadlock happens with 48 Writes waiting. The admission tests go red both ways:
+  that, and a connection window fixed at 200 MiB beside 10000 streams, which starves
+  at about 977 waiting Writes (200 MiB / 214,748 B); the test waits 1500. Nothing caps
+  the number of connections, so these per-connection bounds multiply by the number of
+  connections a client opens.
+  The cost is throughput on one REAPI stream: a stream moves at most its window per
+  round trip, 209 KiB, so about 200 MB/s at 1 ms, 20 MB/s at 10 ms and 5-10 MB/s at 20-40 ms; many streams
+  at once fill the connection as before, and the worker listener (the daemons' path) is
+  unchanged. The measurement that would move this is a large blob from one buck2
+  stream at a real round trip; it has not been run.
 - `--write-puts-in-flight` (default 4) bounds concurrent segment PUTs. A segment
   sealed while all are busy waits; new blobs go to a new open segment.
 - Commits stay one at a time. Each now carries up to a segment's worth of blobs.
@@ -176,7 +212,7 @@ admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-lis
 
 **Built (rollout stage 2), direct path only.** The service is
 `kbf.worker.v1.Segments` (`crates/kbf-proto/proto/kbf/worker/v1/segments.proto`,
-served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Record` and
+served by `crates/kbf-storage/src/segments.rs`); the daemon's side is `Record` and
 `Cas::put_records` in `kbf-transfer` (`source.rs`, `segments.rs`). The container driver
 hashes each output file once and sends the records from the files where they are; the
 native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
@@ -199,7 +235,7 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
   already holds costs a hash, not a copy or a send.
 - The daemon splits uploads at 32 MiB (`SEGMENT_UPLOAD_BYTES`; a larger blob is an
   upload of its own), under the smallest `--segment-upload-max-bytes` a server starts
-  with (1 GiB + 1 MiB), so every server admits them and the daemon needs no flag for
+  with (33 MiB, counting only what an upload holds in memory), so every server admits them and the daemon needs no flag for
   the server's cap. An upload commits or fails whole, and up to
   `--segment-uploads-in-flight` (default 4) of a record set's uploads go at once, so a
   PUT cut on a slow store costs one upload's retry and fall-back, and the uploads that
@@ -207,9 +243,9 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
   every blob it had sent to one failed upload.)
 - `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
   (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
-  to start with `--segment-upload-max-bytes` over it, or over the 4 GiB - 1 one
-  admission counts (`MAX_ADMISSION_BYTES`, a semaphore's most permits per call), so a
-  `Begin` never holds more than the bound counts for it. Each segment of a commit is
+  to start with `--segment-upload-max-bytes` over it, or over what one admission
+  counts (`MAX_ADMISSION_BYTES`, the semaphore's most permits), so a `Begin` never
+  holds more than the bound counts for it. Each segment of a commit is
   stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
   retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
   timed as a segment commit.
@@ -289,12 +325,12 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
 
 ### 4.2 Bounds and failure
 
-- **Caps.** `--segment-upload-max-bytes` is at least one `MAX_BLOB_BYTES` record and its
-  footer (1 GiB + 1 MiB). Without the tier, ranges are held in memory, so the server
-  refuses to start unless the cap is at most `--write-bytes-in-flight` and at most
-  4 GiB - 1, the most one admission counts (default cap 1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
-  high: default 16 GiB, and the server refuses to start unless it is at most
-  the hot store's budget. Either way a legal `Begin` is always admitted.
+- **Caps.** `--segment-upload-max-bytes` (default and least 33 MiB) caps what one
+  upload holds in memory: its segments the tier did not take (all of them, without
+  one). Segments written to the tier as they arrive are not counted, so an upload of any
+  size can be admitted. The server refuses to start unless the cap is at most
+  `--write-bytes-in-flight` and at most what one admission counts, so a legal `Begin`
+  is always admitted.
   `MAX_UPLOAD_RECORDS` (16,384) bounds `Begin`'s message (16,384 entries of 52 B, about
   850 KiB, under `MAX_MESSAGE_BYTES`) and the upload's one `PutBlobs` or `PutStaged`
   (about 1 MiB in the Raft log, an estimate). The daemon splits a larger output set into
@@ -342,7 +378,7 @@ that call and the daemon falls back to per-blob reads.
   calls by it or by its own setting is to be checked on the pilot.
 - **zstd.** Advertise `supported_compressors` and `supported_batch_update_compressors`
   = `[ZSTD]`, and serve `compressed-blobs/zstd/...` on ByteStream (refused today in
-  `kbf-front/src/wire.rs`), in the same change that decodes it, since a client that
+  `kbf-storage/src/wire.rs`), in the same change that decodes it, since a client that
   sees it will send it. Stored bytes stay uncompressed; compression is wire-only.
 
 ## 6. The local write tier
@@ -384,7 +420,7 @@ offset in the block is its offset in the object the block becomes (Buildbarn's
    renames the file to `<epoch>-<seq>.seg` and syncs the directory: a flushed copy.
 5. **Reads.** The location answer carries the staged state from the same metadata
    query: `BlobAnswer::Present { location, staged_on }`. A staged blob is read from its
-   block. `Cache::fetch` (`kbf-front/src/cache.rs`) and the batch read fallback must
+   block. `Cache::fetch` (`kbf-storage/src/cache.rs`) and the batch read fallback must
    never commit `ObjectUnreachable { Missing }` for an object that was staged when the
    query ran; a local read that fails with ENOENT **after** `ObjectFlushed` falls back
    to the store. A flushed object may still be read locally from its `.seg` file.
@@ -431,8 +467,53 @@ per blob read does not. PR 3 adds a ranged `read_at` and a positioned write to `
 
 A ByteStream `Write` over `--write-own-segment-bytes` streams into its own block as it
 arrives (bytes come in order from offset 0), hashed as written, synced, and committed
-as a staged object of one record. Memory per stream is then one message. The 1 GiB
-`MAX_BLOB_BYTES` refusal can be relaxed later for the tier path; the direct path keeps it.
+as a staged object of one record. Memory per stream is then one message. (Built as
+`Cache::stage_streamed` for a `Write` over 16 MiB: each message hashed and written to a
+block of its own off the runtime, the digest checked before the commit, the store
+reached only by the flush; with no room on the tier, it streams to the store, section
+3.2.) No
+blob is too large on any path: the flusher reads a block in pieces of 8 MiB
+(`FLUSH_READ_BYTES`), hashing each into its records on the hashing pool, and hands
+them to the store as a streamed write (a multipart upload of 16 MiB parts on S3,
+aborted on any failure), then the footer, written only once every record hashed; a
+record that fails ends the write in the footer's place, so the store keeps nothing.
+
+Built today for the in-process plane (`kbf-all-in-one`), not yet for ByteStream:
+`Cache::stream(size)` reserves a block of the record's own, `RecordStream::append`
+writes each chunk at the next offset as the walk reads it (from the walk's buffer,
+nothing held), `finish(digest, crc32c)` checks the length and the CRC-32C, and
+`StreamedRecord::commit` syncs the block and commits one `PutStaged`, which seals it.
+The digest is trusted at the commit and checked by the flusher, as for a segment
+upload with the tier.
+
+A segment upload on a tier is written through the same way: `Begin` reserves a range
+per segment for its records (`Cache::reserve_range`), each `PutRange` writes its bytes
+there off the runtime (the range is recorded first; a `Commit` waits until every write
+has answered, and a write that fails forgets its range so it can be sent again), and
+`Commit` syncs the range and commits one `PutStaged` with the footer's records. What an
+upload holds in memory is the range being written. A segment the tier has no room for
+is held in memory as before, **only if every record is at most
+`MAX_UNSTAGED_BLOB_BYTES` (16 MiB)**: a larger record, without a tier or with a full
+one, is answered at `Begin` FAILED_PRECONDITION ("no write tier has room for it: send it
+by a ByteStream Write"), and the transfer engine sends that upload's records blob by
+blob by ByteStream at once (no second attempt), whose `Write` of a blob over 16 MiB
+streams it to the store (section 3.2), whatever its size. The in-process plane does the
+same: a file over 16 MiB with no tier, or no room on it, streams straight to the store as
+the walk reads it (`LocalStore::put_streamed`, over `Cache::store_streamed_claimed`: a
+bounded queue of the walk's chunks, hashed as they pass, the digest claimed when the walk
+finishes the file and checked before the store completes the upload), and an upload its
+`Begin` sends back is stored record by record (`kbf_transfer::put_each`), a large one
+streamed the same way. No record is refused for its size on any plane. 16 MiB is where
+the write group already writes a blob as a segment of its own, and well under the
+32 MiB a daemon batches small files into, so small outputs keep the in-memory path.
+Every read of a blob is bounded too: ByteStream Read, the HTTP blob route and the
+in-process plane's `read_to` read in windows of 8 MiB (`READ_WINDOW_BYTES`), and the
+whole reads left are of blobs the server decodes (an `Action`, `Command`, `Directory`,
+`Tree` or `ActionResult`), at most 64 MiB (`MAX_DECODED_BLOB_BYTES`). `BatchReadBlobs`
+and `BatchUpdateBlobs` stay within REAPI's batch limit (16 MiB of blobs per call,
+`MAX_BATCH_TOTAL_BYTES`, refused above it). The one size ceiling left is S3's: 10,000
+parts of at most 5 GiB, about 48.8 TiB per object; `put_stream` refuses a larger object
+`Unsupported` before it sends a byte.
 
 ### 6.3 What an acknowledgement means now
 
@@ -755,8 +836,8 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | a blob at `--write-own-segment-bytes` gets its own segment without the linger | large blobs held up by small ones |
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
 | 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
-| a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
-| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, over the 4 GiB - 1 one admission counts (`MAX_ADMISSION_BYTES`), or below one 1 GiB record plus footer, is refused; one admission of `MAX_ADMISSION_BYTES` under a 16 GiB bound is counted in full; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole 1 GiB + 1 MiB cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound, or more than it is counted for; mutants: the start check removed, the flag's upper limit removed, `MAX_ADMISSION_BYTES` raised to 8 GiB; a commit that asks for admission again (it waits forever) |
+| a start with `--write-bytes-in-flight` below `MIN_SEGMENT_UPLOAD_BYTES` is refused | a legal `Begin` waiting forever |
+| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, over what one admission counts (`MAX_ADMISSION_BYTES`), or below 33 MiB, is refused; one admission of 5 GiB + 1 MiB under a 16 GiB bound is counted in full, and two at once under an 8 GiB bound are both admitted; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound, or more than it is counted for; mutants: the start check removed, the flag's upper limit removed, an admission clamped to `u32::MAX`, no lock around an admission taken in parts; a commit that asks for admission again (it waits forever) |
 | a `Begin` waits while other uploads hold the bound, and is admitted when they release it | segment uploads bounded apart from ByteStream and batch uploads |
 | an upload's first segment PUT fails: the commit succeeds on a retry under a new key; with 2 PUT slots, a three-segment commit has 2 PUTs at the store | an upload's PUT tried once; an upload's PUTs past `--write-puts-in-flight` |
 

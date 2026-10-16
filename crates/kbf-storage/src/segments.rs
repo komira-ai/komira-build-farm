@@ -5,11 +5,18 @@
 //! Served on the worker listener only, behind its admission (kbf-server wraps this
 //! service as it wraps the blob services); this type authorizes nothing itself.
 //!
-//! - **Begin** checks every footer, refuses an upload over
-//!   `--segment-upload-max-bytes` or [`MAX_UPLOAD_RECORDS`], and then is admitted for
-//!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
-//!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
-//!   Ranges are held in memory until the commit.
+//! - **Begin** checks every footer and refuses an upload over [`MAX_UPLOAD_RECORDS`].
+//!   With a write tier, each segment's records get a range of their own on it, written
+//!   as they arrive; a segment the tier has no room for (or every segment, without a
+//!   tier) is held in memory until the commit. Such a segment may not hold a record
+//!   over [`MAX_UNSTAGED_BLOB_BYTES`]: `Begin` answers FAILED_PRECONDITION
+//!   ([`unstaged_refusal`](crate::unstaged_refusal)), and the client sends the
+//!   upload's records blob by blob through ByteStream, whose `Write` streams a large
+//!   blob to the store. No record is refused for its size. The bytes held in memory may not pass
+//!   `--segment-upload-max-bytes`, and are admitted by [`Cache::admit`]
+//!   (`--write-bytes-in-flight`, the bound ByteStream and batch uploads share), waiting
+//!   (never refusing) while it is spent. An upload whose records all go to the tier
+//!   holds none, whatever its size.
 //! - **PutRange** writes a range of one segment's records. Once Commit was called,
 //!   every PutRange is refused, so the bytes received are the bytes stored.
 //!   *Without a write tier* the range also hashes (SHA-256 and CRC-32C) what it
@@ -62,10 +69,10 @@ use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
-use self::upload::{Declared, Held, Put, Receiving, advance, declare};
-use crate::cache::{Admitted, BuiltSegment, Cache};
+use self::upload::{Declared, Held, Put, Receiving, TierWrites, advance, declare};
+use crate::cache::{Admitted, BuiltSegment, Cache, TierRange};
 use crate::meta_log::MetaLog;
-use crate::{MAX_BLOB_BYTES, wire};
+use crate::{MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal, wire};
 
 /// The most records one upload may hold: bounds `Begin`'s message (16,384 entries of
 /// 52 bytes, about 850 KiB) and the upload's one `PutBlobs`.
@@ -74,15 +81,19 @@ pub const MAX_UPLOAD_RECORDS: usize = 16_384;
 /// The most bytes one `PutRange` or `ReadRange` carries.
 pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 
-/// The smallest `--segment-upload-max-bytes`: one record of [`MAX_BLOB_BYTES`] and its
-/// footer, with room to spare, so any legal blob can be uploaded.
-pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = MAX_BLOB_BYTES + (1 << 20);
+/// The smallest `--segment-upload-max-bytes`, the most bytes one upload may hold in
+/// memory: 33 MiB, a daemon's upload of small files (32 MiB,
+/// `kbf_transfer::SEGMENT_UPLOAD_BYTES`) with room to spare. No record held in memory
+/// is over [`MAX_UNSTAGED_BLOB_BYTES`], and records written to the write tier as they
+/// arrive are not held, so an upload of any size can be admitted.
+pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = 33 << 20;
 
 /// The `--segment-upload-*` flags of the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentsConfig {
-    /// The most bytes one upload may declare (`--segment-upload-max-bytes`). The
-    /// memory uploads in progress hold together is bounded by the cache's
+    /// The most bytes one upload may hold in memory (`--segment-upload-max-bytes`):
+    /// its segments that are not written to the write tier as they arrive. The memory
+    /// uploads in progress hold together is bounded by the cache's
     /// `--write-bytes-in-flight` ([`Cache::admit`]), which `kbf-server` refuses to
     /// start below this cap, so a legal `Begin` is always admitted.
     pub max_bytes: u64,
@@ -225,6 +236,33 @@ impl Upload {
     }
 }
 
+/// Writes the range of `bytes` at `offset`, which `put` recorded, to the write tier,
+/// off the runtime, and answers `writes` whether it did (if not, the range is forgotten
+/// at the next `PutRange` or `Commit`, so it can be sent again, and the call fails
+/// UNAVAILABLE). Nothing of the range is held once this answers.
+async fn write_to_tier(
+    range: Arc<TierRange>,
+    writes: Arc<TierWrites>,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> Result<(), Status> {
+    let written = tokio::task::spawn_blocking(move || range.write(offset, &bytes))
+        .await
+        .map_err(shown)
+        .and_then(|written| written.map_err(shown));
+    writes.done(offset, written.is_ok());
+    written.map_err(|why| {
+        Status::unavailable(format!(
+            "the write tier did not take the range at {offset}: {why}"
+        ))
+    })
+}
+
+/// `e` as a message.
+fn shown(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
 /// Builds every received segment from what `Begin` declared and `PutRange` checked
 /// ([`Receiving::check`]), on the blocking pool: copying footers must not hold a runtime
 /// thread. A
@@ -352,31 +390,60 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             .iter()
             .map(|s| (s.length, s.footer.as_slice()))
             .collect();
-        let (declared, total, records) = declare(&segments, MAX_BLOB_BYTES)?;
-        let cap = self.shared.config.max_bytes;
-        if total > cap {
-            return Err(Status::invalid_argument(format!(
-                "an upload of {total} bytes is over the {cap}-byte cap (--segment-upload-max-bytes)"
-            )));
-        }
+        let (declared, records) = declare(&segments)?;
         if records > MAX_UPLOAD_RECORDS {
             return Err(Status::invalid_argument(format!(
                 "an upload of {records} records is over the {MAX_UPLOAD_RECORDS}-record limit"
             )));
         }
-        // `total <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
+        // With a write tier the daemon's digests are trusted here and checked by the
+        // flusher before the PUT; without one, the only copy is the PUT, so each record
+        // is hashed as its bytes arrive. With one, each segment's records are written
+        // to a range of their own on it as they arrive, if it has room (else held here).
+        let trusted = self.shared.cache.write_tier().is_some();
+        let mut ranges = Vec::with_capacity(declared.len());
+        let mut held = 0u64;
+        for d in &declared {
+            let range = if trusted & (d.records_len > 0) {
+                self.shared.cache.reserve_range(d.records_len).await
+            } else {
+                None
+            };
+            if range.is_none() {
+                // A record held in memory until the commit must be small: memory is
+                // bounded per file. A larger one, with no tier to write it to, is sent
+                // by ByteStream instead, which streams it to the store: the client
+                // falls back to that at this answer.
+                let large = d
+                    .entries
+                    .iter()
+                    .find(|e| e.digest.size_bytes > MAX_UNSTAGED_BLOB_BYTES);
+                if let Some(large) = large {
+                    return Err(Status::failed_precondition(unstaged_refusal(
+                        &large.digest.to_string(),
+                    )));
+                }
+                held = held.saturating_add(d.length);
+            }
+            ranges.push(range);
+        }
+        let cap = self.shared.config.max_bytes;
+        if held > cap {
+            return Err(Status::invalid_argument(format!(
+                "an upload that holds {held} bytes in memory is over the {cap}-byte cap \
+                 (--segment-upload-max-bytes)"
+            )));
+        }
+        // `held <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
         // otherwise), so this always ends.
         let admitted = {
             let _waiting = Waiting::enter(&self.shared.waiting);
-            self.shared.cache.admit(total).await
+            self.shared.cache.admit(held).await
         };
-        // With a write tier the daemon's digests are trusted here and checked by the
-        // flusher before the PUT; without one, the only copy is the PUT, so each record
-        // is hashed as its bytes arrive.
-        let trusted = self.shared.cache.write_tier().is_some();
-        let segments = declared
+        let segments: Vec<Receiving> = declared
             .iter()
-            .map(|d| Receiving::new(d, trusted))
+            .zip(ranges)
+            .map(|(d, range)| Receiving::new(d, trusted, range))
             .collect();
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {
@@ -417,7 +484,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         let declared = upload.declared.get(index).ok_or_else(|| {
             Status::invalid_argument(format!("no segment {segment} in the upload"))
         })?;
-        let claimed = {
+        let (claimed, to_tier) = {
             let mut phase = lock(&upload.phase);
             match &mut *phase {
                 Phase::Receiving { segments, .. } => {
@@ -425,7 +492,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                     if put == Put::Resent {
                         tracing::debug!(segment, offset, "resent range acknowledged, not written");
                     }
-                    claimed
+                    let to_tier = (put == Put::Written).then(|| segments[index].tier());
+                    (claimed, to_tier.flatten())
                 }
                 Phase::Committing | Phase::Done => {
                     return Err(Status::failed_precondition(
@@ -435,6 +503,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 Phase::Dropped => return Err(Status::not_found("the upload was dropped")),
             }
         };
+        if let Some((range, writes)) = to_tier {
+            write_to_tier(range, writes, offset, bytes).await?;
+        }
         if !claimed.is_empty() {
             // Hash what this range completed or extended, here and now, beside the
             // other ranges' own: the commit then has nothing left to hash. The task
@@ -464,7 +535,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         upload.touch();
         {
             let mut phase = lock(&upload.phase);
-            if let Phase::Receiving { segments, .. } = &*phase {
+            if let Phase::Receiving { segments, .. } = &mut *phase {
+                segments.iter_mut().for_each(Receiving::forget_failed);
                 let missing = segments
                     .iter()
                     .zip(&upload.declared)

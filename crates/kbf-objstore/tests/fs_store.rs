@@ -553,3 +553,43 @@ async fn a_file_system_of_objects_counts_the_object_files() {
     drop(store);
     std::fs::remove_dir_all(&dir).expect("remove");
 }
+
+/// Catches: a streamed write that failed (its body broke, or ended short) leaving its
+/// file in `tmp/` until the next open, or anything under its key; and a streamed write
+/// that is not written piece by piece to one file (the object reads back other than
+/// sent).
+#[tokio::test]
+async fn a_failed_streamed_write_leaves_no_file() {
+    use futures::StreamExt;
+    let dir = scratch("streamed");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let pieces = |tail: Option<ObjectStoreError>| {
+        let mut out: Vec<Result<Bytes, ObjectStoreError>> = vec![
+            Ok(Bytes::from_static(b"first ")),
+            Ok(Bytes::from_static(b"second")),
+        ];
+        out.extend(tail.map(Err));
+        futures::stream::iter(out).boxed()
+    };
+    let k = key("streamed/ok");
+    store.put_stream(&k, 12, pieces(None)).await.expect("put");
+    assert_eq!(store.get_range(&k, all(12)).await.unwrap(), "first second");
+    let broke = ObjectStoreError::Body("the source broke".into());
+    for (name, len, tail) in [
+        ("broke", 12, Some(broke)),
+        ("short", 13, None),
+        ("long", 11, None),
+    ] {
+        let k = key(&format!("streamed/{name}"));
+        let wrote = store.put_stream(&k, len, pieces(tail)).await;
+        assert!(
+            matches!(wrote, Err(ObjectStoreError::Body(_))),
+            "{name}: {wrote:?}"
+        );
+        assert!(!file_of(&dir, &k).exists(), "{name}: an object file");
+    }
+    let left = std::fs::read_dir(dir.join("tmp")).expect("tmp").count();
+    assert_eq!(left, 0, "files left in tmp/");
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}

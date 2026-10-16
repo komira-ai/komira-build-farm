@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
+bytes.workspace = true
 clap.workspace = true
 form_urlencoded.workspace = true
 hex.workspace = true
@@ -47,7 +48,6 @@ tracing-subscriber.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true

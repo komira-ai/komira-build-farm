@@ -24,7 +24,7 @@ use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_driver_container::tree::{OutputLimits, collect};
 use kbf_proto::reapi::{ActionResult, Digest, Tree};
-use kbf_transfer::{Cas, fetch};
+use kbf_transfer::{Cas, Record, Source, fetch};
 use kbf_types::LeaseId;
 use prost::Message as _;
 use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
@@ -194,4 +194,80 @@ async fn with_a_tier_each_output_file_is_read_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_tier_each_output_file_is_read_once() {
     each_output_file_is_read_once(false).await;
+}
+
+/// One sparse output over 1 GiB (the size above which a file used not to be taken),
+/// collected through a lease of the plane: it must be opened once, and be held after,
+/// streamed onto the write tier or, without one, to the store (never held in memory).
+async fn a_file_over_1_gib_is_read_once(tier: bool) {
+    let dir = scratch(if tier { "huge-tier" } else { "huge-no-tier" });
+    let plane = plane(&dir.join("server"), tier).await;
+    let upper = dir.join("upper");
+    let out = upper.join("out");
+    std::fs::create_dir_all(&out).expect("mkdir");
+    std::fs::File::create(out.join("huge"))
+        .and_then(|file| file.set_len((1 << 30) + (1 << 20)))
+        .expect("sparse file");
+    let watched = watch(&[&out]);
+    let lease = plane.lease(&LeaseId::new(1, 1));
+    let mut result = ActionResult::default();
+    let collected = collect(
+        &lease,
+        &upper,
+        &CpuPool::new(4),
+        "",
+        &["out/huge".to_owned()],
+        OutputLimits::DEFAULT,
+        &mut result,
+    )
+    .await;
+    let opens = opens(&watched);
+    let reads = opens.get("huge").copied().unwrap_or(0);
+    assert_eq!(
+        reads, 1,
+        "a file over 1 GiB was opened {reads} times (reads={reads}), not once: {opens:?}"
+    );
+    // Held either way: streamed onto the tier, or straight to the store without one.
+    collected.expect("collect");
+    let digest = result.output_files[0].digest.clone().expect("a digest");
+    assert!(lease.missing(&[digest]).await.is_empty(), "not held");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Catches a file over 1 GiB not taken by the plane (read again, or refused): with a
+/// write tier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_a_tier_a_file_over_1_gib_is_read_once() {
+    a_file_over_1_gib_is_read_once(true).await;
+}
+
+/// Catches a file over 16 MiB refused without a write tier (mutant: the refusal
+/// restored), or read again to be stored: it streams to the store from its one read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_tier_a_file_over_1_gib_is_read_once() {
+    a_file_over_1_gib_is_read_once(false).await;
+}
+
+/// Catches a largest blob on the local plane (mutant: the 5 GiB cap restored): a
+/// record over 5 GiB, S3's single-PUT limit, is taken like any other with a write tier
+/// (a range of its own reserved for it) and its bytes are read; here its source has
+/// none, so the read, not its size, fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
+    let dir = scratch("over-5-gib");
+    let plane = plane(&dir.join("server"), true).await;
+    let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
+    let record = Record {
+        digest,
+        crc32c: 0,
+        source: Source::Bytes(bytes::Bytes::new()),
+    };
+    let why = plane
+        .put_records(vec![record])
+        .await
+        .expect_err("a source with no bytes");
+    let why = why.to_string();
+    assert!(why.contains("could not be read"), "{why}");
+    assert!(!why.contains("largest blob"), "{why}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

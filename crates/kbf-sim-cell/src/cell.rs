@@ -62,11 +62,14 @@ pub enum Kind {
     /// A tier whose budget holds little beyond its staged blocks, so flushed copies
     /// are evicted while reads of them are in flight.
     TierEviction,
+    /// All-in-one: daemon 0 is the daemon half of the server's process, and one or two
+    /// kills of that process take both halves down mid-build; both start again.
+    WholeProcess,
 }
 
 impl Kind {
     /// Every kind, in the order the sweeps run them.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Calm,
         Self::Restart,
         Self::Crash,
@@ -85,6 +88,7 @@ impl Kind {
         Self::TierDiskFull,
         Self::TierBadBlock,
         Self::TierEviction,
+        Self::WholeProcess,
     ];
 
     /// Whether the server restarts, or its log stops, in a run of this kind.
@@ -92,7 +96,12 @@ impl Kind {
     pub fn restarts(self) -> bool {
         matches!(
             self,
-            Self::Restart | Self::Crash | Self::IoError | Self::StoreCrash | Self::TierCrash
+            Self::Restart
+                | Self::Crash
+                | Self::IoError
+                | Self::StoreCrash
+                | Self::TierCrash
+                | Self::WholeProcess
         )
     }
 
@@ -130,6 +139,9 @@ pub struct Scenario {
     pub server: ServerPlan,
     pub store: StorePlan,
     pub daemons: usize,
+    /// The daemon that is the daemon half of the server's process
+    /// ([`Kind::WholeProcess`]): it dies and starts again with the server.
+    pub colocated: Option<usize>,
     /// A daemon cut off from every other node from a time, for [`CUT_FOR`].
     pub partition: Option<(usize, FarmTime)>,
     /// Each client's actions, and when it starts on each.
@@ -170,7 +182,7 @@ impl Scenario {
         let mut store = Vec::new();
         match kind {
             Kind::Calm | Kind::TierCalm | Kind::TierEviction => {}
-            Kind::Restart => {
+            Kind::Restart | Kind::WholeProcess => {
                 for _ in 0..rng.between(1, 2) {
                     faults.push((at(&mut rng), ServerFault::Kill));
                 }
@@ -345,6 +357,7 @@ impl Scenario {
             },
             store: StorePlan { faults: store },
             daemons: DAEMONS,
+            colocated: (kind == Kind::WholeProcess).then_some(0),
             partition,
             clients,
             end: quiet.saturating_add(Duration::from_secs(150)),
@@ -545,6 +558,11 @@ pub struct RunReport {
     /// A binary that runs only machine version 1 opening the durable log at the end
     /// (scenario 30); `None` without a tier, or with the server down.
     pub rollback: Option<Rollback>,
+    /// The runs, staged outputs and unacknowledged results the daemon half lost with
+    /// its process ([`Kind::WholeProcess`]; 0 otherwise).
+    pub lost: usize,
+    /// How many actions were started by more than one run of the server's process.
+    pub rerun: usize,
 }
 
 /// Runs `scenario` to its end, checking every property after every step.
@@ -561,11 +579,12 @@ pub fn run(scenario: &Scenario) -> RunReport {
     let server = Server::new(scenario.server.clone(), store_id());
     sim.add_node(server_id(), CellNode::Server(Box::new(server)));
     for n in 0..scenario.daemons {
-        let daemon = FakeDaemon::new(
-            server_id(),
-            format!("daemon-{n}-1"),
-            Resources::new(2_000, 4 << 30),
-        );
+        let capacity = Resources::new(2_000, 4 << 30);
+        let daemon = if scenario.colocated == Some(n) {
+            FakeDaemon::in_process(server_id(), &format!("daemon-{n}"), capacity)
+        } else {
+            FakeDaemon::new(server_id(), format!("daemon-{n}-1"), capacity)
+        };
         sim.add_node(
             NodeId::new(format!("daemon-{n}")),
             CellNode::Daemon(Box::new(daemon)),
@@ -584,10 +603,15 @@ pub fn run(scenario: &Scenario) -> RunReport {
         sim.partition_at(at, Partition::new([cut]));
         sim.partition_at(at.saturating_add(CUT_FOR), Partition::none());
     }
+    let half = scenario
+        .colocated
+        .map(|n| NodeId::new(format!("daemon-{n}")));
+    let mut was_up = false;
     let mut checker = Checker::new(scenario);
     while sim.now() <= scenario.end {
         // The server's tick timer keeps the queue from ever running dry.
         let _ = sim.step();
+        was_up = share_fate(&mut sim, was_up);
         checker.after_step(&sim);
     }
     checker.at_end(&sim);
@@ -602,6 +626,13 @@ pub fn run(scenario: &Scenario) -> RunReport {
         crate::check::orphans(store.objects().map(|(o, _)| o), answers)
     });
     let rollback = scenario.server.tier.and_then(|_| server.rollback());
+    let lost = half
+        .and_then(|h| {
+            sim.node(&h)
+                .and_then(CellNode::daemon)
+                .map(FakeDaemon::lost)
+        })
+        .unwrap_or(0);
     RunReport {
         trace: sim.trace_hash(),
         starts: seen.starts,
@@ -619,5 +650,22 @@ pub fn run(scenario: &Scenario) -> RunReport {
         tier: seen.tier.clone(),
         flush_met: store.flush_met().to_vec(),
         rollback,
+        lost,
+        rerun: seen.started.values().filter(|runs| runs.len() > 1).count(),
     }
+}
+
+/// The daemon half of the server's process goes down when the server's process does,
+/// in the same step, and starts again when it starts; returns whether the server is up
+/// now. `was_up` is what the last call returned.
+fn share_fate(sim: &mut Sim<CellNode>, was_up: bool) -> bool {
+    let up = crate::check::server(sim).is_up();
+    if up != was_up {
+        for (_, node) in sim.nodes_mut() {
+            if let CellNode::Daemon(daemon) = node {
+                daemon.server_process(up);
+            }
+        }
+    }
+    up
 }

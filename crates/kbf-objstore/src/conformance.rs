@@ -24,7 +24,7 @@ use kbf_types::Digest;
 
 use crate::footers::{self, FooterRead, FooterReads};
 use crate::{
-    ByteRange, Capabilities, KeyPrefix, ListToken, ObjectInfo, ObjectKey, ObjectStore,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListToken, ObjectInfo, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
 
@@ -70,6 +70,10 @@ pub enum Check {
     /// With Object Lock, a retained object refuses delete and stays readable; without
     /// it, a retention date is refused.
     ObjectLock,
+    /// `put_stream` of an object of several parts, its body in pieces that do not line
+    /// up with them, reads back whole; a body that fails, or ends short, stores
+    /// nothing; with conditional writes, an existing key is refused and kept.
+    StreamedPut,
 }
 
 /// The outcome of one check.
@@ -168,6 +172,7 @@ pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
         refuses_overwrite(store, prefix, caps).await,
     );
     record(Check::ObjectLock, object_lock(store, prefix, caps).await);
+    record(Check::StreamedPut, streamed_put(store, prefix, caps).await);
     Report { results }
 }
 
@@ -609,5 +614,78 @@ fn describe<T>(r: &Result<T, ObjectStoreError>) -> String {
     match r {
         Ok(_) => "success".to_owned(),
         Err(e) => format!("error: {e}"),
+    }
+}
+
+/// The length of the streamed object: three S3 parts, the last short.
+const STREAMED_LEN: usize = 2 * crate::s3::PART_BYTES as usize + 12_345;
+
+/// The pieces a streamed body comes in: not a divisor of the part size.
+const STREAMED_PIECE: usize = (1 << 20) + 13;
+
+/// `bytes` as a body of `STREAMED_PIECE`-byte pieces, then `tail` (an error) if given.
+fn streamed(bytes: &Bytes, tail: Option<ObjectStoreError>) -> BodyStream {
+    let mut pieces: Vec<Result<Bytes, ObjectStoreError>> = (0..bytes.len())
+        .step_by(STREAMED_PIECE)
+        .map(|at| Ok(bytes.slice(at..(at + STREAMED_PIECE).min(bytes.len()))))
+        .collect();
+    pieces.extend(tail.map(Err));
+    futures::stream::iter(pieces).boxed()
+}
+
+async fn streamed_put<S: ObjectStore>(
+    store: &S,
+    prefix: &KeyPrefix,
+    caps: Capabilities,
+) -> CheckResult {
+    let body = pattern(STREAMED_LEN, 11);
+    let len = body.len() as u64;
+    let k = key(prefix, "streamed")?;
+    let wrote = store.put_stream(&k, len, streamed(&body, None)).await;
+    ensure!(wrote.is_ok(), "put_stream {k}: {wrote:?}");
+    const WINDOW: usize = 4 << 20;
+    for at in (0..body.len()).step_by(WINDOW) {
+        let n = WINDOW.min(body.len() - at);
+        let got = read(store, &k, range(at as u64, n as u64)).await?;
+        ensure!(
+            got == body.slice(at..at + n),
+            "{k}: bytes {at}..{} read back other than streamed",
+            at + n
+        );
+    }
+    let failed = key(prefix, "streamed-failed")?;
+    let broke = ObjectStoreError::Body("the source broke".into());
+    let wrote = store
+        .put_stream(&failed, len, streamed(&body, Some(broke)))
+        .await;
+    ensure!(wrote.is_err(), "{failed}: a body that failed was written");
+    absent(store, &failed).await?;
+    let short = key(prefix, "streamed-short")?;
+    let wrote = store
+        .put_stream(&short, len + 1, streamed(&body, None))
+        .await;
+    let refused = matches!(wrote, Err(ObjectStoreError::Body(_)));
+    ensure!(refused, "{short}: a short body answered {wrote:?}");
+    absent(store, &short).await?;
+    if !caps.conditional_put {
+        return Ok(Outcome::Passed);
+    }
+    let other = pattern(STREAMED_LEN, 12);
+    let again = store.put_stream(&k, len, streamed(&other, None)).await;
+    let refused = matches!(again, Err(ObjectStoreError::AlreadyExists(_)));
+    ensure!(refused, "{k}: a streamed overwrite answered {again:?}");
+    let kept = read(store, &k, range(0, 64)).await?;
+    ensure!(
+        kept == body.slice(..64),
+        "{k}: a refused overwrite changed it"
+    );
+    Ok(Outcome::Passed)
+}
+
+/// Fails unless reading `k` finds no object.
+async fn absent<S: ObjectStore>(store: &S, k: &ObjectKey) -> Result<(), String> {
+    match store.get_range(k, range(0, 1)).await {
+        Err(ObjectStoreError::NotFound(_)) => Ok(()),
+        other => Err(format!("{k}: a write that failed left {other:?}")),
     }
 }

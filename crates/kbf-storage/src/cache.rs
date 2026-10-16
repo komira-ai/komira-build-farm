@@ -9,11 +9,10 @@ use bytes::Bytes;
 use futures::future;
 use kbf_meta::{
     ActionAnswer, ActionRecord, ActionWriteError, Applied, BlobAnswer, Closure, Collected, Command,
-    Epoch, Location, MetaState, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
+    Epoch, MetaState, ObjectId, Retention, Role, Touch, UnreachableReason,
 };
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore,
-    ObjectStoreError,
+    Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore, ObjectStoreError,
 };
 use kbf_proto::reapi;
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentError, WriteError};
@@ -24,7 +23,7 @@ use tonic::Status;
 use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
-use crate::{MAX_BLOB_BYTES, wire};
+use crate::wire;
 
 /// The most [`ObjectStore::may_hold`] checks one action-cache hit keeps in flight. A
 /// hit needs one check per stored object its entry names; over a local store each is
@@ -417,10 +416,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// durable.
     ///
     /// # Errors
-    /// [`CacheError::Invalid`], before anything is stored, if any blob is larger than
-    /// [`MAX_BLOB_BYTES`]: the cache holds none, which its readers rely on. The store or
-    /// the metadata log failed for some blob (the first such blob's error); that blob
-    /// was not reported present.
+    /// The store or the metadata log failed for some blob (the first such blob's
+    /// error); that blob was not reported present.
     pub async fn store_blobs(&self, blobs: Vec<VerifiedBlob>) -> Result<(), CacheError> {
         self.store_admitted(blobs, Admitted::default()).await
     }
@@ -449,28 +446,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             }
         }
         Ok(held)
-    }
-
-    /// Reads a whole blob, verified against its digest, after touching it.
-    ///
-    /// # Errors
-    /// [`CacheError::NotFound`] only if the blob is not held;
-    /// [`CacheError::Unreachable`] if it is held but cannot be read.
-    pub async fn read_blob(&self, digest: &Digest) -> Result<Bytes, CacheError> {
-        if is_empty_blob(digest) {
-            return Ok(Bytes::new());
-        }
-        let answer = self
-            .touched(|s| (s.blob(digest), s.touch_for([digest])))
-            .await?;
-        match answer {
-            BlobAnswer::Absent => Err(CacheError::NotFound(*digest)),
-            BlobAnswer::Unavailable => Err(CacheError::Unreachable(*digest)),
-            BlobAnswer::Present {
-                location,
-                staged_on,
-            } => self.fetch_answer(digest, location, staged_on).await,
-        }
     }
 
     /// Answers `GetActionResult`: the result, and the digest of the ActionResult blob
@@ -657,62 +632,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(answer)
     }
 
-    /// Reads `digest`'s bytes at `location` from the store and checks them. An object
-    /// the store does not have is marked unreachable as [`UnreachableReason::Missing`],
-    /// one whose bytes are wrong as [`UnreachableReason::Corrupt`].
-    async fn fetch(&self, digest: &Digest, location: Location) -> Result<Bytes, CacheError> {
-        self.fetch_from_store(digest, location, true).await
-    }
-
-    /// [`Cache::fetch`], marking the object only if `mark`: a reader never marks an
-    /// object that was staged when its query ran, because the store does not hold it
-    /// yet (design section 6.1.5).
-    async fn fetch_from_store(
-        &self,
-        digest: &Digest,
-        location: Location,
-        mark: bool,
-    ) -> Result<Bytes, CacheError> {
-        let Location {
-            store,
-            object,
-            offset,
-        } = location;
-        if store != StoreId::CONFIGURED {
-            return Err(CacheError::Internal(format!(
-                "blob {digest} is in store {}, and this cache has only store {}",
-                store.get(),
-                StoreId::CONFIGURED.get()
-            )));
-        }
-        let key = self.object_key(object)?;
-        let range = ByteRange::new(offset, digest.size_bytes).ok_or_else(|| {
-            CacheError::Internal(format!("blob {digest} has no readable range at {offset}"))
-        })?;
-        let bytes = match self.writer.get_range(&key, range).await {
-            Ok(bytes) => bytes,
-            Err(e @ (ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
-                tracing::error!(%digest, %key, error = %e, mark, "held blob missing from the store");
-                if mark {
-                    self.mark_unreachable(object, UnreachableReason::Missing)
-                        .await?;
-                }
-                return Err(CacheError::Unreachable(*digest));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        // Digest equality includes the length, so a short read fails here too.
-        if kbf_segments::sha256(&bytes) != *digest {
-            tracing::error!(%digest, %key, mark, "stored bytes fail their digest");
-            if mark {
-                self.mark_unreachable(object, UnreachableReason::Corrupt)
-                    .await?;
-            }
-            return Err(CacheError::Unreachable(*digest));
-        }
-        Ok(bytes)
-    }
-
     /// Whether the store may still hold each of `objects`, the stored objects an
     /// action-cache hit on `action` needs ([`ObjectStore::may_hold`]: a local store
     /// checks its files, a remote one answers yes). Each object the store does not hold
@@ -774,15 +693,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         object: ObjectId,
         reason: UnreachableReason,
     ) -> Result<(), CacheError> {
-        match self
-            .writer
-            .commit(Command::ObjectUnreachable { object, reason })
-            .await?
-        {
-            Applied::Marked(Ok(())) => Ok(()),
-            Applied::Marked(Err(e)) => Err(CacheError::Internal(e.to_string())),
-            other => Err(unexpected(&other)),
-        }
+        self.writer.mark_unreachable(object, reason).await
     }
 }
 
@@ -797,17 +708,6 @@ fn proto_digest(d: Option<&reapi::Digest>) -> Result<Digest, CacheError> {
 }
 
 /// A [`MetaLog`] answered a command with the outcome of a different one: a broken log.
-/// [`CacheError::Invalid`] naming the first of `blobs` larger than [`MAX_BLOB_BYTES`].
-fn refuse_oversized(blobs: &[VerifiedBlob]) -> Result<(), CacheError> {
-    match blobs.iter().find(|b| b.digest.size_bytes > MAX_BLOB_BYTES) {
-        Some(blob) => Err(CacheError::Invalid(format!(
-            "{} is larger than the largest blob this cache accepts ({MAX_BLOB_BYTES} bytes)",
-            blob.digest
-        ))),
-        None => Ok(()),
-    }
-}
-
 fn unexpected(applied: &Applied) -> CacheError {
     CacheError::Internal(format!(
         "metadata log answered with an unexpected outcome {applied:?}"
@@ -816,8 +716,11 @@ fn unexpected(applied: &Applied) -> CacheError {
 
 mod batch;
 mod consistency;
+mod direct;
 mod evict;
 mod flush;
+mod read;
+mod stream;
 mod tier;
 mod touches;
 mod upload;
@@ -829,16 +732,18 @@ pub use consistency::{
     EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
 };
 pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
-pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
+pub use flush::{
+    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound,
+};
+pub use read::{BlobRead, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
+pub(crate) use stream::TierRange;
+pub use stream::{RecordStream, StreamedRecord};
 pub use tier::{TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;
 pub use write_group::{
-    Admitted, CONNECTION_WINDOW_BYTES, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF,
+    Admitted, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, MAX_ADMISSION_BYTES, PUT_BACKOFF,
     PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
 };
 use write_group::{Group, Writer};
-
-#[cfg(test)]
-mod tests;

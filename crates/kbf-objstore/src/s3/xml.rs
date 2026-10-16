@@ -1,4 +1,5 @@
-//! The S3 XML bodies kbf reads: `ListBucketResult` (ListObjectsV2) and `Error`.
+//! The S3 XML bodies kbf reads: `ListBucketResult` (ListObjectsV2), `Error`, and the
+//! answers of a multipart upload; and the one it writes, `CompleteMultipartUpload`.
 
 use roxmltree::{Document, Node};
 
@@ -50,6 +51,69 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
         (false, _) => None,
     };
     Ok(ListPage { objects, next })
+}
+
+/// The `UploadId` of a CreateMultipartUpload answer.
+pub(crate) fn upload_id(body: &[u8]) -> Result<String, ObjectStoreError> {
+    let bad =
+        |what: String| ObjectStoreError::Protocol(format!("CreateMultipartUpload answer: {what}"));
+    let text = std::str::from_utf8(body).map_err(|e| bad(e.to_string()))?;
+    let doc = Document::parse(text).map_err(|e| bad(e.to_string()))?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "InitiateMultipartUploadResult" {
+        return Err(bad(format!("root element is <{}>", root.tag_name().name())));
+    }
+    match child_text(root, "UploadId") {
+        Some(id) if !id.is_empty() => Ok(id.to_owned()),
+        _ => Err(bad("no <UploadId>".into())),
+    }
+}
+
+/// The body of CompleteMultipartUpload: each part's number and ETag, in order.
+pub(crate) fn complete_request(etags: &[String]) -> String {
+    let mut out =
+        String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    for (i, etag) in etags.iter().enumerate() {
+        out.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            i + 1,
+            escape(etag)
+        ));
+    }
+    out.push_str("</CompleteMultipartUpload>");
+    out
+}
+
+/// A CompleteMultipartUpload answer of 200: success only if it is a
+/// `CompleteMultipartUploadResult`. S3 answers 200 and then an `<Error>` when the
+/// completion fails after the answer started.
+pub(crate) fn complete_answer(body: &[u8]) -> Result<(), ObjectStoreError> {
+    let text = std::str::from_utf8(body).unwrap_or_default();
+    let root = Document::parse(text)
+        .ok()
+        .map(|doc| doc.root_element().tag_name().name().to_owned());
+    match root.as_deref() {
+        Some("CompleteMultipartUploadResult") => Ok(()),
+        Some("Error") => {
+            let (code, message) = error_code_message(body);
+            Err(ObjectStoreError::Service {
+                status: 200,
+                code,
+                message,
+            })
+        }
+        _ => Err(ObjectStoreError::Protocol(format!(
+            "CompleteMultipartUpload answered 200 with {:?}",
+            text.chars().take(200).collect::<String>()
+        ))),
+    }
+}
+
+/// `text` with the characters XML gives meaning to escaped.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Whether `node` is an element named `name`, in any namespace.
@@ -109,6 +173,45 @@ mod tests {
         ));
         assert!(list_page(b"<Error><Code>X</Code></Error>").is_err());
         assert!(list_page(b"not xml").is_err());
+    }
+
+    /// Catches: an upload id lost or taken from the wrong element (every part would be
+    /// sent to an upload that does not exist), a completion that names parts out of
+    /// order or unescaped, and a 200 completion whose body is an `<Error>` taken for
+    /// success (an object reported written that the store does not hold).
+    #[test]
+    fn multipart_bodies() {
+        let created = format!(
+            "<?xml version=\"1.0\"?><InitiateMultipartUploadResult {NS}><Bucket>b</Bucket>\
+             <Key>k</Key><UploadId>abc.def-1</UploadId></InitiateMultipartUploadResult>"
+        );
+        assert_eq!(upload_id(created.as_bytes()).unwrap(), "abc.def-1");
+        assert!(upload_id(b"<InitiateMultipartUploadResult/>").is_err());
+        let empty =
+            b"<InitiateMultipartUploadResult><UploadId></UploadId></InitiateMultipartUploadResult>";
+        assert!(upload_id(empty).is_err(), "an empty upload id");
+        assert!(upload_id(b"\xff\xfe").is_err(), "not UTF-8");
+        assert!(upload_id(b"<unclosed").is_err(), "not XML");
+        assert!(upload_id(b"<Error><UploadId>x</UploadId></Error>").is_err());
+        let body = complete_request(&["\"a1\"".into(), "b&2".into()]);
+        assert!(
+            body.contains(
+                "<Part><PartNumber>1</PartNumber><ETag>\"a1\"</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>b&amp;2</ETag></Part>"
+            ),
+            "{body}"
+        );
+        let done = format!(
+            "<CompleteMultipartUploadResult {NS}><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>"
+        );
+        assert!(complete_answer(done.as_bytes()).is_ok());
+        let late = b"<Error><Code>InternalError</Code><Message>m</Message></Error>";
+        let late = complete_answer(late).err().map(|e| e.to_string());
+        assert_eq!(late.as_deref(), Some("store answered 200 InternalError: m"));
+        assert!(matches!(
+            complete_answer(b""),
+            Err(ObjectStoreError::Protocol(_))
+        ));
     }
 
     /// Catches: an error body read without its code, which callers match on.
