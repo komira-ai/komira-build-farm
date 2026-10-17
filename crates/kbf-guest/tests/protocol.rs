@@ -152,6 +152,34 @@ fn a_dripping_connection_is_dropped_after_the_hello_timeout() {
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
 }
 
+/// Catches a deadline that has already passed when a read starts being handed to the OS
+/// as a zero timeout, which means no bound at all. With a hello timeout of zero every
+/// read starts after the deadline, so the agent refuses at once whatever the host
+/// sends. It also takes the already-late branch of the
+/// bounded read in the instantiation every other handshake test uses, without leaving
+/// that branch to the timing of `a_dripping_connection_is_dropped_after_the_hello_timeout`.
+#[test]
+fn a_hello_timeout_of_zero_refuses_before_reading() {
+    let shares = Shares::new("hello-zero");
+    let mut config = shares.config();
+    config.hello_timeout = Duration::ZERO;
+    let served = Served::start(config);
+    let mut host = served.connect_raw();
+    host.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    let reply = recv(&mut host);
+    match reply {
+        GuestMsg::Refused { reason, detail } => {
+            assert_eq!(reason, Refusal::NoHello);
+            assert!(
+                detail.contains("no Hello within the hello timeout"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 /// Catches the Hello deadline left on the socket after `Ready`: the reader would then
 /// time out once a run stays silent for longer than the hello timeout, take that as a
 /// host that is gone, and kill the run (every build over 10 s in production).
