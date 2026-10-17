@@ -17,6 +17,9 @@ impl Segments for StorageService {
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
         self.admission.check(&request, Endpoint::Segments)?;
+        // Counted while it waits for the map, as a write is; the store's own count of the
+        // upload (from its `Begin`, for as long as the upload lives) takes over from it.
+        let _open = self.open_writes.begin();
         self.check_map(generation::requested(&request)?).await?;
         self.segments.begin(request).await
     }

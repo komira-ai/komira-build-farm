@@ -63,6 +63,7 @@ use kbf_proto::worker::{
     ReadRangeResponse,
 };
 use kbf_segments::RecordHasher;
+use kbf_storage::service::{OpenWrite, OpenWrites};
 use kbf_types::Digest;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -133,6 +134,8 @@ struct Shared<M, O> {
     waiting: AtomicUsize,
     next: AtomicU64,
     uploads: Mutex<HashMap<u64, Arc<Upload>>>,
+    /// What counts the uploads as open writes, if the node reports them.
+    open_writes: Option<OpenWrites>,
 }
 
 #[derive(Debug)]
@@ -150,6 +153,10 @@ enum Phase {
     Receiving {
         segments: Vec<Receiving>,
         _admitted: Admitted,
+        /// The upload counted as an open write on its node: from `Begin` until the commit
+        /// that was started for it ends (it is moved into that detached task) or it is
+        /// dropped.
+        _open: Option<OpenWrite>,
     },
     Committing,
     /// Committed or failed; the answer is in [`Upload::done`].
@@ -296,8 +303,22 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
                 waiting: AtomicUsize::new(0),
                 next: AtomicU64::new(1),
                 uploads: Mutex::new(HashMap::new()),
+                open_writes: None,
             }),
         }
+    }
+
+    /// The service counting each upload in `open_writes` from its `Begin` until its commit
+    /// ends or it is dropped, so a node that reports its open writes does not report none
+    /// while a daemon is uploading. Call before the service is cloned or served.
+    ///
+    /// # Panics
+    /// If the service has been cloned.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        let shared = Arc::get_mut(&mut self.shared).expect("set before the service is cloned");
+        shared.open_writes = Some(open_writes);
+        self
     }
 
     /// How many `Begin` calls are waiting for admission now: what a test watches to
@@ -364,6 +385,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         upload: Arc<Upload>,
         segments: Vec<Receiving>,
         admitted: Admitted,
+        _open: Option<OpenWrite>,
     ) {
         let answer = async {
             let built = check_all(Arc::clone(&upload), segments).await?;
@@ -383,6 +405,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
+        // Counted from the call, so a refused or cancelled Begin gives it back.
+        let open = self.shared.open_writes.as_ref().map(OpenWrites::begin);
         let owner = self.shared.connections.of(kbf_tls::remote_addr(&request));
         let segments: Vec<(u64, &[u8])> = request
             .get_ref()
@@ -452,6 +476,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             phase: Mutex::new(Phase::Receiving {
                 segments,
                 _admitted: admitted,
+                _open: open,
             }),
             last_call: Mutex::new(Instant::now()),
             done,
@@ -555,12 +580,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 Phase::Receiving {
                     segments,
                     _admitted: admitted,
+                    _open: open,
                 } => {
                     tokio::spawn(Self::commit_task(
                         Arc::clone(&self.shared.cache),
                         Arc::clone(&upload),
                         segments,
                         admitted,
+                        open,
                     ));
                 }
                 Phase::Dropped => {

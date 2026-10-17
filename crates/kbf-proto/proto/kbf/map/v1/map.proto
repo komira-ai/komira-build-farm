@@ -131,6 +131,14 @@ message HeartbeatRequest {
   // does a node that has no journal. The frontend sums repair_debts over the members to
   // judge the farm's under-replicated blobs (docs/design/architecture-v2.md, section 11).
   bool debts_known = 6;
+  // The writes this node has open now: Write calls it is taking in, as a primary or a
+  // replica, action-cache commits, and segment uploads from Begin until their commit
+  // ends. Read only when writes_known is true. A rollout
+  // stops a node only after it reports none (docs/design/architecture-v2.md, section 11).
+  uint64 open_writes = 7;
+  // Whether this node counts its open writes. False says "I cannot say", never "none": an
+  // older node, which sends neither field, reads as false.
+  bool writes_known = 8;
 }
 
 message HeartbeatResponse {

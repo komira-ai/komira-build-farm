@@ -79,6 +79,8 @@ pub(crate) struct Mem {
     active: AtomicUsize,
     pub most_active: AtomicUsize,
     pub segments: Arc<Seen>,
+    /// The handle the service asked for counted segment uploads with ([`Storage::segments_counted`]).
+    pub counted_with: Mutex<Option<crate::service::OpenWrites>>,
 }
 
 impl Mem {
@@ -231,6 +233,11 @@ impl Storage for Mem {
         Arc::clone(&self.segments) as Arc<dyn Segments>
     }
 
+    fn segments_counted(&self, open: &crate::service::OpenWrites) -> Arc<dyn Segments> {
+        *self.counted_with.lock().expect("lock") = Some(open.clone());
+        self.segments()
+    }
+
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -269,6 +276,8 @@ impl Storage for Mem {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             self.failing()?;
+            // Open unless a test holds the commits (`Knobs::hold_commits`).
+            let _permit = self.knobs.commit_gate.acquire().await;
             if role != Role::Daemon {
                 return Err(ActionWriteError::NotDaemon.into());
             }

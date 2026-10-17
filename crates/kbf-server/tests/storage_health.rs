@@ -23,7 +23,8 @@ use kbf_server::members::{
     Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
 };
 use kbf_server::storage_health::{
-    Debts, MemberReport, NotReady, Report, StorageGate, StorageHealth, render, storage_health,
+    Debts, MemberReport, NotReady, Report, Reported, StorageGate, StorageHealth, render,
+    storage_health,
 };
 use kbf_state::{Store, StoreTime};
 
@@ -39,7 +40,7 @@ fn reported(id: u64, state: MemberState, debts: Debts, seconds: u64) -> MemberRe
         id: MemberId(id),
         state,
         report: Some(Report {
-            debts,
+            said: Reported::debts(debts),
             at: at(seconds),
         }),
     }
@@ -275,13 +276,23 @@ impl Pair {
 
     fn beat_a(&self, debts: Debts) {
         self.members
-            .heartbeat(self.a.0, self.a.1, Progress::CaughtUp, debts)
+            .heartbeat(
+                self.a.0,
+                self.a.1,
+                Progress::CaughtUp,
+                Reported::debts(debts),
+            )
             .expect("a beats");
     }
 
     fn beat_b(&self, debts: Debts) {
         self.members
-            .heartbeat(self.b.0, self.b.1, Progress::CaughtUp, debts)
+            .heartbeat(
+                self.b.0,
+                self.b.1,
+                Progress::CaughtUp,
+                Reported::debts(debts),
+            )
             .expect("b beats");
     }
 
@@ -399,7 +410,12 @@ fn a_member_that_registers_again_starts_without_a_report() {
     assert_eq!(health.silent, [pair.a.0]);
 
     pair.members
-        .heartbeat(again.id, again.boot, Progress::CaughtUp, Debts::Known(0))
+        .heartbeat(
+            again.id,
+            again.boot,
+            Progress::CaughtUp,
+            Reported::debts(Debts::Known(0)),
+        )
         .expect("beats");
     assert_eq!(pair.health().under_replicated_blobs, Some(0));
 }
@@ -413,9 +429,12 @@ fn the_report_of_a_superseded_boot_is_refused() {
     pair.members
         .set_state(pair.a.0, MemberState::Active)
         .expect("promoted");
-    let refused = pair
-        .members
-        .heartbeat(pair.a.0, pair.a.1, Progress::CaughtUp, Debts::Known(0));
+    let refused = pair.members.heartbeat(
+        pair.a.0,
+        pair.a.1,
+        Progress::CaughtUp,
+        Reported::debts(Debts::Known(0)),
+    );
     assert!(matches!(refused, Err(MembershipError::Superseded { .. })));
     assert_eq!(pair.health().silent, [pair.a.0]);
 }

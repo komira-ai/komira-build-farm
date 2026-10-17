@@ -995,3 +995,139 @@ async fn a_read_back_without_the_record_fails_the_commit() {
     front.assert_present(&s.digests, false).await;
     front.assert_present(&other.digests, false).await;
 }
+
+/// Polls until `open` counts `want`; the service moves it from tasks the test does not hold.
+async fn open_reaches(open: &kbf_storage::service::OpenWrites, want: u64) {
+    for _ in 0..1000 {
+        if open.count() == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the open writes are {}, not {want}", open.count());
+}
+
+/// Catches a node that reports no open write while a daemon uploads its outputs, so a
+/// rollout stops it and cuts the upload. An upload is an open write from its `Begin` (which
+/// a refused one gives back), through its ranges, and past the end of the `Commit` call that
+/// started the commit: that commit runs detached and goes on when the caller is gone, so the
+/// count falls only when it has stored the segments. Then an upload nobody commits is
+/// dropped when idle and stops counting. Mutants: the upload not counted; counted only until
+/// `Begin` returns; the count given back when the `Commit` call ends instead of when the
+/// detached commit does; a refused `Begin` left counted.
+#[tokio::test]
+async fn an_upload_is_an_open_write_until_its_commit_ends() {
+    let open = kbf_storage::service::OpenWrites::new();
+    let config = SegmentsConfig {
+        idle: Duration::from_millis(300),
+        ..SegmentsConfig::DEFAULT
+    };
+    let front = Front::start_counted(config, WriteConfig::DEFAULT, Some(open.clone())).await;
+    let s = seg(&[blob(31, 500), blob(32, 500)]);
+    let mut client = front.client().await;
+
+    let refused = client
+        .begin(BeginRequest {
+            segments: vec![UploadSegment {
+                length: 3,
+                footer: Vec::new(),
+            }],
+        })
+        .await
+        .expect_err("a segment that is not one");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert_eq!(open.count(), 0, "a refused Begin is not open");
+
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    assert_eq!(open.count(), 1, "from Begin");
+    put_all(&mut client, upload, 0, &s, 250, false).await;
+    assert_eq!(open.count(), 1, "through its ranges");
+
+    front.store.hold();
+    let mut committing = client.clone();
+    let commit = tokio::spawn(async move { committing.commit(CommitRequest { upload }).await });
+    front.store.wait_for_put().await;
+    assert_eq!(open.count(), 1, "while the commit stores");
+    commit.abort();
+    let _ = commit.await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        open.count(),
+        1,
+        "the detached commit goes on without its caller"
+    );
+    front.store.release();
+    open_reaches(&open, 0).await;
+    front.assert_present(&s.digests, true).await;
+
+    let idle = seg(&[blob(33, 500)]);
+    front.begin(&mut client, std::slice::from_ref(&idle)).await;
+    assert_eq!(open.count(), 1, "an upload nobody commits");
+    open_reaches(&open, 0).await;
+}
+
+/// Catches a `Begin` that waits for admission (the memory budget another upload holds) and
+/// is not counted: it has been taken in and a daemon is waiting on it, so a node that read
+/// zero then would be stopped under it. The second `Begin` is an open write while it waits
+/// (two with the first), and the count falls with it when its connection goes. Mutant: the
+/// count taken after the admission.
+#[tokio::test]
+async fn a_begin_waiting_for_admission_is_an_open_write() {
+    let open = kbf_storage::service::OpenWrites::new();
+    let config = SegmentsConfig {
+        max_bytes: 4 << 10,
+        idle: Duration::from_secs(3600),
+    };
+    let writes = WriteConfig {
+        bytes_in_flight: 4 << 10,
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_counted(config, writes, Some(open.clone())).await;
+    let first = seg(&[blob(60, 1400), blob(61, 1400)]);
+    let second = seg(&[blob(62, 1500)]);
+    let mut a = front.client().await;
+    front.begin(&mut a, std::slice::from_ref(&first)).await;
+    assert_eq!(open.count(), 1);
+
+    let mut b = front.client().await;
+    let segments = vec![second.upload_segment()];
+    let waiting = tokio::spawn(async move { b.begin(BeginRequest { segments }).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while front.service.begins_waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the second Begin waits in the server");
+    assert_eq!(open.count(), 2, "a Begin waiting for the budget is open");
+    waiting.abort();
+    let _ = waiting.await;
+    open_reaches(&open, 1).await;
+}
+
+/// Catches the cache-as-a-store (what a storage node runs) handing out `Segments` handlers
+/// that do not count: `segments_counted` is the one a node's service asks for, and its uploads
+/// move the node's handle, while the plain `segments` leaves a handle alone. Mutant:
+/// `segments_counted` returning the plain handlers.
+#[tokio::test]
+async fn the_cache_as_a_store_counts_the_uploads_of_its_counted_handlers_only() {
+    use kbf_storage::Storage as _;
+    let open = kbf_storage::service::OpenWrites::new();
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let store = kbf_front::CacheStorage::new(front.cache.clone(), SegmentsConfig::DEFAULT);
+    let s = seg(&[blob(41, 500)]);
+    let begin = || {
+        tonic::Request::new(BeginRequest {
+            segments: vec![s.upload_segment()],
+        })
+    };
+
+    store.segments().begin(begin()).await.expect("begin");
+    assert_eq!(open.count(), 0, "the plain handlers count nothing");
+    store
+        .segments_counted(&open)
+        .begin(begin())
+        .await
+        .expect("begin");
+    assert_eq!(open.count(), 1, "the counted ones count the upload");
+}

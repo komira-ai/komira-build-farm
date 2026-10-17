@@ -17,7 +17,7 @@ use hooked::Hooked;
 use kbf_front::Cache;
 use kbf_map::{MemberId, MemberState};
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
-use kbf_server::storage_health::Debts;
+use kbf_server::storage_health::{Debts, Reported};
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::{Cond, Store, Txn};
 use serde_json::{Value, json};
@@ -133,7 +133,12 @@ fn farm(s: &Server, debts: &[Debts]) {
             .set_state(joined.id, MemberState::Active)
             .expect("promoted");
         s.members
-            .heartbeat(joined.id, joined.boot, Progress::CaughtUp, *debts)
+            .heartbeat(
+                joined.id,
+                joined.boot,
+                Progress::CaughtUp,
+                Reported::debts(*debts),
+            )
             .expect("beats");
     }
 }
@@ -152,7 +157,7 @@ async fn the_api_answers_the_number_or_null_and_why() {
         json!({
             "members_total": 0, "members_active": 0, "not_active": [], "silent": [],
             "unreported": [], "debts_total": 0, "under_replicated_blobs": null,
-            "reasons": ["no storage member is registered"],
+            "reasons": ["no storage member is registered"], "nodes": [],
         })
     );
 
@@ -164,6 +169,10 @@ async fn the_api_answers_the_number_or_null_and_why() {
             "members_total": 2, "members_active": 2, "not_active": [], "silent": [],
             "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
             "reasons": ["3 blobs owed"],
+            "nodes": [
+                { "id": 1, "state": "active", "repair_debts": 0, "open_writes": null, "generation": 0 },
+                { "id": 2, "state": "active", "repair_debts": 3, "open_writes": null, "generation": 0 },
+            ],
         })
     );
 
@@ -180,7 +189,12 @@ async fn the_api_answers_the_number_or_null_and_why() {
         .set_state(MemberId(1), MemberState::Active)
         .expect("active");
     s.members
-        .heartbeat(MemberId(2), 1, Progress::CaughtUp, Debts::Known(0))
+        .heartbeat(
+            MemberId(2),
+            1,
+            Progress::CaughtUp,
+            Reported::debts(Debts::Known(0)),
+        )
         .expect("beats");
     let (_, zero) = storage(&s).await;
     assert_eq!(zero["under_replicated_blobs"], 0);

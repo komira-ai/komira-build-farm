@@ -19,7 +19,7 @@ use kbf_proto::worker::segments_client::SegmentsClient;
 use kbf_server::NodeMap;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
-use kbf_server::storage_health::Debts;
+use kbf_server::storage_health::Reported;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{
     EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
@@ -27,7 +27,7 @@ use kbf_server::{
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
 use kbf_storage::repair::{NoLedger, Options, RepairRecord, Repairs};
-use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
+use kbf_storage::service::{CatchUp, OpenWrites, ROLE_URI_PREFIX, RemoteStorage};
 use kbf_store::FaultFs;
 use kbf_types::{Digest, DigestFunction};
 use rcgen::{
@@ -229,7 +229,7 @@ async fn a_node_whose_row_lapsed_registers_again() {
                 MemberId(1),
                 2,
                 kbf_server::members::Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
             )
             .ok()
     })
@@ -665,7 +665,7 @@ async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
                 MemberId(1),
                 2,
                 kbf_server::members::Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
             )
             .ok()
     })
@@ -698,6 +698,70 @@ async fn a_node_without_a_journal_says_it_cannot_say() {
         None
     );
     joiner.abort();
+}
+
+/// The frontend's view of member 1, polled until `ready` holds for it.
+async fn until_node(
+    f: &Frontend,
+    what: &str,
+    ready: impl Fn(&kbf_server::storage_health::NodeHealth) -> bool,
+) -> kbf_server::storage_health::NodeHealth {
+    until(what, || {
+        let health = f.members.storage_health().expect("health");
+        health
+            .nodes
+            .iter()
+            .copied()
+            .find(|n| n.id == MemberId(1) && ready(n))
+    })
+    .await
+}
+
+/// Catches: a node that does not tell the frontend how many writes it has open, tells it a
+/// count that is not the handle's, or says nothing about the map it held when it counted.
+/// Through the real joiner and membership service: 2 open is 2 at the frontend, one ending
+/// is 1, none is 0 (known, not unknown), and the generation is the one the frontend's map
+/// has. A node whose joiner has no handle cannot say, and the frontend reads "unknown", not
+/// zero. Mutant: the joiner reports `Known(0)` without a handle.
+#[tokio::test]
+async fn a_node_reports_the_writes_it_has_open_and_the_map_it_holds() {
+    let f = frontend(None);
+    let open = OpenWrites::new();
+    let (first, second) = (open.begin(), open.begin());
+    let joiner = tokio::spawn(joiner_of(&f).with_open_writes(open.clone()).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let node = until_node(&f, "two open writes", |n| n.open_writes == Some(2)).await;
+    let map = f.members.current_map().expect("read").expect("a map");
+    assert_eq!(node.generation, Some(map.generation()));
+    assert_ne!(map.generation(), 0, "the node was sent a map");
+
+    drop(first);
+    until_node(&f, "one open write", |n| n.open_writes == Some(1)).await;
+    drop(second);
+    until_node(&f, "none open", |n| n.open_writes == Some(0)).await;
+    joiner.abort();
+
+    let silent = tokio::spawn(joiner_of(&f).run());
+    until("the node to register again", || {
+        f.members
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Reported::default(),
+            )
+            .ok()
+    })
+    .await;
+    let node = until_node(&f, "a report without a count", |n| {
+        n.repair_debts.is_none() && n.generation.is_some_and(|g| g != 0)
+    })
+    .await;
+    assert_eq!(node.open_writes, None, "no handle: cannot say");
+    silent.abort();
 }
 
 /// A node started with `--frontend` that the frontend cannot yet admit (its store fails),

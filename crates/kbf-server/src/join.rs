@@ -21,13 +21,13 @@ use kbf_mapsync::MapHolder;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_storage::repair::Repairs;
-use kbf_storage::service::CatchUp;
+use kbf_storage::service::{CatchUp, OpenWrites};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::members::PROTOCOL;
 use crate::node_map::NodeMap;
-use crate::storage_health::Debts;
+use crate::storage_health::{Debts, Writes};
 
 /// The first wait after a failure.
 pub const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -73,6 +73,7 @@ pub struct Joiner {
     identity: Identity,
     retry: Duration,
     repairs: Option<Arc<Repairs>>,
+    open_writes: Option<OpenWrites>,
     catch_up: CatchUp,
     node: Arc<NodeMap>,
 }
@@ -87,6 +88,7 @@ impl Joiner {
             identity,
             retry,
             repairs: None,
+            open_writes: None,
             catch_up: CatchUp::caught_up(),
             node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
         }
@@ -100,6 +102,22 @@ impl Joiner {
     pub fn with_repairs(mut self, repairs: Arc<Repairs>) -> Self {
         self.repairs = Some(repairs);
         self
+    }
+
+    /// The joiner of a node that counts its open writes in `open_writes`, which the node's
+    /// storage service moves ([`OpenWrites`]): every heartbeat says how many are open.
+    /// Without it a heartbeat says the node cannot say ([`Writes::Unknown`]), never none.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        self.open_writes = Some(open_writes);
+        self
+    }
+
+    /// What this node says it has open now.
+    fn writes(&self) -> Writes {
+        self.open_writes
+            .as_ref()
+            .map_or(Writes::Unknown, |open| Writes::Known(open.count()))
     }
 
     /// What this node says it owes now. The journal's lock is held across a disk sync by a
@@ -183,6 +201,12 @@ impl Joiner {
     /// # Errors
     /// NOT_FOUND when the row lapsed (register again); the call failing.
     pub async fn beat(&mut self, joined: &Joined) -> Result<u64, Status> {
+        // The generation before the count: a write routed by an older map is refused once
+        // the node holds the newer one, so a count taken after holds no such write begun
+        // later (docs/design/architecture-v2.md, section 11). No test pins this order: the
+        // two reads cannot be told apart from outside, so a change here is reviewed, not run.
+        let have_generation = self.node.maps().generation();
+        let (writes_known, open_writes) = self.writes().to_wire();
         let (debts_known, repair_debts) = self.debts().await.to_wire();
         let answer = self
             .client
@@ -191,7 +215,9 @@ impl Joiner {
                 boot: joined.boot,
                 repair_debts,
                 debts_known,
-                have_generation: self.node.maps().generation(),
+                have_generation,
+                open_writes,
+                writes_known,
                 catching_up: self.catch_up.is_catching_up(),
             })
             .await?

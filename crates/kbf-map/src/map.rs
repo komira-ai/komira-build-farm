@@ -37,6 +37,20 @@ pub enum MemberState {
 }
 
 impl MemberState {
+    /// The state as an operator reads it: the lower-case, underscored name `GET
+    /// /v1/storage` shows. Exhaustive: a new state fails to compile here instead of
+    /// reaching operators unnamed.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Joining => "joining",
+            Self::CatchingUp => "catching_up",
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::Down => "down",
+        }
+    }
+
     /// Whether the member can be a write owner.
     #[must_use]
     pub const fn takes_writes(self) -> bool {

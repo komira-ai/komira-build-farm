@@ -14,6 +14,7 @@ use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_segments::RecordHasher;
+use kbf_storage::service::OpenWrites;
 use kbf_storage::{
     Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError, StreamedPut,
 };
@@ -135,6 +136,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
             self.config,
             Connections::new(),
         ))
+    }
+
+    /// As [`Storage::segments`], each upload counted in `open` while it is open.
+    fn segments_counted(&self, open: &OpenWrites) -> Arc<dyn Segments> {
+        Arc::new(
+            SegmentsService::new(Arc::clone(&self.cache), self.config, Connections::new())
+                .with_open_writes(open.clone()),
+        )
     }
 
     fn action_result<'a>(

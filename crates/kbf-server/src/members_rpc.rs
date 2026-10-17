@@ -21,7 +21,7 @@ use kbf_storage::service::{Admission, PeerRole, role_of};
 use tonic::{Request, Response, Status};
 
 use crate::members::{Members, MembershipError, Progress, Registrant};
-use crate::storage_health::Debts;
+use crate::storage_health::{Debts, Reported, Writes};
 
 /// The service over `members`, admitting callers as `admission` says.
 pub struct MembershipService {
@@ -138,9 +138,13 @@ impl Membership for MembershipService {
         let id = kbf_map::MemberId(req.member_id);
         let have = req.have_generation;
         let progress = Progress::from_wire(req.catching_up);
-        let debts = Debts::from_wire(req.debts_known, req.repair_debts);
+        let said = Reported {
+            debts: Debts::from_wire(req.debts_known, req.repair_debts),
+            writes: Writes::from_wire(req.writes_known, req.open_writes),
+            generation: have,
+        };
         let (map_generation, map) = blocking(move || {
-            let generation = members.heartbeat(id, req.boot, progress, debts)?;
+            let generation = members.heartbeat(id, req.boot, progress, said)?;
             // Read only for a node that is behind: most beats carry no map.
             let newer = if generation > have {
                 members.current_map()?.filter(|map| map.generation() > have)

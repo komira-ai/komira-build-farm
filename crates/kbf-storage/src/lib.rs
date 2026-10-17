@@ -168,6 +168,16 @@ pub trait Storage: Send + Sync {
     /// can name: the handlers a remote daemon's `Begin`, `PutRange` and `Commit` reach.
     fn segments(&self) -> Arc<dyn Segments>;
 
+    /// [`Storage::segments`], counting each upload in `open` from its `Begin` until the
+    /// commit started for it ends or it is dropped, so a node that reports its open writes
+    /// does not report none while a daemon uploads its outputs. The service of a storage node
+    /// asks for this one. A store whose uploads are not counted answers [`Storage::segments`]
+    /// and the node under-reports; the store a node runs (kbf-front's) overrides it.
+    fn segments_counted(&self, open: &service::OpenWrites) -> Arc<dyn Segments> {
+        let _ = open;
+        self.segments()
+    }
+
     /// `GetActionResult`: the result and the digest of the blob it was read from, if
     /// the entry passes the closure check and its result blob reads back; `None` (a
     /// miss) otherwise.

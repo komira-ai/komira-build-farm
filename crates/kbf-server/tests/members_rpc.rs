@@ -306,6 +306,58 @@ async fn a_heartbeat_carries_what_the_node_owes() {
     );
 }
 
+/// Catches: the wire's open-writes report not reaching the judgement, or reaching it wrong,
+/// and the map generation it rides with. A heartbeat that says 3 writes are open at map 7
+/// shows 3 and 7 for the node; one that says `writes_known = false` shows none whatever count
+/// rides with it; one from an older node (neither field) shows none, never zero. Mutants: the
+/// flag ignored; the count read from the debts field; the generation dropped.
+#[tokio::test]
+async fn a_heartbeat_carries_the_writes_the_node_has_open() {
+    let store = Hooked::new();
+    let (members, mut client) = serve(&store).await;
+    client.register(request(1)).await.expect("registers");
+    members
+        .set_state(kbf_map::MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let beat = |open_writes, writes_known| pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        have_generation: 7,
+        repair_debts: 5,
+        debts_known: true,
+        open_writes,
+        writes_known,
+        ..Default::default()
+    };
+    let node = || members.storage_health().expect("health").nodes[0];
+
+    client.heartbeat(beat(3, true)).await.expect("beats");
+    let seen = node();
+    assert_eq!(
+        (seen.open_writes, seen.repair_debts, seen.generation),
+        (Some(3), Some(5), Some(7))
+    );
+
+    client.heartbeat(beat(0, true)).await.expect("beats");
+    assert_eq!(node().open_writes, Some(0), "counted, and none");
+
+    client.heartbeat(beat(9, false)).await.expect("beats");
+    assert_eq!(
+        node().open_writes,
+        None,
+        "a count sent unknown is not a count"
+    );
+
+    client.heartbeat(beat(3, true)).await.expect("beats");
+    let older = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 1,
+        ..Default::default()
+    };
+    client.heartbeat(older).await.expect("beats");
+    assert_eq!(node().open_writes, None, "an older node does not count");
+}
+
 /// Catches: expired rows nobody frees (session rows, the results of finished operations
 /// and every other time-to-live key sit in the file for good): the timer, with no caller,
 /// removes a row whose time ran out, as an `Expire` row in the change feed, and a reap

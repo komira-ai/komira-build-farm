@@ -90,6 +90,7 @@ fn a_job_outliving_its_receiving_upload_sees_nothing() {
     *lock(&upload.phase) = Phase::Receiving {
         segments: vec![received],
         _admitted: Admitted::nothing(),
+        _open: None,
     };
     assert!(upload.refusal_at(0).is_none());
     advance(&claimed, |i, finished| upload.check_next(0, i, finished));

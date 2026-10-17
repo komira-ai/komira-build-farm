@@ -56,6 +56,7 @@ mod catch_up;
 mod client;
 mod generation;
 mod in_process;
+mod open_writes;
 mod segments;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -80,6 +81,7 @@ pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
 pub use in_process::InProcess;
+pub use open_writes::{OpenWrite, OpenWrites};
 
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
@@ -124,6 +126,7 @@ pub struct StorageService {
     chain: Option<Arc<Chain>>,
     map: Option<Arc<dyn MapSource>>,
     catch_up: Option<CatchUp>,
+    open_writes: OpenWrites,
     refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
@@ -140,6 +143,7 @@ impl StorageService {
             chain: None,
             map: None,
             catch_up: None,
+            open_writes: OpenWrites::new(),
             refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
@@ -178,6 +182,16 @@ impl StorageService {
     #[must_use]
     pub fn with_catch_up(mut self, catch_up: CatchUp) -> Self {
         self.catch_up = Some(catch_up);
+        self
+    }
+
+    /// The service counting the writes it has open in `open_writes`, which the node's
+    /// registration reports ([`OpenWrites`]). A service given none counts into a handle
+    /// nobody reads.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        self.segments = self.storage.segments_counted(&open_writes);
+        self.open_writes = open_writes;
         self
     }
 

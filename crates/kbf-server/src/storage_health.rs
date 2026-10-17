@@ -18,9 +18,19 @@
 //! window: a copy owed after the last report is not in it. Whoever acts on a zero must
 //! keep new writes away from the node first (drain it), then read again.
 //!
+//! **Per node.** The same report says how many writes the node has open ([`Writes`]) and
+//! which map it held when it said so. [`NodeHealth`] shows each member's debts and open
+//! writes, and [`node_idle`] is the judgement a rollout makes about one node: idle only
+//! when every *other* member is `Active`, fresh and knows its debts, no copy is owed
+//! anywhere, and the node itself reports, freshly and knowing, no open write, from a map at
+//! least as new as the one that stopped routing writes to it. Every value that is unknown
+//! (never reported, stale, not counted by an older node) is a reason, never a zero.
+//!
 //! [`StorageGate`] is the question a rollout asks before it takes a storage node down.
 //! `GET /v1/storage` and the metrics `kbf_under_replicated_blobs` (present only while the
-//! number is known) and `kbf_storage_health_known` show the same judgement to an operator.
+//! number is known), `kbf_storage_health_known`, `kbf_member_repair_debts` and
+//! `kbf_member_open_writes` (one sample per member, present only while that member's value
+//! is known) show the same judgement to an operator.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -72,11 +82,87 @@ impl Debts {
     }
 }
 
+/// What a storage node says about the writes it has open, at one heartbeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writes {
+    /// It cannot say: an older node, or one that does not count.
+    Unknown,
+    /// The writes it has open.
+    Known(u64),
+}
+
+impl Writes {
+    /// The wire's `writes_known` and `open_writes`. A count sent with `known` false is not
+    /// a count.
+    #[must_use]
+    pub const fn from_wire(known: bool, open: u64) -> Self {
+        if known {
+            Self::Known(open)
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// The wire's `writes_known` and `open_writes`.
+    #[must_use]
+    pub const fn to_wire(self) -> (bool, u64) {
+        match self {
+            Self::Unknown => (false, 0),
+            Self::Known(open) => (true, open),
+        }
+    }
+}
+
+/// What one heartbeat says about the node: the copies it owes, the writes it has open and
+/// the generation of the map it held when it said so (0: none, or an older node).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reported {
+    /// The copies it owes.
+    pub debts: Debts,
+    /// The writes it has open.
+    pub writes: Writes,
+    /// The map generation it held.
+    pub generation: u64,
+}
+
+impl Default for Reported {
+    /// A node that says nothing: everything unknown.
+    fn default() -> Self {
+        Self {
+            debts: Debts::Unknown,
+            writes: Writes::Unknown,
+            generation: 0,
+        }
+    }
+}
+
+impl Reported {
+    /// A report of `debts` alone.
+    #[must_use]
+    pub const fn debts(debts: Debts) -> Self {
+        Self {
+            debts,
+            writes: Writes::Unknown,
+            generation: 0,
+        }
+    }
+
+    /// This report, with the writes `writes` and the map generation `generation`.
+    #[must_use]
+    pub const fn with_writes(self, writes: Writes, generation: u64) -> Self {
+        Self {
+            writes,
+            generation,
+            ..self
+        }
+    }
+}
+
 /// The newest report of a member, and when the store received it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
     /// What it said.
-    pub debts: Debts,
+    pub said: Reported,
     /// The store's clock when the heartbeat carrying it was received.
     pub at: StoreTime,
 }
@@ -112,6 +198,25 @@ pub struct StorageHealth {
     /// there is at least one, and each is `Active` with a fresh, known report. `None`
     /// otherwise. A gate treats `None` as not zero.
     pub under_replicated_blobs: Option<u64>,
+    /// Every registered member, in the order of `members`, with what it reports.
+    pub nodes: Vec<NodeHealth>,
+}
+
+/// One member as an operator sees it: its state, and the debts and open writes it reported
+/// if the report is fresh. `None` is unknown (never reported, silent past the freshness
+/// window, or a node that does not say), never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeHealth {
+    /// The member.
+    pub id: MemberId,
+    /// Its state in the map.
+    pub state: MemberState,
+    /// The copies it owes.
+    pub repair_debts: Option<u64>,
+    /// The writes it has open.
+    pub open_writes: Option<u64>,
+    /// The generation of the map it held when it reported.
+    pub generation: Option<u64>,
 }
 
 /// Why a storage node must not be taken down yet.
@@ -162,6 +267,10 @@ pub fn storage_health(
         unreported: Vec::new(),
         debts_total: 0,
         under_replicated_blobs: None,
+        nodes: members
+            .iter()
+            .map(|m| node_health(m, now, freshness))
+            .collect(),
     };
     for member in members {
         if member.state != MemberState::Active {
@@ -170,7 +279,7 @@ pub fn storage_health(
         }
         health.members_active += 1;
         match member.report {
-            Some(report) if now.since(report.at) <= freshness => match report.debts {
+            Some(report) if now.since(report.at) <= freshness => match report.said.debts {
                 Debts::Known(debts) => {
                     health.debts_total = health.debts_total.saturating_add(debts);
                 }
@@ -185,6 +294,231 @@ pub fn storage_health(
         && health.unreported.is_empty();
     health.under_replicated_blobs = accounted.then_some(health.debts_total);
     health
+}
+
+/// What `member` reported, if it did so within `freshness` of `now`.
+fn fresh(member: &MemberReport, now: StoreTime, freshness: Duration) -> Option<Reported> {
+    member
+        .report
+        .filter(|report| now.since(report.at) <= freshness)
+        .map(|report| report.said)
+}
+
+fn node_health(member: &MemberReport, now: StoreTime, freshness: Duration) -> NodeHealth {
+    let said = fresh(member, now, freshness);
+    NodeHealth {
+        id: member.id,
+        state: member.state,
+        repair_debts: said.and_then(|said| match said.debts {
+            Debts::Known(debts) => Some(debts),
+            Debts::Unknown => None,
+        }),
+        open_writes: said.and_then(|said| match said.writes {
+            Writes::Known(open) => Some(open),
+            Writes::Unknown => None,
+        }),
+        generation: said.map(|said| said.generation),
+    }
+}
+
+/// Why a storage node is not idle yet: not safe to stop without failing a write or losing
+/// the only copy of a blob. Each reason is a [`Class`] a controller acts on: wait, or hold.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NotIdle {
+    /// The node is not a registered member.
+    #[error("member {} is not registered", .member.0)]
+    UnknownNode {
+        /// The node asked about.
+        member: MemberId,
+    },
+    /// The node is the only member: no other copy of its blobs exists.
+    #[error("no other storage member is registered")]
+    NoOtherMembers,
+    /// Another member is not `Active` (joining, catching up, draining or down): it may be
+    /// the only holder of a blob this node's copy is the other of.
+    #[error("member {} not active", .member.0)]
+    OtherMemberNotActive {
+        /// The other member.
+        member: MemberId,
+    },
+    /// Another `Active` member has not reported within the freshness window: it counts as
+    /// down.
+    #[error("member {} silent", .member.0)]
+    OtherMemberStale {
+        /// The other member.
+        member: MemberId,
+    },
+    /// Another `Active` member reported that it does not know what it owes.
+    #[error("member {} does not know what it owes", .member.0)]
+    OtherMemberDebtsUnknown {
+        /// The other member.
+        member: MemberId,
+    },
+    /// Copies are owed somewhere in the farm (the node's own included): its blobs may have
+    /// no second copy yet.
+    #[error("{n} blobs owed")]
+    CopiesOwed {
+        /// The copies owed, summed.
+        n: u64,
+    },
+    /// The node is not `Active`.
+    #[error("member {} is {}, not active", .member.0, .state.name())]
+    NodeNotActive {
+        /// The node.
+        member: MemberId,
+        /// Its state.
+        state: MemberState,
+    },
+    /// The node has not reported within the freshness window.
+    #[error("member {} silent", .member.0)]
+    NodeStale {
+        /// The node.
+        member: MemberId,
+    },
+    /// The node does not know what it owes.
+    #[error("member {} does not know what it owes", .member.0)]
+    DebtsUnknown {
+        /// The node.
+        member: MemberId,
+    },
+    /// The node does not count its open writes.
+    #[error("member {} does not count its open writes", .member.0)]
+    OpenWritesUnknown {
+        /// The node.
+        member: MemberId,
+    },
+    /// The node has writes open.
+    #[error("member {} has {n} open writes", .member.0)]
+    OpenWrites {
+        /// The node.
+        member: MemberId,
+        /// The writes it reported open.
+        n: u64,
+    },
+    /// The node reported from a map older than the one that stopped routing writes to it,
+    /// so a write routed by the old map may have begun after the count.
+    #[error("member {} reported at map {reported}, before map {wanted}", .member.0)]
+    ReportOlderThan {
+        /// The node.
+        member: MemberId,
+        /// The generation it held when it reported.
+        reported: u64,
+        /// The generation the caller needs it to have seen.
+        wanted: u64,
+    },
+    /// The membership could not be read.
+    #[error("membership unreadable: {0}")]
+    Unreadable(String),
+}
+
+/// What a controller does about a [`NotIdle`] reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// It passes by itself: writes end, copies are made, a report arrives. Look again.
+    Wait,
+    /// The farm is not in a state to take a node down: a second member is not `Active` or
+    /// has gone silent, the node is the only one, or the question cannot be answered. Do
+    /// not stop the node; waiting is not the remedy.
+    Held,
+}
+
+impl NotIdle {
+    /// Whether to wait or to hold. Exhaustive: a new reason must be classed here.
+    #[must_use]
+    pub const fn class(&self) -> Class {
+        match self {
+            Self::CopiesOwed { .. }
+            | Self::OpenWrites { .. }
+            | Self::OpenWritesUnknown { .. }
+            | Self::DebtsUnknown { .. }
+            | Self::OtherMemberDebtsUnknown { .. }
+            | Self::NodeStale { .. }
+            | Self::ReportOlderThan { .. } => Class::Wait,
+            Self::UnknownNode { .. }
+            | Self::NoOtherMembers
+            | Self::OtherMemberNotActive { .. }
+            | Self::OtherMemberStale { .. }
+            | Self::NodeNotActive { .. }
+            | Self::Unreadable(_) => Class::Held,
+        }
+    }
+}
+
+/// Why `node` is not idle as of `now`, every reason, the first being the one
+/// [`Members::node_idle`] returns; empty when it is idle. Idle is judged with `node` marked
+/// out: every other member must be `Active`, within `freshness` and knowing its debts, and
+/// no copy may be owed anywhere (the node's own debts included). The node itself must be
+/// `Active`, fresh, knowing its debts and its open writes, with none open, and must have
+/// held a map of at least `at_generation` when it reported: the map that stopped routing
+/// writes to it (0 asks no more than a report). Pure.
+#[must_use]
+pub fn node_idle(
+    members: &[MemberReport],
+    now: StoreTime,
+    freshness: Duration,
+    node: MemberId,
+    at_generation: u64,
+) -> Vec<NotIdle> {
+    let Some(me) = members.iter().find(|m| m.id == node) else {
+        return vec![NotIdle::UnknownNode { member: node }];
+    };
+    let others: Vec<MemberReport> = members.iter().filter(|m| m.id != node).copied().collect();
+    let farm = storage_health(&others, now, freshness);
+    let mut reasons = Vec::new();
+    if others.is_empty() {
+        reasons.push(NotIdle::NoOtherMembers);
+    }
+    reasons.extend(
+        farm.not_active
+            .iter()
+            .map(|&member| NotIdle::OtherMemberNotActive { member }),
+    );
+    reasons.extend(
+        farm.silent
+            .iter()
+            .map(|&member| NotIdle::OtherMemberStale { member }),
+    );
+    reasons.extend(
+        farm.unreported
+            .iter()
+            .map(|&member| NotIdle::OtherMemberDebtsUnknown { member }),
+    );
+    if me.state != MemberState::Active {
+        reasons.push(NotIdle::NodeNotActive {
+            member: node,
+            state: me.state,
+        });
+    }
+    let Some(said) = fresh(me, now, freshness) else {
+        reasons.push(NotIdle::NodeStale { member: node });
+        return reasons;
+    };
+    match said.debts {
+        Debts::Known(own) => {
+            // Known only when the others are all accounted for; the reasons above say so
+            // when they are not.
+            let owed = farm
+                .under_replicated_blobs
+                .map(|others| others.saturating_add(own));
+            if let Some(n @ 1..) = owed {
+                reasons.push(NotIdle::CopiesOwed { n });
+            }
+        }
+        Debts::Unknown => reasons.push(NotIdle::DebtsUnknown { member: node }),
+    }
+    match said.writes {
+        Writes::Known(0) => {}
+        Writes::Known(n) => reasons.push(NotIdle::OpenWrites { member: node, n }),
+        Writes::Unknown => reasons.push(NotIdle::OpenWritesUnknown { member: node }),
+    }
+    if said.generation < at_generation {
+        reasons.push(NotIdle::ReportOlderThan {
+            member: node,
+            reported: said.generation,
+            wanted: at_generation,
+        });
+    }
+    reasons
 }
 
 impl StorageHealth {
@@ -257,6 +591,17 @@ struct View {
     debts_total: u64,
     under_replicated_blobs: Option<u64>,
     reasons: Vec<String>,
+    nodes: Vec<NodeView>,
+}
+
+/// One member in `GET /v1/storage`: `null` is unknown, never zero.
+#[derive(Debug, Serialize)]
+struct NodeView {
+    id: u64,
+    state: &'static str,
+    repair_debts: Option<u64>,
+    open_writes: Option<u64>,
+    generation: Option<u64>,
 }
 
 impl From<&StorageHealth> for View {
@@ -271,6 +616,17 @@ impl From<&StorageHealth> for View {
             debts_total: health.debts_total,
             under_replicated_blobs: health.under_replicated_blobs,
             reasons: health.reasons().iter().map(ToString::to_string).collect(),
+            nodes: health
+                .nodes
+                .iter()
+                .map(|node| NodeView {
+                    id: node.id.0,
+                    state: node.state.name(),
+                    repair_debts: node.repair_debts,
+                    open_writes: node.open_writes,
+                    generation: node.generation,
+                })
+                .collect(),
         }
     }
 }
@@ -304,9 +660,16 @@ const UNDER_REPLICATED_HELP: &str = "Blobs held by one storage member that no se
 const KNOWN_HELP: &str = "1 when the count of under-replicated blobs is known, 0 when it is unknown (a member is \
      not ACTIVE, is silent, or does not know its debts, or the membership cannot be read)";
 
-/// Appends the two families to `out`: `kbf_storage_health_known` always, and
+const MEMBER_DEBTS_HELP: &str = "Copies one storage member owes: the open records of its repair journal. One sample per \
+     member, present only while that member's report is fresh and says it knows";
+const MEMBER_WRITES_HELP: &str = "Writes one storage member has open now (a Write call it is taking in, or an action-cache \
+     commit). One sample per member, present only while that member's report is fresh and \
+     says it counts; absent is unknown, never zero";
+
+/// Appends the families to `out`: `kbf_storage_health_known` always,
 /// `kbf_under_replicated_blobs` only while the number is known (a gauge of 0 for an
-/// unknown number is the lie this exists to prevent).
+/// unknown number is the lie this exists to prevent), and a sample per member of
+/// `kbf_member_repair_debts` and `kbf_member_open_writes` for each value that is known.
 pub fn render(out: &mut String, health: Option<&StorageHealth>) {
     let known = health.and_then(|health| health.under_replicated_blobs);
     if let Some(blobs) = known {
@@ -324,6 +687,43 @@ pub fn render(out: &mut String, health: Option<&StorageHealth>) {
          kbf_storage_health_known {}",
         u8::from(known.is_some())
     );
+    let nodes = health.map_or(&[][..], |health| &health.nodes[..]);
+    member_family(
+        out,
+        "kbf_member_repair_debts",
+        MEMBER_DEBTS_HELP,
+        nodes,
+        |n| n.repair_debts,
+    );
+    member_family(
+        out,
+        "kbf_member_open_writes",
+        MEMBER_WRITES_HELP,
+        nodes,
+        |n| n.open_writes,
+    );
+}
+
+/// One gauge family with a sample for each member that `value` gives a number for; none
+/// at all (not even the header) when no member does.
+fn member_family(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    nodes: &[NodeHealth],
+    value: impl Fn(&NodeHealth) -> Option<u64>,
+) {
+    let samples: Vec<(MemberId, u64)> = nodes
+        .iter()
+        .filter_map(|node| value(node).map(|v| (node.id, v)))
+        .collect();
+    if samples.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
+    for (id, v) in samples {
+        let _ = writeln!(out, "{name}{{member=\"{}\"}} {v}", id.0);
+    }
 }
 
 /// Appends the families for a scrape of `members`; a membership that cannot be read is

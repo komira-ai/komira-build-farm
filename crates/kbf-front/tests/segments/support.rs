@@ -23,6 +23,7 @@ use kbf_proto::worker::{
 };
 use kbf_segments::layout::{encode_footer, footer_len};
 use kbf_segments::{Footer, IndexEntry, SegmentWriter};
+use kbf_storage::service::OpenWrites;
 use kbf_types::{Digest, DigestFunction};
 use tokio::sync::{Notify, Semaphore};
 use tonic::Status;
@@ -346,6 +347,15 @@ impl Front {
 
     /// As [`Front::start`], with the cache's uploads bounded as `writes` says.
     pub async fn start_with(config: SegmentsConfig, writes: WriteConfig) -> Self {
+        Self::start_counted(config, writes, None).await
+    }
+
+    /// As [`Front::start_with`], the service counting its uploads in `open` if given.
+    pub async fn start_counted(
+        config: SegmentsConfig,
+        writes: WriteConfig,
+        open: Option<OpenWrites>,
+    ) -> Self {
         let store = GatedStore::new();
         let meta = MemoryMetaLog::new(Retention::default());
         let cache = Arc::new(
@@ -356,6 +366,10 @@ impl Front {
         );
         let connections = Connections::new();
         let service = SegmentsService::new(Arc::clone(&cache), config, connections.clone());
+        let service = match open {
+            Some(open) => service.with_open_writes(open),
+            None => service,
+        };
         let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = incoming.local_addr().expect("addr");
         let incoming = incoming.map(move |accepted| accepted.map(|s| connections.track(s)));

@@ -216,3 +216,35 @@ fn a_heartbeat_without_the_report_says_it_cannot_say() {
     };
     assert_eq!(blind.encode_to_vec(), [0x08, 1, 0x10, 2]);
 }
+
+// Catches: the open-writes report moved to other field numbers, or colliding with the debts
+// (5, 6) or the map generation and catch-up flag (3, 4). The bytes are pinned: the count on
+// field 7 and the known flag on 8, each a varint, beside every field before them.
+#[test]
+fn the_heartbeat_open_writes_are_fields_seven_and_eight() {
+    let beat = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 2,
+        have_generation: 4,
+        catching_up: true,
+        repair_debts: 3,
+        debts_known: true,
+        open_writes: 5,
+        writes_known: true,
+    };
+    let bytes = [
+        0x08, 1, 0x10, 2, 0x18, 4, 0x20, 1, 0x28, 3, 0x30, 1, 0x38, 5, 0x40, 1,
+    ];
+    assert_eq!(beat.encode_to_vec(), bytes, "fields 1 to 8");
+    assert_eq!(
+        pb::HeartbeatRequest::decode(&bytes[..]).expect("decodes"),
+        beat
+    );
+
+    let older = pb::HeartbeatRequest::decode(&bytes[..12]).expect("decodes");
+    assert!(
+        !older.writes_known,
+        "a node that predates the report cannot say"
+    );
+    assert_eq!(older.open_writes, 0);
+}

@@ -60,7 +60,10 @@ use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Version, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
 
-use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
+use crate::storage_health::{
+    Debts, MemberReport, NotIdle, Report, Reported, StorageHealth, Writes, node_idle,
+    storage_health,
+};
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -232,15 +235,26 @@ struct StoredReport {
     /// The store's clock at receipt, in nanoseconds.
     #[prost(uint64, tag = "3")]
     at_nanos: u64,
+    #[prost(bool, tag = "4")]
+    writes_known: bool,
+    #[prost(uint64, tag = "5")]
+    open_writes: u64,
+    /// The map generation the node held when it reported.
+    #[prost(uint64, tag = "6")]
+    generation: u64,
 }
 
 impl From<&Report> for StoredReport {
     fn from(report: &Report) -> Self {
-        let (known, debts) = report.debts.to_wire();
+        let (known, debts) = report.said.debts.to_wire();
+        let (writes_known, open_writes) = report.said.writes.to_wire();
         Self {
             known,
             debts,
             at_nanos: u64::try_from(report.at.as_duration().as_nanos()).unwrap_or(u64::MAX),
+            writes_known,
+            open_writes,
+            generation: report.said.generation,
         }
     }
 }
@@ -248,7 +262,11 @@ impl From<&Report> for StoredReport {
 impl From<&StoredReport> for Report {
     fn from(stored: &StoredReport) -> Self {
         Self {
-            debts: Debts::from_wire(stored.known, stored.debts),
+            said: Reported {
+                debts: Debts::from_wire(stored.known, stored.debts),
+                writes: Writes::from_wire(stored.writes_known, stored.open_writes),
+                generation: stored.generation,
+            },
             at: StoreTime::from_duration(Duration::from_nanos(stored.at_nanos)),
         }
     }
@@ -375,7 +393,7 @@ fn plan(
 enum Touch {
     /// A heartbeat of this boot, what it reports and what it says it owes: a whole time to
     /// live more, and the debts report replaced.
-    Beat(u64, Progress, Debts),
+    Beat(u64, Progress, Reported),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
 }
@@ -561,9 +579,9 @@ impl Members {
         id: MemberId,
         boot: u64,
         progress: Progress,
-        debts: Debts,
+        said: Reported,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress, debts))? {
+        if self.touch(id, Touch::Beat(boot, progress, said))? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -601,9 +619,9 @@ impl Members {
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_, progress, debts) => {
+                Touch::Beat(_, progress, said) => {
                     live.report = Some(Report {
-                        debts,
+                        said,
                         at: self.store.now(),
                     });
                     if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
@@ -697,6 +715,28 @@ impl Members {
     /// # Errors
     /// The store failing; a stored value not decoding.
     pub fn storage_health(&self) -> Result<StorageHealth, MembershipError> {
+        let (members, now) = self.member_reports()?;
+        Ok(storage_health(&members, now, self.config.freshness()))
+    }
+
+    /// Whether storage node `node` may be stopped now ([`node_idle`]): `at_generation` is
+    /// the map that stopped routing writes to it, which its last report must have seen.
+    ///
+    /// # Errors
+    /// [`NotIdle`] naming the first reason; a membership that cannot be read is one.
+    pub fn node_idle(&self, node: MemberId, at_generation: u64) -> Result<(), NotIdle> {
+        let (members, now) = self
+            .member_reports()
+            .map_err(|e| NotIdle::Unreadable(e.to_string()))?;
+        node_idle(&members, now, self.config.freshness(), node, at_generation)
+            .into_iter()
+            .next()
+            .map_or(Ok(()), Err)
+    }
+
+    /// The members as the judgements read them, and the store's clock after the reads, so
+    /// a report is judged no fresher than the clock then was.
+    fn member_reports(&self) -> Result<(Vec<MemberReport>, StoreTime), MembershipError> {
         let mut members: BTreeMap<MemberId, MemberReport> = BTreeMap::new();
         for member in self.current_map()?.as_ref().map_or(&[][..], Map::members) {
             members.insert(
@@ -718,10 +758,8 @@ impl Members {
                 },
             );
         }
-        // After the reads, so a report is judged no fresher than the clock then was.
         let now = self.store.now();
-        let members: Vec<MemberReport> = members.into_values().collect();
-        Ok(storage_health(&members, now, self.config.freshness()))
+        Ok((members.into_values().collect(), now))
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {
