@@ -32,6 +32,8 @@ use tonic::{Code, Status};
 
 #[path = "state_store/fate.rs"]
 mod fate;
+#[path = "state_store/floors.rs"]
+mod floors;
 #[path = "state_store/handover.rs"]
 mod handover;
 
@@ -276,6 +278,11 @@ impl Disk {
     /// process started over the file does ([`kbf_state::Fenced`]): once another farm takes
     /// the next one, every write of this farm fails and none lands.
     fn generation_farm(&self) -> TestFarm {
+        self.generation_farm_bounded(kbf_sched::MEMORY_FLOORS)
+    }
+
+    /// [`Disk::generation_farm`], keeping at most `bound` memory floors.
+    fn generation_farm_bounded(&self, bound: usize) -> TestFarm {
         let store: Arc<dyn Store> = self.store.clone();
         let fenced = Fenced::take(store, None).expect("the next generation");
         Farm::new(
@@ -283,6 +290,7 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
+        .with_memory_floors(bound)
         .with_state(Some(StateStore {
             store: Arc::new(fenced),
             epoch: EpochPolicy::Keep,

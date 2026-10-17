@@ -47,8 +47,8 @@ use kbf_proto::worker::{
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, Input, LOSS_REQUEUES, MemoryLadder, OpState,
-    Requeue, Scheduler,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, FloorChange, Input, LOSS_REQUEUES,
+    MemoryLadder, OpState, Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
@@ -220,7 +220,7 @@ struct State {
     /// Until it has, it still holds the lease and no queue row for the operation, so
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
-    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>)>,
+    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>, FloorChange)>,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
     /// When each node's session row in the state store was last written.
@@ -302,6 +302,17 @@ impl Farm {
     pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.sched.set_memory_ladder(ladder);
+        self
+    }
+
+    /// This farm, keeping at most `bound` memory floors (instead of
+    /// [`kbf_sched::MEMORY_FLOORS`]); past that, the one raised longest ago is forgotten
+    /// first. Set before the farm takes a state store over.
+    #[must_use]
+    pub fn with_memory_floors(mut self, bound: usize) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.sched = std::mem::replace(&mut state.sched, Scheduler::new(self.term))
+            .with_memory_floors(bound);
         self
     }
 

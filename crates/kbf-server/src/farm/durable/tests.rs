@@ -183,6 +183,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 losses: 0,
                 fate: None,
             }],
+            floors: Vec::new(),
             cordons: Vec::new(),
         }
     );
@@ -248,7 +249,7 @@ fn a_stale_complete_is_rejected() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("first grant");
     durable
-        .requeued(&requeue(4, 0), None, None)
+        .requeued(&requeue(4, 0), None, None, &FloorChange::default())
         .expect("given up");
     durable
         .persist(&[Effect::Start(start(4, 1))])
@@ -294,13 +295,13 @@ fn a_given_up_lease_requeues_its_operation_once() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 0), None, None)
+        .requeued(&requeue(4, 0), None, None, &FloorChange::default())
         .expect("given up");
     let stored = durable.load().expect("load");
     assert_eq!(stored.operations[0].lease, None);
     assert!(keys(&store).contains(&"queue/0000000000000004".to_owned()));
     durable
-        .requeued(&requeue(4, 0), None, None)
+        .requeued(&requeue(4, 0), None, None, &FloorChange::default())
         .expect("again, nothing changes");
     let again = durable.load().expect("load");
     assert_eq!(again, stored);
@@ -312,7 +313,7 @@ fn a_given_up_lease_requeues_its_operation_once() {
         })])
         .expect("refused");
     durable
-        .requeued(&requeue(4, 0), None, None)
+        .requeued(&requeue(4, 0), None, None, &FloorChange::default())
         .expect("a finished operation has nothing to put back");
     assert!(!keys(&store).iter().any(|k| k.starts_with("queue/")));
 }
@@ -368,14 +369,14 @@ fn a_loss_count_lives_with_its_operation() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 0), Some(2), None)
+        .requeued(&requeue(4, 0), Some(2), None, &FloorChange::default())
         .expect("a lost lease");
     assert_eq!(durable.load().expect("load").operations[0].losses, 2);
     durable
         .persist(&[Effect::Start(start(4, 1))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 1), None, None)
+        .requeued(&requeue(4, 1), None, None, &FloorChange::default())
         .expect("not a lost lease");
     assert_eq!(durable.load().expect("load").operations[0].losses, 2);
     durable
@@ -399,7 +400,7 @@ fn a_refusal_removes_the_loss_count() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 0), Some(3), None)
+        .requeued(&requeue(4, 0), Some(3), None, &FloorChange::default())
         .expect("a lost lease");
     let refusal = Refusal {
         operation: OperationId(4),
@@ -776,7 +777,12 @@ fn a_fate_lives_and_dies_with_its_operation() {
             .persist(&[Effect::Start(start(operation, 0))])
             .expect("grant");
         durable
-            .requeued(&killed(operation, 0), None, Some(&a_fate()))
+            .requeued(
+                &killed(operation, 0),
+                None,
+                Some(&a_fate()),
+                &FloorChange::default(),
+            )
             .expect("a kill");
     }
     let stored = durable.load().expect("load");
@@ -837,6 +843,233 @@ fn a_fate_row_that_is_not_one_is_refused() {
     }
 }
 
+fn key_of(tag: u8) -> ActionKey {
+    request(tag).key
+}
+
+fn a_floor(tag: u8, stamp: u64) -> Floor {
+    Floor {
+        key: key_of(tag),
+        ask: 16 << 30,
+        stamp,
+    }
+}
+
+fn raising(tag: u8, stamp: u64, evicted: &[u8]) -> FloorChange {
+    FloorChange {
+        raised: Some(a_floor(tag, stamp)),
+        evicted: evicted.iter().map(|tag| key_of(*tag)).collect(),
+    }
+}
+
+fn floor_rows(store: &Flaky) -> usize {
+    keys(store)
+        .iter()
+        .filter(|k| k.starts_with("floor/"))
+        .count()
+}
+
+/// Catches: a floor written apart from the requeue that raised it, one that is not loaded
+/// back whole (ask, stamp, key), a raise of the same action that adds a second row, an
+/// evicted floor whose row stays, and a floor that ends with the operation that raised it
+/// (finishing or refusing it). Several floors load in key order.
+#[test]
+fn a_floor_is_written_with_the_requeue_and_outlives_its_operation() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    for tag in [1, 2] {
+        let operation = u64::from(tag);
+        durable
+            .submitted(OperationId(operation), &request(tag))
+            .expect("submit");
+        durable
+            .persist(&[Effect::Start(start(operation, operation * 10))])
+            .expect("grant");
+    }
+    durable
+        .requeued(&killed(1, 10), None, None, &raising(1, 0, &[]))
+        .expect("a kill");
+    assert_eq!(durable.load().expect("load").floors, vec![a_floor(1, 0)]);
+    assert!(keys(&store).contains(&"queue/0000000000000001".to_owned()));
+
+    // Raised again under a later stamp: the same row. A second action: a second row.
+    durable
+        .persist(&[Effect::Start(start(1, 11))])
+        .expect("grant");
+    durable
+        .requeued(&killed(1, 11), None, None, &raising(1, 2, &[]))
+        .expect("a kill");
+    durable
+        .requeued(&killed(2, 20), None, None, &raising(2, 3, &[]))
+        .expect("a kill");
+    assert_eq!(
+        durable.load().expect("load").floors,
+        vec![a_floor(1, 2), a_floor(2, 3)]
+    );
+
+    // Action 3's raise forgets action 1 in the same write.
+    durable
+        .requeued(&killed(2, 20), None, None, &raising(3, 4, &[1]))
+        .expect("a kill");
+    let floors = durable.load().expect("load").floors;
+    assert_eq!(floors, vec![a_floor(2, 3), a_floor(3, 4)]);
+
+    // Neither ending an operation nor refusing it takes a floor.
+    durable
+        .persist(&[Effect::Refuse(Refusal {
+            operation: OperationId(2),
+            waiters: Vec::new(),
+            reason: "no worker".to_owned(),
+        })])
+        .expect("refused");
+    durable
+        .persist(&[Effect::Start(start(1, 12))])
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(1, 12))])
+        .expect("finished");
+    assert_eq!(floor_rows(&store), 2);
+}
+
+/// Catches: a floor lost because its operation ended before the requeue was written (the
+/// write returns early, as it does for a finished operation), and a delete of a forgotten
+/// floor lost the same way. A forgotten key that is raised again in the same change keeps
+/// its row (a delete after the put would take it).
+#[test]
+fn a_floor_is_written_though_its_operation_has_ended() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .requeued(&killed(7, 0), None, None, &raising(1, 0, &[]))
+        .expect("an operation that is gone");
+    assert_eq!(floor_rows(&store), 1);
+    assert!(!keys(&store).iter().any(|k| k.starts_with("queue/")));
+
+    durable
+        .requeued(&killed(7, 0), None, None, &raising(2, 1, &[1]))
+        .expect("an operation that is gone");
+    assert_eq!(durable.load().expect("load").floors, vec![a_floor(2, 1)]);
+
+    durable
+        .requeued(&killed(7, 0), None, None, &raising(2, 2, &[2]))
+        .expect("forgotten and raised again");
+    assert_eq!(durable.load().expect("load").floors, vec![a_floor(2, 2)]);
+
+    durable
+        .requeued(&requeue(7, 0), None, None, &FloorChange::default())
+        .expect("nothing to write");
+    assert_eq!(floor_rows(&store), 1);
+
+    let evicted_only = FloorChange {
+        raised: None,
+        evicted: vec![key_of(2)],
+    };
+    durable
+        .requeued(&killed(7, 0), None, None, &evicted_only)
+        .expect("a forgotten floor");
+    assert_eq!(floor_rows(&store), 0);
+}
+
+/// Catches: a floor row read as anything but what was written: another version, a row cut
+/// short at each field, an instance or digest that is not text, a digest that is not one;
+/// two actions (or an instance with a `/` in it) sharing a key; and an instance name too
+/// long to write.
+#[test]
+fn a_floor_row_that_is_not_one_is_refused() {
+    let floor = a_floor(1, 5);
+    let row = floor::encode(&floor).expect("encodes");
+    assert_eq!(floor::decode(&row), Ok(floor.clone()));
+    let mut other = row.clone();
+    other[0] = 2;
+    let mut instance = row.clone();
+    instance[19] = 0xff;
+    let mut digest = row.clone();
+    *digest.last_mut().expect("a row") = 0xff;
+    let mut not_digest = row.clone();
+    not_digest.pop();
+    not_digest.push(b'x');
+    for (bad, why) in [
+        (other, "not a version 1 floor"),
+        (Vec::new(), "the row ends early"),
+        (row[..8].to_vec(), "the row ends early"),
+        (row[..17].to_vec(), "the row ends early"),
+        (row[..18].to_vec(), "the row ends early"),
+        (row[..20].to_vec(), "the row ends early"),
+        (instance, "an instance name is not text"),
+        (digest, "a digest is not text"),
+        (not_digest, "not a digest"),
+    ] {
+        assert_eq!(floor::decode(&bad), Err(why));
+    }
+
+    let slashed = ActionKey {
+        instance: "a/b".to_owned(),
+        ..key_of(1)
+    };
+    let split = ActionKey {
+        instance: "a".to_owned(),
+        ..key_of(1)
+    };
+    assert_ne!(floor::row_key(&slashed), floor::row_key(&split));
+    assert_ne!(floor::row_key(&key_of(1)), floor::row_key(&key_of(2)));
+    assert!(floor::row_key(&key_of(1)).starts_with("floor/"));
+
+    let long = Floor {
+        key: ActionKey {
+            instance: "i".repeat(usize::from(u16::MAX) + 1),
+            ..key_of(1)
+        },
+        ..floor
+    };
+    assert_eq!(floor::encode(&long), None);
+    let store = Flaky::new();
+    let durable = open(&store);
+    let change = FloorChange {
+        raised: Some(long),
+        evicted: Vec::new(),
+    };
+    let error = durable
+        .requeued(&killed(1, 0), None, None, &change)
+        .expect_err("too large");
+    assert!(error.to_string().contains("too large"), "{error}");
+}
+
+/// Catches: a floor store the farm loads on trust. A row whose key is not the key of the
+/// floor in it (a copied or edited row would floor another action), two floors with one
+/// stamp (the eviction order is undefined), and a row that is not a floor are refused
+/// naming the row.
+#[test]
+fn a_floor_store_that_contradicts_itself_is_refused() {
+    let good = floor::encode(&a_floor(1, 5)).expect("encodes");
+    let same = floor::encode(&a_floor(2, 5)).expect("encodes");
+    let cases = [
+        (
+            vec![(floor::row_key(&key_of(2)), good.clone())],
+            "not the key of the floor it holds",
+        ),
+        (
+            vec![
+                (floor::row_key(&key_of(1)), good.clone()),
+                (floor::row_key(&key_of(2)), same),
+            ],
+            "a stamp another floor has",
+        ),
+        (
+            vec![(floor::row_key(&key_of(1)), vec![9])],
+            "not a version 1 floor",
+        ),
+    ];
+    for (rows, why) in cases {
+        let store = Flaky::new();
+        let durable = open(&store);
+        for (key, value) in rows {
+            put(&store, &key, value);
+        }
+        let text = durable.load().expect_err(why).to_string();
+        assert!(text.contains("floor/") && text.contains(why), "{text}");
+    }
+}
+
 /// Catches: a fate row with a worker name that is not text accepted, a fate too large to
 /// write encoded anyway (a truncated length), a requeue whose fate cannot be written
 /// reported as success, and a load that skips a fate row it cannot read instead of
@@ -861,7 +1094,7 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
     let error = durable
-        .requeued(&killed(4, 0), None, Some(&huge))
+        .requeued(&killed(4, 0), None, Some(&huge), &FloorChange::default())
         .expect_err("too large");
     assert!(error.to_string().contains("fate/0000000000000004"));
     assert!(

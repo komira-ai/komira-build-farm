@@ -35,9 +35,12 @@
 //! the farm's alone, leases given up for not starting [`NOT_STARTED_RERUNS`] alone, and
 //! reconnections neither.
 //!
-//! The floors live in this scheduler alone: a server restart forgets them, which costs
-//! one more killed run per key, never a wrong answer. At most [`MEMORY_FLOORS`] are kept;
-//! past that the one raised longest ago is forgotten first. A floor never falls.
+//! The floors live in this scheduler; a caller with a state store writes each raise down
+//! with the requeue that follows it, forgets the evicted ones in the same write
+//! ([`Scheduler::take_floor_change`]) and gives them back to its successor
+//! ([`Scheduler::restore_floors`]). One without a store loses them at a restart, which
+//! costs one more killed run per key, never a wrong answer. At most [`MEMORY_FLOORS`] are
+//! kept; past that the one raised longest ago is forgotten first. A floor never falls.
 //!
 //! **One value.** Everything this module keeps (the floors and the order they were
 //! raised in, each held operation's memory runs, each node's busy-node kills) is one
@@ -246,13 +249,28 @@ struct OpKills {
 
 /// The memory floors by action key, each with the order it was raised in, and the keys
 /// in that order, so the oldest is forgotten first once there are too many.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `evicted` holds the keys forgotten since the caller last took them
+/// ([`Scheduler::take_floor_change`]), for the state store to forget too. It is
+/// bookkeeping for that write and takes no part in equality.
+#[derive(Clone, Debug)]
 struct Floors {
     asks: BTreeMap<ActionKey, (u64, u64)>,
     order: BTreeMap<u64, ActionKey>,
     next: u64,
     bound: usize,
+    evicted: Vec<ActionKey>,
 }
+
+impl PartialEq for Floors {
+    fn eq(&self, other: &Self) -> bool {
+        // `order` is `asks` read the other way round (each stamp to its key), so it
+        // is equal whenever `asks` is and takes no part here.
+        self.asks == other.asks && self.next == other.next && self.bound == other.bound
+    }
+}
+
+impl Eq for Floors {}
 
 impl Floors {
     const fn new(bound: usize) -> Self {
@@ -261,11 +279,21 @@ impl Floors {
             order: BTreeMap::new(),
             next: 0,
             bound,
+            evicted: Vec::new(),
         }
     }
 
     fn get(&self, key: &ActionKey) -> Option<u64> {
         self.asks.get(key).map(|&(ask, _)| ask)
+    }
+
+    /// `key`'s floor with the stamp it was raised under.
+    fn row(&self, key: &ActionKey) -> Option<Floor> {
+        self.asks.get(key).map(|&(ask, stamp)| Floor {
+            key: key.clone(),
+            ask,
+            stamp,
+        })
     }
 
     /// Raises `key`'s floor to `ask` (it never falls), and makes it the newest.
@@ -278,11 +306,51 @@ impl Floors {
         });
         self.asks.insert(key.clone(), (before.max(ask), stamp));
         self.order.insert(stamp, key.clone());
+        self.evict();
+    }
+
+    /// Forgets the floors raised longest ago until no more than the bound remain.
+    fn evict(&mut self) {
         while self.asks.len() > self.bound {
             let (_, oldest) = self.order.pop_first().expect("every floor is in the order");
             self.asks.remove(&oldest);
+            self.evicted.push(oldest);
         }
     }
+
+    /// Takes up `floors` (empty so far, with stamps no two alike) in the order their
+    /// stamps give, and raises later floors past the largest stamp.
+    fn restore(&mut self, floors: Vec<Floor>) {
+        for Floor { key, ask, stamp } in floors {
+            self.asks.insert(key.clone(), (ask, stamp));
+            self.order.insert(stamp, key);
+            self.next = self.next.max(stamp.saturating_add(1));
+        }
+        self.evict();
+    }
+}
+
+/// One memory floor as the state store keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Floor {
+    /// The action it floors.
+    pub key: ActionKey,
+    /// The least memory a submission of `key` books, in bytes.
+    pub ask: u64,
+    /// When it was raised, among the floors: a larger stamp is a later raise. Equal for
+    /// no two floors.
+    pub stamp: u64,
+}
+
+/// What a memory kill changed in the scheduler's floors, to write down with the requeue
+/// that follows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FloorChange {
+    /// The floor the kill raised, as it stands now; `None` when the kill raised none (or a
+    /// later raise has already forgotten it).
+    pub raised: Option<Floor>,
+    /// The keys forgotten since the last change was taken, to forget in the store too.
+    pub evicted: Vec<ActionKey>,
 }
 
 impl Scheduler {
@@ -306,6 +374,28 @@ impl Scheduler {
     #[must_use]
     pub fn memory_floor(&self, key: &ActionKey) -> Option<u64> {
         self.memory.floors.get(key)
+    }
+
+    /// The floor change `operation`'s newest requeue made, to write down for a successor:
+    /// the floor of its action as it stands, and every floor forgotten since the last
+    /// call (the caller owns those now). Empty for an operation the scheduler no longer
+    /// holds.
+    pub fn take_floor_change(&mut self, operation: OperationId) -> FloorChange {
+        let raised = self
+            .ops
+            .get(&operation)
+            .and_then(|op| self.memory.floors.row(&op.request.key));
+        FloorChange {
+            raised,
+            evicted: std::mem::take(&mut self.memory.floors.evicted),
+        }
+    }
+
+    /// Takes up the floors a predecessor wrote down, in an empty scheduler: before
+    /// [`Scheduler::recover`]. Past the bound, the ones raised longest ago are forgotten
+    /// (and reported by [`Scheduler::take_floor_change`]).
+    pub fn restore_floors(&mut self, floors: Vec<Floor>) {
+        self.memory.floors.restore(floors);
     }
 
     /// The runs of `operation` killed for memory, oldest first; `None` once the
@@ -526,6 +616,74 @@ mod tests {
         assert_eq!(floors.get(&key(3)), Some(GIB));
         assert_eq!(floors.asks.len(), 2);
         assert_eq!(floors.order.len(), 2);
+    }
+
+    /// Catches: floors taken back in the order of their keys (or of their asks) instead
+    /// of their stamps, a new raise that does not outrank a stamp the store gave (the next
+    /// eviction would take the wrong floor), a bound lower than the store held not
+    /// applied (and its forgotten keys not reported), and the pending report of forgotten
+    /// keys left in equality (two schedulers with the same floors would differ).
+    #[test]
+    fn restored_floors_keep_their_order_and_the_bound() {
+        let floor = |n, ask, stamp| Floor {
+            key: key(n),
+            ask: ask * GIB,
+            stamp,
+        };
+        // Stamps 30, 10, 20 for keys 1, 2, 3.
+        let stored = vec![floor(1, 4, 30), floor(2, 8, 10), floor(3, 16, 20)];
+        let mut floors = Floors::new(3);
+        floors.restore(stored.clone());
+        assert_eq!(floors.row(&key(2)), Some(floor(2, 8, 10)));
+        assert_eq!(floors.row(&key(9)), None);
+        assert_eq!(
+            floors.order.keys().copied().collect::<Vec<_>>(),
+            [10, 20, 30]
+        );
+        floors.raise(&key(4), GIB);
+        assert_eq!(floors.get(&key(2)), None, "the oldest stamp goes first");
+        assert_eq!(floors.row(&key(4)).map(|f| f.stamp), Some(31));
+        assert_eq!(floors.evicted, vec![key(2)]);
+
+        let mut small = Floors::new(1);
+        small.restore(stored);
+        assert_eq!(small.get(&key(1)), Some(4 * GIB), "the newest stamp stays");
+        assert_eq!(small.asks.len(), 1);
+        assert_eq!(small.evicted, vec![key(2), key(3)]);
+
+        let mut a = Floors::new(2);
+        a.raise(&key(1), GIB);
+        let mut b = a.clone();
+        b.raise(&key(2), GIB);
+        b.raise(&key(3), GIB);
+        b.evicted.clear();
+        let mut c = b.clone();
+        assert_eq!(b, c);
+        c.evicted.push(key(7));
+        assert_eq!(b, c, "the report of forgotten keys is not state");
+    }
+
+    /// Catches: equality that ignores the next stamp (two schedulers that rank the next
+    /// raise differently called equal) or the bound (two that forget at different sizes
+    /// called equal), when the floors match.
+    #[test]
+    fn floors_with_the_same_rows_differ_in_the_next_stamp_or_the_bound() {
+        let mut a = Floors::new(4);
+        a.raise(&key(1), GIB);
+        let same = a.clone();
+        assert_eq!(a, same);
+
+        let mut later = a.clone();
+        later.next += 1;
+        assert_eq!(later.asks, a.asks);
+        assert_eq!(later.order, a.order);
+        assert_ne!(a, later, "the next stamp is state");
+
+        let mut wider = a.clone();
+        wider.bound += 1;
+        assert_eq!(wider.asks, a.asks);
+        assert_eq!(wider.order, a.order);
+        assert_ne!(a, wider, "the bound is state");
     }
 
     /// A scheduler fed one input at a time at farm time `now`, every commit fed

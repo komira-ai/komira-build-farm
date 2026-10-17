@@ -23,6 +23,13 @@
 //!   successor (after a handover or a crash) books the next rung instead of starting the
 //!   ladder over. A store with no row for an operation books and counts as it did before
 //!   the row existed;
+//! - `floor/<instance>/<action>`: a memory floor, the least memory a fresh submission of
+//!   the action books ([`kbf_sched::Floor`]): the ask and a stamp that orders the raises,
+//!   written in the transaction of the requeue that raises it, deleted in the one that
+//!   forgets it (the scheduler keeps [`kbf_sched::MEMORY_FLOORS`]), and not deleted with
+//!   an operation. A successor loads them all, oldest stamp first, and raises past the
+//!   largest stamp, so the order of eviction survives a reload. They have no expiry;
+//!   in memory they have none either;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
 //!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
@@ -45,7 +52,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kbf_front::{Described, Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
-use kbf_sched::{DaemonInstance, Fate, Recovered, RecoveredLease, Request, Requeue};
+use kbf_sched::{
+    DaemonInstance, Fate, Floor, FloorChange, Recovered, RecoveredLease, Request, Requeue,
+    RequeueReason,
+};
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
     ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
@@ -70,6 +80,7 @@ const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
 const FATE: &str = "fate/";
+const FLOOR: &str = "floor/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
@@ -129,6 +140,8 @@ pub(super) struct Stored {
     pub next_seq: u64,
     /// Every unfinished operation, in id order.
     pub operations: Vec<StoredOperation>,
+    /// Every memory floor, in key order.
+    pub floors: Vec<Floor>,
     /// Every node an operator placed, in node-id order.
     pub cordons: Vec<(WorkerId, StoredCordon)>,
 }
@@ -222,6 +235,7 @@ impl StoredOperation {
 }
 
 mod fate;
+mod floor;
 
 /// The scheduler's handle on its state store.
 pub(super) struct Durable {
@@ -371,6 +385,18 @@ impl Durable {
             let fate = fate::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             fates.insert(operation, fate);
         }
+        let mut floors = Vec::new();
+        let mut stamps = std::collections::BTreeSet::new();
+        for (key, row) in self.store.scan_prefix(FLOOR)? {
+            let floor = floor::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            if key != floor::row_key(&floor.key) {
+                return Err(corrupt(&key, "not the key of the floor it holds"));
+            }
+            if !stamps.insert(floor.stamp) {
+                return Err(corrupt(&key, "a stamp another floor has"));
+            }
+            floors.push(floor);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
             let FarmInput::Submit(request) = decode(&key, &row.value)? else {
@@ -390,6 +416,7 @@ impl Durable {
             next_operation: self.counter(NEXT_OP)?,
             next_seq: self.counter(NEXT_SEQ)?,
             operations,
+            floors,
             cordons: self.cordons()?,
         })
     }
@@ -484,12 +511,34 @@ impl Durable {
         requeue: &Requeue,
         losses: Option<u32>,
         fate: Option<&Fate>,
+        floors: &FloorChange,
     ) -> Result<(), StateError> {
+        let mut txn = Txn::new();
+        // The floor outlives the operation: a kill raises it, and the operation may end
+        // before the write is taken.
+        let raised = floors.raised.as_ref();
+        if let Some(floor) = raised {
+            let row = floor::encode(floor).ok_or_else(|| {
+                corrupt(&floor::row_key(&floor.key), "a floor is too large to write")
+            })?;
+            txn = txn.put(floor::row_key(&floor.key), row, Cond::Any);
+        }
+        // A key forgotten and raised again since keeps its row.
+        for key in floors
+            .evicted
+            .iter()
+            .filter(|k| raised.is_none_or(|f| &f.key != *k))
+        {
+            txn = txn.delete(floor::row_key(key), Cond::Any);
+        }
         if self.store.get(&op_key(requeue.operation))?.is_none() {
-            return Ok(());
+            return if raised.is_some() || !floors.evicted.is_empty() {
+                self.commit(txn)
+            } else {
+                Ok(())
+            };
         }
         let key = lease_key(requeue.lease);
-        let mut txn = Txn::new();
         if let Some(row) = self.store.get(&key)? {
             txn = txn.delete(key, Cond::Version(row.version));
         }
@@ -743,13 +792,22 @@ impl State {
             } else {
                 None
             };
-            self.unsettled.push((requeue.clone(), losses, fate));
+            // Only a kill past the action's own limit raises a floor, and only a raise
+            // forgets one.
+            let floors = if matches!(requeue.reason, RequeueReason::OutOfMemory { .. }) {
+                self.sched.take_floor_change(requeue.operation)
+            } else {
+                FloorChange::default()
+            };
+            self.unsettled.push((requeue.clone(), losses, fate, floors));
         }
         let pending = std::mem::take(&mut self.unsettled);
         let refused: Vec<_> = pending
             .into_iter()
-            .filter(|(requeue, losses, fate)| {
-                !self.durably("a requeue", |d| d.requeued(requeue, *losses, fate.as_ref()))
+            .filter(|(requeue, losses, fate, floors)| {
+                !self.durably("a requeue", |d| {
+                    d.requeued(requeue, *losses, fate.as_ref(), floors)
+                })
             })
             .collect();
         self.unsettled = refused;
@@ -814,6 +872,7 @@ impl State {
             recovered.push(op.recovered(waiter));
         }
         let next_operation = OperationId(stored.next_operation);
+        self.sched.restore_floors(stored.floors);
         self.sched
             .recover(epoch, next_operation, stored.next_seq, recovered);
         self.restore_cordons(stored.cordons);

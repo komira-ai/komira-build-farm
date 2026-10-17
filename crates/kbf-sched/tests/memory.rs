@@ -6,8 +6,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Event, FARM_RERUNS, Input, MemoryLadder, OpState, Request, Requeue,
-    RequeueReason, Scheduler,
+    DaemonInstance, Event, FARM_RERUNS, Floor, FloorChange, Input, MemoryLadder, OpState, Request,
+    Requeue, RequeueReason, Scheduler,
 };
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
@@ -670,4 +670,57 @@ fn floors_are_bounded() {
     assert_eq!(f.s.memory_floor(&key(2)), Some(4 * GIB));
     f.submit(3, request(1, GIB));
     assert_eq!(f.start().resources.memory_bytes, GIB);
+}
+
+/// Catches a floor change that names the wrong floor or the wrong stamp, forgotten keys
+/// not handed over once (a key deleted from the store twice, or never), a change for an
+/// operation the scheduler no longer holds that loses the forgotten keys, and floors
+/// given back to a scheduler that do not floor a fresh submission.
+#[test]
+fn a_floor_change_names_the_raise_and_the_forgotten_keys_once() {
+    let mut f = Farm::new();
+    f.s = Scheduler::new(1).with_memory_floors(1);
+    f.node("a", 16, linux());
+    let mut ops = Vec::new();
+    for n in 1..=2 {
+        f.submit(u64::from(n), request(n, GIB));
+        let start = f.start();
+        ops.push(start.operation);
+        let next = f.killed(&start, OOM);
+        f.finishes(&next, ok());
+    }
+    let first = f.s.take_floor_change(ops[0]);
+    // Both kills happened before the first call: key 1 was forgotten, so the change for
+    // its operation raises nothing, and reports the forgotten key.
+    assert_eq!(first.raised, None);
+    assert_eq!(first.evicted, vec![key(1)]);
+    let second = f.s.take_floor_change(ops[1]);
+    assert_eq!(
+        second.raised,
+        Some(Floor {
+            key: key(2),
+            ask: 4 * GIB,
+            stamp: 1
+        })
+    );
+    assert_eq!(second.evicted, vec![]);
+    assert_eq!(
+        f.s.take_floor_change(OperationId(99)),
+        FloorChange::default()
+    );
+
+    let mut successor = Scheduler::new(2).with_memory_floors(1);
+    successor.restore_floors(vec![
+        Floor {
+            key: key(1),
+            ask: 4 * GIB,
+            stamp: 0,
+        },
+        second.raised.expect("raised"),
+    ]);
+    assert_eq!(successor.memory_floor(&key(1)), None, "the bound");
+    assert_eq!(successor.memory_floor(&key(2)), Some(4 * GIB));
+    let forgotten = successor.take_floor_change(OperationId(99));
+    assert_eq!(forgotten.evicted, vec![key(1)]);
+    assert_eq!(forgotten.raised, None);
 }

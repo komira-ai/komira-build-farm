@@ -10,7 +10,7 @@ use kbf_server::farm::NodeAction;
 use super::*;
 
 /// A node with room for the whole ladder (64 GiB), so a kill at 4 GiB is raised to 16.
-fn register_big(farm: &TestFarm) -> (StreamId, Inbox) {
+pub(super) fn register_big(farm: &TestFarm) -> (StreamId, Inbox) {
     let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
@@ -28,7 +28,7 @@ fn register_big(farm: &TestFarm) -> (StreamId, Inbox) {
 }
 
 /// The leases of the `Start`s waiting in `inbox`, each with the memory it books.
-fn booked(inbox: &mut Inbox) -> Vec<(LeaseId, u64)> {
+pub(super) fn booked(inbox: &mut Inbox) -> Vec<(LeaseId, u64)> {
     let mut starts = Vec::new();
     while let Ok(message) = inbox.try_recv() {
         if let Some(Message::Start(start)) = message.expect("no error").message {
@@ -40,7 +40,7 @@ fn booked(inbox: &mut Inbox) -> Vec<(LeaseId, u64)> {
 }
 
 /// A result of `lease`: killed for passing its own memory limit.
-fn out_of_memory(lease: LeaseId) -> worker::Result {
+pub(super) fn out_of_memory(lease: LeaseId) -> worker::Result {
     worker::Result {
         status: Some(rpc::Status {
             code: Code::ResourceExhausted as i32,
