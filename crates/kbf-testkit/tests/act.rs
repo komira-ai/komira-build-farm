@@ -178,6 +178,37 @@ fn paths_are_renamed_linked_and_chmodded() {
     assert_eq!(mode & 0o7777, 0o640, "{mode:o}");
 }
 
+/// Catches: `sleep-once` sleeping on every run (a fake that must stall one call and
+/// then answer would stall them all), not sleeping on the first, or leaving no flag
+/// behind; and a flag it cannot make passing as a sleep that happened.
+#[test]
+fn sleep_once_sleeps_only_in_the_first_run() {
+    let dir = dir("act-sleep-once");
+    let flag = dir.join("flag").display().to_string();
+    let started = Instant::now();
+    let out = output(&["sleep-once", &flag, "0.4", ";", "echo", "first"]);
+    assert_eq!(text(&out.stdout), "first\n", "{out:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(Path::new(&flag).exists(), "the flag is made");
+
+    let started = Instant::now();
+    let out = output(&["sleep-once", &flag, "30", ";", "echo", "second"]);
+    assert_eq!(text(&out.stdout), "second\n", "{out:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let nowhere = dir.join("no/dir/flag").display().to_string();
+    let out = output(&["sleep-once", &nowhere, "30"]);
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
+}
+
 /// Catches: `wait-for` returning before the path exists (a test gated on it would go
 /// on at once), waiting on although it is there, or never giving up (a red run of a
 /// test gated on it would hang instead of failing).

@@ -6,6 +6,9 @@
 //! The steps:
 //! - `exit CODE`: exits with status `CODE` (0 to 255) at once;
 //! - `sleep SECS`: sleeps `SECS` seconds, fractions allowed;
+//! - `sleep-once FLAG SECS`: makes the file `FLAG`, and sleeps `SECS` seconds only if
+//!   it was not there (the first run to reach it sleeps; later runs go on at once);
+//!   fails if `FLAG` cannot be made;
 //! - `echo [--stderr] WORDS...`: prints the words, joined by spaces, and a newline on
 //!   stdout (on stderr with `--stderr`);
 //! - `append FILE WORDS...`: appends the words, joined by spaces, and a newline to
@@ -184,6 +187,10 @@ pub(crate) enum Step<'a> {
         path: &'a str,
         within: Duration,
     },
+    SleepOnce {
+        flag: &'a str,
+        time: Duration,
+    },
     Mkdir(&'a str),
     Cat(&'a str),
     Mtime {
@@ -301,6 +308,10 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
                 .filter(|m| *m <= 0o7777)
                 .ok_or_else(|| Error::Usage(format!("{mode:?} is not an octal mode")))?,
             path,
+        },
+        ["sleep-once", flag, secs] => Step::SleepOnce {
+            flag,
+            time: seconds(secs)?,
         },
         ["wait-for", path, secs] => Step::WaitFor {
             path,
@@ -469,6 +480,17 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                     .map_err(failed(format!("chmod {path}")))?;
             }
             Step::WaitFor { path, within } => wait_for(path, *within)?,
+            Step::SleepOnce { flag, time } => {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(flag)
+                {
+                    Ok(_) => std::thread::sleep(*time),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(failed(format!("sleep-once {flag}"))(e)),
+                }
+            }
             Step::Mkdir(path) => {
                 std::fs::create_dir_all(path).map_err(failed(format!("mkdir {path}")))?;
             }
@@ -658,7 +680,7 @@ mod tests {
              env B dflt ; pwd ; id ; kill-self 9 ; spawn-child sleep 1 ; \
              spawn-child --pid - setsid ;; sleep 1 ;; exit 0 ; spawn-child --pid f spawn-child id ; \
              run /bin/x a b ; setsid ; alloc 32 ; upper o i ; rename a b ; symlink t l ; chmod 750 p ; \
-             chmod 7777 q ; wait-for w 1.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid ; \
+             chmod 7777 q ; wait-for w 1.5 ; sleep-once o 0.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid ; \
              leads ; write-lines w ; write-lines w a b ; copy o i j ; remove r ; mkfifo p ; \
              truncate t 2048 ; zeros 3 ; zeros --stderr 4 ; ignore-signal 15 ; test -e e ; \
              test ! -d d ; test -x x ; points-to l t ; holds h a b ; inode-links o a b",
@@ -724,6 +746,10 @@ mod tests {
             Step::WaitFor {
                 path: "w",
                 within: Duration::from_millis(1500),
+            },
+            Step::SleepOnce {
+                flag: "o",
+                time: Duration::from_millis(500),
             },
             Step::Mkdir("m/n"),
             Step::Cat("c"),
@@ -814,6 +840,8 @@ mod tests {
             "chmod rwx p",
             "wait-for w",
             "wait-for w soon",
+            "sleep-once o",
+            "sleep-once o soon",
             "spawn-child --pid",
             "spawn-child --pid f",
             "spawn-child echo a ;; ;; exit 0",

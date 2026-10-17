@@ -40,12 +40,17 @@
 //!   that stays does, so a dirty node is loud. Each command names one device, never
 //!   `all`.
 //! - **At daemon start**, when a lease directory a killed daemon left holds [`MARKER`]
-//!   (a regular file, looked at without following a link), every device in the
-//!   default set whose name starts with [`NAME_PREFIX`] is shut down and deleted, with
-//!   `simctl` run in the first such directory before the start-up sweep removes it:
-//!   only the daemon's leases make such devices, and none of them runs before the
-//!   daemon starts. A daemon that was never killed during a simulator lease asks
-//!   `simctl` nothing at start.
+//!   (a regular file, looked at without following a link), the start writes [`PENDING`]
+//!   in the scratch root before it removes that directory, and returns: it never waits
+//!   for `simctl`, which asks `CoreSimulatorService`, and that can stall for minutes.
+//!   While [`PENDING`] is there, a thread of its own ([`Background`]) shuts down and
+//!   deletes every device in the default set whose name starts with [`NAME_PREFIX`],
+//!   except those of leases that run now, with `simctl` run in a directory
+//!   [`SWEEP_DIR`] of the scratch root. A clean sweep removes [`PENDING`]. One that
+//!   fails (the listing did not answer, a delete failed) keeps it and tries again after
+//!   [`RETRY_AFTER`], up to [`SWEEP_ATTEMPTS`] times; if all fail, the next start
+//!   sweeps again. A daemon that was never killed during a simulator lease and owes
+//!   nothing asks `simctl` nothing at start.
 //!
 //! `simctl` runs as an action does ([`crate::xcode::Sandbox`]): under the actions'
 //! sandbox with the network off and the lease directory as its own, so the daemon runs
@@ -55,8 +60,9 @@
 //! service, outside the action's sandbox and its network-off rule, and the action can
 //! reach every device of the default set, not only its own.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
@@ -81,6 +87,26 @@ pub const MARKER: &str = "simulator";
 
 /// How long each `simctl` command has to exit.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(120);
+
+/// How many times the background sweep runs its listing and deletes before it leaves
+/// the devices a killed daemon left to the next start. A `CoreSimulatorService` that
+/// stalls answers no `simctl` for minutes and then answers again, so a try is made
+/// again only after [`RETRY_AFTER`], not at once.
+pub const SWEEP_ATTEMPTS: u32 = 5;
+
+/// How long the background sweep waits after a try that failed before the next one
+/// ([`NativeConfig::simulator_retry`](crate::NativeConfig::simulator_retry)).
+pub const RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// The file in the scratch root that says devices a killed daemon left may still be
+/// there: written at start before the lease directory that held the [`MARKER`] is
+/// removed (the only other record of them), and removed by the first sweep that ends
+/// clean. A start that finds it sweeps again.
+pub const PENDING: &str = "simulators-left";
+
+/// The directory in the scratch root the background sweep runs `simctl` in (as its
+/// lease directory), made when a sweep is owed and kept.
+pub const SWEEP_DIR: &str = "simulator-sweep";
 
 /// How long the driver waits for Xcode to list a lease's new simulator, how often it
 /// looks and how long each look has, before the action runs.
@@ -170,13 +196,16 @@ pub fn request_of(action: &Action, command: &Command) -> Result<Option<Request>,
 
 /// How the driver runs `simctl`: this `xcrun`, under this isolation with these
 /// user-folder rules.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Simctl {
     pub xcrun: PathBuf,
     pub isolation: Isolation,
     pub rules: String,
     pub within: Duration,
     pub listing: Listing,
+    /// The names of the devices the leases that run now were given, from before their
+    /// create to after their delete: the background sweep leaves them alone.
+    pub live: Mutex<BTreeSet<String>>,
 }
 
 /// The simulator a lease may have: what its end needs, set before the create runs.
@@ -398,6 +427,23 @@ impl Simctl {
     /// every device named for the lease; why each delete that failed, or the listing,
     /// did. The end of every lease that asked for a simulator.
     pub(crate) fn end(&self, made: &Made) -> Result<(), String> {
+        let ended = self.delete_all(made);
+        self.live().remove(&made.name);
+        ended
+    }
+
+    /// The names of the devices of the leases that run now, locked.
+    fn live(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records that the lease named `name` may make a device, before its create runs:
+    /// the background sweep skips it until [`Self::end`].
+    pub(crate) fn hold(&self, name: &str) {
+        self.live().insert(name.to_owned());
+    }
+
+    fn delete_all(&self, made: &Made) -> Result<(), String> {
         let named = self.devices(&made.lease);
         let mut udids: Vec<String> = made.udid.iter().cloned().collect();
         let mut failed = Vec::new();
@@ -425,16 +471,39 @@ impl Simctl {
     /// listing or each delete that failed did. The start after a killed daemon left a
     /// lease that may have made one.
     pub(crate) fn sweep(&self, lease: &Path) -> Result<(), String> {
-        let udids: Vec<String> = (self.devices(lease)?.into_iter())
-            .filter(|(name, _)| name.starts_with(NAME_PREFIX))
+        let listed = self.devices(lease)?;
+        // After the listing: a lease that made its device before the listing holds its
+        // name by now.
+        let live = self.live();
+        let udids: Vec<String> = (listed.into_iter())
+            .filter(|(name, _)| name.starts_with(NAME_PREFIX) && !live.contains(name))
             .map(|(_, udid)| udid)
             .collect();
+        drop(live);
         let failed = self.delete(lease, &udids);
         if failed.is_empty() {
             Ok(())
         } else {
             Err(failed.join("; "))
         }
+    }
+
+    /// One try of the sweep [`PENDING`] asks for, in [`SWEEP_DIR`] of `scratch`; a
+    /// clean end removes [`PENDING`] (one that stays only makes the next start sweep
+    /// again).
+    fn sweep_owed(&self, scratch: &Path) -> Result<(), String> {
+        let dir = scratch.join(SWEEP_DIR);
+        // The sandbox's directory is a real path, every link resolved.
+        let real = std::fs::create_dir_all(&dir).and_then(|()| std::fs::canonicalize(&dir));
+        let Ok(real) = real else {
+            return Err(format!(
+                "no directory to sweep simulators in: {}",
+                dir.display()
+            ));
+        };
+        self.sweep(&real)?;
+        let _ = std::fs::remove_file(scratch.join(PENDING));
+        Ok(())
     }
 
     /// Shuts down and deletes each of `udids`, one command each; why each delete that
@@ -567,6 +636,117 @@ fn devices_in(json: &[u8]) -> Result<Vec<(String, String)>, String> {
 /// without following a link.
 pub(crate) fn marked(lease: &Path) -> bool {
     std::fs::symlink_metadata(lease.join(MARKER)).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Whether an earlier start left [`PENDING`] in `scratch` as a regular file, looked at
+/// without following a link.
+pub(crate) fn pending(scratch: &Path) -> bool {
+    std::fs::symlink_metadata(scratch.join(PENDING)).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Writes [`PENDING`] in `scratch`: devices a killed daemon left may still be there.
+pub(crate) fn owe(scratch: &Path) -> std::io::Result<()> {
+    std::fs::write(scratch.join(PENDING), b"")
+}
+
+/// The start's sweep of the devices a killed daemon left, on a thread of its own so
+/// that a stalled `CoreSimulatorService` cannot hold the start.
+#[derive(Debug, Default)]
+pub(crate) struct Background {
+    shared: Arc<Shared>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug, Default)]
+struct Shared {
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    /// The thread is still at its tries.
+    running: bool,
+    /// The runtime is gone: no more tries.
+    stop: bool,
+}
+
+impl Shared {
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits `retry` for the runtime to go; whether it did not.
+    fn pause(&self, retry: Duration) -> bool {
+        let state = self.state();
+        let (state, _) = (self.changed)
+            .wait_timeout_while(state, retry, |s| !s.stop)
+            .unwrap_or_else(PoisonError::into_inner);
+        !state.stop
+    }
+
+    fn finish(&self) {
+        self.state().running = false;
+        self.changed.notify_all();
+    }
+}
+
+impl Background {
+    /// Starts the sweep [`PENDING`] in `scratch` asks for: up to [`SWEEP_ATTEMPTS`]
+    /// tries, `retry` apart, until one ends clean. Like [`std::thread::spawn`], it
+    /// panics if the OS cannot make a thread.
+    pub(crate) fn start(&self, simctl: &Arc<Simctl>, scratch: &Path, retry: Duration) {
+        self.shared.state().running = true;
+        let (shared, simctl, scratch) = (
+            Arc::clone(&self.shared),
+            Arc::clone(simctl),
+            scratch.to_owned(),
+        );
+        let thread = std::thread::spawn(move || {
+            for attempt in 1..=SWEEP_ATTEMPTS {
+                if attempt > 1 && !shared.pause(retry) {
+                    break;
+                }
+                match simctl.sweep_owed(&scratch) {
+                    Ok(()) => break,
+                    Err(why) if attempt < SWEEP_ATTEMPTS => {
+                        tracing::warn!(attempt, "simulators left behind: {why}");
+                    }
+                    Err(why) => tracing::error!(
+                        "simulators left behind, tried again at the next start: {why}"
+                    ),
+                }
+            }
+            shared.finish();
+        });
+        *self.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread);
+    }
+
+    /// Waits until the sweep has ended (clean, out of tries, or never started), at
+    /// most `within`; whether it has.
+    pub(crate) fn wait(&self, within: Duration) -> bool {
+        let state = self.shared.state();
+        let (state, _) = (self.shared.changed)
+            .wait_timeout_while(state, within, |s| s.running)
+            .unwrap_or_else(PoisonError::into_inner);
+        !state.running
+    }
+}
+
+/// Ends the sweep's tries and waits for its thread: at most the `simctl` call it is
+/// in ([`ANSWER_WITHIN`]), as it never waits for the next try once stopped.
+impl Drop for Background {
+    fn drop(&mut self) {
+        self.shared.state().stop = true;
+        self.shared.changed.notify_all();
+        let thread = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(thread) = thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Whether `text` is a UDID as `simctl` prints one: 8-4-4-4-12 hexadecimal digits.

@@ -345,12 +345,14 @@ pub fn no_leases(config: &NativeConfig) -> bool {
     let runs = config.scratch.join("runs");
     // The output spools' directory: its files are unlinked as soon as they are made.
     let spool = config.scratch.join("spool");
+    // The directory a start's simulator sweep runs `simctl` in, kept once made.
+    let sweep = config.scratch.join("simulator-sweep");
     let others = std::fs::read_dir(&config.scratch)
         .expect("scratch root")
         .filter(|entry| {
-            entry
-                .as_ref()
-                .map_or(true, |e| e.path() != runs && e.path() != spool)
+            entry.as_ref().map_or(true, |e| {
+                e.path() != runs && e.path() != spool && e.path() != sweep
+            })
         })
         .count();
     others == 0 && empty(&runs) && empty(&spool)

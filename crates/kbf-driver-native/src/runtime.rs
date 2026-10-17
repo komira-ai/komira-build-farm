@@ -75,6 +75,8 @@ pub struct NativeRuntime<C> {
     warm_up: Mutex<Option<WarmUp>>,
     /// How the simulators of the leases that ask for one are made and deleted.
     simctl: Arc<Simctl>,
+    /// The sweep of the simulators a killed daemon left, started by the start.
+    sweeping: simulator::Background,
     /// The slots of a root daemon's lease-user pool, one lease each.
     #[cfg(target_os = "macos")]
     slots: Option<crate::slots::macos::Slots>,
@@ -148,19 +150,16 @@ impl<C: Cas> NativeRuntime<C> {
             xcrun: config.xcrun.clone(),
             isolation: config.isolation.clone(),
             rules: rules.clone(),
-            within: simulator::ANSWER_WITHIN,
+            within: config.simulator_answer,
             listing: config.simulator_listing,
+            live: Mutex::default(),
         });
-        // The first lease directory a killed daemon left that may hold a simulator:
-        // the simulators every lease left are deleted from it before it is removed.
-        let swept = std::cell::Cell::new(false);
+        // A lease directory a killed daemon left that may hold a simulator is the only
+        // record of it: the start owes the sweep of the devices before it removes one.
+        // The sweep itself runs after the start, on a thread of its own.
         let remove_left = |path: &Path| {
-            if simulator::marked(path) && !swept.replace(true) {
-                // One that cannot be named by its real path cannot be removed either.
-                let real = std::fs::canonicalize(path)?;
-                if let Err(why) = simctl.sweep(&real) {
-                    tracing::error!(dir = %path.display(), "simulators left behind: {why}");
-                }
+            if simulator::marked(path) {
+                simulator::owe(&config.scratch)?;
             }
             remove(path)
         };
@@ -170,6 +169,10 @@ impl<C: Cas> NativeRuntime<C> {
             config.kill_wait,
             &crate::sweep::SYSTEM,
         )?;
+        let sweeping = simulator::Background::default();
+        if simulator::pending(&config.scratch) {
+            sweeping.start(&simctl, &config.scratch, config.simulator_retry);
+        }
         // After the sweep, which sets aside a `runs` that is not the daemon's directory.
         let mut runs = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
@@ -177,6 +180,7 @@ impl<C: Cas> NativeRuntime<C> {
         make_spool_dir(&config.scratch.join(SPOOL))?;
         let runtime = Self {
             simctl,
+            sweeping,
             xcodes: RwLock::new(config.xcodes.clone()),
             config,
             cas,
@@ -188,6 +192,16 @@ impl<C: Cas> NativeRuntime<C> {
         };
         sweep_user_folders(&runtime.config);
         Ok(runtime)
+    }
+
+    /// Waits until the start's sweep of the simulators a killed daemon left has ended,
+    /// at most `within`; whether it has. It has when it ended clean, when it ran out
+    /// of tries (it left the work to the next start), and when the start found none to
+    /// sweep. Nothing needs this to run a lease; it is what a test or a status line
+    /// waits on.
+    #[must_use]
+    pub fn wait_for_simulator_sweep(&self, within: Duration) -> bool {
+        self.sweeping.wait(within)
     }
 
     /// Starts the `xcrun` warm-up for the node's own Xcode and the Xcodes actions may
@@ -758,6 +772,7 @@ async fn create_simulator(
         name: format!("{}{}-{}", simulator::NAME_PREFIX, lease.term, lease.seq),
         udid: None,
     };
+    simctl.hold(&made.name);
     *made_in(slot) = Some(made.clone());
     let marker = prepared.lease.join(simulator::MARKER);
     tokio::fs::write(&marker, b"")

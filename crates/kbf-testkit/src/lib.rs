@@ -2,7 +2,7 @@
 //!
 //! - [`act`]: `kbf-act STEP [; STEP]...`, a fixed set of verbs (exit, sleep, echo,
 //!   append, env, pwd, id, kill-self, spawn-child, run, setsid, alloc, upper,
-//!   rename, symlink, chmod, wait-for, mkdir, cat, mtime, pgid, leads, write-lines,
+//!   rename, symlink, chmod, wait-for, sleep-once, mkdir, cat, mtime, pgid, leads, write-lines,
 //!   copy, remove, mkfifo, truncate, zeros, ignore-signal, test, points-to, holds,
 //!   inode-links) that a test puts in an action's or a child's argv where it would
 //!   have written `sh -c`.
