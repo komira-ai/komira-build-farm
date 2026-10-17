@@ -419,3 +419,45 @@ async fn the_xcode_an_action_names_is_the_one_it_runs() {
         assert_eq!(xcode::build_of(&out), Some(build.as_str()), "{out}");
     }
 }
+
+/// Catches a refusal the operator cannot see: an action that writes outside its lease
+/// and fails sees only `EPERM`, which reads like any permission error (issue #184).
+/// The failed action's stderr must end with the sandbox's own report of the refusal,
+/// from the unified log: the operation and the path. Control: the same action without a
+/// sandbox writes the file and gets no note, so the note is the sandbox's and not
+/// the driver's habit.
+#[tokio::test]
+async fn a_denied_write_is_named_in_the_failed_actions_stderr() {
+    let dir = scratch("denials");
+    let cas = Arc::new(MemoryCas::default());
+    let sandboxed = config(&dir);
+    let mut open = config(&dir.join("unsandboxed"));
+    open.isolation = Isolation::None;
+    let (sandboxed, open) = (runtime(sandboxed, &cas), runtime(open, &cas));
+    let name = format!("denied-{}", std::process::id());
+    let target = dir.join(&name);
+    let script = format!("echo x > {} ; exit 1", target.display());
+
+    let spec = Spec::sh(&script).env("PATH", PATH);
+    let result = run(&sandboxed, &cas, 1, &spec).await.expect("ran");
+    let text = stderr(&cas, &result);
+    assert_eq!(result.exit_code, 1, "{text}");
+    assert!(!target.exists(), "the sandbox let the write through");
+    assert!(
+        text.contains("kbf: the macOS sandbox denied this action"),
+        "no denial in stderr: {text}\n{}",
+        support::sandbox_denials()
+    );
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
+        .unwrap_or_else(|| panic!("no denial names {name}: {text}"));
+    assert!(line.contains("file-write-create"), "{line}");
+
+    let result = run(&open, &cas, 2, &spec).await.expect("ran");
+    let text = stderr(&cas, &result);
+    assert_eq!(result.exit_code, 1, "{text}");
+    assert!(target.exists(), "control: the unsandboxed write failed");
+    assert!(!text.contains("kbf:"), "control: {text}");
+    let _ = std::fs::remove_file(&target);
+}

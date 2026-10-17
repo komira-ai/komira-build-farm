@@ -334,6 +334,7 @@ impl Slot {
         UidWatch {
             uid: self.ready().user.uid,
             record,
+            seen: Arc::default(),
             armed: true,
         }
     }
@@ -384,19 +385,33 @@ impl Drop for Slot {
 pub struct UidWatch {
     uid: u32,
     record: PathBuf,
+    /// Every pid of the uid any measurement saw: whose a sandbox denial is.
+    seen: Arc<Mutex<BTreeSet<i32>>>,
     armed: bool,
 }
 
 impl UidWatch {
+    /// Every pid of the uid seen so far.
+    #[must_use]
+    pub fn seen(&self) -> BTreeSet<i32> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The physical footprint of every process whose effective uid is the slot's, in
     /// bytes.
     ///
     /// # Errors
     /// The process table could not be read.
     pub async fn measure(&self) -> Result<u64, RuntimeError> {
-        let uid = self.uid;
+        let (uid, seen) = (self.uid, Arc::clone(&self.seen));
         let used = tokio::task::spawn_blocking(move || {
             let pids = uid::effective(uid)?;
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(pids.iter().copied());
             Ok::<_, io::Error>(
                 pids.into_iter()
                     .filter_map(procs::footprint)
@@ -739,9 +754,16 @@ mod tests {
         let watch = UidWatch {
             uid: rustix::process::geteuid().as_raw(),
             record: PathBuf::from("/nonexistent"),
+            seen: Arc::default(),
             armed: false,
         };
         let used = watch.measure().await.expect("measured");
         assert!(used > 1 << 20, "this uid's processes use {used} bytes");
+        assert!(
+            watch
+                .seen()
+                .contains(&i32::try_from(std::process::id()).expect("pid")),
+            "the measurement saw this process"
+        );
     }
 }

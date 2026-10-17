@@ -464,3 +464,33 @@ fn the_start_ends_every_process_of_every_slot() {
     assert!(before, "the slot user's sleep {pid} did not start");
     assert!(!after, "the slot user's sleep {pid} outlived the start");
 }
+
+/// Catches a refusal the operator cannot see, for an action that runs as a slot
+/// user (issue #184): a slot user's write outside its lease, home and `/var/folders`
+/// entry (`/var/tmp` is open to every user, so only the sandbox refuses it) fails the
+/// action, and its stderr must end with the sandbox's report of the refusal: the
+/// operation and the path. The action stays up a second after the write, so the poll
+/// of the slot's uid sees the shell whose pid the log names.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
+#[tokio::test]
+async fn a_slot_users_denied_write_is_named_in_its_stderr() {
+    assert_root();
+    let scratch = Scratch::new("denials");
+    let users = Users::new("denials", 1);
+    let cas = Arc::new(MemoryCas::default());
+    let mut config = config(&scratch, users.pool());
+    config.poll = Duration::from_millis(50);
+    let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
+    let name = format!("kbf-denied-{}", std::process::id());
+    let target = format!("/var/tmp/{name}");
+    let script = format!("echo x > {target} ; /bin/sleep 1 ; exit 1");
+    let result = lease(&rt, &cas, 1, &Spec::sh(&script)).await;
+    let _ = std::fs::remove_file(&target);
+    let text = support::stderr(&cas, &result);
+    assert_eq!(result.exit_code, 1, "{text}");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
+        .unwrap_or_else(|| panic!("no denial names {name}: {text}"));
+    assert!(line.contains("file-write-create"), "{line}");
+}

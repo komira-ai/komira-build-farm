@@ -9,6 +9,7 @@ use kbf_daemon::cache::Cache;
 use kbf_daemon::trees::Trees;
 use kbf_outputs::OutputLimits;
 
+use crate::denials::LogReader;
 use crate::network::Isolation;
 use crate::simulator::Listing;
 use crate::slots::Pool;
@@ -101,6 +102,9 @@ pub struct NativeConfig {
     /// trees and writes the rest of the inputs. The store must be outside the scratch
     /// directory, like the cache. `None` clones every input file one by one.
     pub trees: Option<Arc<Trees>>,
+    /// Reads the sandbox's refusals from the system's log for an action that failed
+    /// under the sandbox ([`crate::denials`]); a test replaces it.
+    pub denial_log: LogReader,
 }
 
 impl NativeConfig {
@@ -127,6 +131,7 @@ impl NativeConfig {
             pool: None,
             cache: None,
             trees: None,
+            denial_log: crate::denials::system_log,
         }
     }
 }

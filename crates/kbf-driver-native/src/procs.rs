@@ -38,6 +38,8 @@ pub struct Tracker {
     leader_start: Option<u64>,
     /// Every process seen belonging, by pid, with its start time.
     known: BTreeMap<i32, u64>,
+    /// Every pid ever seen belonging, the leader's included: whose a sandbox denial is.
+    seen: BTreeSet<i32>,
     /// Whether a snapshot has shown the group empty. An empty group's id can be
     /// recycled, so from then on membership is by descent and memory only.
     group_gone: bool,
@@ -54,6 +56,7 @@ impl Tracker {
             leader,
             leader_start: None,
             known: BTreeMap::new(),
+            seen: BTreeSet::from([leader]),
             group_gone: false,
             me,
         }
@@ -73,6 +76,12 @@ impl Tracker {
     #[must_use]
     pub fn leader(&self) -> i32 {
         self.leader
+    }
+
+    /// Every pid seen belonging to the action so far, and its leader's.
+    #[must_use]
+    pub fn seen(&self) -> &BTreeSet<i32> {
+        &self.seen
     }
 
     /// The live processes of the action in `snapshot`, sorted by pid; every one of
@@ -121,6 +130,7 @@ impl Tracker {
         self.known
             .retain(|pid, start| alive.contains(&(*pid, *start)));
         self.known.extend(found.values().map(|p| (p.pid, p.start)));
+        self.seen.extend(found.keys());
         found.into_values().filter(|p| !p.zombie).collect()
     }
 }
@@ -378,6 +388,27 @@ mod tests {
 
     fn pids(procs: &[Proc]) -> Vec<i32> {
         procs.iter().map(|p| p.pid).collect()
+    }
+
+    /// Catches a denial attributed to the wrong pids: a pid that came and went between
+    /// two snapshots forgotten (the sandbox log names it after it is gone), the leader
+    /// missing before any snapshot shows it, and an unrelated process or the daemon
+    /// taken for the action's.
+    #[test]
+    fn every_pid_ever_seen_belonging_is_remembered() {
+        let me = 10;
+        let mut t = Tracker::new(100, me);
+        assert_eq!(t.seen(), &BTreeSet::from([100]));
+        let first = [
+            p(me, 1, me, 5),
+            p(100, me, 100, 50),
+            p(101, 100, 100, 51),
+            p(200, 1, 200, 1),
+        ];
+        t.members(&first);
+        // 101 has ended by now; 102 is new.
+        t.members(&[p(me, 1, me, 5), p(100, me, 100, 50), p(102, 100, 100, 60)]);
+        assert_eq!(t.seen(), &BTreeSet::from([100, 101, 102]));
     }
 
     /// Catches: a child that left the group (`setsid`) not followed, a grandchild

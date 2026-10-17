@@ -1,7 +1,7 @@
 //! [`NativeRuntime`]: one action, one lease directory, one process tree, all of it gone
 //! when the lease ends. See the crate documentation for what a lease gets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use tokio::time::Instant;
 
 use crate::cas::CasStore;
 use crate::config::NativeConfig;
+use crate::denials::{self, Found};
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
@@ -480,6 +481,7 @@ impl<C: Cas> NativeRuntime<C> {
             .process_group(0)
             .kill_on_drop(true);
         let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
+        let started = Instant::now();
         let Spawned {
             mut child,
             pid: leader,
@@ -517,6 +519,17 @@ impl<C: Cas> NativeRuntime<C> {
             }
         };
         watch.end(&mut child, self.config.kill_wait).await?;
+        let did_fail = match &ended {
+            Ended::Exited(status) => status.as_ref().is_ok_and(|s| !s.success()),
+            Ended::TimedOut => true,
+            Ended::Killed | Ended::OutOfMemory { .. } => false,
+        };
+        if did_fail {
+            let ran = started.elapsed();
+            let mut pids = watch.pids();
+            pids.insert(leader);
+            self.report_denials(work.lease_id, dir, pids, ran).await;
+        }
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
             Ended::TimedOut => Err(self.timed_out(cas, work.lease_id, dir).await),
@@ -525,6 +538,55 @@ impl<C: Cas> NativeRuntime<C> {
                 tracing::warn!(lease = %work.lease_id, used, limit, "killed past its memory limit");
                 Err(RuntimeError::OutOfMemory { used, limit })
             }
+        }
+    }
+
+    /// For an action that failed under the sandbox: reads what the sandbox refused its
+    /// processes ([`crate::denials`]), adds it to the end of its stderr file and to the
+    /// node's log. Reading the log can fail or find nothing; the action's own result
+    /// stands either way.
+    async fn report_denials(&self, lease: LeaseId, dir: &Path, pids: BTreeSet<i32>, ran: Duration) {
+        if !matches!(self.config.isolation, network::Isolation::Sandbox(_)) {
+            return;
+        }
+        let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
+        let log = match tokio::task::spawn_blocking(move || read(&file, ran)).await {
+            Ok(Ok(log)) => log,
+            Ok(Err(why)) => {
+                tracing::warn!(%lease, %why, "the sandbox's denials could not be read");
+                return;
+            }
+            Err(why) => {
+                tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
+                return;
+            }
+        };
+        let found = Found::of(&log, &pids);
+        for denial in &found.mine {
+            tracing::warn!(%lease, denial = %denials::shown(denial), "the sandbox denied the action");
+        }
+        for line in found.other_lines() {
+            tracing::info!(%lease, denial = %line, "the sandbox denied a process this lease did not watch");
+        }
+        let Some(note) = found.note() else {
+            return;
+        };
+        let stderr = dir.join("stderr");
+        // The note must not push the action's own stderr past the stdio limit, which
+        // would drop all of it: it stays in the node's log then.
+        let max = self.config.outputs.max_stdio_bytes;
+        let size = std::fs::metadata(&stderr).map_or(u64::MAX, |m| m.len());
+        let note_len = u64::try_from(note.len()).unwrap_or(u64::MAX);
+        if size.saturating_add(note_len) > max {
+            tracing::warn!(%lease, size, max, "the sandbox's denials do not fit in stderr; they are in the node's log");
+            return;
+        }
+        let written = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stderr)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, note.as_bytes()));
+        if let Err(why) = written {
+            tracing::warn!(%lease, %why, "the sandbox's denials could not be added to stderr");
         }
     }
 
@@ -867,6 +929,15 @@ impl Watch {
             Self::Tree(group) => group.measure().await,
             #[cfg(target_os = "macos")]
             Self::Uid(uid) => uid.measure().await,
+        }
+    }
+
+    /// Every pid seen belonging to the action so far.
+    fn pids(&self) -> BTreeSet<i32> {
+        match self {
+            Self::Tree(group) => lock(&group.tracker).seen().clone(),
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => uid.seen(),
         }
     }
 
