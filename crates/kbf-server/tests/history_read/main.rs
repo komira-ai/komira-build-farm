@@ -7,6 +7,7 @@
 //! `read` is what goes right, `edges` what goes wrong (stores that fail, rows that change).
 
 mod edges;
+mod flog;
 #[path = "../pages/mod.rs"]
 mod pages;
 mod read;

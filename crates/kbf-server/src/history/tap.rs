@@ -5,7 +5,7 @@
 //! object store or the state store.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use kbf_front::Tap;
 use kbf_history::records::{
@@ -18,6 +18,8 @@ use kbf_invocation::{
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure};
+
+use super::tails::{Job, Tails};
 
 /// The invocations the tap remembers having offered a record for, at most: the writer
 /// holds no more than its own bound of them (`kbf_history::Limits::invocations`), so a
@@ -60,16 +62,56 @@ impl RunIndex {
     }
 }
 
+/// The record names (`<id>` or `<id>~<n>`) an event was offered for since their last
+/// close, at most [`OPEN_CAP`]. Shared with the tail workers, which close an invocation
+/// again when a failed run reaches the writer after its close.
+#[derive(Debug, Default)]
+pub(super) struct OpenSet(Mutex<BTreeSet<String>>);
+
+impl OpenSet {
+    fn set(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        // A set of names; a panic elsewhere leaves it whole.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes that `name` has events in the writer, to be closed with it.
+    pub(super) fn add(&self, name: &str) {
+        let mut open = self.set();
+        if open.len() >= OPEN_CAP && !open.contains(name) {
+            open.pop_first();
+        }
+        open.insert(name.to_owned());
+    }
+
+    /// Forgets `name`; whether it was open.
+    fn remove(&self, name: &str) -> bool {
+        self.set().remove(name)
+    }
+
+    /// Whether `name` is open.
+    pub(super) fn contains(&self, name: &str) -> bool {
+        self.set().contains(name)
+    }
+
+    /// Forgets every name, returning them.
+    fn take(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.set())
+    }
+}
+
 /// The tap the recorder task calls, over the history writer's queue and the minter.
 #[derive(Debug)]
 pub struct HistoryTap {
     queue: Arc<EventQueue>,
     minter: Arc<Minter>,
-    /// The record names (`<id>` or `<id>~<n>`) an event was offered for since their last
-    /// close.
-    open: Mutex<BTreeSet<String>>,
+    /// The invocations an event was offered for since their last close.
+    open: Arc<OpenSet>,
     /// Where the live record of each run it minted is.
     runs: Arc<RunIndex>,
+    /// The pool that reads a failed run's tails and copies its logs before its record is
+    /// offered, once the server gave history a blob source ([`super::History::with_blobs`]);
+    /// without it a failed run is offered at once with no tails, as every run is.
+    tails: OnceLock<Tails>,
 }
 
 impl HistoryTap {
@@ -77,9 +119,33 @@ impl HistoryTap {
         Self {
             queue,
             minter,
-            open: Mutex::new(BTreeSet::new()),
+            open: Arc::new(OpenSet::default()),
             runs: Arc::new(RunIndex::default()),
+            tails: OnceLock::new(),
         }
+    }
+
+    /// Gives the tap its pool. The first one stays: a second call changes nothing.
+    pub(super) fn install_tails(&self, tails: Tails) {
+        let _already = self.tails.set(tails);
+    }
+
+    /// Waits until no failed run is queued for the tail workers or being handled; at once
+    /// without a pool.
+    pub(super) async fn quiesce(&self) {
+        if let Some(tails) = self.tails.get() {
+            tails.quiesce().await;
+        }
+    }
+
+    /// Whether a pool was installed.
+    pub(super) fn has_tails(&self) -> bool {
+        self.tails.get().is_some()
+    }
+
+    /// The names the tail workers check an invocation's close against.
+    pub(super) fn open_set(&self) -> Arc<OpenSet> {
+        Arc::clone(&self.open)
     }
 
     /// Where the live record of each run this tap minted is.
@@ -87,25 +153,15 @@ impl HistoryTap {
         Arc::clone(&self.runs)
     }
 
-    fn open(&self) -> MutexGuard<'_, BTreeSet<String>> {
-        // A set of names; a panic elsewhere leaves it whole.
-        self.open.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Notes that `name` has events in the writer, to be closed with it.
     fn opened(&self, name: &str) {
-        let mut open = self.open();
-        if open.len() >= OPEN_CAP && !open.contains(name) {
-            open.pop_first();
-        }
-        open.insert(name.to_owned());
+        self.open.add(name);
     }
 
     /// Offers a close of every invocation offered a record and not closed since: the
     /// writer flushes them before it stops.
     pub(super) fn close_all(&self) {
-        let open = std::mem::take(&mut *self.open());
-        for name in open {
+        for name in self.open.take() {
             self.queue.offer(Event::Close {
                 inv: InvRef::named(&name),
             });
@@ -123,17 +179,36 @@ impl HistoryTap {
         let minted = self.minter.mint(&inv.key, at.unix_micros() / 1000);
         let mut record = run_record(row, attempt);
         record.set_run_id(minted.id);
-        let queued = self.queue.offer(Event::Run {
+        let mut job = Job {
             inv,
             record: Box::new(record),
-            failed: None,
             stream_opened_ms: minted.stream_opened_ms,
+        };
+        // A failed run goes to the tail workers, which offer it after reading its logs.
+        // A full pool drops the tails, not the run: it is offered here, with none.
+        if job.record.failed()
+            && let Some(tails) = self.tails.get()
+        {
+            match tails.submit(job) {
+                Ok(()) => return self.minted(name, ended, minted.id.to_bytes()),
+                Err(back) => job = back,
+            }
+        }
+        let queued = self.queue.offer(Event::Run {
+            inv: job.inv,
+            record: job.record,
+            failed: None,
+            stream_opened_ms: job.stream_opened_ms,
         });
         if !queued {
             return None;
         }
+        self.minted(name, ended, minted.id.to_bytes())
+    }
+
+    /// Notes a run whose record was handed on, and returns its id.
+    fn minted(&self, name: &str, ended: &Ended, id: [u8; 12]) -> Option<[u8; 12]> {
         self.opened(name);
-        let id = minted.id.to_bytes();
         self.runs.note(id, ended.key.clone(), ended.row);
         Some(id)
     }
@@ -157,7 +232,7 @@ impl Tap for HistoryTap {
 
     fn idle(&self, key: &RecordKey) {
         let name = key.to_string();
-        if self.open().remove(&name) {
+        if self.open.remove(&name) {
             self.queue.offer(Event::Close {
                 inv: InvRef::named(&name),
             });

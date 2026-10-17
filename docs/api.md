@@ -480,8 +480,30 @@ left out. The run is read from the in-memory record while it is held and from hi
 after, in one rendering: the answer is the same before and after a restart. The run's one
 instance is asked of `invocations.getAuthorizer` before anything is answered. `{run_id}`
 is 24 lowercase hex digits, which the attempts of the build pages give as `run_id` and
-`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end`, tails and
+`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end` and
 transfer counters.
+
+A run that has logs also has `logs`: for each of `stdout`, `stderr` and `result` that it
+has, the `digest`, whether the blob is still held (`available`), an `href`, and for
+`stdout` and `stderr` of a failed run the `tail` history kept (the last 16 KiB, as text),
+its `total_bytes`, `tail: null` with `tail_omitted` (`too_large` over 64 MiB, `unreadable`,
+`busy` when the read budget was not free in time) and `tail_redacted: false`: no
+redaction exists, the tail is as the run wrote it. The `href` is the blob route while the
+blob is held and the log route below once it is not and history holds a copy; `null`
+otherwise. A failed run's `command_rendering` (argv, environment variable names only,
+working directory, output paths, at most 4 KiB, `redacted: false`) is shown beside them.
+
+**`GET /v1/runs/{run_id}/logs/{stdout|stderr|result}`** (with `--history-objects`) is the
+copy of a failed run's log that history kept, which outlives the blob it was copied from
+(30 days, `r30`). It is raw bytes, `application/octet-stream` as an attachment, with
+`X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox` on every answer.
+The run's instance is asked of `invocations.getAuthorizer` before the copy is read, and the
+copy is read for that instance only. One `Range: bytes=...` is honoured (`206`, or `416`),
+and only the blocks that hold the range are read; several ranges are ignored. The bytes of
+an answer count against the same read budget as `/v1/blobs`, and a read waits for it at
+most 10 seconds, then is `503` with `Retry-After` and `"busy": true`. A run with no such
+copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an unknown run
+`404` `no_run`; a query string is `400`.
 
 **The invocation:**
 

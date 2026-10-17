@@ -92,7 +92,11 @@ impl Backend {
         self.0.find_missing(digests).await
     }
 
-    pub(crate) async fn read_blob(&self, digest: &Digest) -> Result<bytes::Bytes, StorageError> {
+    /// The blob `digest`, read whole and verified against its digest.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] if it is not held, or as the store answers.
+    pub async fn read_blob(&self, digest: &Digest) -> Result<bytes::Bytes, StorageError> {
         self.0.read_blob(digest).await
     }
 

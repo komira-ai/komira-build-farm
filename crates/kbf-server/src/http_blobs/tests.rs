@@ -385,6 +385,52 @@ async fn a_digest_larger_than_any_blob_is_404_at_once() {
     }
 }
 
+/// Catches (mutant "a reader makes a budget of its own"): the blob route and the other
+/// readers of the process (the failure-log route, the history writer's tail reads) each
+/// holding a whole budget of their own, so that together they hold more than the process
+/// may. A budget given to the route is the route's: what another reader holds of it, the
+/// route cannot take, and what it releases, the route can.
+#[tokio::test(start_paused = true)]
+async fn the_blob_route_and_other_readers_draw_on_one_budget() {
+    let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
+    let other = state.budget.clone();
+    let held = other.acquire(10, READ_BUDGET_WAIT).await.expect("free");
+    assert_eq!(other.available_permits(), 0);
+    let busy = get_in_time(&state, &digests[0], None).await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(held);
+    assert_eq!(
+        get_in_time(&state, &digests[0], None).await.status(),
+        StatusCode::OK
+    );
+}
+
+/// Catches: a share larger than the whole budget (or than a permit count holds) waiting
+/// for the time it never gets (it is refused at once), a wait that is not the wait, and a
+/// budget that does not start full.
+#[tokio::test(start_paused = true)]
+async fn a_read_budget_refuses_what_never_fits_and_times_out_what_is_not_free() {
+    let budget = ReadBudget::new(100);
+    assert_eq!(budget.available_permits(), 100);
+    assert_eq!(
+        budget.acquire(101, READ_BUDGET_WAIT).await.unwrap_err(),
+        Refused::TooLarge
+    );
+    assert_eq!(
+        budget.acquire(1 << 33, READ_BUDGET_WAIT).await.unwrap_err(),
+        Refused::TooLarge
+    );
+    let all = budget.acquire(100, READ_BUDGET_WAIT).await.expect("free");
+    let asked = tokio::time::Instant::now();
+    let wait = std::time::Duration::from_secs(3);
+    assert_eq!(budget.acquire(1, wait).await.unwrap_err(), Refused::Busy);
+    assert_eq!(asked.elapsed(), wait);
+    drop(all);
+    assert_eq!(budget.available_permits(), 100);
+    assert_eq!(ReadBudget::default().available_permits(), READ_BUDGET_BYTES);
+    assert!(format!("{budget:?}").contains("largest: 100"));
+}
+
 /// Catches: a budget smaller than the largest blob the cache accepts, which could
 /// never be served.
 #[test]

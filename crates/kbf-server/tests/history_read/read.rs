@@ -364,10 +364,26 @@ async fn run_by_id_live_equals_run_by_id_durable() {
     // The writes work again: the writer puts what it held, and a stop flushes the rest.
     world.objects.fail_puts(false);
     world.flushed("runs", 2).await;
+    // A failed run's page shows what history holds of it (its tails) once history holds
+    // it; read again, the live page is the page after a restart.
+    let mut after = Vec::new();
+    for id in &ids {
+        after.push(a.ok(&format!("/v1/runs/{id}")).await);
+    }
+    assert_eq!(
+        after[0], live[0],
+        "a run that passed has nothing more in history"
+    );
+    assert!(
+        live[1]["logs"]["stdout"].get("tail").is_none(),
+        "{}",
+        live[1]
+    );
+    assert_eq!(after[1]["logs"]["stdout"]["tail_omitted"], "unreadable");
     a.stop().await;
 
     let b = world.start(PAGES_ONLY);
-    for (id, live) in ids.iter().zip(&live) {
+    for (id, live) in ids.iter().zip(&after) {
         let durable = b.ok(&format!("/v1/runs/{id}")).await;
         assert_eq!(&durable, live, "{id}");
         assert_eq!(durable["run_id"], id.as_str());

@@ -7,8 +7,10 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use kbf_history::records::FlogStream;
 use kbf_history::{
-    Allow, ChunkCursor, InvKey, InvocationView, ReadError, Reader, RecordsPage, RunId, RunView,
+    Allow, ChunkCursor, FailureLog, InvKey, InvocationView, ReadError, Reader, RecordsPage, RunId,
+    RunView,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
@@ -95,6 +97,20 @@ trait Source: Send + Sync {
         id: RunId,
         allow: Allow<'a>,
     ) -> BoxFuture<'a, Result<Option<RunView>, ReadError>>;
+
+    fn failure_log<'a>(
+        &'a self,
+        id: RunId,
+        stream: FlogStream,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<Option<FailureLog>, ReadError>>;
+
+    fn read_log<'a>(
+        &'a self,
+        log: &'a FailureLog,
+        first: u64,
+        last: u64,
+    ) -> BoxFuture<'a, Result<Bytes, ReadError>>;
 }
 
 impl<O: ObjectStore> Source for Reader<O> {
@@ -129,6 +145,24 @@ impl<O: ObjectStore> Source for Reader<O> {
         allow: Allow<'a>,
     ) -> BoxFuture<'a, Result<Option<RunView>, ReadError>> {
         Box::pin(Reader::run(self, id, allow))
+    }
+
+    fn failure_log<'a>(
+        &'a self,
+        id: RunId,
+        stream: FlogStream,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<Option<FailureLog>, ReadError>> {
+        Box::pin(Reader::failure_log(self, id, stream, allow))
+    }
+
+    fn read_log<'a>(
+        &'a self,
+        log: &'a FailureLog,
+        first: u64,
+        last: u64,
+    ) -> BoxFuture<'a, Result<Bytes, ReadError>> {
+        Box::pin(Reader::read_log(self, log, first, last))
     }
 }
 
@@ -192,6 +226,32 @@ impl HistoryReads {
     /// [`ReadError`].
     pub async fn run(&self, id: RunId, allow: Allow<'_>) -> Result<Option<RunView>, ReadError> {
         self.source.run(id, allow).await
+    }
+
+    /// [`Reader::failure_log`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn failure_log(
+        &self,
+        id: RunId,
+        stream: FlogStream,
+        allow: Allow<'_>,
+    ) -> Result<Option<FailureLog>, ReadError> {
+        self.source.failure_log(id, stream, allow).await
+    }
+
+    /// [`Reader::read_log`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn read_log(
+        &self,
+        log: &FailureLog,
+        first: u64,
+        last: u64,
+    ) -> Result<Bytes, ReadError> {
+        self.source.read_log(log, first, last).await
     }
 }
 

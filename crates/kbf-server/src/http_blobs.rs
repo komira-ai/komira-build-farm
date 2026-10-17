@@ -109,34 +109,103 @@ impl BlobReaders {
     }
 }
 
-struct BlobState<M, O> {
-    cache: Arc<Cache<M, O>>,
-    readers: Option<BlobReaders>,
-    /// One permit per byte of [`READ_BUDGET_BYTES`]; an answer's bytes hold theirs
-    /// until the last of them is dropped.
-    budget: Arc<Semaphore>,
-    /// The whole budget in bytes: the largest blob a read is admitted for.
+/// The memory reads of blobs and logs may hold at once, one permit per byte, taken in the
+/// order the reads asked (the semaphore is fair). One budget is shared by every reader
+/// of a process: the blob route, the failure-log route ([`crate::http_history`]) and the
+/// tail reads of the history writer ([`crate::history`]), so none can take the memory
+/// another needs.
+#[derive(Clone, Debug)]
+pub struct ReadBudget {
+    permits: Arc<Semaphore>,
+    /// The whole budget in bytes: the largest read admitted.
     largest: u64,
 }
 
+/// Why a read was not given its share of a [`ReadBudget`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// More bytes than the whole budget: it could never be admitted.
+    TooLarge,
+    /// The share was not free within the wait.
+    Busy,
+}
+
+impl ReadBudget {
+    /// A budget of `bytes` (at most [`Semaphore::MAX_PERMITS`]; the process's is
+    /// [`READ_BUDGET_BYTES`]).
+    #[must_use]
+    pub fn new(bytes: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(bytes)),
+            largest: u64::try_from(bytes).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Bytes not held now.
+    #[must_use]
+    pub fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    /// `bytes` of the budget, waiting for them at most `wait` in the order of the asks;
+    /// held until the permit is dropped.
+    ///
+    /// # Errors
+    /// [`Refused::TooLarge`] for more than the whole budget (or more than a permit count
+    /// can hold), [`Refused::Busy`] when the share is not free within `wait`.
+    pub async fn acquire(
+        &self,
+        bytes: u64,
+        wait: Duration,
+    ) -> Result<OwnedSemaphorePermit, Refused> {
+        let permits = u32::try_from(bytes)
+            .ok()
+            .filter(|&n| u64::from(n) <= self.largest)
+            .ok_or(Refused::TooLarge)?;
+        tokio::time::timeout(wait, Arc::clone(&self.permits).acquire_many_owned(permits))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(Refused::Busy)
+    }
+}
+
+impl Default for ReadBudget {
+    /// [`READ_BUDGET_BYTES`].
+    fn default() -> Self {
+        Self::new(READ_BUDGET_BYTES)
+    }
+}
+
+struct BlobState<M, O> {
+    cache: Arc<Cache<M, O>>,
+    readers: Option<BlobReaders>,
+    /// An answer's bytes hold their permits until the last of them is dropped.
+    budget: ReadBudget,
+}
+
 impl<M, O> BlobState<M, O> {
-    /// The state of a route that holds at most `budget` blob bytes at once (at most
-    /// [`Semaphore::MAX_PERMITS`]; the route's is [`READ_BUDGET_BYTES`]).
+    /// The state of a route that holds at most `budget` blob bytes at once.
+    #[cfg(test)]
     fn new(cache: Arc<Cache<M, O>>, readers: Option<BlobReaders>, budget: usize) -> Self {
+        Self::sharing(cache, readers, ReadBudget::new(budget))
+    }
+
+    /// The state of a route that takes its memory from `budget`.
+    fn sharing(cache: Arc<Cache<M, O>>, readers: Option<BlobReaders>, budget: ReadBudget) -> Self {
         Self {
             cache,
             readers,
-            budget: Arc::new(Semaphore::new(budget)),
-            largest: u64::try_from(budget).unwrap_or(u64::MAX),
+            budget,
         }
     }
 }
 
 /// A blob's bytes and the budget they hold: dropped with the last `Bytes` that
 /// shares them.
-struct Held {
-    bytes: Bytes,
-    _permit: OwnedSemaphorePermit,
+pub(crate) struct Held {
+    pub(crate) bytes: Bytes,
+    pub(crate) _permit: OwnedSemaphorePermit,
 }
 
 impl AsRef<[u8]> for Held {
@@ -145,15 +214,21 @@ impl AsRef<[u8]> for Held {
     }
 }
 
-/// The blob route over `cache`; with `readers` `None` it answers every request `404`.
-pub fn router<M, O>(cache: Arc<Cache<M, O>>, readers: Option<BlobReaders>) -> Router
+/// The blob route over `cache`; with `readers` `None` it answers every request `404`. The
+/// bytes of its answers are taken from `budget`, which the caller shares with the other
+/// readers of the process (the failure-log route and the history writer's tail reads).
+pub fn router<M, O>(
+    cache: Arc<Cache<M, O>>,
+    readers: Option<BlobReaders>,
+    budget: ReadBudget,
+) -> Router
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
     Router::new()
         .route("/v1/blobs/{digest}", get(blob::<M, O>))
-        .with_state(Arc::new(BlobState::new(cache, readers, READ_BUDGET_BYTES)))
+        .with_state(Arc::new(BlobState::sharing(cache, readers, budget)))
 }
 
 async fn blob<M, O>(State(state): State<Arc<BlobState<M, O>>>, parts: Parts) -> Response
@@ -208,7 +283,7 @@ where
         );
         return Err(error(StatusCode::BAD_REQUEST, &why));
     }
-    let permit = admit(Arc::clone(&state.budget), state.largest, &digest).await?;
+    let permit = admit(&state.budget, &digest).await?;
     let bytes = state
         .cache
         .read_blob(&digest)
@@ -226,34 +301,30 @@ where
 /// passed by smaller ones behind it).
 ///
 /// # Errors
-/// `404` for a digest larger than the whole budget, `largest` bytes: the route's is
+/// `404` for a digest larger than the whole budget: the route's is
 /// [`kbf_front::MAX_BLOB_BYTES`], so the cache never holds such a blob;
 /// `503` with `Retry-After` and `"busy": true` when the share is not free within
 /// [`READ_BUDGET_WAIT`].
-async fn admit(
-    budget: Arc<Semaphore>,
-    largest: u64,
-    digest: &Digest,
-) -> Result<OwnedSemaphorePermit, Response> {
-    let Some(permits) = u32::try_from(digest.size_bytes)
-        .ok()
-        .filter(|&n| u64::from(n) <= largest)
-    else {
-        // INVARIANT: the cache holds no blob over MAX_BLOB_BYTES (the route's
-        // `largest`). `Cache::store_blobs`, the one way bytes are stored, refuses one;
-        // ByteStream Write refuses it before buffering and batches are capped at
-        // MAX_BATCH_TOTAL_BYTES. So this 404 is the answer a read would give.
-        let why = format!(
-            "{digest} is larger than the largest blob this cache accepts \
-             ({largest} bytes), so it is not held"
-        );
-        return Err(error(StatusCode::NOT_FOUND, &why));
-    };
-    tokio::time::timeout(READ_BUDGET_WAIT, budget.acquire_many_owned(permits))
+async fn admit(budget: &ReadBudget, digest: &Digest) -> Result<OwnedSemaphorePermit, Response> {
+    budget
+        .acquire(digest.size_bytes, READ_BUDGET_WAIT)
         .await
-        .ok()
-        .and_then(Result::ok)
-        .ok_or_else(|| busy(digest))
+        .map_err(|refused| match refused {
+            Refused::Busy => busy(digest),
+            Refused::TooLarge => {
+                // INVARIANT: the cache holds no blob over MAX_BLOB_BYTES (the route's
+                // `largest`). `Cache::store_blobs`, the one way bytes are stored, refuses
+                // one; ByteStream Write refuses it before buffering and batches are
+                // capped at MAX_BATCH_TOTAL_BYTES. So this 404 is the answer a read would
+                // give.
+                let largest = budget.largest;
+                let why = format!(
+                    "{digest} is larger than the largest blob this cache accepts \
+                     ({largest} bytes), so it is not held"
+                );
+                error(StatusCode::NOT_FOUND, &why)
+            }
+        })
 }
 
 /// The `503` of a read whose share of the budget was not free in time: `Retry-After`
@@ -304,7 +375,7 @@ fn served(bytes: &Bytes, query: &Query, range: Option<&HeaderValue>) -> Response
 }
 
 /// A header value built from visible ASCII, which is always one.
-fn header(text: String) -> HeaderValue {
+pub(crate) fn header(text: String) -> HeaderValue {
     HeaderValue::try_from(text).expect("visible ASCII is a header value")
 }
 
@@ -371,7 +442,7 @@ impl Query {
 
 /// What part of a blob of some length a `Range` header asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Wanted {
+pub(crate) enum Wanted {
     /// All of it: no header, or one that is ignored.
     Whole,
     /// Bytes `first..=last`, both inside the blob.
@@ -389,7 +460,7 @@ enum Wanted {
 /// for. One range of the unit `bytes` (any case) is honoured; several ranges, another
 /// unit or a malformed value are ignored ([`Wanted::Whole`]). A last byte past the
 /// end is read as the end.
-fn wanted(range: Option<&HeaderValue>, len: u64) -> Wanted {
+pub(crate) fn wanted(range: Option<&HeaderValue>, len: u64) -> Wanted {
     let Some((unit, spec)) = range
         .and_then(|r| r.to_str().ok())
         .and_then(|r| r.split_once('='))

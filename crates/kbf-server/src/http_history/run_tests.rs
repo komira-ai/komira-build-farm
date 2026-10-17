@@ -4,7 +4,7 @@ use kbf_history::records::{Cgroup, MemoryKill, RunOutcome, RunRecord, Timestamps
 use kbf_history::{RunId, StreamId};
 use serde_json::{Value, json};
 
-use super::{parse, render};
+use super::{add_tail, parse, render, rendering};
 
 fn wire(n: u8) -> WireDigest {
     WireDigest::new([n; 32], u64::from(n))
@@ -260,6 +260,61 @@ fn only_the_lowercase_24_digits_are_a_run_id() {
     }
 }
 
+/// Catches: a tail shown with the reason it is missing as well (or none), the wrong reason,
+/// invalid UTF-8 shown as a failure, the length of the log lost with its tail, and a tail
+/// not saying that it is not redacted.
+#[test]
+fn a_tail_is_text_or_the_reason_it_is_not() {
+    use kbf_history::records::{Tail, TailOmitted};
+    let shown = |tail: &Tail| {
+        let mut log = serde_json::Map::new();
+        add_tail(&mut log, tail);
+        Value::Object(log)
+    };
+    let of = |omitted: TailOmitted| Tail {
+        bytes: Vec::new(),
+        total_bytes: 99,
+        omitted: omitted.into(),
+    };
+    assert_eq!(
+        shown(&Tail::of(b"last words\n")),
+        json!({"tail": "last words\n", "tail_omitted": null, "total_bytes": 11,
+               "tail_redacted": false})
+    );
+    // A cut in the middle of a character, and bytes that are not text at all.
+    assert_eq!(shown(&Tail::of(&[0xff, b'o', b'k']))["tail"], "\u{fffd}ok");
+    for (omitted, why) in [
+        (TailOmitted::TooLarge, "too_large"),
+        (TailOmitted::Unreadable, "unreadable"),
+        (TailOmitted::Busy, "busy"),
+    ] {
+        assert_eq!(
+            shown(&of(omitted)),
+            json!({"tail": null, "tail_omitted": why, "total_bytes": 99,
+                   "tail_redacted": false}),
+            "{why}"
+        );
+    }
+}
+
+/// Catches: a command rendering shown with environment values (only names are kept), one
+/// that does not say it is not redacted, and a key renamed.
+#[test]
+fn a_command_rendering_shows_names_and_says_it_is_not_redacted() {
+    let c = kbf_history::records::CommandRendering {
+        argv: vec!["cc".into(), "-c".into()],
+        env_names: vec!["PATH".into()],
+        working_directory: "w".into(),
+        output_paths: vec!["a.o".into()],
+        truncated: true,
+    };
+    assert_eq!(
+        rendering(&c),
+        json!({"argv": ["cc", "-c"], "env_names": ["PATH"], "working_directory": "w",
+               "output_paths": ["a.o"], "truncated": true, "redacted": false})
+    );
+}
+
 mod recorder_side {
     use std::sync::Arc;
     use std::time::Duration;
@@ -280,7 +335,9 @@ mod recorder_side {
 
     use crate::history::{HistoryReads, HistoryTap, RunIndex, Shared};
     use crate::http_history::Durable;
-    use crate::http_history::run::{RunState, live};
+    use crate::http_history::run::{RunState, add_logs, live};
+    use crate::http_invocations::InvocationReaders;
+    use serde_json::Value;
 
     fn key(id: &str) -> RecordKey {
         RecordKey::owner(InvocationId::new(id))
@@ -349,6 +406,8 @@ mod recorder_side {
             recorder,
             readers: None,
             durable: Arc::new(Durable::new(Arc::new(reads))),
+            presence: Arc::new(kbf_front::Cache::memory()),
+            budget: crate::http_blobs::ReadBudget::default(),
         };
         (state, runs, RunId::from_bytes(id))
     }
@@ -377,5 +436,93 @@ mod recorder_side {
         // The row is there, and its attempt carries another id.
         runs.note([4; 12], key("held"), 0);
         assert!(live(&state, RunId::from_bytes([4; 12])).is_none());
+    }
+
+    /// Catches: a digest that is not a SHA-256 one (a hash of the wrong length) making the
+    /// run page fail or lose the log (it is shown as sent, with no link and no answer to
+    /// whether it is held), a log's `available` taken from another log's answer, a blob
+    /// that is held linked to anything but the blob route, one that is gone given no link
+    /// when the route is on (history holds no copy of it here), a tail put on the log it
+    /// is not of, a failed run's command rendering lost, and the logs of a run that has
+    /// none given an empty object.
+    #[tokio::test]
+    async fn a_run_page_shows_each_log_as_held_gone_or_malformed_with_its_tail() {
+        use kbf_history::records::WireDigest;
+        use kbf_history::records::{CommandRendering, FailedRun, RunRecord, Tail, TailOmitted};
+        let cache = Arc::new(kbf_front::Cache::memory());
+        let blob = kbf_front::VerifiedBlob::hashed(bytes::Bytes::from_static(b"held output"));
+        let held = blob.digest();
+        cache.store_blobs(vec![blob]).await.expect("stored");
+        let (state, _, _) = state().await;
+        let state = RunState {
+            presence: cache,
+            ..state
+        };
+        let policy = kbf_auth::Policy::from_json(
+            r#"{"authenticationPolicy": {"allow": {}},
+                "invocations": {"getAuthorizer": {"allow": {}}},
+                "blobs": {"getAuthorizer": {"allow": {}}}}"#,
+        )
+        .expect("a policy");
+        let readers = InvocationReaders::from_policy(&policy).expect("readers");
+        let record = RunRecord {
+            instance: "main".into(),
+            stdout: Some(WireDigest::new(held.hash, held.size_bytes)),
+            stderr: Some(WireDigest {
+                hash: vec![1, 2, 3],
+                size: 5,
+            }),
+            result: Some(WireDigest::new([7; 32], 7)),
+            ..RunRecord::default()
+        };
+        let failed = FailedRun {
+            stdout: Some(Tail::of(b"held out")),
+            stderr: Some(Tail {
+                bytes: Vec::new(),
+                total_bytes: 5,
+                omitted: TailOmitted::Busy.into(),
+            }),
+            command: Some(CommandRendering {
+                argv: vec!["cc".into()],
+                ..CommandRendering::default()
+            }),
+            ..FailedRun::default()
+        };
+        let mut value = serde_json::json!({});
+        add_logs(&state, &readers, &record, Some(&failed), &mut value).await;
+        let logs = &value["logs"];
+        assert_eq!(logs["stdout"]["available"], true, "{value}");
+        let href = logs["stdout"]["href"].as_str().expect("a link");
+        assert!(
+            href.starts_with("/v1/blobs/") && href.contains("instance=main"),
+            "{href}"
+        );
+        assert_eq!(logs["stdout"]["tail"], "held out");
+        assert_eq!(logs["stderr"]["digest"], "010203-5");
+        assert_eq!(logs["stderr"]["available"], Value::Null);
+        assert_eq!(logs["stderr"]["href"], Value::Null);
+        assert_eq!(logs["stderr"]["tail_omitted"], "busy");
+        assert_eq!(logs["result"]["available"], false, "{value}");
+        assert!(
+            logs["result"]["href"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("/v1/blobs/"),
+            "no copy is held, so the blob route's link stays: {value}"
+        );
+        assert!(logs["result"].get("tail").is_none(), "{value}");
+        assert_eq!(
+            value["command_rendering"]["argv"],
+            serde_json::json!(["cc"])
+        );
+        // Without a failed section: no tails and no rendering.
+        let mut value = serde_json::json!({});
+        add_logs(&state, &readers, &record, None, &mut value).await;
+        assert!(value["logs"]["stdout"].get("tail").is_none(), "{value}");
+        assert!(value.get("command_rendering").is_none(), "{value}");
+        // A run with no log at all has no `logs`.
+        let mut value = serde_json::json!({});
+        add_logs(&state, &readers, &RunRecord::default(), None, &mut value).await;
+        assert!(value.get("logs").is_none(), "{value}");
     }
 }

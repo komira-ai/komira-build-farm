@@ -18,6 +18,10 @@ pub struct Stats {
     invocations: AtomicU64,
     pending_rows: AtomicUsize,
     open_invocations: AtomicUsize,
+    /// Failed runs offered without tails: the tail workers' queue was full.
+    tail: AtomicU64,
+    /// Failure-log objects that could not be written (counted with `put`).
+    flog_put: AtomicU64,
 }
 
 impl Stats {
@@ -30,7 +34,19 @@ impl Stats {
             invocations: AtomicU64::new(0),
             pending_rows: AtomicUsize::new(0),
             open_invocations: AtomicUsize::new(0),
+            tail: AtomicU64::new(0),
+            flog_put: AtomicU64::new(0),
         }
+    }
+
+    /// Counts a failed run offered without tails (`stage="tail"`).
+    pub(super) fn tail_dropped(&self) {
+        self.tail.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a failure-log object that was not written (`stage="put"`).
+    pub(super) fn flog_put_failed(&self) {
+        self.flog_put.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Takes what the writer holds after a step.
@@ -44,19 +60,25 @@ impl Stats {
             .store(open_invocations, Ordering::Relaxed);
     }
 
-    /// Records dropped, by stage: `queue`, `buffer`, `put`, `index` and `invocations`.
-    fn stages(&self) -> [(&'static str, u64); 5] {
+    /// Records dropped, by stage: `queue`, `buffer`, `put`, `index`, `invocations` and
+    /// `tail`. `put` counts the writer's chunk writes and the failure-log objects that
+    /// could not be written.
+    fn stages(&self) -> [(&'static str, u64); 6] {
         [
             ("queue", self.queue.dropped()),
             ("buffer", self.buffer.load(Ordering::Relaxed)),
-            ("put", self.put.load(Ordering::Relaxed)),
+            (
+                "put",
+                self.put.load(Ordering::Relaxed) + self.flog_put.load(Ordering::Relaxed),
+            ),
             ("index", self.index.load(Ordering::Relaxed)),
             ("invocations", self.invocations.load(Ordering::Relaxed)),
+            ("tail", self.tail.load(Ordering::Relaxed)),
         ]
     }
 
-    /// Records dropped at `stage` (one of `queue`, `buffer`, `put`, `index` and
-    /// `invocations`; 0 for any other name).
+    /// Records dropped at `stage` (one of `queue`, `buffer`, `put`, `index`,
+    /// `invocations` and `tail`; 0 for any other name).
     #[must_use]
     pub fn dropped(&self, stage: &str) -> u64 {
         self.stages()

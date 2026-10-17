@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use prost::Message;
 
+use crate::flog::FlogRef;
 use crate::keys::{Day, InvKey, WriterId};
 use crate::records::{FailedRun, HitRecord, RunRecord};
 
@@ -72,9 +73,22 @@ pub enum Event {
         /// The invocation.
         inv: InvRef,
     },
+    /// A failure-log object that was written: the writer puts its index row. Offered
+    /// only after the object's PUT returned, so no row names an object not written.
+    Flog(FlogRef),
 }
 
 impl Event {
+    /// The invocation the event belongs to; `None` for a failure-log object, which
+    /// belongs to a run and not to an invocation's records.
+    #[must_use]
+    pub fn inv(&self) -> Option<&InvRef> {
+        match self {
+            Event::Run { inv, .. } | Event::Hit { inv, .. } | Event::Close { inv } => Some(inv),
+            Event::Flog(_) => None,
+        }
+    }
+
     /// The bytes the event holds in memory, for the queue's byte bound: its records'
     /// encoded length plus a fixed allowance for the invocation reference.
     #[must_use]
@@ -86,7 +100,7 @@ impl Event {
                     record.encoded_len() + failed.as_ref().map_or(0, Message::encoded_len)
                 }
                 Event::Hit { record, .. } => record.encoded_len(),
-                Event::Close { .. } => 0,
+                Event::Close { .. } | Event::Flog(_) => 0,
             }
     }
 }

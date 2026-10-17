@@ -11,7 +11,7 @@ use std::fmt;
 use kbf_objstore::{KeyError, KeyPrefix, ObjectKey};
 use sha2::{Digest as _, Sha256};
 
-use crate::run_id::StreamId;
+use crate::run_id::{RunId, StreamId};
 
 const MS_PER_DAY: u64 = 86_400_000;
 
@@ -193,6 +193,9 @@ pub enum Family {
     /// An invocation chunk: run and hit records, and the failed-run section (tails and
     /// command renderings), of one invocation from one writer.
     InvocationChunk,
+    /// The copy of a failed run's stdout, stderr and ActionResult, kept after the log
+    /// blobs themselves are gone (ui-data.md Q21): one object per run.
+    FailureLog,
 }
 
 impl Family {
@@ -201,6 +204,7 @@ impl Family {
     pub fn number(self) -> u8 {
         match self {
             Family::InvocationChunk => 1,
+            Family::FailureLog => 2,
         }
     }
 
@@ -209,6 +213,7 @@ impl Family {
     pub fn from_number(n: u8) -> Option<Family> {
         match n {
             1 => Some(Family::InvocationChunk),
+            2 => Some(Family::FailureLog),
             _ => None,
         }
     }
@@ -217,7 +222,7 @@ impl Family {
     #[must_use]
     pub fn class(self) -> Class {
         match self {
-            Family::InvocationChunk => Class::R30,
+            Family::InvocationChunk | Family::FailureLog => Class::R30,
         }
     }
 
@@ -226,6 +231,7 @@ impl Family {
     pub fn dir(self) -> &'static str {
         match self {
             Family::InvocationChunk => "inv",
+            Family::FailureLog => "flog",
         }
     }
 }
@@ -264,6 +270,25 @@ impl HistoryRoot {
         );
         // Every part is hex digits, a fixed word or a `yyyymmdd` number under a prefix
         // that was checked, so the key is valid by construction.
+        self.0
+            .key(&name)
+            .expect("hex digits and fixed words under a checked prefix make a valid key")
+    }
+
+    /// The key of the failure-log copy of run `run`:
+    /// `<root>history/r30/flog/<day>/<run id>`. The day is the run id's own (the UTC day
+    /// of its commit time), not the day the copy was written, so the key follows from
+    /// the id alone and a sweeper deleting by the day in the key sees the run's day.
+    #[must_use]
+    pub fn flog(&self, run: RunId) -> ObjectKey {
+        let family = Family::FailureLog;
+        let name = format!(
+            "{}/{}/{}/{run}",
+            family.class().prefix(),
+            family.dir(),
+            run.day()
+        );
+        // Hex digits and fixed words under a checked prefix, as for a chunk.
         self.0
             .key(&name)
             .expect("hex digits and fixed words under a checked prefix make a valid key")
@@ -329,6 +354,19 @@ impl IndexRoot {
     #[must_use]
     pub fn ichunk(&self, inv: &InvKey, writer: WriterId, seq: u32) -> String {
         format!("{}ichunk/{inv}/{writer}/{seq:08x}", self.0)
+    }
+
+    /// The row of the object `name` of `family` written on `day`:
+    /// `ui/obj/<family dir>/<day>/<name>`, holding where its footer is.
+    #[must_use]
+    pub fn obj(&self, family: Family, day: Day, name: &str) -> String {
+        format!("{}obj/{}/{day}/{name}", self.0, family.dir())
+    }
+
+    /// The row of the failure-log copy of `run` (see [`HistoryRoot::flog`]).
+    #[must_use]
+    pub fn obj_flog(&self, run: RunId) -> String {
+        self.obj(Family::FailureLog, run.day(), &run.to_string())
     }
 
     /// The prefix of every row of `stream` on `day`, in open-time order.
@@ -437,8 +475,39 @@ mod tests {
         let f = Family::InvocationChunk;
         assert_eq!(Family::from_number(f.number()), Some(f));
         assert_eq!(Family::from_number(0), None);
-        assert_eq!(Family::from_number(2), None);
         assert_eq!((f.class(), f.dir()), (Class::R30, "inv"));
+        // The failure-log copy is family 2, in class r30 under `flog`; a byte past it is
+        // still unknown.
+        let flog = Family::FailureLog;
+        assert_eq!(flog.number(), 2);
+        assert_eq!(Family::from_number(2), Some(flog));
+        assert_eq!(Family::from_number(3), None);
+        assert_eq!((flog.class(), flog.dir()), (Class::R30, "flog"));
+    }
+
+    #[test]
+    fn failure_log_keys_follow_from_the_run_id_alone() {
+        // Catches: a key or row that needs more than the run id (a reader holds nothing
+        // else), a day that is not the run id's (the sweeper deletes by the day in the
+        // key), and a row key that does not sit under the retention class and family of
+        // its object.
+        let root = HistoryRoot::under(&KeyPrefix::new("kbf/").unwrap()).unwrap();
+        let run = RunId::new(1_792_108_800_000, StreamId(0x80_0001), 5);
+        let key = root.flog(run);
+        assert_eq!(
+            key.as_str(),
+            format!("kbf/history/r30/flog/20261016/{run}"),
+            "{key:?}"
+        );
+        let rows = IndexRoot::under("tenant-a/").unwrap();
+        assert_eq!(
+            rows.obj_flog(run),
+            format!("tenant-a/ui/obj/flog/20261016/{run}")
+        );
+        assert_eq!(
+            rows.obj(Family::InvocationChunk, Day::from_number(20_261_016), "x"),
+            "tenant-a/ui/obj/inv/20261016/x"
+        );
     }
 
     #[test]

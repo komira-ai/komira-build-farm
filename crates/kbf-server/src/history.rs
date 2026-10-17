@@ -21,13 +21,19 @@
 //! - **A stop is a flush.** On a graceful stop the writer takes one more step, for at
 //!   most five seconds, with every open invocation closed.
 //!
-//! Not here: a run's tails and command rendering, the list and shape index rows, and
-//! any read route.
+//! - **A failed run keeps its logs** (ui-data.md Q21). Given a blob source
+//!   ([`History::with_blobs`]), the tap hands a failed run to a small pool of workers
+//!   ([`tails`]) instead of the queue: they read its last 16 KiB of stdout and stderr and
+//!   its Command, copy its logs and ActionResult into an object of their own, and then
+//!   offer the run with those tails. Successful runs are offered at once, as before.
+//!
+//! Not here: the list and shape index rows.
 
 mod driver;
 mod flags;
 mod reads;
 mod stats;
+mod tails;
 mod tap;
 
 pub use driver::{History, Options, STEP_EVERY, over};
@@ -37,6 +43,9 @@ pub use reads::HistoryReads;
 #[cfg(test)]
 pub(crate) use reads::Shared;
 pub use stats::Stats;
+pub use tails::{
+    BlobReadError, BlobReads, COMMAND_READ_BYTES, RESULT_COPY_BYTES, TAIL_READ_BYTES, TailOptions,
+};
 pub use tap::HistoryTap;
 #[cfg(test)]
 pub(crate) use tap::RunIndex;

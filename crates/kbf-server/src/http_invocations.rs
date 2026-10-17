@@ -39,15 +39,15 @@ use kbf_objstore::ObjectStore;
 use serde_json::Value;
 
 use crate::history::HistoryReads;
-use crate::http_blobs::{error, off, refusal};
-use crate::http_history::{Durable, run_router};
+use crate::http_blobs::{ReadBudget, error, off, refusal};
+use crate::http_history::{Durable, Presence, run_router};
 
 mod pages;
 mod views;
 
 pub(crate) use pages::{Bad, Request, answer};
 pub use pages::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
-pub(crate) use views::{Draft, rfc3339};
+pub(crate) use views::{Draft, blob_href, rfc3339};
 
 /// The call name refusals are logged with.
 pub(crate) const CALL: &str = "GET /v1/invocations";
@@ -89,21 +89,30 @@ struct PagesState<M, O> {
 /// The build pages over `recorder`'s records, saying whether each blob is still in
 /// `cache`; with `readers` `None` they answer every request `404`. With `history`, a
 /// record the recorder does not hold is read back from it, and `GET /v1/runs/{id}`
-/// answers ([`crate::http_history`]); without it the routes are what they were.
+/// answers ([`crate::http_history`]), and its logs, reading under `budget` (the process's
+/// one read budget); without it the routes are what they were.
 pub fn router<M, O>(
     recorder: Recorder,
     cache: Arc<Cache<M, O>>,
     readers: Option<InvocationReaders>,
     history: Option<Arc<HistoryReads>>,
+    budget: ReadBudget,
 ) -> Router
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
     let durable = history.map(|reads| Arc::new(Durable::new(reads)));
-    let runs = durable
-        .as_ref()
-        .map(|d| run_router(recorder.clone(), readers.clone(), Arc::clone(d)));
+    let presence: Arc<dyn Presence> = cache.clone();
+    let runs = durable.as_ref().map(|d| {
+        run_router(
+            recorder.clone(),
+            readers.clone(),
+            Arc::clone(d),
+            presence,
+            budget,
+        )
+    });
     let state = Arc::new(PagesState {
         recorder,
         cache,

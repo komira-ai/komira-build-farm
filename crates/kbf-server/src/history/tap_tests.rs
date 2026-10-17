@@ -673,3 +673,173 @@ fn a_tap_shows_as_itself() {
         "{shown}"
     );
 }
+
+mod pool {
+    //! A tap with the tail pool installed: which runs go to it, and what happens when it is
+    //! full. The workers are not started, so a job stays queued where the test can see it.
+
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures::future::BoxFuture;
+    use kbf_history::{FlogStore, HistoryRoot, WriterId};
+    use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+
+    use super::*;
+    use crate::history::reads::Shared;
+    use crate::history::stats::Stats;
+    use crate::history::tails::{
+        BlobReadError, BlobReads, Parts, TailOptions, Tails, Workers, pool,
+    };
+    use crate::http_blobs::ReadBudget;
+
+    /// Blobs that are never there.
+    struct NoBlobs;
+
+    impl BlobReads for NoBlobs {
+        fn read<'a>(&'a self, _: &'a Digest) -> BoxFuture<'a, Result<Bytes, BlobReadError>> {
+            Box::pin(async { Err(BlobReadError("none".to_owned())) })
+        }
+    }
+
+    /// A pool of `queue` jobs over `rig`'s queue, its workers not started.
+    fn made(rig: &Rig, queue: usize) -> (Tails, Arc<Stats>, Workers) {
+        let stats = Arc::new(Stats::new(Arc::clone(&rig.queue)));
+        let objects = Shared(Arc::new(MemoryStore::new(Capabilities::default())));
+        let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
+        let parts = Parts {
+            queue: Arc::clone(&rig.queue),
+            blobs: Arc::new(NoBlobs),
+            budget: ReadBudget::default(),
+            flog: Arc::new(FlogStore::new(objects, root, WriterId(1))),
+            stats: Arc::clone(&stats),
+            open: rig.tap.open_set(),
+        };
+        let options = TailOptions {
+            queue,
+            workers: 1,
+            wait: Duration::from_millis(10),
+            read_timeout: Duration::from_secs(1),
+        };
+        let (tails, workers) = pool(parts, options);
+        (tails, stats, workers)
+    }
+
+    /// A rig whose tap has a pool of `queue` jobs, its workers not started.
+    fn pooled(queue: usize) -> (Rig, Arc<Stats>, Workers) {
+        let rig = rig(16);
+        let (tails, stats, workers) = made(&rig, queue);
+        assert!(!rig.tap.has_tails());
+        rig.tap.install_tails(tails);
+        assert!(rig.tap.has_tails());
+        (rig, stats, workers)
+    }
+
+    fn failing() -> ActionRow {
+        row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 1 }),
+        )
+    }
+
+    fn passing() -> ActionRow {
+        row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 0 }),
+        )
+    }
+
+    /// Catches (mutant "copy successful runs too"): a run that passed sent through the pool
+    /// (it would be held for reads of logs nobody will want), and a run that failed offered
+    /// to the writer at once with no tails (the pool would be bypassed). The failed run is
+    /// minted, remembered and its id returned, and its invocation is open, as any run's.
+    #[tokio::test]
+    async fn only_a_failed_run_goes_to_the_pool() {
+        let (rig, stats, workers) = pooled(8);
+        let ok = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &passing());
+        assert!(ok.is_some());
+        let events = rig.queue.drain();
+        assert_eq!(events.len(), 1, "a passing run is offered at once");
+        assert!(matches!(&events[0], Event::Run { failed: None, .. }));
+        let bad = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        let id = bad.expect("an id for a run in the pool");
+        assert!(
+            rig.queue.is_empty(),
+            "nothing is offered until its tails are read"
+        );
+        assert_eq!(stats.dropped("tail"), 0);
+        assert_eq!(rig.tap.runs().find(&id), Some((key("b"), 0)));
+        // The invocation is open: an idle record closes it.
+        rig.tap.idle(&key("b"));
+        assert!(matches!(&rig.queue.drain()[..], [Event::Close { .. }]));
+        // Its workers run it: the run arrives with a failed section, then the close again,
+        // since the invocation was closed meanwhile.
+        let handles = workers.spawn();
+        rig.tap.quiesce().await;
+        let events = rig.queue.drain();
+        assert!(
+            matches!(
+                &events[0],
+                Event::Run {
+                    failed: Some(_),
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
+        assert!(matches!(&events[1], Event::Close { .. }), "{events:?}");
+        handles.iter().for_each(tokio::task::JoinHandle::abort);
+    }
+
+    /// Catches: a full pool that waits or fails the run (the tap runs on the recorder's
+    /// task: it never waits), a run lost with its tails (it is offered with none, and its
+    /// id kept, as before the pool), and a drop not counted as `stage="tail"`.
+    #[tokio::test]
+    async fn a_full_pool_offers_the_run_without_tails_and_counts_it() {
+        let (rig, stats, _workers) = pooled(1);
+        let first = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        assert!(first.is_some());
+        assert!(rig.queue.is_empty());
+        let second = rig
+            .tap
+            .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        assert!(second.is_some(), "its id is kept");
+        assert_ne!(first, second);
+        assert_eq!(stats.dropped("tail"), 1);
+        let events = rig.queue.drain();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], Event::Run { failed: None, .. }),
+            "offered at once, with no tails: {events:?}"
+        );
+    }
+
+    /// Catches: a second pool replacing the first (a run in the first would be lost with
+    /// its workers), and a tap with no pool reporting one or waiting for one.
+    #[tokio::test]
+    async fn the_first_pool_stays() {
+        let (rig, stats, _workers) = pooled(1);
+        let (second, second_stats, _second_workers) = made(&rig, 8);
+        rig.tap.install_tails(second);
+        for _ in 0..2 {
+            rig.tap
+                .ended(&ended("b", EndedKind::Finished, Some(0)), &failing());
+        }
+        assert_eq!(
+            stats.dropped("tail"),
+            1,
+            "the first pool, of one job, is full"
+        );
+        assert_eq!(second_stats.dropped("tail"), 0);
+        let bare = self::rig(4);
+        assert!(!bare.tap.has_tails());
+        // Without a pool, quiesce is at once.
+        bare.tap.quiesce().await;
+    }
+}

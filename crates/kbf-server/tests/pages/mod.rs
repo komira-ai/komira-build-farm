@@ -139,8 +139,14 @@ impl Server {
 
     /// One `GET` of `path` (raw: sent as given).
     pub async fn get(&self, path: &str) -> Answer {
+        self.get_with(path, "").await
+    }
+
+    /// [`Server::get`] with `headers` added to the request: lines ending in `\r\n`.
+    pub async fn get_with(&self, path: &str, headers: &str) -> Answer {
         let mut stream = TcpStream::connect(self.api).await.expect("connect");
-        let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: kbf\r\n{headers}Connection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.expect("send");
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.expect("read");

@@ -40,6 +40,29 @@ impl Draft {
     }
 }
 
+/// `/v1/blobs/{digest}?instance=..` for a blob (and `name` and `inline=text` when given),
+/// or `null` when the blob route is off (`blobs_on` false).
+pub(crate) fn blob_href(
+    blobs_on: bool,
+    digest: &Digest,
+    instance: &str,
+    name: Option<&str>,
+    inline: bool,
+) -> Value {
+    if !blobs_on {
+        return Value::Null;
+    }
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("instance", instance);
+    if let Some(name) = name {
+        query.append_pair("name", name);
+    }
+    if inline {
+        query.append_pair("inline", "text");
+    }
+    format!("/v1/blobs/{}?{}", digest_text(digest), query.finish()).into()
+}
+
 /// Builds a route's answer, noting each blob it lists.
 pub(super) struct Builder {
     /// Whether the blob route answers: without it every `href` is `null`.
@@ -71,18 +94,7 @@ impl Builder {
 
     /// `/v1/blobs/{digest}?instance=..` for a blob, or `null` with the blob route off.
     fn href(&self, digest: &Digest, instance: &str, name: Option<&str>, inline: bool) -> Value {
-        if !self.blobs_on {
-            return Value::Null;
-        }
-        let mut query = form_urlencoded::Serializer::new(String::new());
-        query.append_pair("instance", instance);
-        if let Some(name) = name {
-            query.append_pair("name", name);
-        }
-        if inline {
-            query.append_pair("inline", "text");
-        }
-        format!("/v1/blobs/{}?{}", digest_text(digest), query.finish()).into()
+        blob_href(self.blobs_on, digest, instance, name, inline)
     }
 
     /// A log's object, linked as text when it is small enough to be shown inline.

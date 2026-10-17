@@ -14,41 +14,56 @@ use axum::routing::get;
 use kbf_auth::authorize;
 use kbf_front::Recorder;
 use kbf_history::RunId;
-use kbf_history::records::{RunOutcome, RunRecord, Timestamps, WireDigest};
+use kbf_history::records::{
+    CommandRendering, FailedRun, FlogStream, RunOutcome, RunRecord, Tail, TailOmitted, Timestamps,
+    WireDigest,
+};
 use kbf_invocation::WallTime;
+use kbf_types::Digest;
 use serde_json::{Map, Value, json};
 
-use super::Durable;
+use super::logs;
+use super::{Durable, Presence};
 use crate::history::run_record;
-use crate::http_blobs::{error, refusal};
-use crate::http_invocations::{InvocationReaders, json, pages_off, rfc3339};
+use crate::http_blobs::{ReadBudget, error, refusal};
+use crate::http_invocations::{InvocationReaders, blob_href, json, pages_off, rfc3339};
 
 /// The call name refusals are logged with.
 const CALL: &str = "GET /v1/runs";
 
 /// The routes' path prefix; the run id follows it.
-const PREFIX: &str = "/v1/runs/";
+pub(super) const PREFIX: &str = "/v1/runs/";
 
-struct RunState {
-    recorder: Recorder,
-    readers: Option<InvocationReaders>,
-    durable: Arc<Durable>,
+pub(super) struct RunState {
+    pub(super) recorder: Recorder,
+    pub(super) readers: Option<InvocationReaders>,
+    pub(super) durable: Arc<Durable>,
+    /// Which blobs the cache still holds, for each log's `available` and `href`.
+    pub(super) presence: Arc<dyn Presence>,
+    /// The memory a log read holds, shared with the blob route and the tail workers.
+    pub(super) budget: ReadBudget,
 }
 
-/// `GET /v1/runs/{id}` over `recorder`'s records and `durable`'s history, answering as
-/// the build pages do: off unless the policy names an `invocations.getAuthorizer`.
+/// `GET /v1/runs/{id}` and its logs over `recorder`'s records and `durable`'s history,
+/// answering as the build pages do: off unless the policy names an
+/// `invocations.getAuthorizer`.
 pub(crate) fn router(
     recorder: Recorder,
     readers: Option<InvocationReaders>,
     durable: Arc<Durable>,
+    presence: Arc<dyn Presence>,
+    budget: ReadBudget,
 ) -> Router {
     let state = Arc::new(RunState {
         recorder,
         readers,
         durable,
+        presence,
+        budget,
     });
     Router::new()
         .route("/v1/runs/{id}", get(page))
+        .route("/v1/runs/{id}/logs/{stream}", get(logs::page))
         .with_state(state)
 }
 
@@ -82,50 +97,76 @@ async fn read(
             &format!("{text:?} is not a run id: 24 lowercase hex digits"),
         )
     })?;
-    let live = live(state, id);
-    let record = if live.is_some() {
-        live
-    } else {
-        state
-            .durable
-            .reads
-            .run(id, &|_| true)
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "build history could not be read");
-                error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "build history cannot be read right now",
-                )
-            })?
-            .map(|view| view.run)
-    };
-    let Some(record) = record else {
-        let body = json!({"error": "no_run", "id": text}).to_string();
-        let answer = (
-            StatusCode::NOT_FOUND,
-            [(axum::http::header::CONTENT_TYPE, crate::api::JSON)],
-            body,
-        );
-        return Err(answer.into_response());
+    let Some((record, failed)) = find(state, id).await? else {
+        return Err(no_run(text));
     };
     // The run's one instance, asked as a REAPI call's instance name is, before anything
     // of the run is answered.
     authorize(&*readers.authorizer, &caller, CALL, &record.instance)
         .await
         .map_err(|e| refusal(&e))?;
-    Ok(render(&record))
+    let mut value = render(&record);
+    add_logs(state, readers, &record, failed.as_ref(), &mut value).await;
+    Ok(value)
+}
+
+/// The `404` of a run id nothing holds.
+pub(super) fn no_run(text: &str) -> Response {
+    let body = json!({"error": "no_run", "id": text}).to_string();
+    let answer = (
+        StatusCode::NOT_FOUND,
+        [(axum::http::header::CONTENT_TYPE, crate::api::JSON)],
+        body,
+    );
+    answer.into_response()
+}
+
+/// The run `id`, from the recorder while it holds it and from history after, with the
+/// failed-run section history holds for a failed one (the recorder has none). `None` when
+/// neither holds it.
+///
+/// # Errors
+/// `503` when history cannot be read and the recorder does not hold the run.
+pub(super) async fn find(
+    state: &RunState,
+    id: RunId,
+) -> Result<Option<(RunRecord, Option<FailedRun>)>, Response> {
+    let live = live(state, id);
+    // A live run that did not fail has nothing more in history.
+    if live.as_ref().is_some_and(|r| !r.failed()) {
+        return Ok(live.map(|r| (r, None)));
+    }
+    let view = match state.durable.reads.run(id, &|_| true).await {
+        Ok(view) => view,
+        // The recorder's own record answers; only its tails are missing.
+        Err(e) if live.is_some() => {
+            tracing::warn!(error = %e, "build history could not be read");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "build history could not be read");
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "build history cannot be read right now",
+            ));
+        }
+    };
+    Ok(match (live, view) {
+        (Some(record), view) => Some((record, view.and_then(|v| v.failed))),
+        (None, Some(view)) => Some((view.run, view.failed)),
+        (None, None) => None,
+    })
 }
 
 /// The run id `text` is: 24 lowercase hex digits.
-fn parse(text: &str) -> Option<RunId> {
+pub(super) fn parse(text: &str) -> Option<RunId> {
     let id: RunId = text.parse().ok()?;
     (id.to_string() == text).then_some(id)
 }
 
 /// The run `id`, if the recorder still holds the row it was minted for and that row's
 /// attempt still names it.
-fn live(state: &RunState, id: RunId) -> Option<RunRecord> {
+pub(super) fn live(state: &RunState, id: RunId) -> Option<RunRecord> {
     let bytes = id.to_bytes();
     let (key, row) = state.durable.reads.runs().find(&bytes)?;
     let mut found = None;
@@ -144,6 +185,137 @@ fn live(state: &RunState, id: RunId) -> Option<RunRecord> {
             });
     });
     found
+}
+
+/// The digest `d` names, if it is a SHA-256 one.
+fn digest_of(d: &WireDigest) -> Option<Digest> {
+    let hash = <[u8; 32]>::try_from(d.hash.as_slice()).ok()?;
+    Some(Digest::new(kbf_types::DigestFunction::Sha256, hash, d.size))
+}
+
+/// Adds `logs` (each log the run has: its digest, whether the blob is still held, a
+/// link, and the tail history kept) and, for a failed run, its `command_rendering`.
+async fn add_logs(
+    state: &RunState,
+    readers: &InvocationReaders,
+    record: &RunRecord,
+    failed: Option<&FailedRun>,
+    value: &mut Value,
+) {
+    let wanted = [
+        (FlogStream::Stdout, record.stdout.as_ref()),
+        (FlogStream::Stderr, record.stderr.as_ref()),
+        (FlogStream::Result, record.result.as_ref()),
+    ];
+    let logs: Vec<(FlogStream, &WireDigest, Option<Digest>)> = wanted
+        .into_iter()
+        .filter_map(|(stream, d)| Some((stream, d?, digest_of(d?))))
+        .collect();
+    let digests: Vec<Digest> = logs.iter().filter_map(|(_, _, d)| *d).collect();
+    let present = state.presence.present(&digests).await;
+    let mut held = present.iter().flatten().copied();
+    let mut out = Map::new();
+    let id = record.run_id();
+    for (stream, wire, digest) in logs {
+        let available = digest.and_then(|_| held.next());
+        let blob = digest.map_or(Value::Null, |d| {
+            blob_href(
+                readers.blobs,
+                &d,
+                &record.instance,
+                Some(stream.name()),
+                false,
+            )
+        });
+        // The blob while it is held; once it is not, the copy history kept, if it did.
+        let href = if available == Some(false) || blob.is_null() {
+            copy_href(state, id, stream, &record.instance)
+                .await
+                .unwrap_or(blob)
+        } else {
+            blob
+        };
+        let mut log = Map::new();
+        log.insert("digest".to_owned(), digest_text(wire).into());
+        log.insert(
+            "available".to_owned(),
+            available.map_or(Value::Null, Value::Bool),
+        );
+        log.insert("href".to_owned(), href);
+        let tail = match stream {
+            FlogStream::Stdout => failed.and_then(|f| f.stdout.as_ref()),
+            FlogStream::Stderr => failed.and_then(|f| f.stderr.as_ref()),
+            FlogStream::Result => None,
+        };
+        if let Some(tail) = tail {
+            add_tail(&mut log, tail);
+        }
+        out.insert(stream.name().to_owned(), log.into());
+    }
+    // `render` made an object, and nothing since has changed that.
+    let keys = value.as_object_mut().expect("a run renders as an object");
+    if !out.is_empty() {
+        keys.insert("logs".to_owned(), out.into());
+    }
+    if let Some(command) = failed.and_then(|f| f.command.as_ref()) {
+        keys.insert("command_rendering".to_owned(), rendering(command));
+    }
+}
+
+/// The failure-log route's link for `stream` of run `id`, if history holds a copy of it
+/// for `instance` (the instance the caller was authorized on).
+async fn copy_href(
+    state: &RunState,
+    id: RunId,
+    stream: FlogStream,
+    instance: &str,
+) -> Option<Value> {
+    let allow = |i: &str| i == instance;
+    let held = state.durable.reads.failure_log(id, stream, &allow).await;
+    // A copy that cannot be read now is not linked: the page does not fail for it.
+    held.ok()
+        .flatten()
+        .map(|_| format!("{PREFIX}{id}/logs/{}", stream.name()).into())
+}
+
+/// A log's tail, as `tail` (text; invalid UTF-8 shown as the replacement character) with
+/// its `total_bytes`, or `tail: null` and the reason it is missing. Not redacted: no
+/// redaction machinery exists (ui-data.md Q8), and the key says so.
+fn add_tail(log: &mut Map<String, Value>, tail: &Tail) {
+    let why = match tail.omitted() {
+        TailOmitted::No => None,
+        TailOmitted::TooLarge => Some("too_large"),
+        TailOmitted::Unreadable => Some("unreadable"),
+        TailOmitted::Busy => Some("busy"),
+    };
+    let text = why.map_or_else(
+        || Value::String(String::from_utf8_lossy(&tail.bytes).into_owned()),
+        |_| Value::Null,
+    );
+    log.insert("tail".to_owned(), text);
+    log.insert(
+        "tail_omitted".to_owned(),
+        why.map_or(Value::Null, Value::from),
+    );
+    log.insert("total_bytes".to_owned(), tail.total_bytes.into());
+    log.insert("tail_redacted".to_owned(), false.into());
+}
+
+/// A command rendering as the page shows it: argv, environment names only, not redacted.
+fn rendering(c: &CommandRendering) -> Value {
+    json!({
+        "argv": c.argv,
+        "env_names": c.env_names,
+        "working_directory": c.working_directory,
+        "output_paths": c.output_paths,
+        "truncated": c.truncated,
+        "redacted": false,
+    })
+}
+
+/// A digest as the API writes it.
+fn digest_text(d: &WireDigest) -> String {
+    format!("{}-{}", hex::encode(&d.hash), d.size)
 }
 
 /// One run, as `GET /v1/runs/{id}` answers it: what the run record keeps, in the shape

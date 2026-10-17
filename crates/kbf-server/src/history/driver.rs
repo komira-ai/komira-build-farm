@@ -6,19 +6,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::future::BoxFuture;
 use kbf_front::Tap;
 use kbf_history::{
-    EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Limits, Minter, Offload, Offloaded,
-    QueueLimits, Reader, Writer, WriterId,
+    EventQueue, FlogObject, FlogParts, FlogRef, FlogStore, HistoryIndex, HistoryRoot, IndexRoot,
+    Limits, Minter, Offload, Offloaded, QueueLimits, Reader, RunId, Writer, WriterId,
 };
-use kbf_objstore::ObjectStore;
+use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_state::Store;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::reads::{HistoryReads, Shared};
 use super::stats::Stats;
+use super::tails::{BlobReads, FlogSink, Parts, TailOptions, Workers, pool};
 use super::tap::HistoryTap;
+use crate::http_blobs::ReadBudget;
 
 /// How often the writer takes its queue: twice a second, which keeps the index
 /// transactions at the two a second the writer's own bound allows.
@@ -26,6 +29,11 @@ pub const STEP_EVERY: Duration = Duration::from_millis(500);
 
 /// How long the last step, at a stop, may take before the task is given up.
 const FINAL_STEP: Duration = Duration::from_secs(5);
+
+/// How long a stop waits for the failed runs still in the tail pool before the last step.
+/// Inside [`FINAL_STEP`]: a pool that does not drain leaves its runs to be lost, not the
+/// stop to hang.
+const TAILS_STOP: Duration = Duration::from_secs(2);
 
 /// What a history writer is made with besides its stores.
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +46,9 @@ pub struct Options {
     pub queue: QueueLimits,
     /// The time between steps.
     pub step_every: Duration,
+    /// The tail workers' pool and waits, once the server gives history a blob source
+    /// ([`History::with_blobs`]).
+    pub tails: TailOptions,
 }
 
 impl Default for Options {
@@ -52,6 +63,7 @@ impl Default for Options {
             limits: Limits::default(),
             queue: QueueLimits::default(),
             step_every: STEP_EVERY,
+            tails: TailOptions::default(),
         }
     }
 }
@@ -60,8 +72,13 @@ impl Default for Options {
 /// counters for `/metrics`, and the task that writes.
 pub struct History {
     tap: Arc<HistoryTap>,
+    queue: Arc<EventQueue>,
     stats: Arc<Stats>,
     reads: Arc<HistoryReads>,
+    flog: Arc<dyn FlogSink>,
+    tails: TailOptions,
+    /// The tail workers, made with the blob source and started with the writer.
+    workers: Option<Workers>,
     task: Pin<Box<dyn Future<Output = ()> + Send>>,
     stop: oneshot::Sender<()>,
 }
@@ -72,6 +89,32 @@ impl History {
     pub fn tap(&self) -> Arc<dyn Tap> {
         let tap: Arc<dyn Tap> = self.tap.clone();
         tap
+    }
+
+    /// This history, reading the logs of failed runs from `blobs` under `budget`: each
+    /// failed run is offered to the writer with its tails and command rendering, after its
+    /// stdout, stderr and ActionResult are copied into an object of their own
+    /// ([`super::tails`]). Without a blob source a failed run is offered with none.
+    ///
+    /// A source given before stays: the server gives its own only to a history that was
+    /// not given one.
+    #[must_use]
+    pub fn with_blobs(mut self, blobs: Arc<dyn BlobReads>, budget: ReadBudget) -> Self {
+        if self.tap.has_tails() {
+            return self;
+        }
+        let parts = Parts {
+            queue: Arc::clone(&self.queue),
+            blobs,
+            budget,
+            flog: Arc::clone(&self.flog),
+            stats: Arc::clone(&self.stats),
+            open: self.tap.open_set(),
+        };
+        let (tails, workers) = pool(parts, self.tails);
+        self.tap.install_tails(tails);
+        self.workers = Some(workers);
+        self
     }
 
     /// What the build pages read history with.
@@ -107,6 +150,16 @@ impl Offload for Blocking {
     }
 }
 
+impl<O: ObjectStore> FlogSink for FlogStore<Shared<O>> {
+    fn encode(&self, run: RunId, parts: &FlogParts<'_>) -> FlogObject {
+        FlogStore::encode(self, run, parts)
+    }
+
+    fn put(&self, object: FlogObject) -> BoxFuture<'_, Result<FlogRef, ObjectStoreError>> {
+        Box::pin(FlogStore::put(self, object))
+    }
+}
+
 /// A history writer over `objects` (under `root`) and the rows of `index_root` in
 /// `state`, not yet started: [`spawn`] starts it. `objects` is wrapped in the writer's
 /// own `Scoped` store, which refuses every key outside `<root>history/`.
@@ -122,6 +175,11 @@ pub fn over<O: ObjectStore>(
     let index = HistoryIndex::new(state, index_root, Arc::new(Blocking));
     let objects = Shared(Arc::new(objects));
     let reader = Reader::new(objects.clone(), root.clone(), index.clone());
+    let flog = Arc::new(FlogStore::new(
+        objects.clone(),
+        root.clone(),
+        options.writer,
+    ));
     let writer = Writer::new(
         objects,
         root,
@@ -133,7 +191,7 @@ pub fn over<O: ObjectStore>(
     );
     let tap = Arc::new(HistoryTap::new(Arc::clone(&queue), minter));
     let reads = Arc::new(HistoryReads::new(reader, tap.runs()));
-    let stats = Arc::new(Stats::new(queue));
+    let stats = Arc::new(Stats::new(Arc::clone(&queue)));
     let (stop, stopped) = oneshot::channel();
     let task = Box::pin(run(
         writer,
@@ -144,8 +202,12 @@ pub fn over<O: ObjectStore>(
     ));
     History {
         tap,
+        queue,
         stats,
         reads,
+        flog,
+        tails: options.tails,
+        workers: None,
         task,
         stop,
     }
@@ -186,7 +248,9 @@ async fn run<O: ObjectStore>(
         writer.step(now_ms()).await;
         publish(&writer);
     }
-    // Every invocation offered a record is closed, so the step flushes its chunk.
+    // Failed runs still in the tail pool are given a moment to reach the queue, then
+    // every invocation offered a record is closed, so the step flushes its chunk.
+    let _ = tokio::time::timeout(TAILS_STOP, tap.quiesce()).await;
     tap.close_all();
     writer.step(now_ms()).await;
     publish(&writer);
@@ -205,21 +269,39 @@ impl Drop for Abort {
 pub(crate) struct Running {
     handle: Abort,
     stop: oneshot::Sender<()>,
+    /// The tail workers: aborted with the writer.
+    workers: Vec<Abort>,
 }
 
 /// Starts `history`'s task on the runtime, if there is a history.
 pub(crate) fn spawn(history: Option<History>) -> Option<Running> {
-    let History { task, stop, .. } = history?;
+    let History {
+        task,
+        stop,
+        workers,
+        ..
+    } = history?;
     Some(Running {
         handle: Abort(tokio::spawn(task)),
         stop,
+        workers: workers
+            .map(Workers::spawn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Abort)
+            .collect(),
     })
 }
 
 /// Stops `running` as a server's stop does: its writer takes one last step with every
 /// open invocation closed, for at most [`FINAL_STEP`].
 pub(crate) async fn finish(running: Option<Running>) {
-    let Some(Running { mut handle, stop }) = running else {
+    let Some(Running {
+        mut handle,
+        stop,
+        workers: _workers,
+    }) = running
+    else {
         return;
     };
     let _ = stop.send(());

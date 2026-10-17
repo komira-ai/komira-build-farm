@@ -5,6 +5,9 @@
 //! instances its caller may see. Field numbers are the wire format: a field is added
 //! under a new number and never renumbered.
 
+pub use crate::flog::{
+    FLOG_STREAM_BYTES, FlogOmitted, FlogRecord, FlogStream, FlogSummary, ObjRow, flog_key,
+};
 use crate::run_id::RunId;
 
 /// The longest tail kept of one log stream, after redaction.
@@ -370,6 +373,9 @@ pub enum TailOmitted {
     TooLarge = 1,
     /// The log could not be read.
     Unreadable = 2,
+    /// The read budget was not free in time (the read is not retried: the tail is left
+    /// out rather than the run held).
+    Busy = 3,
 }
 
 /// The last bytes of one log stream of a failed run, after redaction.
@@ -462,6 +468,9 @@ pub struct FailedRun {
     /// The command rendering.
     #[prost(message, optional, tag = "5")]
     pub command: Option<CommandRendering>,
+    /// Why some log of the run was not copied into its failure-log object.
+    #[prost(enumeration = "FlogOmitted", tag = "6")]
+    pub flog_omitted: i32,
 }
 
 /// A test outcome's status.

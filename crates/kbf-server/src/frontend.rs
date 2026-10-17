@@ -389,6 +389,14 @@ fn bind_frontend(
         timeout,
     ));
     let backend = Backend::remote(storage);
+    // A failed run's logs are read from the storage node, under a budget of this
+    // frontend's own: it serves no blob route to share one with.
+    let history = history.map(|history| {
+        history.with_blobs(
+            Arc::new(backend.clone()),
+            crate::http_blobs::ReadBudget::default(),
+        )
+    });
 
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let recording = crate::history::install(recording, history.as_ref());
