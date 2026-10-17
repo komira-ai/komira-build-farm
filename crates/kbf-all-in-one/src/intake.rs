@@ -35,8 +35,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use kbf_front::{CacheError, MAX_UNSTAGED_BLOB_BYTES};
-use kbf_server::{LocalStream, LocalStreamed};
+use kbf_front::MAX_UNSTAGED_BLOB_BYTES;
+use kbf_storage::{PutStream, StorageError, StreamedPut};
 use kbf_transfer::{
     Cas, CasError, DEFAULT_SEGMENT_UPLOADS, Intake, IntakeFile, MAX_UPLOAD_RECORDS, Record,
     SEGMENT_UPLOAD_BYTES, Source,
@@ -160,7 +160,7 @@ impl Shared {
     fn store_streamed(
         self: &Arc<Self>,
         digest: kbf_types::Digest,
-        finished: Result<LocalStreamed, CacheError>,
+        finished: Result<Box<dyn StreamedPut>, StorageError>,
     ) {
         if !lock(&self.state).seen.insert(digest) {
             return;
@@ -182,7 +182,7 @@ impl Shared {
 }
 
 /// A streamed file the server refused or could not store.
-fn not_stored(e: CacheError) -> CasError {
+fn not_stored(e: StorageError) -> CasError {
     CasError::Unavailable("outputs".to_owned(), e.to_string())
 }
 
@@ -254,7 +254,7 @@ impl IntakeFile for TakenFile {
 struct StreamedFile {
     /// The stream, or why it stopped (a write the tier refused): then nothing more is
     /// written, and the finish answers that.
-    stream: Result<LocalStream, CacheError>,
+    stream: Result<Box<dyn PutStream>, StorageError>,
     shared: Arc<Shared>,
 }
 

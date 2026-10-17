@@ -74,8 +74,8 @@ impl StartPass<RaftMetaLog> {
 }
 
 impl<M> StartPass<M> {
-    /// The same pass, started only once `hold` completes.
-    #[cfg(test)]
+    /// The same pass, started only once `hold` completes: the rebuild of the index, in
+    /// the server; in a test, a release the test sends.
     pub(crate) fn held(mut self, hold: impl Future<Output = ()> + Send + 'static) -> Self {
         self.hold = Box::pin(hold);
         self
@@ -647,6 +647,83 @@ mod tests {
         assert_eq!(cache.present(&[kept]).await.expect("present"), [false]);
         assert_eq!(logs.text().matches(NEEDS_V3).count(), 1);
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Catches a start-up pass that runs before the rebuild of the index is done (mutant:
+    /// the pass not held for the rebuild): it would walk the directory against an index
+    /// that does not name the old server's objects yet, keep none of them, and seed the
+    /// evictor with none, so the objects the rebuild then adopts would never be evicted.
+    /// A node over a new log, registered as member 7, rebuilds over three segments of an
+    /// old server in the directory: the rebuild is logged done before the pass is, and the
+    /// pass keeps all three (`kept=3`, no foreign file).
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_start_pass_waits_for_the_rebuild() {
+        use kbf_front::{MemoryMetaLog, ObjectKeys, RebuildConfig, VerifiedBlob};
+        use kbf_meta::NodeWriter;
+        use kbf_storage::service::CatchUp;
+
+        let logs = Capture::waiting_for(PASS_LINES);
+        let _default = logs.subscribe();
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-rebuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
+        let old_keys = ObjectKeys {
+            legacy: KeyPrefix::new(format!("kbf/{:016x}/", 0x11)).expect("prefix"),
+            root: KeyPrefix::new("kbf/").expect("root"),
+        };
+        let old = Cache::open_under(
+            MemoryMetaLog::new(Retention::default()),
+            files.clone(),
+            old_keys,
+        )
+        .await
+        .expect("an old server's cache");
+        for i in 0..3 {
+            let blob = VerifiedBlob::hashed(Bytes::from(format!("old blob {i}")));
+            old.store_blobs(vec![blob]).await.expect("store");
+        }
+
+        let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let keys = ObjectKeys {
+            legacy: meta.store_prefix(),
+            root: KeyPrefix::new("kbf/").expect("root"),
+        };
+        let one = std::num::NonZeroU64::MIN;
+        let writer = NodeWriter::new(one, one);
+        meta.raise_machine_version(MachineVersion::V4)
+            .expect("a node's log takes format 4");
+        let cache = Cache::open_node(meta, files.clone(), keys, writer)
+            .await
+            .expect("a node's cache");
+        let cache = Arc::new(cache);
+        let catch_up = CatchUp::rebuilding();
+        let pass = StartPass::over_raft(files.clone(), EVICT_GRACE);
+        let _background =
+            crate::rebuild::spawn(&cache, &catch_up, Some(pass), RebuildConfig::default());
+        logs.ended().await;
+
+        assert!(!catch_up.is_catching_up());
+        let text = logs.text();
+        let rebuilt = text
+            .find("rebuild of the index from the store done")
+            .expect("the rebuild is logged");
+        let passed = text
+            .find("start-up pass over the cold store directory done")
+            .expect("the pass is logged");
+        assert!(rebuilt < passed, "{text}");
+        for field in [
+            "kept=3",
+            "foreign=0",
+            "orphans_deleted=0",
+            "evicted_objects=0",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
+        drop((cache, old, files));
         let _ = std::fs::remove_dir_all(&root);
     }
 

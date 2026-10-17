@@ -278,6 +278,30 @@ fn input_tree_flags_make_the_input_tree_config() {
     }
 }
 
+/// Catches the membership flags not reaching the config (swapped, or the defaults
+/// other than the design's) and the replication factor changing with them.
+#[test]
+fn member_flags_make_the_membership_config() {
+    let defaults = Args::parse_from(["kbf-server"]).members();
+    assert_eq!(defaults, crate::members::MembershipConfig::default());
+    let set = Args::parse_from([
+        "kbf-server",
+        "--state-store",
+        "sqlite:///var/lib/kbf/state.db",
+        "--member-ttl-secs",
+        "30",
+        "--member-dwell-secs",
+        "600",
+    ])
+    .members();
+    assert_eq!(set.ttl, Duration::from_secs(30));
+    assert_eq!(set.dwell, Duration::from_secs(600));
+    assert_eq!(
+        set.replication,
+        crate::members::MembershipConfig::default().replication
+    );
+}
+
 /// Catches: a `--write-bytes-in-flight` below the smallest segment upload cap (a
 /// `Begin` of that cap would wait for admission forever), a flag wired to the wrong field of
 /// the write configuration, and defaults other than the design's.

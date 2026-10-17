@@ -1,0 +1,67 @@
+# Rendered by `kbf-deploy linux render-units --mode storage-and-daemon`; installed as
+# /etc/systemd/system/kbf-storage-and-daemon.service (kbf
+# docs/design/architecture-v2.md, sections 1 and 11). The daemon half reads and writes
+# the node's storage in-process; its control plane dials --server.
+[Unit]
+Description=kbf build farm storage node and node daemon
+Wants=network-online.target
+After=network-online.target minio.service
+
+[Service]
+User=kbf
+Slice=kbf.slice
+# The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
+Delegate=yes
+# kbf-server's and the daemon's reservations today.
+MemoryMin=16G
+OOMScoreAdjust=-925
+CPUWeight=300
+# No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
+Environment=XDG_RUNTIME_DIR=/run/user/1500
+# One unit, one process: the daemon half reads and writes the node's storage in-process,
+# one cache on the SSD (design sections 1 and 10). The cold store's key pair comes from
+# the one EnvironmentFile below, root's, mode 0600 (systemd reads it as root; check-units
+# rule `credential` allows exactly this file and reads its owner and mode on the node).
+# The key is in this process's environment, which the unit's user can read. The design
+# keeps the key from builds by uid (sections 9 and 15): each action runs as a subordinate
+# id of that user (the container driver's --userns=nomap), with a test that an action
+# cannot read the key; that test does not exist yet. Until it does this unit is for a
+# trusted network only, as all-in-one is.
+# The storage half registers with the frontend by --frontend (the worker listener, by
+# KBF_FRONTEND_NAME, which is not this node's own KBF_HOST_NAME) and advertises the name
+# callers dial, KBF_HOST_NAME, on its storage port. --hot-store should be on
+# --data-dir's filesystem, for the one cache: set KBF_HOT_DIR to say where.
+EnvironmentFile=/etc/kbf/s3.env
+ExecStart=/usr/local/bin/kbf storage-and-daemon \
+    --cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true \
+    --meta-dir=/var/lib/kbf-server/raft \
+    --hot-store=file:///var/lib/kbf-server/hot \
+    --storage-listen=192.0.2.10:8983 \
+    --storage-tls-cert=/etc/kbf/storage.pem \
+    --storage-tls-key=/etc/kbf/storage.key \
+    --storage-client-ca=/etc/kbf/ca.pem \
+    --frontend=https://frontend.example.internal:8981 \
+    --advertise-addr=storage-node.example.internal:8983 \
+    --driver=container \
+    --server=https://frontend.example.internal:8981 \
+    --ca-cert=/etc/kbf/ca.pem \
+    --cert=/etc/kbf/node.pem \
+    --key=/etc/kbf/node.key \
+    --node-id=storage-node-1 \
+    --data-dir=/var/lib/kbf \
+    --actions-memory-max-gib=200 \
+    --supervisor-memory-min-mib=256
+# No --cas: the daemon half reads the node's storage in-process.
+# The storage half drains on SIGTERM: a Write in flight is finished and acknowledged
+# before the process exits, and a large one takes longer than systemd's 90 s default stop
+# timeout, which would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+# Exit 2 is a command line kbf refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

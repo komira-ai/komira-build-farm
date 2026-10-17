@@ -183,6 +183,7 @@ impl Run {
             self.unit("podman_killed", "", ""),
             self.unit("podman_cache", "", " --nocapture"),
             self.unit("podman_env", &conf, ""),
+            self.unit("podman_credential", "", ""),
             self.unit("oci_crun", "", " --nocapture"),
         ]
         .concat()
@@ -198,7 +199,7 @@ impl Run {
 /// The build the verb asks cargo for: every real-Podman target, as JSON, as this user.
 const BUILD: &str = "test --locked --no-run --message-format=json -p kbf-driver-container \
                      --test podman --test podman_memory --test podman_killed --test podman_cache \
-                     --test podman_env --test oci_crun\n";
+                     --test podman_env --test podman_credential --test oci_crun\n";
 
 /// Catches any step of the script dropped or reordered: lingering not turned on, podman
 /// run without the runner's XDG_RUNTIME_DIR, busybox not pulled by its index, the
@@ -376,7 +377,7 @@ fn a_failed_build_starts_no_unit() {
         err.ends_with(
             "xtask: cargo test --no-run -p kbf-driver-container --test podman --test \
              podman_memory --test podman_killed --test podman_cache --test podman_env --test \
-             oci_crun \
+             podman_credential --test oci_crun \
              failed: exit status: 101\n"
         ),
         "{err}"

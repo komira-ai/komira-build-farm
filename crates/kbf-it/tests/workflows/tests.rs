@@ -443,26 +443,24 @@ fn job_permissions_may_not_widen_the_token() {
     }
 }
 
-/// The `if:` line under which a job may sign provenance, as the lint requires it.
-const MAIN_PUSH_IF: &str =
-    "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";
-
 #[test]
-fn signing_scopes_need_a_job_that_runs_only_for_a_push_to_main() {
+fn signing_scopes_need_a_job_that_runs_only_for_a_push() {
     // Catches: `id-token: write` or `attestations: write` allowed in a job a pull
     // request or the merge queue runs, so a branch could sign provenance; and the
-    // exception refused where the artifacts workflow needs it.
+    // exception refused where the artifacts workflow needs it. (The refs it names are
+    // the next test's.)
     let signing = "{contents: read, id-token: write, attestations: write}";
     clean(&workflow(&format!(
-        "    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {signing}\n"
+        "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {signing}\n"
     )));
     for scope in ["id-token", "attestations"] {
         clean(&workflow(&format!(
-            "    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {{{scope}: write}}\n"
+            "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {{{scope}: write}}\n"
         )));
         for cond in [
             "",
             "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
+            "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
             "    if: ${{ github.event_name == 'push' }}\n",
             "    if: ${{ github.ref == 'refs/heads/main' }}\n",
             "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || true }}\n",
@@ -473,7 +471,7 @@ fn signing_scopes_need_a_job_that_runs_only_for_a_push_to_main() {
             assert_eq!(
                 scan(&workflow(&body)),
                 vec![format!(
-                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{MAIN_PUSH_ONLY}`",
+                    "line {}: `{scope}: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
                     if cond.is_empty() { 7 } else { 8 }
                 )],
                 "{body}"
@@ -493,9 +491,48 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
         "write-all",
     ] {
         refused(
-            &format!("    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {p}\n"),
+            &format!("    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {p}\n"),
             "a job's `permissions`",
         );
+    }
+}
+
+/// The `if:` line under which a job may sign provenance: a push to main or to the
+/// development branch.
+const SIGNING_PUSH_IF: &str = "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n";
+
+#[test]
+fn signing_scopes_are_allowed_for_a_push_to_main_or_the_development_branch_only() {
+    // Catches: the development branch's pushes still unable to attest (the rehearsal
+    // would deploy unattested builds); and the widening taken further than those two
+    // refs: any push, any branch, a pull request or the merge queue (an event other than
+    // `push`), a tag, another spelling of the same condition, or a trailing `|| true`.
+    let signing = "{contents: read, id-token: write, attestations: write}";
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {signing}\n"
+    )));
+    for cond in [
+        "    if: ${{ github.event_name == 'push' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2' }}\n",
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/other') }}\n",
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/feature/arch-v2' || github.ref == 'refs/heads/main') }}\n",
+        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}\n",
+        "    if: ${{ github.event_name == 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n",
+        "    if: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}\n",
+        "    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') || true }}\n",
+        "    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2')\n",
+    ] {
+        for scope in ["id-token", "attestations"] {
+            let body =
+                format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{{scope}: write}}\n");
+            let found = scan(&workflow(&body));
+            assert!(
+                found.iter().any(|m| m.contains(&format!(
+                    "`{scope}: write` is allowed only in a job whose `if:` is exactly"
+                ))),
+                "{body}\n-> {found:?}"
+            );
+        }
     }
 }
 
@@ -513,7 +550,7 @@ fn contents_write_needs_a_job_that_runs_only_for_a_pushed_release_tag() {
     )));
     for cond in [
         "",
-        MAIN_PUSH_IF,
+        SIGNING_PUSH_IF,
         "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
         "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}\n",
         "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}\n",
@@ -539,7 +576,7 @@ fn a_release_tag_job_gets_no_other_write_scope() {
     for p in ["{id-token: write}", "{attestations: write}"] {
         refused(
             &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {p}\n"),
-            &format!("is exactly `{MAIN_PUSH_ONLY}`"),
+            &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
         );
     }
     for p in [

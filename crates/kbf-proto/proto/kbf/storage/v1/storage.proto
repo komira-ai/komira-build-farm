@@ -1,0 +1,114 @@
+// The storage node's own calls (docs/design/architecture-v2.md, sections 3, 6 to 8).
+//
+// A storage node serves the blob calls as the standard protocols define them, because
+// every REAPI client and the daemon's transfer engine already speak them:
+//
+//   build.bazel.remote.execution.v2.ContentAddressableStorage  FindMissingBlobs
+//   google.bytestream.ByteStream                               Read, Write, QueryWriteStatus
+//   kbf.worker.v1.Segments                                     Begin, PutRange, Commit,
+//                                                              Locate, ReadRange
+//
+// and this file adds what they have no message for: the action cache as the storage
+// node holds it (the result and the digest of the blob it was read from; a write in two
+// halves, the closure check and then the commit).
+//
+// The map generation (section 6). Every storage call carries the caller's view of the
+// storage map, so a node can answer STALE_MAP when it is behind. The messages below
+// carry it as `map_generation`, field 1 of every request. The standard protocols' messages
+// have no such field and are not ours to change, so on those calls it is the request
+// metadata entry `kbf-map-generation` (decimal). A node with one member ignores it; 0 is
+// "no map seen". It is here now so that the wire does not change when membership lands.
+//
+// Extending: add fields and rpcs, never reuse a number. A request's field 1 stays
+// `map_generation`.
+
+syntax = "proto3";
+
+package kbf.storage.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+
+service ActionStore {
+  // GetActionResult: the entry for an action, if its closure holds and its result blob
+  // reads back; no `entry` is a miss.
+  rpc Get(GetRequest) returns (GetResponse);
+  // The first half of a write: checks that every blob the result needs is held, stores
+  // the result as a blob and answers the record to commit. The action cache is not
+  // touched.
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+  // The second half: commits the record for an action.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+}
+
+message GetRequest {
+  uint64 map_generation = 1;
+  build.bazel.remote.execution.v2.Digest action = 2;
+}
+
+message GetResponse {
+  // Unset: a miss.
+  Entry entry = 1;
+}
+
+message Entry {
+  // The digest of the blob the result was read from.
+  build.bazel.remote.execution.v2.Digest result_digest = 1;
+  build.bazel.remote.execution.v2.ActionResult result = 2;
+}
+
+message PrepareRequest {
+  uint64 map_generation = 1;
+  build.bazel.remote.execution.v2.ActionResult result = 2;
+}
+
+message PrepareResponse {
+  oneof outcome {
+    Record record = 1;
+    Refusal refused = 2;
+  }
+}
+
+// An action-cache entry as written: the result blob and every other blob it needs.
+message Record {
+  build.bazel.remote.execution.v2.Digest result = 1;
+  repeated build.bazel.remote.execution.v2.Digest closure = 2;
+}
+
+// Why an action-cache write was refused (a gRPC status could not carry the blob).
+message Refusal {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // Only a daemon writes the action cache.
+    NOT_DAEMON = 1;
+    // `blob` and `more` are needed and not held.
+    ABSENT = 2;
+    // `blob` and `more` are needed and held at objects that cannot be read; none
+    // needed is absent.
+    UNREACHABLE = 3;
+  }
+  Kind kind = 1;
+  // Set for ABSENT and UNREACHABLE: the first blob lacking.
+  build.bazel.remote.execution.v2.Digest blob = 2;
+  // For ABSENT and UNREACHABLE, the blobs lacking after `blob`, in order.
+  repeated build.bazel.remote.execution.v2.Digest more = 3;
+}
+
+// Who the writer speaks for. A frontend relays both a client's update and a daemon's
+// result; the store enforces that only a daemon's writes land.
+enum Writer {
+  WRITER_UNSPECIFIED = 0;
+  DAEMON = 1;
+  CLIENT = 2;
+}
+
+message CommitRequest {
+  uint64 map_generation = 1;
+  build.bazel.remote.execution.v2.Digest action = 2;
+  Record record = 3;
+  Writer writer = 4;
+}
+
+message CommitResponse {
+  // Unset: committed.
+  Refusal refused = 1;
+}

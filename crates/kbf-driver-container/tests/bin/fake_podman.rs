@@ -19,6 +19,10 @@
 //!   runs: the action is the act program itself.
 //! - `nonce`: this Fake's own marker: the action (and all it starts) inherits
 //!   `FAKE_LEASE=<nonce><cgroup>`, what the test looks for afterwards.
+//! - `env-host`: a name prefix (empty: every name). `create` records each of its own
+//!   variables whose name starts with it in `create-env`, and `start` hands those to
+//!   the action, under the paths and `FAKE_LEASE`: Podman's `env_host`, which copies
+//!   the host's environment into the container when it is created, not when it starts.
 //! - `create-fails`: `create` fails.
 //! - `block-log`: `create` makes a directory where the log file this knob names
 //!   (`stdout` or `stderr`) goes, so the driver cannot create it.
@@ -46,7 +50,8 @@
 //!   busy (ETXTBSY), status `created 0`, and removes this knob.
 //!
 //! Records:
-//! - `create.args` (one argument per line), `calls` (one verb per line; `unshare` with
+//! - `create.args` (one argument per line), `create-env` (with `env-host`: each
+//!   variable `NAME=value` and a NUL, sorted), `calls` (one verb per line; `unshare` with
 //!   its command, `unshare rm` or `unshare chown`), `ps.args`, `removed`;
 //! - `name` and `owner-label`: the container `create` made and its `kbf.owner` label;
 //!   `rm` removes `name`, and `ps` lists the container while `name` exists and the
@@ -287,6 +292,15 @@ impl Fake {
 
     fn create(&self, args: &[Vec<u8>]) -> u8 {
         self.write("create.args", &lines(args));
+        if self.has("env-host") {
+            let prefix = self.cat("env-host");
+            let mut env: Vec<Vec<u8>> = std::env::vars_os()
+                .filter(|(name, _)| name.as_bytes().starts_with(&prefix))
+                .map(|(name, value)| [name.as_bytes(), b"=", value.as_bytes(), b"\0"].concat())
+                .collect();
+            env.sort();
+            self.write("create-env", &env.concat());
+        }
         let _ = std::fs::remove_file(self.file("tree-volumes"));
         for arg in args {
             if let Some(parent) = arg.strip_prefix(b"--cgroup-parent=") {
@@ -368,6 +382,15 @@ impl Fake {
         let steps = self.read("action").unwrap_or_default();
         for arg in arguments(&steps) {
             action.arg(OsString::from_vec(expand(arg, &paths)));
+        }
+        // `env_host`: the variables `create` was run with.
+        for entry in self.cat("create-env").split(|b| *b == 0) {
+            if let Some(at) = entry.iter().position(|b| *b == b'=') {
+                action.env(
+                    OsStr::from_bytes(&entry[..at]),
+                    OsStr::from_bytes(&entry[at + 1..]),
+                );
+            }
         }
         for (name, path) in &paths {
             action.env(name, OsStr::from_bytes(path));

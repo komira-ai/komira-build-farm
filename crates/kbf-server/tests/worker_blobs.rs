@@ -31,7 +31,7 @@ use kbf_server::{Args, bind_server};
 use prost::Message;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SerialNumber,
+    KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
 use sha2::Digest as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -76,17 +76,14 @@ impl Pki {
         pki
     }
 
-    /// A daemon certificate with `names` as its DNS subjectAltNames.
+    /// A daemon certificate with `names` as its DNS subjectAltNames and the daemon role.
     fn node(&self, names: &[&str], serial: u64) -> Node {
-        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
-        let mut params = CertificateParams::new(names).expect("params");
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "cn-is-not-read");
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        params.serial_number = Some(SerialNumber::from(serial));
-        let key = KeyPair::generate().expect("key");
-        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        self.node_as(names, &["daemon"], serial)
+    }
+
+    /// [`Pki::node`] with a `urn:kbf:role:` URI per `roles` instead of the daemon role.
+    fn node_as(&self, names: &[&str], roles: &[&str], serial: u64) -> Node {
+        let (cert, key) = self.signed(names, roles, serial);
         let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).expect("parse");
         let spki = sha2::Sha256::digest(parsed.public_key().raw);
         Node {
@@ -94,6 +91,39 @@ impl Pki {
             serial,
             spki_sha256: spki.iter().map(|b| format!("{b:02x}")).collect(),
         }
+    }
+
+    /// An identity for node-1 presenting a chain of two certificates from the CA: the
+    /// leaf naming `first` (whose key the identity holds), then one naming `then`.
+    fn chain(&self, first: &str, then: &str, serial: u64) -> Identity {
+        let (leaf, key) = self.signed(&["node-1"], &[first], serial);
+        let (extra, _) = self.signed(&["node-1"], &[then], serial + 1);
+        Identity::from_pem(
+            format!("{}\n{}", leaf.pem(), extra.pem()),
+            key.serialize_pem(),
+        )
+    }
+
+    /// A client certificate signed by the CA, with `names` as DNS names, a
+    /// `urn:kbf:role:` URI per `roles`, and `serial`; and its key.
+    fn signed(&self, names: &[&str], roles: &[&str], serial: u64) -> (rcgen::Certificate, KeyPair) {
+        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        let mut params = CertificateParams::new(names).expect("params");
+        params.subject_alt_names.extend(roles.iter().map(|role| {
+            SanType::URI(
+                format!("urn:kbf:role:{role}")
+                    .try_into()
+                    .expect("an IA5 name"),
+            )
+        }));
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "cn-is-not-read");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.serial_number = Some(SerialNumber::from(serial));
+        let key = KeyPair::generate().expect("key");
+        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        (cert, key)
     }
 
     fn write(&self, file: &str, text: &str) -> String {
@@ -663,6 +693,74 @@ async fn a_certificate_must_name_exactly_one_node() {
     }
 }
 
+/// Catches a blob call on the worker listener admitted for a certificate that is not a
+/// daemon's: a frontend's or a storage node's from the same CA (naming one node, as a
+/// daemon's would), a role that is not one, no role, or two. Every call, the blob
+/// calls, the `Segments` calls and the chunking calls, is refused PERMISSION_DENIED; the
+/// control is the same node with the daemon role, served.
+///
+/// Mutant seen red: the role table's layer left off the worker listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_blob_call_refuses_a_certificate_that_is_not_a_daemons() {
+    let pki = Pki::new("roles");
+    let (_, worker) = pki.serve(&[]);
+    let blob = b"a blob only a daemon may move";
+    let two: &[&str] = &["daemon", "frontend"];
+    for (roles, serial) in [
+        (&["frontend"][..], 61),
+        (&["storage"][..], 62),
+        (&["admin"][..], 63),
+        (&[][..], 64),
+        (two, 65),
+    ] {
+        let node = pki.node_as(&["node-1"], roles, serial);
+        let channel = pki.channel(worker, Some(&node.identity)).await;
+        let every = codes(&channel, blob)
+            .await
+            .into_iter()
+            .chain(chunking_codes(&channel).await);
+        for (call, code) in every {
+            assert_eq!(code, Code::PermissionDenied, "{call} with roles {roles:?}");
+        }
+    }
+    let node = pki.node(&["node-1"], 66);
+    let channel = pki.channel(worker, Some(&node.identity)).await;
+    for (call, code) in codes(&channel, blob).await {
+        assert_eq!(code, Code::Ok, "{call} as a daemon");
+    }
+}
+
+/// Catches the role read from a certificate of the presented chain other than the
+/// leaf (the last, or any of them): a peer holding a frontend key could append a
+/// daemon's public certificate after its own and move blobs as a daemon. A chain of
+/// two certificates from the same CA, both naming node-1: frontend first, daemon
+/// second, has every call refused PERMISSION_DENIED; daemon first, frontend second,
+/// is served.
+///
+/// Mutant seen red: `chain.first()` read as `chain.last()` in the role table's layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_call_reads_the_role_from_the_leaf_certificate_alone() {
+    let pki = Pki::new("leaf-role");
+    let (_, worker) = pki.serve(&[]);
+    let blob = b"a blob only a daemon leaf may move";
+    let channel = pki
+        .channel(worker, Some(&pki.chain("frontend", "daemon", 71)))
+        .await;
+    let every = codes(&channel, blob)
+        .await
+        .into_iter()
+        .chain(chunking_codes(&channel).await);
+    for (call, code) in every {
+        assert_eq!(code, Code::PermissionDenied, "{call}, frontend leaf");
+    }
+    let channel = pki
+        .channel(worker, Some(&pki.chain("daemon", "frontend", 73)))
+        .await;
+    for (call, code) in codes(&channel, blob).await {
+        assert_eq!(code, Code::Ok, "{call}, daemon leaf");
+    }
+}
+
 /// Catches: no `ContentAddressableStorage` on the worker listener (the transfer
 /// engine's FindMissingBlobs and batches would fall back for good), and a batch write
 /// or read that does not reach the farm's one cache: a client on the REAPI port must
@@ -722,6 +820,7 @@ async fn chunking_calls_are_admitted_first_and_then_unimplemented() {
 
 /// Catches: REAPI services other than the daemons' two served on the worker listener:
 /// a node certificate must not Execute, read the action cache, or ask for capabilities.
+/// None of them is in the listener's role table, so each is refused PERMISSION_DENIED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_serves_no_other_reapi_service() {
     let pki = Pki::new("only-blobs");
@@ -753,7 +852,7 @@ async fn the_worker_listener_serves_no_other_reapi_service() {
         ("GetCapabilities", capabilities),
     ] {
         let code = result.expect_err(call).code();
-        assert_eq!(code, Code::Unimplemented, "{call}");
+        assert_eq!(code, Code::PermissionDenied, "{call}");
     }
 }
 

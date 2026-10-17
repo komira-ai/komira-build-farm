@@ -294,6 +294,7 @@ fn the_containers_conf_override_and_nocapture_go_to_one_target_each() {
             "podman_killed",
             "podman_cache",
             "podman_env",
+            "podman_credential",
             "oci_crun"
         ]
     );

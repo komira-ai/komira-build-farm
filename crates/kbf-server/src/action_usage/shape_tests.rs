@@ -13,6 +13,16 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// The pattern of an output path and the configuration hash it named.
+fn pattern(path: &str) -> Option<(String, Option<String>)> {
+    owned_pattern(path).map(|(pattern, cfg, _)| (pattern, cfg))
+}
+
+/// The words of the program an action runs.
+fn program(arguments: &[String]) -> Vec<String> {
+    words(arguments).0
+}
+
 fn pat(path: &str) -> Option<(String, Option<String>)> {
     pattern(path)
 }
@@ -633,4 +643,338 @@ fn known_limit_a_test_execution_path_keys_per_configuration() {
     assert_eq!(shape(CFG).key, shape(CFG).key);
     assert_ne!(shape(CFG).key, shape(CFG2).key);
     assert_eq!(shape(CFG).cfg, None);
+}
+
+/// A test buck2 runs remotely writes under `buck-out/<v>/test/execution/`, which the
+/// shape says (`Shape::test`, and so the run record's `test`): from any output, under
+/// any version directory and any prefix. Catches: the flag never set, set from the
+/// program rather than an output, set by a path that only names `test` or `execution`
+/// somewhere else (a target called `test`), or set with no `buck-out` in the path.
+#[test]
+fn an_output_under_the_test_execution_root_marks_the_shape_a_test() {
+    let test = |outputs: &[&str]| Shape::of(&strings(&["runner"]), &strings(outputs)).test;
+    let execution = format!("buck-out/v2/test/execution/komira/{CFG}/{CONTENT2}/default/out");
+    assert!(test(&[&execution]));
+    assert!(test(&["a.o", &execution]), "any one output");
+    assert!(test(&[&format!(
+        "/work/buck-out/v3/test/execution/komira/{CFG}/{CONTENT2}/out"
+    )]));
+    assert!(!test(&[]));
+    assert!(!test(&["a.o"]));
+    assert!(!test(&[&format!(
+        "buck-out/v2/art/komira/{CFG}/src/test/__t__/execution/out"
+    )]));
+    assert!(!test(&["out/test/execution/x"]), "no buck-out");
+    assert!(!test(&["buck-out/v2/test/other/x"]));
+    assert!(
+        !Shape::of(&strings(&[&execution]), &strings(&["a.o"])).test,
+        "a program path is not an output"
+    );
+}
+
+fn target_of_paths(argv: &[&str], outputs: &[&str]) -> Option<(TargetKind, String)> {
+    Shape::of(&strings(argv), &strings(outputs))
+        .target
+        .map(|t| (t.kind, t.label))
+}
+
+fn label(kind: TargetKind, label: &str) -> Option<(TargetKind, String)> {
+    Some((kind, label.to_owned()))
+}
+
+/// Issue #796: the target a compile's own output paths name. Catches: the label
+/// built from the wrong segments (the configuration hash or the content hash or
+/// `output_artifacts` left in it, the cell or the package dropped), the content-hash
+/// form giving another label than the configuration form, a name with a `/` cut at
+/// it, or the root package written other than `cell//:name`.
+#[test]
+fn a_compile_names_its_target_in_every_form() {
+    let want = label(
+        TargetKind::Target,
+        "komira//src/komira_encoding:komira_encoding",
+    );
+    for path in [
+        format!(
+            "buck-out/v2/art/komira/{CFG}/src/komira_encoding/__komira_encoding__/out/libfoo.a"
+        ),
+        format!("buck-out/v2/art/komira/{CFG}-{EXEC}/src/komira_encoding/__komira_encoding__/o"),
+        "buck-out/v2/art/komira/src/komira_encoding/__komira_encoding__/output_artifacts/o"
+            .to_owned(),
+        format!("buck-out/v2/gen/komira/src/komira_encoding/__komira_encoding__/{CONTENT}/o"),
+        format!("/srv/repo/buck-out/v2/art/komira/{CFG}/src/komira_encoding/__komira_encoding__/o"),
+    ] {
+        assert_eq!(target_of_paths(&["cc"], &[&path]), want, "{path}");
+    }
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/pkg/__foo/bar__/o")]
+        ),
+        label(TargetKind::Target, "cell//pkg:foo/bar"),
+        "a name keeps its slash"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/__root__/o")]
+        ),
+        label(TargetKind::Target, "cell//:root"),
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art/cell/pkg/__t__/__action__3__/{CONTENT}/o"
+            )]
+        ),
+        label(TargetKind::Target, "cell//pkg:t"),
+        "a dynamic action is its target's"
+    );
+}
+
+/// Issue #796: an action whose outputs name two owners takes the target of the first
+/// pattern in pattern order (sorted), as `cfg` does. Catches: the target taken from
+/// another pattern (the last one, or the first the client sent), so one action's
+/// target changes with the order of its outputs.
+#[test]
+fn target_is_the_first_patterns() {
+    let z = format!("buck-out/v2/art/cell/{CFG}/pkg/__z__/o");
+    let a = format!("buck-out/v2/art/cell/{CFG}/pkg/__a__/o");
+    let want = label(TargetKind::Target, "cell//pkg:a");
+    assert_eq!(target_of_paths(&["cc"], &[&z, &a]), want, "sent last");
+    assert_eq!(target_of_paths(&["cc"], &[&a, &z]), want, "sent first");
+}
+
+/// Issue #796: anonymous and BXL owners give their kind. Catches: an anonymous
+/// target's glued configuration or attributes hash left in its label, its kind lost
+/// (read as a rule's target), the root-package form's glued content hash kept in the
+/// cell, or a BXL function's hashes left in its label.
+#[test]
+fn anonymous_and_bxl_owners_name_their_kind() {
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art-anon/komira/{CFG}src/x/3fa9c1/__x__/o"
+            )]
+        ),
+        label(TargetKind::Anon, "komira//src/x:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &["buck-out/v2/gen-anon/komira/src/x/deadbeef/__x__/o"]
+        ),
+        label(TargetKind::Anon, "komira//src/x:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &["buck-out/v2/art-anon/anon990e66921b1edf1c/___compiler_type_flags_anon_rule__/o"]
+        ),
+        label(TargetKind::Anon, "anon//:_compiler_type_flags_anon_rule")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[
+                "buck-out/v2/art-bxl/komira/453d11473805230f/tools/build/lint/test_weld.bxl/__check__/ecd72b18569a9587/v.json"
+            ]
+        ),
+        label(
+            TargetKind::Bxl,
+            "komira//tools/build/lint/test_weld.bxl:check"
+        )
+    );
+    assert_eq!(
+        [TargetKind::Target, TargetKind::Anon, TargetKind::Bxl].map(TargetKind::name),
+        ["target", "anon", "bxl"]
+    );
+}
+
+/// Issue #796: a test buck2 built and runs remotely names its target through its
+/// program, its outputs naming none; one run by a program outside `buck-out` names
+/// none, and is `None`, not a guess. Catches: the program word not read for a target,
+/// an argument file's owner taken for the program's, the first output's target not
+/// preferred over the program's, or a `test/execution` path read as a target.
+#[test]
+fn a_test_names_its_target_through_its_program_or_names_none() {
+    let execution = format!("buck-out/v2/test/execution/komira/{CFG}/{CONTENT2}/default/out");
+    let binary = format!("buck-out/v2/art/komira/{CFG}/src/t/__t_test__/t_test");
+    assert_eq!(
+        target_of_paths(&[&binary, "--list"], &[&execution]),
+        label(TargetKind::Target, "komira//src/t:t_test")
+    );
+    assert_eq!(
+        target_of_paths(&["/usr/bin/env", "FOO=1", &binary], &[&execution]),
+        label(TargetKind::Target, "komira//src/t:t_test"),
+        "a wrapped program word"
+    );
+    assert_eq!(
+        target_of_paths(&["test-runner", "suite.cfg"], &[&execution]),
+        None
+    );
+    assert_eq!(
+        target_of_paths(
+            &[
+                "clang",
+                &format!("@buck-out/v2/art/komira/{CFG}/src/a/__a__/args")
+            ],
+            &["a.o"]
+        ),
+        None,
+        "an argument file is not a program"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["buck-out/v2/art/prelude/rust/tools/__rustc_action__/output_artifacts/r.py"],
+            &[&format!(
+                "buck-out/v2/art/komira/{CFG}/src/foo/__foo__/libfoo.rlib"
+            )]
+        ),
+        label(TargetKind::Target, "komira//src/foo:foo"),
+        "the output's target, not the tool's"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/__x__/o"]),
+        None,
+        "no cell"
+    );
+    for path in [
+        "buck-out/v2/art//pkg/__x__/o".to_owned(),
+        format!("buck-out/v2/art//pkg/__x__/{CONTENT}/o"),
+        format!("buck-out/v2/art//{CFG}/pkg/__x__/o"),
+    ] {
+        assert_eq!(
+            target_of_paths(&["cc"], &[&path]),
+            None,
+            "empty cell: {path}"
+        );
+    }
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/cell/pkg/o"]),
+        None,
+        "no name"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/cell/pkg/__open/o"]),
+        None,
+        "a name never closed"
+    );
+}
+
+/// Issue #796, review: a package directory whose name starts and ends with `__`
+/// (Jest's `__tests__`, `__mocks__`) looks like a target name. In the content-hash form
+/// the real name is the one the content hash (or `output_artifacts`) follows, past a
+/// dynamic action's `__action__<k>__`; in the configuration form two such segments
+/// before the output cannot be told apart, so the target is `None`, not a guess.
+/// Catches: the package directory read as the name (`cell//js:tests`), the content
+/// hash not used to find the name, a dynamic action's `__action__<k>__` counted as a
+/// second candidate (its target lost), or the output's own `__x__` file name taken.
+#[test]
+fn a_package_directory_that_looks_like_a_name_is_not_one() {
+    let want = label(TargetKind::Target, "cell//js/__tests__:t");
+    for path in [
+        format!("buck-out/v2/art/cell/js/__tests__/__t__/{CONTENT}/out"),
+        "buck-out/v2/art/cell/js/__tests__/__t__/output_artifacts/out".to_owned(),
+        format!("buck-out/v2/art/cell/js/__tests__/__t__/__action__3__/{CONTENT}/out"),
+        format!("buck-out/v2/gen/cell/js/__tests__/__mocks__/__t__/{CONTENT}/out"),
+    ] {
+        let want = if path.contains("__mocks__") {
+            label(TargetKind::Target, "cell//js/__tests__/__mocks__:t")
+        } else {
+            want.clone()
+        };
+        assert_eq!(target_of_paths(&["cc"], &[&path]), want, "{path}");
+    }
+    for path in [
+        format!("buck-out/v2/art/cell/{CFG}/js/__tests__/__t__/out"),
+        format!("buck-out/v2/art/cell/{CFG}/js/__tests__/__foo/bar__/out"),
+        format!("buck-out/v2/art/cell/{CFG}/js/__t__/__pycache__/out"),
+    ] {
+        assert_eq!(target_of_paths(&["cc"], &[&path]), None, "{path}");
+    }
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art/cell/{CFG}/js/__t__/__action__3__/out"
+            )]
+        ),
+        label(TargetKind::Target, "cell//js:t"),
+        "a dynamic action's key is not a second name"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/js/__t__/__init__")]
+        ),
+        label(TargetKind::Target, "cell//js:t"),
+        "the output's own file name is no candidate"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/js/__init__")]
+        ),
+        None,
+        "a name with nothing under it"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/cell/js/__tests__/__t__/out"]),
+        None,
+        "the content form with no hash after any name"
+    );
+}
+
+/// Issue #796, review: an anonymous target's content-mode path outside the root
+/// package glues the cell to the package (`<cell><pkg>/<content>/__<name>__/…`), so
+/// where the cell ends cannot be read. Catches: the glued segment taken for the cell
+/// (`cellsrc//x:x`). The root-package form, whose cell is glued to the content hash
+/// alone, and the configuration form keep their labels; a package directory that looks
+/// like a name is told apart by the attributes hash before the real one.
+#[test]
+fn an_anonymous_content_mode_target_outside_the_root_names_none() {
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art-anon/cellsrc/x/{CONTENT}/__x__/o")]
+        ),
+        None
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art-anon/cell{CONTENT}/__x__/o")]
+        ),
+        label(TargetKind::Anon, "cell//:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art-anon/cell/{CFG}src/__tests__/3fa9c1/__x__/o"
+            )]
+        ),
+        label(TargetKind::Anon, "cell//src/__tests__:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art-anon/cell/{CFG}3fa9c1/__x__/o")]
+        ),
+        label(TargetKind::Anon, "cell//:x"),
+        "the root package in the configuration form"
+    );
+    for path in [
+        format!("buck-out/v2/art-anon/cell/{CFG}/__x__/o"),
+        format!("buck-out/v2/art-anon/cell/{CFG}src//__x__/o"),
+        format!("buck-out/v2/art-anon/cell/{CFG}src/x/__x__/o"),
+    ] {
+        assert_eq!(
+            target_of_paths(&["cc"], &[&path]),
+            None,
+            "no attributes hash before the name: {path}"
+        );
+    }
 }

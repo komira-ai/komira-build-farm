@@ -1,0 +1,26 @@
+[package]
+name = "kbf-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tokio-rustls.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
+tracing.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

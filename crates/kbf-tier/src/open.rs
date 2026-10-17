@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use kbf_meta::{Epoch, MetaState, ObjectId, StagedState, TierId};
+use kbf_meta::{MetaState, ObjectId, StagedState, TierId, Writer};
 use kbf_store::{Fs, FsFile};
 
 use crate::block::{
@@ -64,8 +64,8 @@ impl StagedIndex for StagedSnapshot {
 pub struct TierStart {
     /// This server's tier id, as the committed state holds it.
     pub tier: TierId,
-    /// This start's writer epoch. Every block of an earlier start is closed to appends.
-    pub epoch: Epoch,
+    /// This start's writer. Every block of an earlier start is closed to appends.
+    pub writer: Writer,
     /// The sizes and delays.
     pub options: TierOptions,
 }
@@ -84,7 +84,8 @@ pub struct Recovery {
     pub unsealed: Vec<ObjectId>,
     /// Staged, sealed objects: for the flusher.
     pub sealed: Vec<ObjectId>,
-    /// Block files deleted as orphans: no staged object names them.
+    /// Block files deleted as orphans (no staged object names them), and flushed
+    /// copies deleted when the options keep none.
     pub removed: Vec<String>,
     /// Flushed copies (`.seg` files) found, kept for local reads.
     pub flushed: Vec<ObjectId>,
@@ -107,9 +108,10 @@ where
     ///    Names the tier does not write are left alone.
     /// 4. `.seg` files are kept as flushed copies, evicted (least recently read first,
     ///    here in name order) while they do not fit in the budget beside the staged
-    ///    blocks.
+    ///    blocks; deleted (and listed with the orphans) when the options keep no
+    ///    flushed copies.
     ///
-    /// `next_seq` numbers the objects of new blocks within `start.epoch`.
+    /// `next_seq` numbers the objects of new blocks within `start.writer`.
     ///
     /// # Errors
     ///
@@ -133,7 +135,7 @@ where
             .collect();
         if let Some(name) = names
             .iter()
-            .find(|n| parse_block_name(n).is_some_and(|o| o.epoch() >= start.epoch))
+            .find(|n| parse_block_name(n).is_some_and(|o| o.writer().at_or_after(start.writer)))
         {
             return Err(TierError::FutureBlock { name: name.clone() });
         }
@@ -187,17 +189,42 @@ where
             fs.sync_dir()
                 .map_err(|e| TierError::io("sync_dir", ".", e))?;
         }
-        for (name, object) in names.iter().filter_map(|n| Some((n, parse_seg_name(n)?))) {
-            let len = fs
-                .file_len(name)
-                .map_err(|e| TierError::io("stat", name, e))?;
-            state.add_seg(object, len);
-            recovery.flushed.push(object);
-        }
-        let tier = Self::from_parts(fs, start.options, start.epoch, state, next_seq);
+        flushed_copies(
+            &fs,
+            &names,
+            start.options.flushed_copies,
+            &mut state,
+            &mut recovery,
+        )?;
+        let tier = Self::from_parts(fs, start.options, start.writer, state, next_seq);
         tier.make_room_at_open();
         Ok((tier, recovery))
     }
+}
+
+/// Step 4 of [`Tier::open`]: each `.seg` file among `names` kept as a flushed copy in
+/// `state` (when `keep`), or deleted; either way listed in `recovery`.
+fn flushed_copies<F: Fs>(
+    fs: &F,
+    names: &BTreeSet<String>,
+    keep: bool,
+    state: &mut State<F::File>,
+    recovery: &mut Recovery,
+) -> Result<(), TierError> {
+    for (name, object) in names.iter().filter_map(|n| Some((n, parse_seg_name(n)?))) {
+        if !keep {
+            fs.remove(name)
+                .map_err(|e| TierError::io("remove", name, e))?;
+            recovery.removed.push(name.clone());
+            continue;
+        }
+        let len = fs
+            .file_len(name)
+            .map_err(|e| TierError::io("stat", name, e))?;
+        state.add_seg(object, len);
+        recovery.flushed.push(object);
+    }
+    Ok(())
 }
 
 /// Deletes every file the tier writes in `fs` (blocks, flushed copies, `TIER`) and

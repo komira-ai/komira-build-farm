@@ -72,6 +72,7 @@ impl Session {
             protocol_version: 1,
             heartbeat_interval_ms: 1_000,
             epoch: 0,
+            ..Welcome::default()
         }));
     }
 

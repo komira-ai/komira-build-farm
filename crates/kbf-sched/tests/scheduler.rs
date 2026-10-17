@@ -905,6 +905,28 @@ fn run_one(h: &mut Harness, waiter: u64, n: u8) -> LeaseGrant {
     grant
 }
 
+/// Catches: a list of unfinished operations that includes a finished one (a successor
+/// process would follow results already given) or leaves out a queued or running one
+/// (a caller left with no answer).
+///
+/// Three operations: one finished, one running, one queued behind it on a node with
+/// room for one.
+#[test]
+fn unfinished_lists_the_operations_not_done_and_no_other() {
+    let mut h = Harness::new();
+    h.worker("a", 1_000, GIB);
+    let done = run_one(&mut h, 0, 0);
+    h.submit(1, request(1));
+    let [running] = h.tick().try_into().unwrap();
+    h.commit_and_start(&running);
+    h.submit(2, request(2));
+    assert!(h.s.state(done.operation).is_some_and(OpState::is_done));
+    assert_eq!(
+        h.s.unfinished().collect::<Vec<_>>(),
+        [running.operation, OperationId(2)]
+    );
+}
+
 /// Catches (issue #165): finished operations kept forever, so the scheduler's memory
 /// grows with every operation it ever ran; one dropped before the retention is up, so
 /// a WaitExecution right after a broken stream finds nothing; and a drop that takes

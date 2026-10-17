@@ -15,8 +15,12 @@
 //! are bound before it runs and stop when it returns, so an answer from either route
 //! means both listeners are bound.
 //!
-//! The REAPI listener answers the same readiness over `grpc.health.v1` ([`failing`] is
+//! The REAPI listener answers the same readiness over `grpc.health.v1` ([`Checks`] is
 //! the one evaluation both use; see [`crate::grpc_health`]).
+//!
+//! The checks beyond the flags are [`Probe`]s, each with a name and a bounded wait: the
+//! server's is its object store, a frontend's ([`crate::frontend`]) are its storage
+//! node, its state store and the storage map.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,8 +32,11 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use kbf_front::{Cache, MetaLog};
+use futures::future::BoxFuture;
+use kbf_front::{Cache, MetaLog, Routed};
 use kbf_objstore::{ByteRange, ObjectStore, ObjectStoreError};
+use kbf_storage::Storage;
+use kbf_types::{Digest, DigestFunction};
 use serde::Serialize;
 
 use crate::api::JSON;
@@ -102,7 +109,8 @@ impl Readiness {
 /// One failing check of `/readyz`.
 #[derive(Serialize)]
 pub struct Failing {
-    /// `stopping`, `leader` or `store`.
+    /// `stopping`, `leader`, or the name of a probe (`store`; a frontend's `storage`,
+    /// `state_store` and `map`).
     pub check: &'static str,
     /// Why it fails.
     pub reason: String,
@@ -125,10 +133,205 @@ struct AliveBody {
     commit: &'static str,
 }
 
-struct HealthState<M, O> {
-    cache: Arc<Cache<M, O>>,
+/// One dependency `/readyz` asks about, with the wait it is allowed.
+pub trait Probe: Send + Sync {
+    /// `Ok` when the dependency answers; else why not (a reason a person can act on).
+    fn probe(&self) -> BoxFuture<'_, Result<(), String>>;
+}
+
+/// The checks of `/readyz`: the stop signal, the scheduler role and the [`Probe`]s, in
+/// that order. One evaluation for the HTTP route and the `grpc.health.v1` service.
+pub struct Checks {
     readiness: Arc<Readiness>,
+    probes: Vec<(&'static str, Arc<dyn Probe>)>,
+}
+
+impl Checks {
+    /// The checks of `readiness` alone; add dependencies with [`Checks::probing`].
+    #[must_use]
+    pub const fn new(readiness: Arc<Readiness>) -> Self {
+        Self {
+            readiness,
+            probes: Vec::new(),
+        }
+    }
+
+    /// These checks, and `probe` under the name `check`.
+    #[must_use]
+    pub fn probing(mut self, check: &'static str, probe: Arc<dyn Probe>) -> Self {
+        self.probes.push((check, probe));
+        self
+    }
+
+    /// The checks of a server over `cache`: its store answers within `timeout`.
+    #[must_use]
+    pub fn of_cache<M, O>(
+        cache: Arc<Cache<M, O>>,
+        readiness: Arc<Readiness>,
+        timeout: Duration,
+    ) -> Self
+    where
+        M: MetaLog,
+        O: ObjectStore + 'static,
+    {
+        Self::new(readiness).probing("store", Arc::new(StoreProbe { cache, timeout }))
+    }
+
+    /// The flags `/readyz` reads.
+    #[must_use]
+    pub fn readiness(&self) -> &Readiness {
+        &self.readiness
+    }
+
+    /// The checks that fail now, in the order the route lists them; empty when the
+    /// server is ready. Asks each probe once.
+    pub async fn failing(&self) -> Vec<Failing> {
+        let mut failing = Vec::new();
+        if self.readiness.is_stopping() {
+            failing.push(Failing {
+                check: "stopping",
+                reason: "a stop signal was received; the server is shutting down".to_owned(),
+            });
+        }
+        if !self.readiness.is_leader() {
+            failing.push(Failing {
+                check: "leader",
+                reason: "this server does not hold the scheduler role".to_owned(),
+            });
+        }
+        for (check, probe) in &self.probes {
+            if let Err(reason) = probe.probe().await {
+                failing.push(Failing { check, reason });
+            }
+        }
+        failing
+    }
+}
+
+/// The object store of a cache, read as [`probe_store`] does.
+struct StoreProbe<M, O> {
+    cache: Arc<Cache<M, O>>,
     timeout: Duration,
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> Probe for StoreProbe<M, O> {
+    fn probe(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(probe_store(&self.cache, self.timeout))
+    }
+}
+
+/// The action digest the storage probe asks a node about: the SHA-256 field all zero,
+/// which no action has, so the node answers "no entry" from its index and the call
+/// writes nothing.
+fn probe_digest() -> Digest {
+    Digest::new(DigestFunction::Sha256, [0; 32], 1)
+}
+
+/// A storage node, asked for the action-cache entry of [`probe_digest`]: a round trip
+/// through the transport, the node's certificate check, its check of the role in the
+/// frontend's certificate (reading the action cache is the one call only a frontend may
+/// make) and its index.
+///
+/// Once the frontend routes by the storage map ([`StorageProbe::routed`] and
+/// [`Routed::active`]) the question goes to the owners the map names for
+/// [`probe_digest`], in order, and the check passes when one of them answers: the
+/// `--storage` node may have left the farm, and a farm whose other members are up is
+/// ready. Before that it is the `--storage` node alone.
+pub struct StorageProbe {
+    storage: Arc<dyn Storage>,
+    routed: Option<Arc<Routed>>,
+    timeout: Duration,
+}
+
+impl StorageProbe {
+    /// A probe of `storage`, waiting at most `timeout` for its answer.
+    #[must_use]
+    pub fn new(storage: Arc<dyn Storage>, timeout: Duration) -> Self {
+        Self {
+            storage,
+            routed: None,
+            timeout,
+        }
+    }
+
+    /// The same probe, asking the owners `routed` names instead of `storage` while it is
+    /// routing by the map.
+    #[must_use]
+    pub fn routed(mut self, routed: Arc<Routed>) -> Self {
+        self.routed = Some(routed);
+        self
+    }
+
+    /// The action-cache lookup, at the owners or at the one node.
+    async fn ask(&self) -> Result<(), kbf_storage::StorageError> {
+        let digest = probe_digest();
+        if let Some(routed) = &self.routed {
+            routed.tag_bootstrap();
+        }
+        match self.routed.as_ref().filter(|routed| routed.active()) {
+            Some(routed) => routed.router().action_result(&digest).await.map(drop),
+            None => self.storage.action_result(&digest).await.map(drop),
+        }
+    }
+}
+
+impl Probe for StorageProbe {
+    fn probe(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            match tokio::time::timeout(self.timeout, self.ask()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(format!("the storage node did not answer: {e}")),
+                Err(_) => Err(format!(
+                    "the storage node had no answer within {} ms",
+                    self.timeout.as_millis()
+                )),
+            }
+        })
+    }
+}
+
+/// The state store, read at [`PROBE_KEY`] (an absent key is an answer).
+pub struct StateProbe {
+    store: Arc<dyn kbf_state::Store>,
+    timeout: Duration,
+}
+
+impl StateProbe {
+    /// A probe of `store`, waiting at most `timeout` for its answer.
+    #[must_use]
+    pub fn new(store: Arc<dyn kbf_state::Store>, timeout: Duration) -> Self {
+        Self { store, timeout }
+    }
+}
+
+impl Probe for StateProbe {
+    fn probe(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let store = Arc::clone(&self.store);
+            let read = tokio::task::spawn_blocking(move || store.get(PROBE_KEY));
+            match tokio::time::timeout(self.timeout, read).await {
+                Ok(Ok(Ok(_))) => Ok(()),
+                Ok(Ok(Err(e))) => Err(format!("a read of {PROBE_KEY} failed: {e}")),
+                Ok(Err(e)) => Err(format!("a read of {PROBE_KEY} did not finish: {e}")),
+                Err(_) => Err(format!(
+                    "a read of {PROBE_KEY} had no answer within {} ms",
+                    self.timeout.as_millis()
+                )),
+            }
+        })
+    }
+}
+
+/// Whether the storage map is loaded: true today, because a frontend has one storage
+/// node (`--storage`) and no map to load. TODO(av2-08): the map arrives from the state
+/// store (`docs/design/architecture-v2.md`, section 6); this probe then fails until it
+/// has been read.
+pub struct MapProbe;
+
+impl Probe for MapProbe {
+    fn probe(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 /// The `/healthz` and `/readyz` routes; `/readyz` probes `cache`'s store, waiting at
@@ -138,14 +341,15 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    router_of(Arc::new(Checks::of_cache(cache, readiness, timeout)))
+}
+
+/// The `/healthz` and `/readyz` routes over `checks`.
+pub fn router_of(checks: Arc<Checks>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz::<M, O>))
-        .with_state(Arc::new(HealthState {
-            cache,
-            readiness,
-            timeout,
-        }))
+        .route("/readyz", get(readyz))
+        .with_state(checks)
 }
 
 async fn healthz() -> Response {
@@ -157,12 +361,8 @@ async fn healthz() -> Response {
     json(StatusCode::OK, &body)
 }
 
-async fn readyz<M, O>(State(health): State<Arc<HealthState<M, O>>>) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
-    let failing = failing(&health.cache, &health.readiness, health.timeout).await;
+async fn readyz(State(checks): State<Arc<Checks>>) -> Response {
+    let failing = checks.failing().await;
     let ready = failing.is_empty();
     let code = if ready {
         StatusCode::OK
@@ -176,40 +376,6 @@ where
         failing,
     };
     json(code, &body)
-}
-
-/// The checks of `/readyz` that fail now, in the order the route lists them; empty
-/// when the server is ready. Probes `cache`'s store once ([`probe_store`]), waiting at
-/// most `timeout`.
-pub async fn failing<M, O>(
-    cache: &Cache<M, O>,
-    readiness: &Readiness,
-    timeout: Duration,
-) -> Vec<Failing>
-where
-    M: MetaLog,
-    O: ObjectStore,
-{
-    let mut failing = Vec::new();
-    if readiness.is_stopping() {
-        failing.push(Failing {
-            check: "stopping",
-            reason: "a stop signal was received; the server is shutting down".to_owned(),
-        });
-    }
-    if !readiness.is_leader() {
-        failing.push(Failing {
-            check: "leader",
-            reason: "this server does not hold the scheduler role".to_owned(),
-        });
-    }
-    if let Err(reason) = probe_store(cache, timeout).await {
-        failing.push(Failing {
-            check: "store",
-            reason,
-        });
-    }
-    failing
 }
 
 /// Reads the first byte of [`PROBE_KEY`] under `cache`'s prefix, waiting at most

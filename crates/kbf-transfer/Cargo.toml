@@ -12,7 +12,9 @@ bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-proto.workspace = true
+kbf-route.workspace = true
 kbf-segments.workspace = true
+kbf-storage.workspace = true
 kbf-types.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 sha2.workspace = true

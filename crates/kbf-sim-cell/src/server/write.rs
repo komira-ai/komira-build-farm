@@ -230,7 +230,7 @@ mod tests {
         assert!(!present(&s, &d));
         // A refused PUT.
         s.apply(message(30_030, "client-0", Msg::Upload { digest: d }));
-        let object = ObjectId::new(object.epoch(), object.seq() + 1);
+        let object = ObjectId::of(object.writer(), object.seq() + 1);
         sends(&mut s);
         s.apply(message(
             30_040,

@@ -417,7 +417,9 @@ impl Oci {
 
 /// Runs `program` (Podman) with `args`: `Ok` if it exits 0, else what it said.
 async fn podman(program: &Path, args: &[std::ffi::OsString]) -> Result<(), String> {
-    let output = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    crate::credential::without_credentials(command.as_std_mut());
+    let output = command
         .arg("--cgroup-manager=cgroupfs")
         .args(args)
         .stdin(std::process::Stdio::null())

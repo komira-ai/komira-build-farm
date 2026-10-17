@@ -10,12 +10,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use kbf_front::{
-    Cache, CacheError, EvictReady, MemoryMetaLog, MetaLog, MetaLogError, PASS_OPENS_PER_SEC,
-    PassReport, VerifiedBlob,
+    Cache, CacheError, EvictReady, MemoryMetaLog, MetaLog, MetaLogError, ObjectKeys,
+    PASS_OPENS_PER_SEC, PassReport, VerifiedBlob,
 };
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, Closure, Collected, Command, Epoch, MetaState, Miss,
-    ObjectId, Retention, Role, ServerId, StagedPut, TierId,
+    NodeWriter, ObjectId, Retention, Role, ServerId, StagedPut, TierId, Writer,
 };
 use kbf_objstore::{Floor, FsStore, KeyPrefix, ObjectKey, ObjectStore};
 use kbf_types::{Digest, FarmTime};
@@ -298,7 +298,7 @@ async fn pass_keeps_current_epoch_staged_foreign() {
     std::fs::write(&headerless, b"").expect("plant a file with no header");
 
     let cache = open(&log, &files).await;
-    assert_eq!(cache.epoch(), Epoch::new(2));
+    assert_eq!(cache.writer(), Writer::Epoch(Epoch::new(2)));
     let current = object_key(2, 0x77);
     plant(&files, &current, 10).await;
     let report = pass(&cache, &files).await;
@@ -316,6 +316,58 @@ async fn pass_keeps_current_epoch_staged_foreign() {
         [object(1, 1), object(1, 0x50), object(2, 0x77)]
     );
     assert_eq!(report.kept, 3);
+    drop((cache, files));
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches the pass deleting another writer's objects, the data-loss case: a registered
+/// node (member 7, boot 2) with an empty index, over a store that holds objects of its
+/// own member's earlier boot, of another member at two boots, and an epoch writer's
+/// object of the log it now writes beside. None is in its index; each may be one only a
+/// rebuild knows (boot 1's metadata directory was wiped), so all are kept and counted
+/// foreign, and only its own object is held. Mutant seen red: the orphan rule widened
+/// from "an earlier epoch of an epoch writer" to "any writer but this one" (every
+/// planted object is deleted).
+#[tokio::test]
+async fn the_start_pass_keeps_other_writers_objects() {
+    let dir = scratch("other-writers");
+    let files = FsStore::open(&dir, FLOOR).expect("open");
+    let log = Log::new();
+    let n = |v| std::num::NonZeroU64::new(v).expect("not zero");
+    let keys = ObjectKeys {
+        legacy: prefix(),
+        root: KeyPrefix::new("kbf/").expect("root"),
+    };
+    let me = NodeWriter::new(n(7), n(2));
+    let cache = Cache::open_node(log.clone(), files.clone(), keys, me)
+        .await
+        .expect("open as member 7 boot 2");
+    let node_key = |member: u64, boot: u64, seq: u64| {
+        key(&format!("kbf/cas/{member:016x}/{boot:016x}/{seq:016x}"))
+    };
+    let others = [
+        node_key(7, 1, 1),
+        node_key(8, 1, 1),
+        node_key(8, 5, 3),
+        object_key(1, 0xff),
+    ];
+    for k in &others {
+        plant(&files, k, 10).await;
+    }
+    let mine = node_key(7, 2, 0x77);
+    plant(&files, &mine, 10).await;
+
+    let report = pass(&cache, &files).await;
+
+    for k in others.iter().chain([&mine]) {
+        assert!(holds(&files, k).await, "{k} was deleted");
+    }
+    assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(report.foreign, others.len() as u64);
+    assert_eq!(
+        report.held.keys().copied().collect::<Vec<_>>(),
+        [ObjectId::of(Writer::Node(me), 0x77)]
+    );
     drop((cache, files));
     std::fs::remove_dir_all(&dir).expect("remove");
 }

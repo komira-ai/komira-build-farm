@@ -19,6 +19,10 @@
 //!   `containers.conf` says;
 //! - no id of the daemon's user (`--userns=nomap`: the container's ids are the user's
 //!   subordinate ids, which [`check_daemon_user`] requires at startup);
+//! - nothing of the node's cold-store key: Podman and `crun` start without the node's
+//!   `AWS_*` variables (`credential`), so no runtime feature that copies the host's
+//!   environment into a container has the key to copy; and a key file of mode `0600`
+//!   is not for the action's ids to read, the subordinate ids above;
 //! - a lease cgroup under the daemon's `actions/` cgroup, which the daemon makes in
 //!   its delegated cgroup at start ([`delegate`]; [`adopt`] checks one given instead)
 //!   and whose limits ([`capacity`]) bound what the node reports, with
@@ -71,6 +75,7 @@ pub mod cas;
 mod cgroup;
 mod cgroup_usage;
 pub mod chown_dirs;
+mod credential;
 pub mod delegate;
 mod exit_record;
 mod hashing;

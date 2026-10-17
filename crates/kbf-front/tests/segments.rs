@@ -297,7 +297,11 @@ async fn a_read_range_over_the_limit_is_refused() {
     for length in [MAX_RANGE_BYTES + 1, 0] {
         let refused = client
             .read_range(ReadRangeRequest {
-                object: Some(ObjectRef { epoch: 1, seq: 1 }),
+                object: Some(ObjectRef {
+                    epoch: 1,
+                    seq: 1,
+                    ..ObjectRef::default()
+                }),
                 offset: 0,
                 length,
             })
@@ -340,7 +344,11 @@ async fn a_read_range_over_the_limit_is_refused() {
     front.store.fail_next_gets(0);
     let absent = client
         .read_range(ReadRangeRequest {
-            object: Some(ObjectRef { epoch: 1, seq: 999 }),
+            object: Some(ObjectRef {
+                epoch: 1,
+                seq: 999,
+                ..ObjectRef::default()
+            }),
             offset: 0,
             length: 10,
         })

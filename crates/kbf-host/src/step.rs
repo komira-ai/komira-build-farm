@@ -1,6 +1,7 @@
 //! The steps a plan is made of, and the line each prints.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::path::HostPath;
@@ -232,6 +233,11 @@ pub enum Step {
         perms: Perms,
         owner: Option<Owner>,
     },
+    /// Point the symbolic link at `path` to `target` (relative to the link's directory
+    /// unless absolute), atomically: a new link is made beside it and renamed over it, so
+    /// `path` names the old target or the new one at every moment. A file or directory at
+    /// `path` is refused, never replaced; its parent must exist.
+    Symlink { path: HostPath, target: PathBuf },
     /// Remove the file, link or empty directory at `path`.
     Remove { path: HostPath },
     /// Run an external tool; a non-zero exit fails the step.
@@ -270,6 +276,9 @@ impl fmt::Display for Step {
             }
             Step::Mkdir { path, perms, owner } => {
                 write!(f, "mkdir {path} ({perms}{})", Owned(owner))
+            }
+            Step::Symlink { path, target } => {
+                write!(f, "link {path} -> {}", Quoted(&target.to_string_lossy()))
             }
             Step::Remove { path } => write!(f, "remove {path}"),
             Step::Run(cmd) => write!(f, "run {cmd}"),
@@ -374,6 +383,20 @@ mod tests {
                     owner: None,
                 },
                 "mkdir /srv/x (1777)",
+            ),
+            (
+                Step::Symlink {
+                    path: p("/usr/local/kbf/current"),
+                    target: PathBuf::from("releases/0123"),
+                },
+                "link /usr/local/kbf/current -> releases/0123",
+            ),
+            (
+                Step::Symlink {
+                    path: p("/srv/a"),
+                    target: PathBuf::from("/srv/b c"),
+                },
+                r#"link /srv/a -> "/srv/b c""#,
             ),
             (Step::Remove { path: p("/etc/x") }, "remove /etc/x"),
             (

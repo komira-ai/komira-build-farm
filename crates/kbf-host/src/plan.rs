@@ -1,6 +1,7 @@
 //! Building a plan from what the host has, and printing or applying it.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::exec::{Entry, Exec, Kind, Meta};
@@ -10,8 +11,8 @@ use crate::trust::Untrusted;
 
 /// The steps that bring the host to what a kit wants, in order.
 ///
-/// Only a [`Planner`] makes one, so every file and directory step in it is a change the
-/// host does not have yet, and a plan made again after it was applied has none.
+/// Only a [`Planner`] makes one, so every file, directory and link step in it is a change
+/// the host does not have yet, and a plan made again after it was applied has none.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     steps: Vec<Step>,
@@ -103,6 +104,22 @@ impl<'a, E: Exec> Planner<'a, E> {
         Ok(there)
     }
 
+    /// The symbolic link at `path` points to `target`; when it points elsewhere or is
+    /// missing, a [`Step::Symlink`] replaces or makes it. Returns whether a step was
+    /// planned. A file, directory or anything else at `path` is refused
+    /// ([`HostError::NotALink`]): the step would never replace it.
+    pub fn symlink(&mut self, path: HostPath, target: PathBuf) -> Result<bool, HostError> {
+        let done = match self.inspect(&path)? {
+            Some(Entry::Link { target: t }) => t == target,
+            None => false,
+            Some(_) => return Err(HostError::NotALink { path }),
+        };
+        if !done {
+            self.plan.steps.push(Step::Symlink { path, target });
+        }
+        Ok(!done)
+    }
+
     /// Run `cmd`. The host cannot say whether a command is needed, so the kit asks
     /// first and calls this only when it is.
     pub fn run(&mut self, cmd: Cmd) {
@@ -189,6 +206,8 @@ pub enum HostError {
     IsRoot,
     #[error("refusing to run as root from a binary root does not own alone: {0}")]
     Untrusted(#[from] Untrusted),
+    #[error("refusing to replace {path} with a symbolic link: it is not one")]
+    NotALink { path: HostPath },
     #[error("cannot read {path}: {source}")]
     Inspect { path: HostPath, source: io::Error },
     #[error("step {index} ({step}) failed: {source}")]

@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, Dispatch, Finished, MemoryMetaLog, Stage, Submission};
-use kbf_objstore::MemoryStore;
+use kbf_front::{Cache, Dispatch, Finished, Stage, Submission};
 use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
 use kbf_sched::{DaemonInstance, FARM_RERUNS, NOT_STARTED_RERUNS, Request};
@@ -21,7 +20,7 @@ type Responses = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
 
 const NODES: [&str; 3] = ["node-a", "node-b", "node-c"];
 
-fn register(farm: &Farm<MemoryMetaLog, MemoryStore>, node: &str) -> (StreamId, Responses) {
+fn register(farm: &Farm, node: &str) -> (StreamId, Responses) {
     let (outbound, responses) = mpsc::unbounded_channel();
     let caps = NodeCaps::from_report([("arch", "x86_64")])
         .expect("caps")

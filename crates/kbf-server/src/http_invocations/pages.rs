@@ -5,7 +5,10 @@
 use std::collections::BTreeSet;
 
 use kbf_front::InvocationId as AcceptedId;
-use kbf_invocation::{ActionRow, How, Invocation, InvocationId, Outcome, RecordKey, WallTime};
+use kbf_invocation::{
+    ActionRow, AttemptEnd, How, Invocation, InvocationId, MemoryKillKind, Outcome, Phase,
+    REQUEUE_NAMES, RecordKey, WallTime, requeue_name,
+};
 use kbf_types::Digest;
 use serde_json::{Map, Value};
 
@@ -91,16 +94,39 @@ pub(super) fn how_name(how: How) -> &'static str {
     HOWS.iter().find(|(h, _)| *h == how).map_or("", |(_, n)| n)
 }
 
-/// What `/actions` keeps: rows of one outcome and of one `how`, either or both.
+/// What `/actions` keeps and in which order: rows of one outcome, of one `how`, with
+/// a lease given up for one reason, with (or without) a memory kill of one kind, any
+/// of these; in row order, or by one phase's duration, longest first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Filter {
     outcome: Option<OutcomeFilter>,
     how: Option<How>,
+    requeue_reason: Option<&'static str>,
+    memory_kill: Option<MemoryKillKind>,
+    sort: Option<Phase>,
 }
 
 impl Filter {
-    /// Whether `row` passes.
+    /// Whether `row` passes. `?memory_kill=none` keeps the rows none of whose leases
+    /// was killed for memory; any other kind, the rows one of whose leases was.
     fn keeps(self, row: &ActionRow) -> bool {
+        let requeued = self.requeue_reason.is_none_or(|want| {
+            row.attempts
+                .iter()
+                .any(|a| matches!(&a.end, Some(AttemptEnd::Requeued(r)) if requeue_name(r) == want))
+        });
+        let killed = self.memory_kill.is_none_or(|want| {
+            let kills = || row.attempts.iter().filter_map(|a| a.memory_kill());
+            match want {
+                MemoryKillKind::None => kills().all(|k| k == MemoryKillKind::None),
+                kind => kills().any(|k| k == kind),
+            }
+        });
+        requeued && killed && self.keeps_built(row)
+    }
+
+    /// Whether `row` passes the filters `/actions` was built with.
+    fn keeps_built(self, row: &ActionRow) -> bool {
         let outcome = self.outcome.is_none_or(|want| {
             matches!(
                 (want, &row.outcome),
@@ -114,11 +140,27 @@ impl Filter {
     }
 
     /// The filter as a page token carries it: `<outcome>+<how>`, `-` for either one
-    /// absent.
+    /// absent, then `+<name>=<value>` for each later filter and the sort given (so a
+    /// token of the built filters reads as it did).
     fn text(self) -> String {
         let outcome = self.outcome.map_or("-", outcome_name);
         let how = self.how.map_or("-", how_name);
-        format!("{outcome}+{how}")
+        let mut text = format!("{outcome}+{how}");
+        for (name, value) in self.later() {
+            text.push_str(&format!("+{name}={value}"));
+        }
+        text
+    }
+
+    /// The filters and sort added after the built ones, by query name, those given.
+    fn later(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        [
+            ("requeue_reason", self.requeue_reason),
+            ("memory_kill", self.memory_kill.map(MemoryKillKind::name)),
+            ("sort", self.sort.map(Phase::name)),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
     }
 
     /// Adds the filter to a query, as `/actions` takes it.
@@ -128,6 +170,9 @@ impl Filter {
         }
         if let Some(how) = self.how {
             query.append_pair("how", how_name(how));
+        }
+        for (name, value) in self.later() {
+            query.append_pair(name, value);
         }
     }
 }
@@ -206,7 +251,11 @@ fn parse_key(text: &str) -> Option<RecordKey> {
 /// The page a paged route's query asks for (`None` for a route that is not paged).
 fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
     let (paged, filtered, takes) = match route {
-        Route::Actions => (true, true, "page_size, page_token, outcome and how"),
+        Route::Actions => (
+            true,
+            true,
+            "page_size, page_token, outcome, how, requeue_reason, memory_kill and sort",
+        ),
         Route::Artifacts | Route::Logs => (true, false, "page_size and page_token"),
         _ => (false, false, "no parameters"),
     };
@@ -249,6 +298,32 @@ fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
                     ))
                 })?);
             }
+            "requeue_reason" if filtered => {
+                let found = REQUEUE_NAMES.iter().find(|n| **n == value);
+                query.filter.requeue_reason = Some(*found.ok_or_else(|| {
+                    Bad::Invalid(format!(
+                        "requeue_reason={value:?}: one of {}",
+                        REQUEUE_NAMES.join(", ")
+                    ))
+                })?);
+            }
+            "memory_kill" if filtered => {
+                let found = MemoryKillKind::NAMED.iter().find(|(_, n)| *n == value);
+                query.filter.memory_kill = Some(found.map(|(k, _)| *k).ok_or_else(|| {
+                    Bad::Invalid(format!(
+                        "memory_kill={value:?}: one of none, own_limit, node_pressure"
+                    ))
+                })?);
+            }
+            "sort" if filtered => {
+                let found = Phase::NAMED.iter().find(|(_, n)| *n == value);
+                query.filter.sort = Some(found.map(|(p, _)| *p).ok_or_else(|| {
+                    Bad::Invalid(format!(
+                        "sort={value:?}: one of wall_ms, execution_ms, queue_ms, \
+                         input_fetch_ms, output_upload_ms (each longest first)"
+                    ))
+                })?);
+            }
             _ => {
                 return Err(Bad::Invalid(format!(
                     "unknown parameter {key:?}; this route takes {takes}"
@@ -264,6 +339,24 @@ fn parse_query(text: &str, route: Route) -> Result<Option<PageQuery>, Bad> {
 /// at the end, so a position stays valid while the record is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cursor {
+    /// A route walked in row order, one entry at a time.
+    Walk(Walk),
+    /// `/actions?sort=<phase>`: the duration (microseconds) and index of the last
+    /// row listed, `None` before the first page. Rows come longest first, ties in row
+    /// order; a page is read in one pass ([`sorted`]). Only `queue` changes once
+    /// measured, and only grows (by each lease granted after a requeue): a row whose
+    /// queueing grows past the cursor's after it was passed is not listed again, and
+    /// none is listed twice. The other phases are measured once the operation has
+    /// ended and never change.
+    Sorted {
+        phase: Phase,
+        after: Option<(u64, usize)>,
+    },
+}
+
+/// A position in a route walked in row order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walk {
     /// `/actions`: the next row to look at.
     Actions { row: usize },
     /// `/artifacts`: the next output of a row to look at.
@@ -292,25 +385,54 @@ pub(super) fn failed(row: &ActionRow) -> bool {
     row.outcome.as_ref().is_some_and(Outcome::is_failure)
 }
 
+/// The rows `filter` keeps whose duration of `phase` comes after `after` in the
+/// order of [`Cursor::Sorted`], the first `n` of them in that order: each row's
+/// duration and index.
+fn sorted(
+    rows: &[ActionRow],
+    filter: Filter,
+    phase: Phase,
+    after: Option<(u64, usize)>,
+    n: usize,
+) -> Vec<(u64, usize)> {
+    let order = |a: &(u64, usize), b: &(u64, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+    let mut found: Vec<(u64, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| filter.keeps(r))
+        .filter_map(|(i, r)| Some((r.durations().of(phase)?, i)))
+        .filter(|e| after.is_none_or(|a| order(&a, e).is_lt()))
+        .collect();
+    if found.len() > n {
+        found.select_nth_unstable_by(n, order);
+        found.truncate(n);
+    }
+    found.sort_unstable_by(order);
+    found
+}
+
 impl Cursor {
-    /// Where a route's first page starts.
-    const fn start(route: Route) -> Self {
-        match route {
-            Route::Artifacts => Self::Artifacts { row: 0, output: 0 },
-            Route::Logs => Self::Logs { row: 0, rest: None },
-            _ => Self::Actions { row: 0 },
+    /// Where a route's first page starts, in the order `filter` asks.
+    const fn start(route: Route, filter: Filter) -> Self {
+        match (route, filter.sort) {
+            (Route::Artifacts, _) => Self::Walk(Walk::Artifacts { row: 0, output: 0 }),
+            (Route::Logs, _) => Self::Walk(Walk::Logs { row: 0, rest: None }),
+            (_, Some(phase)) => Self::Sorted { phase, after: None },
+            _ => Self::Walk(Walk::Actions { row: 0 }),
         }
     }
 
     /// The route's name, as a page token carries it.
     const fn kind(self) -> &'static str {
         match self {
-            Self::Actions { .. } => "actions",
-            Self::Artifacts { .. } => "artifacts",
-            Self::Logs { .. } => "logs",
+            Self::Walk(Walk::Actions { .. }) | Self::Sorted { .. } => "actions",
+            Self::Walk(Walk::Artifacts { .. }) => "artifacts",
+            Self::Walk(Walk::Logs { .. }) => "logs",
         }
     }
+}
 
+impl Walk {
     /// The first entry at or after the cursor that `filter` keeps, and the cursor just
     /// after it; `None` when there is none.
     ///
@@ -389,9 +511,10 @@ impl Token {
     /// The token as it is sent.
     pub(crate) fn encode(self) -> String {
         let (a, b) = match self.cursor {
-            Cursor::Actions { row } => (row, 0),
-            Cursor::Artifacts { row, output } => (row, output),
-            Cursor::Logs { row, rest } => (row, rest.map_or(0, |n| n + 1)),
+            Cursor::Walk(Walk::Actions { row }) => (row, 0),
+            Cursor::Walk(Walk::Artifacts { row, output }) => (row, output as u64),
+            Cursor::Walk(Walk::Logs { row, rest }) => (row, rest.map_or(0, |n| n as u64 + 1)),
+            Cursor::Sorted { after, .. } => after.map_or((0, 0), |(value, row)| (row + 1, value)),
         };
         let text = format!(
             "{TOKEN_VERSION}:{}:{}:{}:{a}:{b}",
@@ -434,25 +557,37 @@ impl Token {
         }
         if filtered != filter.text() {
             return Err(Bad::Invalid(
-                "this page token was made for another filter: send the outcome and how \
-                 of the first page"
+                "this page token was made for another filter: send the outcome, how, \
+                 requeue_reason, memory_kill and sort of the first page"
                     .to_owned(),
             ));
         }
-        let (a, b): (usize, usize) = (
+        let (a, b): (usize, u64) = (
             a.parse().map_err(|_| malformed())?,
             b.parse().map_err(|_| malformed())?,
         );
         let rows = inv.rows().len();
+        let walk = match start {
+            Cursor::Sorted { phase, .. } => {
+                if a > rows {
+                    return Err(malformed());
+                }
+                let after = a.checked_sub(1).map(|row| (b, row));
+                return Ok(Cursor::Sorted { phase, after });
+            }
+            Cursor::Walk(walk) => walk,
+        };
         let rest = b.checked_sub(1);
-        if a > rows || rest.is_some_and(|n| n > rows) {
+        if a > rows || rest.is_some_and(|n| n > rows as u64) {
             return Err(malformed());
         }
-        Ok(match start {
-            Cursor::Actions { .. } => Cursor::Actions { row: a },
-            Cursor::Artifacts { .. } => Cursor::Artifacts { row: a, output: b },
-            Cursor::Logs { .. } => Cursor::Logs { row: a, rest },
-        })
+        // Both fit: `b` is at most one past the rows.
+        let (b, rest) = (b as usize, rest.map(|n| n as usize));
+        Ok(Cursor::Walk(match walk {
+            Walk::Actions { .. } => Walk::Actions { row: a },
+            Walk::Artifacts { .. } => Walk::Artifacts { row: a, output: b },
+            Walk::Logs { .. } => Walk::Logs { row: a, rest },
+        }))
     }
 }
 
@@ -548,28 +683,55 @@ fn paged(
     page: &PageQuery,
     base: &str,
 ) -> Result<Value, Bad> {
-    let start = Cursor::start(route);
+    let start = Cursor::start(route, page.filter);
     let mut cursor = match &page.token {
         Some(text) => Token::decode(text, inv, start, page.filter)?,
         None => start,
     };
     let rows = inv.rows();
+    let (found, more): (Vec<Entry>, bool) = match cursor {
+        // One pass over the rows for the page and whether another follows (one row
+        // past it), not one per entry.
+        Cursor::Sorted { phase, after } => {
+            let mut found = sorted(rows, page.filter, phase, after, page.size + 1);
+            let more = found.len() > page.size;
+            found.truncate(page.size);
+            if let Some(&last) = found.last() {
+                cursor = Cursor::Sorted {
+                    phase,
+                    after: Some(last),
+                };
+            }
+            (
+                found.into_iter().map(|(_, i)| Entry::Row(i)).collect(),
+                more,
+            )
+        }
+        Cursor::Walk(mut walk) => {
+            let mut found = Vec::new();
+            while found.len() < page.size {
+                let Some((entry, next)) = walk.next(rows, page.filter) else {
+                    break;
+                };
+                found.push(entry);
+                walk = next;
+            }
+            cursor = Cursor::Walk(walk);
+            (found, walk.next(rows, page.filter).is_some())
+        }
+    };
     let mut entries = Vec::new();
-    while entries.len() < page.size {
-        let Some((entry, next)) = cursor.next(rows, page.filter) else {
-            break;
-        };
+    for entry in found {
         let at = format!("/{}/{}", start.kind(), entries.len());
         entries.push(match entry {
             Entry::Row(i) if route == Route::Logs => logs(b, &rows[i], base, &at),
             Entry::Row(i) => Value::Object(row(&rows[i], base)),
             Entry::Output(i, o) => artifact(b, &rows[i], o, &at),
         });
-        cursor = next;
     }
     let mut value = Map::new();
     value.insert(start.kind().to_owned(), Value::Array(entries));
-    if cursor.next(rows, page.filter).is_some() {
+    if more {
         let token = Token {
             serial: inv.serial(),
             filter: page.filter,

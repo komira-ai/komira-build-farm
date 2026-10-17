@@ -81,6 +81,14 @@ pub const TARGETS: &[Target] = &[
         nocapture: false,
         containers_conf: true,
     },
+    // Writes and names its own containers.conf: a node that hands its files and its
+    // environment to every container, which the action must still not read the cold
+    // store key through.
+    Target {
+        name: "podman_credential",
+        nocapture: false,
+        containers_conf: false,
+    },
     // The OCI backend on real `crun` (hosted runners carry crun 1.14.1 beside Podman
     // 4.9.3); Podman only pulls and exports the image there.
     Target {

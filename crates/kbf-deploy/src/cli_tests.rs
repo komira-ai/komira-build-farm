@@ -280,6 +280,75 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
+    // A mode's unit reaches its own install: on a host with no such user it asks for the
+    // user the frontend runs as and is refused before any step.
+    let mut exec = FakeExec::new(0);
+    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert_eq!(
+        err,
+        "REFUSED: /usr/bin/getent passwd -- kbf-server printed \"\", which is not what this kit reads\n"
+    );
+    // The converged units' MinIO restart and rollback are not a mode's.
+    for flag in ["--restart-minio", "--uninstall"] {
+        let mut exec = FakeExec::new(0);
+        let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
+        let (code, _, _) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+    }
+    // verify-cert reaches its kit: a CA that is not there is refused; a daemon's row
+    // needs its node id.
+    let mut exec = FakeExec::new(0);
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "storage",
+        "--cert",
+        "/srv/none/storage.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(
+        err.starts_with("REFUSED: cannot read /srv/none/ca.pem"),
+        "{err}"
+    );
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "daemon",
+        "--cert",
+        "/srv/none/node.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("--node-id"), "{err}");
+    // The frontend's REAPI certificate is not the farm CA's: no row checks it.
+    let args = [
+        "linux",
+        "verify-cert",
+        "--row",
+        "frontend-reapi",
+        "--cert",
+        "/srv/none/reapi.pem",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
+    assert!(
+        err.contains("invalid value 'frontend-reapi' for '--row <ROW>'"),
+        "{err}"
+    );
+    assert!(!err.contains("REFUSED: cannot read"), "{err}");
+
     // A rollback of a host whose services are on: a dry run plans, exits 0.
     let mut exec = FakeExec::new(501);
     let (code, out, _) = cli(
@@ -427,6 +496,114 @@ fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
     assert_eq!(code, ExitCode::FAILURE, "{out}");
     assert!(out.starts_with("FAIL "), "{out}");
     assert!(out.contains("UNITS BROKEN"), "{out}");
+}
+
+/// Catches `--mode` not reaching the mode verbs through the merged command line (the
+/// converged units rendered or checked instead) and a broken mode unit exiting 0. Like
+/// the test above, these run the lib tests' instantiation of the `linux` arm.
+#[test]
+fn render_units_then_check_units_with_a_mode_exit_0_and_a_broken_unit_exits_1() {
+    let dir = kbf_host::testkit::scratch("cli-render-mode");
+    let units = dir.join("units");
+    let units = units.to_str().expect("utf-8");
+    let mut exec = FakeExec::new(501);
+    let render = [
+        "linux",
+        "render-units",
+        "--config",
+        LINUX_CONFIG,
+        "--out",
+        units,
+        "--kbf-uid",
+        "1500",
+        "--mode",
+        "daemon",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        out.starts_with("rendered kbf.slice kbf-daemon.service into "),
+        "{out}"
+    );
+    let check = [
+        "linux",
+        "check-units",
+        "--config",
+        LINUX_CONFIG,
+        "--dir",
+        units,
+        "--installable",
+        "--mode",
+        "daemon",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+    assert_eq!(
+        out,
+        "SKIP parse: no kbf binary at /usr/local/bin/kbf, so the flags of kbf daemon were \
+         not parsed; give --kbf-bin PATH to parse them with another\n\
+         UNIT OK: kbf-daemon.service runs kbf daemon\n"
+    );
+    // --kbf-bin reaches the parse rule, and needs --mode.
+    let check: Vec<&str> = check
+        .iter()
+        .copied()
+        .chain(["--kbf-bin", "/opt/kbf/kbf"])
+        .collect();
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+    assert_eq!(out, "UNIT OK: kbf-daemon.service runs kbf daemon\n");
+    let asked = exec
+        .queries
+        .borrow()
+        .last()
+        .map(|c| (c.program.to_string(), c.args[..2].to_vec()));
+    assert_eq!(
+        asked,
+        Some((
+            "/opt/kbf/kbf".to_owned(),
+            vec!["check-args".to_owned(), "daemon".to_owned()]
+        ))
+    );
+    let converged = [
+        "linux",
+        "check-units",
+        "--config",
+        LINUX_CONFIG,
+        "--dir",
+        units,
+        "--kbf-bin",
+        "/opt/kbf/kbf",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &converged);
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("--mode"), "{err}");
+    // A --kbf-bin that is not absolute, or cannot be run, is refused: the flags went
+    // unparsed.
+    let relative: Vec<&str> = check[..check.len() - 1]
+        .iter()
+        .copied()
+        .chain(["kbf"])
+        .collect();
+    let (code, _, err) = cli(&mut exec, &no_env, &relative);
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("--kbf-bin: \"kbf\" is not absolute"), "{err}");
+    exec.answer = Box::new(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.contains("cannot run /opt/kbf/kbf check-args: permission denied"),
+        "{err}"
+    );
+    exec.answer = Box::new(|_| Ok(kbf_host::testkit::reply(0, "", "")));
+
+    let unit = format!("{units}/kbf-daemon.service");
+    let text = std::fs::read_to_string(&unit).expect("rendered");
+    std::fs::write(&unit, text.replace("Delegate=yes", "Delegate=no")).expect("plant");
+    let (code, out, _) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::FAILURE, "{out}");
+    assert!(out.starts_with("FAIL delegate: "), "{out}");
+    assert!(out.contains("UNIT BROKEN"), "{out}");
 }
 
 /// The kit's settings in a file, with a LAN address filled in.

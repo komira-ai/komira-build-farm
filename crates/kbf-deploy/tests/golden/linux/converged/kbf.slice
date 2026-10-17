@@ -1,0 +1,8 @@
+# Rendered by `kbf-deploy linux render-units`; installed as /etc/systemd/system/kbf.slice.
+[Unit]
+Description=kbf build farm (converged storage node: MinIO, kbf-server, kbf-daemon)
+
+[Slice]
+# The sum of its units' MemoryMin= (MinIO + kbf-server + kbf-daemon): the kernel
+# caps a unit's protection at its slice's, so equal, not more.
+MemoryMin=49408M

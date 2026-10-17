@@ -153,7 +153,7 @@ fn fresh() -> (Arc<Gates>, Arc<Tier<GateFs>>) {
     let seq = AtomicU64::new(0);
     let start = TierStart {
         tier: TIER,
-        epoch: Epoch::new(1),
+        writer: kbf_meta::Writer::Epoch(Epoch::new(1)),
         options: options(1 << 30, 1 << 20),
     };
     let next = Box::new(move || seq.fetch_add(1, Ordering::Relaxed));

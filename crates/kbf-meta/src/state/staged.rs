@@ -27,6 +27,57 @@ impl MetaState {
         self.staged.iter().map(|(o, s)| (*o, s))
     }
 
+    /// The objects `object`'s flush waits for (`docs/design/architecture-v2.md`,
+    /// section 8, AC: closure blobs flush before the entry): every object on its tier
+    /// holding a closure blob of an action-cache entry whose result blob `object` holds,
+    /// that is still staged open or sealed. One in conflict is never flushed, so it is
+    /// not waited for. Empty for an object not staged.
+    #[must_use]
+    pub fn flush_waits(&self, object: ObjectId) -> BTreeSet<ObjectId> {
+        let Some(staged) = self.staged.get(&object) else {
+            return BTreeSet::new();
+        };
+        staged
+            .after
+            .iter()
+            .copied()
+            .filter(|o| {
+                self.staged
+                    .get(o)
+                    .is_some_and(|s| s.state != StagedState::Conflict)
+            })
+            .collect()
+    }
+
+    /// Records that the object holding `result`, if it is staged (open or sealed), is
+    /// flushed after every other object on its tier staged with a blob of `closure`.
+    pub(super) fn order_flush<'a>(
+        &mut self,
+        result: &Digest,
+        closure: impl Iterator<Item = &'a Digest>,
+    ) {
+        let Some((object, tier)) = self.staged_at(result) else {
+            return;
+        };
+        let after: BTreeSet<ObjectId> = closure
+            .filter_map(|d| self.staged_at(d))
+            .filter(|(o, t)| *o != object && *t == tier)
+            .map(|(o, _)| o)
+            .collect();
+        // `staged_at` found `object` staged.
+        self.staged
+            .entry(object)
+            .and_modify(|staged| staged.after.extend(after));
+    }
+
+    /// The object and tier `digest` is staged on, if its object is staged and not in
+    /// conflict.
+    fn staged_at(&self, digest: &Digest) -> Option<(ObjectId, TierId)> {
+        let location = self.blobs.get(digest)?.location;
+        let staged = self.staged.get(&location.object)?;
+        (staged.state != StagedState::Conflict).then_some((location.object, staged.tier))
+    }
+
     pub(super) fn add_tier(&mut self, server: ServerId, tier: TierId) -> Result<(), TierError> {
         if self.retired_tiers.contains(&tier) {
             return Err(TierError::TierRetired(tier));
@@ -74,6 +125,7 @@ impl MetaState {
                 len: 0,
                 state: StagedState::Open,
                 blobs: BTreeMap::new(),
+                after: BTreeSet::new(),
             });
             entry.len = entry.len.max(put.end);
             if put.seal && entry.state == StagedState::Open {
@@ -101,7 +153,7 @@ impl MetaState {
     /// Whether `put` may be applied on `tier`; changes nothing.
     fn stageable(&self, tier: TierId, put: &StagedPut) -> Result<(), TierError> {
         let object = put.object;
-        self.allocated(object)?;
+        self.writable(object)?;
         if self.unreachable.contains_key(&object) {
             return Err(TierError::Unreachable(object));
         }
@@ -139,7 +191,7 @@ impl MetaState {
     }
 
     pub(super) fn seal_staged(&mut self, object: ObjectId) -> Result<(), TierError> {
-        self.allocated(object)?;
+        self.known(object)?;
         match self.staged.get_mut(&object) {
             Some(staged) => {
                 if staged.state == StagedState::Open {
@@ -152,7 +204,7 @@ impl MetaState {
     }
 
     pub(super) fn object_flushed(&mut self, object: ObjectId) -> Result<(), TierError> {
-        self.allocated(object)?;
+        self.known(object)?;
         match self.staged.get(&object).map(|s| s.state) {
             Some(StagedState::Open) => Err(TierError::NotSealed(object)),
             Some(StagedState::Sealed | StagedState::Conflict) => {
@@ -164,7 +216,7 @@ impl MetaState {
     }
 
     pub(super) fn flush_conflict(&mut self, object: ObjectId) -> Result<(), TierError> {
-        self.allocated(object)?;
+        self.known(object)?;
         match self.staged.get_mut(&object) {
             Some(staged) if staged.state == StagedState::Open => Err(TierError::NotSealed(object)),
             Some(staged) => {

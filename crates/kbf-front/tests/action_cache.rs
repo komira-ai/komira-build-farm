@@ -219,7 +219,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
     };
     let refused = farm.cache.prepare_action_result(&result).await;
     assert!(
-        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if d == absent.digest),
+        matches!(&refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if *d == [absent.digest]),
         "{refused:?}"
     );
     let result_blob = Blob::of(&result);
@@ -239,7 +239,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
     };
     let refused = farm.cache.prepare_action_result(&result).await;
     assert!(
-        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if d == gone.digest),
+        matches!(&refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if *d == [gone.digest]),
         "{refused:?}"
     );
 
@@ -273,6 +273,51 @@ async fn prepare_refuses_outputs_that_are_not_held() {
         .await
         .expect("daemon commit");
     assert_eq!(get(&farm, &action).await, Ok(result));
+}
+
+/// Catches a refused action-cache write that names only the first blob of its closure
+/// it lacks: the writer would learn of one missing output per round trip, re-upload it,
+/// and be refused again for the next. The refusal must be FAILED_PRECONDITION and name
+/// every missing blob (outputs and stdout alike), and none that is held.
+#[tokio::test]
+async fn a_write_refused_for_missing_outputs_names_every_one() {
+    let farm = Farm::start().await;
+    let held = Blob::new("an output that is held");
+    farm.upload(&[&held]).await;
+    let first = Blob::new("an output never uploaded");
+    let second = Blob::new("another output never uploaded");
+    let stdout = Blob::new("stdout never uploaded");
+    let result = ActionResult {
+        output_files: vec![
+            output_file("a", &first),
+            output_file("held", &held),
+            output_file("b", &second),
+        ],
+        stdout_digest: Some(stdout.proto.clone()),
+        ..Default::default()
+    };
+    let action = Blob::new("an action whose outputs are missing");
+    let refused = farm
+        .cache
+        .write_action_result(Role::Daemon, action.digest, &result)
+        .await
+        .expect_err("a write naming missing blobs");
+    let status = tonic::Status::from(refused);
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    for missing in [&first, &second, &stdout] {
+        assert!(
+            status.message().contains(&missing.digest.to_string()),
+            "{} not named in {:?}",
+            missing.digest,
+            status.message()
+        );
+    }
+    assert!(
+        !status.message().contains(&held.digest.to_string()),
+        "a held blob named: {:?}",
+        status.message()
+    );
+    assert_eq!(get(&farm, &action).await, Err(Code::NotFound));
 }
 
 /// Catches a hit served while the store has lost an object holding one of its blobs

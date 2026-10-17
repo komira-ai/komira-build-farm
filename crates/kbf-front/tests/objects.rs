@@ -202,7 +202,7 @@ async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
     let b = Cache::open(log.clone(), store.clone(), KeyPrefix::default())
         .await
         .expect("open b");
-    let (first, second) = (a.epoch(), b.epoch());
+    let (first, second) = (a.writer(), b.writer());
     assert!(second > first, "{first:?} then {second:?}");
 
     let mut digests = Vec::new();
@@ -216,7 +216,10 @@ async fn two_caches_over_one_log_and_bucket_never_name_the_same_object() {
     let keys = keys(&store).await;
     assert_eq!(keys.len(), 6, "{keys:?}");
     for (cache, count) in [(&a, 3), (&b, 3)] {
-        let epoch = format!("cas/{:016x}/", cache.epoch().get());
+        let kbf_meta::Writer::Epoch(epoch) = cache.writer() else {
+            panic!("an epoch writer");
+        };
+        let epoch = format!("cas/{:016x}/", epoch.get());
         assert_eq!(
             keys.iter().filter(|k| k.starts_with(&epoch)).count(),
             count,
@@ -273,6 +276,40 @@ async fn each_written_segment_is_one_put_blobs_commit() {
     assert_eq!(log.batches(), [5, 2, 2, 1]);
 }
 
+/// Catches a whole-blob read (the blobs the server decodes) that keeps only its first
+/// window, or loses or repeats bytes where windows meet: a blob one byte over a read
+/// window, one of exactly a window, and the empty blob each read back whole and equal;
+/// and a range not within the blob (reversed, or past its end) read as if it were.
+#[tokio::test]
+async fn a_whole_blob_read_gathers_every_window() {
+    let cache = Cache::open(SharedLog::new(), conditional(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let window = usize::try_from(kbf_front::READ_WINDOW_BYTES).expect("a window fits");
+    let over: Vec<u8> = (0..=window).map(|i| (i % 251) as u8).collect();
+    let contents = [
+        Bytes::from(over),
+        Bytes::from(vec![3u8; window]),
+        Bytes::new(),
+    ];
+    let blobs: Vec<VerifiedBlob> = contents.iter().cloned().map(VerifiedBlob::hashed).collect();
+    let digests: Vec<Digest> = blobs.iter().map(VerifiedBlob::digest).collect();
+    cache.store_blobs(blobs).await.expect("store");
+    for (digest, bytes) in digests.iter().zip(contents) {
+        let read = cache.read_blob(digest).await.expect("read");
+        assert_eq!(read, bytes, "{digest}");
+    }
+    // A range not within the blob is refused before anything is read.
+    let over = digests[0];
+    for (from, to) in [(2, 1), (0, over.size_bytes + 1)] {
+        let refused = cache.read_windows(&over, from, to).await.err();
+        assert!(
+            matches!(refused, Some(CacheError::Invalid(_))),
+            "{from}..{to}"
+        );
+    }
+}
+
 /// Catches: a blob too large to share a segment stored as raw bytes with no footer (no
 /// digest or CRC in the store, so nothing could rebuild its index entry), or at an
 /// offset other than 0. It must be an object of its own that parses as a segment of one
@@ -307,6 +344,24 @@ async fn a_blob_too_large_to_share_a_segment_is_a_segment_of_one_record() {
     );
     let read = cache.read_blob(&large.digest()).await.expect("read");
     assert_eq!(read.as_ref(), &[7u8; 300][..]);
+}
+
+/// Catches: a whole-blob read that keeps only the first window of a blob over one
+/// window (`READ_WINDOW_BYTES`, 8 MiB) or joins the windows out of order, over a cache
+/// with no write tier: a 9 MiB blob of distinct bytes comes back whole. Mutant:
+/// `gather` answering its first window.
+#[tokio::test]
+async fn a_whole_read_of_a_blob_over_one_window_comes_back_whole() {
+    let cache = Cache::open(SharedLog::new(), conditional(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let bytes: Vec<u8> = (0..(9u32 << 20))
+        .map(|i| u8::try_from(i % 251).expect("a byte"))
+        .collect();
+    let blob = VerifiedBlob::hashed(Bytes::from(bytes.clone()));
+    cache.store_blobs(vec![blob.clone()]).await.expect("store");
+    let read = cache.read_blob(&blob.digest()).await.expect("read");
+    assert_eq!(read.as_ref(), &bytes[..]);
 }
 
 /// Catches: a read that marks every failure the same way. An object the store does not
@@ -405,7 +460,7 @@ async fn a_location_in_another_store_is_internal_and_marks_nothing() {
     let elsewhere = blob("in store 1");
     let location = Location {
         store: StoreId::new(1),
-        object: ObjectId::new(cache.epoch(), 99),
+        object: ObjectId::of(cache.writer(), 99),
         offset: 0,
     };
     let applied = cache

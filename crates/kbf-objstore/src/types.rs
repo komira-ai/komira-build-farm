@@ -180,15 +180,66 @@ impl PageSize {
 
     /// The size as a number.
     #[must_use]
-    pub fn get(self) -> u16 {
+    pub const fn get(self) -> u16 {
         self.0
     }
 }
 
-/// Where the next [`ObjectStore::list`](crate::ObjectStore::list) page starts. Opaque:
-/// only the store that issued it can read it.
+/// Where the next [`ObjectStore::list`](crate::ObjectStore::list) page starts: a token a
+/// store issued with a page (opaque: only the store that issued it can read it), or
+/// [`ListToken::after`] a key, which every store reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListToken(pub(crate) String);
+pub struct ListToken(pub(crate) Token);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Token {
+    /// An S3 continuation token.
+    Continue(String),
+    /// Start after this key (S3's `start-after`). The in-memory store issues these: its
+    /// next page starts after the last key of the page before.
+    After(ObjectKey),
+    /// Start after `after`, continuing the `FsStore` listing `listing`: its pages carry
+    /// these, so the next page can be cut from that listing's kept keys. Any other
+    /// store reads it as [`Token::After`].
+    Kept {
+        /// The listing the page came from.
+        listing: u64,
+        /// The last key of that page.
+        after: ObjectKey,
+    },
+}
+
+impl ListToken {
+    /// A listing that starts after `key`: the first key it returns is the least key
+    /// under the prefix greater than `key`. `key` need not exist. A rebuild that
+    /// stopped part-way resumes from the last key it finished.
+    #[must_use]
+    pub fn after(key: &ObjectKey) -> Self {
+        Self(Token::After(key.clone()))
+    }
+
+    /// The key a local store's listing resumes after.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::Protocol`] for a continuation token, which only an S3 store
+    /// issues and only it can read.
+    pub(crate) fn local_after(&self) -> Result<&ObjectKey, ObjectStoreError> {
+        match &self.0 {
+            Token::After(key) | Token::Kept { after: key, .. } => Ok(key),
+            Token::Continue(_) => Err(ObjectStoreError::Protocol(
+                "a continuation token from another store".into(),
+            )),
+        }
+    }
+
+    /// The `FsStore` listing this token continues, if it came with one of its pages.
+    pub(crate) fn listing(&self) -> Option<u64> {
+        match &self.0 {
+            Token::Kept { listing, .. } => Some(*listing),
+            Token::After(_) | Token::Continue(_) => None,
+        }
+    }
+}
 
 /// One object in a list page.
 #[derive(Clone, Debug, PartialEq, Eq)]

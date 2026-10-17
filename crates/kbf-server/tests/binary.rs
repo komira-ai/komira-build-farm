@@ -961,6 +961,86 @@ fn the_reapi_plaintext_bind_flag_is_gone() {
     );
 }
 
+/// Catches: a `--storage` the started binary parses but does not hand to the listener
+/// (the blob would land in the server's own cache while the operator believes the node
+/// holds it): a blob written to the started server is held by the node.
+#[test]
+fn the_storage_flag_makes_a_started_server_a_proxy() {
+    use std::sync::Arc;
+
+    use kbf_front::{Cache, CacheStorage, SegmentsConfig};
+    use kbf_proto::google::bytestream::WriteRequest;
+    use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+    use kbf_server::{StorageListener, bind_storage};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let _entered = runtime.enter();
+    let store: Arc<dyn kbf_storage::Storage> = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let node = bind_storage(
+        Arc::clone(&store),
+        StorageListener {
+            listen: "127.0.0.1:0".parse().expect("address"),
+            tls: None,
+            service: kbf_storage::service::Config {
+                write_bytes_in_flight: 64 << 20,
+            },
+        },
+        std::future::pending(),
+    )
+    .expect("bind the node");
+    let addr = node.addr;
+    let serving = node.serving;
+    runtime.spawn(async move { serving.await.expect("serve the node") });
+
+    let url = format!("http://{addr}");
+    let mut c = server(&ANY_PORT);
+    c.args(["--storage", &url]);
+    let (child, _, reapi) = started(c);
+    let blob = b"written to a started server".to_vec();
+    let digest = kbf_segments::sha256(&blob);
+    runtime.block_on(async {
+        let write = WriteRequest {
+            resource_name: format!("uploads/u/blobs/{}/{}", digest.hash_hex(), blob.len()),
+            data: blob.clone(),
+            finish_write: true,
+            ..Default::default()
+        };
+        ByteStreamClient::connect(format!("http://{reapi}"))
+            .await
+            .expect("connect")
+            .write(futures::stream::iter([write]))
+            .await
+            .expect("write");
+        assert!(
+            store
+                .find_missing(&[digest])
+                .await
+                .expect("node")
+                .is_empty()
+        );
+    });
+    interrupt(child);
+}
+
+/// Catches: a `--storage` that is not a URL starting the server anyway (it would serve
+/// from its own cache while the operator believes it proxies): exit 2, the flag and the
+/// value on stderr.
+#[test]
+fn a_storage_flag_that_is_not_a_url_stops_the_start() {
+    let mut c = server(&ANY_PORT);
+    c.args(["--storage", "not a url"]);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--storage \"not a url\": "), "{stderr}");
+}
+
 /// Catches: a `--reapi-auth-policy` the binary does not run on its REAPI listener, and
 /// a policy file that is not a policy but does not stop the start (exit 2, with the
 /// flag and the mistake on stderr).

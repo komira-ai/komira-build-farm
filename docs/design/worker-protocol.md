@@ -37,7 +37,8 @@ service Worker {
 | `Offer` (not read yet) | `LeaseOffer` |
 | `Result` | `Start` |
 | `NodeStatus` | `ResultAck` |
-| | `Cancel` |
+| `MapRequest` | `Cancel` |
+| | `MapUpdate` |
 
 ## A session
 
@@ -115,6 +116,32 @@ handover grace (invariant 7). A server that predates the field ignores it.
 The daemon refuses a `Welcome` whose interval is zero or whose double is not shorter
 than its fence time T, since a gap of two intervals must be noticed well before it
 fences.
+
+### The storage map: `Welcome.map`, `MapUpdate`, `MapRequest`
+
+A daemon knows the frontend's name and nothing else: it finds the storage nodes in the
+storage map ([architecture-v2](architecture-v2.md), section 6), which the frontend sends.
+
+- `Welcome.map` (field 4) is the map the frontend holds when the stream opens. It is
+  absent from a server that holds none (a farm of one member), and the daemon then routes
+  by none.
+- `MapUpdate { map }` is sent on the stream each time the frontend's map changes, whole,
+  with the newest map at the time it is sent. A change that follows another quickly may
+  be sent as the later one alone.
+- `MapRequest { at_least }` (daemon to server) asks for the map. The daemon sends it when
+  it waits for a generation it does not have: a storage node answered `STALE_MAP`
+  (architecture-v2, section 6) naming a generation newer than the daemon's. The server
+  answers with a `MapUpdate` of the map it holds now, which may be older than `at_least`
+  when this frontend has not seen that map yet; the daemon goes on waiting and a later
+  `MapUpdate` reaches it. A server that holds no map does not answer. `at_least` is for
+  the log; the answer does not depend on it.
+
+The daemon keeps the newest map it was sent, whichever message brought it. A map of the
+same or an older generation changes nothing, so a push that arrives late, twice or out of
+order is harmless, and so is one that was never sent: the next `Welcome`, `MapUpdate` or
+answer to a `MapRequest` carries the map. A map the daemon cannot read (an enum value
+this build does not name, a generation of 0, a repeated member) is logged and not taken;
+the session goes on.
 
 ### Node phases
 

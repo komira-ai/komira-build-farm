@@ -6,7 +6,7 @@ use kbf_invocation::{
 use kbf_types::{Digest, DigestFunction};
 
 use super::pages::{
-    Bad, Cursor, Request, Token, answer, instance_names, reader_names, still_authorized,
+    Bad, Cursor, Request, Token, Walk, answer, instance_names, reader_names, still_authorized,
 };
 use super::views::{Draft, digest_text, rfc3339};
 
@@ -30,8 +30,8 @@ fn records(id: &str, instances: &[&str]) -> Records {
             kind: CallKind::GetActionResult {
                 action: d(n),
                 hit: Some(Listing {
-                    result: d(100 + n),
-                    exit_code: 0,
+                    result: Some(d(100 + n)),
+                    exit_code: Some(0),
                     outputs: Vec::new(),
                     stdout: Some(d(200 + n)),
                     stderr: None,
@@ -97,14 +97,14 @@ fn a_token_decodes_to_where_it_was_made_and_nothing_else_decodes() {
         .as_str()
         .expect("a token")
         .to_owned();
-    let start = Cursor::Logs { row: 0, rest: None };
+    let start = Cursor::Walk(Walk::Logs { row: 0, rest: None });
     let filter = Default::default();
     assert_eq!(
         Token::decode(&token, inv, start, filter),
-        Ok(Cursor::Logs {
+        Ok(Cursor::Walk(Walk::Logs {
             row: 1,
             rest: Some(2)
-        }),
+        })),
         "no row failed: the first page went to the other rows at once"
     );
     for bad in [

@@ -1,0 +1,489 @@
+The kbf farm server and a worker daemon in one process (Linux, the container driver only).
+
+Usage: kbf-all-in-one [OPTIONS] --server <SERVERS> --ca-cert <CA_CERT> --cert <CERT> --key <KEY> --node-id <NODE_ID> --driver <DRIVERS>
+
+Options:
+      --role <ROLE>
+          The roles to run
+
+          Possible values:
+          - all: Front, scheduler and metadata in one process
+          
+          [default: all]
+
+      --server <SERVERS>
+          A kbf-server worker listener to connect to, as an `https://host:port` URL; repeatable, or several separated by commas. The host may be a DNS name with a record per server: every round of attempts resolves it again and tries each address. The daemon never stops trying (see `--reconnect-max-ms`)
+
+      --ca-cert <CA_CERT>
+          PEM file of the CA certificates that sign server certificates
+
+      --cold-store <URI>
+          The durable object store, where every blob ends up: `file:///absolute/path` (a directory, `kbf_objstore::FsStore`: locked while the server runs, a second server on it is refused; a write that would leave its filesystem with less free than it keeps, 5% of its size and at least 1 GiB, is refused and wakes the evictor, which forgets the least recently used objects (never one used in the last minute) and deletes their files while less than twice that is free) or `s3://bucket/prefix?endpoint=http://host:port` (MinIO, RustFS; the key pair is `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; query keys `region`, `conditional-put=true` for a store that refuses to overwrite a key, and `min-put-rate=BYTES_PER_SEC`, the slowest rate a PUT body may reach the store at: a PUT is cut after 60 seconds plus its body's length at that rate, 1 MiB/s by default). Objects are keyed under `<prefix><log id>/` (`kbf/` for a directory and for an S3 URI without a path), the id of the metadata log. A directory is checked against the index by a start-up pass in the background; a lost or damaged object is also found when it is read, or before an action-cache hit that needs it is served (a miss). There is no `memory:` store: a `file://` path on a tmpfs is one
+
+      --cert <CERT>
+          PEM file of this daemon's client certificate chain
+
+      --hot-store <URI>
+          The fast tier in front of the cold store: `file:///absolute/path`, a directory on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in the background; reads are served from it while a blob is still there. Its budget is not a flag: 80% of the filesystem's free space less what it keeps free (5% of its size, at least 1 GiB, and never more than half of what is free), at most `--hot-store-max-bytes`; at the budget, writes take the direct path to the cold store. Without it, uploads go straight to the cold store. A daemon's outputs (a segment upload, or the in-process plane) and a ByteStream Write over 16 MiB are written through to it as they arrive, so a large one is never held in memory. Without it, or when it has no room, a daemon's blob over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it arrives (a ByteStream Write, or the in-process plane's own stream), never held whole and never refused for its size. The first start with a hot store raises the metadata log to machine version 2, once; a binary that runs only version 1 no longer reads it. The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise
+
+      --hot-store-max-bytes <BYTES>
+          The most bytes the hot store's block files may hold before they are flushed, lower than its automatic budget
+
+      --key <KEY>
+          PEM file of this daemon's private key
+
+      --hot-store-abandon <ID>
+          Abandons this server's hot store tier `<id>` at start: every object staged on it is marked unreachable as missing (its blobs answer `Unavailable` until uploaded again; nothing is answered `NOT_FOUND`), and the directory becomes a new tier. For a lost or replaced disk, after a start was refused because the directory's `TIER` file is missing or names another tier. The id is the one the refusal names
+
+      --tls-server-name <TLS_SERVER_NAME>
+          The name to verify in the server certificate, when it is not the URL's host
+
+      --meta-dir <DIR>
+          The directory of the metadata log (the CAS index and the action cache, a single-voter Raft log), on a local disk; created if missing. An empty directory gets a new log with a new id; every later start over it reads the id from the directory. Left out, it is `<hot store directory>/meta`; required when there is no `file://` hot store. Given, it wins over the hot store's directory
+
+      --node-id <NODE_ID>
+          A stable name for this node, unique within the cell
+
+      --state-store <URI>
+          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700; every start is a new epoch, so the daemon kills the runs of the leases it held before). Left out, it is `<data-dir>/state.db`. Any other value, `postgres://` included, is refused (Postgres is not wired yet)
+
+      --reconnect-ms <RECONNECT_MS>
+          The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
+          
+          [default: 1000]
+
+      --reconnect-max-ms <RECONNECT_MAX_MS>
+          The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
+          
+          [default: 30000]
+
+      --label <KEY=VALUE>
+          A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in komira's pool runs with `--label pool=darwin-sized`
+
+      --log-dir <DIR>
+          The directory of the durable log file, `kbf-server.log` and its rotated `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in the same format, kept across restarts. Left out, it is `<hot store directory>/log` when the hot store is a directory; with neither, there is no file and the server logs to stderr alone (the start logs which). A directory or file that cannot be written never stops the server ([`crate::log_file`])
+
+      --storage-dial-timeout-ms <STORAGE_DIAL_TIMEOUT_MS>
+          The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be 1 to 3600000 (one hour)
+          
+          [default: 10000]
+
+      --log-max-bytes <BYTES>
+          The most bytes one log file holds before it is rotated; a line longer than this goes alone to a fresh file. With `--log-files` it bounds the log's size on disk
+          
+          [default: 67108864]
+
+      --storage-ping-interval-ms <STORAGE_PING_INTERVAL_MS>
+          How often, in milliseconds, a connection to a storage node with a call on it is pinged (HTTP/2 PING). Must be 1 to 3600000 (one hour)
+          
+          [default: 10000]
+
+      --log-files <N>
+          How many log files are kept, the current one included; rotation drops the oldest. The log never exceeds `--log-max-bytes` times this, plus one line
+          
+          [default: 8]
+
+      --storage-ping-timeout-ms <STORAGE_PING_TIMEOUT_MS>
+          How long, in milliseconds, a ping to a storage node may go unanswered before the connection is dropped and the calls on it fail over to the next owner. Must be 1 to 3600000 (one hour) and no more than `--storage-ping-interval-ms`
+          
+          [default: 10000]
+
+      --driver <DRIVERS>
+          How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
+
+          Possible values:
+          - fake:                 Runs nothing; every action succeeds with an empty result. For bring-up only
+          - container:            Each action in a fresh rootless Podman container (Linux)
+          - native:               Each action as plain processes on the node, for Macs
+          - native-whole-machine: Each whole-machine lease as its own user in its GUI session, through `kbf-mac-session` (macOS)
+
+      --listen <LISTEN>
+          The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves plain text, on any address; off loopback the start line carries a warning
+          
+          [default: 127.0.0.1:8980]
+
+      --cas <CAS>
+          The server's worker listener, an `https://` URL (normally `--server`'s), that the container and native drivers read and write blobs through, over mutual TLS with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`. Plain `http://` is refused: the worker listener admits each blob call by the daemon's certificate. Every driver's blobs go through one transfer engine, over one connection, within the `--transfer-*` limits
+
+      --reapi-tls-cert <REAPI_TLS_CERT>
+          PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
+
+      --data-dir <DIR>
+          The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
+          
+          Default `/var/lib/kbf`. A daemon with the fake driver alone touches no directory unless this is given.
+
+      --reapi-tls-key <REAPI_TLS_KEY>
+          PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
+
+      --data-max-bytes <BYTES>
+          Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
+
+      --reapi-auth-policy <REAPI_AUTH_POLICY>
+          A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
+
+      --output-max-depth <MAX_DEPTH>
+          The deepest directory an output directory may hold, in levels below it (its own entries are level 1)
+          
+          [default: 512]
+
+      --storage <URL>
+          Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
+
+      --output-max-entries <MAX_ENTRIES>
+          The most entries (files, directories, symlinks and anything else) one action's outputs may hold together, the declared outputs included
+          
+          [default: 1000000]
+
+      --worker-listen <WORKER_LISTEN>
+          The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning
+          
+          [default: 127.0.0.1:8981]
+
+      --api-listen <API_LISTEN>
+          The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
+
+      --output-max-bytes <MAX_BYTES>
+          The most bytes one action's output files may hold together
+          
+          [default: 17179869184]
+
+      --api-token-file <API_TOKEN_FILE>
+          A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
+
+      --output-max-stdio-bytes <MAX_STDIO_BYTES>
+          The most bytes each of the action's stdout and stderr may hold
+          
+          [default: 1073741824]
+
+      --invocations-open
+          Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
+
+      --reserve-cpus <N>
+          Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one each). The daemon gives its leases every CPU it may use but these, with no pinning, and sizes its own pools from them. Default: 8 (half the CPUs on a machine of fewer than 16). 0 is allowed; a value that leaves no CPU for leases, or is more than the machine has, is refused. On a host that also runs the server, this covers both; the server has no reserve flag
+
+      --readyz-store-timeout-ms <READYZ_STORE_TIMEOUT_MS>
+          How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
+          
+          [default: 2000]
+
+      --reserve-share <N>
+          How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
+
+      --async-threads <N>
+          Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon
+
+      --worker-tls-cert <WORKER_TLS_CERT>
+          PEM certificate of the worker listener. With `--worker-tls-key` and `--worker-client-ca` it serves mutual TLS; without all three, plain text
+
+      --blocking-threads <N>
+          The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
+
+      --worker-tls-key <WORKER_TLS_KEY>
+          PEM private key of the worker listener
+
+      --cpu-threads <N>
+          Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
+
+      --worker-client-ca <WORKER_CLIENT_CA>
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
+
+      --output-upload-deadline-secs <OUTPUT_UPLOAD_DEADLINE_SECS>
+          How long one lease's whole output upload (its output files, stdout and stderr) may take, in seconds, before the lease fails with a reason naming the upload and the time it ran (container and native drivers). Without it, a store that stops answering holds the lease, and its slot, with no error
+          
+          [default: 1800]
+
+      --worker-deny-list <WORKER_DENY_LIST>
+          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs mutual TLS
+
+      --tls-reload-interval-secs <TLS_RELOAD_INTERVAL_SECS>
+          How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
+          
+          [default: 30]
+
+      --transfer-in-flight <TRANSFER_IN_FLIGHT>
+          The most blob requests in flight at once, for the whole daemon: ByteStream reads and writes, segment ranges and FindMissing calls, over its one connection to `--cas`. Uploads hold at most all but a quarter of them
+          
+          [default: 64]
+
+      --heartbeat-interval-ms <HEARTBEAT_INTERVAL_MS>
+          The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
+          
+          [default: 5000]
+
+      --transfer-bytes-in-flight <BYTES>
+          The most bytes of blobs read into memory in flight at once, for the whole daemon. A blob larger than this is fetched alone
+          
+          [default: 268435456]
+
+      --transfer-memory-blob-bytes <BYTES>
+          The largest input file fetched through memory, where every lease asking for it at once shares one fetch; a larger one is streamed into its file
+          
+          [default: 1048576]
+
+      --unservable-wait-secs <UNSERVABLE_WAIT_SECS>
+          How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
+          
+          [default: 300]
+
+      --memory-ladder-gib <MEMORY_LADDER_GIB>
+          The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
+          
+          [default: 4 16 32]
+
+      --transfer-chunk-bytes <BYTES>
+          The most bytes one ByteStream write message carries
+          
+          [default: 1048576]
+
+      --finished-retention-secs <FINISHED_RETENTION_SECS>
+          How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
+          
+          [default: 60]
+
+      --transfer-find-missing-chunk <TRANSFER_FIND_MISSING_CHUNK>
+          The most digests one FindMissing call asks about
+          
+          [default: 1000]
+
+      --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
+          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
+          
+          [default: 0]
+
+      --transfer-stream-window-bytes <BYTES>
+          The HTTP/2 window of each stream to `--cas`; the connection's is eight times it
+          
+          [default: 8388608]
+
+      --progress-interval-secs <PROGRESS_INTERVAL_SECS>
+          How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
+          
+          [default: 30]
+
+      --transfer-retries <TRANSFER_RETRIES>
+          How many times a blob request is retried after UNAVAILABLE or a broken connection
+          
+          [default: 3]
+
+      --http2-keepalive-interval-secs <HTTP2_KEEPALIVE_INTERVAL_SECS>
+          How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+          
+          [default: 30]
+
+      --segment-upload-streams <SEGMENT_UPLOAD_STREAMS>
+          How many `PutRange` calls one segment upload of an action's outputs has in flight at once, as HTTP/2 streams on the one connection to `--cas` (`docs/design/write-path.md`, section 4.1); also the parallel `ReadRange` calls of a segment-range read
+          
+          [default: 16]
+
+      --http2-keepalive-timeout-secs <HTTP2_KEEPALIVE_TIMEOUT_SECS>
+          How long, in seconds, a PING may go unanswered before the connection is closed
+          
+          [default: 20]
+
+      --segment-uploads-in-flight <SEGMENT_UPLOADS_IN_FLIGHT>
+          How many segment uploads of one action's outputs are in flight at once: the server checks and stages one upload while the next are sending (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take permits of `--transfer-in-flight`'s uploads' share
+          
+          [default: 4]
+
+      --cgroup-parent <CGROUP_PARENT>
+          The cgroup lease cgroups are made under, from the cgroup root (container). Left out, the daemon sets up its own cgroup, which its systemd unit must delegate (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes `actions` beside it, with cpu, memory and pids enabled. Given, it must already enable cpu, memory and pids for its children
+
+      --actions-memory-max-gib <ACTIONS_MEMORY_MAX_GIB>
+          Written to the actions cgroup's `memory.max` at start (container): the most memory all leases together may use, in GiB, so the rest stays for what else runs on the node. The node reports the lowest `memory.max` above its leases, or its memory when that is less, and the CPUs of their cpuset
+
+      --supervisor-memory-min-mib <SUPERVISOR_MEMORY_MIN_MIB>
+          Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB (container, without `--cgroup-parent`): memory the kernel does not reclaim from the daemon while it uses no more, so builds short of memory never take it. The kernel protects no more than the unit's and its slice's `MemoryMin=` allow; the daemon warns when one is lower. 0 protects nothing
+          
+          [default: 256]
+
+      --invocation-memory <INVOCATION_MEMORY>
+          The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
+          
+          [default: 268435456]
+
+      --segment-upload-max-bytes <BYTES>
+          The most bytes, records and footers together, one segment upload on the worker listener may hold in memory (`docs/design/write-path.md`, section 4.2): the segments it declares that are not written to the hot store as they arrive (all of them, without one). Not a limit on a blob's size: a segment held in memory holds no record over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`), and an upload with a larger one and no room on the hot store is answered FAILED_PRECONDITION, so the daemon sends its records by ByteStream, which streams a large blob to the cold store. Those ranges are held until the upload commits, admitted under `--write-bytes-in-flight` with every other upload: a `Begin` waits while that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a daemon's upload of small files with room to spare, and at most `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most one admission counts, so a `Begin` never holds more than it is counted for under the bound
+          
+          [default: 34603008]
+
+      --container-pids-limit <CONTAINER_PIDS_LIMIT>
+          Each container's `pids.max`: its tasks, threads included (container)
+          
+          [default: 8192]
+
+      --segment-upload-idle-secs <SEGMENT_UPLOAD_IDLE_SECS>
+          How long, in seconds, a segment upload may go without a call before it is dropped and its memory returned. An upload is also dropped when the connection that began it closes; one that is committing is kept until its commit ends
+          
+          [default: 60]
+
+      --container-shm-mib <CONTAINER_SHM_MIB>
+          The size of each container's `/dev/shm`, in MiB (container)
+          
+          [default: 64]
+
+      --write-linger <WRITE_LINGER>
+          How long, in milliseconds, the oldest blob of an open segment waits for concurrent uploads to join it before the segment is sealed and written (`docs/design/write-path.md`, section 3.1). No caller is answered before its segment has committed, so this is added to an upload's latency at most
+          
+          [default: 2]
+
+      --container-nofile <CONTAINER_NOFILE>
+          Each container's open-file limit, soft and hard (container). Rootless, it cannot exceed the daemon's own hard limit
+          
+          [default: 65536]
+
+      --write-own-segment-bytes <WRITE_OWN_SEGMENT_BYTES>
+          Blobs of this many bytes or more are written as a segment of their own, past the group, so they neither wait for the linger nor hold up small writes
+          
+          [default: 16777216]
+
+      --container-nproc <CONTAINER_NPROC>
+          The process limit, soft and hard, of each container's user (container). Every container's root is the same host id, so it bounds all the node's actions together
+          
+          [default: 32768]
+
+      --write-bytes-in-flight <WRITE_BYTES_IN_FLIGHT>
+          The most bytes uploads may hold at once. A ByteStream Write is admitted before it reads past its first message, for its blob's size up to 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob is streamed onto the hot store, or to the cold store without room there, not held); a BatchUpdateBlobs for its total; a segment upload's Begin for what it holds in memory. A caller over the bound waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2 stream's message as tonic decodes it, before the handler runs, up to 17 MiB per stream (about 3.4 GiB for 200 streams), times the streams one connection may open on each listener
+          
+          [default: 2147483648]
+
+      --lease-swap-kill-mib <LEASE_SWAP_KILL_MIB>
+          A lease at its own memory cap is killed, and reported out of memory, once it has pushed more than this many MiB into swap at its cap... (container)
+          
+          [default: 512]
+
+      --reapi-max-streams <REAPI_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
+          
+          [default: 10000]
+
+      --lease-swap-kill-percent <LEASE_SWAP_KILL_PERCENT>
+          ...or this percentage of its booked memory, whichever is more. The kernel caps each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit; a lease is killed by this rule only while its own cap keeps being hit (its `memory.events` `max` grew since the last sample) and its swap rose since the last sample, and only swap that rose so counts, never swap that host pressure moved out of it
+          
+          [default: 25]
+
+      --worker-max-streams <WORKER_MAX_STREAMS>
+          The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
+          
+          [default: 200]
+
+      --memory-pressure-pause-percent <MEMORY_PRESSURE_PAUSE_PERCENT>
+          The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
+          
+          [default: 10]
+
+      --write-puts-in-flight <WRITE_PUTS_IN_FLIGHT>
+          The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
+          
+          [default: 4]
+
+      --store-put-attempts <STORE_PUT_ATTEMPTS>
+          How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
+          
+          [default: 3]
+
+      --input-tree-cache-entries <INPUT_TREE_CACHE_ENTRIES>
+          The most decoded Directories an Execute's input check keeps in memory (`docs/design/storage.md#input-tree-check`). Least recently used go first
+          
+          [default: 1048576]
+
+      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
+          How often each lease's `max` events and swap are sampled, in milliseconds (container)
+          
+          [default: 1000]
+
+      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
+          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
+          
+          [default: 268435456]
+
+      --memory-limit-percent <MEMORY_LIMIT_PERCENT>
+          A lease's processes are killed past this percentage of its booked memory...
+          
+          [default: 150]
+
+      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
+          The most Directory blobs the input check reads from the store at once, across all Executes
+          
+          [default: 64]
+
+      --memory-headroom-mib <MEMORY_HEADROOM_MIB>
+          ...plus this many MiB (native). A lease that booked nothing has no limit
+          
+          [default: 512]
+
+      --memory-poll-ms <MEMORY_POLL_MS>
+          How often a lease's memory is measured, in milliseconds (native)
+          
+          [default: 250]
+
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+          
+          [default: 15]
+
+      --xcode-apps <XCODE_APPS>
+          The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
+          
+          [default: /Applications]
+
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+          
+          [default: 300]
+
+      --xcode-recheck-secs <XCODE_RECHECK_SECS>
+          How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
+          
+          [default: 180]
+
+      --require-metal-toolchain
+          This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
+
+      --image <IMAGE>
+          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon checks each is in its user's image store, as the prepare step of every lease does, and exits with status 2 if one is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`). The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+
+      --container-runtime <podman|oci>
+          The runtime that runs each action's container (container): `podman`, the default, runs `podman create` and `podman start` per action; `oci` runs each action in a fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the action path (Podman only pulls and exports an image once per digest). `oci` needs the daemon user's subordinate ids in one range, `uidmap`, and every directory down to `--data-dir` searchable by others
+          
+          [default: podman]
+          [possible values: podman, oci]
+
+      --lease-placement <none|numa-node>
+          Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
+          
+          [default: none]
+          [possible values: none, numa-node]
+
+      --oci-runtime <OCI_RUNTIME>
+          The OCI runtime `--container-runtime=oci` runs actions with (container)
+          
+          [default: /usr/bin/crun]
+
+      --mac-session-socket <MAC_SESSION_SOCKET>
+          The socket `kbf-mac-session` serves (native-whole-machine)
+          
+          [default: /var/run/kbf-mac-session/socket]
+
+      --daemon-user <DAEMON_USER>
+          This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
+          
+          [default: _kbf]
+
+      --pool-users <POOL_USERS>
+          How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
+
+      --pool-first-uid <POOL_FIRST_UID>
+          The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
+
+      --history-index-root <ROOT>
+          Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
+
+      --history-objects <URI>
+          Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

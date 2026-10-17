@@ -220,7 +220,7 @@ mod tests {
         let broken = |r: Result<(), Broken>| r.expect_err("broken").0;
         let short = replay(&log(), 4).map(|_| ());
         assert_eq!(broken(short), Property::ReplicaEquality);
-        let version = MachineVersion::new(NonZeroU32::new(4).expect("non-zero"));
+        let version = MachineVersion::new(NonZeroU32::new(5).expect("non-zero"));
         let mut control = log();
         control.push(entry(4, &LogCommand::MachineVersion(version)));
         assert_eq!(

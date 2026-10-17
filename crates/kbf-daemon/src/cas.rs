@@ -25,11 +25,33 @@ pub(crate) trait Fetch: Send + Sync {
     ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
 }
 
+/// A [`Fetch`] the input cache fills files through as well: the walks' fetch, and a
+/// blob written into a file as it arrives.
+pub(crate) trait Fill: Fetch {
+    /// [`Cas::read_to`]: the blob written into `file` as it arrives, checked against
+    /// `digest`; never held whole by the caller.
+    fn fetch_to<'a>(
+        &'a self,
+        digest: &'a Digest,
+        file: &'a mut tokio::fs::File,
+    ) -> futures::future::BoxFuture<'a, Result<(), CasError>>;
+}
+
 impl<C: Cas> Fetch for C {
     fn fetch<'a>(
         &'a self,
         digest: &'a Digest,
     ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
         Box::pin(fetch(self, digest))
+    }
+}
+
+impl<C: Cas> Fill for C {
+    fn fetch_to<'a>(
+        &'a self,
+        digest: &'a Digest,
+        file: &'a mut tokio::fs::File,
+    ) -> futures::future::BoxFuture<'a, Result<(), CasError>> {
+        Box::pin(self.read_to(digest, file))
     }
 }

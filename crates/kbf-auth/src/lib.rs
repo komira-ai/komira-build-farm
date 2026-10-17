@@ -41,7 +41,7 @@ pub use crate::authorize::{
     PrefixError, authorize,
 };
 pub use crate::layer::{Authenticate, AuthenticateLayer};
-pub use crate::metadata::{AuthenticationMetadata, metadata};
+pub use crate::metadata::{AuthenticationMetadata, metadata, metadata_of_http};
 pub use crate::policy::{Policy, PolicyError};
 
 /// A boxed future, as the traits return them.

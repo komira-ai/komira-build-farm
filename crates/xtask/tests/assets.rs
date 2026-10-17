@@ -44,13 +44,21 @@ fn s(p: &Path) -> &str {
 }
 
 /// The flags a deployment verifies an asset with (docs/artifacts.md), signed by
-/// `signer`.
-fn flags(signer: &str) -> String {
+/// `signer`, from the branch `source_ref`.
+fn flags_from(signer: &str, source_ref: &str) -> String {
     format!(
-        "--repo {REPO} --signer-workflow {signer} --source-ref refs/heads/main \
+        "--repo {REPO} --signer-workflow {signer} --source-ref {source_ref} \
          --deny-self-hosted-runners"
     )
 }
+
+/// [`flags_from`] `refs/heads/main`.
+fn flags(signer: &str) -> String {
+    flags_from(signer, "refs/heads/main")
+}
+
+/// The branch the development line is built and attested on (docs/artifacts.md).
+const DEV_REF: &str = "refs/heads/feature/arch-v2";
 
 /// What the release path leaves: `<root>/dist` packaged and summed as the workflow
 /// does, `<root>/gh/gh` the fake gh, `<root>/tmp` the temporary directory.
@@ -134,6 +142,11 @@ impl Release {
     /// for every file, an SBOM attestation for every tarball, all by `artifacts.yml`.
     /// `skip` leaves out the one for that (name, predicate).
     fn attest(&self, skip: Option<(&str, bool)>) {
+        self.attest_from(skip, "refs/heads/main");
+    }
+
+    /// [`Release::attest`] for a run on the branch `source_ref`.
+    fn attest_from(&self, skip: Option<(&str, bool)>, source_ref: &str) {
         let mut store = String::new();
         for (sha, name) in self.sums() {
             let mut kinds = vec![false];
@@ -149,28 +162,39 @@ impl Release {
                 } else {
                     String::new()
                 };
-                store.push_str(&format!("{sha} {}{predicate}\n", flags(WORKFLOW)));
+                store.push_str(&format!(
+                    "{sha} {}{predicate}\n",
+                    flags_from(WORKFLOW, source_ref)
+                ));
             }
         }
         std::fs::write(self.gh.with_file_name("attested"), store).expect("store");
     }
 
     fn verify(&self, workflow_ref: &str, defect: Option<&str>) -> (Option<i32>, String, String) {
-        xtask(
-            &[
-                "verify-assets",
-                "attestations",
-                s(&self.dist),
-                "--repo",
-                REPO,
-                "--workflow-ref",
-                workflow_ref,
-                "--gh",
-                s(&self.gh),
-            ],
-            &self.tmp,
-            defect,
-        )
+        self.verify_args(workflow_ref, &[], defect)
+    }
+
+    /// [`Release::verify`] with `more` flags.
+    fn verify_args(
+        &self,
+        workflow_ref: &str,
+        more: &[&str],
+        defect: Option<&str>,
+    ) -> (Option<i32>, String, String) {
+        let mut args = vec![
+            "verify-assets",
+            "attestations",
+            s(&self.dist),
+            "--repo",
+            REPO,
+            "--workflow-ref",
+            workflow_ref,
+            "--gh",
+            s(&self.gh),
+        ];
+        args.extend_from_slice(more);
+        xtask(&args, &self.tmp, defect)
     }
 
     fn gh_calls(&self) -> Vec<String> {
@@ -245,6 +269,85 @@ fn the_release_path_packages_sums_and_verifies_every_asset() {
     // A workflow named without `@<ref>` is the same workflow.
     let (code, _, err) = r.verify(WORKFLOW, None);
     assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn a_push_to_the_development_branch_is_verified_against_that_branch() {
+    // Catches: the `--source-ref` of every verification hard-wired to main (the verify
+    // job of a push to the development branch would refuse its own attestations); the
+    // flag ignored, or applied to the signer controls only; and, as the control that
+    // matters for safety, attestations from the development branch accepted when no
+    // ref is given or main is: a file built there must never pass a check for main (a
+    // release verifies as main).
+    let r = Release::build("dev-ref");
+    r.attest_from(None, DEV_REF);
+    // Control: no `--source-ref` is main, so these attestations do not verify.
+    let (code, _, err) = r.verify(&format!("{WORKFLOW}@{DEV_REF}"), None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("attestation signed by"), "{err}");
+    let (code, _, err) = r.verify_args(WORKFLOW, &["--source-ref", "refs/heads/main"], None);
+    assert_eq!(code, Some(1), "{err}");
+    // Asked for the branch they were signed on, every asset verifies, controls included.
+    let (code, out, err) = r.verify_args(WORKFLOW, &["--source-ref", DEV_REF], None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out.lines().count(), 11, "{out}");
+    let calls = r.gh_calls();
+    let first = r.dist.join(first_tarball());
+    assert!(
+        calls.contains(&format!(
+            "attestation verify {} {}",
+            s(&first),
+            flags_from(WORKFLOW, DEV_REF)
+        )),
+        "{calls:#?}"
+    );
+    // Both controls ask for the same branch: another signer, and the flipped copy.
+    let other = format!("{REPO}/.github/workflows/ci.yml");
+    assert!(
+        calls.contains(&format!(
+            "attestation verify {} {}",
+            s(&first),
+            flags_from(&other, DEV_REF)
+        )),
+        "{calls:#?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("/xtask-verify-") && c.ends_with(&flags_from(WORKFLOW, DEV_REF))),
+        "{calls:#?}"
+    );
+    // And main's attestations do not verify as the development branch's.
+    r.attest(None);
+    let (code, _, err) = r.verify_args(WORKFLOW, &["--source-ref", DEV_REF], None);
+    assert_eq!(code, Some(1), "{err}");
+}
+
+#[test]
+fn a_source_ref_that_is_not_a_branch_of_the_repository_is_refused() {
+    // Catches: `--source-ref` taken as free text, so a verification could be pointed at
+    // a tag, a pull request ref or an empty value and pass.
+    let r = Release::build("bad-ref");
+    r.attest(None);
+    for bad in [
+        "",
+        "main",
+        "refs/tags/v1",
+        "refs/pull/1/merge",
+        "refs/heads/",
+    ] {
+        let (code, _, err) = r.verify_args(WORKFLOW, &["--source-ref", bad], None);
+        assert_eq!(code, Some(2), "{bad:?}: {err}");
+        assert!(
+            err.contains("--source-ref") && err.contains("refs/heads/"),
+            "{bad:?}: {err}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(r.gh.with_file_name("gh-args")).unwrap_or_default(),
+        "",
+        "gh was run for a refused ref"
+    );
 }
 
 #[test]

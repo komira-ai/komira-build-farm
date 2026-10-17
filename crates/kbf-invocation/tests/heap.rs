@@ -636,3 +636,62 @@ fn evicted_collisions_leave_nothing_in_their_ids_lists() {
         "real memory after 100 collisions and after one"
     );
 }
+
+/// A run measured by lease `seq` of operation 1, with `numa` NUMA nodes.
+fn ran(seq: u64, numa: u32) -> Event {
+    Event::Ran {
+        operation: OperationId(1),
+        lease: lease(seq),
+        run: Box::new(kbf_invocation::Run {
+            usage: Some(kbf_invocation::RunUsage {
+                numa: (0..numa)
+                    .map(|node| kbf_invocation::NumaBytes { node, bytes: 1 })
+                    .collect(),
+                ..kbf_invocation::RunUsage::default()
+            }),
+            ..kbf_invocation::Run::default()
+        }),
+    }
+}
+
+/// The Command (and shape) of `d(10)` in invocation `a`, its cfg and label `n`
+/// bytes each.
+fn shaped(n: usize) -> Event {
+    Event::Command {
+        id: id("a"),
+        owner: owner(""),
+        action: d(10),
+        command: d(11),
+        shape: Some(Box::new(kbf_invocation::ActionShape {
+            key: 7,
+            cfg: Some("c".repeat(n)),
+            target: Some(kbf_invocation::Target {
+                kind: kbf_invocation::TargetKind::Target,
+                label: kbf_invocation::Text::sent("l".repeat(n)),
+            }),
+            test: false,
+        })),
+    }
+}
+
+/// Catches a lease's run held but not counted (plant `run_bytes` without its NUMA
+/// list, or without its box): it is held twice, in the operation's attempt and its
+/// row's, and the records grow by exactly what they count. And a row's shape held but
+/// not counted (plant `shape_bytes` without its texts or box).
+#[test]
+fn a_run_and_a_shape_add_what_they_count() {
+    let base = vec![queued("a", t(0), 10, 1), granted(1, 1, "node-a", t(1))];
+    for numa in [0, 40] {
+        let mut events = base.clone();
+        events.push(ran(1, numa));
+        let (real, counted) = grows(&base, &events);
+        assert!(real > 0, "the run is held");
+        assert_eq!(counted, real, "{numa} NUMA nodes");
+    }
+    let (real, counted) = grows(
+        &[queued("a", t(0), 10, 1)],
+        &[queued("a", t(0), 10, 1), shaped(300)],
+    );
+    assert!(real > 600, "the shape's texts are held");
+    assert_eq!(counted, real);
+}

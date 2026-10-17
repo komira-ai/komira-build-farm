@@ -2,10 +2,15 @@
 
 mod fault;
 mod give_up;
+pub(crate) mod loss;
 pub(crate) mod memory;
+mod outage;
 mod phase;
+mod recover;
 mod state;
+mod view;
 
+pub use recover::{Fate, Recovered, RecoveredLease};
 pub use state::OpState;
 
 use std::cmp::Reverse;
@@ -19,7 +24,7 @@ use kbf_types::{
     ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
-use crate::cordon::{Cordon, Cordons};
+use crate::cordon::Cordons;
 use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
@@ -77,6 +82,9 @@ struct Operation {
     avoid: BTreeSet<WorkerId>,
     /// Its leases given up as not started ([`memory::NOT_STARTED_RERUNS`]).
     not_started: u32,
+    /// Its leases lost ([`RequeueReason::is_loss`]), counted toward the cap
+    /// ([`Scheduler::with_loss_requeues`]).
+    losses: u32,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -258,6 +266,17 @@ pub struct Scheduler {
     memory: Box<MemoryState>,
     /// The rungs of an action's memory booking ([`memory`]).
     ladder: MemoryLadder,
+    /// Workers a recovered scheduler holds leases for that have not registered yet, and
+    /// until when they may take to ([`Scheduler::recover`]).
+    awaited: BTreeMap<WorkerId, FarmTime>,
+    /// The state store refused a write and has not taken one since
+    /// ([`Scheduler::store_unavailable`]).
+    store_down: bool,
+    /// Until when no lease is given up, after the store returned
+    /// ([`Scheduler::store_available`]).
+    grace_until: FarmTime,
+    /// How many lost leases refuse an operation ([`Scheduler::with_loss_requeues`]).
+    loss_cap: u32,
 }
 
 impl Scheduler {
@@ -282,6 +301,10 @@ impl Scheduler {
             reservations: BTreeMap::new(),
             memory: Box::default(),
             ladder: MemoryLadder::default(),
+            awaited: BTreeMap::new(),
+            store_down: false,
+            grace_until: FarmTime::default(),
+            loss_cap: u32::MAX,
         }
     }
 
@@ -324,139 +347,6 @@ impl Scheduler {
     pub const fn with_unservable_wait(mut self, wait: Duration) -> Self {
         self.unservable_wait = wait;
         self
-    }
-
-    /// Why no live worker can run `operation` now, while it is queued and none can.
-    #[must_use]
-    pub fn waiting(&self, operation: OperationId) -> Option<&str> {
-        let op = self.ops.get(&operation)?;
-        op.unservable.as_ref().map(|u| u.reason.as_str())
-    }
-
-    /// Where `operation` is, if it exists: it was submitted, and is unfinished or
-    /// finished less than the finished retention ago.
-    #[must_use]
-    pub fn state(&self, operation: OperationId) -> Option<&OpState> {
-        self.ops.get(&operation).map(|op| &op.state)
-    }
-
-    /// The runs of `operation` that ended as the farm's fault, oldest first; `None` once
-    /// the scheduler no longer holds it.
-    #[must_use]
-    pub fn farm_runs(&self, operation: OperationId) -> Option<&[FarmRun]> {
-        self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
-    }
-
-    /// The operation in flight that a submission of `request` would join: its
-    /// running twin, if `request` may join one.
-    #[must_use]
-    pub fn twin(&self, request: &Request) -> Option<OperationId> {
-        if !request.joinable() {
-            return None;
-        }
-        self.in_flight.get(&request.key).copied()
-    }
-
-    /// The id the next operation that joins no twin gets.
-    #[must_use]
-    pub const fn next_operation(&self) -> OperationId {
-        OperationId(self.next_op)
-    }
-
-    /// The waiters attached to `operation`, in attach order.
-    #[must_use]
-    pub fn waiters(&self, operation: OperationId) -> Option<&[WaiterId]> {
-        self.ops.get(&operation).map(|op| op.waiters.as_slice())
-    }
-
-    /// The QoS level `operation` is queued at (raised when a more urgent caller joins).
-    #[must_use]
-    pub fn qos(&self, operation: OperationId) -> Option<&Qos> {
-        self.ops.get(&operation).map(|op| &op.request.qos)
-    }
-
-    /// How many operations wait for a lease.
-    #[must_use]
-    pub fn queued_len(&self) -> usize {
-        self.queue.len()
-    }
-
-    /// How many leases are held (granted or running), on all workers.
-    #[must_use]
-    pub fn leases_held(&self) -> usize {
-        self.held.len()
-    }
-
-    /// Queued operations in the order placement will consider them.
-    pub fn queued(&self) -> impl Iterator<Item = OperationId> + '_ {
-        self.queue.iter().map(|(_, id)| *id)
-    }
-
-    /// Whether `worker` is cordoned, and where its drain is; `None` while placement
-    /// may use it.
-    #[must_use]
-    pub fn cordon(&self, worker: &WorkerId) -> Option<&Cordon> {
-        self.cordons.get(worker)
-    }
-
-    /// The leases `worker` holds (granted or running), in lease order.
-    #[must_use]
-    pub fn leases_on(&self, worker: &WorkerId) -> Vec<LeaseId> {
-        self.held
-            .iter()
-            .filter(|(_, h)| {
-                self.ops[&h.operation]
-                    .state
-                    .holding()
-                    .is_some_and(|(_, w)| w == worker)
-            })
-            .map(|(lease, _)| *lease)
-            .collect()
-    }
-
-    /// What `worker`'s newest `Hello` says it is doing ([`Event::Phase`]), if it is
-    /// registered.
-    #[must_use]
-    pub fn phase(&self, worker: &WorkerId) -> Option<&NodePhase> {
-        self.workers.get(worker).map(|w| &w.phase)
-    }
-
-    /// The worker queued whole-machine `operation` holds while it waits for it to empty,
-    /// if any.
-    #[must_use]
-    pub fn reservation(&self, operation: OperationId) -> Option<&WorkerId> {
-        self.reservations.get(&operation)
-    }
-
-    /// What is booked on `worker`, if it is registered. Its memory is what the leases'
-    /// limits add up to: a record, which admission does not read (an action's memory is
-    /// the limit it first runs under).
-    #[must_use]
-    pub fn booked(&self, worker: &WorkerId) -> Option<Resources> {
-        self.workers.get(worker).map(|w| w.booked)
-    }
-
-    /// The leases in `running` (a heartbeat's running set) that this scheduler granted
-    /// and no longer holds on `worker`: given up, granted elsewhere, or finished. Their
-    /// results can no longer be accepted, so a run of one is wasted, and a run of one
-    /// whose operation was granted again runs beside the retry. The caller cancels
-    /// them. A lease of another term is never named: this scheduler does not know
-    /// whether a newer leader granted it.
-    pub fn not_held<'a>(
-        &'a self,
-        worker: &'a WorkerId,
-        running: &'a [LeaseId],
-    ) -> impl Iterator<Item = LeaseId> + 'a {
-        running.iter().copied().filter(move |lease| {
-            let granted = lease.term == self.term && lease.seq < self.next_seq;
-            let held_here = self.held.get(lease).is_some_and(|held| {
-                self.ops[&held.operation]
-                    .state
-                    .holding()
-                    .is_some_and(|(_, w)| w == worker)
-            });
-            granted && !held_here
-        })
     }
 
     /// Drops every finished operation kept for the finished retention or longer. A
@@ -521,6 +411,7 @@ impl Scheduler {
                 unservable: None,
                 farm_runs: Vec::new(),
                 not_started: 0,
+                losses: 0,
                 avoid: BTreeSet::new(),
             },
         );
@@ -568,6 +459,8 @@ impl Scheduler {
             .ops
             .get_mut(&id)
             .expect("held leases name live operations");
+        // Only an operation that holds a lease is requeued, so every call is a give-up.
+        op.losses += u32::from(reason.is_loss());
         op.state = OpState::Queued;
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }
@@ -593,6 +486,11 @@ impl Scheduler {
     /// refused once it has waited so for the unservable wait. Its refusal is committed
     /// first and leaves the queue at once, so nothing places it meanwhile.
     fn place(&mut self, effects: &mut Vec<Effect>) {
+        // A grant the store cannot take is useless, and a refusal as much.
+        if self.store_down {
+            return;
+        }
+        self.refuse_lost(effects);
         let now = self.now;
         let mut servable = Servable::new(&self.workers, &self.cordons, now);
         let mut placed = Vec::new();
@@ -917,25 +815,24 @@ impl StateMachine for Scheduler {
                         w.session += 1;
                     }
                     None => {
-                        self.workers.insert(
-                            worker,
-                            Worker {
-                                capacity,
-                                caps,
-                                booked: Resources::default(),
-                                leases: 0,
-                                whole: false,
-                                devices: BTreeSet::new(),
-                                last_heard: now,
-                                session: 0,
-                                instance,
-                                process: 0,
-                                handover_ends: FarmTime::default(),
-                                stopped_process: None,
-                                phase: NodePhase::Serving,
-                                switch_ends: FarmTime::default(),
-                            },
-                        );
+                        let mut fresh = Worker {
+                            capacity,
+                            caps,
+                            booked: Resources::default(),
+                            leases: 0,
+                            whole: false,
+                            devices: BTreeSet::new(),
+                            last_heard: now,
+                            session: 0,
+                            instance,
+                            process: 0,
+                            handover_ends: FarmTime::default(),
+                            stopped_process: None,
+                            phase: NodePhase::Serving,
+                            switch_ends: FarmTime::default(),
+                        };
+                        self.adopt(&worker, &mut fresh);
+                        self.workers.insert(worker, fresh);
                     }
                 }
                 Vec::new()

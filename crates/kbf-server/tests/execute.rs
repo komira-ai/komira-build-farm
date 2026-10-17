@@ -11,6 +11,8 @@ mod lost;
 mod memory;
 #[path = "execute/missing.rs"]
 mod missing;
+#[path = "execute/run_data.rs"]
+mod run_data;
 #[path = "execute/slow_store.rs"]
 mod slow_store;
 mod support;

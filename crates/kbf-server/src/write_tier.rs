@@ -55,17 +55,37 @@ where
     F::File: Send + 'static,
     O: ObjectStore,
 {
+    attach_with(cache, hot, true).await
+}
+
+/// [`attach`], the tier keeping flushed copies or not ([`TierOptions::flushed_copies`]):
+/// not on a node whose one cache keeps its local copies (`kbf_storage::local_cache`).
+///
+/// # Errors
+/// [`WriteTierError`].
+pub async fn attach_with<F, O>(
+    cache: Cache<RaftMetaLog<F>, O>,
+    hot: Option<&Hot>,
+    flushed_copies: bool,
+) -> Result<(Cache<RaftMetaLog<F>, O>, Option<TierStartup>), WriteTierError>
+where
+    F: Fs + Send + 'static,
+    F::File: Send + 'static,
+    O: ObjectStore,
+{
     let Some(hot) = hot else {
         return Ok((cache, None));
     };
     let fs = StdFs::new(&hot.dir).map_err(WriteTierError::Dir)?;
+    let options = TierOptions {
+        flushed_copies,
+        ..TierOptions::new(hot.budget)
+    };
     cache
         .meta()
         .raise_machine_version(MachineVersion::V2)
         .map_err(WriteTierError::Log)?;
-    let (cache, startup) = cache
-        .attach_tier(fs, TierOptions::new(hot.budget), SERVER, hot.abandon)
-        .await?;
+    let (cache, startup) = cache.attach_tier(fs, options, SERVER, hot.abandon).await?;
     tracing::info!(
         tier = %startup.tier,
         registered = startup.registered,

@@ -32,6 +32,16 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    does; one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).
 
+## `kbf storage-and-daemon`
+
+The same daemon half and the same plane beside the storage node instead of the server
+(`src/storage_and_daemon.rs`, run by the `kbf` binary): one command line of `kbf
+storage`'s flags and `kbf-daemon`'s (the same refusals as above), the storage half
+started as `kbf storage` starts (`kbf_server::storage_half`, which keeps the storage its
+listener serves), and the daemon half's plane over that storage, in-process. Its
+control plane dials `--server` (the frontend's worker listener). The one cache applies
+as in `kbf all-in-one`.
+
 ## The in-process data plane
 
 `LocalDataPlane` implements `kbf_transfer::Cas` over the server's `LocalStore`
@@ -70,10 +80,42 @@ server's own code:
 - **A whole blob** (`put`, and `put_chunks` through it): hashed once, by the server,
   under the admission a ByteStream `Write` takes; a `put_chunks` blob over 16 MiB is
   streamed to the cold store as its chunks are read, never gathered.
-- **Reads** (`get` whole, `read_to` a window at a time) and **FindMissing** (`missing`): the cache's
-  own, which checks every blob it reads against its digest.
+- **Reads** (`get` whole, for a blob the daemon decodes) and **FindMissing** (`missing`):
+  the cache's own, which checks every blob it reads against its digest.
+- **Streamed reads** (`read_to`, what the input cache fills a file with): the storage's
+  windowed read (`LocalStore::read_stream`, a window of the blob in memory at a time),
+  pumped on the server half's runtime a chunk at a time into the file as it arrives (at
+  most two chunks between the halves, never the blob), and hashed: a stream cut short is
+  not taken for the blob.
 
 No message a remote daemon sends changes: `kbf-daemon` still uses the transfer engine.
+
+## One cache (`src/one_cache.rs`)
+
+When the hot store (`--hot-store`) is a directory on the filesystem of `--data-dir`,
+the daemon half's input cache and the server half's hot store are one cache on that disk
+([architecture-v2.md](../../docs/design/architecture-v2.md#10-locality),
+`kbf_storage::local_cache`):
+
+- **One copy of a blob.** The input cache's directory (`<data-dir>/cache`) and its index
+  are the node's only local copies: the hot store deletes a block once it is flushed
+  rather than keeping a flushed copy, and a start deletes the flushed copies an earlier
+  run kept. A lease's input is a hard link to the entry (the same inode), and a shared
+  read-only tree (`<data-dir>/trees`, at its own path) is built from links to entries.
+  What the hot store still holds is its unflushed blocks: acknowledged uploads waiting
+  for the cold store, which no cache may drop. While one of them holds a blob a lease
+  also needs, the blob is on the disk twice, until that block is flushed.
+- **One budget.** The input cache evicts its entries (least recently used, never one a
+  running lease pins) until they and the hot store's blocks fit its budget: after each
+  input it fills, and within about a second of the hot store growing (uploads with no lease
+  running). A hot store budgeted at or above the input cache leaves room for pinned
+  entries alone; the daemon warns when its blocks fill the whole budget.
+- **One fill.** `/metrics` reports `kbf_local_cache_input_bytes`,
+  `kbf_local_cache_storage_bytes` and their sum, `kbf_local_cache_fill_bytes`.
+
+With no hot store, or one on another filesystem, each half keeps what it keeps without
+the other, and the start says why (`one cache: off (...)`). The cold store is the
+durable store, not a cache: a `file://` cold store on the same disk holds its own copy.
 
 ## How it is tested
 
@@ -98,6 +140,18 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
   `Segments` handlers (a remote daemon's path); without a tier, a 256 MiB output
   streams to the cold store with under 16 MiB live.
+- `tests/binary.rs` also runs one action whose 3 MiB input a client uploaded: once the
+  hot store is flushed, one inode under the hot store and the data directory holds the
+  input (the input cache's entry) and `/metrics` counts it once; after a SIGKILL and a
+  restart, the same action leaves the same.
+- `tests/one_cache.rs`: the input cache filled over the plane: a 12 MiB input reaches
+  its file through one streamed read and no whole-blob read, the file never more than
+  five chunks behind what the stream handed out; two leases needing one input at once
+  read it once, into one entry both link; what a streamed read answers when the stream
+  is damaged or cut, the blob is absent, the file cannot be written or the server half
+  is gone; the hot store's staged blocks reported to the one cache as its storage
+  bytes; and a server half that keeps flushed copies without the one cache and none
+  with it.
 - `tests/helpers.rs`: the daemon's helpers run through this binary. The keeper,
   waiting on its stdin as it does for a run's whole life, has one thread and no
   socket, epoll, eventfd or directory open (read from `/proc`), then writes its kill
@@ -115,6 +169,8 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   gone, a file changed after the walk hashed it; without a tier, a `put_chunks` blob
   over 16 MiB streamed (held, not read again once held, corrupt, unreadable) and an
   upload with one stored record by record.
+- `src/one_cache_tests.rs`: one cache only when the hot store shares the data
+  directory's filesystem, given to both halves.
 - `src/intake_tests.rs`: batches sent while the walk goes on (by bytes and by file
   count), the wait for room among the batches in flight, one digest stored once, a
   file left unfinished storing nothing, a file over 5 GiB taken, a large file
@@ -125,10 +181,11 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
 
 ## Not done yet
 
-- **Production use.** The server half's scheduler state is in memory, so a restart of
-  the process loses every lease and operation (the cache's index is kept: the server's
-  metadata log is on disk, under `--meta-dir` or the hot store). Until the
-  scheduler's state is durable, all-in-one is a development shape.
+- **Production use.** The scheduler's state is a SQLite file, `<data-dir>/state.db` (or
+  the `--state-store=sqlite:///...` given), so a restart keeps queued operations and
+  every start is a new epoch: the daemon half kills the runs of the leases the earlier
+  start granted, and they are queued again. The trust warning below still stands, so
+  all-in-one is a development and single-box shape.
 - **The in-process plane's admission.** A remote daemon's blob calls are admitted by its
   certificate and the deny list; this plane's calls are not admitted.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as

@@ -68,10 +68,11 @@ impl Server {
             memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: kbf_sched::FINISHED_RETENTION,
             shutdown_timeout: Duration::from_secs(10),
+            streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: memory,
             segments: kbf_front::SegmentsConfig::DEFAULT,
-            streams: kbf_server::StreamLimits::DEFAULT,
+            stream_limits: kbf_server::StreamLimits::DEFAULT,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let shutdown = async move {
@@ -80,6 +81,7 @@ impl Server {
         let api = Api {
             listen: loopback(),
             token: None,
+            local_cache: None,
         };
         let bound =
             bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)
@@ -204,8 +206,8 @@ pub fn listing(
     logs: (Option<Digest>, Option<Digest>),
 ) -> Listing {
     Listing {
-        result,
-        exit_code,
+        result: Some(result),
+        exit_code: Some(exit_code),
         outputs: outputs
             .iter()
             .enumerate()

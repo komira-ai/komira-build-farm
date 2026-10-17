@@ -19,7 +19,7 @@ use kbf_proto::worker::{
 use kbf_server::{Args, bind_server, bind_server_with_policy};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -50,6 +50,11 @@ fn pki(name: &str) -> Pki {
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("CA key")).expect("CA");
     let leaf = |names: Vec<String>, cn: &str, eku: ExtendedKeyUsagePurpose| {
         let mut params = CertificateParams::new(names).expect("leaf params");
+        if eku == ExtendedKeyUsagePurpose::ClientAuth {
+            // The daemon role, as the worker listener requires.
+            let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+            params.subject_alt_names.push(SanType::URI(role));
+        }
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![eku];
         let key = KeyPair::generate().expect("leaf key");

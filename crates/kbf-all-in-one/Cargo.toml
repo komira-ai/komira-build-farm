@@ -32,6 +32,8 @@ kbf-node.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
 kbf-server.workspace = true
+# The node's one cache (`kbf_storage::local_cache`) and the streamed read's types.
+kbf-storage.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
@@ -39,6 +41,7 @@ kbf-types.workspace = true
 rustix = { workspace = true, features = ["process"] }
 tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "sync"] }
 tonic.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
@@ -48,8 +51,9 @@ kbf-cas-conformance.workspace = true
 kbf-daemon.workspace = true
 # The image store layout the stand-in `podman` reads (tests/binary.rs).
 kbf-driver-container.workspace = true
-# Where a blob is and the store it is in, to damage one (src/plane_tests.rs).
+# The storage boundary the plane is checked through (tests/storage_seam.rs); where a blob is, to damage one (src/plane_tests.rs).
 kbf-meta.workspace = true
+# The store a blob is in, to damage one (src/plane_tests.rs).
 kbf-objstore.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true

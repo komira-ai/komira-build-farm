@@ -10,8 +10,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The `action` knob both `start`s run, one argument per line: its environment, an
-/// argument with each path name the fake expands (and two it must not: `$UPPERX` and
+/// The `action` knob both `start`s run, one argument per line: its environment (with
+/// [`HOST_VARIABLE`], which only `create` runs with), an argument with each path name the fake expands (and two it must not: `$UPPERX` and
 /// `x$CG`), whether it leads its own process group and session, both streams and an
 /// exit code of its own.
 const ACTION: &str = concat!(
@@ -19,11 +19,18 @@ const ACTION: &str = concat!(
     "env\nROOT\n;\n",
     "env\nUPPER\n;\n",
     "env\nFAKE_LEASE\n;\n",
+    "env\nKBF_GOLDEN_HOST\nunset\n;\n",
     "echo\n$CG\n$ROOT/r\n$UPPER/u\n$UPPERX\nx$CG\n;\n",
     "leads\n;\n",
     "echo\n--stderr\nerr\n;\n",
     "exit\n3\n",
 );
+
+/// A variable of the `env-host` knob's prefix that each `create` runs with and no
+/// other call does: `create` records it, and the action of a `start` printing it shows
+/// it was handed on from the record. Set here, not taken from the test's own
+/// environment, so the record is the same on every machine.
+const HOST_VARIABLE: (&str, &str) = ("KBF_GOLDEN_HOST", "from-create");
 
 /// The `--format` the driver reads a container's record with (`podman::Podman::ended`).
 const RECORD: &str = "--format={{.State.Status}} {{.State.ExitCode}} {{.State.FinishedAt.IsZero}}";
@@ -116,7 +123,15 @@ fn calls(dir: &Path) -> Vec<Call> {
         call(&[("state/image-id", None)], &["image", "inspect", "ref"]),
         call(&[("state/create-fails", Some(""))], &create),
         call(&[("state/create-fails", None)], &["create"]),
-        call(&[("state/block-log", Some("stdout"))], &create),
+        // `env-host`: `create` records its variables of the prefix ([`HOST_VARIABLE`]
+        // only), which every later `start` hands to the action.
+        call(
+            &[
+                ("state/block-log", Some("stdout")),
+                ("state/env-host", Some("KBF_GOLDEN_")),
+            ],
+            &create,
+        ),
         call(&[("state/block-log", None)], &ps),
         // Another node's containers: none of them is this one.
         call(
@@ -270,6 +285,14 @@ fn run(dir: &Path, program: &Path) -> (Vec<Answer>, BTreeMap<PathBuf, Entry>) {
             }
         }
         let mut command = Command::new(&link);
+        let creates = call
+            .args
+            .as_ref()
+            .and_then(|a| a.first())
+            .map(String::as_str);
+        if creates == Some("create") {
+            command.env(HOST_VARIABLE.0, HOST_VARIABLE.1);
+        }
         if let Some(args) = &call.args {
             command.arg("--cgroup-manager=cgroupfs").args(args);
         }
@@ -396,11 +419,18 @@ fn the_fake_answers_and_records_as_its_golden_file_says() {
             .any(|a| a.code == Some(3) && a.stdout.contains("group 1 session 1\n")),
         "no start ran the action in a session of its own: {answers:#?}"
     );
+    assert!(
+        answers
+            .iter()
+            .any(|a| a.code == Some(3) && a.stdout.contains(HOST_VARIABLE.1)),
+        "no start handed the action what create ran with (env-host): {answers:#?}"
+    );
     for record in [
         "calls",
         "events",
         "status",
         "create.args",
+        "create-env",
         "ps.args",
         "owner",
         "removed",

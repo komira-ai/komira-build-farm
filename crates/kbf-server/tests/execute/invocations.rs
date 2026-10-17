@@ -34,10 +34,10 @@ use crate::support::{
 };
 
 /// The build's id, as buck2 prints it (`Build ID:`).
-const BUILD: &str = "0b8c2f0e-6d1a-4c55-9a7e-2f43d1c0a9b4";
+pub(crate) const BUILD: &str = "0b8c2f0e-6d1a-4c55-9a7e-2f43d1c0a9b4";
 
 /// `message` with the `RequestMetadata` header buck2 sends, naming invocation `id`.
-fn tagged<T>(id: &str, message: T) -> Request<T> {
+pub(crate) fn tagged<T>(id: &str, message: T) -> Request<T> {
     let metadata = RequestMetadata {
         tool_details: Some(ToolDetails {
             tool_name: "buck2".to_owned(),
@@ -54,7 +54,7 @@ fn tagged<T>(id: &str, message: T) -> Request<T> {
     request
 }
 
-async fn execute(cell: &Cell, id: &str, action: &Blob) -> Streaming<Operation> {
+pub(crate) async fn execute(cell: &Cell, id: &str, action: &Blob) -> Streaming<Operation> {
     let request = ExecuteRequest {
         instance_name: "main".to_owned(),
         action_digest: Some(action.proto.clone()),
@@ -81,7 +81,7 @@ async fn get_action_result(cell: &Cell, id: &str, action: &Blob) -> Result<Actio
 }
 
 /// Uploads `blobs` in one BatchUpdateBlobs call naming `id`; their bytes.
-async fn upload(cell: &Cell, id: &str, blobs: &[&Blob]) -> u64 {
+pub(crate) async fn upload(cell: &Cell, id: &str, blobs: &[&Blob]) -> u64 {
     let request = BatchUpdateBlobsRequest {
         instance_name: "main".to_owned(),
         requests: blobs
@@ -102,7 +102,7 @@ async fn upload(cell: &Cell, id: &str, blobs: &[&Blob]) -> u64 {
 }
 
 /// The record of `id`, once the recorder has applied every event so far.
-async fn record(cell: &Cell, id: &str) -> Invocation {
+pub(crate) async fn record(cell: &Cell, id: &str) -> Invocation {
     cell.recorder.caught_up().await;
     cell.recorder
         .get(&RecordKey::owner(InvocationId::new(id)))
@@ -219,7 +219,7 @@ async fn a_build_records_a_hit_a_run_a_requeue_and_a_failure() {
 
     // The hit copies the stored result's listing.
     let listing = hit_row.listing.as_ref().expect("the hit's listing");
-    assert_eq!(listing.result, stored(&cached));
+    assert_eq!(listing.result, Some(stored(&cached)));
     let outputs: Vec<_> = listing.outputs.iter().map(|o| o.path.as_str()).collect();
     assert_eq!(outputs, ["out"]);
     assert_eq!(hit_row.outcome, Some(Outcome::Ok { exit_code: 0 }));
@@ -235,7 +235,7 @@ async fn a_build_records_a_hit_a_run_a_requeue_and_a_failure() {
     assert_eq!(run_row.outcome, Some(Outcome::Ok { exit_code: 0 }));
     let given = stamped_response(&run_done).result.expect("a result");
     let listing = run_row.listing.as_ref().expect("the run's listing");
-    assert_eq!(listing.result, stored(&given));
+    assert_eq!(listing.result, Some(stored(&given)));
     assert_eq!(listing.outputs[0].digest.size_bytes, "ran".len() as u64);
 
     // The requeue: the lost lease given up, then the rerun accepted.

@@ -1,0 +1,148 @@
+/* kbf pages. Every colour and space is a custom property below: a new look is a new
+   set of values (or a new file), not new markup. Light by default, dark by
+   prefers-color-scheme. No external font, image or import: the CSP allows only this
+   file. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1d2127;
+  --muted: #5d6673;
+  --line: #d9dde3;
+  --surface: #f5f7f9;
+  --accent: #2456c7;
+  --ok-bg: #dcf3e3;
+  --ok-fg: #17653a;
+  --fail-bg: #fbe1e1;
+  --fail-fg: #9b1c1c;
+  --pending-bg: #eceff3;
+  --pending-fg: #4a5361;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --radius: 6px;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --width: 72rem;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b;
+    --fg: #e4e7eb;
+    --muted: #9aa3ae;
+    --line: #2c3239;
+    --surface: #1b1f24;
+    --accent: #7ea6ff;
+    --ok-bg: #133a24;
+    --ok-fg: #8fe0ad;
+    --fail-bg: #451b1b;
+    --fail-fg: #ffaaaa;
+    --pending-bg: #262b31;
+    --pending-fg: #b6bec8;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 var(--font);
+}
+
+a { color: var(--accent); }
+code, pre { font-family: var(--mono); font-size: 0.9em; }
+
+header.top {
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+header.top nav, main, footer.reads {
+  max-width: var(--width);
+  margin: 0 auto;
+  padding: var(--space-2) var(--space-3);
+}
+
+header.top nav { display: flex; align-items: center; gap: var(--space-4); }
+header.top ul { display: flex; gap: var(--space-3); list-style: none; margin: 0; padding: 0; }
+header.top a { text-decoration: none; }
+header.top a[aria-current="page"] { font-weight: 600; color: var(--fg); }
+.brand { font-weight: 700; letter-spacing: 0.02em; }
+
+h1 { font-size: 1.4rem; margin: var(--space-3) 0 var(--space-2); }
+h2 { font-size: 1.1rem; margin: var(--space-4) 0 var(--space-2); }
+
+.crumbs, .hint { color: var(--muted); }
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+}
+
+.lookup { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+.lookup input[type="text"] {
+  min-width: 24rem;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--mono);
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.fields { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-1) var(--space-3); }
+.fields dt { color: var(--muted); }
+.fields dd { margin: 0; overflow-wrap: anywhere; }
+
+.counts { display: flex; flex-wrap: wrap; gap: var(--space-2); list-style: none; padding: 0; }
+.counts li {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-1) var(--space-2);
+}
+.counts .n { font-weight: 600; margin-right: var(--space-1); }
+.counts .label { color: var(--muted); }
+
+table.rows { width: 100%; border-collapse: collapse; }
+table.rows th, table.rows td {
+  text-align: left;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+table.rows th { color: var(--muted); font-weight: 500; }
+
+.pill {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  font-size: 0.85em;
+}
+.pill.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.pill.fail { background: var(--fail-bg); color: var(--fail-fg); }
+.pill.pending { background: var(--pending-bg); color: var(--pending-fg); }
+.pill.other { background: var(--pending-bg); color: var(--pending-fg); }
+
+.log pre {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  overflow: auto;
+  max-height: 32rem;
+  white-space: pre-wrap;
+}
+
+.problem { color: var(--fail-fg); }
+.outputs { list-style: none; padding: 0; }
+
+footer.reads { color: var(--muted); border-top: 1px solid var(--line); margin-top: var(--space-4); }
+footer.reads h2 { font-size: 0.95rem; }
+footer.reads ul { padding-left: var(--space-3); }

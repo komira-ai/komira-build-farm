@@ -35,6 +35,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_RANGE};
 use reqwest::{Method, Response, StatusCode, Url};
 use sha2::{Digest, Sha256};
 
+use crate::types::Token;
 use crate::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
@@ -471,8 +472,12 @@ impl ObjectStore for S3Store {
             ("prefix", prefix.as_str().to_owned()),
             ("max-keys", max_keys.get().to_string()),
         ];
-        if let Some(t) = after {
-            query.push(("continuation-token", t.0.clone()));
+        match after.map(|t| &t.0) {
+            Some(Token::Continue(t)) => query.push(("continuation-token", t.clone())),
+            Some(Token::After(key) | Token::Kept { after: key, .. }) => {
+                query.push(("start-after", key.as_str().to_owned()))
+            }
+            None => {}
         }
         let resp = self
             .conn

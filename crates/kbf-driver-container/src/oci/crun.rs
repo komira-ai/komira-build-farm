@@ -32,6 +32,8 @@ use runc::error::Error;
 use runc::options::{CreateOpts, GlobalOpts};
 use runc::{Command, Io, Runc, Spawner};
 
+use crate::credential::without_credentials;
+
 /// How one `crun run` ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunEnd {
@@ -57,6 +59,7 @@ struct KillOnDrop;
 impl Spawner for KillOnDrop {
     async fn execute(&self, mut cmd: Command) -> runc::Result<(ExitStatus, u32, String, String)> {
         cmd.kill_on_drop(true);
+        without_credentials(cmd.as_std_mut());
         let child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
         let pid = child.id().unwrap_or(0);
         let out = child
@@ -220,7 +223,8 @@ impl Crun {
     /// Runs `crun --root <state> <args>` and waits: `Ok` if it exits 0, else its status
     /// and what it said on stderr.
     fn blocking(&self, state: &Path, args: &[&str], what: &str) -> Result<(), String> {
-        let output = std::process::Command::new(&self.program)
+        let mut command = std::process::Command::new(&self.program);
+        let output = without_credentials(&mut command)
             .arg("--root")
             .arg(state)
             .args(args)

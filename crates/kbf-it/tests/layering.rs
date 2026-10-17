@@ -20,7 +20,29 @@
 //!   run both in one process, and any other crate that links both, or either one into
 //!   the other's side of the farm, makes the split meaningless;
 //! - a `main.rs` of those two that grows past `THIN_MAIN_LINES` code lines, which
-//!   means assembly that a combined binary could not reuse is back in a binary.
+//!   means assembly that a combined binary could not reuse is back in a binary;
+//! - the storage crate (`kbf-storage`) depending, directly or through another crate, on
+//!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
+//!   would make a storage process link the frontend; and the storage crate renamed or
+//!   removed, which would make that check pass vacuously;
+//! - the routing library (`kbf-route`) depending, directly or through another crate, on a
+//!   frontend crate, the server, or the daemon's side (`ROUTE_MUST_NOT_REACH`): the
+//!   frontend and the daemon both link it, and neither may pull in the other's code
+//!   through it;
+//! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
+//!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
+//!   store client, a crate that holds one, or a standalone HTTP client one could be
+//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see the client (the
+//!   client crate renamed, or the server no longer reaching it), which would make that
+//!   check pass vacuously. A daemon-only node holds no cold-store credential and reaches
+//!   bytes only through storage (docs/design/architecture-v2.md, section 9). What this
+//!   pins is the daemon's code: the daemon crates cannot name an object-store client, so
+//!   the separate `kbf-daemon` binary links none. It does not pin the binary a
+//!   daemon-only node runs. The deployed `kbf daemon` is the `kbf` binary (`kbf-cli`),
+//!   which links `kbf-server` and `kbf-objstore` for its other modes (`JOINERS`). For
+//!   that binary the protection is that it is given no credential: its unit loads no
+//!   environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`), and no
+//!   daemon flag names a store or reads an environment variable (kbf-cli's tests).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -36,6 +58,7 @@ const PURE: &[&str] = &[
     "kbf-estimator",
     "kbf-raft",
     "kbf-invocation",
+    "kbf-map",
 ];
 
 const FORBIDDEN: &[&str] = &[
@@ -215,9 +238,9 @@ fn pure_modules_deny_the_clippy_lists() {
     }
 }
 
-/// The one crate allowed to depend on both the server and the node library: the combined
-/// binary.
-const JOINERS: &[&str] = &["kbf-all-in-one"];
+/// The crates allowed to depend on both the server and the node library: the combined
+/// binary and the one `kbf` binary.
+const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -280,7 +303,11 @@ const THIN_MAIN_LINES: usize = 40;
 #[test]
 fn the_server_and_daemon_binaries_are_thin() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for main in ["kbf-server/src/main.rs", "kbf-node/src/main.rs"] {
+    for main in [
+        "kbf-server/src/main.rs",
+        "kbf-node/src/main.rs",
+        "kbf-cli/src/main.rs",
+    ] {
         let path = crates.join(main);
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -295,4 +322,96 @@ fn the_server_and_daemon_binaries_are_thin() {
              in the library, where a combined binary can call it"
         );
     }
+}
+
+/// What the storage crate's normal dependencies must not reach: the frontend's scheduler
+/// and authorization (docs/design/architecture-v2.md, section 3). A storage process
+/// stores; it neither schedules nor decides who may call.
+const STORAGE_MUST_NOT_REACH: &[&str] = &["kbf-sched", "kbf-auth"];
+
+#[test]
+fn storage_reaches_no_frontend_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-storage")
+        .expect("kbf-storage is a workspace member");
+    assert!(root.is_some(), "kbf-storage must have a library target");
+    let violations = reaches(&g, "kbf-storage", STORAGE_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-storage reaches a frontend crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
+/// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
+/// and so are in its closure.
+const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
+
+/// What a daemon crate's normal dependencies must not reach: the object store client
+/// (`kbf-objstore`, which signs S3 requests), the crates that hold the cold store behind
+/// their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`), and the
+/// standalone HTTP clients an S3 client could be written over (`reqwest`, which
+/// `kbf-objstore` is written over, and `ureq`). `hyper-util` is not listed: tonic's
+/// channel, which the daemon dials the server with, is built on its client.
+const COLD_STORE_CLIENT: &[&str] = &["kbf-objstore", "kbf-front", "kbf-server", "reqwest", "ureq"];
+
+#[test]
+fn a_daemon_cannot_build_a_cold_store_client() {
+    let g = load_graph();
+    // Every name the check looks for is a package of the graph, and the walk sees the
+    // client where it is linked: the server builds its cold store from it. Without
+    // these, a renamed or misspelled crate would pass the check below.
+    for name in COLD_STORE_CLIENT {
+        assert!(
+            g.names.values().any(|n| n == *name),
+            "{name} is not a package of the workspace's graph"
+        );
+    }
+    assert!(
+        !reaches(&g, "kbf-server", &["kbf-objstore"]).is_empty(),
+        "the server's closure must reach kbf-objstore, or this walk proves nothing"
+    );
+    let violations: Vec<String> = DAEMON_ONLY
+        .iter()
+        .flat_map(|daemon| reaches(&g, daemon, COLD_STORE_CLIENT))
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "a daemon crate reaches an object-store client (a daemon-only node holds no \
+         cold-store credential, docs/design/architecture-v2.md section 9):\n{}",
+        violations.join("\n")
+    );
+}
+
+/// What the routing library's normal dependencies must not reach: the frontend's scheduler
+/// and authorization, the server, and the daemon's side (the transfer engine and the node).
+/// The frontend and the daemon both use it (docs/design/architecture-v2.md, section 7); a
+/// path to either side's code would make the other link it.
+const ROUTE_MUST_NOT_REACH: &[&str] = &[
+    "kbf-sched",
+    "kbf-auth",
+    "kbf-front",
+    "kbf-server",
+    "kbf-transfer",
+    "kbf-node",
+    "kbf-daemon",
+];
+
+#[test]
+fn route_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-route")
+        .expect("kbf-route is a workspace member");
+    assert!(root.is_some(), "kbf-route must have a library target");
+    let violations = reaches(&g, "kbf-route", ROUTE_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-route reaches a frontend or daemon crate:\n{}",
+        violations.join("\n")
+    );
 }

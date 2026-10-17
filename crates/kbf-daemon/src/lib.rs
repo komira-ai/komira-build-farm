@@ -56,9 +56,11 @@ mod lease;
 mod lease_panic;
 #[cfg(target_os = "linux")]
 mod local;
+mod map;
 #[cfg(target_os = "linux")]
 pub mod numa;
 pub mod phases;
+mod plane;
 pub mod pressure;
 pub mod report;
 pub mod runtime;
@@ -86,8 +88,12 @@ pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
+pub use kbf_mapsync::MapHolder;
+pub use kbf_route::Liveness;
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
+pub use map::{HeldMaps, REFETCH_WITHIN};
+pub use plane::{FarmCas, FarmLease, LocalMember, member_cas, storage_nodes};
 pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};

@@ -46,6 +46,10 @@ fn capture() {
             .finish();
         tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
     });
+    // Tests run in parallel: a callsite another test's thread first reached while this
+    // subscriber was being installed may have cached "never" (tests/thread_log_capture.rs),
+    // so re-evaluate every callsite against it now that it is the global default.
+    tracing_core::callsite::rebuild_interest_cache();
 }
 
 /// The logged lines that contain every one of `parts`.

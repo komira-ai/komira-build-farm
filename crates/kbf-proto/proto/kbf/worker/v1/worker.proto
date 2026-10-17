@@ -32,6 +32,7 @@ package kbf.worker.v1;
 
 import "build/bazel/remote/execution/v2/remote_execution.proto";
 import "google/rpc/status.proto";
+import "kbf/map/v1/map.proto";
 
 // The service a kbf-server front exposes to daemons.
 service Worker {
@@ -49,6 +50,7 @@ message DaemonMessage {
     Offer offer = 3;
     Result result = 4;
     NodeStatus node_status = 5;
+    MapRequest map_request = 6;
   }
 }
 
@@ -61,6 +63,7 @@ message ServerMessage {
     LeaseOffer lease_offer = 4;
     ResultAck result_ack = 5;
     Cancel cancel = 6;
+    MapUpdate map_update = 7;
   }
 }
 
@@ -243,6 +246,31 @@ message Welcome {
   // (docs/design/worker-protocol.md, "Server restarts"). 0 means not named (a server
   // that predates this field): the daemon then forgets nothing.
   uint64 epoch = 3;
+  // The storage map the frontend holds now (docs/design/architecture-v2.md, section 6).
+  // Absent from a server that holds none (a farm of one member): the daemon then routes
+  // by no map. A daemon keeps the newest map it was sent, whichever message brought it,
+  // and ignores one that is not newer than the one it holds.
+  kbf.map.v1.Map map = 4;
+}
+
+// The storage map changed. Sent on the session each time the frontend's map changes,
+// whole (never a difference), with the newest map at the time it is sent: a map change
+// that follows another quickly may be sent as the later one alone. A receiver that
+// misses one is not harmed: it learns the map from the next Welcome, from the answer to
+// a MapRequest, or from the next MapUpdate.
+message MapUpdate {
+  kbf.map.v1.Map map = 1;
+}
+
+// A daemon asks for the map. Sent when a storage node answered STALE_MAP naming a map
+// newer than the daemon's. The server answers with a MapUpdate of the map it holds now,
+// which may be older than at_least when this frontend has not seen that map yet: the
+// daemon then goes on waiting, and a later MapUpdate reaches it. A server that holds no
+// map does not answer.
+message MapRequest {
+  // The generation a storage node named. Informational: the server answers with its
+  // current map whatever the value.
+  uint64 at_least = 1;
 }
 
 // A lease: a numbered permission to run, ordered by (term, seq).

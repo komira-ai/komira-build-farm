@@ -397,7 +397,7 @@ impl AuditLog {
 /// `Cache::object_key` so the audit can run before a `Cache` exists; if the two ever
 /// differ, every audit reports a violation.
 fn object_key(id: ObjectId) -> ObjectKey {
-    let (epoch, seq) = (id.epoch().get(), id.seq());
+    let (epoch, seq) = (id.epoch().expect("an epoch writer's").get(), id.seq());
     KeyPrefix::default()
         .key(&format!("cas/{epoch:016x}/{seq:016x}"))
         .expect("key")

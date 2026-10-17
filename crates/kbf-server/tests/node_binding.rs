@@ -14,13 +14,13 @@ use clap::Parser;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_front::Cache;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, NodeStatus, ServerMessage, Start, daemon_message,
-    server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, MapRequest, NodeStatus, ServerMessage, Start,
+    daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::{Api, Args, ConfigError, DenyListError, bind_server, bind_server_with_api};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SerialNumber,
+    KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -59,6 +59,7 @@ impl Pki {
         let pki = Self { dir, ca };
         let (cert, key) = pki.leaf(
             &["localhost"],
+            &[],
             "server",
             1,
             ExtendedKeyUsagePurpose::ServerAuth,
@@ -69,15 +70,20 @@ impl Pki {
         pki
     }
 
+    /// A certificate with `names` as DNS names and a `urn:kbf:role:` URI per `roles`.
     fn leaf(
         &self,
         names: &[&str],
+        roles: &[&str],
         cn: &str,
         serial: u64,
         eku: ExtendedKeyUsagePurpose,
     ) -> (String, String) {
         let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
         let mut params = CertificateParams::new(names).expect("leaf params");
+        params
+            .subject_alt_names
+            .extend(roles.iter().map(|r| role(r)));
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![eku];
         params.serial_number = Some(SerialNumber::from(serial));
@@ -86,10 +92,17 @@ impl Pki {
         (cert.pem(), key.serialize_pem())
     }
 
-    /// A daemon identity whose certificate has `names` as DNS names and `serial`.
+    /// A daemon identity whose certificate has `names` as DNS names, the daemon role,
+    /// and `serial`.
     fn client(&self, names: &[&str], serial: u64) -> Identity {
+        self.client_as(names, &["daemon"], serial)
+    }
+
+    /// [`Pki::client`] with `roles` instead of the daemon role.
+    fn client_as(&self, names: &[&str], roles: &[&str], serial: u64) -> Identity {
         let (cert, key) = self.leaf(
             names,
+            roles,
             "cn-is-not-read",
             serial,
             ExtendedKeyUsagePurpose::ClientAuth,
@@ -141,6 +154,15 @@ impl Pki {
         tokio::spawn(async move { bound.serving.await.expect("serve") });
         addrs
     }
+}
+
+/// The role URI the certificate table writes, spelled out here.
+fn role(name: &str) -> SanType {
+    SanType::URI(
+        format!("urn:kbf:role:{name}")
+            .try_into()
+            .expect("an IA5 name"),
+    )
 }
 
 fn hello(node: &str) -> daemon_message::Message {
@@ -287,9 +309,72 @@ async fn a_certificate_for_one_node_cannot_open_another_nodes_session() {
         assert_eq!(status.code(), Code::PermissionDenied, "{names:?}");
     }
     // The common name says node-b; only the DNS name counts.
-    let (cert, key) = pki.leaf(&[], "node-b", 5, ExtendedKeyUsagePurpose::ClientAuth);
+    let (cert, key) = pki.leaf(
+        &[],
+        &["daemon"],
+        "node-b",
+        5,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
     let cn = refused(Session::open(addr, &pki, Identity::from_pem(cert, key), "node-b").await);
     assert_eq!(cn.code(), Code::PermissionDenied);
+}
+
+/// Catches a worker session opened on a certificate that is not a daemon's: a
+/// frontend's or a storage node's from the same CA (naming the right node), a role
+/// that is not one, no role, or two; each refused PERMISSION_DENIED. The control: the
+/// same node with the daemon role is welcomed.
+///
+/// Mutant seen red: the role table's layer left off the worker listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_daemon_certificate_opens_a_session() {
+    let pki = Pki::new("roles");
+    let addr = pki.serve(&[]);
+    let two: &[&str] = &["daemon", "storage"];
+    for (roles, serial) in [
+        (&["frontend"][..], 21),
+        (&["storage"][..], 22),
+        (&["admin"][..], 23),
+        (&[][..], 24),
+        (two, 25),
+    ] {
+        let identity = pki.client_as(&["node-a"], roles, serial);
+        let status = refused(Session::open(addr, &pki, identity, "node-a").await);
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{roles:?}: {status:?}"
+        );
+    }
+    Session::open(addr, &pki, pki.client(&["node-a"], 26), "node-a")
+        .await
+        .expect("the daemon role is welcomed");
+}
+
+/// Catches the role read from a certificate of the presented chain other than the
+/// leaf (the last, or any of them): a peer holding a frontend key could append a
+/// daemon's public certificate after its own and pass as a daemon. A chain of two
+/// certificates from the same CA, both naming node-a: frontend first, daemon second,
+/// is refused PERMISSION_DENIED; daemon first, frontend second, is welcomed.
+///
+/// Mutant seen red: `chain.first()` read as `chain.last()` in the role table's layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_reads_the_role_from_the_leaf_certificate_alone() {
+    let pki = Pki::new("leaf-role");
+    let addr = pki.serve(&[]);
+    let chain = |first: &str, then: &str, serial: u64| {
+        let client = ExtendedKeyUsagePurpose::ClientAuth;
+        let (leaf, key) = pki.leaf(&["node-a"], &[first], "leaf", serial, client);
+        let client = ExtendedKeyUsagePurpose::ClientAuth;
+        let (extra, _) = pki.leaf(&["node-a"], &[then], "extra", serial + 1, client);
+        Identity::from_pem(format!("{leaf}\n{extra}"), key)
+    };
+    let status =
+        refused(Session::open(addr, &pki, chain("frontend", "daemon", 31), "node-a").await);
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    Session::open(addr, &pki, chain("daemon", "frontend", 33), "node-a")
+        .await
+        .expect("a daemon leaf is welcomed whatever follows it");
 }
 
 /// Catches (issue #79): the deny list not consulted at `Hello`, read only when the
@@ -398,6 +483,7 @@ async fn a_certificate_from_an_openssl_ca_script_passes() {
     let node = "mac-mini-03";
     let serial: Vec<u8> = (0x31..=0x44).collect();
     let mut params = CertificateParams::new(vec![node.to_owned()]).expect("leaf params");
+    params.subject_alt_names.push(role("daemon"));
     params.distinguished_name.push(DnType::CommonName, node);
     params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -463,6 +549,43 @@ async fn a_revoked_daemon_cannot_deliver_a_result() {
     assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
     assert!(ended.message().contains("serial 51"), "{}", ended.message());
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
+}
+
+/// Catches: a `MapRequest` not checked against the deny list, so a node revoked while its
+/// stream is open goes on pulling the storage map. The control: the same stream's request
+/// before the revocation is accepted (this server holds no map, so it is not answered, and
+/// the stream goes on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_daemon_cannot_ask_for_the_map() {
+    let (pki, _cell, _job, mut daemon, _start) = node_a_holding_a_lease("deny-map").await;
+    daemon.send(daemon_message::Message::MapRequest(MapRequest {
+        at_least: 2,
+    }));
+    let acked = daemon.heartbeat(1).await.expect("the stream goes on");
+    assert!(
+        matches!(
+            acked,
+            Some(ServerMessage {
+                message: Some(server_message::Message::HeartbeatAck(_))
+            })
+        ),
+        "{acked:?}"
+    );
+
+    pki.write("deny.list", "node node-a\n");
+    daemon.send(daemon_message::Message::MapRequest(MapRequest {
+        at_least: 2,
+    }));
+    let ended = daemon
+        .next()
+        .await
+        .expect_err("the MapRequest ended the stream");
+    assert_eq!(ended.code(), Code::PermissionDenied, "{ended:?}");
+    assert!(
+        ended.message().contains("node node-a"),
+        "{}",
+        ended.message()
+    );
 }
 
 /// Catches: a session that goes on reading its stream after it refused a message
@@ -536,6 +659,7 @@ async fn a_revoked_daemon_cannot_report_its_status() {
     let api = Api {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
+        local_cache: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");

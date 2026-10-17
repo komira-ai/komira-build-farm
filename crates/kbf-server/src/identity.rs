@@ -2,6 +2,10 @@
 //! the deny list (issue #79). The same rules admit a worker stream and each blob call
 //! a daemon makes on that listener ([`crate::blobs`]).
 //!
+//! **The role** is checked before any of this, per method, by the listener's table
+//! ([`crate::worker_roles`]): a worker stream or a blob call reaches these rules only
+//! from a certificate naming the daemon role.
+//!
 //! **The rule.** Under mutual TLS a daemon's client certificate must carry exactly one
 //! DNS name in its subjectAltName extension, and that name must equal, byte for byte,
 //! the `node_id` of every `Hello` the stream sends. The subject's common name is not
@@ -33,6 +37,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kbf_map::{DenyEntry, normalize_serial};
 use sha2::{Digest, Sha256};
 use tonic::Status;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
@@ -71,7 +76,7 @@ impl PeerCert {
             .collect();
         Ok(Self {
             names,
-            serial: normal_hex(&hex(cert.raw_serial())),
+            serial: normalize_serial(&hex(cert.raw_serial())),
             spki_sha256: hex(&Sha256::digest(cert.public_key().raw)),
         })
     }
@@ -132,8 +137,9 @@ pub enum Peers {
 }
 
 impl Peers {
-    /// The certificate of a new stream, from the chain TLS verified (`leaf` is its
-    /// first certificate; `None` in plain text).
+    /// The certificate of a new stream or blob call, from the chain TLS verified (`leaf`
+    /// is its first certificate; `None` in plain text). Its role was checked before the
+    /// call was routed ([`crate::worker_roles`]).
     ///
     /// # Errors
     /// UNAUTHENTICATED: under mutual TLS, there is no certificate or it does not parse.
@@ -308,34 +314,17 @@ impl Denied {
     pub fn parse(text: &str) -> Result<Self, (usize, String)> {
         let mut denied = Self::default();
         for (at, line) in text.lines().enumerate() {
-            let line = line.split('#').next().unwrap_or_default();
-            let mut words = line.split_whitespace();
-            let (Some(kind), value, None) = (words.next(), words.next(), words.next()) else {
-                if line.trim().is_empty() {
-                    continue;
+            match DenyEntry::parse_line(line).map_err(|e| (at + 1, e.to_string()))? {
+                None => {}
+                Some(DenyEntry::Serial(v)) => {
+                    denied.serials.insert(v);
                 }
-                return Err((at + 1, "an entry is one kind and one value".to_owned()));
-            };
-            let value = value.ok_or_else(|| (at + 1, format!("{kind} needs a value")))?;
-            let bad = |what: &str| (at + 1, format!("{what}: {value:?}"));
-            match kind {
-                "serial" => {
-                    let hex: String = value.chars().filter(|c| *c != ':').collect();
-                    if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                        return Err(bad("a serial is hex digits, colons allowed"));
-                    }
-                    denied.serials.insert(normal_hex(&hex));
+                Some(DenyEntry::SpkiSha256(v)) => {
+                    denied.spkis.insert(v);
                 }
-                "spki-sha256" => {
-                    if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
-                        return Err(bad("an spki-sha256 is 64 hex digits"));
-                    }
-                    denied.spkis.insert(value.to_ascii_lowercase());
+                Some(DenyEntry::Node(v)) => {
+                    denied.nodes.insert(v);
                 }
-                "node" => {
-                    denied.nodes.insert(value.to_owned());
-                }
-                _ => return Err((at + 1, format!("unknown entry kind {kind:?}"))),
             }
         }
         Ok(denied)
@@ -359,16 +348,6 @@ impl Denied {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Lower case, without leading zeros (a serial of zero is `0`).
-fn normal_hex(hex: &str) -> String {
-    let trimmed = hex.trim_start_matches('0').to_ascii_lowercase();
-    if trimmed.is_empty() {
-        "0".to_owned()
-    } else {
-        trimmed
-    }
 }
 
 /// The metadata a change of the deny list shows in: device, inode, size, mode, owner,

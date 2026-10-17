@@ -32,6 +32,12 @@ ExecStart=@KBF_BIN_DIR@/kbf-server \
     --worker-deny-list=@KBF_ETC@/deny-list \
     --api-listen=127.0.0.1:@KBF_API_PORT@ \
     --api-token-file=@KBF_ETC@/api-token
+# SIGTERM drains: new Execute calls are refused, open streams run until their action is
+# done (Buck2 does not recover a stream that breaks), then the server exits. systemd must
+# not SIGKILL it meanwhile, so no stop timeout. A second SIGTERM ends the open streams
+# (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
+# same drain with no signal.
+TimeoutStopSec=infinity
 Restart=on-failure
 
 [Install]

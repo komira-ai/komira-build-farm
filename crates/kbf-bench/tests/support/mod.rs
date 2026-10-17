@@ -18,7 +18,7 @@ use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_server::{Args, bind_server};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use tonic::transport::Endpoint;
 
@@ -52,6 +52,11 @@ impl Server {
         };
         let signed = |names: Vec<String>, usage: ExtendedKeyUsagePurpose| {
             let mut params = CertificateParams::new(names).expect("params");
+            if usage == ExtendedKeyUsagePurpose::ClientAuth {
+                // The daemon role, as the worker listener requires.
+                let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+                params.subject_alt_names.push(SanType::URI(role));
+            }
             params.extended_key_usages = vec![usage];
             let key = KeyPair::generate().expect("key");
             let cert = params.signed_by(&key, &ca).expect("sign");

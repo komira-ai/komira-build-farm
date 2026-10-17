@@ -1,0 +1,36 @@
+# Rendered by `kbf-deploy linux render-units`; installed as
+# /etc/systemd/system/kbf-daemon.service (kbf docs/deploy/storage-node.md,
+# "Converged units").
+[Unit]
+Description=kbf build farm node daemon
+Wants=network-online.target
+After=network-online.target kbf-server.service
+
+[Service]
+User=kbf
+Slice=kbf.slice
+# The daemon manages its own cgroup: supervisor/ for itself, actions/ for builds.
+Delegate=yes
+# Equal to --supervisor-memory-min-mib.
+MemoryMin=256M
+# Above the server's -925; build containers get 0 back from the driver.
+OOMScoreAdjust=-900
+CPUWeight=200
+# No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
+# daemon's swap watch kills a lease that swaps at its own cap.
+Environment=XDG_RUNTIME_DIR=/run/user/1500
+ExecStart=/usr/local/bin/kbf-daemon \
+    --driver=container \
+    --server=https://storage-node.example.internal:8981 \
+    --cas=https://storage-node.example.internal:8981 \
+    --ca-cert=/etc/kbf/ca.pem \
+    --cert=/etc/kbf/node.pem \
+    --key=/etc/kbf/node.key \
+    --node-id=storage-node-1 \
+    --data-dir=/var/lib/kbf \
+    --actions-memory-max-gib=200 \
+    --supervisor-memory-min-mib=256
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

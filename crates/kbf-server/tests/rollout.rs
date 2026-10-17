@@ -21,6 +21,9 @@ use kbf_types::{
     WorkerId,
 };
 
+mod thread_log;
+use thread_log::logged;
+
 fn w(name: &str) -> WorkerId {
     WorkerId::new(name)
 }
@@ -426,41 +429,6 @@ fn a_step_already_taken_elsewhere_stops_quietly() {
     }
     assert!(fleet.actions().is_empty(), "{:?}", fleet.actions());
     assert!(applier.handed.borrow().is_empty());
-}
-
-std::thread_local! {
-    static LOG: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Writes log lines to this thread's buffer.
-struct ThreadLog;
-
-impl std::io::Write for ThreadLog {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        LOG.with(|log| log.borrow_mut().extend_from_slice(buf));
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Log lines written on this thread while `f` runs, at info and above. The subscriber
-/// is global (installed once), so every callsite is enabled whichever test reaches
-/// it first; each test thread reads only its own lines.
-fn logged(f: impl FnOnce()) -> String {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(|| ThreadLog)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
-    });
-    LOG.with(|log| log.borrow_mut().clear());
-    f();
-    LOG.with(|log| String::from_utf8(log.borrow().clone()).expect("UTF-8 log"))
 }
 
 /// Catches: a hold another driver already made turned into an error (the quiet-stop

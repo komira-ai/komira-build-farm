@@ -107,7 +107,7 @@ impl Dispatch for Queue {
     }
 }
 
-type Service = ExecutionService<MemoryMetaLog, Store, Queue>;
+type Service = ExecutionService<Queue>;
 
 struct Rig {
     cache: Arc<Cache<MemoryMetaLog, Store>>,

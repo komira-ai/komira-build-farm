@@ -16,7 +16,10 @@ Slice=kbf-pilot.slice
 EnvironmentFile=@S3_ENV@
 ExecStart=@EXEC_START@
 KillSignal=SIGINT
-TimeoutStopSec=20
+# SIGINT drains (kbf-server's drain: new Execute calls refused, open streams kept until
+# their action is done), so a stop timeout would SIGKILL the drain. A second SIGINT ends
+# the open streams.
+TimeoutStopSec=infinity
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536

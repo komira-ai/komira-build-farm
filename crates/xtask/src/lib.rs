@@ -225,6 +225,10 @@ enum VerifyAssets {
         /// `GITHUB_WORKFLOW_REF`).
         #[arg(long)]
         workflow_ref: String,
+        /// The branch the attestations were signed on, `refs/heads/<branch>` (on a push,
+        /// `GITHUB_REF`). The default is main's: a release verifies as main.
+        #[arg(long, default_value = "refs/heads/main")]
+        source_ref: String,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
@@ -296,7 +300,14 @@ enum ReleaseVerb {
 #[derive(Subcommand)]
 enum BuildCommit {
     /// `<binary> --version` names `<commit>`, and not the control commit.
-    Check { binary: PathBuf, commit: String },
+    Check {
+        binary: PathBuf,
+        commit: String,
+        /// Also `<binary> --version --json` (kbf): it names `<commit>` and a release
+        /// build.
+        #[arg(long)]
+        json: bool,
+    },
     /// A plain build, two override stamps and a malformed override, from the checkout.
     Stamps { commit: String },
 }
@@ -360,9 +371,11 @@ fn cargo_program() -> OsString {
 fn run(cli: Cli) -> Result<Vec<String>, Error> {
     let root = cli.root.unwrap_or_else(default_root);
     match cli.verb {
-        Verb::BuildCommit(BuildCommit::Check { binary, commit }) => {
-            Ok(vec![build_commit::check(&binary, &commit)?])
-        }
+        Verb::BuildCommit(BuildCommit::Check {
+            binary,
+            commit,
+            json,
+        }) => Ok(vec![build_commit::check(&binary, &commit, json)?]),
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {
             build_commit::stamps(&cargo_program(), &root, &commit)
         }
@@ -481,6 +494,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             dir,
             repo,
             workflow_ref,
+            source_ref,
             gh,
         }) => {
             // The flipped copy's directory, of this process alone.
@@ -490,6 +504,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             let a = sums::Attestations {
                 repo: &repo,
                 workflow_ref: &workflow_ref,
+                source_ref: &source_ref,
                 gh: &gh,
                 scratch: &scratch,
             };

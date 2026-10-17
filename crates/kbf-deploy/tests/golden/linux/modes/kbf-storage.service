@@ -1,0 +1,54 @@
+# Rendered by `kbf-deploy linux render-units --mode storage`; installed as
+# /etc/systemd/system/kbf-storage.service (kbf docs/design/architecture-v2.md,
+# sections 1 and 11). `check-units --mode storage` parses the flags below with
+# `kbf check-args storage`. No state store: a storage node reaches it only through a
+# frontend (section 6).
+[Unit]
+Description=kbf build farm storage node
+Wants=network-online.target
+After=network-online.target minio.service
+
+[Service]
+# Not the daemon's user: a storage node holds the cold store's key.
+User=kbf-server
+Slice=kbf.slice
+# kbf-server's peak use today (KBF_SERVER_RESERVATION_GIB).
+MemoryMin=16G
+# A storage node answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+CPUWeight=300
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account:
+# a secret never goes on the command line. The file is the server user's, mode 0600, so
+# no build and no other user reads it (on the node, check-units rule `credential` reads
+# its owner and mode).
+EnvironmentFile=/etc/kbf/s3.env
+# The cold store is the bucket; uploads land in the hot store on the node's SSD and are
+# flushed to it in the background; the metadata log (the CAS index and the action
+# cache) is in --meta-dir. The three certificate flags come together and turn on mutual
+# TLS with the check of the role in each caller's certificate; without them the node
+# serves plain text on loopback only and refuses to start on any other address. Paths,
+# never the PEM itself and never an environment variable; the key is the server
+# user's alone. check-units rule `storage` refuses a unit without any of these.
+# TODO(registration): --frontend=<the frontend's DNS name> and --advertise-addr, once
+# a storage node registers with a frontend and takes the storage map it pushes; until
+# then the map is this node alone.
+ExecStart=/usr/local/bin/kbf storage \
+    --cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true \
+    --hot-store=file:///var/lib/kbf-server/hot \
+    --meta-dir=/var/lib/kbf-server/raft \
+    --storage-listen=192.0.2.10:8983 \
+    --storage-tls-cert=/etc/kbf/storage.pem \
+    --storage-tls-key=/etc/kbf/storage.key \
+    --storage-client-ca=/etc/kbf/ca.pem
+# kbf drains on SIGTERM: a Write in flight is finished and acknowledged before the node
+# exits, and a large one takes longer than systemd's 90 s default stop timeout, which
+# would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+# Exit 2 is a command line kbf refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

@@ -103,3 +103,44 @@ fn every_requeue_reason_and_failure_class_has_its_own_name() {
     names.dedup();
     assert_eq!(names.len(), failures.len());
 }
+
+/// Catches: a requeue reason whose name [`REQUEUE_NAMES`] does not list (a variant
+/// added, its name given in `requeue_name` but not here: `?requeue_reason=` would
+/// answer 400 for a reason attempts show), or a listed name no reason has. The match
+/// below stops compiling when a variant is added, so the list of reasons here cannot
+/// go stale either.
+#[test]
+fn requeue_names_lists_every_reason_s_name() {
+    use kbf_types::LostWhy;
+    let reasons = [
+        RequeueReason::Silent,
+        RequeueReason::Replaced,
+        RequeueReason::Reconnected,
+        RequeueReason::NotStarted,
+        RequeueReason::SessionSwitch,
+        RequeueReason::OutOfMemory {
+            booked: 1,
+            raised: 2,
+        },
+        RequeueReason::NodeMemoryPressure,
+        RequeueReason::Restarted,
+        RequeueReason::Lost(LostWhy::Fenced),
+        RequeueReason::Infra,
+    ];
+    let index = |r: &RequeueReason| match r {
+        RequeueReason::Silent => 0,
+        RequeueReason::Replaced => 1,
+        RequeueReason::Reconnected => 2,
+        RequeueReason::NotStarted => 3,
+        RequeueReason::SessionSwitch => 4,
+        RequeueReason::OutOfMemory { .. } => 5,
+        RequeueReason::NodeMemoryPressure => 6,
+        RequeueReason::Restarted => 7,
+        RequeueReason::Lost(_) => 8,
+        RequeueReason::Infra => 9,
+    };
+    let indexes: Vec<usize> = reasons.iter().map(index).collect();
+    assert_eq!(indexes, (0..REQUEUE_NAMES.len()).collect::<Vec<_>>());
+    let names: Vec<&str> = reasons.iter().map(requeue_name).collect();
+    assert_eq!(names, REQUEUE_NAMES);
+}

@@ -409,7 +409,7 @@ fn errors_and_debug_say_what_happened() {
         ),
         (
             TierError::FutureBlock { name: "n".into() },
-            "block file n is from this epoch or a later one",
+            "block file n is from this writer or a later one",
         ),
         (
             TierError::Io {

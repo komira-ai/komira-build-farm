@@ -781,6 +781,25 @@ async fn a_bytestream_read_holds_one_window_and_one_message() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Catches a whole-blob read ([`Cache::read_blob`], what the server decodes a
+/// Directory or an ActionResult with) that keeps only its first window or joins the
+/// windows out of order: a 20 MiB blob is three windows (`READ_WINDOW_BYTES`, 8 MiB),
+/// and the bytes come whole, the last window short. Mutant: `gather` returning `first`
+/// alone (a 8 MiB blob, and the digest check does not run on it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_read_of_a_blob_over_one_window_joins_every_window() {
+    let _alone = ALONE.lock().await;
+    let s3 = FakeS3::start().await;
+    let dir = scratch("read-gather");
+    let cache = cache(&s3, &dir, 1 << 30).await;
+    let len = 20 * MIB;
+    let digest = stage_zeros(&cache, len).await;
+    let read = cache.read_blob(&digest).await.expect("read whole");
+    assert_eq!(read.len() as u64, len);
+    assert!(read.iter().all(|b| *b == 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Catches a record stream refused without a write tier (mutant: `Cache::stream`
 /// answering `None` with no tier, which leaves a replicated write nowhere to go), or one
 /// that stores what it was not asked to: with no tier, `Cache::stream` of 40 MiB is a

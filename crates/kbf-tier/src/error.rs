@@ -73,9 +73,10 @@ pub enum TierError {
         /// What `TIER` names.
         found: TierId,
     },
-    /// A block file of this start's epoch or a later one exists at open: the epoch
-    /// was reused.
-    #[error("block file {name} is from this epoch or a later one")]
+    /// A block file of this start's writer or a later one exists at open (the same
+    /// epoch or a later one, or the same member at this boot or a later one): the
+    /// writer was reused.
+    #[error("block file {name} is from this writer or a later one")]
     FutureBlock {
         /// The file.
         name: String,

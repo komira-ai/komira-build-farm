@@ -6,11 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
-use kbf_meta::{Applied, Command, Epoch, ObjectId, UnreachableReason};
-use kbf_objstore::{FsStore, ObjectKey, ObjectStore};
+use kbf_meta::{Applied, Command, ObjectId, UnreachableReason, Writer as ObjectWriter};
+use kbf_objstore::{FsStore, ObjectStore};
 use tokio::time::Instant;
 
-use super::write_group::Writer;
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::{MetaLog, MetaLogError};
 
@@ -67,10 +66,14 @@ pub struct PassReport {
     pub unreadable: u64,
     /// This cache's objects kept: indexed, staged, or written by this process.
     pub kept: u64,
-    /// This cache's objects deleted: of an earlier process and in no index entry.
+    /// This cache's objects deleted: of an earlier epoch of this log and in no index
+    /// entry.
     pub orphans_deleted: u64,
-    /// Files whose key is not one of this cache's objects (another log's prefix, or
-    /// not an object name); logged, kept, and not counted as held.
+    /// Files whose key is not one of this cache's objects and that no index entry
+    /// names: another log's prefix, not an object name, or another writer's object (a
+    /// node writer's that is not this cache's, an earlier boot of its own member
+    /// included, or an epoch writer's once this cache is a node writer); logged, kept,
+    /// and not counted as held.
     pub foreign: u64,
     /// Indexed objects with no file that were forgotten ([`Command::EvictObjects`]).
     pub evicted_objects: u64,
@@ -106,12 +109,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Checks `files`, which must be the store this cache writes to, against the
     /// index, once:
     ///
-    /// - Each object file of this cache that the index names (staged objects too), or
-    ///   whose epoch is this cache's, is kept, and its length and modification time
+    /// - Each object file that the index names (staged objects too), or that is of this
+    ///   cache's writer or a later one ([`ObjectWriter::at_or_after`]), is kept, and its length and modification time
     ///   go into the report's [`PassReport::held`].
-    /// - One of an earlier epoch that nothing names is an orphan (an upload that never
-    ///   committed, an object whose blobs were all healed elsewhere) and is deleted.
-    /// - A file under another prefix is counted and kept.
+    /// - One of an earlier epoch, while this cache writes as an epoch writer, that
+    ///   nothing names is an orphan (an upload that never committed, an object whose
+    ///   blobs were all healed elsewhere) and is deleted.
+    /// - Any other file is foreign, counted and kept: under another prefix, or of
+    ///   another writer. The pass deletes nothing outside its own log's epochs: another
+    ///   node writer's object, an earlier boot of this node's own member included, may
+    ///   be one only a rebuild of the index knows (its metadata directory was wiped).
     /// - Then every indexed object that is not staged and whose file the walk did not
     ///   find, and still is not there, is forgotten with [`Command::EvictObjects`] in
     ///   batches of [`EVICT_BATCH`], with the action-cache entries that need its
@@ -125,7 +132,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///
     /// The shards are walked at `opens_per_sec` ([`PASS_OPENS_PER_SEC`]), unpaced while
     /// the store is under its free-space floor. The index is read once before the walk:
-    /// only objects of the current epoch can be named after that, and those are kept.
+    /// only objects of the current writer can be named after that, and those are kept.
     ///
     /// # Errors
     /// A shard cannot be read, an orphan cannot be deleted, or the metadata log fails
@@ -137,7 +144,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         ready_to_evict: fn(&M) -> Result<EvictReady, MetaLogError>,
     ) -> Result<PassReport, CacheError> {
         let started = Instant::now();
-        let epoch = self.epoch();
+        let writer = self.writer();
         let indexed = self.writer.query(|s| s.indexed_objects()).await?;
         let mut report = PassReport::default();
         let mut pace = Pace::new(opens_per_sec);
@@ -149,7 +156,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             report.files += scan.objects.len() as u64;
             let mut unnamed = Vec::new();
             for file in &scan.objects {
-                let Some(id) = self.writer.object_id(&file.key) else {
+                let Some(id) = self.writer.keys.object(&file.key) else {
                     tracing::debug!(key = %file.key, "start-up pass: a foreign object file, kept");
                     report.foreign += 1;
                     continue;
@@ -162,10 +169,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 if indexed.contains(&id) {
                     indexed_present += 1;
                     report.held.insert(id, held);
-                } else if id.epoch() >= epoch {
+                } else if id.writer().at_or_after(writer) {
                     report.held.insert(id, held);
-                } else {
+                } else if both_epochs(id.writer(), writer) {
+                    // An earlier epoch: a later or equal one is held above.
                     unnamed.push((id, &file.key, held));
+                } else {
+                    tracing::debug!(key = %file.key, "start-up pass: another writer's object, kept");
+                    report.foreign += 1;
                 }
             }
             // A staged object whose blobs were all collected names nothing, but its
@@ -262,18 +273,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 }
 
-impl<M, O> Writer<M, O> {
-    /// The object `key` names if it is one of this cache's object keys
-    /// ([`Writer::object_key`] exactly), else `None`.
-    fn object_id(&self, key: &ObjectKey) -> Option<ObjectId> {
-        let name = key.as_str().strip_prefix(self.prefix.as_str())?;
-        let (epoch, seq) = name.strip_prefix("cas/")?.split_once('/')?;
-        let epoch = u64::from_str_radix(epoch, 16).ok()?;
-        let seq = u64::from_str_radix(seq, 16).ok()?;
-        let id = ObjectId::new(Epoch::new(epoch), seq);
-        // Only the canonical spelling: 16 lowercase digits each.
-        (self.object_key(id).ok()? == *key).then_some(id)
-    }
+/// Whether an object of `of` can be an orphan for a cache writing as `current`: both
+/// are epoch writers of this log. Nothing of another kind of writer is ever deleted.
+fn both_epochs(of: ObjectWriter, current: ObjectWriter) -> bool {
+    matches!(
+        (of, current),
+        (ObjectWriter::Epoch(_), ObjectWriter::Epoch(_))
+    )
 }
 
 /// Spaces the pass's file opens to a rate, on average over each shard.

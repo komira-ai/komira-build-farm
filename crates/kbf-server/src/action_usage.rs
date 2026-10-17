@@ -11,16 +11,19 @@
 //!   rung runs again higher up the memory ladder; each rung has its line):
 //!
 //!   ```text
-//!   action usage: exit_code=<n|-> mnemonic=<"..."|-> target=<"..."|-> wall_us=<n> <cgroup fields>
-//!     key=<16 hex> cfg=<16 hex[-16 hex]|-> outcome=<word> lease=<lease> node=<node>
+//!   action usage: exit_code=<n|-> mnemonic=<"..."|-> target_hint=<"..."|-> wall_us=<n>
+//!     <cgroup fields> key=<16 hex> cfg=<16 hex[-16 hex]|-> target=<"..."|->
+//!     target_kind=<target|anon|bxl|-> outcome=<word> lease=<lease> node=<node>
 //!   ```
 //!
-//!   (one line). The fields up to the cgroup fields are those the line had before
-//!   `key`: `exit_code` is the run's, as the daemon reported it for a run it says
+//!   (one line). `exit_code` is the run's, as the daemon reported it for a run it says
 //!   ended (an OK status), and `-` for one it reports failed (a killed run has no exit
-//!   code). `outcome` is [`outcome`]'s word for the scheduler's outcome, the server's
-//!   verdict: an OK run whose outputs the server cannot store has its exit code and
-//!   `outcome=infra`.
+//!   code). `mnemonic` and `target_hint` are what the client's `RequestMetadata`
+//!   said (buck2 says neither); a hint only, never a key. `target` and `target_kind`
+//!   are the target the action's own `buck-out` paths name ([`Target`], issue #796),
+//!   `-` when they name none. `outcome` is [`outcome`]'s word for the scheduler's
+//!   outcome, the server's verdict: an OK run whose outputs the server cannot store
+//!   has its exit code and `outcome=infra`.
 //! - `action shape:`, the first time this process sees a key: what the key stands for
 //!   (`key=… program="…" outputs=<n> patterns="<up to 8>…"`).
 //!
@@ -54,7 +57,7 @@ use kbf_proto::worker::{self, ResourceUsage};
 use kbf_types::{Failure, LeaseId, LostWhy, OperationId, Outcome, WorkerId};
 use tonic::Code;
 
-pub use shape::{Shape, ShapeKey};
+pub use shape::{Shape, ShapeKey, Target, TargetKind};
 
 /// How many keys [`Shapes`] remembers having described before it forgets them all
 /// (each is then described once more).
@@ -63,16 +66,20 @@ pub const SEEN_KEYS: usize = 65_536;
 /// How many output patterns an `action shape:` line shows.
 const SHOWN_PATTERNS: usize = 8;
 
-/// What the `action usage:` line says an operation is: its shape's key and the
-/// configuration hash beside it, and the label its first caller's `RequestMetadata`
-/// named.
+/// What the `action usage:` line says an operation is: its shape's key, the
+/// configuration hash and the target beside it, and the label its first caller's
+/// `RequestMetadata` named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Subject {
     /// The shape key.
     pub key: ShapeKey,
     /// The configuration hash an output path named.
     pub cfg: Option<String>,
-    /// The mnemonic and target the client sent.
+    /// The target the action's own paths name.
+    pub target: Option<Target>,
+    /// Whether the action is a test run ([`Shape::test`]).
+    pub test: bool,
+    /// The mnemonic and target the client sent: hints, never keys.
     pub label: ActionLabel,
 }
 
@@ -85,9 +92,27 @@ impl Subject {
         let subject = Self {
             key: shape.key,
             cfg: shape.cfg.clone(),
+            target: shape.target.clone(),
+            test: shape.test,
             label: described.label,
         };
         (subject, shape)
+    }
+
+    /// The subject as the invocation record keeps it on the action's row: the key,
+    /// the configuration hash and the target (the label is on the row already, as the
+    /// call's `RequestMetadata`).
+    #[must_use]
+    pub fn recorded(&self) -> kbf_invocation::ActionShape {
+        kbf_invocation::ActionShape {
+            key: u64::from_be_bytes(self.key.bytes()),
+            cfg: self.cfg.clone(),
+            target: self.target.as_ref().map(|t| kbf_invocation::Target {
+                kind: t.kind,
+                label: kbf_invocation::Text::sent(t.label.clone()),
+            }),
+            test: self.test,
+        }
     }
 }
 
@@ -159,7 +184,7 @@ impl Measured {
     #[must_use]
     pub fn of(result: &worker::Result) -> Option<Self> {
         let action_result = result.action_result.as_ref()?;
-        let usage = ResourceUsage::in_result(action_result)?.clone();
+        let usage = ResourceUsage::in_result(action_result)?;
         let ok = result
             .status
             .as_ref()
@@ -168,6 +193,12 @@ impl Measured {
             usage,
             exit_code: ok.then_some(action_result.exit_code),
         })
+    }
+
+    /// The `ResourceUsage` the result carried.
+    #[must_use]
+    pub const fn usage(&self) -> &ResourceUsage {
+        &self.usage
     }
 }
 
@@ -207,14 +238,18 @@ pub fn line(
         .map_or_else(kbf_proto::no_cgroup_fields, |c| {
             c.log_fields(usage.wall_micros)
         });
+    let target = subject.target.as_ref();
     format!(
-        "exit_code={} mnemonic={} target={} wall_us={} {cgroup} key={} cfg={} outcome={} lease={lease} node={node}",
+        "exit_code={} mnemonic={} target_hint={} wall_us={} {cgroup} key={} cfg={} target={} \
+         target_kind={} outcome={} lease={lease} node={node}",
         dash(exit_code.map(|c| c.to_string())),
         text(subject.label.mnemonic.as_ref()),
         text(subject.label.target.as_ref()),
         usage.wall_micros,
         subject.key,
         dash(subject.cfg.clone()),
+        text(target.map(|t| &t.label)),
+        target.map_or("-", |t| t.kind.name()),
         outcome(judged),
     )
 }

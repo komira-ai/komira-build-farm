@@ -94,9 +94,9 @@ pub const ENTRY_OVERHEAD: u64 = 160;
 
 /// The file and subdirectory digests of one Directory.
 #[derive(Debug)]
-struct Decoded {
-    files: Box<[Digest]>,
-    dirs: Box<[Digest]>,
+pub(crate) struct Decoded {
+    pub(crate) files: Box<[Digest]>,
+    pub(crate) dirs: Box<[Digest]>,
 }
 
 impl Decoded {
@@ -504,7 +504,7 @@ async fn absent_files<M: MetaLog, O: ObjectStore>(
     cache.find_missing(files).await
 }
 
-fn decode(digest: &Digest, bytes: &[u8]) -> Result<Decoded, CacheError> {
+pub(crate) fn decode(digest: &Digest, bytes: &[u8]) -> Result<Decoded, CacheError> {
     let invalid = |e: tonic::Status| CacheError::Invalid(e.message().to_owned());
     let directory = Directory::decode(bytes).map_err(|e| {
         CacheError::Invalid(format!("input directory {digest} does not decode: {e}"))

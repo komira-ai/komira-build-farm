@@ -166,6 +166,12 @@ ExecStart=/usr/local/bin/kbf-server \
     --worker-deny-list=/etc/kbf/deny-list \
     --api-listen=127.0.0.1:8982 \
     --api-token-file=/etc/kbf/api-token
+# SIGTERM drains: new Execute calls are refused, open streams run until their action is
+# done (Buck2 does not recover a stream that breaks), then the server exits. systemd must
+# not SIGKILL it meanwhile, so no stop timeout. A second SIGTERM ends the open streams
+# (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
+# same drain with no signal.
+TimeoutStopSec=infinity
 Restart=on-failure
 
 [Install]
@@ -289,10 +295,15 @@ kbf-server \
   modification time, never its bytes) at about 1000 files a second, or as fast as it
   can while the disk is under the free-space floor, and then:
   - keeps each file of an object the index names (staged on the write tier
-    included) or of this process's own writer epoch;
+    included) or of this process's own writer (its writer epoch, or for a node
+    registered with `--frontend` its member and boot);
   - deletes each file of an earlier epoch under this log's prefix that the index does
-    not name: an orphan, such as an upload that failed before its commit;
-  - keeps and counts a file under another prefix, and leaves a file without a header;
+    not name, while the process writes in an epoch: an orphan, such as an upload that
+    failed before its commit;
+  - keeps and counts as foreign every other file: under another prefix, or of another
+    writer (another node's, an earlier boot of this node's own member included, whose
+    metadata directory may have been wiped; or an epoch's, once the node writes as a
+    member and boot). It leaves a file without a header;
   - then forgets each indexed object, not staged, that has no file: its blobs leave
     the index, with every action-cache entry that needs one of them, so
     `FindMissingBlobs` reports them and the client uploads them again. Forgetting
@@ -313,6 +324,27 @@ kbf-server \
   version 3, objects held back by the guard, the bytes held and how long it took. A
   pass that fails is logged and runs again at the next start; until then nothing is
   evicted.
+- The rebuild of the index (a node registered with `--frontend`, over either kind of cold
+  store): a metadata log that has not finished one (a new or wiped directory, or an
+  upgrade of a node that has run before) makes the node register as catching up, serve
+  from the start, and rebuild in the background. It lists every object under the root
+  the keys of all writers share (a node's `cas/<member>/<boot>/<seq>`, and an epoch of
+  any log's `<log id>/cas/<epoch>/<seq>`, the old server's keys included), reads each
+  object's footer (its last bytes, never the records), and indexes the records that are
+  not indexed yet. Objects the node itself is writing are left to its own writes. An
+  object that is not a whole segment (too short, a torn tail, foreign bytes), or whose
+  key is none of these, is counted and logged, not indexed. Meanwhile a read or
+  `FindMissingBlobs` that finds nothing answers `UNAVAILABLE` and never `NOT_FOUND`: a
+  router asks the next owner; hits and writes are served. The log keeps the last key
+  handled, so a restart resumes after it, and that the rebuild is done, so a later start
+  does not list again; the first heartbeat after it makes the node active. A failed
+  attempt (the store cannot be listed or read) is logged and tried again after a
+  back-off; the node stays catching up. The start-up pass above and the evictor begin
+  once the rebuild is done. The action cache is not rebuilt: its entries live only in the
+  log, so a wiped node answers a miss and the action runs again. A node without
+  `--frontend` has no rebuild. The rebuild's line in the log gives the objects listed,
+  segments and records adopted, records already held, the node's own segments, objects
+  skipped, objects with no name of this node's, objects gone and how long it took.
 - Until the pass reaches it, or for a file lost while the server runs, a blob whose
   file was lost, damaged or left empty is still reported present by
   `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and

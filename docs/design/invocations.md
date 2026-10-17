@@ -335,6 +335,11 @@ In stage 2 a flushed row is in a chunk and leaves memory, so the bound covers on
 unflushed rows and the header fields; step 3 then applies only when flushes fail
 (section 7).
 
+**Superseded (owner, 2026-10-16):** stage 2 below is replaced by `ui-data.md` 5.2:
+invocation chunks are kept, cut by the same rule, but as immutable objects under
+`history/` in the object store, indexed by rows in the state store, with no root blob,
+no pin on the Raft log and no log-format bump. The text is kept as history.
+
 **Stage 2, durable** (PRs 7 and 8). The CEO's ruling (2026-10-12): "Yes we should
 switch to durable build records without waiting for HA." So stage 2 runs on today's
 metadata log, the Raft metadata log: a single-voter Raft log on the server's own disk
@@ -421,6 +426,10 @@ invocation; the next server marks those invocations `complete: false`.
 
 ### 3.6 Retention
 
+**Superseded (owner, 2026-10-16)** for durable records: retention is by object class
+and index-row sweep (`ui-data.md` 5.3), with failure logs pinned as `ui-data.md` 5.4
+says; the per-invocation pin below is no longer planned.
+
 - The record: `--invocation-retention` (default 30 days after `last_seen`), the pin's
   hold-until time.
 - **What the pin covers** by default: the root and its chunks. Nothing else.
@@ -442,6 +451,10 @@ invocation; the next server marks those invocations `complete: false`.
   ceiling.
 
 ### 3.7 Cross-build queries
+
+**Superseded (owner, 2026-10-16):** cross-build queries are now planned: `ui-data.md`
+sections 5 and 6 build this derived index as `ui/` rows in the state store, rebuilt
+from history objects, with no Raft and no pins.
 
 The routes of section 4 read one invocation by its id, and nothing else. Listing,
 search and trends across builds (every build of a target, failures this week) are
@@ -753,6 +766,9 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 
 ## 7. Failure modes
 
+The stage 2 and failover rows below are superseded by `ui-data.md` 5.2, which states
+the failure modes of durable records as objects.
+
 | Event | Effect on records |
 |---|---|
 | Recorder channel full | events dropped, builds unaffected, invocation `complete: false` |
@@ -897,7 +913,8 @@ machines, retention, and the HTML page for people last.
   planned in [scheduler.md](scheduler.md#accounting); until then `usage` is `null`.
   Tests: an action that burns a known CPU time and allocates a known amount reports at
   least those (plant "report zeros", red), in each driver's own tests.
-- **7. (M) The pin command and its log format**, on today's single-voter
+- **7. (M) The pin command and its log format**: superseded by `ui-data.md` 5.2 (no pin
+  command, no log-format bump; the text below is kept as history). On today's single-voter
   the Raft metadata log log (3.5), ahead of the HA work (PR #303), which inherits it. The
   format bump is made for the invocation pins alone; the general Pins of
   [storage.md](storage.md#planned) add their commands later, in their own bumps. The
@@ -916,7 +933,9 @@ machines, retention, and the HTML page for people last.
   once the pin expires (plant "keep only the last update's chunks", red); a collection
   run with the object store unreachable (every read fails) gives the same result as
   with it reachable (plant "parse the root", red).
-- **8. (M) Durable records** (3.5 stage 2), on the Raft metadata log: chunks as CAS blobs,
+- **8. (M) Durable records**: superseded by `ui-data.md` 5.2 and its phase U3 (chunks as
+  objects under `history/`, indexed in the state store; the text below is kept as history).
+  Was: 3.5 stage 2, on the Raft metadata log: chunks as CAS blobs,
   roots, the flush rule of 3.4, recovery marking open invocations incomplete. Tests:
   restart keeps every flushed row, and the failures view and `records_since` of 4.10
   answer from it; with the in-memory metadata log (tests only) a restart keeps no record and

@@ -21,7 +21,13 @@ crc32fast.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-caps.workspace = true
+kbf-map.workspace = true
+kbf-mapsync.workspace = true
 kbf-proto.workspace = true
+kbf-route.workspace = true
+# The node's one cache (`kbf_storage::local_cache`), which the input cache shares with
+# local storage on a node that runs both.
+kbf-storage.workspace = true
 # The Cas trait, and the transfer engine the binary's runtimes use.
 kbf-transfer.workspace = true
 kbf-types.workspace = true
@@ -38,13 +44,20 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+kbf-auth.workspace = true
 kbf-front.workspace = true
+kbf-meta.workspace = true
+kbf-segments.workspace = true
 kbf-objstore.workspace = true
 kbf-server.workspace = true
+kbf-store.workspace = true
 # The program the tests' actions run, kbf-testkit's act verbs, through the test binary.
 kbf-testkit.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
+# rebuild_interest_cache for the tests that capture logs while others run.
+tracing-core.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

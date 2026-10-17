@@ -144,9 +144,9 @@ async fn assert_readable(cache: &TierCache, service: &Service, blobs: &[TestBlob
         .locations;
     for (b, at) in blobs.iter().zip(located) {
         assert_eq!(read[&b.digest].as_ref().expect("batch read"), &b.bytes);
-        let ObjectRef { epoch, seq } = at.object.expect("located");
+        let object = at.object.expect("located");
         let range = ReadRangeRequest {
-            object: Some(ObjectRef { epoch, seq }),
+            object: Some(object),
             offset: at.offset,
             length: b.bytes.len() as u64,
         };
@@ -317,7 +317,11 @@ async fn a_range_of_an_object_nobody_holds_is_not_found() {
     let farm = Farm::new(Capabilities::default());
     let (_cache, service) = serve(farm.start(GIB).await);
     let range = ReadRangeRequest {
-        object: Some(ObjectRef { epoch: 1, seq: 999 }),
+        object: Some(ObjectRef {
+            epoch: 1,
+            seq: 999,
+            ..ObjectRef::default()
+        }),
         offset: 0,
         length: 16,
     };

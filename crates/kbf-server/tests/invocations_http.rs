@@ -487,6 +487,7 @@ async fn an_action_answers_its_row_with_attempts_outputs_logs_and_usage() {
             owner: kbf_invocation::Owner::default(),
             action,
             command,
+            shape: None,
         }])
         .await;
     let row = server.ok(&path).await;

@@ -4,9 +4,16 @@
 # unknown or repeated key is refused, and an empty value means the default. Every value
 # here is a placeholder or the default.
 
-# --- The host: no defaults (render-units and check-units refuse without them) ---
-# Its fixed DNS name, the name in the server's certificates and the one daemons dial.
+# --- The host: no defaults (render-units and check-units refuse without them), but KBF_FRONTEND_NAME ---
+# This host's own fixed DNS name or address: the name in its certificates, which a
+# storage node advertises (`--advertise-addr`) for callers to dial. Not the frontend's:
+# that is KBF_FRONTEND_NAME.
 KBF_HOST_NAME=storage-node.example.internal
+# The one name daemons (--server, --cas) and storage nodes (--frontend) dial for the
+# frontend: the name in the frontend's worker certificate. Left out, it is KBF_HOST_NAME,
+# right for a host that runs the frontend itself. On a farm's storage and daemon nodes
+# KBF_HOST_NAME is the node's own, so set this to the frontend's.
+KBF_FRONTEND_NAME=frontend.example.internal
 # The address kbf-server's REAPI and worker listeners bind: the host's pinned LAN
 # address (never 0.0.0.0 or ::), IPv4 or IPv6, written bare (the units bracket IPv6).
 # 192.0.2.0/24 is a documentation range.
@@ -28,30 +35,71 @@ KBF_DAEMON_MEMORY_MIN_MIB=256
 # --- MinIO ---
 # The host's MinIO systemd unit, which the drop-in extends.
 MINIO_UNIT=minio.service
-# kbf-server's S3 endpoint: the host's own MinIO node.
+# The bucket's S3 endpoint. Left out, the converged units use the host's own MinIO
+# (http://127.0.0.1:9000); `render-units --mode storage` refuses without it, since a
+# storage node's MinIO need not be on the node.
 MINIO_S3_ENDPOINT=http://127.0.0.1:9000
 KBF_S3_BUCKET=kbf-cas
+# The key prefix in the bucket, such as farm2/ (letters, digits and . _ - between the
+# slashes; the trailing / is added). A fresh prefix is a fresh cold store beside the old
+# one. Empty: kbf's own default, kbf/. Rendered into the cold store's URI
+# (s3://bucket/prefix/?endpoint=...), for `storage` and `storage-and-daemon`.
+KBF_S3_PREFIX=
 
 # --- kbf-server ---
 # kbf-server's --meta-dir: the metadata log (a single-voter Raft log). On local disk, on
 # a partition apart from the daemon's data directory, swap and MinIO's data.
 KBF_META_DIR=/var/lib/kbf-server/raft
 KBF_SERVER_USER=kbf-server
+# `--mode frontend` only: the frontend's --storage, the https:// URL of one storage node
+# (its KBF_LISTEN_ADDRESS and KBF_STORAGE_PORT), which the certificate in
+# storage.pem must name. Required for that mode. 192.0.2.0/24 is a documentation range.
+KBF_STORAGE_URL=https://192.0.2.20:8983
+# `--mode frontend` and `all-in-one`: the REAPI listener's certificate chain and key
+# (--reapi-tls-cert, --reapi-tls-key). They are not the farm CA's: a `tailscale cert` pair,
+# say, whose file names are the host's, so they are settings. Empty: reapi.pem and
+# reapi.key under KBF_ETC. The key is the server user's alone.
+KBF_REAPI_CERT=
+KBF_REAPI_KEY=
+# `--mode frontend` and `--mode all-in-one`: the operator API's bearer token, passed as
+# the path in --api-token-file= (never the token). Without it the API's writes (drain,
+# ...) answer 401 or are off. Empty: api-token under KBF_ETC. The operator puts the file
+# there; install-units never makes it and refuses a missing one, one not the server
+# user's, or one with a group or other bit.
+KBF_API_TOKEN_FILE=
+# `--mode frontend`: the directory of the SQLite state store (--state-store=
+# sqlite://<dir>/state.db). install-units makes it, the server user's, mode 0700.
+KBF_STATE_DIR=/var/lib/kbf-server/state
 KBF_REAPI_PORT=8980
 KBF_WORKER_PORT=8981
 KBF_API_PORT=8982
+# `kbf storage`'s gRPC port (--storage-listen), on KBF_LISTEN_ADDRESS. Not kbf's own
+# default (8982), which is KBF_API_PORT's.
+KBF_STORAGE_PORT=8983
+# `kbf storage`'s hot store (--hot-store=file://<dir>): the SSD tier uploads land in
+# before they are flushed to the cold store. On local disk, the unit's user's. For
+# `storage-and-daemon`, put it on KBF_DATA_DIR's filesystem (the one cache).
+KBF_HOT_DIR=/var/lib/kbf-server/hot
 
 # --- kbf-daemon ---
 KBF_USER=kbf
 # kbf-daemon's --data-dir: leases/, cache/ and trees/ under it, sized from its filesystem.
 KBF_DATA_DIR=/var/lib/kbf
+# kbf-daemon's --reserve-cpus: the logical CPUs the farm's own processes keep, a quota
+# on all leases together. A whole number; empty leaves kbf's default.
+KBF_RESERVE_CPUS=
+# kbf-daemon's --lease-placement: none (any CPU the daemon may use) or numa-node (one
+# NUMA node per lease; needs cpuset delegated, which the units do). Empty leaves kbf's
+# default, none.
+KBF_LEASE_PLACEMENT=
 # Pinned images, space-separated, each <repo>@sha256:<64 hex> of one architecture's
 # manifest, without docker://. Each becomes the daemon's --image=docker://<entry>,
 # which it checks at start. Empty: no --image flag.
 KBF_IMAGES=
 
 # --- Paths ---
-# Certificates, keys, s3.env, api-token and deny-list.
+# Certificates, keys, s3.env (root's, mode 0600: `storage` and `storage-and-daemon` read
+# it as EnvironmentFile=), api-token and deny-list.
 KBF_ETC=/etc/kbf
 KBF_BIN_DIR=/usr/local/bin
 KBF_SWAP_FILE=/swapfile

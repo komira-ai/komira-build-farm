@@ -73,7 +73,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
         self.recorder.call(&metadata, &caller, instance, &|| {
             CallKind::GetActionResult {
                 action,
-                hit: stored.as_ref().map(|(digest, r)| listing(*digest, r)),
+                hit: stored.as_ref().map(|(digest, r)| listing(Some(*digest), r)),
             }
         });
         match stored {

@@ -20,16 +20,25 @@
 //!
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!
-//! Not done yet (the README lists it): a durable scheduler state, without which a restart
-//! loses every lease; the in-process plane's admission; the `--reserve-cpus` split
-//! between the halves; the simulation's in-process data plane; and the deploy shape,
-//! the ownership step and the unit.
+//! The crate also holds `kbf storage-and-daemon` ([`storage_and_daemon`]): the same
+//! daemon half and the same plane, beside the storage node in place of the server.
+//!
+//! The scheduler's state is a SQLite file, `<data-dir>/state.db` unless `--state-store`
+//! names one ([`cli`]).
+//!
+//! Not done yet (the README lists it): the in-process plane's admission; the `--reserve-cpus` split
+//! between the halves; the whole-process
+//! crash simulation, the driver-panic test and the rest of the helper-dispatch tests;
+//! and the deploy shape, the ownership step and the unit.
 
 pub mod cli;
 mod intake;
+#[cfg(target_os = "linux")]
+mod one_cache;
 mod plane;
 #[cfg(target_os = "linux")]
 mod run;
+pub mod storage_and_daemon;
 
 pub use plane::LocalDataPlane;
 
@@ -43,6 +52,21 @@ pub fn main() -> ExitCode {
         return code;
     }
     run::main()
+}
+
+/// The `kbf all-in-one` mode: [`main`] after the command line is parsed (the
+/// daemon's helper re-execs having been dispatched by the caller, first thing).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn run(flags: &cli::Flags) -> ExitCode {
+    run::run(flags)
+}
+
+/// The `kbf all-in-one` mode off Linux: it refuses to run.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn run(_flags: &cli::Flags) -> ExitCode {
+    main()
 }
 
 /// The `kbf-all-in-one` binary off Linux: it refuses to run.

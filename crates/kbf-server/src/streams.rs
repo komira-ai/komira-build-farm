@@ -168,9 +168,9 @@ mod tests {
         let defaults = Args::parse_from(["kbf-server"])
             .listeners()
             .expect("listeners");
-        assert_eq!(defaults.streams, StreamLimits::DEFAULT);
-        assert_eq!(defaults.streams.reapi, 10_000);
-        assert_eq!(defaults.streams.worker, 200);
+        assert_eq!(defaults.stream_limits, StreamLimits::DEFAULT);
+        assert_eq!(defaults.stream_limits.reapi, 10_000);
+        assert_eq!(defaults.stream_limits.worker, 200);
         let set = Args::parse_from([
             "kbf-server",
             "--reapi-max-streams=30000",
@@ -179,7 +179,7 @@ mod tests {
         .listeners()
         .expect("listeners");
         assert_eq!(
-            set.streams,
+            set.stream_limits,
             StreamLimits {
                 reapi: 30_000,
                 worker: 17
@@ -188,8 +188,11 @@ mod tests {
         let one = Args::parse_from(["kbf-server", "--worker-max-streams=3"])
             .listeners()
             .expect("listeners");
-        assert_eq!(one.streams.reapi, 10_000, "an unset flag keeps its default");
-        assert_eq!(one.streams.worker, 3);
+        assert_eq!(
+            one.stream_limits.reapi, 10_000,
+            "an unset flag keeps its default"
+        );
+        assert_eq!(one.stream_limits.worker, 3);
     }
 
     /// Catches: a limit of 0 (no stream could ever open) or a value that is not a

@@ -58,6 +58,41 @@
 //!   `clang @<its pattern>` (`clang @<file name>` for an absolute one). The rule names no program: what it unwraps is told by
 //!   shape (bare name, path, flag), so no list of runners can go stale.
 //!
+//! **The target** ([`Target`], issue #796): the owner buck2 wrote a `buck-out` path
+//! for, read back from the path: the cell (its first segment), the package (the
+//! segments before the name) and the name (`__` stripped, a `/` in it kept), written
+//! as a label, `cell//pkg:name` (`cell//:name` in the root package), with the kind of
+//! owner its root names (a rule's target, an anonymous target, a BXL function). A
+//! package directory may itself be spelled like a name (Jest's `__tests__`), so the
+//! name is the one `__<name>__` buck2's layout puts where the name goes, and with
+//! none, or more than one that fits, there is no target:
+//!   - a target's, configuration form: a `__<name>__` with something under it, not a
+//!     dynamic action's `__action__<k>__` right after another name.
+//!     `js/__tests__/__t__/out` fits two ways, so names none;
+//!   - a target's, content form: a `__<name>__` followed by its content hash or
+//!     `output_artifacts`, or by a dynamic action's `__action__<k>__` and then one.
+//!     `js/__tests__/__t__/<content>/out` is `cell//js/__tests__:t`;
+//!   - a BXL function's, either form: a `__<name>__` followed by its hash (13 to 16
+//!     hex digits, or `output_artifacts`). A BXL dynamic action writes its key bare
+//!     between the name and the hash, so it names none;
+//!   - an anonymous target's, configuration form: a `__<name>__` right after a hex
+//!     segment (its attributes hash, which is not part of the package). A dynamic
+//!     action's key, which buck2 glues to the name (`__x__<k>__`), stays in it
+//!     (`x__<k>`). buck2's older `gen-anon` root is read this way even with no
+//!     configuration hash;
+//!   - an anonymous target's, content form: only the root package's,
+//!     `<cell><content>/__<name>__/…`, is `cell//:name`. Outside it buck2 glues the
+//!     cell to the package (`<cell><pkg>/<content>/__<name>__/…`), and where the cell
+//!     ends cannot be read, so it names none.
+//!
+//! An empty cell, or a first segment that is itself a name, names none. An action's
+//! target is that of its first output pattern (in pattern order) that names one, else
+//! of its first program word that does (a test binary buck2 built, run remotely);
+//! `None` when neither names one: a remotely run test's outputs under
+//! `buck-out/v2/test/execution/` name none (that root holds no owner's layout), so
+//! such a test run by a program outside `buck-out` has no target. It is read, never
+//! guessed, and is not part of the key.
+//!
 //! The key is SHA-256 of a version tag and the program's words and the sorted,
 //! deduplicated output patterns, each length-prefixed, cut to 8 bytes: stable across
 //! Rust releases and processes (never `DefaultHasher`), and a new tag when the
@@ -67,6 +102,7 @@
 
 use std::fmt;
 
+pub use kbf_invocation::TargetKind;
 use sha2::{Digest as _, Sha256};
 
 /// The tag hashed ahead of every shape: a new one for any change to what a shape is.
@@ -80,10 +116,27 @@ const MAX_WORDS: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShapeKey([u8; 8]);
 
+impl ShapeKey {
+    /// The key's 8 bytes.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 8] {
+        self.0
+    }
+}
+
 impl fmt::Display for ShapeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
     }
+}
+
+/// The owner an action's own `buck-out` paths name (see the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    /// Which kind of owner.
+    pub kind: TargetKind,
+    /// `cell//pkg:name` (`cell//:name` in the cell's root package).
+    pub label: String,
 }
 
 /// What an action is, independent of configuration and input contents.
@@ -100,6 +153,11 @@ pub struct Shape {
     /// Not part of the key: one target built in two configurations has one key, and
     /// this tells them apart.
     pub cfg: Option<String>,
+    /// The target its paths name (see the module docs). Not part of the key.
+    pub target: Option<Target>,
+    /// Whether it is a test run: an output path is under `buck-out/<v>/test/execution/`
+    /// (buck2's root for a remotely run test). Not part of the key.
+    pub test: bool,
 }
 
 impl Shape {
@@ -107,21 +165,36 @@ impl Shape {
     /// (every output field, in any order, repeats allowed).
     #[must_use]
     pub fn of(arguments: &[String], outputs: &[String]) -> Self {
-        let program = program(arguments);
-        let mut patterns: Vec<(String, Option<String>)> =
-            outputs.iter().filter_map(|o| pattern(o)).collect();
-        patterns.sort();
-        let cfg = patterns.iter().find_map(|(_, cfg)| cfg.clone());
+        let (program, program_target) = words(arguments);
+        let test = outputs.iter().any(|o| is_test_execution(o));
+        let mut patterns: Vec<Pattern> = outputs.iter().filter_map(|o| owned_pattern(o)).collect();
+        patterns.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let cfg = patterns.iter().find_map(|(_, cfg, _)| cfg.clone());
+        let target = patterns
+            .iter()
+            .find_map(|(_, _, target)| target.clone())
+            .or(program_target);
         patterns.dedup_by(|a, b| a.0 == b.0);
-        let outputs: Vec<String> = patterns.into_iter().map(|(p, _)| p).collect();
+        let outputs: Vec<String> = patterns.into_iter().map(|(p, _, _)| p).collect();
         let key = key(&program, &outputs);
         Self {
             key,
             program,
             outputs,
             cfg,
+            target,
+            test,
         }
     }
+}
+
+/// Whether `path` is under `buck-out/<v>/test/execution/`, buck2's root for the outputs
+/// of a test run remotely.
+fn is_test_execution(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    segments
+        .windows(4)
+        .any(|w| w[0] == "buck-out" && w[2] == "test" && w[3] == "execution")
 }
 
 /// SHA-256 over the version tag, the program's words and the outputs, each part
@@ -145,14 +218,15 @@ fn key(program: &[String], outputs: &[String]) -> ShapeKey {
     ShapeKey(key)
 }
 
-/// The words of the program an action runs (see the module docs); `["-"]` for an
-/// empty argv.
-#[must_use]
-pub fn program(arguments: &[String]) -> Vec<String> {
+/// The words of the program an action runs (see the module docs; `["-"]` for an
+/// empty argv), and the target of the first of them that is a `buck-out` path naming
+/// one (an argument file's path, after `@`, is not a program and names none).
+fn words(arguments: &[String]) -> (Vec<String>, Option<Target>) {
     let Some((first, rest)) = arguments.split_first() else {
-        return vec!["-".to_owned()];
+        return (vec!["-".to_owned()], None);
     };
-    let mut words = vec![word(first)];
+    let (first, mut target) = word(first);
+    let mut words = vec![first];
     let mut rest = rest.iter();
     while words.len() < MAX_WORDS && words.last().is_some_and(|w| is_bare_program(w)) {
         match rest.find(|a| is_inline(a) || !skipped(a)) {
@@ -160,11 +234,15 @@ pub fn program(arguments: &[String]) -> Vec<String> {
                 words.push(inline.clone());
                 break;
             }
-            Some(arg) => words.push(word(arg)),
+            Some(arg) => {
+                let (next, named) = word(arg);
+                words.push(next);
+                target = target.or(named);
+            }
             None => break,
         }
     }
-    words
+    (words, target)
 }
 
 /// A word that may be a program looked up on `PATH`, which may only run the next
@@ -190,42 +268,47 @@ fn skipped(arg: &str) -> bool {
 
 /// One program word: a `buck-out` path's pattern (`buck-out/tmp` for a scratch path),
 /// an absolute path's file name, any other argument as sent; an argument file's path
-/// (after its `@`) the same way (`@<pattern>`, `@<file name>`).
-fn word(arg: &str) -> String {
+/// (after its `@`) the same way (`@<pattern>`, `@<file name>`). With it, the target a
+/// `buck-out` program path names (never an argument file's).
+fn word(arg: &str) -> (String, Option<Target>) {
     let (at, path) = match arg.strip_prefix('@') {
         Some(path) => ("@", path),
         None => ("", arg),
     };
     match buck_out(path) {
-        Some(Found::Pattern(pattern, _)) => return format!("{at}{pattern}"),
-        Some(Found::Scratch) => return format!("{at}buck-out/tmp"),
+        Some(Found::Pattern(pattern, _, target)) => {
+            return (format!("{at}{pattern}"), target.filter(|_| at.is_empty()));
+        }
+        Some(Found::Scratch) => return (format!("{at}buck-out/tmp"), None),
         None => {}
     }
     if path.starts_with('/') {
-        return format!("{at}{}", basename(path));
+        return (format!("{at}{}", basename(path)), None);
     }
-    arg.to_owned()
+    (arg.to_owned(), None)
 }
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The pattern of an output path, and the configuration hash it named, if any;
-/// `None` for a scratch path, which is left out of the shape.
-#[must_use]
-pub fn pattern(path: &str) -> Option<(String, Option<String>)> {
+/// An output path's pattern, the configuration hash and the target it names.
+type Pattern = (String, Option<String>, Option<Target>);
+
+/// The pattern of an output path, the configuration hash it named and the target it
+/// names, if any; `None` for a scratch path, which is left out of the shape.
+fn owned_pattern(path: &str) -> Option<Pattern> {
     match buck_out(path) {
-        Some(Found::Pattern(pattern, cfg)) => Some((pattern, cfg)),
+        Some(Found::Pattern(pattern, cfg, target)) => Some((pattern, cfg, target)),
         Some(Found::Scratch) => None,
-        None => Some((path.to_owned(), None)),
+        None => Some((path.to_owned(), None, None)),
     }
 }
 
 /// A path under a `buck-out` root kbf knows.
 enum Found {
-    /// Its pattern, and the configuration hash it named.
-    Pattern(String, Option<String>),
+    /// Its pattern, the configuration hash it named, and the target it names.
+    Pattern(String, Option<String>, Option<Target>),
     /// A scratch path (`buck-out/<v>/tmp/`).
     Scratch,
 }
@@ -293,7 +376,95 @@ fn buck_out(path: &str) -> Option<Found> {
         }
         kept.push(segment);
     }
-    Some(Found::Pattern(kept.join("/"), cfg))
+    // buck2's older `gen-anon` root has no content form: read without a
+    // configuration hash, it is read as the configuration form.
+    let form = if cfg.is_some() || segments[at + 2] == "gen-anon" {
+        Form::Configuration
+    } else {
+        Form::Content
+    };
+    let target = target_of(owner, form, &rest, &names);
+    Some(Found::Pattern(kept.join("/"), cfg, target))
+}
+
+/// Which of buck2's two layouts a path is in: with a configuration hash after the
+/// cell, or (its content-based paths) a content hash instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    Configuration,
+    Content,
+}
+
+/// The target `rest` (a path's segments after its root, the configuration hash taken
+/// out, nothing else dropped) names: see the module docs for which `__<name>__` is the
+/// name in each layout. `None` when no segment run, or more than one, can be it, with
+/// an empty cell, or with a cell segment that is itself a name.
+fn target_of(owner: Owner, form: Form, rest: &[&str], names: &Names) -> Option<Target> {
+    let mut cell = *rest.first()?;
+    if names.starts.first().copied().unwrap_or(false) {
+        return None;
+    }
+    // No name starts at the cell, so every name has a segment before it.
+    let spans = names.spans();
+    // A dynamic action's `__action__<k>__`, right after its target's name: no name.
+    let dynamic = |&(start, end): &Span| {
+        start == end && names.ends[start - 1] && rest[start].starts_with("__action__")
+    };
+    // The hash buck2 puts right after the name, past a dynamic action's key (a target's).
+    let hashed = |&(_, end): &Span| {
+        let hash_at = |i: usize| rest.get(i).is_some_and(|s| hash_after_name(owner, s));
+        hash_at(end + 1)
+            || owner == Owner::Target
+                && spans.iter().any(|s| s.0 == end + 1 && dynamic(s))
+                && hash_at(end + 2)
+    };
+    let candidates: Vec<Span> = match (owner, form) {
+        // Only the root package's form can be read: there the cell is glued to the
+        // content hash alone; elsewhere buck2 glues it to the package.
+        (Owner::Anon, Form::Content) => {
+            cell = unglue_content_hash(cell)?;
+            spans.iter().filter(|s| s.0 == 1).copied().collect()
+        }
+        // The name follows the attributes hash.
+        (Owner::Anon, Form::Configuration) => spans
+            .iter()
+            .filter(|s| s.0 >= 2 && !rest[s.0 - 1].is_empty() && is_hex(rest[s.0 - 1]))
+            .copied()
+            .collect(),
+        // The name has the output under it.
+        (Owner::Target, Form::Configuration) => spans
+            .iter()
+            .filter(|s| s.1 + 1 < rest.len() && !dynamic(s))
+            .copied()
+            .collect(),
+        (Owner::Target, Form::Content) | (Owner::Bxl, _) => spans
+            .iter()
+            .filter(|s| !dynamic(s) && hashed(s))
+            .copied()
+            .collect(),
+    };
+    let [(start, end)] = candidates[..] else {
+        return None;
+    };
+    if cell.is_empty() {
+        return None;
+    }
+    // An anonymous target's attributes hash sits between its package and its name.
+    let package_end = match (owner, form) {
+        (Owner::Anon, Form::Configuration) => start - 1,
+        _ => start,
+    };
+    let spelled = rest[start..=end].join("/");
+    let name = &spelled[2..spelled.len() - 2];
+    let kind = match owner {
+        Owner::Target => TargetKind::Target,
+        Owner::Anon => TargetKind::Anon,
+        Owner::Bxl => TargetKind::Bxl,
+    };
+    Some(Target {
+        kind,
+        label: format!("{cell}//{}:{name}", rest[1..package_end].join("/")),
+    })
 }
 
 /// Takes the configuration hash out of `rest` (the segments after the root) and
@@ -346,6 +517,9 @@ struct Names {
     ends: Vec<bool>,
 }
 
+/// The first and last segment of one `__<name>__`.
+type Span = (usize, usize);
+
 impl Names {
     fn of(segments: &[&str]) -> Self {
         let mut names = Self {
@@ -369,6 +543,22 @@ impl Names {
             }
         }
         names
+    }
+
+    /// Each name's first and last segment, in path order (a name's end always
+    /// follows its start, with no other start between).
+    fn spans(&self) -> Vec<Span> {
+        let mut spans = Vec::new();
+        let mut first = 0;
+        for (i, (&start, &end)) in self.starts.iter().zip(&self.ends).enumerate() {
+            if start {
+                first = i;
+            }
+            if end {
+                spans.push((first, i));
+            }
+        }
+        spans
     }
 }
 

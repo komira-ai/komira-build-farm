@@ -320,18 +320,21 @@ fn wide(result: u8, n: usize) -> kbf_invocation::Listing {
     l
 }
 
+/// The outputs of a wide listing: more than the idle record's bytes make room for.
+const WIDE: usize = 80;
+
 fn finished_wide(op: u64, result: u8, at: WallTime) -> Event {
     Event::Finished(kbf_invocation::Finished {
         operation: OperationId(op),
         lease: None,
         outcome: Outcome::Ok { exit_code: 0 },
-        result: Some(wide(result, 50)),
+        result: Some(wide(result, WIDE)),
         at,
     })
 }
 
 /// Catches a bound held only when a row is added: rows already taken grow when their
-/// operation finishes (here by up to 50 outputs each). The idle record goes first
+/// operation finishes (here by up to [`WIDE`] outputs each). The idle record goes first
 /// (plant "no room made for a listing": `q` stays and the listing is cut at once),
 /// then the listing keeps the outputs that fit and its record says
 /// `complete: false`; once nothing fits, a new row is refused with `rows_capped`.
@@ -348,7 +351,7 @@ fn growth_past_the_bound_evicts_idle_records_then_trims_what_fills_in() {
     assert_eq!(held(&r), ["r", "s"], "the idle record goes first");
     let ran = &r.get(&key("r")).expect("r").rows()[0];
     let kept = ran.listing.as_ref().expect("listed").outputs.len();
-    assert!(kept > 0 && kept < 50, "{kept} of 50 outputs kept");
+    assert!(kept > 0 && kept < WIDE, "{kept} of {WIDE} outputs kept");
     assert!(ran.outputs_truncated);
     assert!(!r.get(&key("r")).expect("r").complete());
     assert!(r.get(&key("s")).expect("s").complete());

@@ -303,6 +303,60 @@ const WITHIN: Duration = ANSWER_WITHIN;
 /// issue #481), and short of [`WITHIN`] to keep such a test short.
 const UNTIL_KILLED: Duration = Duration::from_secs(20);
 
+/// A stand-in for `sandbox-exec` that logs the lease it is given, `TMPDIR` and
+/// whether the rules deny the network, and the program with its arguments, to `log`,
+/// then runs the program. It runs it as `sh PROGRAM`, not by exec: the programs are
+/// scripts, and a script another thread's fork still holds open for writing (it was
+/// written a moment ago) cannot be exec'd (ETXTBSY, exit 126) but is read by `sh` all
+/// the same. The survey's own spawns are started again when busy; this one is not the
+/// survey's.
+fn fake_sandbox_exec(dir: &Path, log: &Path) -> PathBuf {
+    fake(
+        dir,
+        "sandbox-exec",
+        &format!(
+            "#!/bin/sh\n\
+             case \"$4\" in *'(deny network*)'*'(rules)'*) net=off ;; *) net=on ;; esac\n\
+             lease=\"$2\"; shift 4\n\
+             echo \"$lease TMPDIR=$TMPDIR net=$net $*\" >> '{}'\n\
+             exec /bin/sh \"$@\"\n",
+            log.display()
+        ),
+    )
+}
+
+/// Catches the stand-in sandbox failing a question only because its program is busy
+/// (ETXTBSY), which made the survey test below fail now and then: a script held open
+/// for writing, as a child forked while it was written holds it, is run all the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_fake_sandbox_runs_a_program_held_open_for_writing() {
+    let dir = scratch("sandbox-busy");
+    let program = fake(&dir, "program", "#!/bin/sh\necho ran \"$@\"\n");
+    let log = dir.join("log");
+    let sandbox = fake_sandbox_exec(&dir, &log);
+    let _writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&program)
+        .expect("open");
+    // Exec'd, the program is busy.
+    let busy = std::process::Command::new(&program)
+        .output()
+        .expect_err("busy");
+    assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
+    // Through `sh`, as the sandbox is itself a script just written.
+    let out = std::process::Command::new("/bin/sh")
+        .arg(&sandbox)
+        .args(["-D", "lease", "-p", "(rules)"])
+        .arg(&program)
+        .arg("x")
+        .output()
+        .expect("sandbox");
+    assert!(out.status.success(), "{:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran x\n");
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
 /// Catches (CEO decision on issue #164): a question of the survey, `xcrun`'s lookup
 /// above all (it reads and fills a cache leases can write), run outside the sandbox,
 /// with the network on, without the user-folder rules, in another lease directory or
@@ -324,18 +378,7 @@ fn the_survey_asks_every_question_under_its_sandbox() {
     link_xcodebuild(&xcodebuild, &apps.join("Xcode_old.app"));
     std::os::unix::fs::symlink(apps.join("Xcode_good.app"), apps.join("Xcode.app")).expect("link");
     let log = dir.join("sandbox-log");
-    let sandbox_exec = fake(
-        &dir,
-        "sandbox-exec",
-        &format!(
-            "#!/bin/sh\n\
-             case \"$4\" in *'(deny network*)'*'(rules)'*) net=off ;; *) net=on ;; esac\n\
-             lease=\"$2\"; shift 4\n\
-             echo \"$lease TMPDIR=$TMPDIR net=$net $*\" >> '{}'\n\
-             exec \"$@\"\n",
-            log.display()
-        ),
-    );
+    let sandbox_exec = fake_sandbox_exec(&dir, &log);
     let sandbox = Sandbox {
         isolation: Isolation::Sandbox(sandbox_exec),
         dir: dir.join("scratch/lease-survey"),

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::support::fake::{Fake, image};
 use crate::support::fake_oci::FakeOci;
 use crate::support::rig::Rig;
-use crate::support::{Spec, blob, exists, store_action, work};
+use crate::support::{Spec, blob, ended, exists, store_action, work};
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_types::Resources;
 
@@ -249,14 +249,6 @@ async fn a_restart_removes_what_its_predecessor_left<R: Rig>() {
     assert!(ended(&pid), "the action still runs");
     assert!(!exists(&rig.lease_dir(1)), "scratch directory left");
     assert!(!exists(&rig.lease_cgroup(1)), "lease cgroup left");
-}
-
-/// Whether process `pid` has ended: gone, or a zombie not yet reaped.
-fn ended(pid: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| Some(stat.rsplit_once(") ")?.1.starts_with('Z')))
-        .unwrap_or(true)
 }
 
 /// Catches the lease's directories not being given to the container's root before the

@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -26,8 +26,13 @@ pub enum Entry {
         perms: Perms,
         owner: Owner,
     },
-    /// A symbolic link, socket or device: never what a plan wants, so a file or
-    /// directory step replaces it (or fails) and a removal removes it.
+    /// A symbolic link, never followed: what a [`Step::Symlink`] makes, and what a
+    /// file or directory step replaces (or fails on).
+    Link {
+        target: PathBuf,
+    },
+    /// A socket or device: never what a plan wants, so a file or directory step replaces
+    /// it (or fails) and a removal removes it.
     Other,
 }
 
@@ -107,7 +112,7 @@ impl Exec for HostExec {
                 bytes: fs::read(self.root.join(path))?,
             },
             Kind::Dir => Entry::Dir { perms, owner },
-            Kind::Other => Entry::Other,
+            Kind::Other => link_or_other(fs::read_link(self.root.join(path)))?,
         }))
     }
 
@@ -156,6 +161,7 @@ impl Exec for HostExec {
                 }
                 set_perms_owner(&full, *perms, *owner)
             }
+            Step::Symlink { path, target } => symlink(&self.root.join(path), target),
             Step::Remove { path } => {
                 let full = self.root.join(path);
                 if fs::symlink_metadata(&full)?.is_dir() {
@@ -189,14 +195,63 @@ impl Exec for HostExec {
     }
 }
 
-/// Write `bytes` beside `full` and rename the copy over it, so a reader sees the old
-/// file or the new one, never a part.
-fn write_file(full: &Path, perms: Perms, owner: Option<Owner>, bytes: &[u8]) -> io::Result<()> {
+/// What `read_link` on a path that is neither a file nor a directory says it is: a link
+/// with its target, or (EINVAL, not a link) a socket or device.
+fn link_or_other(read: io::Result<PathBuf>) -> io::Result<Entry> {
+    match read {
+        Ok(target) => Ok(Entry::Link { target }),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(Entry::Other),
+        Err(e) => Err(e),
+    }
+}
+
+/// Point the link at `full` to `target`, atomically: a fresh link is made beside it and
+/// renamed over it, so a reader of `full` sees the old target or the new one, never no
+/// link. Anything at `full` that is not a link (a file, a directory) is refused, never
+/// replaced. The directory is synced after the rename, so the new link survives a power
+/// cut once the step has succeeded.
+fn symlink(full: &Path, target: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(full) {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is not a symbolic link; refusing to replace it",
+                    full.display()
+                ),
+            ));
+        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let tmp = temp_beside(full);
+    // A link left by an interrupted run.
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::os::unix::fs::symlink(target, &tmp)?;
+    fs::rename(&tmp, full)?;
+    // For a power cut, which no test makes: no test fails without this sync.
+    let parent = full
+        .parent()
+        .expect("a HostPath names a file in a directory");
+    fs::File::open(parent)?.sync_all()
+}
+
+/// The name a step makes its new file or link under before renaming it over `full`.
+fn temp_beside(full: &Path) -> PathBuf {
     let name = full
         .file_name()
         .expect("a HostPath names a file")
         .to_string_lossy();
-    let tmp = full.with_file_name(format!(".{name}.kbf-host-tmp"));
+    full.with_file_name(format!(".{name}.kbf-host-tmp"))
+}
+
+/// Write `bytes` beside `full` and rename the copy over it, so a reader sees the old
+/// file or the new one, never a part.
+fn write_file(full: &Path, perms: Perms, owner: Option<Owner>, bytes: &[u8]) -> io::Result<()> {
+    let tmp = temp_beside(full);
     // A copy left by an interrupted run; `create_new` below never follows a link there.
     match fs::remove_file(&tmp) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),

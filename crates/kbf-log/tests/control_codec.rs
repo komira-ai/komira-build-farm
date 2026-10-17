@@ -857,12 +857,12 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
 }
 
 /// Catches a control command written or read under a format this build does not know
-/// (format 4; formats 1 to 3 all carry control commands, since formats 2 and 3 only add
+/// (format 5; formats 1 to 4 all carry control commands, since formats 2 to 4 only add
 /// metadata commands).
 #[test]
 fn control_commands_refuse_an_unknown_format() {
     let command = batch(FarmInput::Tick);
-    let format = Format::new(4);
+    let format = Format::new(5);
     assert_eq!(encode(format, &command), Err(EncodeError::Format(format)));
     assert_eq!(
         kbf_log::decode(format, &enc(&command)),
@@ -883,11 +883,14 @@ fn machine_versions_name_their_entry_formats() {
     assert_eq!(MachineVersion::V2.format(), Some(Format::V2));
     assert_eq!(MachineVersion::V3.get(), 3);
     assert_eq!(MachineVersion::V3.format(), Some(Format::V3));
-    let v4 = MachineVersion::new(NonZeroU32::new(4).expect("non-zero"));
-    assert_eq!(v4.format(), None);
+    assert_eq!(MachineVersion::V4.get(), 4);
+    assert_eq!(MachineVersion::V4.format(), Some(Format::V4));
+    let v5 = MachineVersion::new(NonZeroU32::new(5).expect("non-zero"));
+    assert_eq!(v5.format(), None);
     assert!(
         MachineVersion::V1 < MachineVersion::V2
             && MachineVersion::V2 < MachineVersion::V3
-            && MachineVersion::V3 < v4
+            && MachineVersion::V3 < MachineVersion::V4
+            && MachineVersion::V4 < v5
     );
 }

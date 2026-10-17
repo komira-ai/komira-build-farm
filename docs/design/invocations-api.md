@@ -32,10 +32,10 @@ Three limits an agent must know, each said again where it applies:
   cannot say the build passed: it says which of the actions it saw failed. buck2's own
   exit code is the build's result; a failure buck2 found without the farm (a parse
   error, a local action) is not in the record.
-- **Records do not survive a restart yet.** Until PRs 7 and 8 land (next after the
-  client and driver metrics, section 9), a server restart loses every record, and the
-  memory bound evicts idle ones (3.5); with the in-memory metadata log (tests only) a restart loses them
-  after that too, by design. An agent reads soon after its build. A record that is gone
+- **Records do not survive a restart yet.** Until history objects land (`ui-data.md`
+  5.2, phase U3, which supersedes PRs 7 and 8), a server restart loses every record, and
+  the memory bound evicts idle ones (3.5); with an in-memory object store (tests only) a
+  restart loses them after that too, by design. An agent reads soon after its build. A record that is gone
   answers `404` with a body that says whether the server could have held it (4.10).
 - **CPU and memory are `null` today** for every action a real driver ran (section 1);
   PR 11 fills them.
@@ -73,10 +73,14 @@ GET /v1/invocations/{id}/failures?page_size=20
      "outcome": {"ok": {"exit_code": 1}},
      "failure": null,
      "attempts": [
-       {"worker": "node-a", "queued_micros": 1200, "run_micros": 900000,
-        "end": {"requeue": "silent"}},
-       {"worker": "node-b", "queued_micros": 800, "run_micros": 1500000,
-        "end": {"result": "ok"}}],
+       {"lease": "3.4811", "worker": "node-a",
+        "queued": "...Z", "granted": "...Z", "started": "...Z", "ended": "...Z",
+        "end": {"requeue": "silent"},
+        "run_id": "...", "href": "/v1/runs/...", "...": "the rest of ui-data.md 6.3"},
+       {"lease": "3.4812", "worker": "node-b",
+        "queued": "...Z", "granted": "...Z", "started": "...Z", "ended": "...Z",
+        "end": {"result": "ok"},
+        "run_id": "...", "href": "/v1/runs/...", "...": "the rest of ui-data.md 6.3"}],
      "command": {"arguments": ["cc", "-c", "a.c", "-o", "out/a.o"],
                  "environment_names": ["PATH", "LANG"], "working_directory": "",
                  "platform": {"OSFamily": "linux"}, "timeout_micros": null,
@@ -99,8 +103,11 @@ GET /v1/invocations/{id}/failures?page_size=20
   pressure, missing input, lost) with the daemon's reason text, capped at 1 KiB (3.2):
   for an INFRA failure, the farm's own reason (`null`, as here, for an action that ran
   to a non-zero exit). `stdout` or `stderr` is `null` when the result has none.
-  `attempts` lists every lease with its worker, its queue time (queued to granted) and
-  run time (granted to ended), and how it ended: the reruns and why.
+  `attempts` lists every lease in the attempt shape of `ui-data.md` 6.3 (amended
+  there): the built keys of `actions/{digest}` (lease, worker, RFC 3339 `queued`,
+  `granted`, `started`, `ended`, `end`), then `run_id` with its `href`, the memory and
+  usage fields; queue time is `granted - queued` and run time `ended - granted`, derived
+  from those strings, not separate keys. How each ended: the reruns and why.
 - **The command** is read when the page is answered, from the Action blob (its
   platform, its timeout, the Command digest) and the Command blob (arguments,
   environment variable names, working directory, output paths). The record keeps
@@ -108,7 +115,8 @@ GET /v1/invocations/{id}/failures?page_size=20
   either blob has left the CAS, or when the client never uploaded the Action. Values
   of environment variables are never put in the answer: they are where a secret most
   often is, and an agent that needs them reads the Command blob by its link (4.2
-  `blobs`) under the same authorizer. The node is each attempt's `worker`;
+  `blobs`), which also needs the `commands.getRaw` authority of `ui-data.md` 8
+  (never granted by open mode). The node is each attempt's `worker`;
   `GET /v1/nodes` describes it.
 - **Outputs**: the action's output files and directories as its row lists them (3.2),
   each with its digest, `available` and `href`, as in 4.2. Only a failed action's
@@ -138,8 +146,10 @@ GET /v1/invocations/{id}/failures?page_size=20
   `command` are blob bytes, so they also need `blobs`: with `invocations` and no
   `blobs`, both are `null`, as the `href`s are.
 - **Paging**: 4.5's rules; `page_size` default 20, maximum 100. `next_page` is the link
-  of the next page, absent on the last. In stage 2 the root's failed-row positions
-  (3.5) give the rows without a scan of the chunks.
+  of the next page, absent on the last. Stage 2 of `invocations.md` 3.5 (a root blob
+  with failed-row positions) is superseded by `ui-data.md` 5.2: the `ichunk` index rows
+  give each chunk's failed count, and the failed-run section of each chunk with failures
+  gives the rows, so only those chunks are read (`ui-data.md` 5.2, 5.3, 5.5).
 
 ### 4.8 The client: `kbf build show`
 
@@ -239,7 +249,7 @@ runs. The requirement, landing with the client tokens of issue 227:
 
 ### 4.10 A record that is gone
 
-Until PRs 7 and 8 land, a restart loses every record and the memory bound evicts idle
+Until history objects land (`ui-data.md` U3, superseding PRs 7 and 8), a restart loses every record and the memory bound evicts idle
 ones (3.5): **an agent reads soon after its build.** The server cannot tell a lost id
 from one it never saw (in stage 1 it keeps nothing across a restart), so a "lost at
 restart" answer would be a guess. It answers `404`, on every route (4.1), with a body
@@ -259,12 +269,13 @@ lost; the agent reruns the build to see it again. The comparison is the agent's:
 knows when its build ended and the server does not, so the client prints the body and
 exits 3 in both cases.
 
-**The gap closes when PRs 7 and 8 land** (section 9, right after the client and the
-driver metrics). On the Raft metadata log a flushed record survives a restart and the
-memory bound no longer loses it (a flushed row leaves memory and is read from its chunk, 3.5): what a restart
-loses is each open invocation's unflushed window, and those invocations say
-`complete: false` (section 7), and minted one-action invocations, which are never
-flushed. `records_since` then is the oldest time the retention (3.6) still holds, and
-a `404` inside it means the farm saw no call with that id. On the in-memory metadata log (tests only) a
-restart still loses every record, by design (3.5), and `records_since` stays the
-server's start.
+**The gap closes with history objects** (`ui-data.md` 5.2 and its phase U3, which
+supersede PRs 7 and 8 and the Raft metadata log). A record flushed into an invocation
+chunk object survives a restart and the memory bound no longer loses it (a flushed row
+leaves memory and is read from its chunk, `ui-data.md` 5.5): what a restart
+loses is the history writer's queue and each open invocation's unflushed buffers, and
+those invocations say `complete: false` with `gap_from` (`ui-data.md` 5.2), and minted
+one-action invocations, which are never flushed. `records_since` then is the oldest time
+the history retention classes (`ui-data.md` 5.3) still hold, and a `404` inside it means
+the farm saw no call with that id. With an in-memory object store (tests only) a restart
+still loses every record, by design, and `records_since` stays the server's start.

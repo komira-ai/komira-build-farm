@@ -6,17 +6,13 @@
 //! whose blobs the CAS holds, so the client can fetch every digest it is given. The
 //! partial result is never written to the action cache.
 
-use kbf_front::{Cache, MetaLog, digest_from_proto};
-use kbf_objstore::ObjectStore;
+use kbf_front::{Backend, digest_from_proto};
 use kbf_proto::reapi::{ActionResult, Digest};
 
 /// The partial result to answer a timed-out action with, from what the daemon
 /// `reported`: its stdout and stderr digests that the CAS holds, nothing else. `None`
 /// when neither is held, or the CAS cannot say (the timeout is still answered).
-pub(crate) async fn partial<M: MetaLog, O: ObjectStore>(
-    cache: &Cache<M, O>,
-    reported: ActionResult,
-) -> Option<ActionResult> {
+pub(crate) async fn partial(cache: &Backend, reported: ActionResult) -> Option<ActionResult> {
     let logs = [reported.stdout_digest, reported.stderr_digest];
     let digests: Vec<_> = logs
         .iter()

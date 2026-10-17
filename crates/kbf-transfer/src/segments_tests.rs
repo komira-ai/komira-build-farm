@@ -124,7 +124,11 @@ fn footers_parse_and_ranges_map_to_the_spool() {
 /// of another object starts another, and a run never grows past the limit.
 #[test]
 fn coalescing_joins_close_blobs_of_one_object() {
-    let object = |seq| ObjectRef { epoch: 1, seq };
+    let object = |seq| ObjectRef {
+        epoch: 1,
+        seq,
+        ..ObjectRef::default()
+    };
     let d = |n: u8, size: i64| Digest {
         hash: format!("{n:02x}"),
         size_bytes: size,

@@ -91,10 +91,11 @@ fn listeners() -> Listeners {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 
@@ -107,6 +108,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
     let api = Api {
         listen: loopback(),
         token,
+        local_cache: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -361,14 +363,16 @@ async fn an_api_address_in_use_is_refused() {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: addr,
         token: None,
+        local_cache: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {
@@ -378,7 +382,7 @@ async fn an_api_address_in_use_is_refused() {
 }
 
 fn register(
-    farm: &Farm<MemoryMetaLog, MemoryStore>,
+    farm: &Farm,
     node: &str,
 ) -> (
     kbf_server::farm::StreamId,
@@ -455,7 +459,7 @@ async fn two_nodes_whose_streams_ended_before_one_read_are_both_disconnected() {
     );
     let (_, first) = register(&farm, "linux-1");
     let (_, second) = register(&farm, "linux-2");
-    let connected = |farm: &Farm<MemoryMetaLog, MemoryStore>| {
+    let connected = |farm: &Farm| {
         let mut nodes: Vec<(String, bool)> = farm
             .nodes()
             .nodes

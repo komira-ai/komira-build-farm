@@ -10,6 +10,7 @@ use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, WorkerId};
 
 use crate::event::{Call, InvocationId, Listing, Metadata, Outcome, Output, Owner, WallTime};
+use crate::run::{ActionShape, Run};
 
 /// Rows one record keeps; past it, actions are counted but not rowed (section 3.3).
 pub const ROW_CAP: usize = 1_000_000;
@@ -134,6 +135,12 @@ pub struct Attempt {
     pub ended: Option<WallTime>,
     /// How it ended; `None` while it is held.
     pub end: Option<AttemptEnd>,
+    /// What its lease's report measured; `None` without a report the scheduler took.
+    pub run: Option<Box<Run>>,
+    /// The id the history writer minted for this attempt in this record, as opaque bytes
+    /// (`kbf_history::RunId::to_bytes`); `None` until the recorder's tap sets one
+    /// ([`crate::Records::set_run_id`]).
+    pub run_id: Option<[u8; 12]>,
 }
 
 /// How a lease ended.
@@ -177,6 +184,9 @@ pub struct ActionRow {
     pub outputs_truncated: bool,
     /// The Command digest, once the recorder has read it from the Action blob.
     pub command: Option<Digest>,
+    /// The shape the server read from the Command; `None` until then, and for an
+    /// action that was not queued (a cache hit).
+    pub shape: Option<Box<ActionShape>>,
 }
 
 impl ActionRow {
@@ -196,6 +206,7 @@ impl ActionRow {
             listing: None,
             outputs_truncated: false,
             command: None,
+            shape: None,
         }
     }
 
@@ -213,8 +224,8 @@ impl ActionRow {
     }
 
     /// The memory the row holds beyond its own slot in the record's row list, as the
-    /// bound of section 3.5 counts it: the bytes of its texts, its attempts and its
-    /// outputs. Every list a row holds is allocated to its length (a copy, or cut
+    /// bound of section 3.5 counts it: the bytes of its texts, its shape, its attempts
+    /// and its outputs. Every list a row holds is allocated to its length (a copy, or cut
     /// back), so lengths are its capacities.
     pub(crate) fn heap_bytes(&self) -> usize {
         let text = |t: &Option<Text>| t.as_ref().map_or(0, |t| t.value.len());
@@ -231,7 +242,18 @@ impl ActionRow {
             + attempts_bytes(&self.attempts)
             + outcome_bytes(self.outcome.as_ref())
             + outputs
+            + self.shape.as_deref().map_or(0, shape_bytes)
     }
+}
+
+/// What a row's shape takes: its box and its texts.
+pub(crate) fn shape_bytes(shape: &ActionShape) -> usize {
+    size_of::<ActionShape>() + shape.heap_bytes()
+}
+
+/// What an attempt's run takes: its box and its NUMA list.
+pub(crate) fn run_bytes(run: &Run) -> usize {
+    size_of::<Run>() + run.heap_bytes()
 }
 
 /// What a row's `attempts` take beyond the row, as [`ActionRow::heap_bytes`] counts
@@ -240,13 +262,13 @@ pub(crate) fn attempts_bytes(attempts: &[Attempt]) -> usize {
     attempts.iter().map(attempt_bytes).sum()
 }
 
-/// What one attempt takes: itself, its worker's name and its failure reason.
+/// What one attempt takes: itself, its worker's name, its failure reason and its run.
 pub(crate) fn attempt_bytes(a: &Attempt) -> usize {
     let reason = match &a.end {
         Some(AttemptEnd::Failed(_, why)) => why.len(),
         _ => 0,
     };
-    size_of::<Attempt>() + a.worker.as_str().len() + reason
+    size_of::<Attempt>() + a.worker.as_str().len() + reason + a.run.as_deref().map_or(0, run_bytes)
 }
 
 /// What an outcome's text takes.
@@ -402,6 +424,8 @@ pub struct Invocation {
     pub(crate) indexed: WallTime,
     /// Whether the memory bound stopped this record taking rows (section 3.5, step 3).
     pub(crate) rows_closed: bool,
+    /// The `last_seen` at which [`crate::Records::idle_since`] last reported the record.
+    pub(crate) idle_reported: Option<WallTime>,
 }
 
 impl Invocation {
@@ -429,6 +453,7 @@ impl Invocation {
             counted: 0,
             indexed: call.at,
             rows_closed: false,
+            idle_reported: None,
         }
     }
 

@@ -112,6 +112,7 @@ async fn drops_mark_the_record_the_event_was_for() {
         owner: Owner::default(),
         action: d(3),
         command: d(4),
+        shape: None,
     });
     recorder.emit(Event::Finished(Finished {
         operation: OperationId(8),
@@ -228,7 +229,8 @@ async fn a_call_is_recorded_under_its_id_and_caller() {
 
 /// Catches a row listing that loses an output, mixes up a file and a directory, drops
 /// the executable bit, the logs or the usage, or keeps an output whose digest does
-/// not parse.
+/// not parse; and a timed-out run's partial listing given the partial result's exit
+/// code (an action that was stopped has none).
 #[test]
 fn a_listing_copies_outputs_logs_and_usage() {
     let usage = ResourceUsage {
@@ -277,8 +279,14 @@ fn a_listing_copies_outputs_logs_and_usage() {
         }),
         ..Default::default()
     };
-    let l = listing(d(9), &result);
-    assert_eq!((l.result, l.exit_code), (d(9), 3));
+    let l = listing(Some(d(9)), &result);
+    assert_eq!((l.result, l.exit_code), (Some(d(9)), Some(3)));
+    let partial = listing(None, &result);
+    assert_eq!(
+        (partial.result, partial.exit_code),
+        (None, None),
+        "a partial result's action was stopped: no exit code, not its 3"
+    );
     assert_eq!(
         l.outputs,
         [
@@ -306,7 +314,7 @@ fn a_listing_copies_outputs_logs_and_usage() {
             wall_micros: 4,
         })
     );
-    let bare = listing(d(9), &ActionResult::default());
+    let bare = listing(Some(d(9)), &ActionResult::default());
     assert_eq!((bare.outputs.len(), bare.usage), (0, None));
 }
 
@@ -333,7 +341,7 @@ async fn a_call_that_is_not_recorded_builds_nothing() {
 
 /// A finish whose result lists `n` outputs with 60-byte paths.
 fn finished_listing(n: usize) -> Event {
-    let mut l = listing(d(9), &ActionResult::default());
+    let mut l = listing(Some(d(9)), &ActionResult::default());
     l.outputs = (0..n)
         .map(|k| Output {
             path: format!("buck-out/v2/gen/root/0123456789abcdef/pkg/__lib__/{k:08}.o"),
@@ -419,7 +427,7 @@ fn a_listing_keeps_one_output_past_the_row_limit() {
             .collect(),
         ..Default::default()
     };
-    let l = listing(d(9), &result);
+    let l = listing(Some(d(9)), &result);
     assert_eq!(l.outputs.len(), kbf_invocation::OUTPUTS_PER_ROW + 1);
     assert_eq!(l.outputs.last().map(|o| o.path.as_str()), Some("f1000"));
 }

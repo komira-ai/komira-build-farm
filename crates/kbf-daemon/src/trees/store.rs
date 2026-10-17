@@ -28,7 +28,7 @@ use tokio::sync::watch;
 use super::build::{build, bytes_under, publish_later, remove_tree};
 use super::classify::{Candidate, tree_name};
 use crate::cache::{Cache, InputStats};
-use crate::cas::Fetch;
+use crate::cas::Fill;
 use crate::tree::{Loaded, TreeError, io as io_error};
 
 /// The mode of the store directory: owner everything, others may only traverse. The
@@ -333,7 +333,7 @@ impl TreeStore {
     /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
     pub(super) async fn acquire(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         in_flight: usize,
         cache: &Cache,
         node: &Candidate,
@@ -395,7 +395,7 @@ impl TreeStore {
     /// Builds the tree as `builder`, names it, and pins it.
     async fn lead(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         in_flight: usize,
         cache: &Cache,
         node: &Candidate,

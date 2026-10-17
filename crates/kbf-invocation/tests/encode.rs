@@ -175,6 +175,7 @@ fn a_row_carries_every_field() {
             owner: owner(""),
             action: d(1),
             command: d(50),
+            shape: None,
         },
     ] {
         r.apply(e);

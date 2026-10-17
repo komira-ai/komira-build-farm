@@ -5,13 +5,15 @@ mod support;
 
 use std::time::Instant;
 
-use kbf_meta::ObjectId;
+use std::num::NonZeroU64;
+
+use kbf_meta::{Epoch, NodeWriter, ObjectId, Writer};
 use kbf_store::{FaultFs, Fs, FsFile};
-use kbf_tier::{TIER, TierError, TierId, WriteTier, block_name};
+use kbf_tier::{TIER, TierError, TierId, WriteTier, block_name, seg_name};
 
 use support::{
     Index, SEAL_AFTER, TIER as OURS, ack_group, ack_upload, blocks, bytes, len_of, open_tier,
-    options,
+    open_tier_as, options,
 };
 
 const LIMIT: u64 = 1 << 20;
@@ -244,6 +246,43 @@ fn a_block_of_this_epoch_refuses_the_start() {
     assert_eq!(blocks(&fs), [block_name(object)]);
 }
 
+fn node(member: u64, boot: u64) -> Writer {
+    let n = |v| NonZeroU64::new(v).expect("not zero");
+    Writer::Node(NodeWriter::new(n(member), n(boot)))
+}
+
+/// Catches: a node writer's start that takes a block of its own boot or a later one
+/// (the boot was reused: it would append to, or delete, another process's block), and
+/// one that refuses over an earlier boot's staged block or another member's (it must
+/// recover the first and leave the second as an orphan, as an earlier epoch's). The
+/// new block is named by the node writer, so a third start sees it. Mutant seen red:
+/// `at_or_after` comparing members only (the earlier boot's block refuses the start).
+#[test]
+fn a_node_writer_restarts_over_earlier_boots_and_refuses_its_own() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let (tier, _) = open_tier_as(&fs, node(7, 2), opts(), &index).unwrap();
+    let object = ack_upload(&tier, &mut index, b"live").unwrap();
+    assert_eq!(object.writer(), node(7, 2));
+    assert_eq!(
+        block_name(object),
+        "0000000000000007-0000000000000002-0000000000000000.blk"
+    );
+    drop(tier);
+    for again in [node(7, 2), node(7, 1)] {
+        assert!(matches!(
+            open_tier_as(&fs, again, opts(), &Index::default()),
+            Err(TierError::FutureBlock { name }) if name == block_name(object)
+        ));
+    }
+    let (tier, rec) = open_tier_as(&fs, node(7, 3), opts(), &index).unwrap();
+    assert_eq!(rec.sealed, [object]);
+    assert_eq!(tier.read(object, 0, 4).unwrap(), b"live");
+    drop(tier);
+    let (_, rec) = open_tier_as(&fs, node(8, 1), opts(), &Index::default()).unwrap();
+    assert_eq!(rec.removed, [block_name(object)]);
+}
+
 /// Catches: an unsealed staged block left open after a restart (it would never be
 /// sealed or flushed), its committed bytes not counted against the budget, and new
 /// ranges appended to a block of an earlier start.
@@ -264,7 +303,7 @@ fn a_restart_seals_what_was_open_and_counts_what_is_staged() {
     index.seal(open);
     assert!(tier.poll_seals(now + SEAL_AFTER).is_empty());
     let r = tier.reserve_group(1, now).unwrap();
-    assert_eq!(r.object().epoch().get(), 2);
+    assert_eq!(r.object().epoch().map(Epoch::get), Some(2));
     assert_eq!(r.offset(), 0);
     let staged: Vec<ObjectId> = index.staged().iter().map(|s| s.object).collect();
     assert_eq!(staged, [open, sealed]);
@@ -372,4 +411,55 @@ fn clear_deletes_every_file_the_tier_writes_and_nothing_else() {
     let cut = fs.crash_reordered(0, 0);
     assert_eq!(cut.list().unwrap(), ["notes.txt"]);
     assert_eq!(kbf_tier::clear(&cut).unwrap(), Vec::<String>::new());
+}
+
+/// Catches a start without flushed copies keeping the copies an earlier run kept (a
+/// node switched to one cache would hold them, uncounted by the one cache, forever),
+/// counting them, or deleting a staged block with them: the copy is deleted and listed
+/// with the removed files; the staged block stays, readable and counted.
+#[test]
+fn a_start_without_flushed_copies_deletes_the_earlier_runs_copies() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let now = Instant::now();
+    let (tier, _) = open_tier(&fs, 1, options(1 << 20, LIMIT), &index).unwrap();
+    let (flushed, _) = ack_group(&tier, &mut index, &bytes(1, 10), now).unwrap();
+    for object in tier.poll_seals(now + SEAL_AFTER) {
+        index.seal(object);
+        tier.sealed(object).unwrap();
+    }
+    tier.flushed(flushed).unwrap();
+    index.tiers.get_mut(&OURS).unwrap().remove(&flushed);
+    let staged = ack_upload(&tier, &mut index, &bytes(2, 6)).unwrap();
+    drop(tier);
+    assert!(fs.contents(&seg_name(flushed)).is_some());
+    let fs = fs.restart();
+    let options = options(1 << 20, LIMIT).without_flushed_copies();
+    let (tier, recovery) = open_tier(&fs, 2, options, &index).unwrap();
+    assert_eq!(fs.contents(&seg_name(flushed)), None);
+    assert_eq!(recovery.removed, [seg_name(flushed)]);
+    assert!(recovery.flushed.is_empty(), "{recovery:?}");
+    assert_eq!(tier.read(staged, 0, 6).unwrap(), bytes(2, 6));
+    let usage = tier.usage();
+    assert_eq!((usage.used, usage.flushed), (6, 0));
+    drop(tier);
+    // A copy that cannot be deleted (or, kept, measured) stops the start, whichever
+    // step fails.
+    fs.put(&seg_name(flushed), &bytes(1, 10));
+    for options in [options, opts()] {
+        let ops = {
+            let probe = fs.restart();
+            let start = probe.ops();
+            open_tier(&probe, 3, options, &index).unwrap();
+            probe.ops() - start
+        };
+        for op in 0..ops {
+            let attempt = fs.restart();
+            attempt.fail_at(attempt.ops() + op, kbf_store::Fault::Error);
+            let opened = open_tier(&attempt, 3, options, &index);
+            assert!(matches!(opened, Err(TierError::Io { .. })), "op {op}");
+        }
+    }
+    let (_, recovery) = open_tier(&fs.restart(), 3, opts(), &index).unwrap();
+    assert_eq!(recovery.flushed, [flushed], "a kept copy is listed");
 }

@@ -300,3 +300,41 @@ fn a_block_deleted_under_the_tier_reads_as_not_here() {
         Err(TierError::UnknownBlock(_))
     ));
 }
+
+/// Catches a tier whose node keeps its local copies in the one cache
+/// (`kbf_storage::local_cache`) still keeping a flushed copy: a second copy of every
+/// flushed blob on the same disk (the "two directories" mutant). Without flushed
+/// copies, a flushed block is deleted, stops counting, is read by no one (a reader goes
+/// to the store), and a reservation does not see it.
+#[test]
+fn without_flushed_copies_a_flushed_block_is_deleted() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let now = Instant::now();
+    let options = options(1 << 20, LIMIT).without_flushed_copies();
+    assert!(!options.flushed_copies);
+    let (tier, _) = open_tier(&fs, 1, options, &index).unwrap();
+    let (object, at) = ack_group(&tier, &mut index, &bytes(1, 10), now).unwrap();
+    seal(&tier, &mut index, now);
+    tier.flushed(object).unwrap();
+    assert_eq!(fs.contents(&block_name(object)), None);
+    assert_eq!(fs.contents(&seg_name(object)), None);
+    assert!(matches!(
+        tier.read(object, at, 10),
+        Err(TierError::UnknownBlock(o)) if o == object
+    ));
+    let usage = tier.usage();
+    assert_eq!((usage.used, usage.flushed), (0, 0));
+    let other = ack_upload(&tier, &mut index, &bytes(2, 10)).unwrap();
+    fs.fail_at(fs.ops(), kbf_store::Fault::Error);
+    assert!(matches!(
+        tier.flushed(other),
+        Err(TierError::Io { op: "remove", .. })
+    ));
+    assert!(
+        fs.contents(&block_name(other)).is_some(),
+        "left for the next start's sweep"
+    );
+    assert_eq!(fs.contents(&seg_name(other)), None);
+    assert_eq!(tier.usage().used, 0);
+}

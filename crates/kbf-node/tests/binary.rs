@@ -1288,7 +1288,31 @@ fn ended(pid: i32) -> bool {
             .expect("ps");
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     };
-    stat.is_empty() || stat.starts_with('Z')
+    stat_is_ended(&stat)
+}
+
+/// Whether a process whose state field (what follows its command name in
+/// `/proc/<pid>/stat`, or `ps -o stat=`) is `stat` has ended: it is gone (no field), a
+/// zombie (`Z`) or dead (`X`, or `x` on kernels before 3.13). A zombie that its new
+/// parent reaps shows `X` for the instant the reaper holds it, so `X` must count: read
+/// as alive, a process that had ended turns up as a survivor on the next look.
+fn stat_is_ended(stat: &str) -> bool {
+    stat.is_empty() || stat.starts_with(['Z', 'X', 'x'])
+}
+
+/// Catches an `ended` that calls a process alive while its reaper holds it: the state
+/// `X` follows `Z` for an instant before the pid is gone, so a process seen ended once
+/// (as `Z`) was a survivor on the next look (the flake of
+/// [`a_killed_daemons_action_ends_without_a_restart`]). Every state field that means
+/// the process is still there must stay alive.
+#[test]
+fn a_process_whose_reaper_holds_it_has_ended() {
+    for stat in ["", "Z", "Z 1 2 3", "X", "X 1 2 3", "x"] {
+        assert!(stat_is_ended(stat), "{stat:?} has ended");
+    }
+    for stat in ["R", "S 1 2 3", "D", "T", "t", "I", "Ss+"] {
+        assert!(!stat_is_ended(stat), "{stat:?} is still there");
+    }
 }
 
 /// Waits until the daemon logging to `log` says its first survey ended, for at most

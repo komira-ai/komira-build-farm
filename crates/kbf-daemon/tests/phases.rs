@@ -59,7 +59,7 @@ impl Farm {
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
             reapi_tls: None,
             worker_tls: Some(WorkerTls {
-                server: pki.server_tls(),
+                server: pki.worker_tls(),
                 deny_list: None,
             }),
             heartbeat_interval: Duration::from_millis(100),
@@ -69,10 +69,11 @@ impl Farm {
             memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
+            streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             segments: kbf_front::SegmentsConfig::DEFAULT,
-            streams: kbf_server::StreamLimits::DEFAULT,
+            stream_limits: kbf_server::StreamLimits::DEFAULT,
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

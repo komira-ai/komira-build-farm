@@ -3,13 +3,19 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use futures::channel::mpsc::unbounded;
+use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+use kbf_mapsync::{FakeMapSource, MapSource};
 use kbf_proto::worker::worker_client::WorkerClient;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, LeaseId, Offer, daemon_message, server_message,
+    Capability, DaemonMessage, Heartbeat, LeaseId, MapRequest, Offer, daemon_message,
+    server_message,
 };
 use support::{
-    Blob, Cell, FakeDaemon, Job, done, done_within_quiet, failed, hello, output, ran, response,
+    Blob, Cell, FakeDaemon, Job, PROMPT, done, done_within_quiet, failed, hello, output, ran,
+    response,
 };
 use tonic::Code;
 use tonic::transport::Endpoint;
@@ -412,4 +418,27 @@ async fn a_listed_lease_the_server_gave_up_is_cancelled() {
     let result = output(&cell, "from the retry", 0).await;
     assert!(back.report(ran(Some(retry), &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result));
+}
+
+/// Catches a session that does not answer a `MapRequest` with the map the server holds:
+/// the session handler of this binary's cell is the instantiation of the generic server
+/// code that every other arm of the handler is covered in, so the request is asked here
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_map_request_is_answered_with_the_map_held() {
+    let member = Member {
+        id: MemberId(1),
+        addr: "127.0.0.1:1".to_owned(),
+        zone: String::new(),
+        weight: 1,
+        state: MemberState::Active,
+    };
+    let held = Map::new(3, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
+    let source = Arc::new(FakeMapSource::new(held));
+    let cell = Cell::start_with_map(source as Arc<dyn MapSource>).await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    daemon.send(daemon_message::Message::MapRequest(MapRequest {
+        at_least: 9,
+    }));
+    assert_eq!(daemon.map_update_within(PROMPT).await, Some(3));
 }

@@ -1,10 +1,13 @@
 //! `cargo xtask build-commit`: kbf-server names the commit it was built from
 //! (`crates/kbf-server/build.rs`).
 //!
-//! - `check <binary> <commit>`: `<binary> --version` prints exactly `<name> <package
-//!   version>+<first 12 of commit>`, where `<name>` is the binary's file name. Control:
-//!   the same output must not pass for the commit with its first digit changed, so a
-//!   comparison that accepts anything fails instead of passing.
+//! - `check [--json] <binary> <commit>`: `<binary> --version` prints exactly `<name>
+//!   <package version>+<first 12 of commit>`, where `<name>` is the binary's file name.
+//!   Control: the same output must not pass for the commit with its first digit
+//!   changed, so a comparison that accepts anything fails instead of passing. With
+//!   `--json`, `<binary> --version --json` (kbf's build identity, crates/kbf-cli) must
+//!   also print a JSON object whose `commit` is the first 12 of `<commit>` and whose
+//!   `profile` is `release`: the shipped bytes say what they are.
 //! - `stamps <commit>`: from the checkout, a plain build of kbf-server passes `check`
 //!   for `<commit>`; builds with `KBF_BUILD_COMMIT_OVERRIDE` set to two stamps each pass
 //!   `check` for their own stamp (so they name no other commit; a `<commit>` that begins
@@ -103,17 +106,22 @@ pub fn check_version(
     Ok(())
 }
 
-/// `binary --version`, without its line end.
-fn version_of(binary: &Path) -> Result<String, Error> {
-    let out = Command::new(binary)
-        .arg("--version")
+/// `binary --version`, or with `json` `binary --version --json`, without its line end.
+fn version_of(binary: &Path, json: bool) -> Result<String, Error> {
+    let mut cmd = Command::new(binary);
+    cmd.arg("--version");
+    if json {
+        cmd.arg("--json");
+    }
+    let out = cmd
         .stderr(Stdio::inherit())
         .output()
         .map_err(Error::spawn(binary.display().to_string()))?;
     if !out.status.success() {
         return Err(Error::Failed(format!(
-            "{} --version: {}",
+            "{} --version{}: {}",
             binary.display(),
+            if json { " --json" } else { "" },
             out.status
         )));
     }
@@ -121,17 +129,55 @@ fn version_of(binary: &Path) -> Result<String, Error> {
     Ok(text.strip_suffix('\n').unwrap_or(&text).to_owned())
 }
 
-/// `check <binary> <commit>`: the line it prints on success.
+/// What the identity `json` (the output of `--version --json`) says of a release build of
+/// `commit`: the line `check --json` adds to what it prints.
 ///
 /// # Errors
-/// As [`check_version`], or the binary did not run.
-pub fn check(binary: &Path, commit: &str) -> Result<String, Error> {
+/// `json` is not a JSON object, lacks a string `commit` or `profile`, names another
+/// commit than the first 12 digits of `commit`, or is not a `release` build.
+pub fn check_identity(json: &str, commit: &str) -> Result<String, Error> {
+    let bad = |why: String| Error::Failed(format!("--version --json: {why}"));
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| bad(format!("not a JSON object: {json}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| bad(format!("not a JSON object: {json}")))?;
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad(format!("no string field {name:?}")))
+    };
+    let (stamp, profile) = (field("commit")?, field("profile")?);
+    let short = &commit[..commit.len().min(12)];
+    if stamp != short {
+        return Err(bad(format!("\"commit\" is {stamp:?}; expected {short:?}")));
+    }
+    if profile != "release" {
+        return Err(bad(format!(
+            "\"profile\" is {profile:?}; expected \"release\""
+        )));
+    }
+    Ok(format!(
+        "--version --json: commit {stamp}, profile {profile}"
+    ))
+}
+
+/// `check [--json] <binary> <commit>`: the line it prints on success.
+///
+/// # Errors
+/// As [`check_version`] (and, with `json`, [`check_identity`]), or the binary did not run.
+pub fn check(binary: &Path, commit: &str, json: bool) -> Result<String, Error> {
     let name = binary
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let version = version_of(binary)?;
+    let version = version_of(binary, false)?;
     check_version(&version, &name, commit, names)?;
+    if json {
+        let identity = check_identity(&version_of(binary, true)?, commit)?;
+        return Ok(format!("ok: {version}; {identity}"));
+    }
     Ok(format!("ok: {version}"))
 }
 
@@ -190,10 +236,10 @@ pub fn stamps(cargo: &OsStr, root: &Path, commit: &str) -> Result<Vec<String>, E
     let binary = root.join("target/debug/kbf-server");
     let mut passed = Vec::new();
     build_ok(cargo, root, None)?;
-    passed.push(check(&binary, commit)?);
+    passed.push(check(&binary, commit, false)?);
     for stamp in STAMPS {
         build_ok(cargo, root, Some(stamp))?;
-        passed.push(check(&binary, stamp)?);
+        passed.push(check(&binary, stamp, false)?);
     }
     let out = build(cargo, root, Some(BAD_STAMP))?;
     let log = String::from_utf8_lossy(&out.stderr);

@@ -19,6 +19,8 @@
 //!   to hash them ([`Intake`]), so each is read once.
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
+//! - [`RoutedCas`]: the same [`Cas`] over the storage map (`kbf-route`): each blob goes to
+//!   the storage nodes that own it, so a daemon moves bytes to and from storage directly.
 //! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.
 //! - [`Record`]: a blob to store, with where its bytes are ([`Source`]: memory, a file the
 //!   caller hashed, or a [`Spool`]). [`Cas::put_records`] stores them; the engine reads
@@ -41,6 +43,7 @@ mod config;
 mod engine;
 mod find;
 mod flights;
+mod routed;
 mod segments;
 mod source;
 mod spool;
@@ -55,6 +58,7 @@ pub use config::{
 };
 pub use engine::{Scope, Transfers};
 pub use kbf_segments::RecordHasher;
+pub use routed::RoutedCas;
 pub use segments::{
     COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned,
     SEGMENT_UPLOAD_BYTES, plan, put_each, read_pieces,

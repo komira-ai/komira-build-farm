@@ -110,6 +110,27 @@ impl Farm {
         Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch, closing)).await
     }
 
+    /// The cache services and `Execution` over `dispatch`, whose streams end when
+    /// `closing`'s closer closes and are re-sent at every tick of `progress`.
+    pub async fn with_execution_progress<D: Dispatch>(
+        dispatch: Arc<D>,
+        closing: Closing,
+        progress: kbf_front::Progress,
+    ) -> Self {
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                progress,
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                kbf_front::DEFAULT_RESOURCES.memory_bytes,
+            )
+        };
+        Self::serve(routes).await
+    }
+
     /// The cache services and `Execution` over `dispatch` (streams never closed),
     /// where an action that names no memory size books `default_memory` bytes.
     pub async fn with_default_memory<D: Dispatch>(dispatch: Arc<D>, default_memory: u64) -> Self {
@@ -119,6 +140,7 @@ impl Farm {
                 cache,
                 dispatch,
                 closing,
+                kbf_front::Progress::off(),
                 Arc::new(Authorizers::allow_all()),
                 &kbf_front::Recorder::off(),
                 default_memory,

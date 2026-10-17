@@ -122,6 +122,9 @@ fn any_difference_plans_the_step_again() {
         file(P644, other_owner, b"A=1\n"),
         dir(P644, Owner { uid: 0, gid: 0 }),
         Entry::Other,
+        Entry::Link {
+            target: "/a.real".into(),
+        },
     ];
     for have in files {
         let mut exec = FakeExec::new(0);
@@ -328,4 +331,76 @@ fn the_planner_says_whether_it_planned_a_step() {
     assert!(!planner.absent(p("/g")).expect("plan"));
     assert_eq!(planner.steps().len(), 3);
     assert_eq!(planner.finish().steps().len(), 3);
+}
+
+/// Catches a link planner that plans a flip when the link already points at the target
+/// (every deploy would rewrite `current` for nothing, and a re-plan after an apply would
+/// not be empty), one that keeps a link pointing elsewhere, and one that plans a step
+/// over a file, directory or socket (which the step would refuse half-way through an
+/// apply) instead of refusing before any step.
+///
+/// Mutants seen red: `done` always false; a non-link planned as a flip.
+#[test]
+fn a_link_is_planned_only_when_it_points_elsewhere_or_is_missing() {
+    let mut exec = FakeExec::new(0);
+    let want = std::path::PathBuf::from("releases/b");
+    let plan = |exec: &FakeExec| {
+        let mut planner = Planner::new(exec);
+        let planned = planner
+            .symlink(p("/kbf/current"), want.clone())
+            .expect("plan");
+        (planned, planner.finish())
+    };
+    let (planned, missing) = plan(&exec);
+    let flip = Step::Symlink {
+        path: p("/kbf/current"),
+        target: want.clone(),
+    };
+    assert!(planned);
+    assert_eq!(missing.steps(), std::slice::from_ref(&flip));
+    exec.entries.insert(
+        p("/kbf/current"),
+        Entry::Link {
+            target: "releases/a".into(),
+        },
+    );
+    assert_eq!(plan(&exec).1.steps(), [flip]);
+    execute(
+        &missing,
+        RunAs::Root,
+        Mode::Apply,
+        &mut exec,
+        &mut Vec::new(),
+    )
+    .expect("apply");
+    let (planned, again) = plan(&exec);
+    assert!(!planned && again.is_empty(), "the re-plan was {again:?}");
+
+    let others = [
+        Entry::File {
+            perms: P644,
+            owner: RUNNER,
+            bytes: Vec::new(),
+        },
+        Entry::Dir {
+            perms: P755,
+            owner: RUNNER,
+        },
+        Entry::Other,
+    ];
+    for have in others {
+        let mut exec = FakeExec::new(0);
+        exec.entries.insert(p("/kbf/current"), have.clone());
+        let err = Planner::new(&exec)
+            .symlink(p("/kbf/current"), want.clone())
+            .expect_err("refused");
+        assert!(
+            matches!(&err, HostError::NotALink { path } if *path == p("/kbf/current")),
+            "{have:?}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "refusing to replace /kbf/current with a symbolic link: it is not one"
+        );
+    }
 }

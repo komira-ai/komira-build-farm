@@ -48,12 +48,17 @@ hex = "0.4.3"
 # The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
+# The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.
+http-body = "1.1.0"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
 # xz for the tar.xz archives `cargo xtask fetch` unpacks; pure Rust, no C liblzma.
 lzma-rs = "0.3.0"
 hmac = "0.13.0"
+# The state store's Postgres backend (kbf-state, feature `postgres`): the blocking client,
+# no TLS (an `sslmode=require` URL is refused rather than downgraded).
+postgres = "0.19.10"
 # The MDM gate serves its mutual-TLS listener with hyper directly (axum's own `serve`
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
@@ -101,6 +106,10 @@ ruzstd = "0.9.1"
 # drives `crun` through: run, kill and delete. The async client; the crate has no
 # synchronous client in the same build.
 runc = { version = "0.3.0", features = ["async"] }
+# The SQLite state store (kbf-state): the C library is compiled in (`bundled`), so the file
+# format and WAL behaviour do not depend on the host's libsqlite3; `hooks` for the commit
+# counter. No default features: no statement cache (hashlink) and no wasm shim.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
@@ -110,6 +119,10 @@ saphyr-parser = "0.1.0"
 security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The fixed-key hash behind the storage map's rendezvous scores (kbf-map): SipHash-2-4 with a
+# specified output, so an owner list is the same on every build and platform. Already in the
+# tree through another crate; MIT OR Apache-2.0.
+siphasher = "1.0.4"
 sha2 = "0.11.0"
 # OpenSSH signatures (`ssh-keygen -Y sign`) on operator erase requests (kbf-mdm): the
 # SSHSIG envelope and security-key (`sk-`) signature verification.
@@ -135,18 +148,21 @@ tonic-prost-build = "0.14.6"
 # The REAPI authentication layer (kbf-auth). Already in the tree through tonic.
 tower-layer = "0.3.3"
 tracing = "0.1.44"
+tracing-core = "0.1.36"
 tracing-subscriber = "0.3.23"
 # HTTPS downloads for `cargo xtask fetch`, over the rustls (ring) above: no provider
 # feature, so neither aws-lc-rs nor the bundled webpki roots (CDLA licence) come in;
 # the agent is given ring and the host's roots.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
-# Reads the fields of a daemon's client certificate the worker listener checks (its DNS
-# subjectAltName, serial and public key); TLS has already verified the certificate.
+# Reads the fields of a peer's client certificate the listeners check (its role URI,
+# kbf-peer; a daemon's DNS subjectAltName, serial and public key, kbf-server); TLS has
+# already verified the certificate.
 x509-parser = "0.18.1"
 # The zip archives kbf-deploy installs (`mdm install`): deflate only, through flate2.
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
+kbf-all-in-one = { path = "crates/kbf-all-in-one" }
 kbf-auth = { path = "crates/kbf-auth" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
@@ -156,10 +172,13 @@ kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-history = { path = "crates/kbf-history" }
 kbf-host = { path = "crates/kbf-host" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }
+kbf-map = { path = "crates/kbf-map" }
+kbf-mapsync = { path = "crates/kbf-mapsync" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-mdm = { path = "crates/kbf-mdm" }
 kbf-mdm-api = { path = "crates/kbf-mdm-api" }
@@ -167,19 +186,25 @@ kbf-meta = { path = "crates/kbf-meta" }
 kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
+kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-raft = { path = "crates/kbf-raft" }
+kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
+kbf-state = { path = "crates/kbf-state" }
+kbf-storage = { path = "crates/kbf-storage" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-threads = { path = "crates/kbf-threads" }
+kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
+kbf-ui = { path = "crates/kbf-ui" }
 # The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
@@ -190,3 +215,15 @@ xtask = { path = "crates/xtask" }
 [workspace.lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"
+
+# Dev and test builds: a test binary with full debug info is ~0.5 GB and a target
+# directory holds thousands of them, plus incremental state. Line tables keep panic
+# backtraces and profilers at file:line; variable-level debug info is the part dropped.
+# `test` inherits `dev`; it is spelled out so the two cannot drift. Release is untouched.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false

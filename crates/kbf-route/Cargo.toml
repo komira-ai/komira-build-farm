@@ -1,0 +1,32 @@
+[package]
+name = "kbf-route"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The routing library of architecture v2 (docs/design/architecture-v2.md, sections 6 to 8):
+# blob and action-cache calls over the storage map, for the frontend and the daemon. It
+# depends on the storage client and the map, never on the frontend's scheduler or
+# authorization, nor on the daemon's transfer engine (crates/kbf-it/tests/layering.rs).
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+kbf-map.workspace = true
+kbf-meta.workspace = true
+kbf-proto.workspace = true
+kbf-segments.workspace = true
+kbf-storage.workspace = true
+kbf-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

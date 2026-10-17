@@ -1,0 +1,49 @@
+# Rendered by `kbf-deploy linux render-units --mode daemon`; installed as
+# /etc/systemd/system/kbf-daemon.service in place of the kbf-daemon binary's unit
+# (kbf docs/design/architecture-v2.md, sections 1 and 11). `kbf daemon` takes exactly
+# the flags kbf-daemon takes.
+[Unit]
+Description=kbf build farm node daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=@KBF_USER@
+Slice=kbf.slice
+# The daemon manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
+Delegate=yes
+# Equal to --supervisor-memory-min-mib.
+MemoryMin=@DAEMON_MEMORY_MIN@
+# Build containers get 0 back from the driver.
+OOMScoreAdjust=-900
+CPUWeight=200
+# No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
+# daemon's swap watch kills a lease that swaps at its own cap.
+Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
+# --server and --cas dial the frontend by KBF_FRONTEND_NAME, not this node's own
+# KBF_HOST_NAME. TODO(registration): --frontend=<the frontend's DNS name> in place of
+# them, and --advertise-addr where the bind address is not routable, once a daemon
+# registers with a frontend and takes the storage map it pushes. (No comment goes inside
+# the continued lines below: systemd 239 and older read one into the command line.)
+ExecStart=@KBF_BIN_DIR@/kbf daemon \
+    --driver=container \
+    --server=https://@KBF_FRONTEND_NAME@:@KBF_WORKER_PORT@ \
+    --cas=https://@KBF_FRONTEND_NAME@:@KBF_WORKER_PORT@ \
+    --ca-cert=@KBF_ETC@/ca.pem \
+    --cert=@KBF_ETC@/node.pem \
+    --key=@KBF_ETC@/node.key \
+    --node-id=@KBF_NODE_ID@ \
+    --data-dir=@KBF_DATA_DIR@ \
+@DAEMON_IMAGE_ARGS@
+@DAEMON_TUNING_ARGS@
+    --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
+    --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
+Restart=on-failure
+# Exit 2 is a command line kbf refused (or an image it cannot parse): a restart cannot
+# fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

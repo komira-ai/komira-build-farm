@@ -2,8 +2,10 @@
 //! fetch per blob however many leases want it, links of one inode per key per lease,
 //! the fallbacks to a private copy, the checks on every hit, eviction by budget and by
 //! free space, and the one-owner lock; restarts (`restart`), crashes (`crash`) and
-//! refusals and I/O errors (`edges`); measurements at 1M entries, off the gate
-//! (`measure`). One test binary, so each part of the cache is measured in one place.
+//! refusals and I/O errors (`edges`); the node's one cache with local storage and fills
+//! that stream (`one_cache`); fills that end without an entry leave nothing in `tmp/`
+//! (`tmp_files`); measurements at 1M entries, off the gate (`measure`). One test
+//! binary, so each part of the cache is measured in one place.
 #![cfg(target_os = "linux")]
 
 #[path = "cache/crash.rs"]
@@ -12,9 +14,13 @@ mod crash;
 mod edges;
 #[path = "cache/measure.rs"]
 mod measure;
+#[path = "cache/one_cache.rs"]
+mod one_cache;
 #[path = "cache/restart.rs"]
 mod restart;
 mod support;
+#[path = "cache/tmp_files.rs"]
+mod tmp_files;
 
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;

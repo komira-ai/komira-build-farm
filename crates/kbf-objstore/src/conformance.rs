@@ -3,7 +3,9 @@
 //! [`run`] drives every check against one store under a scratch prefix and returns a
 //! [`Report`]; it never panics on a misbehaving store. It checks the base contract
 //! (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list
-//! paging) and every claim in [`Capabilities`]: a store claiming conditional writes must
+//! paging (also past S3's 1000-key page), a listing that starts after a key or covers the whole bucket, and the footer
+//! reads a rebuild makes; the listing checks in `list` page through every page size, a
+//! prefix that matches nothing, nested keys, and keys written during a listing) and every claim in [`Capabilities`]: a store claiming conditional writes must
 //! refuse an overwrite, a store claiming Object Lock must refuse deleting a retained
 //! object and keep it readable, and a store not claiming Object Lock must refuse a
 //! retention date rather than store the object unlocked.
@@ -11,16 +13,20 @@
 //! Objects written under Object Lock cannot be removed until their date (one hour), so
 //! give each run a fresh prefix when running against a real store.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt as _, TryStreamExt as _, stream};
+use kbf_segments::{SegmentWriter, layout::footer_len};
+use kbf_types::Digest;
 
+use crate::footers::{self, FooterRead, FooterReads};
 use crate::{
-    BodyStream, ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListToken, ObjectInfo, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize,
 };
 
 /// How long the Object Lock check retains its object.
@@ -28,6 +34,10 @@ const LOCK_FOR: Duration = Duration::from_secs(3600);
 /// Objects the list check writes; with pages of [`LIST_PAGE`], the last page is short.
 const LIST_OBJECTS: usize = 7;
 const LIST_PAGE: u16 = 3;
+/// Objects the page-cap check writes: one past S3's largest page.
+const PAST_PAGE_CAP: usize = 1001;
+/// How many of those writes are in flight at once.
+const PAST_PAGE_CAP_PUTS: usize = 16;
 
 /// One check in the suite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +53,35 @@ pub enum Check {
     /// Paged listing returns every key under the prefix once, in order, in pages no
     /// larger than asked, and nothing outside the prefix.
     ListPagination,
+    /// A listing [`ListToken::after`] a key (present or not) starts at the next key
+    /// under the prefix and pages on from there.
+    ListStartAfter,
+    /// A listing of one key more than the largest page ([`PageSize::MAX`], S3's 1000)
+    /// in pages of that size returns every key once, in order (so over at least two pages).
+    ListPastPageCap,
+    /// A listing under the empty prefix covers the whole bucket, in order, across pages
+    /// (started after a key just before this run's own, so the check reads only those).
+    ListEmptyPrefix,
+    /// Six keys listed in pages of 1, 2, 3, 4, 6 and 7 (one key a page, exact
+    /// multiples, a short last page, one page), page by page and streamed through
+    /// [`listing::objects`](crate::listing::objects): every key and size once, in order,
+    /// no page larger than asked.
+    ListPageSizes,
+    /// A prefix that matches no key, between two keys that share its text, lists
+    /// nothing, page by page and streamed.
+    ListNoMatch,
+    /// Keys nested under `/` at several depths, and the characters either side of `/`:
+    /// a listing returns every key under the prefix at any depth (no grouping at `/`),
+    /// in byte order, under a prefix ending in `/` or not.
+    ListNested,
+    /// Between pages, a key written after the cursor and keys deleted behind and ahead
+    /// of it: every key present throughout is listed exactly once, in order. Keys
+    /// written or deleted during the listing may or may not be listed.
+    ListDuringWrites,
+    /// [`footers::read_footers`] over segments, a torn segment, a foreign object and a
+    /// short one gives every segment's index exactly, skips the rest for the right
+    /// reason, and reads only the tails.
+    FooterReads,
     /// With conditional writes, `put_new` refuses an existing key and keeps its bytes.
     PutNewRefusesOverwrite,
     /// With Object Lock, a retained object refuses delete and stays readable; without
@@ -135,6 +174,26 @@ pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
         delete_idempotent(store, prefix).await,
     );
     record(Check::ListPagination, list_pagination(store, prefix).await);
+    record(Check::ListStartAfter, list_start_after(store, prefix).await);
+    record(
+        Check::ListPastPageCap,
+        list_past_page_cap(store, prefix).await,
+    );
+    record(
+        Check::ListEmptyPrefix,
+        list_empty_prefix(store, prefix).await,
+    );
+    record(
+        Check::ListPageSizes,
+        list::list_page_sizes(store, prefix).await,
+    );
+    record(Check::ListNoMatch, list::list_no_match(store, prefix).await);
+    record(Check::ListNested, list::list_nested(store, prefix).await);
+    record(
+        Check::ListDuringWrites,
+        list::list_during_writes(store, prefix).await,
+    );
+    record(Check::FooterReads, footer_reads(store, prefix).await);
     record(
         Check::PutNewRefusesOverwrite,
         refuses_overwrite(store, prefix, caps).await,
@@ -154,10 +213,18 @@ macro_rules! ensure {
     };
 }
 
+mod list;
+
 fn key(prefix: &KeyPrefix, name: &str) -> Result<ObjectKey, String> {
     prefix
         .key(name)
         .map_err(|e| format!("scratch key {name}: {e}"))
+}
+
+fn child(prefix: &KeyPrefix, name: &str) -> Result<KeyPrefix, String> {
+    prefix
+        .child(name)
+        .map_err(|e| format!("scratch prefix {name}: {e}"))
 }
 
 fn range(offset: u64, len: u64) -> ByteRange {
@@ -282,9 +349,7 @@ async fn delete_idempotent<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Che
 }
 
 async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
-    let dir = prefix
-        .child("list/")
-        .map_err(|e| format!("list prefix: {e}"))?;
+    let dir = child(prefix, "list/")?;
     let mut want = BTreeSet::new();
     for i in 0..LIST_OBJECTS {
         let k = key(&dir, &format!("k{i}"))?;
@@ -294,37 +359,13 @@ async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Check
     // Shares the text `<prefix>list` but not `<prefix>list/`: must not be listed.
     put(store, &key(prefix, "list-outside")?, &pattern(1, 0)).await?;
 
-    let page_size = PageSize::new(LIST_PAGE).expect("in range");
-    let mut seen = Vec::new();
-    let mut token = None;
-    let mut pages = 0;
-    loop {
-        pages += 1;
-        ensure!(
-            pages <= LIST_OBJECTS + 1,
-            "list did not end after {pages} pages"
-        );
-        let page = store
-            .list(&dir, token.as_ref(), page_size)
-            .await
-            .map_err(|e| format!("list page {pages}: {e}"))?;
-        ensure!(
-            page.objects.len() <= usize::from(LIST_PAGE),
-            "page {pages} has {} keys; at most {LIST_PAGE} were asked for",
-            page.objects.len()
-        );
-        seen.extend(page.objects.into_iter().map(|o| (o.key, o.size)));
-        match page.next {
-            Some(t) => token = Some(t),
-            None => break,
-        }
-    }
-    let keys: Vec<&ObjectKey> = seen.iter().map(|(k, _)| k).collect();
+    let (seen, pages) = list_from(store, &dir, None, LIST_PAGE, usize::MAX).await?;
+    let keys: Vec<&ObjectKey> = seen.iter().map(|o| &o.key).collect();
     ensure!(
         keys.windows(2).all(|w| w[0] < w[1]),
         "listed keys are not strictly ascending (out of order or repeated): {keys:?}"
     );
-    let got: BTreeSet<_> = seen.into_iter().collect();
+    let got: BTreeSet<_> = seen.into_iter().map(|o| (o.key, o.size)).collect();
     let missing: Vec<_> = want.difference(&got).map(|(k, _)| k.as_str()).collect();
     let extra: Vec<_> = got.difference(&want).map(|(k, _)| k.as_str()).collect();
     ensure!(
@@ -335,6 +376,198 @@ async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Check
     ensure!(
         pages >= min_pages,
         "{LIST_OBJECTS} keys came in {pages} pages of at most {LIST_PAGE}"
+    );
+    Ok(Outcome::Passed)
+}
+
+/// Lists `prefix` from `after` in pages of `page` keys until the listing ends or
+/// `enough` keys came, failing past [`LIST_OBJECTS`] + 1 pages or on a page larger than
+/// asked: the objects in the order they came, and how many pages.
+async fn list_from<S: ObjectStore>(
+    store: &S,
+    prefix: &KeyPrefix,
+    mut after: Option<ListToken>,
+    page: u16,
+    enough: usize,
+) -> Result<(Vec<ObjectInfo>, usize), String> {
+    let page_size = PageSize::new(page).expect("in range");
+    let mut keys = Vec::new();
+    let mut pages = 0;
+    while keys.len() < enough {
+        pages += 1;
+        ensure!(
+            pages <= LIST_OBJECTS + 1,
+            "list did not end after {pages} pages"
+        );
+        let got = store
+            .list(prefix, after.as_ref(), page_size)
+            .await
+            .map_err(|e| format!("list {prefix:?} page {pages}: {e}"))?;
+        ensure!(
+            got.objects.len() <= usize::from(page),
+            "page {pages} has {} keys; at most {page} were asked for",
+            got.objects.len()
+        );
+        keys.extend(got.objects);
+        match got.next {
+            Some(t) => after = Some(t),
+            None => break,
+        }
+    }
+    Ok((keys, pages))
+}
+
+async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+    let dir = child(prefix, "after/")?;
+    let mut all = Vec::new();
+    for i in 0..LIST_OBJECTS {
+        let k = key(&dir, &format!("k{i}"))?;
+        put(store, &k, &pattern(1, 3)).await?;
+        all.push(k);
+    }
+    // After a key that exists, and after one that does not but sorts between k2 and k3.
+    for from in ["k2", "k2x"] {
+        let after = ListToken::after(&key(&dir, from)?);
+        let (got, _) = list_from(store, &dir, Some(after), LIST_PAGE, usize::MAX).await?;
+        let got: Vec<ObjectKey> = got.into_iter().map(|o| o.key).collect();
+        ensure!(
+            got == all[3..],
+            "listing {dir:?} after {from}: expected {:?}, got {got:?}",
+            &all[3..]
+        );
+    }
+    Ok(Outcome::Passed)
+}
+
+async fn list_past_page_cap<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+    let dir = child(prefix, "many/")?;
+    let mut want = Vec::with_capacity(PAST_PAGE_CAP);
+    for i in 0..PAST_PAGE_CAP {
+        want.push(key(&dir, &format!("m{i:04}"))?);
+    }
+    let body = pattern(1, 5);
+    stream::iter(want.iter().map(|k| put(store, k, &body)))
+        .buffer_unordered(PAST_PAGE_CAP_PUTS)
+        .try_collect::<()>()
+        .await?;
+    let (got, pages) = list_from(store, &dir, None, PageSize::MAX.get(), usize::MAX).await?;
+    let got: Vec<ObjectKey> = got.into_iter().map(|o| o.key).collect();
+    if got != want {
+        let (first, last) = (got.first(), got.last());
+        return Err(format!(
+            "listing {PAST_PAGE_CAP} keys under {dir:?} in pages of {}: got {} keys in {pages} pages, first {first:?}, last {last:?}",
+            PageSize::MAX.get(),
+            got.len()
+        ));
+    }
+    Ok(Outcome::Passed)
+}
+
+async fn list_empty_prefix<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+    let dir = child(prefix, "empty/")?;
+    let mut want = Vec::new();
+    for i in 0..5 {
+        let k = key(&dir, &format!("e{i}"))?;
+        put(store, &k, &pattern(1, 4)).await?;
+        want.push(k);
+    }
+    // `<prefix>empty` sorts just before `<prefix>empty/e0`, and no key of this run lies
+    // between them, so the whole-bucket listing from there starts with `want`.
+    let after = ListToken::after(&key(prefix, "empty")?);
+    let (got, _) = list_from(store, &KeyPrefix::default(), Some(after), 2, want.len()).await?;
+    let got: Vec<ObjectKey> = got.into_iter().map(|o| o.key).collect();
+    ensure!(
+        got.get(..want.len()) == Some(&want[..]),
+        "listing the whole bucket after {prefix:?}empty: expected {want:?} first, got {got:?}"
+    );
+    Ok(Outcome::Passed)
+}
+
+/// The tail the footer check reads first: longer than the one-record segment's footer
+/// (1108 bytes), shorter than the nine-record one's (1524), which takes a second read.
+const FOOTER_TAIL: u64 = 1200;
+
+async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+    let dir = child(prefix, "footers/")?;
+    // What the segments hold, as their writer laid them out: records back to back.
+    let mut want: BTreeMap<Digest, (ObjectKey, u64)> = BTreeMap::new();
+    let mut footers_len = BTreeMap::new();
+    for (name, records) in [("seg-a", 1_usize), ("seg-b", 9), ("seg-torn", 1)] {
+        let k = key(&dir, name)?;
+        let mut writer = SegmentWriter::new(1 << 20);
+        let mut offset = 0;
+        let mut index = Vec::new();
+        for r in 0..records {
+            let blob = pattern(100 + r, name.len() as u8 + r as u8);
+            let digest = writer.push(&blob).map_err(|e| format!("{name}: {e}"))?;
+            index.push((digest, (k.clone(), offset)));
+            offset += blob.len() as u64;
+        }
+        let mut bytes = writer.finish();
+        if name == "seg-torn" {
+            // The first byte of the fan-out flipped: the trailer reads, the footer's
+            // CRC does not.
+            bytes[offset as usize] ^= 1;
+        } else {
+            want.extend(index);
+            footers_len.insert(k.clone(), footer_len(records as u64));
+        }
+        put(store, &k, &bytes.into()).await?;
+    }
+    put(store, &key(&dir, "foreign")?, &pattern(4096, 8)).await?;
+    put(store, &key(&dir, "short")?, &pattern(10, 9)).await?;
+
+    let reads = FooterReads {
+        concurrency: NonZeroUsize::new(2).expect("not zero"),
+        page: PageSize::new(2).expect("in range"),
+        tail: NonZeroU64::new(FOOTER_TAIL).expect("not zero"),
+    };
+    let read: Vec<FooterRead> = footers::read_footers(store, &dir, None, reads)
+        .try_collect()
+        .await
+        .map_err(|e| format!("reading footers under {dir:?}: {e}"))?;
+    let mut got = BTreeMap::new();
+    let mut skipped = BTreeMap::new();
+    for r in read {
+        match r {
+            FooterRead::Segment(s) => {
+                // The first read, or the footer if it is longer: never the records
+                // before them.
+                let most = footers_len[&s.key].max(FOOTER_TAIL);
+                ensure!(
+                    s.bytes_read <= most,
+                    "{}: read {} bytes for its footer; at most {most} are needed",
+                    s.key,
+                    s.bytes_read
+                );
+                for e in s.footer.entries() {
+                    got.insert(e.digest, (s.key.clone(), e.offset));
+                }
+            }
+            FooterRead::Skipped(s) => {
+                // The reason without its detail: "not a segment: <why>" or another.
+                let why = s.why.to_string();
+                let why = why.split(':').next().unwrap_or_default().to_owned();
+                let name = s.key.as_str().rsplit('/').next().unwrap_or_default();
+                skipped.insert(name.to_owned(), why);
+            }
+        }
+    }
+    ensure!(
+        got == want,
+        "segment indexes read back: expected {want:?}, got {got:?}"
+    );
+    let want_skipped: BTreeMap<String, String> = [
+        ("foreign", "not a segment"),
+        ("seg-torn", "not a segment"),
+        ("short", "shorter than a segment trailer"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    ensure!(
+        skipped == want_skipped,
+        "skipped objects: expected {want_skipped:?}, got {skipped:?}"
     );
     Ok(Outcome::Passed)
 }

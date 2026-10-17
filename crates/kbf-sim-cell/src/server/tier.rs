@@ -70,9 +70,9 @@ pub struct TierPlan {
 impl TierPlan {
     fn options(self) -> TierOptions {
         TierOptions {
-            budget: self.budget,
             seal_after: self.seal_after,
             segment_limit: self.segment_limit,
+            ..TierOptions::new(self.budget)
         }
     }
 }
@@ -301,7 +301,7 @@ impl Server {
         let snapshot = up.query(StagedSnapshot::of);
         let start = TierStart {
             tier: id,
-            epoch: up.writer,
+            writer: kbf_meta::Writer::Epoch(up.writer),
             options: plan.options(),
         };
         let next = Arc::clone(&up.next_object);

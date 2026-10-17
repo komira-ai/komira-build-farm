@@ -2,12 +2,12 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use super::*;
-use crate::plan::{Mode, Planner, RunAs, execute};
-use crate::testkit::scratch;
+use crate::plan::{HostError, Mode, Planner, RunAs, execute};
+use crate::testkit::{ScratchHost, scratch};
 
 fn p(s: &str) -> HostPath {
     HostPath::new(s).expect("valid test path")
@@ -129,16 +129,19 @@ fn mkdir_sets_an_existing_directory_and_refuses_a_file() {
 }
 
 /// Catches `inspect` following a link (a link to a file would read as that file, and a
-/// plan could never replace the link), and errors other than "not found" read as
-/// absent.
+/// plan could never replace the link) or losing its target (a link plan could never
+/// see it is done), and errors other than "not found" read
+/// as absent.
 #[test]
-fn inspect_sees_links_as_other_and_reports_errors() {
+fn inspect_sees_a_link_and_its_target_and_reports_errors() {
     let (mut exec, dir) = host("inspect");
     fs::write(dir.join("target"), "x").expect("seed");
     std::os::unix::fs::symlink(dir.join("target"), dir.join("link")).expect("link");
     assert_eq!(
         exec.inspect(&p("/link")).expect("inspect"),
-        Some(Entry::Other)
+        Some(Entry::Link {
+            target: dir.join("target")
+        })
     );
     assert_eq!(exec.inspect(&p("/none")).expect("inspect"), None);
     let err = exec
@@ -474,4 +477,170 @@ fn only_a_closed_pipe_ends_the_input_write_quietly() {
     assert!(fed(Err(io::ErrorKind::BrokenPipe.into())).is_ok());
     let err = fed(Err(io::ErrorKind::PermissionDenied.into())).expect_err("kept");
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+}
+
+fn link_step(path: &str, target: &str) -> Step {
+    Step::Symlink {
+        path: p(path),
+        target: PathBuf::from(target),
+    }
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .expect("list")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Catches a link step that does not land under the root, that follows an old link to
+/// a directory (and makes the new link inside it), that leaves its temporary link
+/// behind, or a plan made again after the apply that is not empty (a real `inspect`
+/// that loses the target would plan the flip on every run).
+///
+/// Mutant seen red: `Planner::symlink` comparing nothing (`done = false`).
+#[test]
+fn a_link_flips_to_its_new_target_and_a_rerun_plans_nothing() {
+    let mut exec = ScratchHost::new("exec-link-flip");
+    let root = exec.root.clone();
+    fs::create_dir_all(root.join("usr/local/kbf/releases/a")).expect("seed");
+    fs::create_dir_all(root.join("usr/local/kbf/releases/b")).expect("seed");
+    let plan_once = |exec: &ScratchHost, target: &str| {
+        let mut planner = Planner::new(exec);
+        planner
+            .symlink(p("/usr/local/kbf/current"), PathBuf::from(target))
+            .expect("plan");
+        planner.finish()
+    };
+    for target in ["releases/a", "releases/b"] {
+        let plan = plan_once(&exec, target);
+        assert_eq!(plan.steps(), [link_step("/usr/local/kbf/current", target)]);
+        execute(&plan, RunAs::Root, Mode::Apply, &mut exec, &mut Vec::new()).expect("apply");
+        let link = root.join("usr/local/kbf/current");
+        assert_eq!(fs::read_link(&link).expect("a link"), PathBuf::from(target));
+        assert!(
+            plan_once(&exec, target).is_empty(),
+            "the re-run planned steps"
+        );
+    }
+    assert_eq!(
+        names_in(&root.join("usr/local/kbf")),
+        ["current", "releases"],
+        "a temporary link was left"
+    );
+    assert!(
+        names_in(&root.join("usr/local/kbf/releases/a")).is_empty(),
+        "the flip followed the old link into its directory"
+    );
+}
+
+/// Catches a flip that removes the old link before the new one exists (a reader, or a
+/// restart, would find no link): here making the new link fails (its target is longer
+/// than the system takes), and the old link must still be there, unchanged.
+///
+/// Mutant seen red: remove `path`, then make the link at `path` (no temporary link and
+/// rename).
+#[test]
+fn a_flip_that_fails_leaves_the_old_link() {
+    let (mut exec, dir) = host("link-fails");
+    std::os::unix::fs::symlink("releases/a", dir.join("current")).expect("seed");
+    let long = "x".repeat(5000);
+    let err = exec
+        .apply(&link_step("/current", &long))
+        .expect_err("a target longer than PATH_MAX is refused");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidFilename, "{err}");
+    assert_eq!(
+        fs::read_link(dir.join("current")).expect("the old link is still there"),
+        PathBuf::from("releases/a")
+    );
+    assert_eq!(names_in(&dir), ["current"]);
+}
+
+/// Catches a flip with a window in which the path names nothing: a reader polls the link
+/// while it flips between two targets, and must see one of them every time.
+///
+/// Mutant seen red: remove `path`, then make the link at `path`.
+#[test]
+fn a_reader_always_finds_the_link_while_it_flips() {
+    let (mut exec, dir) = host("link-reader");
+    std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
+    let link = dir.join("current");
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut missing = 0;
+            while !stop.load(Ordering::Relaxed) {
+                if fs::read_link(&link).is_err() {
+                    missing += 1;
+                }
+            }
+            missing
+        })
+    };
+    for i in 0..300 {
+        let target = if i % 2 == 0 { "b" } else { "a" };
+        exec.apply(&link_step("/current", target)).expect("flip");
+    }
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(reader.join().expect("reader"), 0, "the link was missing");
+}
+
+/// Catches a link step that replaces a file or a directory (rename(2) would put a link
+/// over a file, losing it) instead of refusing, a planner that plans that step instead of
+/// refusing first, and errors other than "not found" at the path read as absent.
+///
+/// Mutant seen red: the step's not-a-link check removed (the file is replaced).
+#[test]
+fn a_link_never_replaces_a_file_or_a_directory() {
+    let (mut exec, dir) = host("link-refuses");
+    fs::write(dir.join("file"), "keep").expect("seed");
+    fs::create_dir(dir.join("dir")).expect("seed");
+    for name in ["/file", "/dir"] {
+        let err = exec.apply(&link_step(name, "x")).expect_err(name);
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{name}: {err}");
+        assert!(err.to_string().contains("not a symbolic link"), "{err}");
+        let refused = Planner::new(&exec).symlink(p(name), PathBuf::from("x"));
+        assert!(
+            matches!(&refused, Err(HostError::NotALink { path }) if *path == p(name)),
+            "{name}: {refused:?}"
+        );
+    }
+    assert_eq!(fs::read(dir.join("file")).expect("kept"), b"keep");
+    assert!(dir.join("dir").is_dir());
+    assert_eq!(names_in(&dir), ["dir", "file"]);
+    let err = exec
+        .apply(&link_step("/file/below", "x"))
+        .expect_err("a file has no children");
+    assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+}
+
+/// Catches a stale temporary name the step cannot clear (a directory someone left
+/// there) being ignored: the step must fail and leave the link as it was.
+#[test]
+fn a_stale_temporary_that_cannot_be_removed_fails_the_flip() {
+    let (mut exec, dir) = host("link-stale");
+    std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
+    fs::create_dir_all(dir.join(".current.kbf-host-tmp/x")).expect("seed");
+    exec.apply(&link_step("/current", "b"))
+        .expect_err("the temporary name is taken by a directory");
+    assert_eq!(
+        fs::read_link(dir.join("current")).expect("kept"),
+        PathBuf::from("a")
+    );
+}
+
+/// Catches an error reading a link read as "not a link" (a link that vanished between
+/// the stat and the read would plan as a socket), and EINVAL read as an error.
+#[test]
+fn only_einval_reads_as_not_a_link() {
+    let einval = Err(io::Error::from(io::ErrorKind::InvalidInput));
+    assert_eq!(link_or_other(einval).expect("not a link"), Entry::Other);
+    let gone = Err(io::Error::from(io::ErrorKind::NotFound));
+    assert_eq!(
+        link_or_other(gone).expect_err("an error").kind(),
+        io::ErrorKind::NotFound
+    );
 }

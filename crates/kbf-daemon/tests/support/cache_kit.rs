@@ -318,8 +318,8 @@ impl Hooks for Gates {
 }
 
 /// A test's cache configuration: the cache in `dir/cache`, leases under `dir/leases`,
-/// `max_bytes`, no pause in a pass, snapshots and passes far apart, `hooks`, a fake
-/// clock at `clock`.
+/// `max_bytes`, no pause in a pass, snapshots, passes and room checks far apart,
+/// `hooks`, a fake clock at `clock`.
 pub fn config(dir: &Path, max_bytes: u64, hooks: Arc<Gates>, clock: &FakeClock) -> CacheConfig {
     let cache = dir.join("cache");
     std::fs::create_dir_all(&cache).expect("cache dir");
@@ -328,6 +328,7 @@ pub fn config(dir: &Path, max_bytes: u64, hooks: Arc<Gates>, clock: &FakeClock) 
     config.pass_pace = Duration::ZERO;
     config.snapshot_every = Duration::from_secs(3600);
     config.pass_every = Duration::from_secs(3600);
+    config.room_every = Duration::from_secs(3600);
     config.hooks = hooks;
     config.clock = clock.clock();
     config

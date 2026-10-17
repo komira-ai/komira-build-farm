@@ -15,9 +15,11 @@
 //!   first tarball with its last byte flipped must not match that line, so a check that
 //!   accepts anything fails instead of passing.
 //! - `verify-assets attestations <dir> --repo <owner/repo> --workflow-ref <ref>
-//!   [--gh <program>]` ([`verify_attestations`]): every listed tarball and SBOM has build
-//!   provenance signed by the workflow `--workflow-ref` names, for `refs/heads/main`, on
-//!   a GitHub-hosted runner, and every tarball has an SBOM attestation from the same
+//!   [--source-ref refs/heads/<branch>] [--gh <program>]` ([`verify_attestations`]):
+//!   every listed tarball and SBOM has build provenance signed by the workflow
+//!   `--workflow-ref` names, for the branch `--source-ref` names (default
+//!   `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage error),
+//!   on a GitHub-hosted runner, and every tarball has an SBOM attestation from the same
 //!   workflow: the `gh attestation verify` commands docs/artifacts.md gives. Controls:
 //!   the first tarball must not verify as signed by `ci.yml`, and the flipped copy must
 //!   not verify.
@@ -255,6 +257,10 @@ pub struct Attestations<'a> {
     /// The workflow that signed them, `<owner>/<repo>/<path>@<ref>` as Actions sets
     /// `GITHUB_WORKFLOW_REF`.
     pub workflow_ref: &'a str,
+    /// The branch they were signed on, as `refs/heads/<branch>`: `gh` verifies each
+    /// attestation names it. A deployment of what a push to `main` built passes
+    /// `refs/heads/main`.
+    pub source_ref: &'a str,
     /// The `gh` program.
     pub gh: &'a Path,
     /// An empty directory for the flipped copy.
@@ -271,7 +277,7 @@ impl Attestations<'_> {
             .args(["--repo", self.repo, "--signer-workflow", signer])
             .args([
                 "--source-ref",
-                "refs/heads/main",
+                self.source_ref,
                 "--deny-self-hosted-runners",
             ]);
         if let Some(p) = predicate {
@@ -302,6 +308,15 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
         .workflow_ref
         .split_once('@')
         .map_or(a.workflow_ref, |(w, _)| w);
+    if a.source_ref
+        .strip_prefix("refs/heads/")
+        .is_none_or(str::is_empty)
+    {
+        return Err(Error::Usage(format!(
+            "--source-ref {:?} is not a branch: expected refs/heads/<branch>",
+            a.source_ref
+        )));
+    }
     let own = format!("{}/.github/workflows/", a.repo);
     if !workflow.starts_with(&own) {
         return Err(Error::Usage(format!(

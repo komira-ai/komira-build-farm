@@ -135,3 +135,34 @@ fn the_scratch_host_changes_files_under_its_root_and_plays_its_commands() {
 fn fs_read(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).expect("read")
 }
+
+/// Catches a fake link step that replaces a file or directory (the host refuses, so a
+/// kit's test on the fake would pass where the host fails) or that does not record the
+/// link where a plan made after it reads it.
+#[test]
+fn the_fake_flips_links_and_refuses_anything_else() {
+    let mut exec = FakeExec::new(0);
+    let flip = |target: &str| Step::Symlink {
+        path: p("/kbf/current"),
+        target: target.into(),
+    };
+    exec.apply(&flip("releases/a")).expect("make");
+    exec.apply(&flip("releases/b")).expect("flip");
+    assert_eq!(
+        exec.inspect(&p("/kbf/current")).expect("inspect"),
+        Some(Entry::Link {
+            target: "releases/b".into()
+        })
+    );
+    let meta = exec.stat(&p("/kbf/current")).expect("stat").expect("there");
+    assert_eq!(meta.kind, Kind::Other);
+    let file = Entry::File {
+        perms: Perms::new(0o644),
+        owner: RUNNER,
+        bytes: b"keep".to_vec(),
+    };
+    exec.entries.insert(p("/kbf/current"), file.clone());
+    let err = exec.apply(&flip("releases/c")).expect_err("a file");
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(exec.entries.get(&p("/kbf/current")), Some(&file));
+}

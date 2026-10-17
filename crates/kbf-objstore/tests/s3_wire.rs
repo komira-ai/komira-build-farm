@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::TryStreamExt as _;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
+    ByteRange, Capabilities, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError,
+    PageSize, listing,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -263,6 +265,189 @@ async fn list_sends_the_token_and_reads_the_next_one() {
         ),
         "{}",
         heads[1]
+    );
+}
+
+/// Catches: a listing [`ListToken::after`] a key that does not send it as
+/// `start-after` (S3 would read it as a continuation token and refuse it, or list from
+/// the start), or sends it as well as a continuation token on the pages that follow.
+#[tokio::test]
+async fn list_after_a_key_sends_start_after_then_the_token() {
+    let page = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                <NextContinuationToken>t2</NextContinuationToken>\
+                <Contents><Key>p/c</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], page),
+        answer("200 OK", &[], page),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let after = ListToken::after(&ObjectKey::new("p/b").unwrap());
+    let first = s
+        .list(&prefix, Some(&after), PageSize::new(3).unwrap())
+        .await
+        .unwrap();
+    s.list(&prefix, first.next.as_ref(), PageSize::new(3).unwrap())
+        .await
+        .unwrap();
+
+    let heads = seen.lock().unwrap();
+    assert!(
+        heads[0].starts_with(
+            "GET /kbf-test?list-type=2&max-keys=3&prefix=p%2F&start-after=p%2Fb HTTP/1.1"
+        ),
+        "{}",
+        heads[0]
+    );
+    assert!(
+        heads[1].starts_with(
+            "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=3&prefix=p%2F HTTP/1.1"
+        ),
+        "{}",
+        heads[1]
+    );
+}
+
+/// Catches: a listing stream over S3 that does not carry the continuation token from
+/// page to page, or stops at a truncated page: two pages, each asked for once, the
+/// second with the first's token, every key in order.
+#[tokio::test]
+async fn the_listing_stream_follows_continuation_tokens() {
+    let first = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>t2</NextContinuationToken>\
+                 <Contents><Key>p/a</Key><Size>1</Size></Contents>\
+                 <Contents><Key>p/b/c</Key><Size>2</Size></Contents></ListBucketResult>";
+    let last = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                <Contents><Key>p/c</Key><Size>3</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], first),
+        answer("200 OK", &[], last),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let got: Vec<(String, u64)> = listing::objects(&s, &prefix, None, PageSize::new(2).unwrap())
+        .map_ok(|o| (o.key.as_str().to_owned(), o.size))
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        [("p/a".into(), 1), ("p/b/c".into(), 2), ("p/c".into(), 3)]
+    );
+    let heads = seen.lock().unwrap();
+    assert_eq!(heads.len(), 2);
+    assert!(
+        heads[1].starts_with(
+            "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=2&prefix=p%2F HTTP/1.1"
+        ),
+        "{}",
+        heads[1]
+    );
+}
+
+/// Catches: a listing stream resumed [`ListToken::after`] a key over S3 that restarts at
+/// the start of the prefix (no `start-after`), sends the key again with the
+/// continuation token, or believes a server that lists the key itself (an inclusive
+/// `start-after`, which would hand a rebuild a segment twice): the stream sends
+/// `start-after`, then only the token, and yields exactly the keys after the key; a
+/// server answering with the key itself ends the stream with `Protocol`.
+#[tokio::test]
+async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_s3() {
+    let first = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>t2</NextContinuationToken>\
+                 <Contents><Key>p/c</Key><Size>1</Size></Contents>\
+                 <Contents><Key>p/d</Key><Size>2</Size></Contents></ListBucketResult>";
+    let last = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                <Contents><Key>p/e</Key><Size>3</Size></Contents></ListBucketResult>";
+    let inclusive = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                     <Contents><Key>p/b</Key><Size>1</Size></Contents>\
+                     <Contents><Key>p/c</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, seen) = script(vec![
+        answer("200 OK", &[], first),
+        answer("200 OK", &[], last),
+        answer("200 OK", &[], inclusive),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let from = ListToken::after(&ObjectKey::new("p/b").unwrap());
+    let size = PageSize::new(2).unwrap();
+    let got: Vec<String> = listing::objects(&s, &prefix, Some(from.clone()), size)
+        .map_ok(|o| o.key.as_str().to_owned())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(got, ["p/c", "p/d", "p/e"]);
+    {
+        let heads = seen.lock().unwrap();
+        assert!(
+            heads[0].starts_with(
+                "GET /kbf-test?list-type=2&max-keys=2&prefix=p%2F&start-after=p%2Fb HTTP/1.1"
+            ),
+            "{}",
+            heads[0]
+        );
+        assert!(
+            heads[1].starts_with(
+                "GET /kbf-test?continuation-token=t2&list-type=2&max-keys=2&prefix=p%2F HTTP/1.1"
+            ),
+            "{}",
+            heads[1]
+        );
+    }
+    let refused: Result<Vec<_>, _> = listing::objects(&s, &prefix, Some(from), size)
+        .try_collect()
+        .await;
+    match refused {
+        Err(ObjectStoreError::Protocol(m)) => assert!(m.contains("p/b after p/b"), "{m}"),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+}
+
+/// Catches: a listing failure mapped to the wrong error, or to an empty page (a rebuild
+/// would take an unreadable bucket for an empty one): an S3 error is `Service` with its
+/// status and code; an answer that is not a ListObjectsV2 result, or that lists a key
+/// kbf cannot name (non-ASCII here: an object kbf did not write), is `Protocol`.
+#[tokio::test]
+async fn listing_failures_are_typed() {
+    let denied = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+    let missing = "<Error><Code>NoSuchBucket</Code><Message>gone</Message></Error>";
+    let foreign = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                   <Contents><Key>p/caf\u{e9}</Key><Size>1</Size></Contents></ListBucketResult>";
+    let (endpoint, _) = script(vec![
+        answer("403 Forbidden", &[], denied),
+        answer("404 Not Found", &[], missing),
+        answer("200 OK", &[], "<html>not s3</html>"),
+        answer("200 OK", &[], foreign),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    let prefix = KeyPrefix::new("p/").unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(s.list(&prefix, None, PageSize::MAX).await.unwrap_err());
+    }
+    assert!(
+        matches!(&answers[0], ObjectStoreError::Service { status: 403, code, .. } if code == "AccessDenied"),
+        "{:?}",
+        answers[0]
+    );
+    assert!(
+        matches!(&answers[1], ObjectStoreError::Service { status: 404, code, .. } if code == "NoSuchBucket"),
+        "{:?}",
+        answers[1]
+    );
+    assert!(
+        matches!(&answers[2], ObjectStoreError::Protocol(why) if why.contains("root element is <html>")),
+        "{:?}",
+        answers[2]
+    );
+    assert!(
+        matches!(&answers[3], ObjectStoreError::Protocol(why) if why.contains("listed key") && why.contains('\u{e9}')),
+        "{:?}",
+        answers[3]
     );
 }
 

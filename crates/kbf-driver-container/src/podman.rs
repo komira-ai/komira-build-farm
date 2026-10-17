@@ -11,6 +11,7 @@ use std::process::Stdio;
 use kbf_daemon::trees::SharedMount;
 use tokio::process::{Child, Command};
 
+use crate::credential::without_credentials;
 use crate::exit_record;
 
 /// Where the input root appears inside the container.
@@ -227,6 +228,7 @@ impl Podman {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
+        without_credentials(command.as_std_mut());
         command
             .arg("--cgroup-manager=cgroupfs")
             .stdin(Stdio::null())
@@ -420,7 +422,8 @@ impl Podman {
 
     /// Runs Podman with `args`, blocking; its output if it succeeded.
     fn blocking_output(&self, args: &[&str], verb: &str) -> Result<std::process::Output, String> {
-        let output = std::process::Command::new(&self.program)
+        let mut command = std::process::Command::new(&self.program);
+        let output = without_credentials(&mut command)
             .arg("--cgroup-manager=cgroupfs")
             .args(args)
             .stdin(Stdio::null())

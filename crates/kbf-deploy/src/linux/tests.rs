@@ -676,7 +676,8 @@ fn bad_settings_are_refused_before_anything_renders() {
     // little left to the OS, a listener on every interface, a host value left unset,
     // a typo'd or repeated key, a character systemd would expand or a unit cannot
     // carry, an image by tag or in the daemon's docker:// form, a number or port that
-    // is not one, a relative path, and a MinIO unit that is not a service.
+    // is not one, two listeners on one port (the first pair, the last pair, the first
+    // and the last), a relative path, and a MinIO unit that is not a service.
     let tag = "gcr.io/distroless/base-debian12:latest";
     let tag_digest = format!("gcr.io/distroless/base-debian12:nonroot@{D1}");
     let docker = format!("docker://{}", img());
@@ -719,11 +720,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 59: unknown key KBF_RAM",
+            "line 107: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 59: KBF_RAM_GIB is already set on line 17",
+            "line 107: KBF_RAM_GIB is already set on line 24",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),
@@ -773,6 +774,26 @@ fn bad_settings_are_refused_before_anything_renders() {
         (
             example_with(&[("KBF_META_DIR", "/var/lib/../raft")]),
             "KBF_META_DIR: \"/var/lib/../raft\" has an empty",
+        ),
+        (
+            example_with(&[("KBF_STORAGE_PORT", "0")]),
+            "KBF_STORAGE_PORT must be a port number from 1 to 65535, not '0'",
+        ),
+        (
+            example_with(&[("KBF_HOT_DIR", "hot")]),
+            "KBF_HOT_DIR: \"hot\" is not absolute",
+        ),
+        (
+            example_with(&[("KBF_REAPI_PORT", "8981")]),
+            "KBF_REAPI_PORT and KBF_WORKER_PORT are both 8981: each listener of a host needs its own port",
+        ),
+        (
+            example_with(&[("KBF_STORAGE_PORT", "8982")]),
+            "KBF_API_PORT and KBF_STORAGE_PORT are both 8982",
+        ),
+        (
+            example_with(&[("KBF_STORAGE_PORT", "8980")]),
+            "KBF_REAPI_PORT and KBF_STORAGE_PORT are both 8980",
         ),
         (
             example_with(&[("MINIO_UNIT", "minio")]),
@@ -885,5 +906,27 @@ fn an_unset_key_takes_the_default_config_example_shows() {
     let host = "KBF_HOST_NAME=storage-node.example.internal\nKBF_LISTEN_ADDRESS=192.0.2.10\n\
                 KBF_NODE_ID=storage-node-1\nKBF_RAM_GIB=256\n";
     let minimal = LinuxConfig::parse(host).expect("the four host values are enough");
-    assert_eq!(minimal, config(&[]));
+    // MINIO_S3_ENDPOINT alone has no default in the settings: the converged units take
+    // the host's own MinIO, and `--mode storage` refuses (modes_tests).
+    assert_eq!(minimal.minio_s3_endpoint, None);
+    let example = config(&[]);
+    assert_eq!(
+        example.minio_s3_endpoint.as_deref(),
+        Some(super::config::LOOPBACK_MINIO)
+    );
+    assert_eq!(
+        LinuxConfig {
+            minio_s3_endpoint: example.minio_s3_endpoint.clone(),
+            // The example names another frontend and a storage node to call; left out,
+            // the frontend is this host and there is no storage URL.
+            frontend_name: example.frontend_name.clone(),
+            storage_url: example.storage_url.clone(),
+            ..minimal.clone()
+        },
+        example
+    );
+    assert_eq!(
+        rendered(&minimal, &Templates::BUILT_IN),
+        rendered(&example, &Templates::BUILT_IN)
+    );
 }

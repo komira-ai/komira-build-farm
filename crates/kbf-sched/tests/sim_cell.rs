@@ -407,6 +407,8 @@ impl Worker {
     }
 }
 
+// One cell per simulated node, built once per run: the leader's size is no cost.
+#[allow(clippy::large_enum_variant)]
 enum Cell {
     Leader(Leader),
     Log(Log),

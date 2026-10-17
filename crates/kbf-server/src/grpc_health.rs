@@ -1,7 +1,7 @@
 //! `grpc.health.v1.Health` on the REAPI listener, for a proxy's gRPC health check
 //! (`docs/api.md`).
 //!
-//! The answer is `/readyz`'s ([`crate::health::failing`]): `SERVING` when every check
+//! The answer is `/readyz`'s ([`crate::health::Checks::failing`]): `SERVING` when every check
 //! passes, `NOT_SERVING` when one fails, a stop signal included. Every service the
 //! listener serves shares that one answer; [`SERVICES`] lists the names it knows.
 //!
@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::Stream;
-use futures::future::BoxFuture;
 use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -39,7 +38,7 @@ use kbf_proto::reapi::execution_server::ExecutionServer;
 use tonic::server::NamedService;
 use tonic::{Request, Response, Status};
 
-use crate::health::{Readiness, failing};
+use crate::health::{Checks, Readiness};
 
 /// The service names the health service answers for: `""` (the server as a whole)
 /// and each service of the REAPI listener.
@@ -55,83 +54,54 @@ pub const SERVICES: [&str; 6] = [
 /// How often an open `Watch` probes the store when nothing else changes.
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The `grpc.health.v1.Health` service over a cache's store and a server's
-/// [`Readiness`].
-pub struct HealthService<M, O> {
-    inner: Arc<Inner<M, O>>,
+/// The `grpc.health.v1.Health` service over a server's [`Checks`].
+pub struct HealthService {
+    inner: Arc<Inner>,
 }
 
-struct Inner<M, O> {
-    cache: Arc<Cache<M, O>>,
-    readiness: Arc<Readiness>,
-    probe_timeout: Duration,
+struct Inner {
+    checks: Arc<Checks>,
     watch_interval: Duration,
 }
 
-impl<M, O> HealthService<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl HealthService {
     /// The service: each evaluation probes `cache`'s store, waiting at most
     /// `probe_timeout`; an open `Watch` probes it again every `watch_interval`.
     #[must_use]
-    pub fn new(
+    pub fn new<M, O>(
         cache: Arc<Cache<M, O>>,
         readiness: Arc<Readiness>,
         probe_timeout: Duration,
         watch_interval: Duration,
-    ) -> Self {
+    ) -> Self
+    where
+        M: MetaLog,
+        O: ObjectStore + 'static,
+    {
+        let checks = Checks::of_cache(cache, readiness, probe_timeout);
+        Self::of(Arc::new(checks), watch_interval)
+    }
+
+    /// The service over `checks`, an open `Watch` evaluating them again every
+    /// `watch_interval`.
+    #[must_use]
+    pub fn of(checks: Arc<Checks>, watch_interval: Duration) -> Self {
         Self {
             inner: Arc::new(Inner {
-                cache,
-                readiness,
-                probe_timeout,
+                checks,
                 watch_interval,
             }),
         }
     }
 }
 
-impl<M, O> Inner<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl Inner {
     async fn evaluate(&self) -> ServingStatus {
-        let failing = failing(&self.cache, &self.readiness, self.probe_timeout).await;
-        if failing.is_empty() {
+        if self.checks.failing().await.is_empty() {
             ServingStatus::Serving
         } else {
             ServingStatus::NotServing
         }
-    }
-}
-
-/// What a `Watch` stream reads: the status, the [`Readiness`] whose changes wake it,
-/// and its probe interval. A trait object, so the stream's state machine is one
-/// function and not one per metadata log and store type.
-trait Evaluate: Send + Sync {
-    fn status(&self) -> BoxFuture<'_, ServingStatus>;
-    fn readiness(&self) -> &Readiness;
-    fn watch_interval(&self) -> Duration;
-}
-
-impl<M, O> Evaluate for Inner<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
-    fn status(&self) -> BoxFuture<'_, ServingStatus> {
-        Box::pin(self.evaluate())
-    }
-
-    fn readiness(&self) -> &Readiness {
-        &self.readiness
-    }
-
-    fn watch_interval(&self) -> Duration {
-        self.watch_interval
     }
 }
 
@@ -153,7 +123,7 @@ fn stopping() -> Status {
 enum Watching {
     /// Sending: `last` is the status it sent last, if any.
     Open {
-        inner: Arc<dyn Evaluate>,
+        inner: Arc<Inner>,
         known: bool,
         changed: tokio::sync::watch::Receiver<()>,
         last: Option<ServingStatus>,
@@ -179,9 +149,9 @@ impl Watching {
         loop {
             // Read before the evaluation: a stop signal that comes during it is
             // answered by the next turn, which `changed` wakes at once.
-            let is_stopping = inner.readiness().is_stopping();
+            let is_stopping = inner.checks.readiness().is_stopping();
             let status = if known {
-                inner.status().await
+                inner.evaluate().await
             } else {
                 ServingStatus::ServiceUnknown
             };
@@ -204,7 +174,7 @@ impl Watching {
             // Wakes on a change of `Readiness` or at the interval, whichever is first.
             // `changed` fails only once its sender is dropped, and the sender lives in
             // `inner`'s readiness, which this stream holds.
-            let _ = tokio::time::timeout(inner.watch_interval(), changed.changed()).await;
+            let _ = tokio::time::timeout(inner.watch_interval, changed.changed()).await;
         }
     }
 }
@@ -212,11 +182,7 @@ impl Watching {
 type WatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<M, O> Health for HealthService<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl Health for HealthService {
     async fn check(
         &self,
         request: Request<HealthCheckRequest>,
@@ -248,8 +214,8 @@ where
     ) -> Result<Response<Self::WatchStream>, Status> {
         let known = known(&request.into_inner().service);
         // Subscribed before the first evaluation, so no change after it is missed.
-        let changed = self.inner.readiness.subscribe();
-        let inner: Arc<dyn Evaluate> = Arc::clone(&self.inner) as Arc<dyn Evaluate>;
+        let changed = self.inner.checks.readiness().subscribe();
+        let inner = Arc::clone(&self.inner);
         let start = Watching::Open {
             inner,
             known,

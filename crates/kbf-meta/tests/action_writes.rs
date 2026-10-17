@@ -63,13 +63,13 @@ fn writes_need_every_blob_held_and_reachable() {
     };
     assert_eq!(
         put_action(&mut m, Role::Daemon, action, record.clone()),
-        Err(ActionWriteError::Absent(output))
+        Err(ActionWriteError::Absent(vec![output]))
     );
     put(&mut m, output, in_segment(2, 0));
     mark_missing(&mut m, 2);
     assert_eq!(
         put_action(&mut m, Role::Daemon, action, record.clone()),
-        Err(ActionWriteError::Unreachable(output))
+        Err(ActionWriteError::Unreachable(vec![output]))
     );
     assert_eq!(m.action_count(), 0);
     mark_reachable(&mut m, 2);

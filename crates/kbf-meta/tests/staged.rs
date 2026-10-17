@@ -3,10 +3,12 @@
 
 mod common;
 
-use common::{DAY, digest, in_segment, mark_missing, meta, object, put, tick};
+use std::collections::BTreeSet;
+
+use common::{DAY, digest, in_segment, mark_missing, meta, object, put, put_action, tick};
 use kbf_meta::{
-    Applied, BlobAnswer, BlobWrite, Command, Epoch, Location, MetaState, ObjectId, ServerId,
-    StagedPut, StagedState, StoreId, TierError, TierId, UnallocatedEpoch,
+    ActionRecord, Applied, BlobAnswer, BlobWrite, Closure, Command, Epoch, ForeignWriter, Location,
+    MetaState, ObjectId, Role, ServerId, StagedPut, StagedState, StoreId, TierError, TierId,
 };
 use kbf_types::Digest;
 
@@ -397,7 +399,7 @@ fn a_refused_put_changes_nothing() {
                 object: never,
                 ..part(0, 100, &[])
             },
-            TierError::Unallocated(UnallocatedEpoch(never)),
+            TierError::Foreign(ForeignWriter(never)),
         ),
     ];
     for (name, bad, error) in cases {
@@ -547,4 +549,46 @@ fn stored_objects_lists_each_stored_object_of_an_entry_once_and_no_staged_one() 
         [object(6), object(8)]
     );
     assert!(m.stored_objects(&digest(21)).is_empty());
+}
+
+/// Catches an action-cache entry whose result's object is not held back for its
+/// closure's (architecture-v2 section 8: closure blobs flush before the entry), one held
+/// back for blobs the store already holds or that share its own object, a wait that
+/// outlives the flush it waits for, and waits answered for an object never staged.
+#[test]
+fn a_result_object_waits_for_the_staged_objects_of_its_closure() {
+    let mut m = tiered();
+    stage(&mut m, part(1, 200, &[(2, 0), (4, 100)])).expect("result's object");
+    stage(&mut m, sealed(part(2, 100, &[(3, 0)]))).expect("output's object");
+    put(&mut m, digest(5), in_segment(9, 0));
+    let record = ActionRecord {
+        result: digest(2),
+        closure: Closure::from_iter([digest(3), digest(4), digest(5)]),
+    };
+    assert_eq!(m.flush_waits(object(1)), BTreeSet::new());
+    put_action(&mut m, Role::Daemon, digest(1), record).expect("written");
+    assert_eq!(m.flush_waits(object(1)), BTreeSet::from([object(2)]));
+    assert_eq!(m.flush_waits(object(2)), BTreeSet::new());
+
+    let refused = ActionRecord {
+        result: digest(3),
+        closure: Closure::from_iter([digest(2), digest(6)]),
+    };
+    assert!(put_action(&mut m, Role::Daemon, digest(7), refused).is_err());
+    assert_eq!(
+        m.flush_waits(object(2)),
+        BTreeSet::new(),
+        "a refused write orders"
+    );
+
+    assert_eq!(
+        tier_cmd(&mut m, Command::ObjectFlushed { object: object(2) }),
+        Ok(())
+    );
+    assert_eq!(m.flush_waits(object(1)), BTreeSet::new());
+    assert_eq!(
+        m.flush_waits(object(99)),
+        BTreeSet::new(),
+        "an object never staged waits for none"
+    );
 }

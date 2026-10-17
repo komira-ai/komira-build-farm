@@ -162,10 +162,11 @@ fn start_with_prefix(prefix: &str) -> Server {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     start_on(prefix, listeners)
 }
@@ -190,6 +191,7 @@ fn start_on(prefix: &str, listeners: Listeners) -> Server {
     let api = Api {
         listen: loopback,
         token: None,
+        local_cache: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let shutdown = async move {

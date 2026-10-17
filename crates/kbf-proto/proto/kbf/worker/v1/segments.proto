@@ -83,10 +83,16 @@ message LocateRequest {
   repeated build.bazel.remote.execution.v2.Digest digests = 1;
 }
 
-// A stored object, by its writer epoch and sequence number.
+// A stored object, by its writer and sequence number. The writer is an epoch
+// (`member`, `boot` and `log` zero), a registered storage node (`epoch` and `log` zero,
+// `member` and `boot` not zero), or an epoch of another log, which a rebuild of the index
+// adopted (`member` and `boot` zero, `epoch` and `log` not zero).
 message ObjectRef {
   uint64 epoch = 1;
   uint64 seq = 2;
+  uint64 member = 3;
+  uint64 boot = 4;
+  uint64 log = 5;
 }
 
 message BlobLocation {

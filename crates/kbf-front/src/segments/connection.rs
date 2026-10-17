@@ -78,6 +78,12 @@ impl Connections {
         IO: Connected<ConnectInfo = TcpConnectInfo>,
     {
         let peer = stream.connect_info().remote_addr;
+        self.track_peer(stream, peer)
+    }
+
+    /// `stream`, registered as the live connection of `peer` until it is dropped; for a
+    /// stream whose connect info is not tonic's own (a TLS stream of `kbf-tls`).
+    pub fn track_peer<IO>(&self, stream: IO, peer: Option<SocketAddr>) -> Tracked<IO> {
         let registration = peer.map(|peer| {
             let (open, receiver) = watch::channel(());
             let id = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;

@@ -14,11 +14,14 @@
 //! plain text on an address that is not loopback (`<listeners>` is `reapi`, `worker`
 //! or `reapi,worker`; see [`Args::plain_text_off_loopback`]). The server starts either
 //! way. On Unix the SIGINT and SIGTERM handlers are installed before that line is
-//! printed, so either signal any time after it stops the server with exit 0: open
-//! Execute and WaitExecution streams end UNAVAILABLE, REAPI connections are sent
-//! GOAWAY, and the server exits once they close or `--shutdown-timeout-secs` runs out
-//! (issue #168). If a handler cannot be installed it exits 2 without printing the
-//! start line.
+//! printed, so either signal any time after it stops the server with exit 0: new
+//! Execute calls are refused UNAVAILABLE, REAPI connections are sent GOAWAY, open
+//! Execute and WaitExecution streams run until their action is done (Buck2 does not
+//! recover a broken stream), and the server exits once they close; when
+//! `--shutdown-timeout-secs` is set and runs out, the open streams end UNAVAILABLE, and
+//! so they do at a second SIGINT or SIGTERM, which stops the server after a short
+//! grace. `POST /v1/frontend/drain` on the operator API begins the same drain with no
+//! signal. If a handler cannot be installed it exits 2 without printing the start line.
 //!
 //! Events go to stderr and, with `--log-dir` (by default `log/` in the `--hot-store`
 //! directory), also to a size-capped rotating file (`kbf_server::log_file`); an INFO
@@ -47,7 +50,7 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use clap::Parser;
-use kbf_server::{Args, interrupted, sizes_on, start};
+use kbf_server::{Args, sizes_on, start_interruptible};
 use kbf_threads::Topology;
 
 fn main() -> ExitCode {
@@ -68,7 +71,7 @@ fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
     let sizes = sizes_on(args, Topology::detect());
     sizes.log();
     sizes.runtime()?.block_on(async {
-        let server = start(args, interrupted).await?;
+        let server = start_interruptible(args).await?;
         println!("{}", server.start_line());
         Ok(server.serve().await?)
     })

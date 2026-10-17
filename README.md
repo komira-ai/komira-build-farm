@@ -16,6 +16,10 @@ kbf is written in Rust. Its programs are named `kbf-*`:
   processes (`--driver native`), with its process tree, memory and network
   watched by the daemon.
 
+`kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`
+and `all-in-one`; the programs above remain.
+Smoke test: `kbf all-in-one --help`
+
 ## Status
 
 Early development. The project is design-first: interfaces and tests land

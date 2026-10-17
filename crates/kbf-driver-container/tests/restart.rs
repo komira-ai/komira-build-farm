@@ -10,15 +10,7 @@ use kbf_daemon::Runtime;
 use kbf_driver_container::StartError;
 use kbf_types::Resources;
 use support::fake::{Fake, image};
-use support::{Spec, exists, store_action, work};
-
-/// Whether process `pid` has ended: gone, or a zombie not yet reaped.
-fn ended(pid: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| Some(stat.rsplit_once(") ")?.1.starts_with('Z')))
-        .unwrap_or(true)
-}
+use support::{Spec, ended, exists, store_action, work};
 
 /// Catches (issue #155) a restarted daemon that leaves its killed predecessor's
 /// container running (the "container sweep skipped" mutant: the scheduler would run

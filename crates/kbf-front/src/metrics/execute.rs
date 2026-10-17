@@ -28,6 +28,16 @@ pub struct ExecuteMetrics {
     pub errors: Counter,
     /// Execute and WaitExecution streams open: begun and not yet ended.
     pub in_flight: Gauge,
+    /// Operation streams alive: one per Execute or WaitExecution whose call became a
+    /// stream of operations ([`OpenExecute::streaming`]), from the moment it is made
+    /// (before its first item is read) until it ends or its caller drops it. Unlike
+    /// `in_flight` it holds no call that is still being authorized or prepared and none
+    /// answered from the action cache, so it is the count a drain waits to see reach 0.
+    pub open_executions: Gauge,
+    /// Execute calls the front took (not refused for a drain), a cache hit included.
+    /// A rollout that sees it flat while `open_executions` is 0 sees a frontend no
+    /// client is using.
+    pub started: Counter,
     /// Execute streams the scheduler accepted whose operation has not left `QUEUED`
     /// yet. A stream that joined a running twin counts only until its first update.
     pub queued: Gauge,
@@ -55,6 +65,8 @@ impl Default for ExecuteMetrics {
             requests: Counter::default(),
             errors: Counter::default(),
             in_flight: Gauge::default(),
+            open_executions: Gauge::default(),
+            started: Counter::default(),
             queued: Gauge::default(),
             prepare: Histogram::new(Unit::Seconds),
             dispatch: Histogram::new(Unit::Seconds),
@@ -78,6 +90,7 @@ impl ExecuteMetrics {
             counted: true,
             ok: false,
             queued: false,
+            streaming: false,
         }
     }
 
@@ -94,6 +107,7 @@ impl ExecuteMetrics {
             counted: false,
             ok: false,
             queued: false,
+            streaming: false,
         }
     }
 
@@ -113,6 +127,16 @@ impl ExecuteMetrics {
             "kbf_execute_in_flight",
             "Execute and WaitExecution streams open",
             self.in_flight.get(),
+        );
+        out.gauge(
+            "kbf_front_open_executions",
+            "Execute and WaitExecution operation streams alive, from the stream's making to its end",
+            self.open_executions.get(),
+        );
+        out.counter(
+            "kbf_front_executes_started_total",
+            "Execute calls the front took, not refused for a drain, a cache hit included",
+            self.started.get(),
         );
         out.gauge(
             "kbf_execute_queued",
@@ -162,6 +186,8 @@ pub struct OpenExecute {
     ok: bool,
     /// Whether this stream is in the `queued` gauge.
     queued: bool,
+    /// Whether this stream is in the `open_executions` gauge.
+    streaming: bool,
 }
 
 impl OpenExecute {
@@ -203,6 +229,15 @@ impl OpenExecute {
         }
     }
 
+    /// The call became a stream of operations: counts it in `open_executions` until
+    /// the guard is dropped. Once only; a second call changes nothing.
+    pub fn streaming(&mut self) {
+        if !self.streaming {
+            self.streaming = true;
+            self.metrics.open_executions.add_one();
+        }
+    }
+
     /// Marks the call answered without error.
     pub const fn ok(&mut self) {
         self.ok = true;
@@ -213,6 +248,9 @@ impl Drop for OpenExecute {
     fn drop(&mut self) {
         if self.queued {
             self.metrics.queued.sub_one();
+        }
+        if self.streaming {
+            self.metrics.open_executions.sub_one();
         }
         self.metrics.in_flight.sub_one();
         if self.counted {

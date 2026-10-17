@@ -2,13 +2,13 @@
 //! each server writes to, and the staged objects, whose only copy is a block file on
 //! one tier until it is flushed to the object store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use kbf_types::Digest;
 
 use crate::model::ObjectId;
-use crate::state::UnallocatedEpoch;
+use crate::state::ForeignWriter;
 
 /// A local write tier: one directory on one server's disk. The server draws the id the
 /// first time it opens the directory, writes it to the directory's `TIER` file and
@@ -91,13 +91,19 @@ pub enum StagedState {
     Conflict,
 }
 
-/// A staged object: its tier, committed length, state and blob list.
+/// A staged object: its tier, committed length, state and blob list, and the objects
+/// its flush waits for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedObject {
     pub(crate) tier: TierId,
     pub(crate) len: u64,
     pub(crate) state: StagedState,
     pub(crate) blobs: BTreeMap<Digest, u64>,
+    /// Objects on the same tier holding a closure blob of an action-cache entry whose
+    /// result blob this object holds, as they were when the entry was written
+    /// ([`Command::PutAction`](crate::Command::PutAction)). Kept while they are staged;
+    /// [`MetaState::flush_waits`](crate::MetaState::flush_waits) answers which still are.
+    pub(crate) after: BTreeSet<ObjectId>,
 }
 
 impl StagedObject {
@@ -130,9 +136,9 @@ impl StagedObject {
 /// Why a tier command was refused. A refused command changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TierError {
-    /// An object names an epoch that was never allocated.
+    /// An object is not of a writer the log takes for the command.
     #[error(transparent)]
-    Unallocated(#[from] UnallocatedEpoch),
+    Foreign(#[from] ForeignWriter),
     /// The tier is not the current tier of any server.
     #[error("{0} is not registered to any server")]
     UnknownTier(TierId),

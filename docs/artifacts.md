@@ -4,8 +4,8 @@ kbf's binaries are built by CI, never on a developer's machine, and a node is to
 only bytes CI built and attested. The workflow is
 [`.github/workflows/artifacts.yml`](../.github/workflows/artifacts.yml).
 
-What exists today is the build, the signing, the sums, on `main` the attestations,
-and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+What exists today is the build, the signing, the sums, the attestations on a push to
+`main` or to `feature/arch-v2`, and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
 The deployment job that verifies an asset before it reaches a node and the node's own
 SHA-256 check are **planned** and not built yet
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
@@ -13,21 +13,37 @@ Sections below that describe them say so.
 
 ## What is built
 
+Eleven tarballs, each with its SBOM, built by one job per platform:
+
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-daemon-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-daemon-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
-`kbf-deploy` is the deploy tool (its kits are listed in
+`kbf` is the one binary with all five modes (`kbf daemon`, `kbf all-in-one`, `kbf
+storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
+and 5.1), the one a host runs. `kbf-daemon` and `kbf-server` are the separate daemon
+and server binaries. `kbf-deploy` is the deploy tool (its kits are listed in
 [ARCHITECTURE.md](../ARCHITECTURE.md)), shipped so an operator installs the tool the
 same way as the binaries it installs: by digest, from these attested files, not built
-on the operator's machine. It is built for Linux only. Every kit that changes a host
-changes a Linux one (systemd units, the MDM services, a systemd user service, or a
-cluster through `kubectl`), and no CI job builds or tests `kbf-deploy` on macOS, so a
-darwin asset would ship bytes no test ran. The one verb meant for an operator's own
-machine, `mdm erase-request`, runs on a Linux one as well. A darwin asset needs a macOS
-job that builds and tests the crate first.
+on the operator's machine.
+
+The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
+that drops one of these files from the workflow, packages one that is not listed, or
+leaves this table describing another set.
+
+Every kit that changes a host changes a Linux one (systemd units, the MDM services, a
+systemd user service, or a cluster through `kubectl`), and `kbf-deploy` for macOS is
+there for the verbs a Mac runs on itself. The macOS job builds it, signs it and runs
+it as it does every macOS binary (below), but no CI job runs `kbf-deploy`'s tests on
+macOS: the bytes are known to start, and nothing more is claimed for them until a job
+tests the crate there.
+
+A pull request into `feature/arch-v2` builds only the Linux files: the macOS job and the
+sums are skipped there to spare the macOS runners, and the push to `feature/arch-v2`
+builds and attests all of them for its head. A newer push to `feature/arch-v2` cancels
+the older push's run; every commit on `main` keeps a run of its own.
 
 `<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
@@ -44,34 +60,70 @@ sums assemble`), and checks every file against it (`cargo xtask verify-assets su
 every file listed once, each matching, and a copy of the first tarball with one byte
 flipped not matching).
 
-`kbf-server` embeds the first 12 characters of the commit it was built from, and
-`--version` prints `kbf-server <package version>+<commit>` (so do its start line and
-the `server` field of `GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before
-packaging, each Linux job checks that the binary's `--version` names `GITHUB_SHA`
-(`cargo xtask build-commit check`). `KBF_BUILD_COMMIT_OVERRIDE` replaces the
+`kbf-server` and `kbf` embed the first 12 characters of the commit they were built
+from (`kbf` through the server library it links), and `--version` prints `<binary>
+<package version>+<commit>` (so do the server's start line and the `server` field of
+`GET /v1/nodes`, [api.md](api.md#get-v1nodes)). Before packaging, each Linux job
+checks that `kbf-server`'s `--version` names `GITHUB_SHA` (`cargo xtask build-commit
+check`), and that `kbf`'s does too and that `kbf --version --json` (below) names the
+same commit and a release build (`build-commit check --json`); the macOS job makes
+the second check on the signed `kbf`, the bytes it packages. `KBF_BUILD_COMMIT_OVERRIDE` replaces the
 commit in a build, for CI tests that need two stamps from one checkout; a build that
 set it here would fail that check.
 
 The Linux binaries link glibc dynamically and need the glibc of Ubuntu 24.04 or
 newer.
 
+## What `kbf --version --json` says
+
+A host checks what it runs with one command, `kbf --version --json` (exactly those two
+words, in either order): one JSON object on one line of stdout, exit 0, the fields
+sorted by name.
+
+```text
+{"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+```
+
+- `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
+  git checkout); compare it with the first 12 of the commit in the asset's name.
+- `profile`: `release` for every asset here (the workflow refuses a `debug` one).
+- `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
+  binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
+  `min_protocol` through `protocol`.
+- `state_schema`: the schema version of the SQLite state file the binary creates and
+  reads.
+- `version`: the package version.
+
+`--json` without `--version` is a usage error. The fields are a contract: the test
+`version_json_reports_the_build_identity` (`crates/kbf-cli/tests/binary.rs`) fails when
+one is added, dropped or renamed.
+
 ## When
 
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, then the `attest` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and nothing else. The `verify` job then assembles `SHA256SUMS` again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below. |
+| Push to `main` or to `feature/arch-v2` | The same, then the `attest` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and nothing else. The `verify` job then assembles `SHA256SUMS` again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`). |
+
+An attestation names the ref it was signed on: `refs/heads/main` or
+`refs/heads/feature/arch-v2`. The second is there so that a rehearsal of a deployment
+runs attested builds before they reach `main`; whoever verifies one asks for the branch
+they mean, and an asset attested on `feature/arch-v2` does not verify as `main`'s. A
+release (below) verifies as `main` and only takes the files of a push run on `main`, so
+a file built from the development branch is never released.
 
 Only the `attest` job holds `id-token: write` and `attestations: write`, and only
-under the exact `if:` that limits it to a push to `main`. The workflow lint
-(`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, so no pull
-request run holds a token that can sign an attestation. No repository code runs in
+under the exact `if:` that limits it to a push to `main` or to `feature/arch-v2` (the
+`verify` job runs under the same one). The workflow lint
+(`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, and in one
+whose `if:` is any other spelling, so no pull request or merge-queue run holds a token
+that can sign an attestation. No repository code runs in
 `attest` and nothing is built there: it holds those scopes for the pinned signing
 actions alone. Every action is pinned by commit SHA, and that lint refuses one that
 is not.
 
 The attest job names each tarball and its SBOM, one `actions/attest-sbom` step per
-tarball, and runs only on `main`. So that a binary added to a build job cannot reach
+tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
 `main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
 request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
@@ -152,7 +204,10 @@ gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
 ```
 
 - `--signer-workflow` and `--source-ref`: without them, an attestation signed by any
-  workflow of the repository, on any branch, would verify.
+  workflow of the repository, on any branch, would verify. Name the branch the asset
+  was built on: `refs/heads/main` above, `refs/heads/feature/arch-v2` for a build of
+  the development branch (`cargo xtask verify-assets attestations --source-ref`, which
+  defaults to `main` and refuses a value that is not `refs/heads/<branch>`).
 - `--deny-self-hosted-runners`: the signing job ran on a GitHub-hosted runner.
 - For the SBOM attestation, add `--predicate-type https://cyclonedx.org/bom`.
 
@@ -160,25 +215,29 @@ The node itself is then to check the asset's SHA-256 against the value the job h
 it, before it installs anything (planned, with the node's `apply`; design section 4.2).
 
 The `verify` job runs exactly these checks on what `attest` signed (`cargo xtask
-verify-assets attestations`, with read-only scopes), and two that must fail: the first
+verify-assets attestations`, with read-only scopes, for the branch pushed), and two that
+must fail: the first
 tarball verified as signed by `ci.yml`, and a copy with one flipped byte. If either
 verifies, the job fails.
 
 ## macOS signing: what ad hoc with the hardened runtime gives
 
-`cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs `kbf-daemon` with
-`codesign --force --sign - --options runtime`: an ad-hoc signature (no certificate)
-with the hardened runtime. That works without an Apple Developer account, and the job
-checks it every run: `codesign --verify --strict` passes, the signed binary runs (`kbf-daemon --version`
+`cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs each macOS binary the job
+builds (`kbf-daemon`, `kbf` and `kbf-deploy`, one step each) with `codesign --force
+--sign - --options runtime`: an ad-hoc signature (no certificate) with the hardened
+runtime. That works without an Apple Developer account, and the job checks it every
+run: `codesign --verify --strict` passes, the signed binary runs (`<binary> --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
-list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf-daemon`; only
-the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
+list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf-daemon`, `kbf`
+or `kbf-deploy`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
 [macos-vm-guests.md](design/macos-vm-guests.md) section 7), and the binary's minimum
 macOS is 14.0. After packaging, `cargo xtask darwin-asset` takes the binary back out
 of its tarball, the bytes that ship (refusing a tarball that is not exactly the one
 entry `package` writes), and checks it again: `codesign --verify --strict`, the flags,
-a run of `--version`, and the entitlements against the list.
+a run of `--version`, and the entitlements against the list. A step for each of the
+three tarballs does this, and the repository lint (`release_artifacts`) refuses a macOS
+binary that is packaged without its own `sign-darwin` before and `darwin-asset` after.
 
 What it gives:
 
@@ -215,8 +274,9 @@ What it constrains:
 
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
-  signed. That is fine for `kbf-daemon`, which links and loads only system libraries.
-  On a Mac with System Integrity Protection on, a library it linked at start-up that
+  signed. That is fine for a binary that links and loads only system libraries, as
+  `kbf-daemon` does; `kbf` and `kbf-deploy` are signed the same way, and CI does not
+  list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
   Apple did not sign would stop it from starting. CI does not show this: the hosted
   runners have SIP off and library validation off (`vm.cs_library_validation` 0), so
   the check above that runs the signed binary would pass with such a library.

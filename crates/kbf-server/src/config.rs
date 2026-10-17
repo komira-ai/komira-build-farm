@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use kbf_front::WriteConfig;
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use kbf_tls::{TlsError, TlsFiles, TlsSource};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 use kbf_front::SegmentsConfig;
@@ -22,9 +22,12 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, WorkerTls};
+use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
+
+/// The default of `--tls-reload-interval-secs`.
+const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
 
 /// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
 /// [`kbf_sched::fence::START_VALIDITY`].
@@ -48,6 +51,10 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
+    /// The node's one cache, when a daemon in this process shares the hot store's disk
+    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    #[arg(skip)]
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
     /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
     /// server on it is refused; a write that would leave its filesystem with less free
@@ -165,6 +172,16 @@ pub struct Args {
     /// the blob route do, and they are off unless it names their authorizers.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
+    /// Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage
+    /// node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then
+    /// answers a client's CAS, ByteStream and action-cache calls from that node, passing
+    /// ByteStream through without holding a blob. The local stores are still opened:
+    /// Execution and the worker listener use them (`kbf frontend` is this mode without
+    /// them: Execution reads the node too). Plain text (`http://`) only here; `kbf
+    /// frontend` takes the flags of the mutual TLS to the node. Without it, the server
+    /// answers those calls itself.
+    #[arg(long, value_name = "URL")]
+    pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
     /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
     /// off loopback the start line carries a warning.
@@ -206,7 +223,10 @@ pub struct Args {
     /// PEM private key of the worker listener.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_client_ca"])]
     pub worker_tls_key: Option<PathBuf>,
-    /// PEM CA that daemon client certificates must chain to.
+    /// PEM CA that client certificates must chain to. Each must also name the role the
+    /// method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker
+    /// session and blob calls, the storage role (`urn:kbf:role:storage`) for
+    /// `kbf.map.v1.Membership`; a frontend certificate may call nothing here.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
     /// The worker listener's deny list: certificate serials, public keys and node ids
@@ -215,6 +235,20 @@ pub struct Args {
     /// mutual TLS.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
     pub worker_deny_list: Option<PathBuf>,
+    /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
+    /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
+    /// applied to the next TLS handshake, with no restart and without ending a connection
+    /// already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable,
+    /// not PEM, a key that is not the certificate's, an expired certificate, a renewal
+    /// caught between its two writes) are logged and counted in
+    /// `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving;
+    /// the next look finds them whole and applies them. The files must be good at start.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TLS_RELOAD_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    pub tls_reload_interval_secs: u64,
     /// The heartbeat interval daemons are asked for, in milliseconds, at most half the
     /// window in which a daemon may act on a `Start` (each `Start` names the newest
     /// heartbeat the server took, so a longer interval would leave it too little).
@@ -250,11 +284,26 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
     pub finished_retention_secs: u64,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
-    /// disconnect after their open Execute and WaitExecution streams are ended
-    /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
-    /// off when it runs out.
-    #[arg(long, default_value_t = 10)]
+    /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
+    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until
+    /// its action is done. Buck2 never recovers a stream that breaks mid-action, so the
+    /// default, 0, is no deadline; set one at least as long as the longest action. When
+    /// it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
+    /// off).
+    #[arg(long, default_value_t = 0)]
     pub shutdown_timeout_secs: u64,
+    /// How often, in seconds, every open Execute and WaitExecution stream is sent its
+    /// operation again (same name, not done, current stage), so a load balancer's idle
+    /// timeout never cuts a long action. 0 sends none.
+    #[arg(long, default_value_t = 30)]
+    pub progress_interval_secs: u64,
+    /// How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a
+    /// quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused).
+    #[arg(long, default_value_t = 30)]
+    pub http2_keepalive_interval_secs: u64,
+    /// How long, in seconds, a PING may go unanswered before the connection is closed.
+    #[arg(long, default_value_t = 20)]
+    pub http2_keepalive_timeout_secs: u64,
     /// Thread sizes: the overrides `--async-threads`, `--blocking-threads` and
     /// `--cpu-threads` (see `kbf_threads`). Left out, the server uses every CPU it may
     /// (the async workers and the CPU pool each one thread per logical CPU); it has no
@@ -328,7 +377,7 @@ pub struct Args {
     /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
     /// stream (about 3.4 GiB for 200 streams), times the streams one connection may open
-    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    /// on each listener.
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
@@ -364,6 +413,39 @@ pub struct Args {
     /// all Executes.
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
+    /// Where the scheduler keeps its state, written before each change is acknowledged and
+    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
+    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
+    /// they held before. The file is created, with its directory, if missing (0600, and
+    /// 0700 for a directory it makes) and held by one process: a second frontend on it
+    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
+    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+    // Listed beside `--meta-dir`, whose place in the help it takes without moving the
+    // flags declared after it.
+    #[arg(
+        long,
+        value_name = "URI",
+        value_parser = crate::state_store::StateStoreParser,
+        display_order = 5,
+    )]
+    pub state_store: Option<crate::state_store::StateStoreUri>,
+    /// How long, in seconds, a storage node's membership row lives without a heartbeat
+    /// before the state store expires it and the member goes down in the storage map.
+    /// Nodes are asked to heartbeat three times as often.
+    #[arg(long, value_name = "SECONDS", default_value_t = 15, requires = "state_store", value_parser = clap::value_parser!(u64).range(3..))]
+    pub member_ttl_secs: u64,
+    /// How long, in seconds, a down storage member stays in the map before it leaves
+    /// and its blobs move to other owners.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        requires = "state_store"
+    )]
+    pub member_dwell_secs: u64,
+    /// Build history: `--history-objects` and `--history-index-root`.
+    #[command(flatten)]
+    pub history: crate::history::HistoryFlags,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -380,6 +462,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// A listener's TLS files do not make a configuration.
+    #[error("TLS: {0}")]
+    Tls(#[from] TlsError),
     /// The deny list cannot be read or parsed.
     #[error("--worker-deny-list: {0}")]
     DenyList(#[from] DenyListError),
@@ -402,12 +487,27 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// `--storage` is not a URL.
+    #[error("--storage {url:?}: {source}")]
+    Storage {
+        url: String,
+        #[source]
+        source: tonic::transport::Error,
+    },
     /// A segment upload could declare more than uploads may hold at once.
     #[error(
         "--segment-upload-max-bytes {cap} is over --write-bytes-in-flight {bound}: \
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
+    /// `kbf storage` would serve plain text off loopback, admitting every caller.
+    #[error(
+        "--storage-listen {addr} is not a loopback address and the node has no TLS, so it \
+         would admit every caller (Write and ActionCommit included); add \
+         --storage-tls-cert, --storage-tls-key and --storage-client-ca, or listen on a \
+         loopback address"
+    )]
+    PlaintextStorageOffLoopback { addr: SocketAddr },
     /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
     #[error("--memory-ladder-gib: {0}")]
     MemoryLadder(#[from] kbf_sched::LadderError),
@@ -455,15 +555,22 @@ impl Args {
     /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
+        let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
             &self.worker_client_ca,
         ) {
             (Some(cert), Some(key), Some(ca)) => Some(WorkerTls {
-                server: ServerTlsConfig::new()
-                    .identity(Identity::from_pem(read(cert)?, read(key)?))
-                    .client_ca_root(Certificate::from_pem(read(ca)?)),
+                server: TlsSource::files(
+                    "worker",
+                    TlsFiles {
+                        cert: cert.clone(),
+                        key: key.clone(),
+                        client_ca: Some(ca.clone()),
+                    },
+                    reload,
+                )?,
                 deny_list: self
                     .worker_deny_list
                     .as_deref()
@@ -473,9 +580,15 @@ impl Args {
             _ => None,
         };
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
-            (Some(cert), Some(key)) => {
-                Some(ServerTlsConfig::new().identity(Identity::from_pem(read(cert)?, read(key)?)))
-            }
+            (Some(cert), Some(key)) => Some(TlsSource::files(
+                "reapi",
+                TlsFiles {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    client_ca: None,
+                },
+                reload,
+            )?),
             _ => None,
         };
         Ok(Listeners {
@@ -489,22 +602,41 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
-            shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
+            shutdown_timeout: match self.shutdown_timeout_secs {
+                0 => Duration::MAX,
+                secs => Duration::from_secs(secs),
+            },
+            streams: StreamTiming {
+                progress_interval: Duration::from_secs(self.progress_interval_secs),
+                keepalive_interval: Duration::from_secs(self.http2_keepalive_interval_secs),
+                keepalive_timeout: Duration::from_secs(self.http2_keepalive_timeout_secs),
+            },
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
             segments: SegmentsConfig {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
-            streams: self.streams.limits(),
+            stream_limits: self.streams.limits(),
         })
+    }
+
+    /// How storage members live in the state store: `--member-ttl-secs` and
+    /// `--member-dwell-secs`.
+    #[must_use]
+    pub fn members(&self) -> crate::members::MembershipConfig {
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(self.member_ttl_secs),
+            dwell: Duration::from_secs(self.member_dwell_secs),
+            ..crate::members::MembershipConfig::default()
+        }
     }
 
     /// Refuses a `--segment-upload-max-bytes` over `--write-bytes-in-flight`: an upload
     /// of the whole cap would hold its ranges in memory past the bound uploads share.
     /// A function of its own: only the unit test reaches the refusal, and the integration
     /// tests reach the rest of `listeners`, so neither would cover all of one function.
-    fn segment_upload_fits_write_bound(&self) -> Result<(), ConfigError> {
+    pub(crate) fn segment_upload_fits_write_bound(&self) -> Result<(), ConfigError> {
         if self.segment_upload_max_bytes > self.write_bytes_in_flight {
             return Err(ConfigError::SegmentUploadOverWriteBound {
                 cap: self.segment_upload_max_bytes,
@@ -558,6 +690,24 @@ impl Args {
         Ok(policy)
     }
 
+    /// The storage node `--storage` names, if given.
+    ///
+    /// # Errors
+    /// The URL is not one.
+    pub fn storage(&self) -> Result<Option<tonic::transport::Endpoint>, ConfigError> {
+        self.storage
+            .as_ref()
+            .map(|url| {
+                tonic::transport::Endpoint::from_shared(url.clone()).map_err(|source| {
+                    ConfigError::Storage {
+                        url: url.clone(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
+    }
+
     /// The operator API these flags describe, if `--api-listen` is given, with the
     /// token read from `--api-token-file`.
     ///
@@ -572,7 +722,12 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        let local_cache = self.local_cache.clone();
+        Ok(Some(Api {
+            listen,
+            token,
+            local_cache,
+        }))
     }
 
     /// How the cache groups and bounds uploads: `--write-linger`,
@@ -652,7 +807,7 @@ pub fn loopback_only(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
-fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
+pub(crate) fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
     std::fs::read(path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,

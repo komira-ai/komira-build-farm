@@ -1,5 +1,5 @@
 //! Compiles the vendored REAPI, googleapis and gRPC health protos, `kbf.worker.v1` (its
-//! `Worker` and `Segments` services) and `kbf.log.v1` into Rust.
+//! `Worker` and `Segments` services), `kbf.storage.v1`, `kbf.log.v1` and `kbf.map.v1` into Rust.
 //!
 //! Parsing is done by `protox`, in pure Rust, so the build needs no `protoc` binary.
 //! Nothing generated is checked in; the code lands in `OUT_DIR`.
@@ -18,6 +18,8 @@ const FILES: &[&str] = &[
     "google/rpc/status.proto",
     "grpc/health/v1/health.proto",
     "kbf/log/v1/log.proto",
+    "kbf/map/v1/map.proto",
+    "kbf/storage/v1/storage.proto",
     "kbf/worker/v1/segments.proto",
     "kbf/worker/v1/worker.proto",
 ];

@@ -15,9 +15,14 @@ testkit = ["tokio/net", "tokio/io-util", "tokio/sync"]
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+# The stream of footers (`footers`).
 futures.workspace = true
 hex.workspace = true
 hmac.workspace = true
+# The segment footer format, read back by `footers`.
+kbf-segments.workspace = true
+# `Digest`, the key of a segment's index.
+kbf-types.workspace = true
 # The free-space floor and the filesystem numbers (`disk`), shared with the daemon.
 kbf-threads.workspace = true
 md-5.workspace = true

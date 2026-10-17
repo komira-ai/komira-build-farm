@@ -213,6 +213,12 @@ most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
 caches over one metadata log hold different epochs, so they never name the same key.
+A storage node registered with a frontend (`kbf storage --frontend`) names its objects
+by the member id and boot counter its registration was given instead:
+`<root>cas/<member>/<boot>/<seq>`, where `<root>` is the prefix without the log id. The
+state store hands each boot out once, so the keys stay apart across a wiped metadata
+directory too; the node's log is at machine version 4 and has the writer set
+(`SetWriter`), and takes a put of no other node writer's object. Both layouts are read. An object the log never put (an old server's, under another log id; another node's; an earlier boot's) enters the index only when a rebuild adopts it from its footer (`AdoptSegment`); an epoch of another log is named with that log's id.
 Under the in-memory metadata log (tests only) the metadata is in memory and starts again from epoch 1 at
 every start, so with an S3 cold store each server start writes under its own prefix (the
 configured prefix plus the start time), and keys never collide across restarts. Under

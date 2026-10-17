@@ -58,6 +58,7 @@ impl MetaState {
         }
         for object in &objects {
             self.unreachable.remove(object);
+            self.lost.remove(object);
         }
         self.losses += held.len() as u64;
         Evicted { blobs, actions }

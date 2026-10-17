@@ -269,6 +269,9 @@ async fn a_token_used_with_another_filter_is_400() {
         assert_eq!(answer.code, 400, "{query}: {}", answer.json);
         let why = answer.json["error"].as_str().unwrap_or_default();
         assert!(why.contains("another filter"), "{query}: {why}");
+        for name in ["outcome", "how", "requeue_reason", "memory_kill", "sort"] {
+            assert!(why.contains(name), "{query}: the error names {name}: {why}");
+        }
     }
     for route in ["logs", "artifacts"] {
         let answer = server

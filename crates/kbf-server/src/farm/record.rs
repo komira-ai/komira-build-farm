@@ -14,9 +14,9 @@
 //! [`Dispatch::submit`]: kbf_front::Dispatch::submit
 
 use kbf_front::{ExecuteCall, Finished, wall_now};
-use kbf_invocation::{Event, LeaseEnd, Outcome as Answered};
+use kbf_invocation::{Event, LeaseEnd, Outcome as Answered, Run};
 use kbf_sched::Requeue;
-use kbf_types::{Answer, Digest, LeaseGrant, OperationId, Outcome, Refusal, StartLease};
+use kbf_types::{Answer, Digest, LeaseGrant, LeaseId, OperationId, Outcome, Refusal, StartLease};
 use tonic::Code;
 
 use super::State;
@@ -41,7 +41,7 @@ impl State {
     }
 
     /// Whether a recorded call waits on `operation`.
-    fn is_recorded(&self, operation: OperationId) -> bool {
+    pub(super) fn is_recorded(&self, operation: OperationId) -> bool {
         self.recorded.contains(&operation)
     }
 
@@ -80,9 +80,21 @@ impl State {
         });
     }
 
+    /// Sends what the report of `lease` measured, once the scheduler took it. Only a
+    /// recorded operation's report is measured (`Farm::report` asks
+    /// [`State::is_recorded`] before it builds `run`).
+    pub(super) fn record_ran(&self, operation: OperationId, lease: LeaseId, run: Run) {
+        self.recorder.emit(Event::Ran {
+            operation,
+            lease,
+            run: Box::new(run),
+        });
+    }
+
     /// Sends the end of `answer`'s operation: its callers were told `finished`; the
-    /// listing of its result, stored as `stored`, if it ran; and `reason`, the
-    /// daemon's text, if its lease reported a failure.
+    /// listing of its result, stored as `stored`, if it ran, or of a timed-out run's
+    /// partial result (its logs); and `reason`, the daemon's text, if its lease
+    /// reported a failure.
     pub(super) fn record_finished(
         &mut self,
         answer: &Answer,
@@ -94,8 +106,9 @@ impl State {
             return;
         }
         let listing = match finished {
-            Finished::Ran(result) => stored.map(|digest| kbf_front::listing(digest, result)),
-            _ => None,
+            Finished::Ran(result) => stored.map(|digest| kbf_front::listing(Some(digest), result)),
+            Finished::TimedOut { partial, .. } => Some(kbf_front::listing(None, partial)),
+            Finished::Failed(_) => None,
         };
         let end = match answer.outcome {
             Outcome::Completed { .. } => LeaseEnd::Accepted,

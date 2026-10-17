@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use kbf_threads::disk::{FreeSpace, Space, keep_free, percent_of};
 
 /// The default `--data-dir`.
-pub(crate) const DEFAULT_DATA_DIR: &str = "/var/lib/kbf";
+pub const DEFAULT_DATA_DIR: &str = "/var/lib/kbf";
 
 /// The mode of the data directory itself: the OCI backend's container root is a
 /// subordinate id, an "other" to the daemon's directories, and must search every
@@ -67,6 +67,25 @@ pub(crate) struct DataArgs {
     /// of it), under the filesystem's automatic one.
     #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
     pub data_max_bytes: Option<u64>,
+    /// The node's one cache, when the process runs local storage on the same disk
+    /// (`kbf-all-in-one`, [`crate::Cli::share_cache`]); no flag sets it.
+    #[arg(skip)]
+    pub local_cache: Option<std::sync::Arc<kbf_daemon::cache::LocalCache>>,
+}
+
+impl crate::Cli {
+    /// Makes the input cache the node's one cache with local storage, `local`: for a
+    /// binary that runs local storage on the same disk in its own process
+    /// (`kbf-all-in-one`; see `kbf_storage::local_cache`).
+    pub fn share_cache(&mut self, local: std::sync::Arc<kbf_daemon::cache::LocalCache>) {
+        self.data.local_cache = Some(local);
+    }
+
+    /// `--data-dir`, as the daemon resolves it (`/var/lib/kbf` when it is not given).
+    #[must_use]
+    pub fn data_dir(&self) -> PathBuf {
+        self.data.dir()
+    }
 }
 
 impl DataArgs {
@@ -292,9 +311,16 @@ fn made(dir: &Path) -> impl FnOnce(std::io::Error) -> DataDirError {
 /// The container driver's cache and trees, for the driver to open once Podman's storage
 /// passed its checks; `None`, after a warning, when the filesystem is too small or the
 /// daemon's own path is unknown.
+///
+/// No plan, no cache. The cache is the node's one cache with local storage if `data`
+/// has one ([`DataArgs::local_cache`]).
 #[cfg(target_os = "linux")]
-pub(crate) fn given(plan: &Plan) -> Option<kbf_driver_container::CacheUse> {
+pub(crate) fn given(
+    plan: Option<&Plan>,
+    data: &DataArgs,
+) -> Option<kbf_driver_container::CacheUse> {
     use kbf_daemon::cache::{CacheConfig, Disabled};
+    let plan = plan?;
     let shown = plan.cache().display().to_string();
     let budgets = plan.budgets.ok_or(Disabled::NoBudget);
     // The helper is this binary, by the path it was started from: after an update
@@ -306,6 +332,7 @@ pub(crate) fn given(plan: &Plan) -> Option<kbf_driver_container::CacheUse> {
         Ok((budgets, helper)) => {
             let mut config = CacheConfig::new(plan.cache(), plan.leases(), budgets.cache_max_bytes);
             config.min_free_bytes = budgets.cache_min_free_bytes;
+            config.local.clone_from(&data.local_cache);
             let trees = kbf_daemon::trees::TreeConfig::new(plan.trees(), budgets.trees_max_bytes);
             Some(kbf_driver_container::CacheUse {
                 config,
@@ -549,7 +576,7 @@ mod tests {
     /// Catches the container driver's cache and trees not being the plan's: the cache in
     /// `<data>/cache` linking from `<data>/leases`, its budget, its eviction floor and
     /// the trees' budget the plan's, the trees in `<data>/trees` with the daemon's own
-    /// thresholds; and no cache at all for a filesystem too small for one.
+    /// thresholds; and no cache at all for a filesystem too small for one or no plan.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_container_driver_is_given_the_plans_cache_and_trees() {
@@ -557,8 +584,9 @@ mod tests {
             total: 200 * GIB,
             available: 150 * GIB,
         };
-        let plan = Plan::new(&args(&["--data-dir=/d"]), true, &Fake(space)).expect("plan");
-        let given = super::given(&plan).expect("a cache");
+        let data = args(&["--data-dir=/d"]);
+        let plan = Plan::new(&data, true, &Fake(space)).expect("plan");
+        let given = super::given(Some(&plan), &data).expect("a cache");
         let budgets = plan.budgets.expect("budgets");
         assert_eq!(given.config.dir, Path::new("/d/cache"));
         assert_eq!(given.config.scratch, Path::new("/d/leases"));
@@ -574,8 +602,9 @@ mod tests {
             total: GIB,
             available: GIB,
         };
-        let plan = Plan::new(&args(&["--data-dir=/d"]), true, &Fake(tiny)).expect("plan");
-        assert!(super::given(&plan).is_none());
+        let plan = Plan::new(&data, true, &Fake(tiny)).expect("plan");
+        assert!(super::given(Some(&plan), &data).is_none());
+        assert!(super::given(None, &data).is_none());
     }
 
     /// Catches the native driver on macOS not being given the plan's cache and trees:

@@ -41,7 +41,7 @@ use std::time::Instant;
 use kbf_proto::reapi::Digest;
 
 use crate::cache::{Cache, InputStats};
-use crate::cas::{Cas, Fetch, label};
+use crate::cas::{Cas, Fetch, Fill, label};
 use crate::tree::{
     Copies, CountedReads, Loaded, TreeError, WritePhases, io as io_error, make_directories, millis,
 };
@@ -186,7 +186,7 @@ impl Trees {
     /// [`Trees::materialize`] behind a pointer: compiled once whatever the CAS.
     async fn materialize_dyn(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         in_flight: usize,
         cache: &Cache,
         root: &Digest,

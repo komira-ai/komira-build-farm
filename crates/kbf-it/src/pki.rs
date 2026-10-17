@@ -9,11 +9,14 @@ use std::path::{Path, PathBuf};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 
 /// The name in the server certificate. A daemon verifies it with `--tls-server-name`.
 pub const SERVER_NAME: &str = "localhost";
+
+/// The role the daemon's client certificate names, as the worker listener requires.
+const DAEMON_ROLE_URI: &str = "urn:kbf:role:daemon";
 
 /// Where [`write`] put each file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,8 +46,8 @@ pub enum PkiError {
 
 /// Generates a CA, a server certificate for [`SERVER_NAME`] and a client certificate
 /// that names `node_id` (as its one DNS subjectAltName, which the server binds to the
-/// daemon's `Hello`, and as its common name), and writes them under `dir` (created if
-/// missing).
+/// daemon's `Hello`, and as its common name) and the daemon role
+/// (`urn:kbf:role:daemon`), and writes them under `dir` (created if missing).
 ///
 /// # Errors
 /// Generation fails, or a file cannot be written.
@@ -61,6 +64,11 @@ pub fn write(dir: &Path, node_id: &str) -> Result<PkiFiles, PkiError> {
 
     let leaf = |names: Vec<String>, cn: &str, eku| -> Result<(String, String), PkiError> {
         let mut params = CertificateParams::new(names)?;
+        if eku == ExtendedKeyUsagePurpose::ClientAuth {
+            params
+                .subject_alt_names
+                .push(SanType::URI(DAEMON_ROLE_URI.try_into()?));
+        }
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![eku];
         let key = KeyPair::generate()?;

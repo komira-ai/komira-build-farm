@@ -46,8 +46,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
 use kbf_types::{IllegalStep, NodeStep, Rollout, RolloutId, RolloutState, WorkerId};
 
 use crate::farm::{Farm, NodeAction};
@@ -157,7 +155,7 @@ pub trait Fleet {
     fn placement(&self, node: &WorkerId) -> Option<NodePlacement>;
 }
 
-impl<M: MetaLog, O: ObjectStore> Fleet for Farm<M, O> {
+impl Fleet for Farm {
     fn place(&self, node: &WorkerId, action: NodeAction) -> Result<(), String> {
         Farm::place(self, node, action)
             .map(drop)

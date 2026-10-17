@@ -5,6 +5,10 @@
 //! `kbf_host::Plan` of steps and carries it out with `kbf_host::execute`, which prints
 //! each step as `DRY-RUN: <step>` by default and does it only with `--apply`.
 //!
+//! - [`host`]: the host side of commit-confirm deploys: the releases' layout on disk,
+//!   the deploy state and its lock, and `host status` (read-only); and the SQLite
+//!   state store's file backed up online (`host state-backup`) and restored offline
+//!   under the store's own lock (`host state-restore`).
 //! - [`https`]: a small HTTPS client (rustls with ring, the host's trusted roots) for
 //!   the kits that download or check over TLS.
 //! - [`config`]: `--config FILE`, `KEY=VALUE` lines over a closed key set; an unknown
@@ -40,6 +44,7 @@
 pub mod cli;
 pub mod config;
 pub mod envoy;
+pub mod host;
 pub mod https;
 pub mod linux;
 pub mod log;

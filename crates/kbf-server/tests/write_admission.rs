@@ -111,10 +111,11 @@ fn listeners() -> Listeners {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     }
 }
 

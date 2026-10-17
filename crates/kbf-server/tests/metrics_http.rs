@@ -13,6 +13,7 @@ use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
 use kbf_proto::reapi::FindMissingBlobsRequest;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_server::{Api, Listeners, bind_server_with_api};
+use kbf_storage::local_cache::LocalCache;
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -24,6 +25,11 @@ fn loopback() -> SocketAddr {
 
 /// A server with the operator API in this process; its REAPI and API addresses.
 fn start() -> (SocketAddr, SocketAddr) {
+    start_with(None)
+}
+
+/// [`start`], its operator API reporting `local`'s fill.
+fn start_with(local: Option<Arc<LocalCache>>) -> (SocketAddr, SocketAddr) {
     let listeners = Listeners {
         reapi: loopback(),
         worker: loopback(),
@@ -36,14 +42,16 @@ fn start() -> (SocketAddr, SocketAddr) {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: loopback(),
         token: None,
+        local_cache: local,
     };
     let cache = Arc::new(Cache::memory());
     let bound =
@@ -111,6 +119,11 @@ async fn metrics_count_what_the_reapi_listener_serves() {
         "{body}"
     );
     assert_eq!(sample(&body, "kbf_bytestream_write_requests_total"), 0);
+    assert!(!body.contains("kbf_local_cache"), "{body}");
+    // The loss-mark families, read from the metadata state at the scrape.
+    assert!(body.contains("# TYPE kbf_cache_lost_blobs gauge"), "{body}");
+    assert_eq!(sample(&body, "kbf_cache_lost_blobs"), 0);
+    assert_eq!(sample(&body, "kbf_cache_blob_losses_total"), 0);
 
     let data = b"an output a client uploads".to_vec();
     let name = format!("blobs/{}/{}", hex(&data), data.len());
@@ -159,5 +172,32 @@ async fn metrics_count_what_the_reapi_listener_serves() {
         ("kbf_object_get_seconds_count", 1),
     ] {
         assert_eq!(sample(&body, series), value, "{series}");
+    }
+}
+
+/// Catches the one cache's fill missing from `/metrics` on a process that has one
+/// (`kbf-all-in-one`), a gauge that reads one half for the other, and a fill that is not
+/// each half once: with the input cache holding 30 bytes and local storage 7, the
+/// gauges say 30, 7 and 37, read when scraped.
+#[tokio::test]
+async fn metrics_report_the_one_caches_fill() {
+    let local = Arc::new(LocalCache::new());
+    let storage = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let held = Arc::clone(&storage);
+    local.attach_storage(Box::new(move || {
+        held.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    local.attach_inputs(Box::new(|| 30));
+    let (_, api) = start_with(Some(local));
+    storage.store(7, std::sync::atomic::Ordering::SeqCst);
+    let (code, _, body) = scrape(api).await;
+    assert_eq!(code, 200, "{body}");
+    for (name, value) in [
+        ("kbf_local_cache_input_bytes", 30),
+        ("kbf_local_cache_storage_bytes", 7),
+        ("kbf_local_cache_fill_bytes", 37),
+    ] {
+        assert!(body.contains(&format!("# TYPE {name} gauge")), "{body}");
+        assert_eq!(sample(&body, name), value, "{name}");
     }
 }

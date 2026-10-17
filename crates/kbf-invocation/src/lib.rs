@@ -30,6 +30,7 @@ mod event;
 mod metrics;
 mod record;
 mod records;
+mod run;
 
 /// The generated `kbf.invocation.v1` messages.
 #[allow(clippy::all, missing_docs)]
@@ -41,9 +42,13 @@ pub use event::{
     Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Listing, Metadata,
     Outcome, Output, Owner, Usage, WallTime,
 };
-pub use metrics::{Histogram, Metrics, failure_name, requeue_name};
+pub use metrics::{Histogram, Metrics, REQUEUE_NAMES, failure_name, requeue_name};
 pub use record::{
     ActionRow, Attempt, AttemptEnd, Counts, How, IDLE_AFTER, Invocation, OUTPUTS_PER_ROW,
     REASON_CAP, ROW_CAP, RecordKey, State, TEXT_CAP, Text,
 };
-pub use records::Records;
+pub use records::{Ended, EndedKind, Records};
+pub use run::{
+    ActionShape, Durations, MemoryKillKind, NumaBytes, Phase, ReapiTimes, Run, RunUsage, Target,
+    TargetKind,
+};

@@ -3,7 +3,8 @@
 //! ranges, synced before anything in them is acknowledged, sealed, counted against
 //! the hot store's budget, and recovered at a restart from the committed state.
 //!
-//! - A **block** is one file, `<epoch>-<seq>.blk`, named by the object it becomes. A
+//! - A **block** is one file, `<epoch>-<seq>.blk` (`<member>-<boot>-<seq>.blk` for a
+//!   node writer), named by the object it becomes. A
 //!   blob's offset in the block is its offset in that object. Grouped writes share
 //!   the one open block, each in a range reserved in order ([`WriteTier::reserve_group`]);
 //!   a segment upload's segment is a block of its own ([`WriteTier::reserve_upload`]).

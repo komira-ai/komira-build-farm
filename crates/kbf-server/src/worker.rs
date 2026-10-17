@@ -33,7 +33,12 @@
 //!   the operator API. Otherwise it is kept as the node's newest software status,
 //!   unless a newer stream of the node has registered since;
 //! - after the server ends a stream, nothing more is read from it;
+//! - a `MapRequest` is answered with a `MapUpdate` of the storage map the server holds
+//!   now, when it holds one (the `map_push` module);
 //! - an `Offer` is not read yet.
+//!
+//! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,8 +46,7 @@ use std::time::Duration;
 
 use futures::{Stream, stream};
 use kbf_caps::NodeCaps;
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
+use kbf_mapsync::MapSource;
 use kbf_proto::worker::{
     Capability, DaemonMessage, HeartbeatAck, Hello, Phase, ServerMessage, Welcome, daemon_message,
     server_message, worker_server::Worker,
@@ -55,6 +59,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers};
+use crate::map_push::MapFeed;
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -65,19 +70,20 @@ pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
 
 /// The `Worker` service over a [`Farm`].
 #[derive(Debug)]
-pub struct WorkerService<M, O> {
-    farm: Arc<Farm<M, O>>,
+pub struct WorkerService {
+    farm: Arc<Farm>,
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
+    map: MapFeed,
 }
 
-impl<M, O> WorkerService<M, O> {
+impl WorkerService {
     /// The service over `farm`, knowing its daemons as `peers`. `Welcome` asks daemons
     /// for a heartbeat every `heartbeat_interval`; a stream that sends no `Hello` within
     /// `hello_wait` is ended DEADLINE_EXCEEDED.
     pub const fn new(
-        farm: Arc<Farm<M, O>>,
+        farm: Arc<Farm>,
         peers: Peers,
         heartbeat_interval: Duration,
         hello_wait: Duration,
@@ -87,7 +93,16 @@ impl<M, O> WorkerService<M, O> {
             peers,
             heartbeat_interval,
             hello_wait,
+            map: MapFeed::NONE,
         }
+    }
+
+    /// The service sending the storage map `map` holds to each daemon: in `Welcome`, and
+    /// in a `MapUpdate` each time it changes.
+    #[must_use]
+    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
+        self.map = MapFeed::new(map);
+        self
     }
 }
 
@@ -95,18 +110,14 @@ impl<M, O> WorkerService<M, O> {
 pub type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<M, O> Worker for WorkerService<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl Worker for WorkerService {
     type SessionStream = SessionStream;
 
     async fn session(
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<SessionStream>, Status> {
-        let certs = request.peer_certs();
+        let certs = kbf_tls::peer_certs(&request);
         let leaf = certs.as_deref().and_then(|chain| chain.first());
         let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
         let mut inbound = request.into_inner();
@@ -133,11 +144,15 @@ where
         let worker = WorkerId::new(hello.node_id);
         let instance = DaemonInstance::new(hello.instance_id);
         let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
+        // Subscribed before the map is read: a change between the two is sent again as a
+        // `MapUpdate`, never missed.
+        let changes = self.map.subscribe();
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
             epoch: self.farm.lease_epoch(),
+            map: self.map.welcome_map(),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
@@ -150,7 +165,10 @@ where
             welcome,
         );
         tracing::info!(%worker, ?capacity, "worker registered");
+        // After `register`, which queued the `Welcome`: the first update follows it.
+        self.map.push(changes, &outbound);
         let session = Session {
+            map: self.map.clone(),
             farm: Arc::clone(&self.farm),
             peers: self.peers.clone(),
             peer,
@@ -166,8 +184,9 @@ where
 }
 
 /// One stream after its first `Hello`.
-struct Session<M, O> {
-    farm: Arc<Farm<M, O>>,
+struct Session {
+    map: MapFeed,
+    farm: Arc<Farm>,
     peers: Peers,
     /// The stream's client certificate (`None` in plain text).
     peer: Option<PeerCert>,
@@ -175,7 +194,7 @@ struct Session<M, O> {
     stream: StreamId,
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
+impl Session {
     /// Handles the stream's messages until it ends, or one of them ends it.
     async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
         let worker = &self.worker;
@@ -266,6 +285,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
                 let _ = farm.node_status(worker, stream, status);
                 None
             }
+            Some(daemon_message::Message::MapRequest(_)) => {
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                self.map.answer()
+            }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");
@@ -276,7 +301,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
     }
 }
 
-fn message(message: server_message::Message) -> ServerMessage {
+pub(crate) fn message(message: server_message::Message) -> ServerMessage {
     ServerMessage {
         message: Some(message),
     }

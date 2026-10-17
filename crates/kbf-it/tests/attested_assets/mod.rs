@@ -22,7 +22,7 @@ fn stem(name: &str, platform: &str) -> String {
 
 /// The (binary name, platform) of every `cargo xtask package` line in the workflow's
 /// `run:` steps, in file order. An error names a package line it cannot read.
-fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
+pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
     let mut found = Vec::new();
     for step in workflows::run_steps(workflow)? {
         for line in step.script.lines().map(str::trim_start) {

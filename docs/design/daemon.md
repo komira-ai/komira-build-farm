@@ -22,7 +22,11 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 
 The daemon is configured by flags only: `--server` (an `https://` URL; repeatable, or
 several separated by commas), `--ca-cert`, `--cert`, `--key`, `--tls-server-name`,
-`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`.
+`--node-id`, `--runtime`, `--reconnect-ms` and `--reconnect-max-ms`. How long a silent
+storage node is waited on is set by `--storage-dial-timeout-ms`,
+`--storage-ping-interval-ms` and `--storage-ping-timeout-ms` (10000 each; none is zero or
+over 3600000, one hour, and the ping timeout is at most the interval); a daemon with one of them wrong does not
+start.
 The certificate must name `--node-id` as its one DNS subjectAltName, or the server
 refuses the session (see
 [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list)).
@@ -781,15 +785,16 @@ drops a killed run's result and cuts a timeout's to its logs
 | Field | What it is |
 |---|---|
 | `exit_code` | the exit code the daemon reported for a run it says ended (an OK status); `-` for one it reports failed (killed, timed out, lost: none). It is the run's, not the server's verdict: an OK run whose outputs the server cannot store has its exit code and `outcome=infra` |
-| `mnemonic`, `target` | the `RequestMetadata` the client sent on the Execute, quoted; `-` when it sent none (buck2 sends neither) |
+| `mnemonic`, `target_hint` | the `RequestMetadata` the client sent on the Execute (`action_mnemonic`, `target_id`), quoted; `-` when it sent none (buck2 sends neither). A hint only, never a key |
 | `wall_us` and the cgroup fields | the run's wall time and the same cgroup fields as the `lease phases:` line above |
 | `key` | the action's shape key, 16 hex digits (below) |
 | `cfg` | the configuration hash an output path named (`<16 hex>` or `<16 hex>-<16 hex>`); `-` for none (buck2's content-hash paths) |
+| `target`, `target_kind` | the target the action's own `buck-out` paths name (issue #796): `"cell//pkg:name"` from its first output pattern that names one, else from its first program word that does (a test binary buck2 built), and the owner's kind (`target`, `anon` or `bxl`); `-` when they name none (a remotely run test under `buck-out/v2/test/execution/`, run by a program outside `buck-out`). Read from the Command, never from the client |
 | `outcome` | how the scheduler judged the report: `ok`, `oom` (the action's own memory limit), `node-pressure`, `timeout`, `infra`, `invalid`, `missing-input`, `lost-restart`, `lost-fenced` |
 | `lease`, `node` | the lease and the node that ran it: the join to the daemon's `lease phases:` and `transfers:` lines |
 
-The fields up to the cgroup fields are those the line had before `key`, in the same
-order; the rest are appended. A report the server refuses (its lease is no longer
+The fields keep their order; `target_hint` was called `target` before the derived
+target took that name. A report the server refuses (its lease is no longer
 current) has no line: that is how a **cancelled** lease ends. Its usage is in the
 daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`
 line, and that line names the `key` too. A report without a `ResourceUsage` has no line.

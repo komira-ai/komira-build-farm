@@ -13,6 +13,9 @@
 //!   directory, the JSON messages a test wrote for it.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
+//! - Run as `kbf`, it prints `kbf 0.1.0+<stamp>` for `--version`, with the stamp from the
+//!   file `kbf.stamp` next to it, and for `--version --json` the contents of the file
+//!   `kbf.json` next to it (the identity a test wrote for it, to plant a bad one).
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
@@ -38,7 +41,7 @@
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
-//! `build-fails` (every build fails), `stamp-fails` (every build with an override
+//! `build-fails` (every build fails), `json-fails` (`kbf --version --json` exits 1), `stamp-fails` (every build with an override
 //! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
@@ -68,6 +71,23 @@ fn server(argv0: &str) -> ExitCode {
     }
     let stamp = std::fs::read_to_string(format!("{argv0}.stamp")).expect("stamp file");
     println!("kbf-server 0.1.0+{stamp}");
+    ExitCode::SUCCESS
+}
+
+/// `kbf --version` and `kbf --version --json`, from the files next to the fake.
+fn kbf(argv0: &str, args: &[String]) -> ExitCode {
+    if args == ["--version", "--json"] {
+        if defect("json-fails") {
+            return ExitCode::FAILURE;
+        }
+        print!(
+            "{}",
+            std::fs::read_to_string(format!("{argv0}.json")).expect("json file")
+        );
+    } else {
+        let stamp = std::fs::read_to_string(format!("{argv0}.stamp")).expect("stamp file");
+        println!("kbf 0.1.0+{stamp}");
+    }
     ExitCode::SUCCESS
 }
 
@@ -309,6 +329,8 @@ fn main() -> ExitCode {
     let rest: Vec<String> = args.collect();
     if argv0.ends_with("/kbf-server") {
         server(&argv0)
+    } else if argv0.ends_with("/kbf") {
+        kbf(&argv0, &rest)
     } else if argv0.ends_with("/gh") {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {

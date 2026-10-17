@@ -21,14 +21,15 @@
 //! The task is a future, [`Recording::run`], that the server spawns as a task of its
 //! own. A [`Recorder::off`] records nothing and costs a branch per call.
 
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{
-    Call, CallKind, Event, ExecuteAnswer, Invocation, InvocationId, Listing, Metadata,
-    OUTPUTS_PER_ROW, Output, Owner, ROW_CAP, RecordKey, Records, Usage, WallTime,
+    ActionRow, Call, CallKind, Ended, Event, ExecuteAnswer, Invocation, InvocationId, Listing,
+    Metadata, OUTPUTS_PER_ROW, Output, Owner, ROW_CAP, RecordKey, Records, Usage, WallTime,
 };
 use kbf_proto::reapi;
 use kbf_proto::worker::ResourceUsage;
@@ -52,6 +53,9 @@ const USAGE_TYPE_URL: &str = "type.googleapis.com/kbf.worker.v1.ResourceUsage";
 /// Drop marks held before the task takes them; past it every record is marked.
 const MARKS_CAP: usize = 1024;
 
+/// How often the task asks its records which have gone idle, when it has a [`Tap`].
+const IDLE_SWEEP: Duration = Duration::from_secs(10);
+
 /// Where events go. Cheap to clone; every clone sends to the same task.
 #[derive(Clone, Debug, Default)]
 pub struct Recorder(Option<Arc<Shared>>);
@@ -61,6 +65,30 @@ pub struct Recorder(Option<Arc<Shared>>);
 pub struct Recording {
     events: mpsc::Receiver<(usize, Event)>,
     shared: Arc<Shared>,
+    tap: Option<Arc<dyn Tap>>,
+}
+
+/// What reads the records as they settle, for history that outlives them: the
+/// [`Recording`] task calls it after it applies each event and, every ten seconds,
+/// for the records that went idle. It is installed with [`Recording::with_tap`].
+///
+/// **It never blocks.** Both methods run on the task, under the lock of the records
+/// the build pages read, so a slow tap delays the page reads and every later event,
+/// and (once the channel is full) drops them. Do no I/O, take no lock a request
+/// path takes, wait for nobody, and do not call back into the [`Recorder`] (its
+/// reads take the lock the call already holds). Hand the work to another task
+/// through a bounded queue that drops and counts when it is full. A panic ends the
+/// recording task.
+pub trait Tap: Send + Sync + Debug {
+    /// Something settled (see [`Ended`]): the attempt at `ended.attempt` of `row`, or
+    /// the cache hit that gave it. Returns the id to keep on the attempt (opaque bytes
+    /// the tap minted for it), if it minted one; the task writes it into the record, so
+    /// that the page of the row can name the run.
+    fn ended(&self, ended: &Ended, row: &ActionRow) -> Option<[u8; 12]>;
+
+    /// The record under `key` has been quiet for `IDLE_AFTER` with no operation in
+    /// flight; reported once per quiet spell.
+    fn idle(&self, key: &RecordKey);
 }
 
 #[derive(Debug)]
@@ -124,6 +152,7 @@ impl Recorder {
         let recording = Recording {
             events,
             shared: Arc::clone(&shared),
+            tap: None,
         };
         (Self(Some(shared)), recording)
     }
@@ -281,7 +310,8 @@ impl Shared {
                 }
                 Event::Granted { operation, .. }
                 | Event::Started { operation, .. }
-                | Event::Requeued { operation, .. } => marks.operations.push((after, *operation)),
+                | Event::Requeued { operation, .. }
+                | Event::Ran { operation, .. } => marks.operations.push((after, *operation)),
                 Event::Finished(f) => marks.operations.push((after, f.operation)),
             },
             None => {
@@ -322,29 +352,81 @@ impl Shared {
 }
 
 impl Recording {
+    /// This task with `tap` reading the records as they settle ([`Tap`]). Without one
+    /// the task does nothing beyond applying events: no sweep, no extra wake-up.
+    #[must_use]
+    pub fn with_tap(self, tap: Arc<dyn Tap>) -> Self {
+        Self {
+            tap: Some(tap),
+            ..self
+        }
+    }
+
     /// Applies events as they come, and marks the records of dropped ones. It runs
     /// as long as the server: the channel never closes, since this task holds a
     /// sender of its own.
     pub async fn run(mut self) {
+        let mut sweep = self.tap.as_ref().map(|_| {
+            let start = tokio::time::Instant::now() + IDLE_SWEEP;
+            let mut sweep = tokio::time::interval_at(start, IDLE_SWEEP);
+            sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            sweep
+        });
         loop {
-            // Queued events first: a drop's mark waits for the events sent before it.
-            let event = tokio::select! {
+            // Queued events first: a drop's mark waits for the events sent before it. Without
+            // a tap the sweep's future never completes (select! builds a disabled branch's
+            // future too, so it cannot be an `expect`).
+            let (event, swept) = tokio::select! {
                 biased;
-                event = self.events.recv() => event,
-                () = self.shared.marked.notified() => None,
+                event = self.events.recv() => (event, false),
+                () = self.shared.marked.notified() => (None, false),
+                () = async {
+                    match sweep.as_mut() {
+                        Some(sweep) => {
+                            sweep.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => (None, true),
             };
             {
                 let mut records = lock(&self.shared.records);
                 let mut applied = self.shared.applied.load(Ordering::Acquire);
                 if let Some((bytes, event)) = event {
-                    records.apply(event);
+                    let ended = records.apply(event);
                     self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                     applied += 1;
+                    if let Some(tap) = &self.tap {
+                        tell(tap.as_ref(), &mut records, &ended);
+                    }
                 }
                 self.shared.take_marks(&mut records, applied);
+                if swept {
+                    let idle = records.idle_since(wall_now());
+                    let report = |tap: &Arc<dyn Tap>| idle.iter().for_each(|key| tap.idle(key));
+                    self.tap.iter().for_each(report);
+                }
                 self.shared.applied.store(applied, Ordering::Release);
             }
             self.shared.progress.notify_waiters();
+        }
+    }
+}
+
+/// Tells `tap` what `ended` (the end of one applied event), and writes into each
+/// attempt the id the tap kept for it. A record the event's own admission removed
+/// from the bound is passed over.
+fn tell(tap: &dyn Tap, records: &mut Records, ended: &[Ended]) {
+    for e in ended {
+        let told = records
+            .get(&e.key)
+            .and_then(|inv| inv.rows().get(e.row))
+            .and_then(|row| {
+                let lease = e.attempt.and_then(|a| row.attempts.get(a)).map(|a| a.lease);
+                tap.ended(e, row).zip(lease)
+            });
+        if let Some((id, lease)) = told {
+            records.set_run_id(&e.key, e.row, lease, id);
         }
     }
 }
@@ -361,6 +443,8 @@ pub struct ExecuteCall {
     call: Call,
     action: Digest,
     command: Digest,
+    /// The shape the dispatcher read from the Command, if it read one.
+    shape: Option<Box<kbf_invocation::ActionShape>>,
 }
 
 /// What an Execute call's `RequestMetadata` says the action is: its kind (`CppCompile`)
@@ -401,18 +485,30 @@ impl ExecuteCall {
             call,
             action,
             command,
+            shape: None,
         })
+    }
+
+    /// The call, with the `shape` the dispatcher read from its Command, which its row
+    /// takes with the Command digest.
+    #[must_use]
+    pub fn with_shape(self, shape: kbf_invocation::ActionShape) -> Self {
+        Self {
+            shape: Some(Box::new(shape)),
+            ..self
+        }
     }
 
     /// The events of the call, answered with the operation name `name` on the
     /// scheduler's `operation`, which it `joined` or queued: the call, then the
-    /// Command digest its row takes.
+    /// Command digest (and shape) its row takes.
     #[must_use]
     pub fn answered(self, name: String, operation: OperationId, joined: bool) -> [Event; 2] {
         let Self {
             mut call,
             action,
             command,
+            shape,
         } = self;
         let answer = if joined {
             ExecuteAnswer::Joined { name, operation }
@@ -425,6 +521,7 @@ impl ExecuteCall {
             owner: call.owner.clone(),
             action,
             command,
+            shape,
         };
         [Event::Call(Box::new(call)), command]
     }
@@ -484,14 +581,15 @@ pub fn wall_now() -> WallTime {
     WallTime::from_unix_micros(u64::try_from(since.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// What a row copies from the ActionResult stored as `result` (section 3.2): its
+/// What a row copies from the ActionResult stored as `result` (`None` for a
+/// timed-out run's partial result, which is never stored) (section 3.2): its
 /// output files and directories (files first, each in the result's order; one whose
 /// digest does not parse is left out), its stdout and stderr digests and the
 /// `ResourceUsage` it carries. It lists at most one output past the
 /// [`OUTPUTS_PER_ROW`] a row keeps, so that the row knows it was cut and an event
 /// holds no more.
 #[must_use]
-pub fn listing(result: Digest, r: &reapi::ActionResult) -> Listing {
+pub fn listing(result: Option<Digest>, r: &reapi::ActionResult) -> Listing {
     let files = r.output_files.iter().filter_map(|f| {
         let digest = wire::digest(f.digest.as_ref()).ok()?;
         Some(Output {
@@ -513,7 +611,7 @@ pub fn listing(result: Digest, r: &reapi::ActionResult) -> Listing {
     let log = |d: Option<&reapi::Digest>| d.and_then(|d| wire::digest(Some(d)).ok());
     Listing {
         result,
-        exit_code: r.exit_code,
+        exit_code: result.map(|_| r.exit_code),
         outputs: files.chain(directories).take(OUTPUTS_PER_ROW + 1).collect(),
         stdout: log(r.stdout_digest.as_ref()),
         stderr: log(r.stderr_digest.as_ref()),

@@ -40,6 +40,8 @@ pub enum HostError {
     #[error(transparent)]
     Template(#[from] TemplateError),
     #[error(transparent)]
+    Render(#[from] super::modes::RenderError),
+    #[error(transparent)]
     Check(#[from] CheckError),
     #[error(transparent)]
     Path(#[from] PathError),
@@ -99,6 +101,12 @@ pub enum HostError {
     NotExecutable(HostPath),
     #[error("{bin} has no {flag} (its --help does not list it), which its unit passes")]
     NoFlag { bin: HostPath, flag: String },
+
+    // install-units --mode
+    #[error("{0} names no User= or root: kbf runs as a user of its own")]
+    RunsAsRoot(String),
+    #[error(transparent)]
+    ModeCheck(#[from] super::modes::ParseError),
 
     // image-pull
     #[error("no image: set KBF_IMAGES or pass --image <repo>@sha256:<digest>")]

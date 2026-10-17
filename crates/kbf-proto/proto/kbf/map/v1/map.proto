@@ -1,0 +1,134 @@
+// kbf.map.v1: the storage map as it travels (docs/design/architecture-v2.md, section 6).
+//
+// `Welcome.map` and `MapUpdate` (a later change) carry a `Map`. The `Membership` service
+// is how a storage node joins: it is served by a frontend, which is the only process that
+// writes membership to the state store.
+//
+// The map is the farm's placement: a frontend builds it, every storage node, daemon and
+// frontend routes by it, and it must mean the same thing everywhere, so the decoder
+// (kbf-proto's `kbf_map::Map` conversion) is strict:
+// - Enums are closed. Every enum's zero value is UNSPECIFIED and is refused, and so is any
+//   value this file does not name; it is never read as a default.
+// - A map the domain refuses (generation 0, replication 0 or above the member count, a
+//   repeated member id, a zero weight, an empty address, a malformed or repeated denied entry) is refused.
+// - `replication` is a uint32 on the wire (proto has no smaller integer); above 255 is
+//   refused.
+//
+// `generation` is field 1, as `map_generation` is field 1 of every storage request
+// (kbf.storage.v1), so a reader that wants only the number reads the first field.
+//
+// Extending: add fields and enum values, never reuse a number. A new enum value is read
+// by an older decoder as an error, so it ships only after every reader has the old
+// decoder's refusal handled (a new MemberState needs a map generation floor).
+syntax = "proto3";
+
+package kbf.map.v1;
+
+message Map {
+  // Larger for a later map; 0 is "no map seen" and is never a map's generation.
+  uint64 generation = 1;
+  repeated Member members = 2;
+  Rule rule = 3;
+  // The replication factor R: how many owners a digest has.
+  uint32 replication = 4;
+  // The lowest protocol version a member may speak.
+  uint32 min_protocol = 5;
+  // What the frontend refuses, each as `kind value` in kbf_map::DenyEntry's canonical
+  // form: `serial <lowercase hex, no colons or leading zeros>`, `spki-sha256 <64 lowercase
+  // hex>` or `node <node id>`. The decoder accepts other spellings of the same entry and
+  // refuses a repeat after canonicalizing. Member ids are not named here; they are
+  // assigned at registration.
+  repeated string denied = 6;
+}
+
+message Member {
+  // Assigned by the state store at registration.
+  uint64 id = 1;
+  // The address callers dial.
+  string addr = 2;
+  // The zone label; empty when the node has none.
+  string zone = 3;
+  // Relative share of the digests, at least 1.
+  uint32 weight = 4;
+  MemberState state = 5;
+}
+
+enum MemberState {
+  MEMBER_STATE_UNSPECIFIED = 0;
+  MEMBER_STATE_JOINING = 1;
+  MEMBER_STATE_CATCHING_UP = 2;
+  MEMBER_STATE_ACTIVE = 3;
+  MEMBER_STATE_DRAINING = 4;
+  MEMBER_STATE_DOWN = 5;
+}
+
+enum Rule {
+  RULE_UNSPECIFIED = 0;
+  // The top R members by weighted rendezvous score. This value fixes the whole
+  // computation: the hash keys, the byte layout of the hashed key, the score and its
+  // logarithm, bit for bit. Any change to one of them is a NEW rule value, never an edit
+  // of this one, because it remaps every blob.
+  RULE_RENDEZVOUS = 1;
+}
+
+// A storage node's way into the map (docs/design/architecture-v2.md, section 6). Two unary
+// calls rather than a stream: membership lives in the state store, so nothing is kept per
+// connection, and a node that reconnects to another frontend loses nothing.
+service Membership {
+  // Joins, or joins again. The store assigns the member id and the boot counter; the same
+  // instance_id gets the same id and a larger boot counter every time. The member starts
+  // as JOINING, or CATCHING_UP when the request says it is rebuilding its index.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Keeps the member's row alive, and carries the end of a rebuild (CATCHING_UP to
+  // ACTIVE). NOT_FOUND means the row expired (or never was): register again.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_STORAGE = 1;
+}
+
+message RegisterRequest {
+  Role role = 1;
+  // Stable across restarts of one node; the key of its member id.
+  string instance_id = 2;
+  // The address callers dial.
+  string addr = 3;
+  // Relative capacity: its share of the digests, at least 1.
+  uint32 weight = 4;
+  string zone = 5;
+  // The newest protocol version this node speaks; refused below the map's min_protocol.
+  uint32 protocol = 6;
+  // The node is rebuilding its index: it enters the map as CATCHING_UP, not JOINING, and
+  // answers what it cannot find UNAVAILABLE until a heartbeat reports the rebuild done.
+  bool catching_up = 7;
+}
+
+message RegisterResponse {
+  uint64 member_id = 1;
+  // Larger at every registration of this member; object keys are (member id, boot).
+  uint64 boot = 2;
+  // How often to heartbeat, in milliseconds: well under the row's time to live.
+  uint64 heartbeat_interval_ms = 3;
+  Map map = 4;
+}
+
+message HeartbeatRequest {
+  uint64 member_id = 1;
+  uint64 boot = 2;
+  // The generation of the map the node holds (0: none). Absent from an older node, which
+  // reads as 0 and is sent the map every beat.
+  uint64 have_generation = 3;
+  // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
+  // ACTIVE at the first heartbeat that says false; no other state is changed by it.
+  bool catching_up = 4;
+}
+
+message HeartbeatResponse {
+  // The generation of the current map.
+  uint64 map_generation = 1;
+  // The current map, when its generation is above the request's have_generation: a node
+  // that missed a bump learns it from its next beat, with no other call.
+  Map map = 2;
+}

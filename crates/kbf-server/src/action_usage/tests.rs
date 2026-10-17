@@ -64,10 +64,11 @@ fn only_an_ok_run_has_an_exit_code_and_only_a_measured_one_a_line() {
     assert_eq!(Measured::of(&bare), None);
 }
 
-/// Catches: a field renamed or moved ahead of the old ones (a reader of the old line
-/// breaks), a missing new field, a label not quoted, `-` lost for an absent one.
+/// Catches: a field renamed or moved, a missing field, a label not quoted, `-` lost
+/// for an absent one; and (issue #796) the client's `target_id` written where the
+/// derived target goes, or the derived target missing from the line.
 #[test]
-fn the_line_keeps_the_old_fields_first_and_appends_the_new() {
+fn the_line_names_the_hint_and_the_derived_target_apart() {
     let shapes = Shapes::default();
     let mut subject = shapes.subject(described(
         &["cc"],
@@ -88,8 +89,9 @@ fn the_line_keeps_the_old_fields_first_and_appends_the_new() {
     assert_eq!(
         line,
         format!(
-            "exit_code=0 mnemonic=- target=\"//pkg:t\" wall_us=1000 {cgroup} key={} \
-             cfg=7a3c1e9f0b2d4c68 outcome=oom lease={lease} node=node-a",
+            "exit_code=0 mnemonic=- target_hint=\"//pkg:t\" wall_us=1000 {cgroup} key={} \
+             cfg=7a3c1e9f0b2d4c68 target=\"cell//pkg:t\" target_kind=target outcome=oom \
+             lease={lease} node=node-a",
             subject.key
         )
     );
@@ -178,4 +180,54 @@ fn a_shape_line_shows_eight_patterns_and_marks_the_rest() {
             few.key
         )
     );
+}
+
+/// Catches: the test flag dropped between the shape and the record the row keeps (a
+/// run record would never say it is a test), or set on every record.
+#[test]
+fn the_record_says_whether_the_action_is_a_test() {
+    let recorded = |outputs: &[&str]| {
+        let (subject, _) = Subject::of(described(&["runner"], outputs));
+        (subject.test, subject.recorded().test)
+    };
+    let execution = "buck-out/v2/test/execution/cell/7a3c1e9f0b2d4c68/fedcba9876543210/default/o";
+    assert_eq!(recorded(&[execution]), (true, true));
+    assert_eq!(recorded(&["a.o"]), (false, false));
+}
+
+/// Catches: the record given another key than the line's (bytes reordered), the
+/// configuration hash or the target dropped, a kind mapped to another, or the
+/// client's `target_id` recorded as the derived target.
+#[test]
+fn the_record_keeps_the_subject_s_key_cfg_and_target() {
+    use kbf_invocation::TargetKind as Kind;
+    let recorded = |outputs: &[&str]| {
+        let mut described = described(&["cc"], outputs);
+        described.label.target = Some("//client:says".to_owned());
+        let (subject, _) = Subject::of(described);
+        (subject.key, subject.recorded())
+    };
+    let (key, shape) = recorded(&["buck-out/v2/art/cell/7a3c1e9f0b2d4c68/pkg/__t__/t.o"]);
+    assert_eq!(shape.key_text(), key.to_string());
+    assert_eq!(shape.cfg.as_deref(), Some("7a3c1e9f0b2d4c68"));
+    let target = shape.target.expect("a target");
+    assert_eq!(
+        (target.kind, target.label.value.as_str()),
+        (Kind::Target, "cell//pkg:t")
+    );
+    for (path, kind) in [
+        (
+            "buck-out/v2/art-anon/cell/7a3c1e9f0b2d4c68pkg/3fa9c1/__t__/o",
+            Kind::Anon,
+        ),
+        (
+            "buck-out/v2/art-bxl/cell/x.bxl/__f__/0123456789abcdef/o",
+            Kind::Bxl,
+        ),
+    ] {
+        let (_, shape) = recorded(&[path]);
+        assert_eq!(shape.target.map(|t| t.kind), Some(kind), "{path}");
+    }
+    let (_, shape) = recorded(&["out/a.o"]);
+    assert_eq!(shape.target, None, "the client's target_id is no target");
 }

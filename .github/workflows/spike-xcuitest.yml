@@ -27,6 +27,17 @@ on:
       - crates/kbf-driver-native/src/network.rs
       - crates/kbf-driver-native/src/procs.rs
       - crates/kbf-driver-native/src/user_folders.rs
+  push:
+    branches: [feature/arch-v2]
+    paths:
+      - .github/workflows/spike-xcuitest.yml
+      - tools/spike/macos/fixtures/**
+      - crates/kbf-driver-native/tests/xcuitest_sandbox.rs
+      - crates/kbf-driver-native/tests/support/xcode_fixture.rs
+      - crates/kbf-driver-native/src/home.rs
+      - crates/kbf-driver-native/src/network.rs
+      - crates/kbf-driver-native/src/procs.rs
+      - crates/kbf-driver-native/src/user_folders.rs
 
 permissions: {}
 
@@ -36,6 +47,9 @@ concurrency:
 
 jobs:
   xcuitest-sandbox:
+    # Not run for a pull request into feature/arch-v2; it runs on pushes to it, on pull
+    # requests into any other branch, and by hand.
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' }}
     runs-on: macos-15
     timeout-minutes: 90
     permissions:

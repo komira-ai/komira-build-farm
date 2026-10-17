@@ -517,6 +517,44 @@ async fn the_same_digest_from_two_callers_is_one_record() {
     assert_audit_clean(&cache);
 }
 
+/// A blob the cache already holds is answered at once and joins no segment. `b` is
+/// stored; then a caller stores `b` again and `c` in one call: only `c` is written, in
+/// a segment of one record, and the second call is answered `Ok` for both. A blob
+/// stored twice in a row takes the same path.
+///
+/// Catches: a blob already stored written again (a second PUT and a second record, one
+/// more byte of storage for every re-upload), and a held blob left out of the answer
+/// (the call hangs or fails). Mutant seen red: `held` ignored in `submit` (the second
+/// call PUTs a segment of two records). This is also the one test that takes the
+/// held arm in this file's cache type, which the coverage ratchet counts per type.
+#[tokio::test(start_paused = true)]
+async fn a_blob_already_stored_is_answered_and_not_written_again() {
+    let (cache, store) = default_cache().await;
+    let (b, c) = (blob(30, 4096), blob(31, 4096));
+    cache.store_blobs(vec![b.clone()]).await.expect("first");
+    assert_eq!(store.put_keys().len(), 1);
+
+    cache
+        .store_blobs(vec![b.clone(), c.clone()])
+        .await
+        .expect("second");
+    assert_eq!(store.put_keys().len(), 2, "PUTs: only `c` is new");
+    assert_eq!(cache.meta().batches(), [1, 1], "PutBlobs commits");
+    assert_eq!(
+        records_in(&store, &key_of(&cache, c.digest()).await).await,
+        1
+    );
+    assert_ne!(
+        key_of(&cache, b.digest()).await,
+        key_of(&cache, c.digest()).await
+    );
+
+    cache.store_blobs(vec![b.clone()]).await.expect("third");
+    assert_eq!(store.put_keys().len(), 2, "PUTs: nothing was new");
+    assert_eq!(cache.meta().batches(), [1, 1]);
+    assert_audit_clean(&cache);
+}
+
 /// With two PUT slots, six segments sealed while every PUT is held: exactly two PUTs
 /// reach the store; once they are let go every caller succeeds, and no more than two
 /// were ever in flight.

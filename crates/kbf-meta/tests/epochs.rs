@@ -7,8 +7,8 @@ use common::{
     ANY_INDEX, DAY, EPOCH, digest, in_segment, mark, mark_at, mark_missing, meta, object, put, tick,
 };
 use kbf_meta::{
-    Applied, BlobAnswer, BlobWrite, Command, Epoch, Generation, Location, LossMark, MetaState,
-    ObjectId, Retention, StoreId, UnallocatedEpoch, UnreachableReason,
+    Applied, BlobAnswer, BlobWrite, Command, Epoch, ForeignWriter, Generation, Location, LossMark,
+    MetaState, ObjectId, Retention, StoreId, UnreachableReason,
 };
 
 fn alloc(m: &mut MetaState) -> Epoch {
@@ -62,7 +62,7 @@ fn objects_of_an_unallocated_epoch_are_refused_and_change_nothing() {
                 location: at_epoch(1, 1),
             }
         ),
-        Applied::Blob(Err(UnallocatedEpoch(ObjectId::new(Epoch::new(1), 1))))
+        Applied::Blob(Err(ForeignWriter(ObjectId::new(Epoch::new(1), 1))))
     );
     assert_eq!(fresh, before);
 
@@ -70,7 +70,7 @@ fn objects_of_an_unallocated_epoch_are_refused_and_change_nothing() {
     let before = m.clone();
     for epoch in [0, EPOCH.get() + 1, u64::MAX] {
         let location = at_epoch(epoch, 3);
-        let refused = Err(UnallocatedEpoch(location.object));
+        let refused = Err(ForeignWriter(location.object));
         assert_eq!(
             m.execute(
                 ANY_INDEX,
@@ -121,7 +121,7 @@ fn put_blobs_with_one_unallocated_location_records_nothing() {
             (digest(3), bad),
         ]),
     );
-    assert_eq!(applied, Applied::Blobs(Err(UnallocatedEpoch(bad.object))));
+    assert_eq!(applied, Applied::Blobs(Err(ForeignWriter(bad.object))));
     assert_eq!(m, before);
     assert_eq!(m.blob_count(), 0);
 }

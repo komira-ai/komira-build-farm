@@ -16,30 +16,38 @@ hex.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
 kbf-front.workspace = true
+kbf-history.workspace = true
 kbf-invocation.workspace = true
 kbf-log.workspace = true
+kbf-map.workspace = true
+kbf-mapsync.workspace = true
 kbf-caps.workspace = true
 kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true
 kbf-raft.workspace = true
+kbf-route.workspace = true
 kbf-sched.workspace = true
+kbf-state.workspace = true
+kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-threads.workspace = true
 kbf-tier.workspace = true
+kbf-tls.workspace = true
 kbf-types.workspace = true
 percent-encoding.workspace = true
 prost.workspace = true
 prost-types.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["fs", "net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
+tower-layer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 x509-parser.workspace = true
@@ -48,11 +56,20 @@ x509-parser.workspace = true
 kbf-segments.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
+# The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
+kbf-state = { workspace = true, features = ["test-support"] }
+# The pages, rendered over this server's real routes (tests/ui_pages.rs).
+kbf-ui.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+# The codec of a raw call to each method of the worker listener's role table
+# (tests/worker_roles.rs).
+tonic-prost.workspace = true
+# rebuild_interest_cache for the tests that install a global subscriber while others run.
+tracing-core.workspace = true
 
 [lints]
 workspace = true

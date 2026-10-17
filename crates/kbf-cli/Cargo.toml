@@ -1,0 +1,77 @@
+[package]
+name = "kbf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The one binary: `kbf <mode>` over the libraries of kbf-node and kbf-all-in-one
+# (docs/design/cluster.md, sections 1 and 5.1). Like kbf-all-in-one it links both the
+# server and the node library (the version stamp is kbf-server's), so it is listed in
+# `JOINERS` in crates/kbf-it/tests/layering.rs.
+[[bin]]
+name = "kbf"
+path = "src/main.rs"
+
+# The container driver's stand-in `podman`, which runs each action as a plain process,
+# for tests/storage_and_daemon.rs: the program kbf-all-in-one's tests run, built here
+# because a test can run only its own package's binaries, under a name of its own so a
+# workspace build does not write two binaries to one path. Not shipped.
+[[bin]]
+name = "kbf-cli-fake-podman"
+path = "../kbf-driver-container/tests/bin/fake_podman.rs"
+test = false
+
+# The stand-in `systemctl` for tests/frontend_handover.rs: `kbf frontend handover` run
+# against it, in Rust like the stand-in `podman` (no shell in test code). Not shipped.
+[[bin]]
+name = "kbf-cli-fake-systemctl"
+path = "tests/bin/fake_systemctl.rs"
+test = false
+
+[dependencies]
+clap.workspace = true
+kbf-all-in-one.workspace = true
+kbf-node.workspace = true
+kbf-server.workspace = true
+# The stand-in `podman`'s (kbf-cli-fake-podman).
+rustix = { workspace = true, features = ["process"] }
+# The schema version of the SQLite state file, which `kbf --version --json` reports.
+kbf-state.workspace = true
+# The identity `kbf --version --json` prints (src/version.rs).
+serde_json.workspace = true
+
+[dev-dependencies]
+# The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):
+# the daemon's transfer engine over real gRPC, and the storage client.
+bytes.workspace = true
+kbf-cas-conformance.workspace = true
+kbf-storage.workspace = true
+kbf-transfer.workspace = true
+kbf-types.workspace = true
+# The protocol the daemon half speaks, which `kbf --version --json` reports as the
+# server's (src/tests.rs pins them equal).
+kbf-daemon.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tonic.workspace = true
+# `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the image
+# store layout the stand-in `podman` reads, the act steps it runs through this test
+# binary, the REAPI messages (the node's certificates are made with rcgen, below).
+kbf-driver-container.workspace = true
+kbf-proto.workspace = true
+kbf-testkit.workspace = true
+prost.workspace = true
+# The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
+# parser (tests/deploy_units.rs).
+kbf-deploy.workspace = true
+# The host `check-units --mode` runs `kbf check-args` on (tests/deploy_units.rs).
+kbf-host.workspace = true
+# Certificates made as the farm's issuer makes them, checked by `kbf-deploy linux
+# verify-cert` and read back with the storage node's own role check
+# (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
+rcgen.workspace = true
+
+[lints]
+workspace = true

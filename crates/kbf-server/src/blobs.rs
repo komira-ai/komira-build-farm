@@ -7,7 +7,9 @@
 //! Every call of both services is admitted before it is served, by one rule
 //! ([`admit`], over [`crate::identity`]): the listener serves mutual TLS, the call's
 //! client certificate names exactly one node, and neither the certificate (serial,
-//! public key) nor that node is on the deny list, looked at again for this call. A
+//! public key) nor that node is on the deny list, looked at again for this call. Before
+//! that, the listener's role table ([`crate::worker_roles`]) took the call from a
+//! certificate naming the daemon role alone. A
 //! streamed request (a Write, a RegisterChunkMapping) is refused before its first
 //! message is read. Under plain text every call is refused UNAUTHENTICATED. An
 //! admitted call is served as the REAPI listener serves it; the chunking calls answer
@@ -16,7 +18,8 @@
 //! `kbf.worker.v1.Segments` ([`WorkerSegments`]: segment upload and segment-range
 //! reads, `docs/design/write-path.md`, section 4) is admitted by the same rule.
 //!
-//! `Execution`, `ActionCache` and `Capabilities` answer UNIMPLEMENTED on this listener.
+//! `Execution`, `ActionCache` and `Capabilities` are not in the role table, so this
+//! listener refuses them PERMISSION_DENIED.
 
 use kbf_front::{ByteStreamService, CasService, MetaLog, SegmentsService};
 use kbf_objstore::ObjectStore;
@@ -43,7 +46,7 @@ use crate::identity::Peers;
 
 /// Admits the call `request` is, as the module docs say, or says why not (and logs it).
 async fn admit<T>(peers: &Peers, request: &Request<T>, call: &'static str) -> Result<(), Status> {
-    let certs = request.peer_certs();
+    let certs = kbf_tls::peer_certs(request);
     let leaf = certs.as_deref().and_then(|chain| chain.first());
     let admitted = peers.admit_call(leaf.map(AsRef::as_ref)).await;
     admitted.map(drop).inspect_err(|refused| {

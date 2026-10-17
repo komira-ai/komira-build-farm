@@ -34,14 +34,34 @@ impl Stamp {
             .execution_metadata
             .get_or_insert_with(ExecutedActionMetadata::default);
         node.as_str().clone_into(&mut metadata.worker);
-        metadata.queued_timestamp = Some(Timestamp::from(self.queued));
-        metadata
-            .worker_start_timestamp
-            .get_or_insert_with(|| Timestamp::from(self.started));
-        metadata
-            .worker_completed_timestamp
-            .get_or_insert_with(|| Timestamp::from(received));
+        let times = self.times(metadata, received);
+        metadata.queued_timestamp = Some(times.queued);
+        metadata.worker_start_timestamp = Some(times.worker_start);
+        metadata.worker_completed_timestamp = Some(times.worker_completed);
     }
+
+    /// The three times [`Stamp::apply`] writes into `metadata`, without writing them:
+    /// `queued` the server's, the worker start and completion the daemon's when it
+    /// sent them, else the `Start` and `received`.
+    pub(crate) fn times(self, metadata: &ExecutedActionMetadata, received: SystemTime) -> Stamped {
+        Stamped {
+            queued: Timestamp::from(self.queued),
+            worker_start: metadata
+                .worker_start_timestamp
+                .unwrap_or_else(|| Timestamp::from(self.started)),
+            worker_completed: metadata
+                .worker_completed_timestamp
+                .unwrap_or_else(|| Timestamp::from(received)),
+        }
+    }
+}
+
+/// The times a [`Stamp`] sets in a run's metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stamped {
+    pub(crate) queued: Timestamp,
+    pub(crate) worker_start: Timestamp,
+    pub(crate) worker_completed: Timestamp,
 }
 
 #[cfg(test)]

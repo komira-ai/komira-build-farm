@@ -1,0 +1,44 @@
+# Rendered by `kbf-deploy linux render-units`; installed as
+# /etc/systemd/system/kbf-server.service (kbf docs/deploy/storage-node.md).
+[Unit]
+Description=kbf build farm server
+Wants=network-online.target
+After=network-online.target minio.service
+
+[Service]
+# Not the daemon's user: builds must not read the operator API token.
+User=kbf-server
+Slice=kbf.slice
+# kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
+MemoryMin=16G
+# A server answering from swap would slow every build at once.
+MemorySwapMax=0
+# Above MinIO's -950, below the daemon's -900.
+OOMScoreAdjust=-925
+CPUWeight=300
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account,
+# mode 0600: a secret never goes on the command line.
+EnvironmentFile=/etc/kbf/s3.env
+ExecStart=/usr/local/bin/kbf-server \
+    --cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true \
+    --meta-dir=/var/lib/kbf-server/raft \
+    --listen=192.0.2.10:8980 \
+    --reapi-tls-cert=/etc/kbf/reapi.pem \
+    --reapi-tls-key=/etc/kbf/reapi.key \
+    --worker-listen=192.0.2.10:8981 \
+    --worker-tls-cert=/etc/kbf/worker.pem \
+    --worker-tls-key=/etc/kbf/worker.key \
+    --worker-client-ca=/etc/kbf/ca.pem \
+    --worker-deny-list=/etc/kbf/deny-list \
+    --api-listen=127.0.0.1:8982 \
+    --api-token-file=/etc/kbf/api-token
+# SIGTERM drains: new Execute calls are refused, open streams run until their action is
+# done (Buck2 does not recover a stream that breaks), then the server exits. systemd must
+# not SIGKILL it meanwhile, so no stop timeout. A second SIGTERM ends the open streams
+# (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
+# same drain with no signal.
+TimeoutStopSec=infinity
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

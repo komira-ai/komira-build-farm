@@ -160,3 +160,83 @@ fn a_refusal_exits_2_on_stderr_and_writes_nothing() {
     let (code, _, _) = run(&["linux", "render-units", "--config", path(&config)]);
     assert_eq!(code, 2, "a missing --out");
 }
+
+#[test]
+fn a_mode_renders_and_checks_and_an_unknown_mode_is_refused() {
+    // Catches: --mode not wired to the mode units (the converged four written
+    // instead), a broken mode unit whose check exits 0, and a mode kbf does not have
+    // (a typo, an old binary's name) rendered instead of refused with exit 2.
+    let dir = scratch("mode");
+    let config = dir.join("config.local");
+    std::fs::write(&config, EXAMPLE).expect("config");
+    let out = dir.join("units");
+    let render = |mode: &str| {
+        run(&[
+            "linux",
+            "render-units",
+            "--config",
+            path(&config),
+            "--out",
+            path(&out),
+            "--kbf-uid",
+            "1500",
+            "--mode",
+            mode,
+        ])
+    };
+    let check = |mode: &str| {
+        run(&[
+            "linux",
+            "check-units",
+            "--config",
+            path(&config),
+            "--dir",
+            path(&out),
+            "--installable",
+            "--mode",
+            mode,
+        ])
+    };
+    let (code, stdout, stderr) = render("frontend");
+    assert_eq!((code, stderr.as_str()), (0, ""), "{stdout}");
+    assert!(
+        stdout.starts_with("rendered kbf.slice kbf-frontend@.service into "),
+        "{stdout}"
+    );
+    let (code, stdout, _) = check("frontend");
+    // The frontend's flags are parsed by the installed kbf, or the check says it found
+    // none (a machine without kbf, such as CI): a SKIP line, then the verdict.
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.ends_with("UNIT OK: kbf-frontend@.service runs kbf frontend\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .rev()
+            .skip(1)
+            .all(|l| l.starts_with("SKIP parse: ")),
+        "{stdout}"
+    );
+
+    let unit = out.join("kbf-frontend@.service");
+    let text = std::fs::read_to_string(&unit).expect("unit");
+    let planted = text.replace("TimeoutStopSec=infinity", "TimeoutStopSec=90s");
+    assert_ne!(planted, text, "the defect is not planted");
+    std::fs::write(&unit, planted).expect("plant");
+    let (code, stdout, _) = check("frontend");
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.starts_with("FAIL stop: "), "{stdout}");
+
+    for bad in ["kbf-server", "worker", ""] {
+        let (code, stdout, stderr) = render(bad);
+        assert_eq!((code, stdout.as_str()), (2, ""), "{bad:?}");
+        assert!(
+            stderr.contains(
+                "[possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]"
+            ),
+            "{bad:?}: {stderr}"
+        );
+    }
+}

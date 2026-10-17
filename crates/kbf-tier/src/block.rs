@@ -1,6 +1,8 @@
 //! The names in a tier directory and the `TIER` file.
 
-use kbf_meta::{Epoch, ObjectId, TierId};
+use std::num::NonZeroU64;
+
+use kbf_meta::{Epoch, LegacyWriter, NodeWriter, ObjectId, TierId, Writer};
 
 /// The file that names the tier a directory belongs to.
 pub const TIER: &str = "TIER";
@@ -21,29 +23,64 @@ pub(crate) fn parse_tier_file(bytes: &[u8]) -> Option<TierId> {
     (tier_file_bytes(id) == bytes).then_some(id)
 }
 
-/// The block file of `object`: `<epoch>-<seq>.blk`, each as 16 lowercase hex digits,
-/// as in the object's key in the store.
+/// The stem of `object`'s files: `<epoch>-<seq>` for an epoch writer's object,
+/// `<member>-<boot>-<seq>` for a node writer's, each as 16 lowercase hex digits. An
+/// object of another log's epoch is never staged (only a rebuild of the index names one),
+/// but has a stem all the same: `l<log id>-<epoch>-<seq>`.
+fn stem(object: ObjectId) -> String {
+    match object.writer() {
+        Writer::Epoch(e) => format!("{:016x}-{:016x}", e.get(), object.seq()),
+        Writer::Node(n) => format!(
+            "{:016x}-{:016x}-{:016x}",
+            n.member(),
+            n.boot(),
+            object.seq()
+        ),
+        Writer::Legacy(l) => format!(
+            "l{:016x}-{:016x}-{:016x}",
+            l.log(),
+            l.epoch().get(),
+            object.seq()
+        ),
+    }
+}
+
+/// The block file of `object`: `<epoch>-<seq>.blk` (an epoch writer's) or
+/// `<member>-<boot>-<seq>.blk` (a node writer's), each as 16 lowercase hex digits.
 #[must_use]
 pub fn block_name(object: ObjectId) -> String {
-    format!("{:016x}-{:016x}.blk", object.epoch().get(), object.seq())
+    format!("{}.blk", stem(object))
 }
 
 /// The object a block file name names, or `None` if `name` is not exactly the name
 /// [`block_name`] gives some object.
 #[must_use]
 pub fn parse_block_name(name: &str) -> Option<ObjectId> {
-    let (epoch, seq) = name.strip_suffix(".blk")?.split_once('-')?;
-    let epoch = u64::from_str_radix(epoch, 16).ok()?;
-    let seq = u64::from_str_radix(seq, 16).ok()?;
-    let object = ObjectId::new(Epoch::new(epoch), seq);
+    let hex = |s: &str| u64::from_str_radix(s, 16).ok();
+    let fields: Vec<&str> = name.strip_suffix(".blk")?.split('-').collect();
+    let object = match fields[..] {
+        [epoch, seq] => ObjectId::new(Epoch::new(hex(epoch)?), hex(seq)?),
+        [log, epoch, seq] if log.starts_with('l') => {
+            let log = NonZeroU64::new(hex(&log[1..])?)?;
+            let epoch = NonZeroU64::new(hex(epoch)?)?;
+            let writer = LegacyWriter::new(log, Epoch::new(epoch.get()));
+            ObjectId::of(Writer::Legacy(writer), hex(seq)?)
+        }
+        [member, boot, seq] => {
+            let member = NonZeroU64::new(hex(member)?)?;
+            let boot = NonZeroU64::new(hex(boot)?)?;
+            ObjectId::of(Writer::Node(NodeWriter::new(member, boot)), hex(seq)?)
+        }
+        _ => return None,
+    };
     (block_name(object) == name).then_some(object)
 }
 
 /// The flushed copy of `object`: its block renamed once its `ObjectFlushed`
-/// committed, `<epoch>-<seq>.seg`.
+/// committed, `<epoch>-<seq>.seg` or `<member>-<boot>-<seq>.seg`.
 #[must_use]
 pub fn seg_name(object: ObjectId) -> String {
-    format!("{:016x}-{:016x}.seg", object.epoch().get(), object.seq())
+    format!("{}.seg", stem(object))
 }
 
 /// The object a flushed copy's name names, or `None` if `name` is not exactly the
@@ -82,6 +119,54 @@ mod tests {
             "00000000000000ab0000000000000007.blk",
             "00000000000000ag-0000000000000007.blk",
             "00000000000000ab-000000000000000g.blk",
+        ] {
+            assert_eq!(parse_block_name(bad), None, "{bad}");
+        }
+    }
+
+    /// Catches: a node writer's block name that does not round-trip, that drops the
+    /// boot (two boots of one member would share a block name), or that parses with a
+    /// zero member or boot, a fourth field, or a non-canonical spelling; and an epoch
+    /// name read as a node's or the other way round.
+    #[test]
+    fn node_block_names_round_trip_and_nothing_else_parses() {
+        let n = |v| NonZeroU64::new(v).expect("not zero");
+        let id = ObjectId::of(Writer::Node(NodeWriter::new(n(7), n(0x2b))), 3);
+        let stem = "0000000000000007-000000000000002b-0000000000000003";
+        assert_eq!(block_name(id), format!("{stem}.blk"));
+        assert_eq!(parse_block_name(&block_name(id)), Some(id));
+        assert_eq!(seg_name(id), format!("{stem}.seg"));
+        assert_eq!(parse_seg_name(&seg_name(id)), Some(id));
+        let next_boot = ObjectId::of(Writer::Node(NodeWriter::new(n(7), n(0x2c))), 3);
+        assert_ne!(block_name(next_boot), block_name(id));
+        let epoch = ObjectId::new(Epoch::new(7), 3);
+        assert_ne!(parse_block_name(&block_name(epoch)), Some(id));
+        for bad in [
+            "0000000000000000-000000000000002b-0000000000000003.blk",
+            "0000000000000007-0000000000000000-0000000000000003.blk",
+            "0000000000000007-000000000000002B-0000000000000003.blk",
+            "0000000000000007-000000000000002b-0000000000000003-0000000000000001.blk",
+            "7-2b-3.blk",
+        ] {
+            assert_eq!(parse_block_name(bad), None, "{bad}");
+        }
+    }
+
+    /// Catches: a name for an object of another log's epoch (which a tier never stages,
+    /// but the type allows) that collides with an epoch's or a node's, or does not
+    /// round-trip, or parses with a zero log or epoch.
+    #[test]
+    fn another_logs_block_names_round_trip_and_stay_apart() {
+        let n = |v| NonZeroU64::new(v).expect("not zero");
+        let id = ObjectId::of(Writer::Legacy(LegacyWriter::new(n(9), Epoch::new(2))), 3);
+        let stem = "l0000000000000009-0000000000000002-0000000000000003";
+        assert_eq!(block_name(id), format!("{stem}.blk"));
+        assert_eq!(parse_block_name(&block_name(id)), Some(id));
+        assert_eq!(parse_seg_name(&seg_name(id)), Some(id));
+        for bad in [
+            "l0000000000000000-0000000000000002-0000000000000003.blk",
+            "l0000000000000009-0000000000000000-0000000000000003.blk",
+            "L0000000000000009-0000000000000002-0000000000000003.blk",
         ] {
             assert_eq!(parse_block_name(bad), None, "{bad}");
         }

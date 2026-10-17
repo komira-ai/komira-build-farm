@@ -5,7 +5,8 @@
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
-use crate::record::{Text, outcome_bytes, output_bytes};
+use crate::record::{Text, outcome_bytes, output_bytes, run_bytes, shape_bytes};
+use crate::run::{ActionShape, Run};
 
 /// A wall-clock time, in microseconds since the Unix epoch, read by the caller.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -58,8 +59,9 @@ pub struct Owner(pub String);
 pub enum Event {
     /// A call that carried an invocation id.
     Call(Box<Call>),
-    /// The Command digest the recorder read from an Action blob: set on that action's
-    /// row in the invocation the id and owner name.
+    /// The Command digest the recorder read from an Action blob, and the shape the
+    /// server read from that Command: set on that action's row in the invocation the
+    /// id and owner name.
     Command {
         /// The invocation.
         id: InvocationId,
@@ -69,6 +71,8 @@ pub enum Event {
         action: Digest,
         /// The Command digest the Action names.
         command: Digest,
+        /// The Command's shape, when the server read one.
+        shape: Option<Box<ActionShape>>,
     },
     /// A lease of `operation` was granted on `worker`.
     Granted {
@@ -101,6 +105,15 @@ pub enum Event {
         /// When.
         at: WallTime,
     },
+    /// The report of `lease` was taken by the scheduler, and measured `run`.
+    Ran {
+        /// The scheduler's operation.
+        operation: OperationId,
+        /// The lease the report was for.
+        lease: LeaseId,
+        /// What it measured.
+        run: Box<Run>,
+    },
     /// `operation` ended, and its callers were answered with `outcome`.
     Finished(Finished),
 }
@@ -113,7 +126,10 @@ impl Event {
     pub fn bytes(&self) -> usize {
         let owned = match self {
             Self::Call(call) => call.bytes(),
-            Self::Command { id, owner, .. } => id.0.len() + owner.0.len(),
+            Self::Command {
+                id, owner, shape, ..
+            } => id.0.len() + owner.0.len() + shape.as_deref().map_or(0, shape_bytes),
+            Self::Ran { run, .. } => run_bytes(run),
             Self::Granted { worker, .. } => worker.as_str().len(),
             Self::Started { .. } | Self::Requeued { .. } => 0,
             Self::Finished(f) => {
@@ -330,10 +346,12 @@ pub enum ExecuteAnswer {
 /// (section 3.2), so a page lists outputs and logs after the blob is gone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
-    /// The ActionResult blob.
-    pub result: Digest,
-    /// The action's exit code.
-    pub exit_code: i32,
+    /// The ActionResult blob; `None` for a timed-out run's partial result, which is
+    /// never stored (its stdout and stderr are).
+    pub result: Option<Digest>,
+    /// The action's exit code; `None` for a timed-out run's partial result, whose
+    /// action was stopped and has no exit code.
+    pub exit_code: Option<i32>,
     /// Its output files and directories, in the result's order. A row keeps the first
     /// [`crate::OUTPUTS_PER_ROW`].
     pub outputs: Vec<Output>,

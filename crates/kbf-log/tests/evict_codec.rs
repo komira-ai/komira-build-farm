@@ -256,7 +256,11 @@ fn an_unset_meta_command_is_refused_under_every_format() {
 fn wrap(objects: &[(u64, u64)]) -> Vec<u8> {
     let objects = objects
         .iter()
-        .map(|&(epoch, seq)| proto::ObjectId { epoch, seq })
+        .map(|&(epoch, seq)| proto::ObjectId {
+            epoch,
+            seq,
+            ..proto::ObjectId::default()
+        })
         .collect();
     proto::LogCommand {
         command: Some(proto::log_command::Command::Meta(proto::MetaCommand {

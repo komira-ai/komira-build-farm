@@ -132,7 +132,10 @@ pub(crate) fn write_resource(name: &str) -> Result<Resource, Status> {
 
 /// Parses `{sha256/}{hash}/{size}` from the segments after `blobs`, returning the
 /// digest and the segments left over.
-fn blob_digest<'a>(name: &str, parts: &'a [&'a str]) -> Result<(Digest, &'a [&'a str]), Status> {
+pub(crate) fn blob_digest<'a>(
+    name: &str,
+    parts: &'a [&'a str],
+) -> Result<(Digest, &'a [&'a str]), Status> {
     let parts = match parts.first() {
         Some(&SHA256_NAME) => &parts[1..],
         _ => parts,
@@ -145,7 +148,7 @@ fn blob_digest<'a>(name: &str, parts: &'a [&'a str]) -> Result<(Digest, &'a [&'a
     Ok((digest, rest))
 }
 
-fn bad_resource(name: &str, why: &str) -> Status {
+pub(crate) fn bad_resource(name: &str, why: &str) -> Status {
     Status::invalid_argument(format!("resource name {name:?}: {why}"))
 }
 

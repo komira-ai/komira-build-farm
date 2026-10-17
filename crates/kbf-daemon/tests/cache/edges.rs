@@ -430,7 +430,8 @@ async fn a_floor_the_filesystem_meets_evicts_nothing() {
 }
 
 /// Catches a sibling entry copied without its hash checked (the plain key changed on
-/// disk would become the executable key's bytes): the executable key is then fetched.
+/// disk would become the executable key's bytes), or its refused copy left in `tmp/`:
+/// the executable key is then fetched, and `tmp/` is empty.
 #[tokio::test]
 async fn a_sibling_that_hashes_wrong_is_not_copied() {
     let dir = scratch("cache-sibling");
@@ -461,6 +462,7 @@ async fn a_sibling_that_hashes_wrong_is_not_copied() {
     .expect("exec");
     assert_eq!(std::fs::read(at.join("x")).expect("read"), b"tool");
     assert_eq!(cas.reads_of(&digest(b"tool")), 2);
+    assert_eq!(tmp_files(&dir), 0, "the refused copy is left in tmp/");
     stop(cache, &gates);
 }
 

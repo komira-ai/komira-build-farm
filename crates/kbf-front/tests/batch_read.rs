@@ -382,7 +382,7 @@ async fn a_damaged_record_in_a_joined_get_fails_alone_and_marks_its_object() {
 async fn blobs_in_another_store_are_internal_and_never_read() {
     let farm = Farm::new().await;
     let (a, b) = (blob("elsewhere one"), blob("elsewhere two"));
-    let object = ObjectId::new(farm.cache.epoch(), 99);
+    let object = ObjectId::of(farm.cache.writer(), 99);
     let mut offset = 0;
     for x in [&a, &b] {
         let location = Location {
@@ -457,7 +457,7 @@ async fn two_digests_indexed_at_one_location_do_not_panic_the_call() {
     let (a, b) = (blob("same place one"), blob("same place two"));
     let location = Location {
         store: StoreId::CONFIGURED,
-        object: ObjectId::new(farm.cache.epoch(), 99),
+        object: ObjectId::of(farm.cache.writer(), 99),
         offset: 0,
     };
     for x in [&a, &b] {

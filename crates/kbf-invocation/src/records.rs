@@ -12,8 +12,14 @@ use crate::event::{
 };
 use crate::record::{
     ActionRow, Attempt, AttemptEnd, How, Invocation, OUTPUTS_PER_ROW, REASON_CAP, ROW_CAP,
-    RecordKey, State, attempt_bytes, attempts_bytes, btree_entry_bytes, capped, output_bytes,
+    RecordKey, State, TEXT_CAP, attempt_bytes, attempts_bytes, btree_entry_bytes, capped,
+    output_bytes, run_bytes, shape_bytes,
 };
+use crate::run::ActionShape;
+
+mod ended;
+
+pub use ended::{Ended, EndedKind};
 
 /// How many dropped calls of records not made yet [`Records`] remembers, so that the
 /// record each would have made starts incomplete (see
@@ -97,6 +103,8 @@ pub struct Records {
     evicted_seen: Option<WallTime>,
     /// Records removed for the bound.
     evicted: u64,
+    /// What the event being applied ended; [`Records::apply`] hands it out.
+    ended: Vec<Ended>,
 }
 
 /// The records of one id that are held.
@@ -192,6 +200,7 @@ impl Records {
             evicted: 0,
             made: 0,
             evicted_seen: None,
+            ended: Vec::new(),
         }
     }
 
@@ -246,8 +255,15 @@ impl Records {
         self.evicted_seen
     }
 
-    /// Applies one event, admitting what it adds within the bound.
-    pub fn apply(&mut self, event: Event) {
+    /// Applies one event, admitting what it adds within the bound, and returns what it
+    /// ended: each attempt of each row that settled, and each cache hit that gained
+    /// its row (see [`Ended`]).
+    pub fn apply(&mut self, event: Event) -> Vec<Ended> {
+        self.apply_event(event);
+        std::mem::take(&mut self.ended)
+    }
+
+    fn apply_event(&mut self, event: Event) {
         match event {
             Event::Call(call) => self.call(&call),
             Event::Command {
@@ -255,12 +271,15 @@ impl Records {
                 owner,
                 action,
                 command,
+                shape,
             } => {
-                if let Some(key) = self.find(&id, &owner) {
-                    let inv = self.record(&key);
-                    if let Some(i) = inv.row_of(&action) {
-                        // A digest, held in the row: nothing to admit.
-                        inv.rows[i].command = Some(command);
+                if let Some(key) = self.find(&id, &owner)
+                    && let Some(i) = self.record(&key).row_of(&action)
+                {
+                    // A digest, held in the row: nothing to admit.
+                    self.record(&key).rows[i].command = Some(command);
+                    if let Some(shape) = shape {
+                        self.fill_shape(&key, i, shape);
                     }
                 }
             }
@@ -279,6 +298,8 @@ impl Records {
                         started: None,
                         ended: None,
                         end: None,
+                        run: None,
+                        run_id: None,
                     };
                     let fits = self.make_room(None, attempt_bytes(&attempt));
                     // Making room may have removed every record waiting on it.
@@ -320,10 +341,63 @@ impl Records {
                     }
                     op.queued = at;
                     self.spread(operation, at);
+                    // A report that carries a run block follows (`Ran`), which then
+                    // settles the attempt.
+                    if !ended::reports(reason) {
+                        self.settled(operation, lease, EndedKind::Requeued, at);
+                    }
+                }
+            }
+            Event::Ran {
+                operation,
+                lease,
+                run,
+            } => {
+                let held = self.operations.get(&operation);
+                let Some(i) = held.and_then(|op| op.attempts.iter().position(|a| a.lease == lease))
+                else {
+                    return;
+                };
+                let fits = self.make_room(None, run_bytes(&run));
+                // Making room may have removed every record waiting on it; it leaves
+                // the attempts of an operation it keeps as they were.
+                if let Some(op) = self.operations.get_mut(&operation) {
+                    if fits {
+                        op.attempts[i].run = Some(run);
+                        self.recount_operation(operation);
+                    } else {
+                        self.mark_incomplete_operation(operation);
+                    }
+                    let at = self.now;
+                    self.spread(operation, at);
+                    self.settled(operation, lease, EndedKind::Ran, at);
                 }
             }
             Event::Finished(finished) => self.finish(finished),
         }
+    }
+
+    /// Sets `shape` on row `i` of `key`'s record, its target's label capped as a
+    /// `RequestMetadata` text is; left out if it does not fit (the record then
+    /// marked incomplete).
+    fn fill_shape(&mut self, key: &RecordKey, i: usize, mut shape: Box<ActionShape>) {
+        if let Some(target) = &mut shape.target {
+            let value = capped(&target.label.value, TEXT_CAP);
+            target.label.truncated |= value.len() < target.label.value.len();
+            target.label.value = value;
+        }
+        let had = self.record(key).rows[i]
+            .shape
+            .as_deref()
+            .map_or(0, shape_bytes);
+        if self.make_room(Some(key), shape_bytes(&shape).saturating_sub(had)) {
+            let inv = self.record(key);
+            inv.rows[i].shape = Some(shape);
+            inv.refresh_row(i);
+        } else {
+            self.record(key).mark_incomplete();
+        }
+        self.recount(key);
     }
 
     /// Marks incomplete the record a dropped call of `id` by `owner` went to: the
@@ -487,11 +561,11 @@ impl Records {
                 // A hit adds a row only for an action the record has not seen.
                 if inv.row_of(action).is_none() {
                     let mut row = ActionRow::new(*action, call, How::CacheHit, None);
-                    row.outcome = Some(Outcome::Ok {
-                        exit_code: listing.exit_code,
-                    });
+                    row.outcome = listing.exit_code.map(|exit_code| Outcome::Ok { exit_code });
                     row.set_listing(listing.clone(), OUTPUTS_PER_ROW);
-                    self.add_row(&key, row);
+                    if let Some(i) = self.add_row(&key, row) {
+                        self.hit(&key, i, call.at);
+                    }
                 }
             }
             CallKind::Execute { action, answer } => self.execute(&key, call, *action, answer),
@@ -528,12 +602,12 @@ impl Records {
             Ok(operation) => operation,
             Err(result) => {
                 let inv = self.record(key);
-                inv.counts.failed += u64::from(result.exit_code != 0);
+                inv.counts.failed += u64::from(result.exit_code.is_some_and(|c| c != 0));
                 if let Some(i) = index {
-                    inv.rows[i].outcome = Some(Outcome::Ok {
-                        exit_code: result.exit_code,
-                    });
+                    inv.rows[i].outcome =
+                        result.exit_code.map(|exit_code| Outcome::Ok { exit_code });
                     self.fill_listing(key, i, (**result).clone());
+                    self.hit(key, i, call.at);
                 }
                 return;
             }
@@ -604,7 +678,17 @@ impl Records {
         let had = attempts_bytes(&self.record(key).rows[i].attempts);
         if self.make_room(Some(key), attempts_bytes(attempts).saturating_sub(had)) {
             let inv = self.record(key);
-            inv.rows[i].attempts = attempts.to_vec();
+            // The operation's attempts carry no history id: each row's are its own, set
+            // once (`Records::set_run_id`), and kept across the copies that follow.
+            let held = std::mem::take(&mut inv.rows[i].attempts);
+            let mut copy = attempts.to_vec();
+            for a in &mut copy {
+                a.run_id = held
+                    .iter()
+                    .find(|h| h.lease == a.lease)
+                    .and_then(|h| h.run_id);
+            }
+            inv.rows[i].attempts = copy;
             inv.refresh_row(i);
         } else {
             self.record(key).mark_incomplete();
@@ -717,6 +801,9 @@ impl Records {
                 self.fill_outcome(&w.key, i, &outcome);
                 if let Some(listing) = &f.result {
                     self.fill_listing(&w.key, i, listing.clone());
+                }
+                if let Some((lease, _)) = &f.lease {
+                    self.note_ended(&w.key, i, *lease, EndedKind::Finished, f.at);
                 }
             }
         }

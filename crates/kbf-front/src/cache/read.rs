@@ -91,7 +91,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
         let unread = Location {
             store: StoreId::CONFIGURED,
-            object: ObjectId::new(self.writer.epoch, 0),
+            object: ObjectId::of(self.writer.names_as, 0),
             offset: 0,
         };
         if is_empty_blob(digest) {

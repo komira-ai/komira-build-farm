@@ -88,8 +88,8 @@ pub fn joined(inv: &str, at: WallTime, action: u8, op: u64) -> Event {
 /// logs.
 pub fn listing(result: u8, exit_code: i32) -> Listing {
     Listing {
-        result: d(result),
-        exit_code,
+        result: Some(d(result)),
+        exit_code: Some(exit_code),
         outputs: vec![Output {
             path: format!("out/{result}.o"),
             digest: d(result.wrapping_add(1)),

@@ -1,0 +1,23 @@
+[package]
+name = "kbf-mapsync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The storage map in motion (docs/design/architecture-v2.md, section 6): the seam a
+# frontend implements to say which map it holds and when it changes, and the holder a
+# daemon or a storage node keeps the newest pushed map in. Depends on the map and on
+# tokio's watch channel only, so the frontend, storage, the daemon and the router can all
+# use it (crates/kbf-it/tests/layering.rs).
+[dependencies]
+kbf-map.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

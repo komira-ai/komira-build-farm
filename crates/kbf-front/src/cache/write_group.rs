@@ -30,9 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{
-    Applied, Command, Epoch, Location, MetaState, ObjectId, StoreId, UnreachableReason,
-};
+use kbf_meta::{Applied, Command, Location, MetaState, ObjectId, StoreId, UnreachableReason};
 use kbf_objstore::{ByteRange, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, SegmentWriter, WriteError};
@@ -269,6 +267,104 @@ enum Answer {
     Waiting(oneshot::Receiver<Result<(), CacheError>>),
 }
 
+/// Where a cache's object keys go (`docs/design/architecture-v2.md`, section 6).
+///
+/// An epoch writer's object is `<legacy>cas/<epoch>/<seq>`; a node writer's is
+/// `<root>cas/<member>/<boot>/<seq>`, each number as 16 lowercase hex digits. A server
+/// over a metadata log has `legacy` = `<root><log id>/`, so the two never meet: a key
+/// under the log's prefix has 16 hex digits where a node key has `cas`, and one more
+/// number. A cache reads both, so the objects indexed before a node registered stay
+/// readable after. An epoch of another log, which only a rebuild of the index names
+/// ([`kbf_meta::LegacyWriter`]), is `<root><log id>/cas/<epoch>/<seq>` for a log id that
+/// is not the cache's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectKeys {
+    /// The prefix of an epoch writer's keys.
+    pub legacy: KeyPrefix,
+    /// The prefix of a node writer's keys.
+    pub root: KeyPrefix,
+}
+
+impl ObjectKeys {
+    /// Both kinds of key under `prefix`.
+    #[must_use]
+    pub fn under(prefix: KeyPrefix) -> Self {
+        Self {
+            legacy: prefix.clone(),
+            root: prefix,
+        }
+    }
+
+    /// The key of object `id`.
+    ///
+    /// # Errors
+    /// [`CacheError::Key`] if the prefix and id do not form a valid key.
+    pub fn key(&self, id: ObjectId) -> Result<ObjectKey, CacheError> {
+        let seq = id.seq();
+        Ok(match id.writer() {
+            kbf_meta::Writer::Epoch(e) => {
+                let epoch = e.get();
+                self.legacy.key(&format!("cas/{epoch:016x}/{seq:016x}"))?
+            }
+            kbf_meta::Writer::Node(n) => {
+                let (member, boot) = (n.member(), n.boot());
+                self.root
+                    .key(&format!("cas/{member:016x}/{boot:016x}/{seq:016x}"))?
+            }
+            kbf_meta::Writer::Legacy(l) => {
+                let (log, epoch) = (l.log(), l.epoch().get());
+                self.root
+                    .key(&format!("{log:016x}/cas/{epoch:016x}/{seq:016x}"))?
+            }
+        })
+    }
+
+    /// The object `key` names if it is exactly [`ObjectKeys::key`] of some object of
+    /// any kind, else `None`. An object under the cache's own log id is an epoch
+    /// writer's, never another log's.
+    #[must_use]
+    pub fn object(&self, key: &ObjectKey) -> Option<ObjectId> {
+        let hex = |s: &str| u64::from_str_radix(s, 16).ok();
+        let under = |prefix: &KeyPrefix| -> Option<Vec<&str>> {
+            let name = key.as_str().strip_prefix(prefix.as_str())?;
+            Some(name.strip_prefix("cas/")?.split('/').collect())
+        };
+        let legacy = under(&self.legacy).and_then(|f| match f[..] {
+            [epoch, seq] => Some(ObjectId::new(kbf_meta::Epoch::new(hex(epoch)?), hex(seq)?)),
+            _ => None,
+        });
+        let node = || {
+            under(&self.root).and_then(|f| match f[..] {
+                [member, boot, seq] => {
+                    let writer = kbf_meta::NodeWriter::new(
+                        std::num::NonZeroU64::new(hex(member)?)?,
+                        std::num::NonZeroU64::new(hex(boot)?)?,
+                    );
+                    Some(ObjectId::of(kbf_meta::Writer::Node(writer), hex(seq)?))
+                }
+                _ => None,
+            })
+        };
+        // `<root><log id>/cas/<epoch>/<seq>`, a log id that is not the cache's own (that
+        // one is `legacy`, above, when `legacy` is under `root`).
+        let other_log = || {
+            let name = key.as_str().strip_prefix(self.root.as_str())?;
+            let f: Vec<&str> = name.split('/').collect();
+            let [log, "cas", epoch, seq] = f[..] else {
+                return None;
+            };
+            let writer = kbf_meta::LegacyWriter::new(
+                std::num::NonZeroU64::new(hex(log)?)?,
+                kbf_meta::Epoch::new(std::num::NonZeroU64::new(hex(epoch)?)?.get()),
+            );
+            Some(ObjectId::of(kbf_meta::Writer::Legacy(writer), hex(seq)?))
+        };
+        let id = legacy.or_else(node).or_else(other_log)?;
+        // Only the canonical spelling: 16 lowercase digits each.
+        (self.key(id).ok()? == *key).then_some(id)
+    }
+}
+
 /// The store side of the cache: the metadata log, the bucket, how objects are named,
 /// and the cache's metrics. Shared with the tasks that write segments, so a segment
 /// written after its callers have gone is still timed.
@@ -276,8 +372,9 @@ enum Answer {
 pub(super) struct Writer<M, O> {
     pub(super) meta: M,
     pub(super) objects: O,
-    pub(super) prefix: KeyPrefix,
-    pub(super) epoch: Epoch,
+    pub(super) keys: ObjectKeys,
+    /// The writer this cache names its objects as.
+    pub(super) names_as: kbf_meta::Writer,
     pub(super) metrics: CacheMetrics,
     /// Shared with the write tier, which numbers its blocks' objects from it too.
     pub(super) next_seq: Arc<AtomicU64>,
@@ -288,12 +385,12 @@ pub(super) struct Writer<M, O> {
 }
 
 impl<M, O> Writer<M, O> {
-    pub(super) fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+    pub(super) fn new(meta: M, objects: O, keys: ObjectKeys, names_as: kbf_meta::Writer) -> Self {
         Self {
             meta,
             objects,
-            prefix,
-            epoch,
+            keys,
+            names_as,
             metrics: CacheMetrics::default(),
             next_seq: Arc::new(AtomicU64::new(1)),
             tier: OnceLock::new(),
@@ -301,14 +398,13 @@ impl<M, O> Writer<M, O> {
         }
     }
 
-    /// The key of object `id`: `<prefix>cas/<epoch>/<seq>`, each as 16 hex digits.
+    /// The key of object `id` ([`ObjectKeys::key`]).
     pub(super) fn object_key(&self, id: ObjectId) -> Result<ObjectKey, CacheError> {
-        let (epoch, seq) = (id.epoch().get(), id.seq());
-        Ok(self.prefix.key(&format!("cas/{epoch:016x}/{seq:016x}"))?)
+        self.keys.key(id)
     }
 
     pub(super) fn allocate(&self) -> ObjectId {
-        ObjectId::new(self.epoch, self.next_seq.fetch_add(1, Ordering::Relaxed))
+        ObjectId::of(self.names_as, self.next_seq.fetch_add(1, Ordering::Relaxed))
     }
 }
 

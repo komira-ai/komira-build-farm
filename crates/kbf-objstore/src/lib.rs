@@ -1,5 +1,7 @@
 //! The `ObjectStore` trait with an in-memory fake, a local-directory store and an S3
-//! backend, and the conformance suite every backend must pass.
+//! backend, the conformance suite every backend must pass, every object under a prefix
+//! as a stream that holds one page at a time ([`listing`]), and the reader that gets
+//! every segment's index back from the segments' footers ([`footers`]).
 //!
 //! kbf names every key and records every location in its own replicated log, so it never
 //! asks a store whether something exists, and needs no consistent listing and no
@@ -11,7 +13,9 @@
 
 mod body;
 pub mod conformance;
+pub mod footers;
 mod fs_store;
+pub mod listing;
 mod memory;
 pub mod s3;
 mod types;

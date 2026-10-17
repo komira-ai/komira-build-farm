@@ -225,3 +225,14 @@ async fn a_panic_on_the_blocking_pool_is_resumed() {
     .to_string();
     assert!(line.starts_with("files=3 "), "{line}");
 }
+
+/// Catches `CacheConfig::new` giving a node with one cache another room check than the
+/// one its docs promise: local storage that grows past the budget is evicted for within
+/// a second (a room check an hour apart would let uploads fill the disk meanwhile), and
+/// a cache is not one cache unless it is told so.
+#[test]
+fn a_new_config_looks_for_room_every_second_and_has_no_one_cache() {
+    let config = super::CacheConfig::new(PathBuf::from("c"), PathBuf::from("s"), 7);
+    assert_eq!(config.room_every, std::time::Duration::from_secs(1));
+    assert!(config.local.is_none());
+}

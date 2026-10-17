@@ -192,7 +192,10 @@ fn sha256_hex(text: &str) -> String {
 }
 
 fn object_key(object: ObjectId) -> ObjectKey {
-    let (epoch, seq) = (object.epoch().get(), object.seq());
+    let (epoch, seq) = (
+        object.epoch().expect("an epoch writer's").get(),
+        object.seq(),
+    );
     ObjectKey::new(format!("{PREFIX}cas/{epoch:016x}/{seq:016x}")).expect("a key")
 }
 
@@ -320,7 +323,7 @@ async fn evict_spares_grace_window() {
     let f = Fixture::new("grace").await;
     let a = f.store("blob-a").await;
     f.store("blob-b").await;
-    let old = ObjectId::new(f.cache.epoch(), 99);
+    let old = ObjectId::of(f.cache.writer(), 99);
     f.files
         .put_new(&object_key(old), Bytes::from(vec![7; 10]), None)
         .await
@@ -420,7 +423,7 @@ async fn evict_commits_before_delete() {
 #[tokio::test]
 async fn evict_skips_staged_objects() {
     let f = Fixture::new("staged").await;
-    let staged = ObjectId::new(f.cache.epoch(), 50);
+    let staged = ObjectId::of(f.cache.writer(), 50);
     f.files
         .put_new(&object_key(staged), Bytes::from(vec![7; 10]), None)
         .await

@@ -80,10 +80,25 @@ pub fn open_tier(
     options: TierOptions,
     index: &Index,
 ) -> Result<(Tier<FaultFs>, Recovery), TierError> {
+    open_tier_as(
+        fs,
+        kbf_meta::Writer::Epoch(Epoch::new(epoch)),
+        options,
+        index,
+    )
+}
+
+/// Opens `fs` as a start of `writer`, numbering new blocks from 0.
+pub fn open_tier_as(
+    fs: &FaultFs,
+    writer: kbf_meta::Writer,
+    options: TierOptions,
+    index: &Index,
+) -> Result<(Tier<FaultFs>, Recovery), TierError> {
     let seq = Arc::new(AtomicU64::new(0));
     let start = TierStart {
         tier: TIER,
-        epoch: Epoch::new(epoch),
+        writer,
         options,
     };
     Tier::open(

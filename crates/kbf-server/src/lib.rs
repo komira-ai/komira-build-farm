@@ -22,12 +22,18 @@
 //!   the REAPI policy names `invocations.getAuthorizer` (or `--invocations-open` is
 //!   given); and `GET /v1/blobs/{digest}`, a CAS blob's bytes for a browser
 //!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`.
+//! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
+//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
 //!   the rollout driver.
+//! - Build history ([`history`]): off unless `--history-objects` is given, each attempt and
+//!   cache hit of an invocation a client named is recorded in an object store, off the
+//!   path of the call it belongs to, with a run id the build pages name the run by. It
+//!   drops and counts when a store is slow; it never delays or fails a call.
 //! - The durable log ([`log_file`]): a size-capped rotating file in `--log-dir` (by default
 //!   `log/` in the hot store's directory) that gets every event stderr gets.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
@@ -40,6 +46,18 @@
 //!   on that listener alone and an authorizer per kind of call in the services;
 //!   without the flag every call is accepted and allowed.
 //!
+//! - The storage node ([`storage_node`], `kbf storage`): the same cache and stores,
+//!   served alone over gRPC by `kbf_storage::service` (blobs through the standard
+//!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
+//!   role in the caller's certificate. No scheduler, REAPI or state store.
+//!   [`storage_half`] is the same start for `kbf storage-and-daemon`, keeping the storage
+//!   its listener serves for the daemon half in the same process.
+//!
+//! - The frontend ([`frontend`], `kbf frontend`): the REAPI listener, the scheduler,
+//!   the worker streams and the operator API, with no cache of its own. CAS, ByteStream
+//!   and the action cache are proxied to a storage node over mutual TLS, Execute and the
+//!   scheduler read and write that node, and `/readyz` follows it and the state store.
+//!
 //! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
 //! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
 //! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
@@ -48,50 +66,76 @@
 
 pub mod action_usage;
 pub mod api;
+pub mod api_client;
 pub mod blobs;
 #[cfg(test)]
 mod build_commit;
 pub mod config;
+pub mod drain;
 pub mod farm;
 mod fault;
+mod flag_set;
 pub mod fleet;
+pub mod front_maps;
+pub mod frontend;
 pub mod grpc_health;
+pub mod handover;
 pub mod health;
+pub mod history;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
+pub mod join;
+mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
+mod map_push;
 pub mod mdm;
+pub mod members;
+pub mod members_rpc;
 mod memory;
 pub mod metrics;
 mod missing;
+pub mod node_map;
 pub mod raft_log;
+mod rebuild;
+pub mod replication;
 pub mod rollout;
+mod run_record;
 pub mod serve;
 pub mod stamp;
 mod start;
 mod startup_pass;
+pub mod state_store;
+pub mod storage_half;
+pub mod storage_node;
 pub mod stores;
 pub mod streams;
 mod timeout;
 pub mod token;
 pub mod worker;
+pub mod worker_roles;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
-pub use farm::Farm;
+pub use drain::{Drain, DrainStatus};
+pub use farm::{DONE_FLOOR, EpochPolicy, Farm, SESSION_RENEWAL, StateError};
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
-pub use local::{LocalRead, LocalStore, LocalStream, LocalStreamed};
+pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
+pub use local::LocalStore;
+pub use node_map::NodeMap;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
-    bind_server_with_policy,
+    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
+    bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
+    bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_service,
+    bind_storage,
 };
-pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
+pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
+pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
 

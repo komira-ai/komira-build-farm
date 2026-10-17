@@ -1,36 +1,43 @@
 # The binaries nodes and servers run, and the deploy tool that installs them, built once
-# per commit (docs/artifacts.md): kbf-daemon for darwin-arm64 (signed ad hoc with the
-# hardened runtime), and kbf-daemon, kbf-server and kbf-deploy for linux-x86_64 and
-# linux-arm64. Each comes as a tarball with a CycloneDX SBOM; one SHA256SUMS covers a
+# per commit (docs/artifacts.md): kbf (all five modes, `kbf --version --json` says what
+# it is), kbf-daemon, kbf-server and kbf-deploy for linux-x86_64 and linux-arm64, and
+# kbf, kbf-daemon and kbf-deploy for darwin-arm64 (each signed ad hoc with the hardened
+# runtime). Each comes as a tarball with a CycloneDX SBOM; one SHA256SUMS covers a
 # commit's files.
 #
 # On a pull request or in the merge queue this is a build check: everything is built,
-# signed, packaged and summed, and nothing is attested. On a push to main, the attest
-# job signs build provenance for every file and an SBOM attestation for every tarball,
-# and the verify job then checks them as the planned deployment job is to. Only attest
-# may hold `id-token: write` and `attestations: write`, and only under its exact
-# main-push `if:` (the workflow lint, crates/kbf-it/tests/workflows, requires both).
+# signed, packaged and summed, and nothing is attested (a pull request into
+# feature/arch-v2 skips darwin-arm64, and so the sums, to spare the macOS runners). On a push to main or to
+# feature/arch-v2, the attest job signs build provenance for every file and an SBOM
+# attestation for every tarball, and the verify job then checks them, for the branch
+# that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
+# write` and `attestations: write`, and only under its exact `if:` (the workflow lint,
+# crates/kbf-it/tests/workflows, requires both; crates/kbf-it/tests/release_artifacts
+# pins the set of files built and attested).
 #
 # The files are kept as workflow artifacts for 90 days, GitHub's limit. A release
 # (release.yml, on a pushed `v*` tag) attaches these exact files for a commit on main,
-# checked again against these attestations, and never rebuilds. The deployment job and
-# the node's SHA-256 check are planned, not built (docs/design/mac-node-provisioning.md
-# sections 4.1 and 4.2).
+# checked again against these attestations as refs/heads/main's, and never rebuilds. The
+# deployment job and the node's SHA-256 check are planned, not built
+# (docs/design/mac-node-provisioning.md sections 4.1 and 4.2).
 name: artifacts
 
 on:
   pull_request:
   merge_group:
   push:
-    branches: [main]
+    branches: [main, feature/arch-v2]
 
 permissions: {}
 
-# A pull request's newer run replaces its older one. Every commit on main gets its own
-# group, so no commit's run is cancelled or dropped while queued.
+# A pull request's newer run replaces its older one, and so does a newer push to
+# feature/arch-v2: only its head needs attested files, and a superseded push run would
+# otherwise hold a macOS runner for hours (each push had its own group, and pushes
+# queued 2-4 h behind each other for the few macOS runners). Every commit on main still
+# gets its own group, so no main commit's run is cancelled or dropped while queued.
 concurrency:
-  group: artifacts-${{ github.event_name == 'push' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: artifacts-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,13 +55,17 @@ defaults:
 
 jobs:
   darwin-arm64:
+    # Not for pull requests into feature/arch-v2: nothing is attested from a pull request,
+    # macOS runners are the scarce ones, and the push to feature/arch-v2 builds and
+    # attests darwin-arm64 for its head. Pull requests into main still build it.
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' }}
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
       contents: read
     env:
       TARGET: aarch64-apple-darwin
-      # The oldest macOS kbf-daemon supports: a property of the build, not of the runner.
+      # The oldest macOS the binaries support: a property of the build, not of the runner.
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,9 +81,10 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          # On a push to main (the build the attest job signs) nothing is restored: the
-          # attested binary is built from a clean target/, never on a cached one. The
-          # lookup still tells the save step below whether this key exists.
+          # On a push (to main or feature/arch-v2: the build the attest job signs)
+          # nothing is restored: the attested binary is built from a clean target/,
+          # never on a cached one. The lookup still tells the save step below whether
+          # this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_DARWIN" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
@@ -80,17 +92,31 @@ jobs:
       - run: uname -m
       - run: xcodebuild -version
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node --bin kbf-daemon
-      - name: Sign ad hoc with the hardened runtime, and check it
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-cli -p kbf-deploy --bin kbf-daemon --bin kbf --bin kbf-deploy
+      - name: Sign kbf-daemon ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-daemon" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Sign kbf ad hoc with the hardened runtime, and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Sign kbf-deploy ad hoc with the hardened runtime, and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-deploy" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: The signed kbf names the commit and a release build
+        run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
         run: git diff --exit-code -- Cargo.lock
-      - name: Package
+      - name: Package kbf-daemon
         run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
-      - name: Check the packaged binary's signature, and run it
+      - name: Package kbf
+        run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-deploy
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Check the packaged kbf-daemon's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-daemon
+      - name: Check the packaged kbf's signature, and run it
+        run: cargo xtask darwin-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" kbf
+      - name: Check the packaged kbf-deploy's signature, and run it
+        run: cargo xtask darwin-asset "dist/kbf-deploy-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-deploy
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-darwin-arm64
@@ -129,15 +155,18 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          # On a push to main (the build the attest job signs) nothing is restored: the
-          # attested binary is built from a clean target/, never on a cached one. The
-          # lookup still tells the save step below whether this key exists.
+          # On a push (to main or feature/arch-v2: the build the attest job signs)
+          # nothing is restored: the attested binary is built from a clean target/,
+          # never on a cached one. The lookup still tells the save step below whether
+          # this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
+      - name: kbf names the commit and a release build
+        run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
@@ -148,6 +177,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-server" --sbom crates/kbf-server/kbf-server_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-deploy
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf
+        run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -184,15 +215,18 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          # On a push to main (the build the attest job signs) nothing is restored: the
-          # attested binary is built from a clean target/, never on a cached one. The
-          # lookup still tells the save step below whether this key exists.
+          # On a push (to main or feature/arch-v2: the build the attest job signs)
+          # nothing is restored: the attested binary is built from a clean target/,
+          # never on a cached one. The lookup still tells the save step below whether
+          # this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy -p kbf-cli --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
+      - name: kbf names the commit and a release build
+        run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
       - name: The SBOM step left Cargo.lock unchanged
@@ -203,6 +237,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-server" --sbom crates/kbf-server/kbf-server_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-deploy
         run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf
+        run: cargo xtask package --binary "target/$TARGET/release/kbf" --sbom crates/kbf-cli/kbf_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -246,13 +282,13 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # Push to main only: build provenance for every file, and an SBOM attestation for
-  # every tarball. This job signs and does nothing else: while it holds `id-token: write`
+  # Push to main or feature/arch-v2 only: build provenance for every file, and an SBOM
+  # attestation for every tarball. This job signs and does nothing else: while it holds `id-token: write`
   # no repository code runs, and nothing is built, only the pinned actions below. The
   # sums job checked these files against SHA256SUMS; the verify job checks what it signs.
   attest:
     needs: [sums]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -278,6 +314,14 @@ jobs:
           sbom-path: dist/kbf-daemon-${{ github.sha }}-darwin-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
+          subject-path: dist/kbf-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-deploy-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-x86_64.tar.gz
           sbom-path: dist/kbf-daemon-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -290,6 +334,10 @@ jobs:
           sbom-path: dist/kbf-deploy-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-x86_64.tar.gz
+          sbom-path: dist/kbf-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -300,14 +348,19 @@ jobs:
         with:
           subject-path: dist/kbf-deploy-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-deploy-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-${{ github.sha }}-linux-arm64.tar.gz
+          sbom-path: dist/kbf-${{ github.sha }}-linux-arm64.cdx.json
 
-  # Push to main only, after attest: the checks the planned deployment job is to make
-  # (cargo xtask verify-assets, crates/xtask/src/sums.rs), with read-only scopes. The
+  # Push to main or feature/arch-v2 only, after attest: the checks the planned deployment
+  # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch
+  # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes. The
   # files are assembled again into a SHA256SUMS that must be byte for byte the one the
   # sums job published and attest signed, then checked against it, then each verified.
   verify:
     needs: [attest]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -334,4 +387,4 @@ jobs:
       - name: Verify as the planned deployment job is to
         env:
           GH_TOKEN: ${{ github.token }}
-        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF"
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF"

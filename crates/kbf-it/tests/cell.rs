@@ -21,11 +21,11 @@ use kbf_proto::reapi::{
     Action, BatchUpdateBlobsRequest, Command as ReapiCommand, Digest, Directory, ExecuteRequest,
     ExecuteResponse, batch_update_blobs_request,
 };
-use kbf_server::{Listeners, WorkerTls, bind_server};
+use kbf_server::{Listeners, TlsSource, WorkerTls, bind_server};
 use prost::Message;
 use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
-use tonic::transport::{Certificate, Channel, Endpoint, Identity, ServerTlsConfig};
+use tonic::transport::{Channel, Endpoint};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-cell");
 
@@ -169,12 +169,13 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
     assert!(out.status.success(), "{}", text(&out.stderr));
 
     let cache = Arc::new(Cache::memory());
-    let tls = ServerTlsConfig::new()
-        .identity(Identity::from_pem(
-            read(&pki.join("server.pem")),
-            read(&pki.join("server.key")),
-        ))
-        .client_ca_root(Certificate::from_pem(read(&pki.join("ca.pem"))));
+    let tls = TlsSource::fixed(
+        "worker",
+        read(&pki.join("server.pem")).as_bytes(),
+        read(&pki.join("server.key")).as_bytes(),
+        Some(read(&pki.join("ca.pem")).as_bytes()),
+    )
+    .expect("the worker listener's TLS");
     let listeners = Listeners {
         reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
         worker: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -190,10 +191,11 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let bound = bind_server(cache, listeners, pending()).expect("bind");
     let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

@@ -12,8 +12,8 @@ use kbf_front::{MetaLog, MetaLogError};
 use kbf_log::{Bootstrap, DecodeError, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, BlobAnswer, BlobWrite, Closure, Command, Epoch, Evicted,
-    Location, MetaState, ObjectId, Retention, Role, ServerId, StagedObject, StagedPut, StoreId,
-    TierId, UnreachableReason,
+    Location, MetaState, NodeWriter, ObjectId, Retention, Role, ServerId, StagedObject, StagedPut,
+    StoreId, TierId, UnreachableReason, Writer,
 };
 use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
 use kbf_server::raft_log::{RECORD, RECORD_TMP, TICK};
@@ -590,8 +590,8 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         .expect("a raise");
     let raised = log.applied_index();
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
-    let v4 = MachineVersion::new(NonZeroU32::new(4).expect("non-zero"));
-    assert!(log.raise_machine_version(v4).is_err());
+    let v5 = MachineVersion::new(NonZeroU32::new(5).expect("non-zero"));
+    assert!(log.raise_machine_version(v5).is_err());
     assert_eq!(log.machine_version(), MachineVersion::V2);
     drop(log);
     let rolled_back = RaftMetaLog::open_running(
@@ -607,10 +607,10 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         "{rolled_back:?}"
     );
     let unknown =
-        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v4)
+        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v5)
             .await;
     assert!(
-        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v4),
+        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v5),
         "{unknown:?}"
     );
     let log = open(&fs.restart(), 4).await;
@@ -618,7 +618,7 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
     drop(log);
     let dir = fs.restart();
-    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v4));
+    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v5));
     let refused = refusal(&dir.restart(), 4).await;
     assert!(
         matches!(&refused, RaftLogError::Decode { index, .. } if *index == later),
@@ -657,6 +657,55 @@ async fn raising_the_machine_version_to_3_lets_evict_objects_commit_and_lasts() 
     assert_eq!(
         log.commit(evict()).await,
         Ok(Applied::Evicted(Evicted::default()))
+    );
+}
+
+/// Catches: a binary that does not run machine version 4 (mutant `RUNS = V3`), which
+/// could never register a storage node's writer; and a `SetWriter`, or a put of a node
+/// writer's object, committed into a log below version 4, which a version-3 replica
+/// would refuse. Raised, both commit, and the raise lasts across a restart.
+#[tokio::test(start_paused = true)]
+async fn raising_the_machine_version_to_4_lets_node_writers_commit_and_lasts() {
+    let one = NonZeroU64::MIN;
+    let writer = NodeWriter::new(one, one);
+    let put = Command::PutBlob {
+        digest: blob_digest(1),
+        location: Location {
+            store: StoreId::new(0),
+            object: ObjectId::of(Writer::Node(writer), 1),
+            offset: 0,
+        },
+    };
+    let fs = FaultFs::new();
+    let log = open(&fs, 7).await;
+    for to in [MachineVersion::V1, MachineVersion::V2, MachineVersion::V3] {
+        log.raise_machine_version(to).expect("a raise");
+        for command in [Command::SetWriter(writer), put.clone()] {
+            let refused = log.commit(command).await;
+            assert!(
+                matches!(refused, Err(MetaLogError::Unavailable(_))),
+                "at {to:?}: {refused:?}"
+            );
+        }
+    }
+    log.raise_machine_version(MachineVersion::V4)
+        .expect("a raise");
+    assert_eq!(
+        log.commit(Command::SetWriter(writer)).await,
+        Ok(Applied::Writer(Ok(())))
+    );
+    assert_eq!(
+        log.commit(put.clone()).await,
+        Ok(Applied::Blob(Ok(BlobWrite::Stored)))
+    );
+    drop(log);
+    let log = open(&fs.restart(), 7).await;
+    assert_eq!(log.machine_version(), MachineVersion::V4);
+    let next = NodeWriter::new(one, one.saturating_add(1));
+    assert_eq!(
+        log.commit(Command::SetWriter(next)).await,
+        Ok(Applied::Writer(Ok(()))),
+        "the replayed log remembers boot 1, so boot 2 is the next"
     );
 }
 

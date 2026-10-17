@@ -279,6 +279,38 @@ impl Drop for CpuHog {
     }
 }
 
+/// Whether process `pid` has ended: gone, a zombie (`Z`) or dead (`X`, or `x` before
+/// Linux 3.13). A zombie that its new parent reaps shows `X` for the instant the reaper
+/// holds it, so `X` counts: read as alive, a process that had ended turns up as a
+/// survivor on the next look (the race kbf-node's `ended` had, fixed there in #884).
+pub fn ended(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| Some(state_is_ended(stat.rsplit_once(") ")?.1)))
+        .unwrap_or(true)
+}
+
+/// Whether the text after a process's command name in `/proc/<pid>/stat` (its state
+/// letter first) says the process has ended.
+pub fn state_is_ended(after_comm: &str) -> bool {
+    after_comm.starts_with(['Z', 'X', 'x'])
+}
+
+/// Catches an `ended` that calls a process alive while its reaper holds it (state `X`,
+/// which follows `Z` for an instant before the pid is gone): a process seen ended once
+/// was a survivor on the next look. Every state that means the process is still there
+/// must stay alive.
+#[test]
+fn a_process_whose_reaper_holds_it_has_ended() {
+    for state in ["Z 1 2 3", "X 1 2 3", "x 1 2 3"] {
+        assert!(state_is_ended(state), "{state:?} has ended");
+    }
+    for state in ["R 1 2 3", "S 1 2 3", "D", "T", "t", "I"] {
+        assert!(!state_is_ended(state), "{state:?} is still there");
+    }
+    assert!(ended("4294967295"), "a pid with no /proc entry has ended");
+}
+
 /// Whether anything exists at `path` (a dangling symlink counts).
 pub fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()

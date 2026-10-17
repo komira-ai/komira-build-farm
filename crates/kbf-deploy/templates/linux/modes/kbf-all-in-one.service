@@ -1,0 +1,74 @@
+# Rendered by `kbf-deploy linux render-units --mode all-in-one`; installed as
+# /etc/systemd/system/kbf-all-in-one.service (kbf docs/design/architecture-v2.md,
+# sections 1 and 11). `kbf all-in-one` takes exactly the flags kbf-all-in-one takes:
+# kbf-server's and kbf-daemon's, but --cas, and the container driver only.
+#
+# TRUSTED, SINGLE BOX OR DEVELOPMENT ONLY. Builds run in the process that holds the
+# farm's state and its cold store, as one user. The container driver runs each action
+# as a subordinate id of that user (--userns=nomap), but no test yet proves an action
+# cannot read what the user holds (design section 9); `check-units --mode all-in-one`
+# prints a `WARN trusted:` line until one does.
+[Unit]
+Description=kbf build farm, all in one process
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# The daemon half runs rootless Podman as the kbf user.
+User=@KBF_USER@
+Slice=kbf.slice
+# The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
+Delegate=yes
+# kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
+MemoryMin=@SERVER_MEMORY_MIN@
+OOMScoreAdjust=-925
+CPUWeight=300
+# No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
+Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
+# The single box's cold store is a directory beside the daemon's data (design section
+# 11), so the unit holds no cold-store key (check-units rule `credential`).
+# The scheduler's state is a SQLite file, `state.db` in the data directory: the
+# default of `kbf all-in-one`, so the unit gives no --state-store.
+ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
+    --cold-store=file://@KBF_DATA_DIR@/cold \
+    --meta-dir=@KBF_META_DIR@ \
+    --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
+    --reapi-tls-cert=@KBF_REAPI_CERT@ \
+    --reapi-tls-key=@KBF_REAPI_KEY@ \
+    --worker-listen=@KBF_LISTEN_HOST@:@KBF_WORKER_PORT@ \
+    --worker-tls-cert=@KBF_ETC@/worker.pem \
+    --worker-tls-key=@KBF_ETC@/worker.key \
+    --worker-client-ca=@KBF_ETC@/ca.pem \
+    --worker-deny-list=@KBF_ETC@/deny-list \
+    --api-listen=127.0.0.1:@KBF_API_PORT@ \
+    --api-token-file=@KBF_API_TOKEN_FILE@ \
+    --driver=container \
+    --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
+    --ca-cert=@KBF_ETC@/ca.pem \
+    --cert=@KBF_ETC@/node.pem \
+    --key=@KBF_ETC@/node.key \
+    --node-id=@KBF_NODE_ID@ \
+    --data-dir=@KBF_DATA_DIR@ \
+@DAEMON_IMAGE_ARGS@
+@DAEMON_TUNING_ARGS@
+    --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
+    --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
+# TODO: the certificate flags of the new modes, which replace the worker
+# listener's, once `kbf all-in-one` has them.
+# kbf drains on SIGTERM: new Execute calls are refused, open streams run until their
+# action is done (Buck2 does not recover a stream that breaks), with no deadline
+# (--shutdown-timeout-secs 0), then the server exits. A stop that ends sooner fails every
+# build in flight, so systemd sends SIGTERM and never kills it for taking long
+# (check-units rule `stop`). A second SIGTERM ends the open streams
+# (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
+# same drain with no signal.
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+# Exit 2 is a command line kbf refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

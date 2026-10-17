@@ -9,15 +9,27 @@
 //!   `ActionResult` blob plus its [`Closure`];
 //! - the objects the store has reported unreachable, each with a [`LossMark`]: its
 //!   [`UnreachableReason`] and the [`Generation`] (log index) of the last mark;
-//! - the committed farm time, and the next writer [`Epoch`].
+//!   an object marked while it was staged has lost its blobs (their only copy was its
+//!   block on a write tier), counted by [`MetaState::lost_blobs`] and
+//!   [`MetaState::blob_losses`];
+//! - the committed farm time, the next writer [`Epoch`], and the node writers set
+//!   ([`NodeWriter`]), the latest of them current;
 //! - the local write tiers ([`TierId`]), one current tier per server, and the
 //!   **staged** objects: objects whose only copy is a block file on a tier until they
 //!   are flushed to the store ([`StagedObject`], docs/design/write-path.md, section 6).
 //!   A staged blob answers `Present` with the tier it is staged on.
 //!
-//! Object ids are a writer epoch and a sequence number ([`ObjectId`]). Epochs come only
-//! from [`Command::AllocEpoch`], never twice, and a command naming an object of an epoch
-//! never allocated is refused ([`UnallocatedEpoch`]).
+//! Object ids are a [`Writer`] and a sequence number ([`ObjectId`]). A writer is an
+//! epoch, which comes only from [`Command::AllocEpoch`], never twice, or a registered
+//! storage node's member and boot ([`NodeWriter`]), which the state store hands out and
+//! [`Command::SetWriter`] makes current. A command naming an object of an epoch never
+//! allocated or of a node writer never set is refused, and so is a put naming a node
+//! writer that is not the current one ([`ForeignWriter`]).
+//! An object some other writer put (another node, an earlier boot, an epoch of a log
+//! that was lost) enters the index only by [`Command::AdoptSegment`], the step of a
+//! rebuild of the index from the store, which records a segment's records that are not
+//! indexed yet and never replaces one that is; [`Command::RebuildProgress`] and
+//! [`Command::RebuildDone`] keep how far that rebuild is ([`MetaState::rebuild`]).
 //!
 //! It changes only by [`Command`]s, which every replica applies in log order, each with
 //! the log index of its entry ([`MetaState::execute`]); farm time arrives as
@@ -42,10 +54,12 @@ mod state;
 mod tier;
 
 pub use crate::model::{
-    ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Generation, Location,
-    LossMark, Miss, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
+    ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Generation, LegacyWriter,
+    Location, LossMark, Miss, NodeWriter, ObjectId, Retention, Role, StoreId, Touch,
+    UnreachableReason, Writer,
 };
 pub use crate::state::{
-    ActionWriteError, Applied, BlobWrite, Collected, Command, Evicted, MetaState, UnallocatedEpoch,
+    ActionWriteError, AdoptRefused, Adopted, Applied, BlobWrite, Collected, Command, Evicted,
+    ForeignWriter, MetaState, Rebuild, StaleWriter,
 };
 pub use crate::tier::{ServerId, StagedObject, StagedPut, StagedState, TierError, TierId};

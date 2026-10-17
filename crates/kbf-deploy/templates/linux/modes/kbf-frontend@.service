@@ -1,0 +1,78 @@
+# Rendered by `kbf-deploy linux render-units --mode frontend`; installed as the template
+# unit kbf-frontend (the file name has an at sign before the dot) in /etc/systemd/system/
+# (kbf docs/design/frontend-handover.md; architecture-v2.md, sections 1 and 11).
+# `check-units --mode frontend` parses the flags below with `kbf check-args frontend`.
+#
+# A template with two instances, a and b, that run the same command line: only one serves
+# at a time. An update starts the idle one while the other still serves (`kbf frontend
+# handover`): the new process takes the listeners, the state store and the daemons over
+# the control socket, `systemctl start` returns when it has said READY=1, and the old one
+# drains its open builds and exits. Only instance a is enabled (DefaultInstance=a). No
+# `Conflicts=` between the instances: starting one must never stop the other, which is
+# draining (check-units rule `handover`).
+[Unit]
+Description=kbf build farm frontend, instance %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# kbf sends READY=1 (sd_notify) once it serves and its probes pass, so `systemctl start`
+# of the idle instance returns only when it can take the builds. A frontend that cannot
+# take the listeners over fails to start and the one serving is not touched.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+# The control socket's directory, shared by the two instances: it must outlive the
+# instance that stops (RuntimeDirectoryPreserve=yes), or the draining one would take the
+# socket the next handover asks at with it.
+RuntimeDirectory=kbf-frontend
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# Not the daemon's user: the frontend holds the state store and the operator token.
+User=@KBF_SERVER_USER@
+Slice=kbf.slice
+# A frontend answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+CPUWeight=300
+# The three listeners: the REAPI one clients dial (a certificate the farm's CA did not
+# issue, such as a `tailscale cert` pair: KBF_REAPI_CERT and KBF_REAPI_KEY name the
+# files), the worker one daemons and storage nodes dial (mutual TLS from the farm's CA),
+# and the operator API, on loopback. The frontend calls the storage node at
+# KBF_STORAGE_URL with its worker certificate, the `frontend` role's. The state store is
+# a SQLite file in KBF_STATE_DIR, the only backend kbf opens (check-units rule
+# `state-store` fails any other scheme, a relative path, and an ${VAR}, which systemd
+# expands into the command line). The keys and the operator API token (KBF_API_TOKEN_FILE,
+# which the operator puts there: install-units never makes it) are the server user's alone.
+ExecStart=@KBF_BIN_DIR@/kbf frontend \
+    --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
+    --reapi-tls-cert=@KBF_REAPI_CERT@ \
+    --reapi-tls-key=@KBF_REAPI_KEY@ \
+    --worker-listen=@KBF_LISTEN_HOST@:@KBF_WORKER_PORT@ \
+    --worker-tls-cert=@KBF_ETC@/worker.pem \
+    --worker-tls-key=@KBF_ETC@/worker.key \
+    --worker-client-ca=@KBF_ETC@/ca.pem \
+    --api-listen=127.0.0.1:@KBF_API_PORT@ \
+    --api-token-file=@KBF_API_TOKEN_FILE@ \
+    --storage=@KBF_STORAGE_URL@ \
+    --storage-client-cert=@KBF_ETC@/worker.pem \
+    --storage-client-key=@KBF_ETC@/worker.key \
+    --storage-ca=@KBF_ETC@/ca.pem \
+    --state-store=sqlite://@KBF_STATE_DIR@/state.db \
+    --handover-socket=/run/kbf-frontend/control.sock
+# The instance that handed over drains and exits by itself; kbf drains on SIGTERM too: new Execute calls are refused, open streams run until their
+# action is done (Buck2 does not recover a stream that breaks), with no deadline
+# (--shutdown-timeout-secs 0), then the server exits. A stop that ends sooner fails every
+# build in flight, so systemd sends SIGTERM and never kills it for taking long
+# (check-units rule `stop`). A second SIGTERM ends the open streams
+# (`systemctl kill --signal=TERM` on the unit), and `kbf cluster drain --frontend` begins the
+# same drain with no signal.
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+# Exit 2 is a command line kbf refused: a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+DefaultInstance=a
+WantedBy=multi-user.target

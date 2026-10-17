@@ -581,6 +581,15 @@ mod tests {
         assert!(!leases.cancel(id()), "a finished lease");
     }
 
+    /// Asks every callsite again whether the subscriber just installed wants it.
+    /// tracing caches each callsite's interest when it is first reached; a test on
+    /// another thread that reaches the callsite while no subscriber (or only that
+    /// test's, with a lower filter) is registered leaves it cached as never, and
+    /// the capture then misses its line. Call it inside `with_default`.
+    fn rebuild_interest() {
+        tracing_core::callsite::rebuild_interest_cache();
+    }
+
     /// Bytes logged through [`Captured::writer`].
     #[derive(Clone, Default)]
     struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -620,6 +629,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            rebuild_interest();
             leases.finished(ended, outcome, usage, &phases);
         });
         // Nothing is buffered; the subscriber never flushes.
@@ -709,6 +719,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let result = tracing::subscriber::with_default(subscriber, || {
+            rebuild_interest();
             leases.finished(ended, outcome, usage, &phases)
         });
         let log = String::from_utf8(captured.0.lock().expect("log lock").clone()).expect("UTF-8");

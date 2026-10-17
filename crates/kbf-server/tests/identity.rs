@@ -21,6 +21,15 @@ fn dns(name: &str) -> SanType {
     SanType::DnsName(name.try_into().expect("an IA5 name"))
 }
 
+/// The role URI the certificate table writes, spelled out here.
+fn role(name: &str) -> SanType {
+    SanType::URI(
+        format!("urn:kbf:role:{name}")
+            .try_into()
+            .expect("an IA5 name"),
+    )
+}
+
 fn peer(sans: Vec<SanType>) -> PeerCert {
     PeerCert::from_der(&cert(sans, "ignored", &[1])).expect("a certificate")
 }
@@ -179,7 +188,7 @@ fn a_bad_deny_list_is_refused_at_open() {
 /// a certificate that is read but not returned for the stream.
 #[test]
 fn a_certified_listener_needs_a_readable_certificate() {
-    let der = cert(vec![dns("node-a")], "node-a", &[7]);
+    let der = cert(vec![dns("node-a"), role("daemon")], "node-a", &[7]);
     assert_eq!(
         Peers::Unauthenticated.peer(Some(&der)).expect("plain"),
         None

@@ -148,6 +148,10 @@ fn job(argv: &str, action_platform: &[(&str, &str)], do_not_cache: bool) -> Job 
     }
 }
 
+/// How long a step that must happen may take before the test calls it hung: a hang
+/// deadline, never a speed bound.
+const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn start(farm: &Farm, action: &Blob) -> Result<Streaming<Operation>, Status> {
     farm.exec()
         .execute(ExecuteRequest {
@@ -326,8 +330,8 @@ async fn failures_and_abandoned_operations_end_the_stream() {
 
 /// Catches (issue #168): a server going away that leaves open Execute and
 /// WaitExecution streams to die with the connection (UNKNOWN on the client) instead of
-/// ending them UNAVAILABLE, which clients retry; a stream opened after the close that
-/// stays open; and a done operation already there lost to the close (each of eight
+/// ending them UNAVAILABLE, which clients retry; a WaitExecution opened after the close
+/// that stays open; an Execute after the close that is not refused; and a done operation already there lost to the close (each of eight
 /// streams must get its done operation, so a close noticed first fails all but once in
 /// 256 runs); and a WaitExecution after the close on an operation kept finished (issue
 /// #165) ended UNAVAILABLE or left open instead of answered.
@@ -388,10 +392,234 @@ async fn closing_ends_open_streams_unavailable() {
     assert!(done.done, "{done:?}");
     assert_eq!(next(&mut kept).await.expect("healthy"), None);
 
-    let mut late = start(&farm, &job.action).await.expect("Execute");
+    // An Execute after the close is refused at open (as in a drain). A WaitExecution
+    // on a running operation opens, sends its first operation and ends UNAVAILABLE.
+    let refused = start(&farm, &job.action).await.expect_err("Execute after");
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    let mut late = farm
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: "operations/0".to_owned(),
+        })
+        .await
+        .expect("WaitExecution after the close")
+        .into_inner();
     next(&mut late).await.expect("healthy").expect("queued");
     let gone = next(&mut late).await.expect_err("opened after the close");
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+}
+
+/// Catches (komira-build-farm#791): a drain that ends open streams (Buck2 does not
+/// recover a broken Execute stream, so every action in flight would fail) instead of
+/// leaving them open until their action is done; a drain that lets a new Execute in;
+/// and a drain that refuses a WaitExecution on an operation still running. The
+/// planted mutant is `Closer::drain` closing: the open stream then ends UNAVAILABLE
+/// at its first read after the drain.
+#[tokio::test]
+async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
+    let script = Arc::new(Script::default());
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
+    let job = job("drained", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    let mut open = start(&farm, &job.action).await.expect("Execute");
+    next(&mut open).await.expect("healthy").expect("queued");
+
+    closer.drain();
+    script.set(0, Stage::Executing);
+    let running = next(&mut open)
+        .await
+        .expect("the stream survives the drain")
+        .expect("executing");
+    assert_eq!(stage(&running), ExecStage::Executing as i32);
+
+    let refused = start(&farm, &job.action).await.expect_err("a new Execute");
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    assert!(refused.message().contains("draining"), "{refused:?}");
+    assert_eq!(script.submitted().len(), 1, "the refused call was queued");
+
+    let mut waited = farm
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: "operations/0".to_owned(),
+        })
+        .await
+        .expect("WaitExecution during the drain")
+        .into_inner();
+    next(&mut waited)
+        .await
+        .expect("healthy")
+        .expect("executing");
+
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    for (what, ops) in [("Execute", &mut open), ("WaitExecution", &mut waited)] {
+        let done = next(ops).await.expect(what).expect("the done operation");
+        assert!(done.done, "{what}: {done:?}");
+        assert_eq!(next(ops).await.expect(what), None, "{what}");
+    }
+}
+
+/// A dispatch whose first `submit` stops inside the call until the test lets it go,
+/// over a [`Script`]: the window between an Execute's drain check and its stream.
+struct Gated {
+    script: Arc<Script>,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Dispatch for Gated {
+    fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
+        let entered = self
+            .entered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let release = self
+            .release
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(release) = release {
+            // Blocks this thread, which is why the test runs on several.
+            let _ = release.recv();
+        }
+        self.script.submit(submission)
+    }
+
+    fn wait(&self, name: &str) -> Option<Ticket> {
+        self.script.wait(name)
+    }
+}
+
+/// Catches an Execute that passed the drain check and is then refused, or ended, by a
+/// drain that began while its `submit` was running: the call was taken before the
+/// drain, so its stream is kept until its action is done, like every stream open at the
+/// drain (komira-build-farm#791: Buck2 does not recover a stream that breaks). The
+/// drain begins, and the next Execute is refused, while the first is inside `submit`.
+/// Mutant: a second `closing.draining()` check after `submit` (returning UNAVAILABLE)
+/// fails the first `expect` below. `Dispatch::submit` is synchronous, so the test needs
+/// a thread for the blocked handler and one for itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_that_begins_during_submit_keeps_the_stream() {
+    let script = Arc::new(Script::default());
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release_tx, release) = std::sync::mpsc::channel();
+    let gated = Arc::new(Gated {
+        script: Arc::clone(&script),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release)),
+    });
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(gated, closing).await;
+    let job = job("drained mid-submit", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    let opening = start(&farm, &job.action);
+    let draining = async {
+        tokio::time::timeout(HANG, entered)
+            .await
+            .expect("the Execute reaches submit")
+            .expect("the dispatch is alive");
+        closer.drain();
+        let refused = start(&farm, &job.action).await.expect_err("a new Execute");
+        assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+        release_tx.send(()).expect("submit is waiting");
+    };
+    let (opened, ()) = tokio::join!(opening, draining);
+
+    let mut open = opened.expect("the Execute taken before the drain keeps its stream");
+    let queued = next(&mut open).await.expect("healthy").expect("queued");
+    assert_eq!(stage(&queued), ExecStage::Queued as i32);
+    script.set(0, Stage::Executing);
+    let running = next(&mut open).await.expect("kept").expect("executing");
+    assert_eq!(stage(&running), ExecStage::Executing as i32);
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    let done = next(&mut open).await.expect("kept").expect("done");
+    assert!(done.done, "{done:?}");
+    assert_eq!(next(&mut open).await.expect("ends"), None);
+    assert_eq!(
+        script.submitted().len(),
+        1,
+        "only the first call was queued"
+    );
+}
+
+/// Catches `kbf_front_executes_started_total` counting a call the drain refused (a
+/// rollout waiting for it to stand still would never see it flat), missing a call that
+/// was taken (a cache hit is one), or counting a WaitExecution; and
+/// `kbf_front_open_executions` not following the streams a client holds over the wire
+/// (a WaitExecution counts, one the client drops lowers it) or missing from `/metrics`.
+/// Mutants: the counter raised before the drain check; raised in `wait_execution`.
+#[tokio::test]
+async fn started_counts_the_executes_taken_and_open_executions_follows_the_streams() {
+    let script = Arc::new(Script::default());
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
+    let metrics = &farm.cache.metrics().execute;
+    let job = job("counted", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    assert_eq!(
+        (metrics.started.get(), metrics.open_executions.get()),
+        (0, 0)
+    );
+
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("QUEUED");
+    assert_eq!(
+        (metrics.started.get(), metrics.open_executions.get()),
+        (1, 1)
+    );
+    let wait = || async {
+        farm.exec()
+            .wait_execution(WaitExecutionRequest {
+                name: "operations/0".to_owned(),
+            })
+            .await
+            .expect("WaitExecution")
+            .into_inner()
+    };
+    let mut waited = wait().await;
+    next(&mut waited).await.expect("healthy").expect("QUEUED");
+    assert_eq!(
+        (metrics.started.get(), metrics.open_executions.get()),
+        (1, 2),
+        "a WaitExecution is a stream, not a start"
+    );
+
+    closer.drain();
+    start(&farm, &job.action).await.expect_err("refused");
+    assert_eq!(metrics.started.get(), 1, "a refused Execute was counted");
+
+    let text = farm.cache.metrics().render();
+    for family in [
+        "kbf_front_open_executions 2",
+        "kbf_front_executes_started_total 1",
+    ] {
+        assert!(
+            text.lines().any(|l| l == family),
+            "{family} not in:\n{text}"
+        );
+    }
+    drop(waited);
+    for _ in 0..200 {
+        if metrics.open_executions.get() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        metrics.open_executions.get(),
+        1,
+        "a dropped stream stayed open"
+    );
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    next(&mut ops).await.expect("healthy").expect("done");
+    assert_eq!(next(&mut ops).await.expect("healthy"), None);
+    assert_eq!(metrics.open_executions.get(), 0);
 }
 
 /// Catches: an Execute that submits an action whose result is cached, answers a hit

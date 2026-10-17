@@ -95,6 +95,18 @@ pub fn metadata<T>(request: &tonic::Request<T>) -> Arc<AuthenticationMetadata> {
         .map_or_else(|| Arc::clone(&EMPTY), Arc::clone)
 }
 
+/// [`metadata`] for a call that is still a bare HTTP request, as a raw pass-through
+/// service sees it: the metadata [`crate::AuthenticateLayer`] put in `extensions`, or
+/// empty metadata.
+#[must_use]
+pub fn metadata_of_http(
+    extensions: &tonic::codegen::http::Extensions,
+) -> Arc<AuthenticationMetadata> {
+    extensions
+        .get::<Arc<AuthenticationMetadata>>()
+        .map_or_else(|| Arc::clone(&EMPTY), Arc::clone)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -151,5 +163,20 @@ mod tests {
         let md = Arc::new(md(json!("u"), json!("p")));
         carried.extensions_mut().insert(Arc::clone(&md));
         assert_eq!(metadata(&carried), md);
+    }
+
+    /// Catches: the raw path reading another place than the layer wrote (a call the
+    /// layer authenticated would be authorized as anonymous), or a bare HTTP request
+    /// that reads as anything but empty metadata.
+    #[test]
+    fn a_bare_http_request_reads_what_the_layer_wrote() {
+        let mut extensions = tonic::codegen::http::Extensions::new();
+        assert_eq!(
+            *metadata_of_http(&extensions),
+            AuthenticationMetadata::default()
+        );
+        let md = Arc::new(md(json!("u"), json!("p")));
+        extensions.insert(Arc::clone(&md));
+        assert_eq!(metadata_of_http(&extensions), md);
     }
 }

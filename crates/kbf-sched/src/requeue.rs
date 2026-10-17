@@ -64,6 +64,28 @@ pub enum RequeueReason {
     Infra,
 }
 
+impl RequeueReason {
+    /// Whether the give-up follows a kill for memory, which changes what the scheduler
+    /// books and holds for the operation (a raised booking, a memory run).
+    #[must_use]
+    pub const fn is_memory_kill(&self) -> bool {
+        matches!(self, Self::OutOfMemory { .. } | Self::NodeMemoryPressure)
+    }
+
+    /// Whether the give-up is a lost lease: the node was silent, the daemon was
+    /// replaced, restarted or reconnected without the lease. They count toward the cap
+    /// on lost leases ([`crate::LOSS_REQUEUES`]). The ones a worker reports, the memory
+    /// ladder's, a switch of the GUI session and a `Start` that never arrived have
+    /// budgets of their own.
+    #[must_use]
+    pub const fn is_loss(&self) -> bool {
+        matches!(
+            self,
+            Self::Silent | Self::Replaced | Self::Reconnected | Self::Restarted
+        )
+    }
+}
+
 impl fmt::Display for RequeueReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -165,6 +187,32 @@ mod tests {
         );
         assert!(text[8].contains("fenced"), "{}", text[8]);
         assert!(text[9].contains("daemon restarted while"), "{}", text[9]);
+    }
+
+    /// Catches: a reason that counts toward the cap on lost leases though its own
+    /// budget already bounds it (a worker's report, the memory ladder, a GUI session
+    /// switch, a `Start` that never arrived), and a lost lease left out of the count.
+    #[test]
+    fn only_lost_leases_count_toward_the_cap() {
+        let lost = [
+            RequeueReason::Silent,
+            RequeueReason::Replaced,
+            RequeueReason::Reconnected,
+            RequeueReason::Restarted,
+        ];
+        let budgeted = [
+            RequeueReason::NotStarted,
+            RequeueReason::SessionSwitch,
+            RequeueReason::OutOfMemory {
+                booked: 1 << 30,
+                raised: 2 << 30,
+            },
+            RequeueReason::NodeMemoryPressure,
+            RequeueReason::Lost(LostWhy::Fenced),
+            RequeueReason::Infra,
+        ];
+        assert!(lost.iter().all(RequeueReason::is_loss));
+        assert!(!budgeted.iter().any(RequeueReason::is_loss));
     }
 
     /// Catches: a size shown in bytes, or rounded to a whole GiB it is not (an operator

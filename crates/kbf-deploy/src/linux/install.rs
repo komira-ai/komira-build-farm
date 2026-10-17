@@ -46,7 +46,7 @@ use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
 use kbf_host::step::{Cmd, HttpUrl, Owner, Perms};
 use kbf_host::user::RunUser;
 
-const UNITS: &str = "/etc/systemd/system";
+pub(super) const UNITS: &str = "/etc/systemd/system";
 const REMOVED: &str = "/var/lib/kbf-linux/removed";
 const CONTROLLERS: &str = "/sys/fs/cgroup/cgroup.controllers";
 const LINGER: &str = "/var/lib/systemd/linger";
@@ -59,7 +59,7 @@ pub const READY: Duration = Duration::from_secs(60);
 /// Who owns each binary, `.previous` copy and unit install-units writes: root, user and
 /// group. The in-place check compares it too, so a right file another user owns (and so
 /// could rewrite what systemd runs as root) is replaced.
-const ROOT: Owner = Owner { uid: 0, gid: 0 };
+pub(super) const ROOT: Owner = Owner { uid: 0, gid: 0 };
 
 /// What `install-units` was asked for.
 pub struct Install {
@@ -190,30 +190,7 @@ fn preflight<E: Exec>(
     }
     let kbf = host::user_named(exec, &c.user)?;
     let server = host::user_named(exec, &c.server_user)?;
-    // A range line is `<user>:<first id>:<count>`, the user named or given by uid
-    // (subuid(5); newuidmap takes either).
-    let uid = kbf.uid.to_string();
-    for file in ["/etc/subuid", "/etc/subgid"] {
-        let file = HostPath::new(file)?;
-        let ranged = text_of(exec, &file)?.is_some_and(|t| {
-            t.lines().any(|l| {
-                l.split_once(':')
-                    .is_some_and(|(who, _)| who == kbf.name || who == uid)
-            })
-        });
-        if !ranged {
-            return Err(HostError::NoSubIds {
-                user: kbf.name.clone(),
-                file,
-            });
-        }
-    }
-    if stat(exec, &under(&HostPath::new(LINGER)?, &kbf.name)?)?.is_none() {
-        return Err(HostError::NoLinger {
-            user: kbf.name.clone(),
-            uid: kbf.uid,
-        });
-    }
+    rootless(exec, &kbf)?;
     let private = [
         ("s3.env", &server),
         ("api-token", &server),
@@ -289,6 +266,35 @@ fn preflight<E: Exec>(
         }
     }
     Ok((kbf, server))
+}
+
+/// `kbf` can run rootless Podman: it has subuid and subgid ranges and lingers.
+pub(super) fn rootless<E: Exec>(exec: &E, kbf: &RunUser) -> Result<(), HostError> {
+    // A range line is `<user>:<first id>:<count>`, the user named or given by uid
+    // (subuid(5); newuidmap takes either).
+    let uid = kbf.uid.to_string();
+    for file in ["/etc/subuid", "/etc/subgid"] {
+        let file = HostPath::new(file)?;
+        let ranged = text_of(exec, &file)?.is_some_and(|t| {
+            t.lines().any(|l| {
+                l.split_once(':')
+                    .is_some_and(|(who, _)| who == kbf.name || who == uid)
+            })
+        });
+        if !ranged {
+            return Err(HostError::NoSubIds {
+                user: kbf.name.clone(),
+                file,
+            });
+        }
+    }
+    if stat(exec, &under(&HostPath::new(LINGER)?, &kbf.name)?)?.is_none() {
+        return Err(HostError::NoLinger {
+            user: kbf.name.clone(),
+            uid: kbf.uid,
+        });
+    }
+    Ok(())
 }
 
 /// A file's text, `None` when there is no regular file at `path`.
@@ -406,7 +412,7 @@ pub fn run_uninstall<E: Exec>(
     Ok(execute(&p, RunAs::Root, mode, exec, &mut out)?)
 }
 
-fn systemctl(args: &[&str]) -> Cmd {
+pub(super) fn systemctl(args: &[&str]) -> Cmd {
     args.iter()
         .fold(Cmd::new(tool(SYSTEMCTL)), |cmd, arg| cmd.arg(*arg))
 }
