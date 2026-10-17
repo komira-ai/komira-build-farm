@@ -122,6 +122,60 @@ pub enum CheckFailure {
     Endpoints { cluster: String },
     #[error("server {host}: no transport socket match, so its name is not checked")]
     EndpointTlsMatch { host: String },
+    #[error("the box config has {got} listeners, not the REAPI one and the worker one")]
+    Listeners { got: String },
+    #[error(
+        "the REAPI listener has no TLS with a certificate and h2: REAPI clients dial it with TLS"
+    )]
+    ListenerTls,
+    #[error(
+        "{path} is cut after {got} s of silence, not never: an action's own timeout is uncapped, so Execute and WaitExecution need a route idle_timeout of 0s"
+    )]
+    ExecuteIdle { path: String, got: String },
+    #[error("{path}: retry policy outside what repeats no work ({why})")]
+    RetryRoutes { path: String, why: String },
+    #[error(
+        "cluster {cluster}: close_connections_on_host_health_failure cuts the open streams of an instance that is only draining"
+    )]
+    HealthKeepsStreams { cluster: String },
+    #[error("cluster {cluster}: {why}, so a concurrent stream past it is refused")]
+    Breakers { cluster: String, why: String },
+    #[error("cluster {cluster}: no HTTP/2 keepalive on the upstream connections")]
+    UpstreamKeepalive { cluster: String },
+    #[error(
+        "cluster {cluster}: upstream max_concurrent_streams is {got}, not at most kbf's {want}: a burst of streams is sent down one fresh connection and refused"
+    )]
+    UpstreamStreams {
+        cluster: String,
+        got: String,
+        want: String,
+    },
+    #[error("cluster {cluster}: {why}")]
+    Instances { cluster: String, why: String },
+    #[error("port {port} is used twice ({first} and {second})")]
+    InstancePorts {
+        port: String,
+        first: String,
+        second: String,
+    },
+    #[error("the worker listener is not a tcp_proxy alone to kbf_workers ({why})")]
+    WorkerListener { why: String },
+    #[error("{at}: TLS in Envoy on the worker hop loses the daemon's certificate identity")]
+    WorkerTls { at: String },
+    #[error(
+        "the worker proxy's idle_timeout is {got}, not 0s: a daemon's session is quiet between heartbeats"
+    )]
+    WorkerIdle { got: String },
+    #[error("cluster kbf_workers: {why}")]
+    WorkerHealth { why: String },
+    #[error("the admin interface listens on {address}, not loopback")]
+    AdminLoopback { address: String },
+    #[error(
+        "--parent-shutdown-time-s is {got}, under the longest action ({want} s): the old epoch is closed with its streams open"
+    )]
+    ParentShutdown { got: String, want: String },
+    #[error("--drain-time-s {got} is not below --parent-shutdown-time-s {parent}")]
+    DrainTime { got: String, parent: String },
 }
 
 impl CheckFailure {
@@ -178,6 +232,28 @@ impl CheckFailure {
         "endpoint-tls-match",
     ];
 
+    /// The checks only the box topology runs ([`super::box_check`]), in the order it runs
+    /// them.
+    pub const BOX_NAMES: [&'static str; 17] = [
+        "listeners",
+        "listener-tls",
+        "execute-idle-off",
+        "retry-routes",
+        "health-keeps-streams",
+        "breakers",
+        "upstream-keepalive",
+        "upstream-streams",
+        "instances",
+        "instance-ports",
+        "worker-listener",
+        "worker-tls",
+        "worker-idle",
+        "worker-health",
+        "admin-loopback",
+        "parent-shutdown",
+        "drain-time",
+    ];
+
     /// The check's name, the word after `FAIL`.
     pub fn name(&self) -> &'static str {
         match self {
@@ -230,6 +306,23 @@ impl CheckFailure {
             CheckFailure::UpstreamSan { .. } => "upstream-san",
             CheckFailure::Endpoints { .. } => "endpoints",
             CheckFailure::EndpointTlsMatch { .. } => "endpoint-tls-match",
+            CheckFailure::Listeners { .. } => "listeners",
+            CheckFailure::ListenerTls => "listener-tls",
+            CheckFailure::ExecuteIdle { .. } => "execute-idle-off",
+            CheckFailure::RetryRoutes { .. } => "retry-routes",
+            CheckFailure::HealthKeepsStreams { .. } => "health-keeps-streams",
+            CheckFailure::Breakers { .. } => "breakers",
+            CheckFailure::UpstreamKeepalive { .. } => "upstream-keepalive",
+            CheckFailure::UpstreamStreams { .. } => "upstream-streams",
+            CheckFailure::Instances { .. } => "instances",
+            CheckFailure::InstancePorts { .. } => "instance-ports",
+            CheckFailure::WorkerListener { .. } => "worker-listener",
+            CheckFailure::WorkerTls { .. } => "worker-tls",
+            CheckFailure::WorkerIdle { .. } => "worker-idle",
+            CheckFailure::WorkerHealth { .. } => "worker-health",
+            CheckFailure::AdminLoopback { .. } => "admin-loopback",
+            CheckFailure::ParentShutdown { .. } => "parent-shutdown",
+            CheckFailure::DrainTime { .. } => "drain-time",
         }
     }
 

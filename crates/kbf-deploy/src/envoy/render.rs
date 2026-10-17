@@ -57,12 +57,13 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("prefix", "/google.bytestream.ByteStream/"),
 ];
 
-const TLS_SOCKET: &str = "envoy.transport_sockets.tls";
-const UPSTREAM_TLS: &str =
+pub(super) const TLS_SOCKET: &str = "envoy.transport_sockets.tls";
+pub(super) const UPSTREAM_TLS: &str =
     "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
-const HCM: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
-const ROUTER: &str = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router";
-const HTTP_OPTIONS: &str = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+pub(super) const HCM: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
+pub(super) const ROUTER: &str =
+    "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router";
+pub(super) const HTTP_OPTIONS: &str = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
 
 /// The two files `envoy render` writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,13 +90,13 @@ pub fn sha256_hex(text: &str) -> String {
         .collect()
 }
 
-fn ca_validation() -> (&'static str, Json) {
-    ("trusted_ca", Json::object([("filename", CA_FILE.into())]))
+pub(super) fn ca_validation(ca_file: &str) -> (&'static str, Json) {
+    ("trusted_ca", Json::object([("filename", ca_file.into())]))
 }
 
 /// TLS to one kbf-server: its certificate must chain to the CA and name `host` (the
 /// name Envoy dials); h2 is what gRPC needs.
-fn upstream_tls(host: &str) -> Json {
+pub(super) fn upstream_tls(host: &str, ca_file: &str) -> Json {
     let san = Json::object([
         ("san_type", "DNS".into()),
         ("matcher", Json::object([("exact", host.into())])),
@@ -114,7 +115,7 @@ fn upstream_tls(host: &str) -> Json {
                         (
                             "validation_context",
                             Json::object([
-                                ca_validation(),
+                                ca_validation(ca_file),
                                 ("match_typed_subject_alt_names", Json::List(vec![san])),
                             ]),
                         ),
@@ -125,7 +126,7 @@ fn upstream_tls(host: &str) -> Json {
     ])
 }
 
-fn socket_address(address: &str, port: i64) -> Json {
+pub(super) fn socket_address(address: &str, port: i64) -> Json {
     Json::object([(
         "socket_address",
         Json::object([("address", address.into()), ("port_value", port.into())]),
@@ -209,6 +210,27 @@ fn endpoint(s: &Server) -> Json {
     ])
 }
 
+/// The cluster's default socket (for an endpoint no match names): TLS to the CA too,
+/// never plain text.
+pub(super) fn default_upstream_tls(ca_file: &str) -> Json {
+    Json::object([
+        ("name", TLS_SOCKET.into()),
+        (
+            "typed_config",
+            Json::object([
+                ("@type", UPSTREAM_TLS.into()),
+                (
+                    "common_tls_context",
+                    Json::object([
+                        ("alpn_protocols", vec!["h2"].into()),
+                        ("validation_context", Json::object([ca_validation(ca_file)])),
+                    ]),
+                ),
+            ]),
+        ),
+    ])
+}
+
 fn cluster(servers: &[Server]) -> Json {
     let socket_matches = servers
         .iter()
@@ -216,7 +238,7 @@ fn cluster(servers: &[Server]) -> Json {
             Json::object([
                 ("name", s.host.as_str().into()),
                 ("match", Json::object([("server", s.host.as_str().into())])),
-                ("transport_socket", upstream_tls(&s.host)),
+                ("transport_socket", upstream_tls(&s.host, CA_FILE)),
             ])
         })
         .collect();
@@ -269,25 +291,7 @@ fn cluster(servers: &[Server]) -> Json {
         // Each server's own SNI and name check; the default (an endpoint no match
         // names) is TLS to the CA too, never plain text.
         ("transport_socket_matches", Json::List(socket_matches)),
-        (
-            "transport_socket",
-            Json::object([
-                ("name", TLS_SOCKET.into()),
-                (
-                    "typed_config",
-                    Json::object([
-                        ("@type", UPSTREAM_TLS.into()),
-                        (
-                            "common_tls_context",
-                            Json::object([
-                                ("alpn_protocols", vec!["h2"].into()),
-                                ("validation_context", Json::object([ca_validation()])),
-                            ]),
-                        ),
-                    ]),
-                ),
-            ]),
-        ),
+        ("transport_socket", default_upstream_tls(CA_FILE)),
         // grpc.health.v1.Health/Check on each server's REAPI listener. The empty
         // service name is the server as a whole.
         (

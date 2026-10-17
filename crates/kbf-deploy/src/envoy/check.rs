@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::box_render::RETRY_ON;
 pub use super::check_failure::CheckFailure;
 use super::render::{CONFIG_HASH_ANNOTATION, sha256_hex};
 
@@ -92,13 +93,13 @@ pub(super) struct Malformed(pub(super) String);
 
 /// The failures found so far.
 #[derive(Default)]
-struct Checker {
-    failures: Vec<CheckFailure>,
+pub(super) struct Checker {
+    pub(super) failures: Vec<CheckFailure>,
 }
 
 impl Checker {
     /// Record `failure()` unless `ok`; return `ok`.
-    fn require(&mut self, ok: bool, failure: impl FnOnce() -> CheckFailure) -> bool {
+    pub(super) fn require(&mut self, ok: bool, failure: impl FnOnce() -> CheckFailure) -> bool {
         if !ok {
             self.failures.push(failure());
         }
@@ -109,12 +110,12 @@ impl Checker {
 static NULL: Value = Value::Null;
 
 /// `v` as a list; anything else is an empty one.
-fn list(v: &Value) -> &[Value] {
+pub(super) fn list(v: &Value) -> &[Value] {
     v.as_array().map_or(&[], Vec::as_slice)
 }
 
 /// `v` for a message: a string as itself, anything else as JSON.
-fn text(v: &Value) -> String {
+pub(super) fn text(v: &Value) -> String {
     v.as_str().map_or_else(|| v.to_string(), str::to_owned)
 }
 
@@ -178,7 +179,9 @@ pub(super) fn show(d: Duration) -> String {
 
 /// A name-keyed view of a list, as a Python dict built from it: the first position of
 /// each name, holding the last item with that name.
-fn by_name<'a>(items: impl Iterator<Item = (&'a Value, &'a Value)>) -> Vec<(&'a Value, &'a Value)> {
+pub(super) fn by_name<'a>(
+    items: impl Iterator<Item = (&'a Value, &'a Value)>,
+) -> Vec<(&'a Value, &'a Value)> {
     let mut out: Vec<(&Value, &Value)> = Vec::new();
     for (k, v) in items {
         match out.iter_mut().find(|(seen, _)| *seen == k) {
@@ -189,7 +192,7 @@ fn by_name<'a>(items: impl Iterator<Item = (&'a Value, &'a Value)>) -> Vec<(&'a 
     out
 }
 
-fn get<'a>(dict: &[(&Value, &'a Value)], key: &Value) -> Option<&'a Value> {
+pub(super) fn get<'a>(dict: &[(&Value, &'a Value)], key: &Value) -> Option<&'a Value> {
     dict.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
@@ -409,7 +412,7 @@ fn check_netpol(
 
 /// A stream's whole life must not be bounded: `max_stream_duration` absent or 0 in
 /// `opts` (an HttpProtocolOptions or a RouteAction's MaxStreamDuration).
-fn unbounded(c: &mut Checker, opts: &Value, at: &str) -> Result<(), Malformed> {
+pub(super) fn unbounded(c: &mut Checker, opts: &Value, at: &str) -> Result<(), Malformed> {
     let d = &opts["max_stream_duration"];
     let ok = d.is_null() || duration(d)?.is_zero();
     c.require(ok, || CheckFailure::MaxStreamDuration {
@@ -422,7 +425,10 @@ fn unbounded(c: &mut Checker, opts: &Value, at: &str) -> Result<(), Malformed> {
 /// Envoy's route choice for a gRPC call on `path`: the first route whose match takes
 /// it. Exact for a match on `path` or `prefix` only; the route-match check refuses any
 /// other key.
-fn first_route<'a>(routes: &'a [Value], path: &str) -> Result<Option<&'a Value>, Malformed> {
+pub(super) fn first_route<'a>(
+    routes: &'a [Value],
+    path: &str,
+) -> Result<Option<&'a Value>, Malformed> {
     for r in routes {
         let m = &r["match"];
         if m["path"] == path {
@@ -487,6 +493,32 @@ fn check_envoy(
     c.require(!truthy(&chain["transport_socket"]), || {
         CheckFailure::ListenerPlaintext
     });
+    let used = check_hcm(c, hcm, &clusters, Kit::Front)?;
+    for (name, cl) in &clusters {
+        if used.contains(&name.to_string()) {
+            check_cluster(c, cl, &text(name), ca_file, Kit::Front)?;
+        }
+    }
+    Ok(())
+}
+
+/// Which topology's rules the connection manager is held to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kit {
+    /// The Kubernetes front.
+    Front,
+    /// One host's Envoy in front of two instances ([`super::box_check`]).
+    Box,
+}
+
+/// The connection manager `hcm`, its routes and the stream bounds every method of
+/// [`METHODS`] meets; the names of the clusters the routes use.
+pub(super) fn check_hcm(
+    c: &mut Checker,
+    hcm: &Value,
+    clusters: &[(&Value, &Value)],
+    kit: Kit,
+) -> Result<BTreeSet<String>, Malformed> {
     let codec = hcm.get("codec_type");
     let h2 = codec.is_none_or(|v| *v == "AUTO" || *v == "HTTP2");
     c.require(h2, || CheckFailure::Codec {
@@ -518,7 +550,7 @@ fn check_envoy(
     c.require(vhosts.len() == 1 && every_authority, || CheckFailure::Vhost);
     let routes = vhosts.first().map_or(&[][..], |v| list(&v["routes"]));
     for r in routes {
-        check_route_shape(c, r);
+        check_route_shape(c, r, kit);
     }
     let mut used = BTreeSet::new();
     for method in METHODS {
@@ -529,7 +561,7 @@ fn check_envoy(
         };
         let action = &r["route"];
         let cluster = &action["cluster"];
-        let defined = get(&clusters, cluster).is_some();
+        let defined = get(clusters, cluster).is_some();
         if defined {
             used.insert(cluster.to_string());
         }
@@ -549,28 +581,66 @@ fn check_envoy(
             secs: show(timeout),
         });
         unbounded(c, &action["max_stream_duration"], &path)?;
-        let idle = match action.get("idle_timeout") {
-            Some(d) => duration(d)?,
-            None => idle,
-        };
+        let route_idle = action.get("idle_timeout").map(duration).transpose()?;
+        let idle = route_idle.unwrap_or(idle);
         c.require(idle.is_zero() || idle > SILENT, || {
             CheckFailure::IdleTimeout {
-                path,
+                path: path.clone(),
                 secs: show(idle),
             }
         });
-    }
-    for (name, cl) in &clusters {
-        if used.contains(&name.to_string()) {
-            check_cluster(c, cl, &text(name), ca_file)?;
+        if kit == Kit::Box {
+            // An action's own timeout is uncapped, so a bound on silence that the
+            // connection manager's value gives these two can cut a long one.
+            let long = method.ends_with("/Execute") || method.ends_with("/WaitExecution");
+            c.require(!long || route_idle.is_some_and(|d| d.is_zero()), || {
+                CheckFailure::ExecuteIdle {
+                    path: path.clone(),
+                    got: route_idle.map_or_else(|| "absent".to_owned(), show),
+                }
+            });
+            check_retry(c, r, &path);
         }
     }
-    Ok(())
+    Ok(used)
+}
+
+/// A route's `retry_policy` (box only): only conditions that repeat no work
+/// ([`RETRY_ON`]), and none on a ByteStream call, whose body streams.
+fn check_retry(c: &mut Checker, r: &Value, path: &str) {
+    let policy = &r["route"]["retry_policy"];
+    if policy.is_null() {
+        return;
+    }
+    let bytestream = path.starts_with("/google.bytestream.");
+    let on: Vec<&str> = policy["retry_on"]
+        .as_str()
+        .map_or_else(Vec::new, |s| s.split(',').collect());
+    let allowed = RETRY_ON.split(',').collect::<Vec<_>>();
+    let extra = extra_keys(policy, &["retry_on", "num_retries"]);
+    let why = if bytestream {
+        Some("a ByteStream body streams and cannot be replayed".to_owned())
+    } else if on.is_empty() || !on.iter().all(|c| allowed.contains(c)) {
+        Some(format!(
+            "retry_on {} is not within {RETRY_ON}",
+            text(&policy["retry_on"])
+        ))
+    } else if !extra.is_empty() {
+        Some(format!("unmodelled keys {}", json!(extra)))
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        c.failures.push(CheckFailure::RetryRoutes {
+            path: path.to_owned(),
+            why,
+        });
+    }
 }
 
 /// A route matches on `path` or `prefix` alone, is not a catch-all, and its action
 /// only picks a cluster and sets timeouts.
-fn check_route_shape(c: &mut Checker, r: &Value) {
+fn check_route_shape(c: &mut Checker, r: &Value, kit: Kit) {
     let m = &r["match"];
     let prefix = m["prefix"].as_str();
     c.require(prefix != Some("") && prefix != Some("/"), || {
@@ -585,7 +655,11 @@ fn check_route_shape(c: &mut Checker, r: &Value) {
             extra: json!(extra).to_string(),
         }
     });
-    let extra = extra_keys(&r["route"], &ACTION_KEYS);
+    let mut known = ACTION_KEYS.to_vec();
+    if kit == Kit::Box {
+        known.push("retry_policy");
+    }
+    let extra = extra_keys(&r["route"], &known);
     c.require(extra.is_empty(), || CheckFailure::RouteAction {
         matched: m.to_string(),
         extra: json!(extra).to_string(),
@@ -595,11 +669,12 @@ fn check_route_shape(c: &mut Checker, r: &Value) {
 /// A cluster a route uses: health-checked by grpc.health.v1 on a name kbf-server
 /// answers, never sending to an unhealthy server, HTTP/2 over TLS to the mounted CA,
 /// each server's name checked.
-fn check_cluster(
+pub(super) fn check_cluster(
     c: &mut Checker,
     cl: &Value,
     name: &str,
     ca_file: Option<&str>,
+    kit: Kit,
 ) -> Result<(), Malformed> {
     let cluster = || name.to_owned();
     let hcs = list(&cl["health_checks"]);
@@ -655,7 +730,12 @@ fn check_cluster(
         cluster: cluster(),
     });
     for e in eps {
-        let host = &e["endpoint"]["address"]["socket_address"]["address"];
+        // The front dials each server by the name it checks; a box dials loopback ports
+        // and checks the one name it was given.
+        let host = match kit {
+            Kit::Front => &e["endpoint"]["address"]["socket_address"]["address"],
+            Kit::Box => &e["endpoint"]["hostname"],
+        };
         let criteria = &e["metadata"]["filter_metadata"]["envoy.transport_socket_match"];
         let m = matches
             .iter()
@@ -673,7 +753,13 @@ fn check_cluster(
 
 /// A transport socket of the hop to the servers: TLS that trusts the mounted CA and
 /// offers h2; for one server (`host`), its SNI and the certificate's name too.
-fn tls(c: &mut Checker, ts: &Value, at: &str, ca_file: Option<&str>, host: Option<&Value>) {
+pub(super) fn tls(
+    c: &mut Checker,
+    ts: &Value,
+    at: &str,
+    ca_file: Option<&str>,
+    host: Option<&Value>,
+) {
     let tc = &ts["typed_config"];
     if !c.require(tc["@type"] == UPSTREAM_TLS, || CheckFailure::UpstreamTls {
         at: at.to_owned(),

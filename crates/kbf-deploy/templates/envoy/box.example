@@ -1,0 +1,40 @@
+# kbf-deploy envoy --topology box: one host's Envoy in front of two kbf instances
+# (a and b), for an update that moves new streams to the other instance while the
+# old one finishes what it holds.
+#
+# Format: KEY=VALUE, one per line, starting in the first column, no spaces around
+# `=`, optional double quotes around the value. `#` lines and blank lines are
+# skipped. It is parsed, never sourced. `kbf-deploy envoy render --topology box`
+# refuses a key not listed here, a key given twice, a missing key, a value of the
+# wrong shape and a port used twice. Put no secret here: the key is a path.
+
+# The DNS name the instances' REAPI certificate carries: Envoy's SNI and name
+# check on the hop to them.
+KBF_BOX_HOST=kbf.example.internal
+
+# --- the ports clients and daemons dial (Envoy owns them) ----------------------
+KBF_BOX_REAPI_PORT=8980
+KBF_BOX_WORKER_PORT=8981
+# Envoy's admin interface, on loopback.
+KBF_BOX_ADMIN_PORT=9901
+
+# --- the instances' loopback ports ---------------------------------------------
+# Instance a takes base+0 (REAPI), base+1 (worker), base+2 (API); instance b takes
+# base+10, base+11, base+12. The Envoy file is static, so these are fixed.
+KBF_BOX_BACKEND_PORT_BASE=18980
+
+# --- TLS ------------------------------------------------------------------------
+# What Envoy shows REAPI clients (absolute paths).
+KBF_BOX_CERT_FILE=/etc/kbf/tls/reapi.pem
+KBF_BOX_KEY_FILE=/etc/kbf/tls/reapi.key
+# The CA the instances' REAPI certificates chain to.
+KBF_BOX_CA_FILE=/etc/kbf/tls/ca.pem
+
+# --- limits ----------------------------------------------------------------------
+# kbf's --reapi-max-streams (1 to 32767): the streams one upstream connection carries.
+KBF_BOX_REAPI_MAX_STREAMS=10000
+# The most actions the farm holds open at once (one open Execute is one request).
+KBF_BOX_STREAM_CEILING=65536
+# The longest action in seconds. Envoy's old epoch is kept this long plus a quarter
+# hour after a hot restart (--parent-shutdown-time-s).
+KBF_BOX_LONGEST_ACTION_SECS=21600

@@ -847,6 +847,101 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
 
+/// Catches `--topology box` not wired to the box kit (the front's files written, or the
+/// front's check run on a box config), the box render and check not agreeing through
+/// the files, a failed box check exiting other than 1 with its line on stdout, an
+/// unreadable file or a bad setting exiting other than 2, and the default topology
+/// changing (the front's tests above run without the flag).
+#[test]
+fn envoy_box_topology_renders_checks_and_refuses() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-box");
+    let config = dir.join("box.local");
+    let example = include_str!("../templates/envoy/box.example");
+    std::fs::write(&config, example).expect("config");
+    let config = config.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+    let passed = "12 methods routed, every box check passed\n";
+
+    let (code, out, err) = cli(
+        &mut exec,
+        &no_env,
+        &["envoy", "check", "--topology", "box", "--config", &config],
+    );
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (ExitCode::SUCCESS, passed, "")
+    );
+    let check = [
+        "envoy",
+        "check",
+        "--topology",
+        "box",
+        "--config",
+        &config,
+        "--dir",
+        &rendered,
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with(&format!("REFUSED: cannot read {rendered}/envoy.json: ")),
+        "{err}"
+    );
+
+    let render = [
+        "envoy",
+        "render",
+        "--topology",
+        "box",
+        "--config",
+        &config,
+        "--out",
+        &rendered,
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert_eq!(
+        out,
+        format!("rendered envoy.json envoy.args into {rendered}\n")
+    );
+    assert!(
+        !std::path::Path::new(&rendered)
+            .join("manifests.json")
+            .exists()
+    );
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (ExitCode::SUCCESS, passed, "")
+    );
+
+    let args = format!("{rendered}/envoy.args");
+    let text = std::fs::read_to_string(&args).expect("rendered");
+    std::fs::write(&args, text.replace("22500", "900")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
+    assert!(
+        out.starts_with("FAIL parent-shutdown: --parent-shutdown-time-s is 900, "),
+        "{out}"
+    );
+
+    let envoy = format!("{rendered}/envoy.json");
+    std::fs::write(&envoy, "{").expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with(&format!("REFUSED: {envoy} is not JSON: ")),
+        "{err}"
+    );
+
+    std::fs::write(&config, example.replace("KBF_BOX_HOST=", "KBF_BOX_HOSTS=")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(err.ends_with(": unknown key KBF_BOX_HOSTS\n"), "{err}");
+}
+
 /// Catches the `pilot` kit dropped from the merged command line (clap would exit 2 on
 /// an unknown subcommand, with no `REFUSED:`), and its refusals not reaching stderr
 /// as `REFUSED:` through `run`; this also runs `run`'s pilot arm in the lib tests'

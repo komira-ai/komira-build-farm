@@ -145,6 +145,13 @@ enum Kit {
     Log(log::LogArgs),
 }
 
+/// What the envoy kit renders and checks.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Topology {
+    Front,
+    Box,
+}
+
 #[derive(Subcommand)]
 enum Envoy {
     /// Write manifests.json (the Kubernetes objects) and envoy.json (Envoy's config)
@@ -156,6 +163,11 @@ enum Envoy {
         /// Where to write the two files.
         #[arg(long)]
         out: PathBuf,
+        /// `front` (the default): the Kubernetes front. `box`: one host's Envoy in
+        /// front of two kbf instances; writes envoy.json and envoy.args, from the box
+        /// settings (templates/envoy/box.example).
+        #[arg(long, value_enum, default_value_t = Topology::Front)]
+        topology: Topology,
     },
     /// Check a render for what the REAPI path through the front depends on: every
     /// client call routed with no bound on a stream's life, TLS to the CA naming
@@ -168,6 +180,10 @@ enum Envoy {
         /// The directory render wrote; without it, the render of --config is checked.
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// The topology --config and the render are of; see `render`. For `box`, the
+        /// rules are the long-stream, health, limit and hot-restart ones.
+        #[arg(long, value_enum, default_value_t = Topology::Front)]
+        topology: Topology,
     },
     /// Check the render and what the cluster must already hold, have the API server
     /// validate the render, and with --apply apply it (server-side, field manager
@@ -866,9 +882,25 @@ fn envoy_kit<E: Exec>(
                 }
             };
         }
-        Envoy::Render { config, out: dir } => envoy::render_files(&config, &dir),
-        Envoy::Check { config, dir } => match envoy::check_files(&config, dir.as_deref()) {
-            Ok(failures) if failures.is_empty() => Ok(envoy::check_passed()),
+        Envoy::Render {
+            config,
+            out: dir,
+            topology: Topology::Front,
+        } => envoy::render_files(&config, &dir),
+        Envoy::Render {
+            config,
+            out: dir,
+            topology: Topology::Box,
+        } => envoy::render_box_files(&config, &dir),
+        Envoy::Check {
+            config,
+            dir,
+            topology,
+        } => match envoy_check(topology, &config, dir.as_deref()) {
+            Ok(failures) if failures.is_empty() => Ok(match topology {
+                Topology::Front => envoy::check_passed(),
+                Topology::Box => envoy::check_box_passed(),
+            }),
             Ok(failures) => {
                 for f in &failures {
                     let _ = writeln!(out, "{}", f.line());
@@ -887,6 +919,18 @@ fn envoy_kit<E: Exec>(
             let _ = writeln!(err, "REFUSED: {e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `envoy check` of the topology's render.
+fn envoy_check(
+    topology: Topology,
+    config: &Path,
+    dir: Option<&Path>,
+) -> Result<Vec<envoy::check::CheckFailure>, envoy::Refusal> {
+    match topology {
+        Topology::Front => envoy::check_files(config, dir),
+        Topology::Box => envoy::check_box_files(config, dir),
     }
 }
 

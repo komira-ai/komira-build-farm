@@ -1,0 +1,4 @@
+--parent-shutdown-time-s 22500
+--drain-time-s 60
+--drain-strategy gradual
+--skip-hot-restart-on-no-parent
