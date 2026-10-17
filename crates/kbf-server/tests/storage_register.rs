@@ -19,13 +19,17 @@ use kbf_proto::worker::segments_client::SegmentsClient;
 use kbf_server::NodeMap;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
+use kbf_server::storage_health::Debts;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{
     EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
 };
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
+use kbf_storage::repair::{NoLedger, Options, RepairRecord, Repairs};
 use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
+use kbf_store::FaultFs;
+use kbf_types::{Digest, DigestFunction};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -221,7 +225,12 @@ async fn a_node_whose_row_lapsed_registers_again() {
     // member has the id it had.
     until("the node to register again", || {
         f.members
-            .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Debts::Unknown,
+            )
             .ok()
     })
     .await;
@@ -579,6 +588,116 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
     node_serving.abort();
     drop(stop);
     serving.await.expect("joins").expect("stops");
+}
+
+fn node_x() -> NodeIdentity {
+    NodeIdentity {
+        instance_id: "node-x".to_owned(),
+        addr: "192.0.2.5:8982".to_owned(),
+        zone: String::new(),
+        weight: 1,
+    }
+}
+
+fn joiner_of(f: &Frontend) -> Joiner {
+    let channel = Endpoint::from_shared(format!("http://{}", f.worker))
+        .expect("endpoint")
+        .connect_lazy();
+    Joiner::new(channel, node_x(), 5 * MS)
+}
+
+fn owed(i: u8) -> RepairRecord {
+    RepairRecord {
+        digest: Digest::new(DigestFunction::Sha256, [i; 32], 10),
+        replica: MemberId(2),
+        generation: 1,
+    }
+}
+
+fn open_journal(fs: &FaultFs) -> Arc<Repairs> {
+    Arc::new(Repairs::open(fs.clone(), Options::default(), Arc::new(NoLedger)).expect("journal"))
+}
+
+/// The frontend's number once member 1 has been promoted to Active and has reported:
+/// polled until `want` (the node beats on its own schedule).
+async fn until_number(f: &Frontend, want: Option<u64>) {
+    until("the frontend's number", || {
+        let health = f.members.storage_health().expect("health");
+        (health.under_replicated_blobs == want && health.silent.is_empty()).then_some(())
+    })
+    .await;
+}
+
+/// Catches: a node that does not tell the frontend what its journal holds, or tells it
+/// something else. Through the real joiner and the real membership service: 2 copies owed
+/// is 2 at the frontend, a third is 3 at the next beat, and a node that restarts (its
+/// journal reopened, the process registering again) reports the debts it had, not 0 for
+/// "none since I started". Mutants: the count of debts since the journal was opened; the
+/// debts never sent; sent as unknown.
+#[tokio::test]
+async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
+    let f = frontend(None);
+    let fs = FaultFs::new();
+    let repairs = open_journal(&fs);
+    for i in 1..=2 {
+        let _pending = repairs.owe(owed(i)).await.expect("owed");
+    }
+    let first = tokio::spawn(joiner_of(&f).with_repairs(Arc::clone(&repairs)).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    until_number(&f, Some(2)).await;
+
+    let _pending = repairs.owe(owed(3)).await.expect("owed");
+    until_number(&f, Some(3)).await;
+
+    first.abort();
+    drop(repairs);
+    let reopened = open_journal(&fs.crash(0));
+    let second = tokio::spawn(joiner_of(&f).with_repairs(reopened).run());
+    // Boot 2 is the registration after the restart (its index is whole, so it is Active
+    // at once). A beat of boot 2 is accepted only after it, and says nothing, so the
+    // stale report of boot 1 is gone before the number is read.
+    until("the node to register again", || {
+        f.members
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Debts::Unknown,
+            )
+            .ok()
+    })
+    .await;
+    until_number(&f, Some(3)).await;
+    second.abort();
+}
+
+/// Catches: a node with no journal saying it owes nothing. Without one it cannot say, and
+/// the frontend must read "unknown", not zero. Mutant: the joiner reports `Known(0)` when
+/// it has no journal.
+#[tokio::test]
+async fn a_node_without_a_journal_says_it_cannot_say() {
+    let f = frontend(None);
+    let joiner = tokio::spawn(joiner_of(&f).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    until("the node to say it cannot say", || {
+        let health = f.members.storage_health().expect("health");
+        (health.unreported == [MemberId(1)]).then_some(health)
+    })
+    .await;
+    assert_eq!(
+        f.members
+            .storage_health()
+            .expect("health")
+            .under_replicated_blobs,
+        None
+    );
+    joiner.abort();
 }
 
 /// A node started with `--frontend` that the frontend cannot yet admit (its store fails),

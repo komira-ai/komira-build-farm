@@ -36,7 +36,7 @@ use support::{Client, Job, PROMPT, done, ran, response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 /// The flags of `kbf frontend` for a start on loopback ports, and these more.
 pub fn flags(more: &[&str]) -> Result<FrontendFlags, clap::Error> {
@@ -1415,6 +1415,95 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .expect("the frontend stops")
         .unwrap()
         .expect("served");
+}
+
+/// The text of `GET path` on `api`.
+async fn get_text(api: SocketAddr, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status code");
+    (code, body.to_owned())
+}
+
+/// Catches: a frontend that keeps storage members but does not show their health (its
+/// operator API and scrape are assembled apart from the all-in-one's). A node registers
+/// with the frontend's membership service; it is CatchingUp, so the number is `null` naming
+/// it, `kbf_storage_health_known` is 0, and `kbf_under_replicated_blobs` is absent rather
+/// than 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_a_state_store_shows_the_storage_health() {
+    use kbf_proto::kbf::map::v1 as pb;
+    use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
+
+    let dir = scratch_dir("storage-health");
+    let flag = format!("--state-store=sqlite://{}", dir.join("state.db").display());
+    let f = flags(&["--storage=http://127.0.0.1:1", &flag]).expect("parses");
+    let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
+    let (api, worker) = (handle.api.expect("the operator API"), handle.worker);
+    let served = tokio::spawn(handle.serve());
+
+    let (code, body) = get(api, "/v1/storage").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["members_total"], 0, "{body}");
+    assert_eq!(body["under_replicated_blobs"], Value::Null, "{body}");
+
+    let channel = Endpoint::from_shared(format!("http://{worker}"))
+        .expect("endpoint")
+        .connect_lazy();
+    MembershipClient::new(channel)
+        .register(pb::RegisterRequest {
+            role: pb::Role::Storage.into(),
+            instance_id: "node-1".to_owned(),
+            addr: "192.0.2.1:8982".to_owned(),
+            weight: 1,
+            zone: String::new(),
+            catching_up: true,
+            protocol: kbf_server::members::PROTOCOL,
+        })
+        .await
+        .expect("registers");
+    let (code, body) = get(api, "/v1/storage").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["not_active"], serde_json::json!([1]), "{body}");
+    assert_eq!(body["under_replicated_blobs"], Value::Null, "{body}");
+    assert_eq!(
+        body["reasons"],
+        serde_json::json!(["member 1 not active"]),
+        "{body}"
+    );
+
+    let (code, scrape) = get_text(api, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(
+        scrape.contains("\nkbf_storage_health_known 0\n"),
+        "{scrape}"
+    );
+    assert!(!scrape.contains("kbf_under_replicated_blobs"), "{scrape}");
+    served.abort();
+}
+
+/// Catches: storage health shown by a frontend that has no state store to keep members in
+/// (it would answer a number for a farm it cannot see): `/v1/storage` is not there, and
+/// the scrape has neither family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_without_a_state_store_has_no_storage_health() {
+    let node = Node::start().await;
+    let front =
+        Front::start(&flags(&[&format!("--storage=http://{}", node.addr)]).expect("parses")).await;
+    let (code, _) = get_text(front.api, "/v1/storage").await;
+    assert_eq!(code, 404);
+    let (code, scrape) = get_text(front.api, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(!scrape.contains("kbf_storage_health_known"), "{scrape}");
+    assert!(!scrape.contains("kbf_under_replicated_blobs"), "{scrape}");
 }
 
 /// Catches: `--history-objects` taken by a frontend and not wired (a frontend whose

@@ -243,6 +243,44 @@ the drain, and the unit templates in `kbf-deploy` set it.
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
 restart it.
 
+## `GET /v1/storage`
+
+Whether every blob is known to have its copies elsewhere: the number a rollout asks
+before it takes a storage node down. A read, open like `GET /v1/nodes`, served by a
+frontend with a state store (without one there are no storage members, and the route is
+`404`). The definition, which is also the help text of the metric below:
+
+`under_replicated_blobs` is the sum, over all registered storage members, of the blobs
+each owes a second copy (the open records of the member's repair journal, which each
+storage heartbeat reports). It is **known** only when every registered member is `ACTIVE`
+and has reported within the freshness window (two heartbeat intervals); otherwise it is
+**unknown**, because a member that is down, joining, catching up, draining or silent may
+hold blobs that nobody counts. A member that has not read its journal since it started, or
+has none, reports that it cannot say; that is unknown too, never zero. So is a farm with
+no registered member.
+
+```json
+{ "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
+  "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
+  "reasons": ["3 blobs owed"] }
+```
+
+- `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
+  not zero.
+- `debts_total`: the debts of the `ACTIVE` members that reported within the window and
+  said, summed even when the total is unknown.
+- `not_active`, `silent`, `unreported`: member ids that make the number unknown: members
+  that are not `ACTIVE`; `ACTIVE` members with no report within the window; `ACTIVE`
+  members whose report says they cannot say.
+- `reasons`: why the number is not zero, in that order, as a rollout would say it
+  (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
+  zero.
+
+The number is as old as the newest heartbeat. A copy owed since then is not in it, so
+whoever acts on a zero keeps new writes away from the node first (drains it), then reads
+again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
+`503` with `{"error": ...}` when the membership cannot be read.
+
 ## `GET /healthz` and `GET /readyz`
 
 For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
@@ -337,6 +375,8 @@ caller goes away before the answer counts as an error.
 | `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
+| `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
+| `kbf_storage_health_known` | gauge | 1 when `kbf_under_replicated_blobs` is exported, 0 when it is unknown (including a membership that cannot be read). Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
 | `kbf_execute_queued` | gauge | Execute streams the scheduler accepted whose operation has not left `QUEUED` |

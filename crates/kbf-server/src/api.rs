@@ -4,6 +4,9 @@
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
 //!   software status each sent and where it is in placement ([`crate::fleet`]).
+//! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
+//!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
+//!   store.
 //! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
 //!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
@@ -374,13 +377,13 @@ fn is_json(value: &[u8]) -> bool {
 
 /// `value` as a JSON body. The views serialize plain strings, numbers and lists, which
 /// cannot fail.
-fn json(code: StatusCode, value: &impl serde::Serialize) -> Response {
+pub(crate) fn json(code: StatusCode, value: &impl serde::Serialize) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_default();
     (code, [(CONTENT_TYPE, JSON)], body).into_response()
 }
 
 /// An error answer; a 401 names the scheme it wants (RFC 9110 section 11.6.1).
-fn error(code: StatusCode, why: &str) -> Response {
+pub(crate) fn error(code: StatusCode, why: &str) -> Response {
     let mut answer = json(code, &serde_json::json!({ "error": why }));
     if code == StatusCode::UNAUTHORIZED {
         let bearer = axum::http::HeaderValue::from_static("Bearer");

@@ -6,7 +6,9 @@
 //! - an unspecified or unknown enum value, or a replication factor that does not fit a
 //!   `u8`, read as a default instead of refused;
 //! - a map the domain refuses getting in through the wire;
-//! - the generation moving off field 1.
+//! - the generation moving off field 1;
+//! - the heartbeat's debts report moving off fields 5 and 6, or an older node's heartbeat
+//!   (which sends neither) being read as "owes nothing" instead of "cannot say".
 
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_proto::MapDecodeError;
@@ -174,4 +176,43 @@ fn denied_entries_are_parsed_canonically_and_refused_when_bad_or_repeated() {
             "a1b".to_owned()
         )))
     );
+}
+
+// Catches: the debts report moved to other field numbers (a node and a frontend of two
+// builds would read each other's counts as something else). The bytes are pinned: the
+// member id and boot on fields 1 and 2, the count on field 5 and the known flag on 6,
+// each a varint.
+#[test]
+fn the_heartbeat_debts_are_fields_five_and_six() {
+    let beat = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 2,
+        repair_debts: 3,
+        debts_known: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        beat.encode_to_vec(),
+        [0x08, 1, 0x10, 2, 0x28, 3, 0x30, 1],
+        "fields 1, 2, 5 and 6"
+    );
+    let back =
+        pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2, 0x28, 3, 0x30, 1][..]).expect("decodes");
+    assert_eq!(back, beat);
+}
+
+// Catches: a heartbeat from a node that predates the report read as having said it owes
+// nothing. It carries neither field, so `debts_known` decodes false: "cannot say". And a
+// node that says it cannot say sends no bytes for either field.
+#[test]
+fn a_heartbeat_without_the_report_says_it_cannot_say() {
+    let old = pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2][..]).expect("decodes");
+    assert!(!old.debts_known);
+    assert_eq!(old.repair_debts, 0);
+    let blind = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 2,
+        ..Default::default()
+    };
+    assert_eq!(blind.encode_to_vec(), [0x08, 1, 0x10, 2]);
 }

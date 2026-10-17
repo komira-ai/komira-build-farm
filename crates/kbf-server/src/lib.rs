@@ -108,6 +108,7 @@ mod start;
 mod startup_pass;
 pub mod state_store;
 pub mod storage_half;
+pub mod storage_health;
 pub mod storage_node;
 pub mod stores;
 pub mod streams;

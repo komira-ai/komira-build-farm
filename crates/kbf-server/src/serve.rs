@@ -679,10 +679,15 @@ where
         Arc::clone(&cache),
         local,
         history.as_ref().map(crate::history::History::stats),
+        members.clone(),
         tls_sources,
     ))
     .merge(blob_routes)
     .merge(page_routes);
+    // The storage health, if there are members: no branch in this generic function.
+    let api_routes = members.iter().fold(api_routes, |routes, members| {
+        routes.merge(crate::storage_health::router(Arc::clone(members)))
+    });
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);

@@ -13,7 +13,7 @@ use kbf_types::Digest;
 use super::chain::{MIB, held, within};
 use super::degrade::a_build_with_a_killed_owner;
 use super::farm::Farm;
-use crate::repair::{Options, Pass, RepairConfig, RepairWorker, Repairs};
+use crate::repair::{NoLedger, Options, Pass, RepairConfig, RepairWorker, Repairs};
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Held, Mem, StreamFault, sha};
 use crate::{Answer, ReadStream, Storage, StorageError};
@@ -111,6 +111,45 @@ async fn the_copy_is_made_when_the_replica_returns() {
     assert_eq!(copy, Some(bytes));
     assert!(settled_told(&farm, 0, &digest).await);
     assert_eq!(repairs.pass().await, Pass::default());
+}
+
+/// Catches a count that is not the journal. The frontend's under-replicated number is the
+/// sum of what each node reports, so a node must report exactly the copies it owes: a write
+/// answered with one copy is 1 once it has finished (the writes in flight are not the
+/// debts: none is in flight now), only on the node that holds the blob, still 1 after a
+/// restart (the journal is read when it is opened), and 0 once the worker has made the copy.
+/// Mutants: the count taken from the writes in flight; the replica counted too; the count
+/// kept at 1 after the debt is settled; the count of a reopened journal 0.
+#[tokio::test]
+async fn the_count_a_node_reports_is_the_copies_it_owes() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    assert_eq!(farm.nodes[0].repairs.open_debt_count(), 0);
+    let (_, digest) = owed_blob(&farm, 5 * MIB + 3, 1).await;
+    assert!(
+        !farm.nodes[0].repairs.is_in_flight(&digest),
+        "the write is over, so the count below is not the writes in flight"
+    );
+    assert_eq!(farm.nodes[0].repairs.open_debt_count(), 1);
+    assert_eq!(farm.nodes[1].repairs.open_debt_count(), 0);
+
+    let restarted = Repairs::open(
+        farm.nodes[0].fs.crash(0),
+        Options::default(),
+        Arc::new(NoLedger),
+    )
+    .expect("reopen the journal");
+    assert_eq!(restarted.open_debt_count(), 1);
+
+    farm.nodes[1].switch.restore();
+    let repairs = worker(&farm, 0);
+    assert_eq!(
+        repairs.pass().await,
+        Pass {
+            settled: 1,
+            waiting: 0
+        }
+    );
+    assert_eq!(farm.nodes[0].repairs.open_debt_count(), 0);
 }
 
 /// Catches a blob sent to an owner that already has it, and a read of the store for it:

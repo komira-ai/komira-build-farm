@@ -287,6 +287,7 @@ impl Disk {
             store: Arc::new(fenced),
             epoch: EpochPolicy::Keep,
             members: Default::default(),
+            history: None,
         }))
         .expect("a farm over the store")
     }

@@ -46,6 +46,7 @@ trait Debts: Send {
     fn owed(&mut self, record: RepairRecord) -> Result<(), JournalError>;
     fn done(&mut self, digest: &Digest) -> Result<(), JournalError>;
     fn records(&self) -> Vec<RepairRecord>;
+    fn count(&self) -> usize;
 }
 
 impl<F: Fs + Send> Debts for Journal<F>
@@ -62,6 +63,10 @@ where
 
     fn records(&self) -> Vec<RepairRecord> {
         Journal::records(self).copied().collect()
+    }
+
+    fn count(&self) -> usize {
+        Journal::len(self)
     }
 }
 
@@ -301,6 +306,15 @@ impl Repairs {
                 ledger.owed(&record).await;
             }
         });
+    }
+
+    /// How many copies are owed now: the open records of the journal, which has been read
+    /// in full by [`Repairs::open`], so a node that restarted counts the debts it had. Not
+    /// the writes in flight: a write counts from the moment its record is durable. Blocks
+    /// while a write that owes is syncing the journal.
+    #[must_use]
+    pub fn open_debt_count(&self) -> u64 {
+        u64::try_from(Self::lock(&self.debts).count()).unwrap_or(u64::MAX)
     }
 
     /// Every copy owed now, in digest order.
