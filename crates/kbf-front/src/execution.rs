@@ -253,6 +253,18 @@ impl Closer {
         });
     }
 
+    /// Takes new Execute calls again after [`Closer::drain`]. Does nothing once the
+    /// closer has closed. Returns whether it undid a drain.
+    pub fn undrain(&self) -> bool {
+        self.0.send_if_modified(|phase| {
+            let draining = *phase == Phase::Draining;
+            if draining {
+                *phase = Phase::Open;
+            }
+            draining
+        })
+    }
+
     /// Ends every open Execute and WaitExecution stream that is not done UNAVAILABLE,
     /// and every one opened from now on after its first operation. Also drains.
     pub fn close(&self) {

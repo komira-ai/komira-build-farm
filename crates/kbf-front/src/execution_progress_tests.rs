@@ -207,3 +207,22 @@ async fn open_executions_is_raised_with_the_stream_and_lowered_however_it_ends()
     assert!(ops.next().await.is_none());
     assert_eq!(gauge.get(), 0);
 }
+
+/// Catches an `undrain` that does not take new Execute calls again (an update that
+/// failed its prepare would leave the old process refusing), one that reports a change
+/// when there was none, and one that undoes a close. Mutants: `undrain` doing nothing;
+/// `undrain` returning `true` always; `undrain` setting `Open` from `Closed`.
+#[test]
+fn undrain_takes_calls_again_until_the_close() {
+    let (closer, open) = closing();
+    assert!(!closer.undrain(), "undid a drain that was not there");
+    closer.drain();
+    assert!(open.draining());
+    assert!(closer.undrain());
+    assert!(!open.draining());
+    assert!(!closer.undrain());
+    closer.drain();
+    closer.close();
+    assert!(!closer.undrain(), "undid a close");
+    assert!(open.draining());
+}
