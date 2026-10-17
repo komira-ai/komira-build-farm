@@ -36,7 +36,7 @@ use kbf_storage::Storage;
 use kbf_storage::StorageError;
 use kbf_storage::repair::{JournalError, NoLedger, Options, RepairConfig, RepairWorker, Repairs};
 use kbf_storage::replicate::{Chain, ChainConfig, MapSource, Peers};
-use kbf_storage::service::{InProcess, StorageService};
+use kbf_storage::service::{InProcess, OpenWrites, StorageService};
 use kbf_store::StdFs;
 use tonic::transport::ClientTlsConfig;
 
@@ -171,7 +171,12 @@ pub(crate) fn bind_node(
 ) -> Result<Node, Box<dyn Error>> {
     let maps = Arc::new(MapHolder::new());
     let node = Arc::new(NodeMap::new(Arc::clone(&maps)));
-    let service = listener.service(Arc::clone(&storage));
+    // The service moves it, the registration reports it: the writes this node has open,
+    // which a rollout waits to see end before it stops the node.
+    let open_writes = OpenWrites::new();
+    let service = listener
+        .service(Arc::clone(&storage))
+        .with_open_writes(open_writes.clone());
     let (shutdown, stop) = stopping(shutdown);
     let (service, worker, repairs) = if flags.frontend.is_some() {
         let peer_tls = flags.peer_tls()?;
@@ -183,9 +188,16 @@ pub(crate) fn bind_node(
     };
     let (bound, in_process) = bind_service(service, listener.listen, listener.tls, shutdown)?;
     let addr = bound.addr;
-    let joiner = flags
-        .joiner(addr, node)?
-        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
+    // The registration reports what the node counts: its open writes, and its repair journal's
+    // debts when it keeps one (a node that copies nothing keeps none, and says it cannot say).
+    let joiner = flags.joiner(addr, node)?.map(|joiner| {
+        let joiner = joiner.with_open_writes(open_writes);
+        let joiner = match &repairs {
+            Some(repairs) => joiner.with_repairs(Arc::clone(repairs)),
+            None => joiner,
+        };
+        AbortOnDrop(tokio::spawn(joiner.run()))
+    });
     let repair = worker.map(|worker| AbortOnDrop(tokio::spawn(run_repairs(worker, stop))));
     Ok(Node {
         addr,
