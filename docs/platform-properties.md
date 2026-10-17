@@ -391,15 +391,18 @@ without `sandbox-exec` cannot turn the network off and says so in its
 The native driver runs every action on a Mac under `sandbox-exec` with a profile that
 denies every file write outside the action's lease directory and `/dev`. The lease
 directory holds the input root (the working directory and outputs), and the action's
-own home, temporary and cache directories, named by `HOME`, `TMPDIR`,
-`XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the lease
-ends. Three kinds of write in the daemon user's temporary folder
-(`getconf DARWIN_USER_TEMP_DIR`, under `/var/folders`) are allowed too, because macOS
-tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
+own home, temporary and cache directories, named by `HOME`, `CFFIXED_USER_HOME`
+(where Foundation's tools, `swift build` and `xcodebuild` among them, take `~` from),
+`TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the
+lease ends. Four kinds of write in the daemon user's temporary and cache folders
+(`getconf DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR`, under `/var/folders`) are
+allowed too, because macOS tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
 `TemporaryItems`, which `swift build` and `xcodebuild` need; the daemon makes that
 folder, and an action cannot remove, rename or replace it), `xcrun`'s cache
 (`xcrun_db`, behind `cc`, `clang` and `swiftc`), and Swift Build's scratch directory
-(`swbuild.tmp.<random>` and what is in it, which `xcodebuild` needs to build an app).
+(`swbuild.tmp.<random>` and what is in it, which `xcodebuild` needs to build an app),
+and the module cache of the Metal compiler (`C/clang/ModuleCache/`, which `xcrun metal`
+uses whatever `CLANG_MODULE_CACHE_PATH` says; the daemon makes the folder).
 The daemon sweeps the first two's leftovers once their last change is an hour from now,
 before or after, never through a symlink; it leaves `swbuild.tmp.*` alone, since a
 long build's can be older than that. Until each lease runs as its own user, leases on one Mac share those names:
@@ -415,13 +418,16 @@ A tool that writes anywhere else (`/tmp`, a path
 under the daemon user's real home, the rest of `/var/folders`) fails, so a build rule
 points such a tool into the lease: `swiftc -module-cache-path`,
 `xcodebuild -derivedDataPath`. `xcodebuild` and SwiftPM find `~` through the user
-database, not `HOME`: `swift build` only warns and goes on without its user-level
-caches, but `xcodebuild` resolving a Swift package fails, because it must write
-`~/Library/Caches/org.swift.swiftpm` (issue #179); `xcodebuild` on a project without
-packages works. Setting `CFFIXED_USER_HOME` to the lease's `HOME` is no way round it:
-`xcodebuild` then has a system service mount its Metal toolchain under that home,
-and the mount, owned by root, keeps the lease directory from being removed, which
-fails the lease (issue #178). Apple's
+database, not `HOME`, so the lease sets `CFFIXED_USER_HOME` to its home too: their
+caches (`~/Library/Caches/org.swift.swiftpm`, issue #179) are then the lease's own.
+`xcodebuild` then has a system service mount the Metal toolchain below that home
+(`Library/Developer/DVTDownloads/MetalToolchain/mounts`), read-only and root-owned, and
+the daemon unmounts every volume at or below a lease directory before it removes the
+directory, at the lease's end and at the next start (issue #178); a mount it cannot
+unmount fails the lease as any directory it cannot remove does. The Metal compiler's
+module cache is shared by the leases of one daemon user (a `.pcm` file one lease
+leaves is read by the next, until each lease has its own user).
+Apple's
 tools that nest a sandbox of their own need it turned off, since macOS refuses a
 sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
 the outer profile still keeps their writes inside the lease.

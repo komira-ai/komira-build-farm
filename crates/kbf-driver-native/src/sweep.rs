@@ -108,6 +108,8 @@ pub(crate) fn sweep(
     end_recorded(scratch, wait, table, &mut aside)?;
     if let Some(dir) = &aside.dir {
         for name in names.unwrap_or_default() {
+            // A volume a system service mounted below the entry (issue #178) goes first.
+            crate::mounts::unmount_logged(&aside.path.join(&name));
             if let Err(why) = kbf_outputs::remove_tree_at(dir, &name) {
                 tracing::error!(dir = %aside.path.display(), entry = ?name, "a quarantined entry still cannot be removed: {why}");
             }

@@ -8,8 +8,8 @@
 //! - a fresh lease directory under the configured scratch root, the input root written
 //!   into it, the working directory and each output's parent made (REAPI);
 //! - its own home, temporary and cache directories inside the lease directory, named by
-//!   `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` (`home`); so a
-//!   tool's `~` and module caches go with the lease;
+//!   `HOME`, `CFFIXED_USER_HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`
+//!   (`home`); so a tool's `~` and module caches go with the lease;
 //! - its `arguments` run with those variables and the Command's environment (which wins
 //!   where both name a variable) and nothing else, stdin from `/dev/null`, stdout and
 //!   stderr captured to files, as the leader of a new process group;
@@ -131,6 +131,7 @@ mod cas;
 mod config;
 pub mod home;
 mod keeper;
+pub mod mounts;
 pub mod network;
 pub mod procs;
 mod program;

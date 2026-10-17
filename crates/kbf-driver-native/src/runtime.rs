@@ -119,7 +119,7 @@ impl<C: Cas> NativeRuntime<C> {
     /// survived SIGKILL for the kill wait. A leftover directory that cannot be removed
     /// is moved aside instead (see the crate documentation), not an error.
     pub fn new(config: NativeConfig, cas: Arc<C>) -> std::io::Result<Self> {
-        Self::with_remover(config, cas, &kbf_outputs::remove_tree)
+        Self::with_remover(config, cas, &crate::mounts::remove_lease_dir)
     }
 
     /// [`NativeRuntime::new`], sweeping the scratch root with `remove`: a test hands
@@ -1094,7 +1094,7 @@ fn end(simctl: &Simctl, made: Option<Made>, path: &Path) -> Result<(), String> {
 }
 
 fn clean(path: &Path) -> Result<(), String> {
-    kbf_outputs::remove_tree(path).map_err(|e| format!("remove {}: {e}", path.display()))
+    crate::mounts::remove_lease_dir(path).map_err(|e| format!("remove {}: {e}", path.display()))
 }
 
 impl Drop for LeaseDir {

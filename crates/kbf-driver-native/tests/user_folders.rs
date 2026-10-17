@@ -646,3 +646,178 @@ async fn a_temporary_items_of_another_user_is_not_swept() {
     sudo(&["chown", me.trim()]);
     assert!(kept, "swept a TemporaryItems owned by root");
 }
+
+/// The newest Xcode on this runner whose `xcrun --find metal` finds the Metal
+/// compiler (a node without the Metal toolchain installed has none to test).
+fn xcode_with_metal() -> Option<(String, PathBuf)> {
+    xcodes().into_iter().rev().find(|(_, developer_dir)| {
+        std::process::Command::new(xcode::XCRUN)
+            .args(["--find", "metal"])
+            .env("DEVELOPER_DIR", developer_dir)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
+/// A one-kernel Metal source.
+const SHADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\
+kernel void add(device float *a [[buffer(0)]], uint i [[thread_position_in_grid]]) \
+{ a[i] += 1.0; }\n";
+
+/// Catches a sandbox under which the Metal compiler cannot build its `metal_types`
+/// module: its default module cache is `DARWIN_USER_CACHE_DIR/clang/ModuleCache`,
+/// outside the lease (issue #183). No cache flag is passed: the lease's
+/// `CLANG_MODULE_CACHE_PATH` is what must move it.
+#[tokio::test]
+async fn a_metal_shader_compiles_with_no_flags() {
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let Some((build, developer_dir)) = xcode_with_metal() else {
+        eprintln!("no Xcode with a Metal compiler on this runner: nothing to check");
+        return;
+    };
+    let dir = scratch("metal");
+    let mut config: NativeConfig = config(&dir);
+    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    let mut spec = Spec::sh(
+        "xcrun metal -c shader.metal -o \"$TMPDIR/shader.air\" \
+         && xcrun metallib \"$TMPDIR/shader.air\" -o shader.metallib \
+         && head -c 4 shader.metallib",
+    )
+    .env("PATH", PATH)
+    .property("xcode", &build);
+    spec.inputs = vec![("shader.metal".to_owned(), SHADER.as_bytes().to_vec())];
+    let result = run_long(&rt, &cas, 1, &spec).await;
+    assert_eq!(
+        (result.exit_code, stdout(&cas, &result).as_str()),
+        (0, "MTLB"),
+        "{}\n{}",
+        stderr(&cas, &result),
+        sandbox_denials()
+    );
+}
+
+/// A Swift package `hello` that depends on the local package `lib` (so SwiftPM loads
+/// two manifests, and caches them).
+fn package_with_a_local_dependency() -> Vec<(String, Vec<u8>)> {
+    let root = "// swift-tools-version:5.9\n\
+                import PackageDescription\n\
+                let package = Package(name: \"hello\",\n\
+                dependencies: [.package(path: \"lib\")],\n\
+                targets: [.executableTarget(name: \"hello\", dependencies: \
+                [.product(name: \"lib\", package: \"lib\")], path: \"Sources/hello\")])\n";
+    let lib = "// swift-tools-version:5.9\n\
+               import PackageDescription\n\
+               let package = Package(name: \"lib\",\n\
+               products: [.library(name: \"lib\", targets: [\"lib\"])],\n\
+               targets: [.target(name: \"lib\")])\n";
+    vec![
+        ("Package.swift".to_owned(), root.as_bytes().to_vec()),
+        (
+            "Sources/hello/main.swift".to_owned(),
+            b"import lib\nprint(greeting)\n".to_vec(),
+        ),
+        ("lib/Package.swift".to_owned(), lib.as_bytes().to_vec()),
+        (
+            "lib/Sources/lib/lib.swift".to_owned(),
+            b"public let greeting = \"hello\"\n".to_vec(),
+        ),
+    ]
+}
+
+/// Catches a sandbox under which `xcodebuild` cannot build a Swift package with a
+/// dependency (derived data, package cache and cloned sources in the lease): SwiftPM
+/// writes its manifest cache in `~/Library/Caches/org.swift.swiftpm`, which it finds
+/// through the user database, not `HOME` (issue #179).
+#[tokio::test]
+async fn xcodebuild_builds_a_swift_package() {
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let Some((build, developer_dir)) = newest_xcode() else {
+        eprintln!("no Xcode on this runner: nothing to check");
+        return;
+    };
+    let dir = scratch("xcodebuild-package");
+    let mut config: NativeConfig = config(&dir);
+    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    let mut spec = Spec::sh(
+        "xcodebuild -scheme hello -destination 'platform=macOS' \
+         -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$TMPDIR/pc\" \
+         -clonedSourcePackagesDirPath \"$TMPDIR/sp\" build \
+         && \"$TMPDIR/dd/Build/Products/Debug/hello\"",
+    )
+    .env("PATH", PATH)
+    .property("xcode", &build);
+    spec.inputs = package_with_a_local_dependency();
+    let result = run_long(&rt, &cas, 1, &spec).await;
+    let out = stdout(&cas, &result);
+    assert_eq!(
+        (result.exit_code, out.lines().last()),
+        (0, Some("hello")),
+        "{}\n{}\n{}",
+        tail(&out),
+        tail(&stderr(&cas, &result)),
+        sandbox_denials()
+    );
+}
+
+/// Catches a lease that cannot end because of what `xcodebuild` had a system service
+/// mount in its home (issue #178). Run with `CFFIXED_USER_HOME` the lease's home, as
+/// Foundation's tools need it to keep their caches in the lease (issue #179),
+/// `xcodebuild` has the Metal toolchain mounted below `<home>/Library/Developer`,
+/// read-only and root-owned; removing the lease directory then failed with `EROFS`, the
+/// directory was quarantined and the image stayed mounted. The test fails if the
+/// toolchain is not mounted during the action (it would check nothing), the run fails,
+/// a lease directory stays, or a volume stays mounted below the scratch root.
+#[tokio::test]
+async fn a_toolchain_mounted_in_the_leases_home_does_not_keep_the_lease() {
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let Some((build, developer_dir)) = newest_xcode() else {
+        eprintln!("no Xcode on this runner: nothing to check");
+        return;
+    };
+    let dir = scratch("toolchain-mount");
+    let mut config: NativeConfig = config(&dir);
+    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
+    let scratch_root = config.clone();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    let mut spec = Spec::sh(&format!(
+        "{LAYOUT}export CFFIXED_USER_HOME=\"$HOME\"; \
+         xcodebuild -showComponent MetalToolchain > /dev/null 2>&1; \
+         xcodebuild -scheme hello -destination 'platform=macOS' \
+         -derivedDataPath \"$TMPDIR/dd\" build > /dev/null 2>&1; \
+         /sbin/mount | grep -c 'MetalToolchain/mounts'"
+    ))
+    .env("PATH", PATH)
+    .property("xcode", &build);
+    spec.inputs = package();
+    let action = spec.timeout(Duration::from_secs(600)).store(&cas);
+    let ran = tokio::time::timeout(Duration::from_secs(630), rt.run(work(1, action, 0)))
+        .await
+        .expect("the run ends");
+    let mounts = std::process::Command::new("/sbin/mount")
+        .output()
+        .expect("mount");
+    let left: Vec<String> = String::from_utf8_lossy(&mounts.stdout)
+        .lines()
+        .filter(|line| line.contains(&dir.display().to_string()))
+        .map(str::to_owned)
+        .collect();
+    let result = ran.unwrap_or_else(|e| panic!("the lease failed: {e}\nmounted: {left:#?}"));
+    let out = stdout(&cas, &result);
+    assert!(
+        out.trim().parse::<u32>().is_ok_and(|n| n > 0),
+        "the toolchain was not mounted during the action, so this checks nothing: {out}\n{}",
+        stderr(&cas, &result)
+    );
+    assert!(left.is_empty(), "mounted after the lease: {left:#?}");
+    assert!(
+        support::no_leases(&scratch_root),
+        "a lease directory stays: {:?}",
+        std::fs::read_dir(&scratch_root.scratch)
+            .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+    );
+}

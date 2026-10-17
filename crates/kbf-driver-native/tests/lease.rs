@@ -68,6 +68,7 @@ async fn the_environment_is_the_commands_and_the_leases_own() {
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     let lease = config.scratch.join("lease-1-1");
     let mut want: Vec<String> = [
+        ("CFFIXED_USER_HOME", "home"),
         ("CLANG_MODULE_CACHE_PATH", "cache/clang/ModuleCache"),
         ("HOME", "home"),
         ("TMPDIR", "tmp"),
@@ -92,11 +93,12 @@ async fn each_lease_has_its_own_home_tmp_and_cache() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    // The action prints the four variables, which must name its lease's own
+    // The action prints the five variables, which must name its lease's own
     // directories, then makes `left` in each with `symlink`, which fails (exit 1,
     // naming it) where `left` is there already or the directory is missing.
     let vars = [
         "HOME",
+        "CFFIXED_USER_HOME",
         "TMPDIR",
         "XDG_CACHE_HOME",
         "CLANG_MODULE_CACHE_PATH",
@@ -107,6 +109,8 @@ async fn each_lease_has_its_own_home_tmp_and_cache() {
             .iter()
             .map(|sub| lease.join(sub).display().to_string())
             .collect();
+        // The directory each variable names, in the order of `vars`.
+        let named: Vec<String> = [0, 0, 1, 2, 3].iter().map(|&i| dirs[i].clone()).collect();
         let steps: Vec<String> = vars
             .iter()
             .map(|var| format!("env {var}"))
@@ -116,7 +120,7 @@ async fn each_lease_has_its_own_home_tmp_and_cache() {
         let result = run(&rt, &cas, seq, &spec).await.expect("ran");
         assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
         let printed: Vec<String> = stdout(&cas, &result).lines().map(str::to_owned).collect();
-        assert_eq!(printed, dirs, "lease {seq}");
+        assert_eq!(printed, named, "lease {seq}");
     }
     assert!(no_leases(&config), "the lease directories are removed");
 

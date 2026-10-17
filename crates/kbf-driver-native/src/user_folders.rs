@@ -17,14 +17,20 @@
 //!   cannot: on the macOS runner (Xcode 16.4) both XCUITest fixtures of
 //!   `docs/spikes/macos-p0.md` failed to build under the profile without it (the
 //!   one-file C tool `tests/user_folders.rs` builds did not). The name is Swift
-//!   Build's own random one, so it cannot be one per lease.
+//!   Build's own random one, so it cannot be one per lease;
+//! - the Metal compiler (`xcrun metal`) keeps its module cache in
+//!   `C/clang/ModuleCache/<hash>` and ignores `CLANG_MODULE_CACHE_PATH`, which moves
+//!   clang's own (issue #183; on the macOS runner, Xcode 26.6, `metal -c` failed with
+//!   "unable to open output file .../metal_types-<hash>.pcm" until the rule below).
+//!   A lease cannot point it elsewhere without a flag on its command line.
 //!
 //! The sandbox profile ([`UserFolders::rules`]) lets an action write below
 //! `T/TemporaryItems` (not the folder itself: an action that could replace it with a
 //! symlink would aim the daemon's sweep anywhere), to those `xcrun` names, and to an
 //! entry named `swbuild.tmp.` and at least one more character, and what is below it
-//! (one regular expression without an end anchor), and nothing else in the two
-//! folders, the folders themselves included. The daemon finds
+//! (one regular expression without an end anchor), and below `C/clang/ModuleCache/`
+//! (not the folder itself, which the sweep makes, mode 0700, when it is missing), and
+//! nothing else in the two folders, the folders themselves included. The daemon finds
 //! the folders once, at start ([`UserFolders::detect`]), with every link resolved: the
 //! sandbox compares the real paths of the files written. The sweep makes
 //! `TemporaryItems` (mode 0700) when it is missing, since an action cannot.
@@ -33,7 +39,9 @@
 //! each lease its own `/var/folders` entry): leases of the daemon's user share these
 //! names, so a lease can see, change or remove the temporary files another lease has
 //! open there, and can rewrite `xcrun_db`, which the next lease's compiler shims read
-//! to find their tools. The daemon runs no developer tool outside the sandbox while it
+//! to find their tools, or leave a `.pcm` in `ModuleCache` that the next Metal compile
+//! reads (clang checks a module file against its sources and flags, not against who
+//! wrote it). The daemon runs no developer tool outside the sandbox while it
 //! serves, so what a lease wrote there reaches only sandboxed tools: every survey of
 //! the Xcodes, the first and those it repeats while the node serves
 //! ([`crate::xcode_watch`]), asks each question under the actions' sandbox, where
@@ -81,6 +89,11 @@ const TEMPORARY_ITEMS: &str = "TemporaryItems";
 
 /// `xcrun`'s cache in the temporary folder; it writes `<XCRUN_DB>-<random>` first.
 const XCRUN_DB: &str = "xcrun_db";
+
+/// Where in the cache folder clang (and the Metal compiler, which ignores
+/// `CLANG_MODULE_CACHE_PATH`) keep their module caches: a directory per compiler
+/// configuration, holding the `.pcm` files.
+const MODULE_CACHE: [&str; 2] = ["clang", "ModuleCache"];
 
 /// What Swift Build's scratch directory in the temporary folder is named: this, then
 /// `mkdtemp`'s random characters.
@@ -164,9 +177,11 @@ impl UserFolders {
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
+        let cache = regex_quote(&self.cache.to_string_lossy());
         let swbuild = regex_quote(SWBUILD_TMP);
+        let modules = MODULE_CACHE.join("/");
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\")\n  (regex #\"^{cache}/{modules}/\"))\n",
         )
     }
 
@@ -197,6 +212,31 @@ impl UserFolders {
             }
         }
         sweep_in(&temp, format!("{XCRUN_DB}-").as_bytes(), age, now, remove);
+        self.make_module_cache(uid);
+    }
+
+    /// Makes the module cache folder (`clang/ModuleCache` in the cache folder, mode
+    /// 0700) if it is missing, one directory at a time through descriptors: an action
+    /// cannot make the folders above it, and the rule opens only what is below.
+    fn make_module_cache(&self, uid: u32) {
+        let mut dir = match open_own(CWD, &self.cache, uid) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(cache = %self.cache.display(), "module cache not made: {e}");
+                return;
+            }
+        };
+        for name in MODULE_CACHE {
+            // An error shows when the folder is opened next.
+            let _ = rustix::fs::mkdirat(&dir, name, Mode::RWXU);
+            match open_own(dir.as_fd(), Path::new(name), uid) {
+                Ok(next) => dir = next,
+                Err(e) => {
+                    tracing::warn!(cache = %self.cache.display(), "{name} not made: {e}");
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -399,7 +439,8 @@ mod tests {
             "(allow file-write*\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryItems/\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/xcrun_db(-[^/]*)?$\")\n  \
-             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/swbuild\\.tmp\\.[^/]+\"))\n"
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/swbuild\\.tmp\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/clang/ModuleCache/\"))\n"
         );
         assert_eq!(
             regex_quote("a.^$*+?()[]{}|b/-"),
@@ -565,6 +606,45 @@ mod tests {
             std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
             0o700
         );
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches a sweep that does not make `clang/ModuleCache` in the cache folder (the
+    /// Metal compiler cannot make it under the sandbox, and fails at its first
+    /// module), makes it in a folder another user owns, makes it with a mode others
+    /// may use, empties it on a later sweep, or replaces a file that is in the way.
+    #[test]
+    fn the_sweep_makes_the_module_cache_for_the_daemon_user_alone() {
+        let dir = scratch("modules");
+        let f = folders(&dir);
+        let modules = f.cache().join("clang/ModuleCache");
+        assert!(!modules.exists());
+        let me = rustix::process::geteuid().as_raw();
+        let now = SystemTime::now();
+        f.sweep_as(me + 1, Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        assert!(!f.cache().join("clang").exists(), "made in another user's");
+        f.sweep(Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        for folder in [f.cache().join("clang"), modules.clone()] {
+            let mode = std::fs::symlink_metadata(&folder)
+                .expect("made")
+                .permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+                0o700,
+                "{}",
+                folder.display()
+            );
+        }
+        std::fs::write(modules.join("keep"), b"x").expect("write");
+        f.sweep(Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        assert!(modules.join("keep").exists());
+        kbf_outputs::remove_tree(&dir).expect("clean");
+
+        let dir = scratch("modules-file");
+        let f = folders(&dir);
+        std::fs::write(f.cache().join("clang"), b"not a folder").expect("file");
+        f.sweep(Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        assert!(f.cache().join("clang").is_file());
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
