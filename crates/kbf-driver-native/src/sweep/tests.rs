@@ -382,7 +382,8 @@ fn what_is_not_a_record_is_set_aside_and_the_start_goes_on() {
 /// Catches an entry owned by another user taken for the daemon's.
 #[test]
 fn only_the_daemons_own_entries_are_read() {
-    let why = ours(Path::new("/"), std::fs::FileType::is_dir).expect_err("root's");
+    let root = std::fs::symlink_metadata("/").expect("root");
+    let why = owned(&root, std::fs::FileType::is_dir).expect_err("root's");
     assert!(why.to_string().contains("owned by uid 0"), "{why}");
 }
 
@@ -536,6 +537,67 @@ fn what_is_moved_aside_after_the_kill_goes_into_what_was_checked() {
     assert_eq!(kept.len(), 5, "{kept:?}");
     assert!(kept[0].starts_with("lease-stuck."), "{kept:?}");
     assert!(!dir.join("lease-stuck").exists(), "moved out of the way");
+}
+
+/// Catches (issue #193) a `runs` swapped for a symlink after it was checked and
+/// listed: what the sweep reads, removes and moves aside of it afterwards was found by
+/// path ("runs by path" mutant), so it would remove the records of the directory the
+/// link names and move its entries into the quarantine, where the next start removes
+/// them. The swap is done from the process table read of the first live record, as the
+/// action the record names would; the directory the link names holds an entry of every
+/// name `runs/` held, and all of them must stay while what `runs/` held (moved away,
+/// which the descriptor follows) is emptied.
+#[test]
+fn a_runs_swapped_for_a_link_during_the_sweep_is_not_followed() {
+    let dir = scratch("runsswap");
+    let (runs, moved, decoy) = (dir.join(RUNS), dir.join("moved"), dir.join("decoy"));
+    std::fs::create_dir(&decoy).expect("mkdir");
+    chmod(&decoy, 0o700);
+    let boot = crate::record::boot_id().expect("boot");
+    // Two live-looking records (the first one read swaps `runs`, and at least one
+    // entry follows it), a torn record, and a directory that is no record.
+    let live = |pgid: u32| format!("{pgid} 5 {boot}\n");
+    write_record(&dir, "lease-9-v1", &live(2_000_000_063));
+    write_record(&dir, "lease-9-v2", &live(2_000_000_064));
+    write_record(&dir, "lease-9-t", "torn");
+    std::fs::create_dir(runs.join("lease-9-d")).expect("mkdir");
+    for name in ["lease-9-v1", "lease-9-v2", "lease-9-t"] {
+        std::fs::write(decoy.join(name), live(2_000_000_065)).expect("write");
+        chmod(&decoy.join(name), 0o600);
+    }
+    std::fs::create_dir(decoy.join("lease-9-d")).expect("mkdir");
+    let swapped = std::cell::Cell::new(false);
+    let swap = || {
+        if !swapped.replace(true) {
+            std::fs::rename(&runs, &moved).expect("rename");
+            std::os::unix::fs::symlink(&decoy, &runs).expect("symlink");
+        }
+        Ok(Vec::new())
+    };
+    let table = Table {
+        snapshot: &swap,
+        ours: &|_| true,
+        guards: &Guards::now,
+    };
+    sweep(&dir, &kbf_outputs::remove_tree, WAIT, &table).expect("sweep");
+    assert!(swapped.get(), "a live record read the table");
+    let names = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        names(&decoy),
+        ["lease-9-d", "lease-9-t", "lease-9-v1", "lease-9-v2"],
+        "the directory the link names was touched"
+    );
+    assert!(names(&moved).is_empty(), "{:?}", names(&moved));
+    let aside = quarantined(&dir);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(aside[0].starts_with("runs.lease-9-d."), "{aside:?}");
 }
 
 /// Catches a quarantine the sweep makes after the kill followed when it is a link:

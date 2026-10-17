@@ -20,7 +20,9 @@
 //! The records are trusted to be the daemon's: an entry of `runs/` that is not a
 //! regular file of the daemon's user that only that user may write (a FIFO, a
 //! directory, a symlink, a group- or other-writable file), and a `runs` that is not
-//! such a directory, is moved aside into [`QUARANTINE`] unread; a record is read
+//! such a directory, is moved aside into [`QUARANTINE`] unread (`runs/` is opened once
+//! without following a link, and its records are listed, read, removed and moved through
+//! that descriptor, so a swap of `runs` for a link during the sweep is never followed); a record is read
 //! without blocking and at most [`MAX_RECORD_BYTES`] of it, and none of this stops the
 //! start. Only the daemon writes `runs/` on macOS (the sandbox keeps actions out of
 //! it); on Linux an action of the same user can write a well-formed record there,
@@ -44,7 +46,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -189,25 +191,29 @@ fn end_recorded(
     aside: &mut Aside,
 ) -> io::Result<()> {
     let runs = scratch.join(RUNS);
-    let entries =
-        match ours(&runs, std::fs::FileType::is_dir).and_then(|()| std::fs::read_dir(&runs)) {
-            Ok(entries) => entries,
-            // Absent until a runtime first starts on this scratch root.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(why) => {
-                set_aside(&runs, aside, &why);
-                return Ok(());
-            }
-        };
+    // `runs/` is opened once, without following a link, and checked as the daemon's;
+    // everything below reads, removes and moves by name relative to that descriptor,
+    // so a `runs` an action swaps for a symlink after the check is never followed:
+    // the records that were listed are the ones read, removed and moved.
+    let (held, names) = match hold_runs(&runs) {
+        Ok(held) => held,
+        // Absent until a runtime first starts on this scratch root.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(why) => {
+            set_aside(&runs, aside, &why);
+            return Ok(());
+        }
+    };
     let boot = crate::record::boot_id()?;
     let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let guards = (table.guards)();
     let mut survivors = Vec::new();
-    for path in entries.flatten().map(|e| e.path()) {
-        let record = match read_record(&path) {
+    for name in &names {
+        let path = runs.join(name);
+        let record = match read_record(&held, name) {
             Ok(record) => record,
             Err(why) => {
-                set_aside(&path, aside, &why);
+                set_aside_from(&held, name, &path, aside, &why);
                 continue;
             }
         };
@@ -234,7 +240,7 @@ fn end_recorded(
             }
             None => tracing::warn!(record = %path.display(), "removing a torn run record"),
         }
-        if let Err(why) = std::fs::remove_file(&path) {
+        if let Err(why) = rustix::fs::unlinkat(&held, name, rustix::fs::AtFlags::empty()) {
             tracing::error!(record = %path.display(), "a run record cannot be removed: {why}");
         }
     }
@@ -248,10 +254,24 @@ fn end_recorded(
     }
 }
 
-/// Fails unless `path` (not followed) is of the kind `kind` accepts and owned by this
-/// process's user.
-fn ours(path: &Path, kind: fn(&std::fs::FileType) -> bool) -> io::Result<()> {
-    owned(&std::fs::symlink_metadata(path)?, kind)
+/// `runs/` at `runs`, opened without following a link and checked as the daemon's
+/// directory ([`owned`]) once, and the names in it now, in name order, listed through
+/// that descriptor.
+fn hold_runs(runs: &Path) -> io::Result<(OwnedFd, Vec<OsString>)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(runs)?;
+    owned(&dir.metadata()?, std::fs::FileType::is_dir)?;
+    let dir = OwnedFd::from(dir);
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(&dir)? {
+        names.push(OsStr::from_bytes(entry?.file_name().to_bytes()).to_owned());
+    }
+    names.retain(|name| ![".", ".."].contains(&name.to_str().unwrap_or_default()));
+    names.sort();
+    Ok((dir, names))
 }
 
 /// Fails unless `meta` is of the kind `kind` accepts and owned by this process's user.
@@ -281,30 +301,51 @@ fn owned(meta: &std::fs::Metadata, kind: fn(&std::fs::FileType) -> bool) -> io::
     Ok(())
 }
 
-/// Reads the run record at `path`: a regular file of this process's user, opened
-/// without following a link and without blocking, at most [`MAX_RECORD_BYTES`] of it.
-/// `None` for a file that holds no whole record.
-fn read_record(path: &Path) -> io::Result<Option<Record>> {
+/// Reads the run record `name` of `runs`: a regular file of this process's user,
+/// opened relative to `runs` without following a link and without blocking, at most
+/// [`MAX_RECORD_BYTES`] of it. `None` for a file that holds no whole record.
+fn read_record(runs: &OwnedFd, name: &OsStr) -> io::Result<Option<Record>> {
+    use rustix::fs::{Mode, OFlags};
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    ours(path, std::fs::FileType::is_file)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    // What was opened, not what was looked at a moment before.
+    let fd = rustix::fs::openat(
+        runs,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let file = std::fs::File::from(fd);
+    // What was opened, not what is listed.
     owned(&file.metadata()?, std::fs::FileType::is_file)?;
     let mut bytes = Vec::new();
     file.take(MAX_RECORD_BYTES).read_to_end(&mut bytes)?;
     Ok(std::str::from_utf8(&bytes).ok().and_then(Record::parse))
 }
 
-/// Moves `path`, which is not a run record the daemon wrote (`why`), into the
+/// Moves `runs` itself, which is not a directory the daemon made (`why`), into the
 /// quarantine through `aside`, logged; one that cannot be moved stays, also logged.
-fn set_aside(path: &Path, aside: &mut Aside, why: &io::Error) {
-    let mut name = std::ffi::OsString::from("runs.");
-    name.push(path.file_name().unwrap_or_default());
-    match aside.take(path, &name) {
+fn set_aside(runs: &Path, aside: &mut Aside, why: &io::Error) {
+    let moved = aside_name(runs.file_name().unwrap_or_default());
+    let result = aside.take(runs, &moved);
+    log_aside(runs, result, why);
+}
+
+/// Moves the entry `name` of `runs/`, which is not a run record the daemon wrote
+/// (`why`), into the quarantine through `aside`, out of the directory `held` that was
+/// checked; `path` names it for the log.
+fn set_aside_from(held: &OwnedFd, name: &OsStr, path: &Path, aside: &mut Aside, why: &io::Error) {
+    let result = aside.take_from(held, name, &aside_name(name));
+    log_aside(path, result, why);
+}
+
+/// The name an entry of `runs/` gets in the quarantine, before the suffix.
+fn aside_name(name: &OsStr) -> OsString {
+    let mut moved = OsString::from("runs.");
+    moved.push(name);
+    moved
+}
+
+fn log_aside(path: &Path, result: io::Result<PathBuf>, why: &io::Error) {
+    match result {
         Ok(to) => {
             tracing::error!(entry = %path.display(), to = %to.display(), "not a run record the daemon wrote ({why}); moved aside")
         }
@@ -377,13 +418,24 @@ impl Aside {
     /// Moves `path` into the quarantine under its `name` and a suffix no earlier start
     /// used; returns where, as a path for the log.
     fn take(&mut self, path: &Path, name: &OsStr) -> io::Result<PathBuf> {
+        self.take_from(rustix::fs::CWD, path, name)
+    }
+
+    /// [`Aside::take`] for `source`, a path relative to the directory `from` (a
+    /// descriptor already checked, or the working directory for a path).
+    fn take_from(
+        &mut self,
+        from: impl AsFd,
+        source: impl rustix::path::Arg,
+        name: &OsStr,
+    ) -> io::Result<PathBuf> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let mut aside = name.to_owned();
         aside.push(format!(".{nanos}"));
-        rustix::fs::renameat(rustix::fs::CWD, path, self.dir()?, &aside)?;
+        rustix::fs::renameat(from, source, self.dir()?, &aside)?;
         Ok(self.path.join(aside))
     }
 }
