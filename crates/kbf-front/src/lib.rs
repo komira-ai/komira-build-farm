@@ -67,6 +67,7 @@ mod meta_log;
 pub mod metrics;
 mod proxy;
 mod recorder;
+mod relay;
 mod request_metadata;
 mod routed;
 mod segments;
@@ -113,6 +114,7 @@ pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,
 };
+pub use crate::relay::{Handed, Relay};
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,

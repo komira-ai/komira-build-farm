@@ -1,11 +1,12 @@
 //! A farm taken out of service for a successor: what it stops doing, how it answers the
 //! callers it kept, and the operator's cordon across the change.
 
-use kbf_front::Backend;
+use kbf_front::{Backend, Handed};
 use kbf_server::farm::LOST_LOOKS;
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::PlacementView;
 use kbf_state::{Cond, Txn};
+use kbf_types::OperationId;
 
 use super::*;
 
@@ -229,6 +230,112 @@ async fn a_farm_with_no_state_store_follows_no_one() {
     );
     farm.fence();
     assert_eq!(farm.follow().expect("follow"), 0);
+}
+
+/// Catches: the relay asking a farm that has not handed over, or one that has, the wrong
+/// thing: `handed` is the fence, and nothing else.
+#[tokio::test]
+async fn a_farm_has_handed_over_when_it_is_fenced() {
+    let disk = Disk::new();
+    let (farm, _) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    assert!(!farm.handed());
+    farm.fence();
+    assert!(farm.handed());
+}
+
+/// Catches: an operation the relay cannot find, or finds wrongly, by its action: it is the
+/// unfinished row naming the action and instance (the instance may be left out for a call
+/// that has none, then it must be the only one; two instances running one action are
+/// ambiguous and neither is guessed), and a farm with no state store finds none. Mutants:
+/// the instance ignored; a finished operation (no `op/` row) still found.
+#[tokio::test(start_paused = true)]
+async fn an_operation_is_found_by_its_action_among_the_unfinished_rows() {
+    let disk = Disk::new();
+    let (old, _) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    let (new, _) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    let ticket = queue(&new, unplaceable(2));
+    let other = |instance: &str| Request {
+        key: ActionKey {
+            instance: instance.to_owned(),
+            ..unplaceable(2).key
+        },
+        ..unplaceable(2)
+    };
+    let action = unplaceable(2).key.action;
+    let found = old.operation_of(Some("main"), &action).expect("rows");
+    assert!(found.is_some(), "the unfinished operation is found");
+    assert_eq!(old.operation_of(Some("other"), &action), Ok(None));
+    assert_eq!(old.operation_of(None, &action), Ok(found));
+    assert_eq!(
+        old.operation_of(Some("main"), &request(9).key.action),
+        Ok(None)
+    );
+    queue(&new, other("other"));
+    assert_eq!(old.operation_of(None, &action), Ok(None), "ambiguous");
+    assert_eq!(old.operation_of(Some("main"), &action), Ok(found));
+    drop(ticket);
+
+    let bare = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    assert_eq!(bare.operation_of(Some("main"), &action), Ok(None));
+    assert_eq!(bare.look(OperationId(0)), Ok(None));
+}
+
+/// Catches: the fallback of a relayed call answering wrongly from the rows of an operation
+/// this farm's scheduler never held: a queued one shows nothing, a leased one is shown
+/// executing, a finished one is answered from its `done/` row, and one with no trace is
+/// answered UNAVAILABLE at the third look in a row and counted in
+/// `kbf_frontend_relay_lost_total`, as the follower does for the callers it kept. Mutants:
+/// the lost rule not applied to a relayed operation; the lost count not added.
+#[tokio::test(start_paused = true)]
+async fn a_relayed_operation_is_followed_from_the_rows_as_a_kept_caller_is() {
+    let disk = Disk::new();
+    let (old, backend) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    old.fence();
+    let (new, _) = farm_over_disk(&disk, kbf_sched::UNSERVABLE_WAIT);
+    let (stream, mut inbox) = register(&new);
+    queue(&new, request(1));
+    queue(&new, unplaceable(2));
+    let [lease] = starts(&mut inbox)[..] else {
+        panic!("one lease expected");
+    };
+    let find = |request: &Request| {
+        old.operation_of(Some("main"), &request.key.action)
+            .expect("rows")
+            .expect("unfinished")
+    };
+    let (ran, waits) = (find(&request(1)), find(&unplaceable(2)));
+    assert_eq!(old.look(waits), Ok(None));
+    assert_eq!(old.look(ran), Ok(Some(Stage::Executing)));
+
+    assert!(new.heartbeat(&node(), stream, 1, vec![lease]).await);
+    assert!(accepted(&new, lease).await);
+    let Ok(Some(Stage::Done(finished))) = old.look(ran) else {
+        panic!("answered from the done row");
+    };
+    assert_eq!(
+        status(&finished),
+        (Code::InvalidArgument as i32, "test".to_owned())
+    );
+
+    let txn = Txn::new()
+        .delete(format!("op/{:016x}", waits.0), Cond::Any)
+        .delete(format!("queue/{:016x}", waits.0), Cond::Any);
+    disk.store.txn(txn).expect("store").expect("erased");
+    for _ in 0..2 {
+        assert_eq!(old.look(waits), Ok(None));
+    }
+    assert_eq!(backend.metrics().frontend_relay_lost.get(), 0);
+    let Ok(Some(Stage::Done(lost))) = old.look(waits) else {
+        panic!("answered lost");
+    };
+    let (code, why) = status(&lost);
+    assert_eq!(code, Code::Unavailable as i32);
+    assert!(why.contains("lost in a frontend handover"), "{why}");
+    assert_eq!(backend.metrics().frontend_relay_lost.get(), 1);
 }
 
 /// What the operator did to `node-a`, as the farm shows it.

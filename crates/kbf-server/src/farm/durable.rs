@@ -48,8 +48,8 @@ use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Fate, Recovered, RecoveredLease, Request, Requeue};
 use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Versioned};
 use kbf_types::{
-    ControlRecord, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease, WaiterId,
-    WorkerId,
+    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, StartLease,
+    WaiterId, WorkerId,
 };
 
 use tokio::sync::watch;
@@ -417,6 +417,26 @@ impl Durable {
             None => Txn::new().delete(key, Cond::Any),
         };
         self.commit(txn)
+    }
+
+    /// The unfinished operations that run `action` (of `instance`, if given): at most one
+    /// per instance, since a twin joins the operation that is running.
+    pub(super) fn operations_of(
+        &self,
+        instance: Option<&str>,
+        action: &Digest,
+    ) -> Result<Vec<OperationId>, StateError> {
+        let mut found = Vec::new();
+        for (key, row) in self.store.scan_prefix("op/")? {
+            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
+                return Err(corrupt(&key, "not a request"));
+            };
+            let named = instance.is_none_or(|instance| request.key.instance == instance);
+            if named && request.key.action == *action {
+                found.push(parse_operation(&key, "op/")?);
+            }
+        }
+        Ok(found)
     }
 
     /// Where `operation` stands.

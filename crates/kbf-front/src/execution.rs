@@ -267,7 +267,7 @@ pub struct Closing(watch::Receiver<Phase>);
 
 impl Closing {
     /// Completes once the closer has closed; never, if it is dropped first.
-    async fn closed(&mut self) {
+    pub(crate) async fn closed(&mut self) {
         let dropped = self
             .0
             .wait_for(|phase| *phase == Phase::Closed)
@@ -329,7 +329,7 @@ impl Progress {
     }
 
     /// Completes at the next tick; never, if there is no ticker (or it is dropped).
-    async fn tick(&mut self) {
+    pub(crate) async fn tick(&mut self) {
         if self.0.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
@@ -897,7 +897,7 @@ fn any(type_name: &str, value: Vec<u8>) -> Any {
 }
 
 /// The operation `name` at `stage`.
-fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operation {
+pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operation {
     let mut partial = None;
     let (value, result) = match stage {
         Stage::Queued => (execution_stage::Value::Queued, None),

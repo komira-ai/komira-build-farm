@@ -7,9 +7,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use kbf_front::Stage;
+use kbf_front::{Handed, Stage};
 use kbf_sched::{Event, Input};
-use kbf_types::{Answer, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
+use kbf_types::{Answer, Digest, FarmTime, OperationId, StateMachine as _, WaiterId, WorkerId};
 use tokio::sync::watch;
 use tonic::{Code, Status};
 
@@ -155,10 +155,7 @@ impl State {
         }
         let (mut waiting, mut lost) = (0, 0);
         for (operation, callers, progress) in looked {
-            let looks = self.looks.entry(operation).or_default();
-            *looks = looks.saturating_add(1) * u8::from(progress.is_gone());
-            let gone_for_good = *looks >= LOST_LOOKS;
-            let stage = progress.stage(gone_for_good);
+            let (stage, gone_for_good) = self.looked_at(operation, progress);
             let ended = matches!(stage, Some(Stage::Done(_)));
             waiting += callers.len() * usize::from(!ended);
             lost += callers.len() * usize::from(ended) * usize::from(gone_for_good);
@@ -172,6 +169,16 @@ impl State {
             tracing::warn!(lost, "operations the successor lost: answered UNAVAILABLE");
         }
         Ok((waiting, lost))
+    }
+
+    /// One look at `operation`: what its callers are shown now (`None` leaves them as they
+    /// are), and whether the store has had no trace of it for [`LOST_LOOKS`] looks in a
+    /// row. The count is the operation's: a look that finds it starts it over.
+    fn looked_at(&mut self, operation: OperationId, progress: Progress) -> (Option<Stage>, bool) {
+        let looks = self.looks.entry(operation).or_default();
+        *looks = looks.saturating_add(1) * u8::from(progress.is_gone());
+        let gone_for_good = *looks >= LOST_LOOKS;
+        (progress.stage(gone_for_good), gone_for_good)
     }
 
     /// Takes up the cordons of the nodes an operator placed before this process started,
@@ -216,4 +223,50 @@ fn show(channel: &watch::Sender<Stage>, stage: Stage) {
         }
         changed
     });
+}
+
+impl Handed for Farm {
+    fn handed(&self) -> bool {
+        self.lock().fenced
+    }
+
+    /// Reads the unfinished rows of the state store (one scan per relayed call, made while
+    /// the successor's first operation arrives); a farm with no store finds none.
+    fn operation_of(
+        &self,
+        instance: Option<&str>,
+        action: &Digest,
+    ) -> Result<Option<OperationId>, String> {
+        let state = self.lock();
+        let Some(durable) = &state.durable else {
+            return Ok(None);
+        };
+        let found = durable
+            .operations_of(instance, action)
+            .map_err(|error| error.to_string())?;
+        Ok(match found[..] {
+            [only] => Some(only),
+            _ => None,
+        })
+    }
+
+    /// The follower ([`Farm::follow`]) for one operation this farm's scheduler never
+    /// held: the same looks, the same three-look rule for an operation the store has no
+    /// trace of, counted in `kbf_frontend_relay_lost_total` when it is answered lost.
+    fn look(&self, operation: OperationId) -> Result<Option<Stage>, String> {
+        let mut state = self.lock();
+        let Some(durable) = &state.durable else {
+            return Ok(None);
+        };
+        let progress = durable
+            .progress(operation)
+            .map_err(|error| error.to_string())?;
+        let (stage, lost) = state.looked_at(operation, progress);
+        drop(state);
+        self.cache
+            .metrics()
+            .frontend_relay_lost
+            .add(u64::from(lost));
+        Ok(stage)
+    }
 }

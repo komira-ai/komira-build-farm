@@ -430,6 +430,12 @@ pub struct CacheMetrics {
     /// because the state store held no trace of their operation
     /// (`kbf_frontend_relay_lost_total`).
     pub frontend_relay_lost: Counter,
+    /// Execute and WaitExecution calls a frontend that handed its roles over forwarded to
+    /// its successor (`kbf_handover_relayed_total`).
+    pub handover_relayed: Counter,
+    /// Relayed calls open now: each keeps the frontend alive until its action ends
+    /// (`kbf_handover_relays_open`).
+    pub handover_relays_open: Gauge,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
@@ -478,6 +484,8 @@ impl Default for CacheMetrics {
             sched_queued: Level::default(),
             sched_leases: Level::default(),
             frontend_relay_lost: Counter::default(),
+            handover_relayed: Counter::default(),
+            handover_relays_open: Gauge::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
@@ -659,6 +667,17 @@ impl CacheMetrics {
             "Callers of a frontend that handed its work over, told UNAVAILABLE because the \
              state store held no trace of their operation",
             self.frontend_relay_lost.get(),
+        );
+        out.counter(
+            "kbf_handover_relayed_total",
+            "Execute and WaitExecution calls forwarded to the successor of a frontend that \
+             handed its roles over",
+            self.handover_relayed.get(),
+        );
+        out.gauge(
+            "kbf_handover_relays_open",
+            "Relayed Execute and WaitExecution calls open now",
+            self.handover_relays_open.get(),
         );
         out.gauge(
             "kbf_tier_in_flight",

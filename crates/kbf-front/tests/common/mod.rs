@@ -212,6 +212,11 @@ impl Farm {
         Self { cache, channel }
     }
 
+    /// A channel to this farm's listener.
+    pub fn channel(&self) -> Channel {
+        self.channel.clone()
+    }
+
     pub fn caps(&self) -> CapabilitiesClient<Channel> {
         CapabilitiesClient::new(self.channel.clone())
     }
