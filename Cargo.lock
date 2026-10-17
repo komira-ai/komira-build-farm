@@ -1905,6 +1905,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "kbf-map",
+ "kbf-types",
  "prost",
  "prost-types",
  "protox",

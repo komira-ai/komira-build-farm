@@ -1,0 +1,143 @@
+// kbf.enroll.v1: how a node joins the farm and keeps its certificate
+// (docs/design/install-and-enrollment.md, sections 4.3, 5.3 and 5.8).
+//
+// `Enroll` is served by a frontend on a listener of its own that authenticates the server
+// only: the caller proves itself with a token secret (`Enroll`) or with the key the
+// registry holds for it (`Renew`), never with a client certificate. `ColdStore` is served
+// on the worker listener, behind its role table (storage only).
+//
+// A request the frontend refuses answers with a gRPC status whose code and message come
+// from the closed set of refusal reasons in `kbf_types::RefusalReason` (code per reason,
+// message exactly its `message()`); nothing here repeats that set.
+//
+// Times are unix seconds. A certificate is DER; a CSR is PKCS#10 DER of at most 2 KiB and
+// carries only a public key and its proof of possession (the frontend reads nothing else
+// from it, section 5.5).
+//
+// Extending: add fields and enum values, never reuse a number. `CredentialMode` is closed:
+// its zero value is UNSPECIFIED and a reader refuses it and any value it does not know.
+syntax = "proto3";
+
+package kbf.enroll.v1;
+
+service Enroll {
+  // Spend a token to register a node and get its certificates. Idempotent for the same
+  // request: a retry after a lost answer returns the stored certificates and spends no
+  // second use.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  // Get fresh certificates for an enrolled node, proved by the key the registry holds.
+  rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+// Served on the worker listener (mutual TLS), storage role only: the cold-store keys of a
+// farm whose frontend holds them (design section 4.3). A node holds the answer in memory
+// only. It is never part of `NodeConfig`.
+service ColdStore {
+  rpc GetKeys(GetKeysRequest) returns (GetKeysResponse);
+}
+
+message RoleCsr {
+  // "storage" or "daemon"; the frontend role is never granted by a token.
+  string role = 1;
+  // PKCS#10, ECDSA P-256, at most 2 KiB. One key per role.
+  bytes csr_der = 2;
+}
+
+message EnrollRequest {
+  // The token's lookup id (12 characters of lower-case base32); not secret.
+  string token_id = 1;
+  // The 32 secret bytes of the token (the token string carries them as base64url).
+  bytes token_secret = 2;
+  string node_id = 3;
+  // Storage role only: "host:port".
+  string advertise = 4;
+  string zone = 5;
+  // One per requested role, each with its own key; a role appears at most once.
+  repeated RoleCsr csrs = 6;
+  // Informational.
+  NodeFacts facts = 7;
+}
+
+message NodeFacts {
+  string os = 1;
+  string arch = 2;
+  // The running release's commit.
+  string commit = 3;
+  uint32 protocol = 4;
+  string package_version = 5;
+}
+
+message IssuedCert {
+  string role = 1;
+  bytes leaf_der = 2;
+  // Lower-case hex without leading zeros: the deny list's spelling of a serial.
+  string serial = 3;
+  int64 not_before = 4;
+  int64 not_after = 5;
+}
+
+message EnrollResponse {
+  repeated IssuedCert certs = 1;
+  // Every CA certificate to trust, current first.
+  bytes ca_bundle_pem = 2;
+  NodeConfig config = 3;
+  // For the node's clock-skew check.
+  int64 server_time = 4;
+  // When the node should first try to renew.
+  int64 renew_after = 5;
+}
+
+message RenewRequest {
+  string node_id = 1;
+  // One per role the node holds, each signed by the key the registry holds for that role.
+  repeated RoleCsr csrs = 2;
+  // Also inside the CSR's signed attributes.
+  int64 issued_at = 3;
+  // The configuration generation the node holds.
+  uint64 config_generation = 4;
+}
+
+message RenewResponse {
+  repeated IssuedCert certs = 1;
+  bytes ca_bundle_pem = 2;
+  // Present only when its generation differs from the request's.
+  NodeConfig config = 3;
+  int64 server_time = 4;
+  int64 renew_after = 5;
+}
+
+enum CredentialMode {
+  CREDENTIAL_MODE_UNSPECIFIED = 0;
+  // The storage node fetches the keys with `ColdStore.GetKeys`.
+  CREDENTIAL_MODE_KEYS = 1;
+  // The node uses its own cloud identity; the frontend sends no key.
+  CREDENTIAL_MODE_AMBIENT = 2;
+}
+
+// What a node pulls from its frontend; never a secret.
+message NodeConfig {
+  // Strictly increases at every change.
+  uint64 generation = 1;
+  // Granted roles, "storage" and "daemon"; they decide the node's mode.
+  repeated string roles = 2;
+  // The https URL a daemon dials (`--server`).
+  string worker_endpoint = 3;
+  // What `--cas` is for a daemon-only node.
+  string cas_endpoint = 4;
+  uint32 storage_port = 5;
+  // `s3://bucket/prefix/?endpoint=...`; never a key.
+  string cold_store = 6;
+  uint32 min_protocol = 7;
+  // Seconds between looks at the certificate files (30).
+  uint32 tls_reload_interval_s = 8;
+  // Optional: a changed frontend URL (design section 4.2).
+  string frontend_url = 9;
+  CredentialMode credential_mode = 10;
+}
+
+message GetKeysRequest {}
+
+message GetKeysResponse {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+}
