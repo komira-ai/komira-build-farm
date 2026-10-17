@@ -168,6 +168,14 @@ jobs:
         run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # The box render run by the pinned Envoy in front of two stub instances: long
+      # silent streams, an instance turning not ready, the ceiling of open streams and a
+      # hot restart, each with a control that plants the defect and sees it
+      # (crates/kbf-it/tests/envoy_box). About half a minute.
+      - name: Envoy runs the box render (long streams, health, ceiling, hot restart)
+        run: cargo test -p kbf-it --test envoy_box --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       # A measurement: what an action-cache hit costs over a file store against the
       # memory store, by stored objects per hit (crates/kbf-front/tests/measure_hit.rs).
       # The numbers are in the log and gate nothing (runners are noisy: read the

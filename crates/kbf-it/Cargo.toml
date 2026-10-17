@@ -42,6 +42,7 @@ tracing-subscriber.workspace = true
 xtask.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 hex.workspace = true
 kbf-front.workspace = true
 kbf-proto.workspace = true
@@ -52,7 +53,9 @@ prost.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true
-tokio = { workspace = true, features = ["time"] }
+# The real-Envoy tests (tests/envoy_box): stub servers and Envoy as a child process.
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
+tonic = { workspace = true, features = ["tls-ring"] }
 
 [lints]
 workspace = true
