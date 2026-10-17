@@ -32,7 +32,7 @@ rcgen.workspace = true
 # `kbf-cell m1`'s calls to the operator API.
 reqwest.workspace = true
 # SIGINT for the processes `kbf-cell m1` started.
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["net", "process"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
@@ -42,13 +42,18 @@ tracing-subscriber.workspace = true
 xtask.workspace = true
 
 [dev-dependencies]
+# The frontend handover crash matrix (tests/frontend_handover_crash.rs): real `kbf`
+# processes, a daemon and a client over gRPC, the state file read back.
+futures.workspace = true
 hex.workspace = true
 kbf-front.workspace = true
 kbf-proto.workspace = true
 kbf-server.workspace = true
+kbf-state.workspace = true
 kbf-threads.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
+rusqlite.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true

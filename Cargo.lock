@@ -1674,6 +1674,7 @@ name = "kbf-it"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "hex",
  "kbf-daemon",
  "kbf-deploy",
@@ -1681,6 +1682,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
+ "kbf-state",
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
@@ -1688,6 +1690,7 @@ dependencies = [
  "prost",
  "rcgen",
  "reqwest",
+ "rusqlite",
  "rustix",
  "saphyr-parser",
  "serde_json",
