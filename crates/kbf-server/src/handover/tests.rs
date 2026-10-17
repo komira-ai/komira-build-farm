@@ -60,6 +60,13 @@ pub(super) struct Gives {
     pub reads_fail: AtomicBool,
     pub reads_failed: AtomicUsize,
     pub reads_served: AtomicUsize,
+    /// How many of the next batches of writes the store refuses (as a failure of the
+    /// backend), counting down by one per refusal.
+    pub refuse_next: AtomicUsize,
+    /// Every write answers that a newer writer exists ([`StoreError::Fenced`]).
+    pub newer_writer: AtomicBool,
+    /// Batches of writes the store was asked to apply, refused or not.
+    pub writes_tried: AtomicUsize,
     hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
@@ -72,6 +79,9 @@ impl Gives {
             reads_fail: AtomicBool::new(false),
             reads_failed: AtomicUsize::new(0),
             reads_served: AtomicUsize::new(0),
+            refuse_next: AtomicUsize::new(0),
+            newer_writer: AtomicBool::new(false),
+            writes_tried: AtomicUsize::new(0),
             hook: Mutex::new(None),
         })
     }
@@ -89,6 +99,18 @@ impl Gives {
 
 impl Store for Gives {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        self.writes_tried.fetch_add(1, Ordering::SeqCst);
+        if self.newer_writer.load(Ordering::SeqCst) {
+            return Err(StoreError::Fenced);
+        }
+        let refused = self
+            .refuse_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if refused.is_ok() {
+            return Err(StoreError::Failed(
+                "the store refuses this write".to_owned(),
+            ));
+        }
         self.inner.apply_batch(batch)
     }
 

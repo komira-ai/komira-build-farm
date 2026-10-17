@@ -625,6 +625,12 @@ impl Durable {
         }
     }
 
+    /// Whether a write was refused because a newer writer holds the store: nothing this
+    /// handle writes can succeed any more.
+    pub(super) fn superseded(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
     /// A write that tells whether the store takes writes again.
     pub(super) fn ping(&self) -> Result<(), StateError> {
         self.commit(Txn::new().put(ALIVE, Vec::new(), Cond::Any))

@@ -84,6 +84,47 @@ drain's deadline is wall-clock time).
 new frontend once it serves. The old one's own state is only systemd's: `active` until it
 has answered its last stream, then it exits.
 
+## What a handover carries and what it does not
+
+**Carried, as rows of the state store.** The operations and their queue order (`op/`,
+`queue/`), the leases (`lease/`), the loss count of an operation (`loss/`), the result of a
+finished one (`done/`), the daemons' sessions, the cordons and drains, and the epoch. The
+old frontend writes the leases it has given up before it gives up the writer role: it
+retries, for at most `--handover-quiesce-secs`, the requeues the store refused, and stops
+at once if the store says a newer writer exists. If the store still refuses at the
+deadline, the handover completes and the old frontend logs an ERROR naming the operations
+it could not write; the new frontend then recovers each of them with the lease the store
+still holds, and the daemon's heartbeat or the lease grace settles it.
+
+Rows for the state that is in memory today and in the stack of changes #897, #911, #915 and
+#916 (`fate/` for the memory ladder and the fault budgets of an operation, `floor/` for the
+memory floors, `subject/` for the usage line of an operation) are carried only once those
+changes are merged; until then a successor starts those from nothing.
+
+**Not carried.**
+
+- An invocation record is split between the two processes: an invocation in flight, or a
+  recent one, looked up through `/v1` or the UI on the new frontend is not found. Build
+  results are not affected, because callers are answered from `done/`.
+- Counters restart at 0 in the new process (the `pressure` counter included), so a sum
+  across processes scraped one by one sees a drop. Use `rate()` or `increase()`.
+- `action shape:` is logged again, once per key, by the new process.
+- The unservable timer restarts: a refusal can be delayed by up to `unservable_wait`.
+- `kbf_front_open_executions` stays above zero in the old process for as long as it
+  answers callers from the store.
+- A kill whose store write was not acknowledged before a crash costs at most one extra run
+  or one extra budget step.
+- The rule "seen before: the last measured peak plus a buffer" for the memory a key is
+  booked is not implemented; the floors are only the highest rung an operation was raised
+  to.
+
+**Known gap.** Two other refused writes are not retried, before or at a handover. When
+the store refuses the rows of a committed record (an `Effect::Commit`), the farm logs it
+and drops the effects that depended on it; when it refuses the `done/` row of a finished
+operation, the farm logs it and answers its callers from memory. Neither is written again
+by the old frontend, so the new one recovers such an operation from the rows it finds: the
+lease it was granted, or no result. An issue is to be filed for it.
+
 ## When it goes wrong
 
 | What happens | What clients see | What the operator does |

@@ -13,7 +13,7 @@ use kbf_types::{Answer, FarmTime, OperationId, StateMachine as _, WaiterId, Work
 use tokio::sync::watch;
 use tonic::{Code, Status};
 
-use super::durable::{Progress, StateError, StoredCordon};
+use super::durable::{Durable, Progress, StateError, StoredCordon};
 use super::{Farm, NodeAction, State, failed, unix_ms};
 
 /// How many looks in a row at the state store may find an operation neither unfinished
@@ -25,6 +25,9 @@ pub const LOST_LOOKS: u8 = 3;
 /// Why a request that raced the handover is refused (UNAVAILABLE: Buck2 asks again, and
 /// the successor answers).
 const HANDING_OVER: &str = "this frontend is handing its work to its successor";
+
+/// How often [`Farm::flush_unsettled`] writes again what the state store refused.
+const FLUSH_LOOK: Duration = Duration::from_millis(10);
 
 /// What the callers of an operation the successor lost are told.
 const LOST: &str = "the result of the action was lost in a frontend handover";
@@ -81,6 +84,44 @@ impl Farm {
         self.lock().fenced = true;
     }
 
+    /// Writes, to the state store, the requeues it refused (a lease the scheduler gave
+    /// up while the store did not take the write), so that the successor recovers each
+    /// operation queued and not under the lease this process gave up. Works on a fenced
+    /// farm, which feeds the scheduler nothing and so would never write them again.
+    /// Tries again every [`FLUSH_LOOK`] until none is left, and stops at once when the
+    /// store says a newer writer holds it (nothing may be written then), or at the
+    /// `deadline`; whatever is left is logged at ERROR, naming the operations. Returns
+    /// the operations whose requeues were not written.
+    pub async fn flush_unsettled(&self, deadline: Duration) -> Vec<OperationId> {
+        let until = tokio::time::Instant::now() + deadline;
+        let (left, why) = loop {
+            // The lock is not held across the sleep.
+            let step = self.lock().flush_step();
+            match step {
+                Flushed::Settled => return Vec::new(),
+                Flushed::Superseded(left) => break (left, "the state store has a newer writer"),
+                Flushed::Refused(left) => {
+                    if tokio::time::Instant::now() >= until {
+                        break (
+                            left,
+                            "the state store kept refusing them until the deadline",
+                        );
+                    }
+                    tokio::time::sleep(FLUSH_LOOK).await;
+                }
+            }
+        };
+        let operations: Vec<String> = left.iter().map(|op| format!("{:016x}", op.0)).collect();
+        tracing::error!(
+            count = left.len(),
+            operations = %operations.join(","),
+            why,
+            "requeues not written to the state store: the successor recovers these operations \
+             with the lease they held"
+        );
+        left
+    }
+
     /// Ends every worker stream with `status`, so each daemon dials again (to the
     /// successor, once this process no longer accepts). Returns how many streams were
     /// still open.
@@ -108,7 +149,38 @@ impl Farm {
     }
 }
 
+/// How an attempt to write the requeues the state store refused ended.
+pub(super) enum Flushed {
+    /// Every requeue is written.
+    Settled,
+    /// A newer writer holds the store: these operations' requeues will not be written.
+    Superseded(Vec<OperationId>),
+    /// The store refused again: these operations' requeues are still unwritten.
+    Refused(Vec<OperationId>),
+}
+
 impl State {
+    /// Writes the requeues the state store has not taken, and the ones the scheduler has
+    /// given up since the last feed, once. Works on a fenced farm: this is the one thing
+    /// a fenced farm writes, because the successor's recovery depends on it (see
+    /// [`Farm::flush_unsettled`]).
+    pub(super) fn flush_step(&mut self) -> Flushed {
+        let superseded = |state: &Self| state.durable.as_ref().is_some_and(Durable::superseded);
+        if !superseded(self) {
+            self.log_requeues();
+        }
+        let left: Vec<OperationId> = self
+            .unsettled
+            .iter()
+            .map(|(requeue, ..)| requeue.operation)
+            .collect();
+        match (left.is_empty(), superseded(self)) {
+            (true, _) => Flushed::Settled,
+            (false, true) => Flushed::Superseded(left),
+            (false, false) => Flushed::Refused(left),
+        }
+    }
+
     /// Feeds `event` to the scheduler (see [`State::carry_out`]), unless the farm is
     /// fenced: then nothing is fed and there are no answers.
     pub(super) fn feed(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
