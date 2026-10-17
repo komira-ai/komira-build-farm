@@ -23,6 +23,11 @@
 //!   successor (after a handover or a crash) books the next rung instead of starting the
 //!   ladder over. A store with no row for an operation books and counts as it did before
 //!   the row existed;
+//! - `subject/<operation>`: what the operation's `action usage:` line says it is (the
+//!   shape key, configuration hash, target and the client's mnemonic and target hint,
+//!   [`crate::action_usage::Subject`]), written in the submission's transaction beside
+//!   `op/` and `queue/` and deleted with them, so a successor logs the same line the
+//!   writer would have. A store with no row for an operation logs the empty shape;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
 //!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
@@ -70,6 +75,7 @@ const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
 const CORDON: &str = "cordon/";
 const FATE: &str = "fate/";
+const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
@@ -202,6 +208,8 @@ pub(super) struct StoredOperation {
     pub losses: u32,
     /// What its kills for memory changed, if it was killed.
     pub fate: Option<Fate>,
+    /// What its `action usage:` line says it is, if the writer recorded it.
+    pub subject: Option<Subject>,
 }
 
 impl StoredOperation {
@@ -222,6 +230,7 @@ impl StoredOperation {
 }
 
 mod fate;
+mod subject;
 
 /// The scheduler's handle on its state store.
 pub(super) struct Durable {
@@ -255,6 +264,10 @@ fn loss_key(operation: OperationId) -> String {
 
 fn fate_key(operation: OperationId) -> String {
     format!("{FATE}{:016x}", operation.0)
+}
+
+fn subject_key(operation: OperationId) -> String {
+    format!("{SUBJECT}{:016x}", operation.0)
 }
 
 fn done_key(operation: OperationId) -> String {
@@ -371,6 +384,12 @@ impl Durable {
             let fate = fate::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             fates.insert(operation, fate);
         }
+        let mut subjects = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix(SUBJECT)? {
+            let operation = parse_operation(&key, SUBJECT)?;
+            let subject = subject::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            subjects.insert(operation, subject);
+        }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
             let FarmInput::Submit(request) = decode(&key, &row.value)? else {
@@ -384,6 +403,7 @@ impl Durable {
                 lease,
                 losses: losses.remove(&operation).unwrap_or(0),
                 fate: fates.remove(&operation),
+                subject: subjects.remove(&operation),
             });
         }
         Ok(Stored {
@@ -437,16 +457,23 @@ impl Durable {
         self.store.get(key)?.map_or(Ok(0), |row| number(key, &row))
     }
 
-    /// An operation submitted: its request, and its place in the queue.
+    /// An operation submitted: its request, what its `action usage:` line says it is,
+    /// and its place in the queue, in one transaction.
     pub(super) fn submitted(
         &self,
         operation: OperationId,
         request: &Request,
+        subject: &Subject,
     ) -> Result<(), StateError> {
         let value = encode(FarmInput::Submit(request.clone()))?;
         self.commit(
             Txn::new()
                 .put(op_key(operation), value, Cond::Absent)
+                .put(
+                    subject_key(operation),
+                    subject::encode(subject),
+                    Cond::Absent,
+                )
                 .put(queue_key(operation), Vec::new(), Cond::Absent)
                 .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any),
         )
@@ -518,7 +545,8 @@ impl Durable {
                 .delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
                 .delete(loss_key(operation), Cond::Any)
-                .delete(fate_key(operation), Cond::Any),
+                .delete(fate_key(operation), Cond::Any)
+                .delete(subject_key(operation), Cond::Any),
         )
     }
 
@@ -529,7 +557,8 @@ impl Durable {
                 .delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
                 .delete(loss_key(operation), Cond::Any)
-                .delete(fate_key(operation), Cond::Any),
+                .delete(fate_key(operation), Cond::Any)
+                .delete(subject_key(operation), Cond::Any),
         )
     }
 
@@ -787,16 +816,19 @@ impl State {
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
-        for op in stored.operations {
+        for mut op in stored.operations {
             let key = op.request.key.clone();
             let waiter = self.machine.submit(Waiter {
                 key: key.clone(),
                 kind: op.request.kind,
                 do_not_cache: op.request.do_not_cache,
                 queued: now,
-                // The command the callers described is not kept: a recovered operation's
-                // `action usage:` line names the empty shape.
-                usage: Subject::of(Described::default()).0,
+                // A row from a writer that did not record the subject (an older build)
+                // leaves the `action usage:` line naming the empty shape.
+                usage: op
+                    .subject
+                    .take()
+                    .unwrap_or_else(|| Subject::of(Described::default()).0),
             });
             self.stages.insert(waiter, watch::channel(Stage::Queued).0);
             if let Some(grant) = &op.lease {
@@ -828,10 +860,10 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn queue(&self, request: &Request) -> Result<(), Status> {
+    pub(super) fn queue(&self, request: &Request, subject: &Subject) -> Result<(), Status> {
         let id = self.sched.next_operation();
         let joins = self.sched.twin(request).is_some();
-        if !joins && !self.durably("a submission", |d| d.submitted(id, request)) {
+        if !joins && !self.durably("a submission", |d| d.submitted(id, request, subject)) {
             if self
                 .durable
                 .as_ref()

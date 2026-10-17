@@ -34,6 +34,9 @@ use tonic::{Code, Status};
 mod fate;
 #[path = "state_store/handover.rs"]
 mod handover;
+#[path = "state_store/subject.rs"]
+mod subject;
+mod thread_log;
 
 const GIB: u64 = 1 << 30;
 

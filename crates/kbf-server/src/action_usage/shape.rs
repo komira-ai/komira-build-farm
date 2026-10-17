@@ -117,6 +117,12 @@ const MAX_WORDS: usize = 3;
 pub struct ShapeKey([u8; 8]);
 
 impl ShapeKey {
+    /// The key whose 8 bytes are `bytes`, as [`ShapeKey::bytes`] gave them.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 8]) -> Self {
+        Self(bytes)
+    }
+
     /// The key's 8 bytes.
     #[must_use]
     pub const fn bytes(self) -> [u8; 8] {

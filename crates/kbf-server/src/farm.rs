@@ -784,7 +784,7 @@ impl Dispatch for Farm {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request)?;
+        state.admit(&submission.request, &usage)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {

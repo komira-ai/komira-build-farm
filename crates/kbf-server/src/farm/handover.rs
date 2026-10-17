@@ -123,11 +123,15 @@ impl State {
     ///
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
-    pub(super) fn admit(&self, request: &kbf_sched::Request) -> Result<(), Status> {
+    pub(super) fn admit(
+        &self,
+        request: &kbf_sched::Request,
+        subject: &crate::action_usage::Subject,
+    ) -> Result<(), Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(request)
+        self.queue(request, subject)
     }
 
     /// The callers of `operation` that have not been answered.
