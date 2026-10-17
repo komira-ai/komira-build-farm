@@ -77,9 +77,12 @@ KBF_API_PORT=8982
 # default (8982), which is KBF_API_PORT's.
 KBF_STORAGE_PORT=8983
 # `kbf storage`'s hot store (--hot-store=file://<dir>): the SSD tier uploads land in
-# before they are flushed to the cold store. On local disk, the unit's user's. For
-# `storage-and-daemon`, put it on KBF_DATA_DIR's filesystem (the one cache).
-KBF_HOT_DIR=/var/lib/kbf-server/hot
+# before they are flushed to the cold store. On local disk, the unit's user's, and
+# every directory above it must be enterable by that user (install-units and
+# check-units refuse one that is not: /var/lib/kbf-server is the server account's, 0700,
+# and `storage-and-daemon` runs as KBF_USER). Unset, it is <KBF_DATA_DIR>/hot, on the
+# filesystem of the one cache; for `storage-and-daemon` keep it on KBF_DATA_DIR's.
+KBF_HOT_DIR=/var/lib/kbf/hot
 
 # --- kbf-daemon ---
 KBF_USER=kbf

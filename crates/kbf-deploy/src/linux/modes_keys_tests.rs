@@ -88,7 +88,7 @@ fn each_mode_renders_its_full_flag_set() {
         words(&[
             "--cold-store=s3://kbf-cas/farm2/?endpoint=http://127.0.0.1:9000&conditional-put=true",
             "--meta-dir=/var/lib/kbf-server/raft",
-            "--hot-store=file:///var/lib/kbf-server/hot",
+            "--hot-store=file:///var/lib/kbf/hot",
             "--storage-listen=192.0.2.10:8983",
             "--storage-tls-cert=/etc/kbf/storage.pem",
             "--storage-tls-key=/etc/kbf/storage.key",
@@ -129,7 +129,7 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Storage),
         words(&[
             "--cold-store=s3://kbf-cas/farm2/?endpoint=http://127.0.0.1:9000&conditional-put=true",
-            "--hot-store=file:///var/lib/kbf-server/hot",
+            "--hot-store=file:///var/lib/kbf/hot",
             "--meta-dir=/var/lib/kbf-server/raft",
             "--storage-listen=192.0.2.10:8983",
             "--storage-tls-cert=/etc/kbf/storage.pem",

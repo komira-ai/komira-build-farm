@@ -92,7 +92,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, stop, stores};
+use super::{cpuset, credential, handover, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -313,6 +313,51 @@ pub fn check(
     ))
 }
 
+/// Rule `traverse`: a `file://` `--hot-store` the unit's `User=` can reach. Skipped, with
+/// a note, where the user or a directory cannot be read.
+fn hot_store_reachable<E: Exec>(
+    exec: &E,
+    unit: &UnitFile,
+    failures: &mut Vec<Failure>,
+    notes: &mut Vec<String>,
+) {
+    let Some(dir) = unit
+        .flag("hot-store")
+        .and_then(|v| v.strip_prefix("file://"))
+        .and_then(|v| HostPath::new(v).ok())
+    else {
+        return;
+    };
+    let Some(name) = unit.get_in("Service", "User").filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let user = match kbf_host::user::lookup(exec, name) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            notes.push(format!(
+                "SKIP traverse: no user {name} on this host, so the path to --hot-store was not read"
+            ));
+            return;
+        }
+        Err(e) => {
+            notes.push(format!("SKIP traverse: {e}"));
+            return;
+        }
+    };
+    // root enters every directory.
+    if user.uid == 0 {
+        return;
+    }
+    match traverse::blocked_by(&user, &dir, |p| exec.stat(p)) {
+        Ok(None) => {}
+        Ok(Some((above, meta))) => failures.push(Failure {
+            rule: "traverse",
+            message: traverse::message(&user, &dir, &above, &meta),
+        }),
+        Err(e) => notes.push(format!("SKIP traverse: {e}")),
+    }
+}
+
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
 /// then the rules that read the host `exec` runs on: `parse` (`kbf_bin`, or the unit's
 /// own binary when `exec` shows it there, run as `<kbf> check-args <mode> <flags...>`
@@ -381,6 +426,7 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
+    hot_store_reachable(exec, &merged, &mut failures, &mut notes);
     let argv = merged.exec_start();
     if runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {

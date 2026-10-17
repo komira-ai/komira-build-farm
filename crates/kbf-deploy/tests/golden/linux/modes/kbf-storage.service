@@ -35,7 +35,7 @@ EnvironmentFile=/etc/kbf/s3.env
 # then the map is this node alone.
 ExecStart=/usr/local/bin/kbf storage \
     --cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true \
-    --hot-store=file:///var/lib/kbf-server/hot \
+    --hot-store=file:///var/lib/kbf/hot \
     --meta-dir=/var/lib/kbf-server/raft \
     --storage-listen=192.0.2.10:8983 \
     --storage-tls-cert=/etc/kbf/storage.pem \

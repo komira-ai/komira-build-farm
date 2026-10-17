@@ -26,7 +26,8 @@ Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#r
 - On the host it runs on: `/sys/devices/system/cpu/online` and
   `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
   files the unit's `EnvironmentFile=` lines name (rule `credential`), the storage unit's
-  `User=` (`getent passwd`, rule `credential`), and `kbf check-args` (rule `parse`).
+  `User=` (`getent passwd`, rule `credential`), the owner and mode of each directory above a
+  `file://` `--hot-store` (rule `traverse`), and `kbf check-args` (rule `parse`).
   Run it on the node, as root, for all of them.
 
 It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
@@ -46,6 +47,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
+| `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | flags that `kbf <mode>` refuses |
@@ -139,8 +141,11 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
   `--advertise-addr=<KBF_HOST_NAME>:<KBF_STORAGE_PORT>`), then the daemon unit's flags,
   with `--server` the same frontend URL. It runs as `KBF_USER` with
   `EnvironmentFile=<KBF_ETC>/s3.env` (below). `install-units --mode` makes `--meta-dir`
-  and `--hot-store` the user's, mode 0700, and `--hot-store` should be on `--data-dir`'s
-  filesystem (`KBF_HOT_DIR`): the one cache.
+  and `--hot-store` the user's, mode 0700. `KBF_HOT_DIR` defaults to `<KBF_DATA_DIR>/hot`
+  (`/var/lib/kbf/hot`), on `--data-dir`'s filesystem: the one cache, and a path `KBF_USER`
+  can reach. It must stay one: `/var/lib/kbf-server` is the server account's, mode 0700,
+  and a hot store under it fails the unit's start with `Permission denied` (rule
+  `traverse`).
 - **`frontend`**: `--listen=<KBF_LISTEN_ADDRESS>:<KBF_REAPI_PORT>` with
   `--reapi-tls-cert=<KBF_REAPI_CERT>` and `--reapi-tls-key=<KBF_REAPI_KEY>` (a
   certificate pair the farm's CA did not issue, such as a `tailscale cert` pair, so the

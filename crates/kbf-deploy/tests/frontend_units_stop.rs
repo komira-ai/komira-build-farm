@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// The program (its file name) and first argument an `ExecStart=` starts when the unit
 /// runs a frontend: the server binary, the `kbf` frontend and all-in-one modes, and the
 /// pilot unit's placeholder for the server command it renders. Matched word by word, not
-/// as a substring: the storage unit's `--hot-store=file:///var/lib/kbf-server/hot`
+/// as a substring: the storage unit's `--meta-dir=/var/lib/kbf-server/raft`
 /// names `kbf-server` too.
 const FRONTENDS: [(&str, Option<&str>); 4] = [
     ("kbf-server", None),

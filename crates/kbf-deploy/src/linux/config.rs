@@ -115,6 +115,7 @@ pub struct LinuxConfig {
     /// kbf-server's `--meta-dir`: its metadata log, a single-voter Raft log.
     pub meta_dir: HostPath,
     /// `kbf storage`'s `--hot-store` directory: the SSD tier in front of the cold store.
+    /// Defaults to `<data_dir>/hot`.
     pub hot_dir: HostPath,
     /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
     pub data_dir: HostPath,
@@ -300,6 +301,10 @@ impl LinuxConfig {
             v if v.strip_prefix("https://").is_some_and(|h| !h.is_empty()) => Some(v.to_owned()),
             v => return Err(LinuxError::StorageUrl(v.to_owned())),
         };
+        // The hot store defaults beside the daemon's data: the same filesystem (the one
+        // cache) and a path the unit's user can reach, which `/var/lib/kbf-server` (the
+        // frontend account's, 0700) is not for the units that run as `KBF_USER`.
+        let data_dir = path("KBF_DATA_DIR", "/var/lib/kbf")?;
         Ok(LinuxConfig {
             frontend_name: or("KBF_FRONTEND_NAME", &host_name),
             storage_url,
@@ -330,8 +335,8 @@ impl LinuxConfig {
                 .map(str::to_owned),
             s3_bucket: or("KBF_S3_BUCKET", "kbf-cas"),
             meta_dir: path("KBF_META_DIR", "/var/lib/kbf-server/raft")?,
-            hot_dir: path("KBF_HOT_DIR", "/var/lib/kbf-server/hot")?,
-            data_dir: path("KBF_DATA_DIR", "/var/lib/kbf")?,
+            hot_dir: path("KBF_HOT_DIR", &format!("{data_dir}/hot"))?,
+            data_dir,
             images,
             user: or("KBF_USER", "kbf"),
             server_user: or("KBF_SERVER_USER", "kbf-server"),

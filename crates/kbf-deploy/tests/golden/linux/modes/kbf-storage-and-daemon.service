@@ -37,7 +37,7 @@ EnvironmentFile=/etc/kbf/s3.env
 ExecStart=/usr/local/bin/kbf storage-and-daemon \
     --cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true \
     --meta-dir=/var/lib/kbf-server/raft \
-    --hot-store=file:///var/lib/kbf-server/hot \
+    --hot-store=file:///var/lib/kbf/hot \
     --storage-listen=192.0.2.10:8983 \
     --storage-tls-cert=/etc/kbf/storage.pem \
     --storage-tls-key=/etc/kbf/storage.key \

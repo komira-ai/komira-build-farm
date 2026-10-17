@@ -720,11 +720,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 107: unknown key KBF_RAM",
+            "line 110: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 107: KBF_RAM_GIB is already set on line 24",
+            "line 110: KBF_RAM_GIB is already set on line 24",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),
@@ -929,4 +929,32 @@ fn an_unset_key_takes_the_default_config_example_shows() {
         rendered(&minimal, &Templates::BUILT_IN),
         rendered(&example, &Templates::BUILT_IN)
     );
+}
+
+/// `KBF_HOT_DIR` unset takes `<KBF_DATA_DIR>/hot`, in the units of both modes that carry a
+/// hot store: the old default under `/var/lib/kbf-server` is the frontend account's
+/// 0700 directory, which `storage-and-daemon`'s `KBF_USER` cannot enter. A set value
+/// wins. Catches the default left at the server account's directory, and one that
+/// ignores a moved `KBF_DATA_DIR`.
+#[test]
+fn the_hot_dir_defaults_beside_the_data_dir_in_each_mode() {
+    use super::modes::{self, Mode};
+    let hot = |c: &LinuxConfig, mode| {
+        let text = modes::render(c, Some(1500), mode).expect("renders");
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix("--hot-store=").map(str::to_owned))
+            .unwrap_or_default()
+            .trim_end_matches(" \\")
+            .to_owned()
+    };
+    let plain = config(&[("KBF_HOT_DIR", "")]);
+    assert_eq!(plain.hot_dir.as_str(), "/var/lib/kbf/hot");
+    let moved = config(&[("KBF_HOT_DIR", ""), ("KBF_DATA_DIR", "/srv/kbf")]);
+    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
+        assert_eq!(hot(&plain, mode), "file:///var/lib/kbf/hot", "{mode}");
+        assert_eq!(hot(&moved, mode), "file:///srv/kbf/hot", "{mode}");
+    }
+    let set = config(&[("KBF_HOT_DIR", "/fast/hot"), ("KBF_DATA_DIR", "/srv/kbf")]);
+    assert_eq!(set.hot_dir.as_str(), "/fast/hot");
+    assert_eq!(hot(&set, Mode::StorageAndDaemon), "file:///fast/hot");
 }
