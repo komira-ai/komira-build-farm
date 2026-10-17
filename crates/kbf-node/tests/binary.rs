@@ -150,9 +150,28 @@ fn keep(mode: kbf_daemon::keeper::Mode) -> Duration {
     closed.elapsed()
 }
 
+/// Where tests that run a container daemon put their directories: Cargo's per-target
+/// temporary directory, unless an ancestor of it is closed to other users (a home
+/// directory often is), which the container driver refuses (its containers' ids are not
+/// the daemon's, and must be able to search down to the data directory); then the
+/// system's temporary directory.
+fn scratch_root() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let searchable = std::fs::canonicalize(&target).is_ok_and(|real| {
+        real.ancestors()
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0))
+    });
+    if searchable {
+        target
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// A scratch directory for one test, with a CA and a client certificate in it.
 fn tls(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let dir = scratch_root()
         .join("kbf-node")
         .join(format!("{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch");
@@ -533,21 +552,22 @@ fn each_driver_starts_and_stops_on_sigterm() {
         let (unit, cgroup_flags) = cgroup_tree(&tls("container-cgroup"), "cpu memory pids");
         let mut container = vec![
             "--driver=container".to_owned(),
+            OCI_RUNTIME.to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
             format!("--data-dir={}", data.display()),
             format!("--id-files={}", ids.display()),
             "--actions-memory-max-gib=1".to_owned(),
         ];
         container.extend(cgroup_flags);
-        let (bin, log) = podman_stub("container-bin");
+        let (bin, log) = container_bin("container-bin");
         let status = runs_until_sigterm_with_path("container", &container, Some(&bin));
         assert!(status.success(), "{status}");
-        let asked = read(&log);
+        // Podman is first on PATH and fails when run: the daemon never starts it, and
+        // the OCI backend's own state (its helper root) is what the start made.
+        assert!(!log.exists(), "podman ran: {}", read(&log));
         assert!(
-            asked
-                .lines()
-                .any(|a| a == "--filter=label=kbf.owner=node-1"),
-            "the sweep looks for this node's containers: {asked}"
+            data.join("leases/oci-helper").is_dir(),
+            "no OCI helper root"
         );
         // The daemon set up its cgroup (crates/kbf-driver-container/src/delegate.rs).
         assert_eq!(read(&unit.join("supervisor/cgroup.procs")), "1");
@@ -573,9 +593,10 @@ fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String)
     }
     let ids = id_files(&format!("{name}-ids"), "65536");
     let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu cpuset memory pids");
-    let (bin, _) = podman_stub(&format!("{name}-bin"));
+    let (bin, _) = container_bin(&format!("{name}-bin"));
     let mut flags = vec![
         "--driver=container".to_owned(),
+        OCI_RUNTIME.to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
@@ -655,18 +676,59 @@ fn a_placement_without_the_container_driver_is_refused() {
     );
 }
 
-/// A directory put first in `PATH` holding a `podman` that lists no container and
-/// logs its arguments to the returned file (`kbf-podman-stub`, linked in as
-/// `podman`): the start-up sweep asks it for this node's leftovers before the daemon
-/// connects. A symlink to the built binary, not a written file: exec'ing a file this
-/// process just wrote can fail with ETXTBSY while another test thread forks.
-fn podman_stub(name: &str) -> (PathBuf, PathBuf) {
+/// The OCI runtime the container daemons of these tests are given: it only has to be a
+/// file, since the start-up never runs it (no lease runs here).
+const OCI_RUNTIME: &str = "--oci-runtime=/usr/bin/true";
+
+/// A directory to put first in `PATH` for a container daemon, and the file it logs to.
+/// It holds `newuidmap` and `newgidmap` as the `uidmap` package installs them (setuid;
+/// the OCI backend's start-up looks for both) and a `podman` that fails and logs
+/// (`kbf-no-podman`, linked in as `podman`): kbf runs containers with `crun` only, so
+/// the daemon must never start it, and the returned log must stay absent. A symlink to
+/// the built binary, not a written file: exec'ing a file this process just wrote can
+/// fail with ETXTBSY while another test thread forks.
+fn container_bin(name: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
     let bin = tls(name);
     let log = bin.join("podman.log");
     let _ = std::fs::remove_file(bin.join("podman"));
-    let stub = env!("CARGO_BIN_EXE_kbf-podman-stub");
+    let stub = env!("CARGO_BIN_EXE_kbf-no-podman");
     std::os::unix::fs::symlink(stub, bin.join("podman")).expect("link podman");
+    for tool in ["newuidmap", "newgidmap"] {
+        let path = bin.join(tool);
+        std::fs::write(&path, b"").expect("write the tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+    }
     (bin, log)
+}
+
+/// Catches a tripwire that cannot trip: every container test above puts this `podman`
+/// first on `PATH` and asserts its log stays absent, which proves nothing if it does not
+/// log when it is run. Run through its link by path, and by bare name through a `PATH`
+/// whose first directory lacks it (as the daemon would start `podman`), it records its
+/// arguments, says so and exits 125.
+#[test]
+fn the_podman_that_must_never_run_fails_and_records_the_call() {
+    let (bin, log) = container_bin("no-podman-bin");
+    let decoy = tls("no-podman-decoy");
+    let by_path = Command::new(bin.join("podman"))
+        .args(["pull", "image"])
+        .output()
+        .expect("spawn");
+    assert_eq!(by_path.status.code(), Some(125));
+    assert!(
+        String::from_utf8_lossy(&by_path.stderr).contains("podman was removed"),
+        "{by_path:?}"
+    );
+    assert_eq!(read(&log), "pull\nimage\n");
+    let path = format!("{}:{}", decoy.display(), bin.display());
+    let by_name = Command::new("podman")
+        .env("PATH", path)
+        .arg("ps")
+        .output()
+        .expect("spawn");
+    assert_eq!(by_name.status.code(), Some(125));
+    assert_eq!(read(&log), "pull\nimage\nps\n");
 }
 
 /// A stand-in cgroup v2 mount in `dir`, of plain directories, for the container
@@ -712,7 +774,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
     let ids = id_files("capacity-ids", "65536");
     let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
     std::fs::write(unit.join("memory.min"), "0\n").expect("plant");
-    let (bin, _) = podman_stub("capacity-bin");
+    let (bin, _) = container_bin("capacity-bin");
     let log = dir.join("daemon.log");
     let path = format!(
         "{}:{}",
@@ -729,6 +791,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
             format!("--key={}", dir.join("node.key").display()),
             "--node-id=node-1".to_owned(),
             "--driver=container".to_owned(),
+            OCI_RUNTIME.to_owned(),
             format!("--cas=https://127.0.0.1:{}", front.worker.port()),
             format!("--data-dir={}", dir.display()),
             format!("--id-files={}", ids.display()),
@@ -827,7 +890,7 @@ fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
     let ids = id_files("reserve-ids", "65536");
     let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
     std::fs::remove_file(unit.join("cpuset.cpus.effective")).expect("no cpuset");
-    let (bin, _) = podman_stub("reserve-bin");
+    let (bin, _) = container_bin("reserve-bin");
     let log = dir.join("daemon.log");
     let path = format!(
         "{}:{}",
@@ -844,6 +907,7 @@ fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
             format!("--key={}", dir.join("node.key").display()),
             "--node-id=node-1".to_owned(),
             "--driver=container".to_owned(),
+            OCI_RUNTIME.to_owned(),
             format!("--cas=https://127.0.0.1:{}", front.worker.port()),
             format!("--data-dir={}", dir.display()),
             format!("--id-files={}", ids.display()),
@@ -896,13 +960,14 @@ fn a_container_node_given_its_actions_cgroup_writes_only_its_cap() {
     std::fs::write(actions.join("cgroup.subtree_control"), "cpu memory pids\n").expect("plant");
     flags.extend([
         "--driver=container".to_owned(),
+        OCI_RUNTIME.to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
         "--cgroup-parent=/kbf.slice/kbf-daemon.service/actions".to_owned(),
         "--actions-memory-max-gib=2".to_owned(),
     ]);
-    let (bin, _) = podman_stub("adopted-bin");
+    let (bin, _) = container_bin("adopted-bin");
     let status = runs_until_sigterm_with_path("adopted", &flags, Some(&bin));
     assert!(status.success(), "{status}");
     assert_eq!(read(&actions.join("memory.max")), "2147483648");
@@ -930,6 +995,7 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
             .args(base(&dir))
             .args([
                 "--driver=container".to_owned(),
+                OCI_RUNTIME.to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
                 format!("--data-dir={}", dir.display()),
                 format!("--id-files={}", ids.display()),
@@ -1090,7 +1156,7 @@ fn a_driver_missing_its_flags_refuses_to_start() {
 }
 
 /// Catches the container driver starting on a node whose daemon user has no
-/// subordinate ids, or too few (every lease would fail in `podman create`): the
+/// subordinate ids, or too few (every lease would fail at `crun`'s id mapping): the
 /// "drop the startup check" mutant. The daemon exits non-zero naming the file and
 /// the user, before it reaches the front.
 #[test]
@@ -1113,6 +1179,7 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
             .args(base(&ids))
             .args([
                 "--driver=container".to_owned(),
+                OCI_RUNTIME.to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
                 format!("--data-dir={}", ids.display()),
                 "--cgroup-parent=/kbf.slice/actions".to_owned(),
@@ -1130,10 +1197,10 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
     }
 }
 
-/// Catches `--container-runtime` and `--oci-runtime` not reaching the driver: a node told
-/// to run actions through a runtime that is not there refuses to start, naming it (the
-/// "ignore the flag" mutant would start a Podman node), and a runtime that is neither
-/// `podman` nor `oci` is refused by the parser.
+/// Catches `--oci-runtime` not reaching the driver: a node told to run actions through a
+/// runtime that is not there refuses to start, naming it; `--container-runtime=podman`
+/// being taken (Podman was removed: the parser refuses it, saying so); and any other
+/// runtime than `oci` being taken.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1166,14 +1233,22 @@ fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
     let stderr = read(&log);
     assert!(stderr.contains(&says), "{stderr}");
 
-    let out = Command::new(BIN)
-        .args(base(&ids))
-        .args(["--driver=fake", "--container-runtime=runc"])
-        .output()
-        .expect("spawn");
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("possible values: podman, oci"), "{stderr}");
+    for (runtime, says) in [
+        (
+            "podman",
+            "podman was removed: kbf runs containers with crun only",
+        ),
+        ("runc", "\"runc\" is not a container runtime: oci"),
+    ] {
+        let out = Command::new(BIN)
+            .args(base(&ids))
+            .args(["--driver=fake", &format!("--container-runtime={runtime}")])
+            .output()
+            .expect("spawn");
+        assert_eq!(out.status.code(), Some(2), "{runtime}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{runtime}: {stderr}");
+    }
 }
 
 /// The exit status of `child`, a daemon expected to refuse to start, waited for up to
@@ -1220,7 +1295,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
     ] {
         let dir = tls(&format!("zero-{name}"));
         let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
-        let (bin, podman_log) = podman_stub(&format!("zero-{name}-bin"));
+        let (bin, podman_log) = container_bin(&format!("zero-{name}-bin"));
         let log = dir.join("stderr");
         let path = format!(
             "{}:{}",
@@ -1232,6 +1307,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
             .args(base(&dir))
             .args([
                 "--driver=container".to_owned(),
+                OCI_RUNTIME.to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
                 format!("--data-dir={}", dir.display()),
                 format!("--id-files={}", ids.display()),
@@ -1576,14 +1652,10 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     assert_ne!(second_said.instance_id, first_said.instance_id);
 }
 
-/// The per-architecture manifest the stub's image store holds for a pinned image.
+/// The per-architecture manifest whose digest names the pinned image the store holds.
 #[cfg(target_os = "linux")]
 const MANIFEST: &[u8] =
     br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
-/// An image index (a multi-architecture list).
-#[cfg(target_os = "linux")]
-const INDEX: &[u8] =
-    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
 
 /// `--image`'s value for the busybox image whose manifest is `bytes`.
 #[cfg(target_os = "linux")]
@@ -1596,16 +1668,15 @@ fn image_by(hex: &str) -> String {
     format!("docker://registry.test/tools/busybox@sha256:{hex}")
 }
 
-/// Puts `bytes` in the stub's image store (see `src/bin/kbf-podman-stub.rs`) as image
-/// `img1`'s manifest, under the digest of `bytes`, and makes the stub know `img1`.
+/// Puts the unpacked image whose manifest is `bytes` in the node's image store under
+/// `dir` (the daemon's `--data-dir`), where a fetch and unpack leaves it
+/// (`<data>/leases/oci-images/<hex>/rootfs`): the daemon finds it with one `stat`, and
+/// fetches nothing.
 #[cfg(target_os = "linux")]
-fn store_manifest(bin: &Path, bytes: &[u8]) {
-    let digest = format!("sha256:{}", kbf_daemon::cas::digest_of(bytes).hash);
-    let dir = bin.join("store/img1");
-    std::fs::create_dir_all(&dir).expect("mkdir store");
-    let file = kbf_driver_container::image::manifest_file(&digest);
-    std::fs::write(dir.join(file), bytes).expect("write manifest");
-    std::fs::write(bin.join("image-id"), "img1\n").expect("image id");
+fn unpacked_image(dir: &Path, bytes: &[u8]) {
+    let hex = kbf_daemon::cas::digest_of(bytes).hash;
+    let root = dir.join("leases/oci-images").join(hex).join("rootfs");
+    std::fs::create_dir_all(root).expect("an unpacked image");
 }
 
 /// The container driver's flags for the daemon in `dir`, against the server `base`
@@ -1615,6 +1686,7 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
     let (_, cgroup_flags) = cgroup_tree(dir, "cpu memory pids");
     let mut flags = vec![
         "--driver=container".to_owned(),
+        OCI_RUNTIME.to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
@@ -1625,60 +1697,53 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
 }
 
 /// Catches a container node that starts while an image it is pinned to (`--image`)
-/// cannot run on it, instead of exiting with status 2 and the fix: an image missing
-/// from its store started anyway (warned about and continued), its refusal without the
-/// `podman pull <repo>@sha256:<digest>` that fixes it, an image index digest taken for
-/// one architecture's manifest (`manifest_kind` not asked), a tag accepted, only the
-/// first `--image` checked (a good image first, an index second), and only the last
-/// one deciding (an index first, a good image second). Each daemon
-/// still running after 30 s has started, and fails the test. Linux only, as the
-/// driver is.
+/// cannot run on it, instead of exiting with status 2 and the reason: an image that is
+/// not in the node's store and cannot be fetched (the registry is not there) started
+/// anyway (warned about and continued), a tag accepted, only the first `--image` checked
+/// (a good image first, one that cannot be fetched second), and only the last one
+/// deciding (the other way round). Each daemon still running after 30 s has started, and
+/// fails the test. An image whose digest names an index is refused by the fetch before
+/// anything is unpacked: that is `tests/fake_podman.rs`'s (`fake_oci`), which has a
+/// registry to serve one. Linux only, as the driver is.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
     let ids = id_files("image-refused-ids", "65536");
     let digest = kbf_daemon::cas::digest_of(MANIFEST).hash;
     let tagged = format!("docker://registry.test/tools/busybox:1@sha256:{digest}");
-    let index = "names an image index; name the per-architecture manifest digest";
-    /// (name, the images, what the stub's store holds, what the refusal says)
-    type Case = (&'static str, Vec<String>, &'static [&'static [u8]], String);
-    let cases: [Case; 5] = [
+    // A registry address nothing listens on: the fetch cannot connect. Another digest
+    // than the stored image's: the store is keyed by digest alone, whatever the repository.
+    let other = kbf_daemon::cas::digest_of(b"an image no registry serves").hash;
+    let unfetchable = format!("docker://127.0.0.1:1/tools/busybox@sha256:{other}");
+    let cannot_fetch = "127.0.0.1:1/v2/tools/busybox/manifests/sha256:";
+    /// (name, the images, whether the good image is in the store, what the refusal says)
+    type Case = (&'static str, Vec<String>, bool, String);
+    let cases: [Case; 4] = [
         (
             "image-missing",
-            vec![image_of(MANIFEST)],
-            &[],
-            format!("podman pull registry.test/tools/busybox@sha256:{digest}"),
+            vec![unfetchable.clone()],
+            false,
+            cannot_fetch.to_owned(),
         ),
-        (
-            "image-index",
-            vec![image_of(INDEX)],
-            &[INDEX],
-            index.to_owned(),
-        ),
-        (
-            "image-tag",
-            vec![tagged],
-            &[MANIFEST],
-            "names a tag".to_owned(),
-        ),
+        ("image-tag", vec![tagged], true, "names a tag".to_owned()),
         (
             "image-second",
-            vec![image_of(MANIFEST), image_of(INDEX)],
-            &[MANIFEST, INDEX],
-            index.to_owned(),
+            vec![image_of(MANIFEST), unfetchable.clone()],
+            true,
+            cannot_fetch.to_owned(),
         ),
         (
             "image-first",
-            vec![image_of(INDEX), image_of(MANIFEST)],
-            &[INDEX, MANIFEST],
-            index.to_owned(),
+            vec![unfetchable, image_of(MANIFEST)],
+            true,
+            cannot_fetch.to_owned(),
         ),
     ];
     for (name, images, stored, says) in cases {
         let dir = tls(name);
-        let (bin, _) = podman_stub(&format!("{name}-bin"));
-        for bytes in stored {
-            store_manifest(&bin, bytes);
+        let (bin, podman_log) = container_bin(&format!("{name}-bin"));
+        if stored {
+            unpacked_image(&dir, MANIFEST);
         }
         let path = format!(
             "{}:{}",
@@ -1701,13 +1766,14 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
             !log.contains(FIRST_ATTEMPT),
             "{name}: it tried a session: {log}"
         );
+        assert!(!podman_log.exists(), "{name}: podman ran: {log}");
     }
 }
 
 /// Catches the images a container node is pinned to (`--image`) missing from the
 /// `NodeStatus` it sends after the Welcome (`GET /v1/nodes` would not show what the
 /// node can run), listed unsorted or more than once, and a node whose images are all
-/// in its store, as manifests, refusing to start. Three images given out of order, the
+/// in its store, refusing to start. Three images given out of order, the
 /// first one twice, with distinct images at both ends: a node that drops the first or
 /// the last `--image` from its status fails the set.
 #[cfg(target_os = "linux")]
@@ -1716,12 +1782,12 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
     let dir = tls("image-listed");
     let front = front::Front::start(&dir);
     let ids = id_files("image-listed-ids", "65536");
-    let (bin, _) = podman_stub("image-listed-bin");
+    let (bin, _) = container_bin("image-listed-bin");
     let other = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
     let third = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#;
-    store_manifest(&bin, MANIFEST);
-    store_manifest(&bin, other);
-    store_manifest(&bin, third);
+    for manifest in [MANIFEST, other, third] {
+        unpacked_image(&dir, manifest);
+    }
     let mut images = [image_of(MANIFEST), image_of(other), image_of(third)];
     images.sort();
     let given = [

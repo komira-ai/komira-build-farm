@@ -11,8 +11,9 @@
 //! so the daemon needs no profile of its own.
 //!
 //! A helper runs one program, never a shell: this daemon's own binary in its
-//! `__chown-dirs` mode (descriptor-relative, never following a symlink) or the node's
-//! `find`, `mkdir`, `tar` and `touch`, from a read-only bind of the host's `/usr`. Its
+//! `__chown-dirs` mode (descriptor-relative, never following a symlink) or its
+//! `__unpack-layers` mode, or the node's `find`, from a read-only bind of the host's
+//! `/usr`. Its
 //! root is a small directory of mount points ([`prepare_rootfs`]) shared by all helpers.
 //! The directories it works on are bound at `/t/0`, `/t/1`, ... so no per-lease path
 //! is ever created in the shared root.
@@ -85,80 +86,33 @@ pub(crate) fn remove_job(dir: &Path) -> Job {
     }
 }
 
-/// The mount points the driver binds over in an unpacked image, as directories, and the
-/// files (`/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`) it binds over.
-const MOUNT_DIRS: [&str; 13] = [
-    "dev",
-    "proc",
-    "sys",
-    "etc",
-    "tmp",
-    "var/tmp",
-    "run",
-    "root",
-    "kbf/root",
-    "dev/pts",
-    "dev/shm",
-    "dev/mqueue",
-    "sys/fs/cgroup",
-];
-const MOUNT_FILES: [&str; 3] = ["etc/hosts", "etc/hostname", "etc/resolv.conf"];
-
-/// The name of the tar inside the directory `exported` that [`unpack_jobs`] binds.
-pub(crate) const TAR_FILE: &str = "image.tar";
-
-/// The four jobs that unpack `exported/image.tar` into `stage/rootfs`, in order, in a container
-/// with an action's user namespace (so the files are owned by the ids the action sees):
-/// the root directory, which `stage` (open to the container's root) lets it make; the
-/// extraction; the mount points; the files. The tar's own directories keep their
-/// modes (`--no-overwrite-dir` leaves the ones made before alone: `/tmp` is the
-/// image's, made by the tar).
-pub(crate) fn unpack_jobs(stage: &Path, exported: &Path) -> [Job; 4] {
-    let binds = || {
-        vec![
+/// The job that unpacks the layer files `layers` of the directory `blobs` into
+/// `stage/rootfs` ([`crate::unpack_layers`]), with this daemon's binary `daemon`, in a
+/// container with an action's user namespace (so the files are owned by the ids the
+/// action sees). `stage` is open to the container's root, which makes the root
+/// directory in it; `blobs` is read-only.
+pub(crate) fn unpack_job(daemon: &Path, stage: &Path, blobs: &Path, layers: &[String]) -> Job {
+    let mut args = vec![
+        DAEMON_BINARY.to_owned(),
+        crate::unpack_layers::ARG.to_owned(),
+        bound_at(0),
+        bound_at(1),
+    ];
+    args.extend(layers.iter().cloned());
+    Job {
+        binds: vec![
             Bind {
                 source: stage.to_owned(),
                 writable: true,
             },
             Bind {
-                source: exported.to_owned(),
+                source: blobs.to_owned(),
                 writable: false,
             },
-        ]
-    };
-    let job = |args: Vec<String>| Job {
-        binds: binds(),
-        daemon: None,
+        ],
+        daemon: Some(daemon.to_owned()),
         args,
-    };
-    let strings = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
-    let under = |names: &[&str]| {
-        names
-            .iter()
-            .map(|n| format!("/t/0/rootfs/{n}"))
-            .collect::<Vec<_>>()
-    };
-    let mut mkdir = strings(&["/usr/bin/mkdir", "-p", "--"]);
-    mkdir.extend(under(&MOUNT_DIRS));
-    let mut touch = strings(&["/usr/bin/touch", "--"]);
-    touch.extend(under(&MOUNT_FILES));
-    [
-        job(strings(&["/usr/bin/mkdir", "/t/0/rootfs"])),
-        job(strings(&[
-            "/usr/bin/tar",
-            "--extract",
-            "--preserve-permissions",
-            "--same-owner",
-            "--numeric-owner",
-            "--no-overwrite-dir",
-            "--file",
-            "/t/1/image.tar",
-            "--directory",
-            "/t/0/rootfs",
-        ])),
-        job(mkdir),
-        job(touch),
-    ]
+    }
 }
 
 /// A directory bound into a helper.
@@ -302,4 +256,21 @@ pub(crate) fn prepare_rootfs(dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Copies the daemon's binary to `<scratch>/oci-bin/kbf-daemon` (mode 0755, replaced
+/// atomically) and returns that path. A helper with an action's ids cannot search the
+/// directories the binary was installed or built under (a home directory is 0750), but the
+/// scratch directory was checked to be searchable by others.
+pub(crate) fn install_daemon(scratch: &Path, daemon: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch.join("oci-bin");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    let staged = dir.join(format!(".kbf-daemon-{}", std::process::id()));
+    std::fs::copy(daemon, &staged)?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    let target = dir.join("kbf-daemon");
+    std::fs::rename(&staged, &target)?;
+    Ok(target)
 }

@@ -2,10 +2,13 @@
 //! runtime, shared by the test binaries that run the OCI backend without real `crun`.
 //!
 //! The stand-in is the program `kbf-fake-crun` (`tests/bin/fake_crun.rs`, which lists
-//! its knobs and records). The image is already unpacked in the node's image store
-//! (a directory a real unpack would have made), so a lease finds it with one `stat`,
-//! and the stand-in `podman` beside the `crun` link is never called on the action path:
-//! [`FakeOci::podman_calls`] is how a test checks that.
+//! its knobs and records). By default the image is already unpacked in the node's image
+//! store (a directory a real unpack would have made), so a lease finds it with one
+//! `stat`; [`FakeOci::fetching`] leaves it to be fetched from a registry in this process
+//! and unpacked, which the stand-in `crun` does by running the daemon's own
+//! `__unpack-layers` mode. A `podman` beside the `crun` link is the same program as a
+//! stub that fails and records that it ran: [`FakeOci::podman_calls`] is how a test
+//! checks that nothing ever runs it, and the configuration's `podman` names it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use kbf_driver_container::{
 use kbf_types::Resources;
 
 use super::fake::{MANIFEST, sha256};
+use super::registry::{FakeRegistry, Image};
 use super::{Spec, exists, store_action, work};
 
 /// The stand-in `crun` the tests link: `kbf-fake-crun`.
@@ -39,8 +43,8 @@ pub struct FakeOci {
     pub dir: PathBuf,
     /// The stand-in `crun`'s state and knobs.
     pub state: PathBuf,
-    /// The stand-in `podman`'s (it must stay unused on the action path).
-    pub podman_state: PathBuf,
+    /// The registry in this process, for a fake made with [`FakeOci::fetching`].
+    pub registry: Option<FakeRegistry>,
     pub cgroup: PathBuf,
     pub scratch: PathBuf,
     pub config: PodmanConfig,
@@ -61,6 +65,19 @@ fn id_files(dir: &Path) -> IdFiles {
     files
 }
 
+/// A directory of `newuidmap` and `newgidmap` that satisfy the start-up check.
+fn id_tools(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tools = dir.join("id-tools");
+    std::fs::create_dir_all(&tools).expect("mkdir tools");
+    for name in ["newuidmap", "newgidmap"] {
+        let path = tools.join(name);
+        std::fs::write(&path, b"").expect("tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+    }
+    tools
+}
+
 impl FakeOci {
     pub fn new(name: &str) -> Self {
         Self::with(name, |_| {})
@@ -68,26 +85,41 @@ impl FakeOci {
 
     /// [`FakeOci::new`], with `configure` applied to the runtime's configuration last.
     pub fn with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
+        Self::build(name, None, configure)
+    }
+
+    /// A fake whose image is not in the node's store: `registry` serves it, and the
+    /// first lease (or check) fetches and unpacks it.
+    pub fn fetching(name: &str, registry: FakeRegistry) -> Self {
+        Self::build(name, Some(registry), |_| {})
+    }
+
+    fn build(
+        name: &str,
+        registry: Option<FakeRegistry>,
+        configure: impl FnOnce(&mut PodmanConfig),
+    ) -> Self {
         let dir = super::scratch(&format!("fake-oci-{name}"));
         let state = dir.join("crun-state");
-        let podman_state = dir.join("state");
         let cgroup = dir.join("cgroup");
         let scratch = dir.join("scratch");
-        for d in [&state, &podman_state, &cgroup.join("actions"), &scratch] {
+        for d in [&state, &cgroup.join("actions"), &scratch] {
             std::fs::create_dir_all(d).expect("mkdir");
         }
         let crun = dir.join("crun");
         std::os::unix::fs::symlink(program(), &crun).expect("link crun");
         let podman = dir.join("podman");
-        std::os::unix::fs::symlink(super::fake::program(), &podman).expect("link podman");
+        std::os::unix::fs::symlink(program(), &podman).expect("link podman");
         super::fake::link_act(&dir);
-        // The unpacked image: where a real unpack of the pinned image would leave it.
-        let hex = sha256(MANIFEST);
-        let rootfs = scratch
-            .join("oci-images")
-            .join(hex.trim_start_matches("sha256:"))
-            .join("rootfs");
-        std::fs::create_dir_all(rootfs.join("kbf/root")).expect("rootfs");
+        if registry.is_none() {
+            // The unpacked image: where a real unpack of the pinned image would leave it.
+            let hex = sha256(MANIFEST);
+            let rootfs = scratch
+                .join("oci-images")
+                .join(hex.trim_start_matches("sha256:"))
+                .join("rootfs");
+            std::fs::create_dir_all(rootfs.join("kbf/root")).expect("rootfs");
+        }
         let since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after 1970");
@@ -99,6 +131,10 @@ impl FakeOci {
         config.container_runtime = ContainerRuntime::Oci;
         config.oci.runtime = crun;
         config.oci.id_files = id_files(&dir.join("ids"));
+        config.oci.id_tool_path = Some(id_tools(&dir).into_os_string());
+        if let Some(registry) = &registry {
+            config.oci.plain_http_registries = vec![registry.addr.clone()];
+        }
         // The stand-in runs as the test's user, so no other id needs to reach the lease,
         // and a home directory closed to others is fine.
         config.oci.check_search = false;
@@ -112,7 +148,7 @@ impl FakeOci {
         Self {
             dir,
             state,
-            podman_state,
+            registry,
             cgroup,
             scratch,
             config,
@@ -145,13 +181,21 @@ impl FakeOci {
         self.lines("events")
     }
 
-    /// The verbs the stand-in `podman` was run with: none on the action path.
+    /// The times the `podman` stub was run: never, on any path.
     pub fn podman_calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.podman_state.join("calls"))
+        std::fs::read_to_string(self.dir.join("podman-ran"))
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// The registry's requests so far.
+    pub fn registry_requests(&self) -> Vec<String> {
+        self.registry
+            .as_ref()
+            .map(FakeRegistry::requests)
+            .unwrap_or_default()
     }
 
     /// The `config.json` of the last action's bundle.
@@ -162,21 +206,35 @@ impl FakeOci {
 
     /// The image's directory in the node's image store.
     pub fn image_dir(&self) -> PathBuf {
-        let hex = sha256(MANIFEST);
-        self.scratch
-            .join("oci-images")
-            .join(hex.trim_start_matches("sha256:"))
+        self.image_dir_of(&sha256(MANIFEST))
     }
 
-    /// Makes the image not yet unpacked, and the stand-in `podman`'s store hold it, as
-    /// a node that has pulled it and not run it yet.
-    pub fn pulled_not_unpacked(&self) {
-        super::force_remove(&self.image_dir());
-        std::fs::write(self.podman_state.join("image-id"), "img1\n").expect("image id");
-        let dir = self.podman_state.join("store/fake-images/img1");
-        std::fs::create_dir_all(&dir).expect("mkdir store");
-        let file = kbf_driver_container::image::manifest_file(&sha256(MANIFEST));
-        std::fs::write(dir.join(file), MANIFEST).expect("manifest");
+    /// The directory in the node's image store of the image with manifest `digest`.
+    pub fn image_dir_of(&self, digest: &str) -> PathBuf {
+        self.scratch
+            .join("oci-images")
+            .join(digest.trim_start_matches("sha256:"))
+    }
+
+    /// The names in the image store's directory.
+    pub fn image_store(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.scratch.join("oci-images"))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Publishes `image` on this fake's registry and returns the reference an action
+    /// names it by.
+    pub fn publish(&self, image: &Image) -> String {
+        let registry = self.registry.as_ref().expect("a fake made with `fetching`");
+        registry.publish(image);
+        image.reference(&registry.addr, "test/tiny")
     }
 
     pub fn lease_dir(&self, seq: u64) -> PathBuf {

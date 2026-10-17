@@ -18,6 +18,8 @@
 //! - `continuation`: no comment line inside a continued directive. systemd 241 and
 //!   later skip one (systemd.syntax(7)); 240 skips one only at the start of the line,
 //!   and 239 and older join it into the value, so its words become arguments.
+//! - `runtime`: a mode that runs builds passes `--container-runtime=oci` and
+//!   `--oci-runtime=`, and no file of its unit names Podman ([`super::runtime`]).
 //! - `exec`: `ExecStart=` is `<KBF_BIN_DIR>/kbf <mode>`, this unit's mode (a unit
 //!   that starts another mode, or an old binary, under this mode's name).
 //! - `slice`: the unit is in `kbf.slice`.
@@ -92,7 +94,7 @@ use kbf_host::step::Cmd;
 use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
 use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, stop, stores};
+use super::{cpuset, credential, handover, runtime, stop, stores};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -597,6 +599,18 @@ fn rules(
                 config.bin_dir
             ),
         );
+    }
+
+    // runtime
+    if mode.runs_builds() {
+        let texts: Vec<(&str, &str)> = files
+            .files
+            .iter()
+            .map(|(name, text)| (name.as_str(), text.as_str()))
+            .collect();
+        for how in runtime::check(&name, unit, &texts) {
+            fail("runtime", how);
+        }
     }
 
     // slice

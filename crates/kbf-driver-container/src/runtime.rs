@@ -73,13 +73,12 @@ pub const KIND: &str = "action";
 /// Where and how the driver runs containers.
 #[derive(Clone, Debug)]
 pub struct PodmanConfig {
-    /// The `podman` program: the runtime with `--container-runtime=podman`, and with
-    /// `oci` the source of images (pulled and exported once per digest, never per action).
+    /// The `podman` program of the Podman engine, which only the fake-Podman tests select
+    /// (`container_runtime` `Podman`); nothing of the OCI backend runs it.
     pub podman: PathBuf,
-    /// Which runtime runs the actions' containers (`--container-runtime`).
+    /// Which runtime runs the actions' containers: `Oci`, the only one a flag names.
     pub container_runtime: ContainerRuntime,
-    /// The OCI backend's runtime and id files (`--oci-runtime`), used with
-    /// `container_runtime` `oci`.
+    /// The OCI backend's runtime and id files (`--oci-runtime`).
     pub oci: OciConfig,
     /// The directory each lease's scratch directory is made in.
     pub scratch: PathBuf,
@@ -155,7 +154,7 @@ struct Cached {
 }
 
 impl PodmanConfig {
-    /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
+    /// A configuration for `owner`'s containers run by `crun` (the OCI backend), cgroup v2 at
     /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`kbf_daemon::UPLOAD_DEADLINE`],
     /// [`ContainerLimits::DEFAULT`] and
@@ -164,7 +163,7 @@ impl PodmanConfig {
     pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
         Self {
             podman: PathBuf::from("podman"),
-            container_runtime: ContainerRuntime::Podman,
+            container_runtime: ContainerRuntime::Oci,
             oci: OciConfig::default(),
             scratch,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
@@ -289,11 +288,13 @@ impl<C: Cas> PodmanRuntime<C> {
     /// cache cannot be opened, it warns and runs uncached.
     pub fn new(config: PodmanConfig, cas: Arc<C>) -> Result<Self, StartError> {
         config.check()?;
-        let podman = Podman::new(config.podman.clone());
         let engine = match config.container_runtime {
-            ContainerRuntime::Podman => Engine::Podman(Arc::new(PodmanBackend::new(podman))),
+            ContainerRuntime::Podman => {
+                let podman = Podman::new(config.podman.clone());
+                Engine::Podman(Arc::new(PodmanBackend::new(podman)))
+            }
             ContainerRuntime::Oci => Engine::Oci(
-                Oci::new(&config.oci, &config.scratch, podman, &config.cgroup_parent)
+                Oci::new(&config.oci, &config.scratch, &config.cgroup_parent)
                     .map_err(|e| StartError::Oci(e.to_string()))?,
             ),
         };

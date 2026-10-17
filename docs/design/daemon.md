@@ -325,8 +325,16 @@ native-whole-machine`.
 
 ## The container driver
 
-`PodmanRuntime` runs each `action` lease in a fresh rootless Podman container that is
-never reused. Each lease goes through six steps.
+**kbf runs containers with `crun` only.** Podman is not a runtime a node can be given:
+measured on a node, Podman took about twenty seconds to launch a container and `crun`
+milliseconds, so the node's runtime is the OCI backend (below), the default and the
+only value of `--container-runtime`. The steps and tables in this section that name
+Podman describe the path the code still holds for its own tests until it is deleted;
+what a node runs is the OCI backend section, and the six steps are the same code for it.
+
+`PodmanRuntime` (the name stays until the Podman code is deleted) runs each `action`
+lease in a fresh rootless container that is never reused. Each lease goes through six
+steps.
 
 1. **Prepare.**
    - Fetch the `Action` and `Command` from the CAS and verify them.
@@ -334,9 +342,11 @@ never reused. Each lease goes through six steps.
      on the `Command` for clients older than REAPI 2.2). It must be
      `docker://<repo>@sha256:<digest>`: a tag is refused, and so is a digest that names
      an image index (a multi-architecture list) rather than one architecture's manifest.
-     The driver tells the two apart by reading the manifest the node's image store
-     keeps under that digest, after checking that its bytes hash to the digest. The image
-     must already be in the node's store; nodes never pull at action time.
+     The driver tells the two apart by fetching the manifest from the image's registry
+     by that digest: its bytes must hash to the digest, and an index is refused. The
+     image is unpacked in the node's image store once per digest, on the first lease
+     that names it or at start for a pinned image (below), and every byte of it was
+     checked against a digest on the way in.
    - Check the `Command`: it must have arguments; the working directory and every output
      path must be relative, without `.`, `..` or empty components.
    - Write the input root into the lease's scratch directory. Every name in a client's
@@ -368,11 +378,11 @@ never reused. Each lease goes through six steps.
 **Pinned images.** `kbf-daemon --driver container --image docker://<repo>@sha256:<d>`
 (repeatable) names images the node is set up to run. At start, after its cgroup is
 set up and before it connects, the daemon checks each as the prepare step checks a
-lease's image (`PodmanRuntime::check_pinned`): named by digest, in its user's image
-store, and one architecture's manifest. The first that is not stops the daemon with
-exit status 2 and the fix: for a missing image, `podman pull <repo>@sha256:<d>`, to
-run as the daemon's user; for an index digest, to name the per-architecture manifest
-digest. The images are listed, sorted and each once, in the node's `NodeStatus`
+lease's image (`PodmanRuntime::check_pinned`): named by digest, fetched into the node's
+image store if it is not there (from its registry, every byte checked against a digest),
+and one architecture's manifest. The first that cannot be stops the daemon with exit
+status 2 and the reason: a registry that cannot be reached or refuses, a blob that is not
+its digest, or an index digest (name the per-architecture manifest digest). The images are listed, sorted and each once, in the node's `NodeStatus`
 (`container_images`), which `GET /v1/nodes` shows as `software.container_images`. They
 route no work: placement does not match an action's image against them, and an action
 may still name an image the node was not pinned to (it is checked at prepare as
@@ -404,12 +414,14 @@ on the lease cgroup, then a forced removal in the clean step.
 
 ### The OCI backend (`--container-runtime=oci`)
 
-`kbf-daemon --container-runtime=oci [--oci-runtime=/usr/bin/crun]` runs each action in a
-fresh rootless sandbox made by `crun` directly, with no Podman on the action path. The
-default stays `podman`; the six driver steps, the lease cgroup, the watch, the OOM
-classification, output collection and the clean are the same code for both (`backend.rs`
-is the seam). `crun` is driven through the `runc` crate (containerd/rust-extensions,
-Apache-2.0) and `config.json` is built with `oci-spec`'s typed builders.
+`kbf-daemon --container-runtime=oci [--oci-runtime=/usr/bin/crun]` (the default, and the
+only value) runs each action in a fresh rootless sandbox made by `crun` directly, with no
+Podman anywhere: not on the action path, not for images, not in the deploy kit, not in
+host setup. The six driver steps, the lease cgroup, the watch, the OOM classification,
+output collection and the clean are the same code (`backend.rs` is the seam, and holds
+the Podman path's last code until it is deleted). `crun` is driven through the `runc`
+crate (containerd/rust-extensions, Apache-2.0) and `config.json` is built with
+`oci-spec`'s typed builders.
 
 Per action: the image is already unpacked (below); a helper container gives the lease's
 directories to the action's root; `config.json`, the `hosts` and `hostname` files are
@@ -453,27 +465,46 @@ state database is touched.
   trees (`SharedMount`: a host directory and a destination below `/kbf/root`) are bound
   read-only after the overlay; the tree store that fills them is not part of this
   backend.
-- **Helper containers** (`oci/helper.rs`) do what `podman unshare` does: a user namespace
-  with the daemon user as id 0 and the range as ids `1..`, so the action's root is `1:1`.
-  A helper runs one program, never a shell: this daemon's binary in its `__chown-dirs`
-  mode (with `--whole` trees, so the whole hand-over is one process and walks by
-  descriptor, never following a symlink), or the node's `find`, `mkdir`, `tar`, `touch`,
-  from a read-only bind of the host's `/usr`. `crun` creates the namespaces, so the only
+- **Helper containers** (`oci/helper.rs`) do the work that needs a user namespace with
+  the daemon user as id 0 and the range as ids `1..` (so the action's root is `1:1`), or,
+  for an image's unpack, an action's own mapping. A helper runs one program, never a
+  shell: this daemon's binary in its `__chown-dirs` mode (with `--whole` trees, so the
+  whole hand-over is one process and walks by descriptor, never following a symlink) or
+  its `__unpack-layers` mode, or the node's `find` (to empty a directory the container's
+  ids own), from a read-only bind of the host's `/usr`. `crun` creates the namespaces, so the only
   AppArmor grant for user namespaces is `crun`'s shipped profile, and the daemon needs
   none of its own. A helper's cgroup is `<actions parent>/<id>`, named in its config:
   left to itself `crun` makes one beside the daemon's own, and kills it on removal.
-- **The image store** (`oci/image.rs`): `<scratch>/oci-images/<hex>/rootfs`, unpacked once
-  per digest, off the action path. The node's Podman store is where an image is pulled
-  and its manifest checked (`podman pull <repo>@sha256:<d>`, as before); the first lease,
-  or the `--image` check at start, runs `podman export` and four helper containers that
-  extract the tar with an action's mapping, so every file is owned by the host id the
-  action sees as the image's own id. One flight per digest. After that a lease costs one
-  `stat`. Tar's extended attributes are not extracted (file capabilities are lost).
-- **Node requirements** beyond the Podman path's: `crun`, `uidmap`, one subordinate range
-  of 65,536, every directory from `/` to `--data-dir` searchable by others (the
-  container's ids are not the daemon user's: `chmod o+x`), kernel overlayfs in a user
-  namespace (5.11 or later). The daemon checks the range, the paths and the files at
-  start and refuses to start naming what is wrong.
+- **The image store** (`oci/image.rs`, and the `kbf-image` crate): `<scratch>/oci-images/<hex>/rootfs`,
+  keyed by the manifest digest alone and unpacked once per digest, off the action path.
+  The daemon fetches the image itself, anonymously, over https (hyper over rustls, the
+  host's roots; a `Bearer` challenge is answered with a pull token, and a blob's
+  redirect target gets no credentials): the manifest by the pinned digest, which its
+  bytes must hash to, and which must be one image, not an index (a Docker schema 1
+  manifest, a foreign layer and a zstd layer are refused too); then the config and every
+  layer blob, each hashed as it is written and compared with the manifest's digest and
+  size before use (a failed one is deleted), and the image's own platform, when its
+  config states one, must be the node's. Limits bound a wrong pin: 4 MiB of manifest, 128
+  layers, 16 GiB of blobs. One helper container then applies the layers in order with
+  `kbf-daemon __unpack-layers`, in an action's user namespace, so every file is owned by
+  the host id the action sees as the image's own id: `.wh.` whiteouts and `.wh..wh..opq`
+  opaque markers apply to lower layers only, a path is resolved inside the root and never
+  outside it (`..` in an entry is refused, a symlink is followed as a chroot would), the
+  owner is set before the mode (`chown` clears setuid), an id above 65,535 is an error,
+  and device nodes and fifos are skipped. One flight per digest; the blobs and the stage
+  are removed whatever happens. After that a lease costs one `stat`. Tar's extended
+  attributes are not extracted (file capabilities are lost). A node needs egress to the
+  registries of its images (`registry-1.docker.io` for `docker.io`, `gcr.io`, ...).
+- **Node requirements:** `crun`; `newuidmap` and `newgidmap` (package `uidmap`) on the
+  daemon's `PATH`, setuid root or holding file capabilities; one subordinate range of
+  65,536 for the daemon's user; every directory from `/` to `--data-dir` searchable by
+  others (the container's ids are not the daemon user's: `chmod o+x`); kernel overlayfs
+  in a user namespace (5.11 or later); cgroup v2 delegated to the daemon's unit
+  (`Delegate=yes`); and whatever permits unprivileged user namespaces for `crun` (its
+  shipped AppArmor profile on Ubuntu 24.04). The daemon checks the range, the paths, the
+  files and the two id tools at start and refuses to start naming what is wrong.
+  Lingering and `XDG_RUNTIME_DIR` are not needed: `crun` always runs with an explicit
+  `--root` inside the lease.
 - **Per-action overhead.** The stand-in `crun` test (`fake_oci.rs`) times the lifecycle
   and counts the processes (four, against the Podman path's more); what a real node adds
   is to be measured on a build host: the latency of a helper container (user namespace,
@@ -622,8 +653,9 @@ behind the real server and a real client, on a hosted x86_64 runner.
 It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
 `crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
 its execution platform passes on as `container-image`), starts one `kbf-server` and one
-`kbf-daemon --driver container` as a `Delegate=yes` system service with
-`--actions-memory-max-gib 8`, checks the cgroup layout the daemon made in its unit
+`kbf-daemon --driver container --image <the sample's image>` as a `Delegate=yes` system
+service with `--actions-memory-max-gib 8` (the daemon fetches and unpacks the image before
+it says `Hello`; no tool pulls it ahead), checks the cgroup layout the daemon made in its unit
 (`supervisor/` holds the daemon; the unit's cgroup and `actions/` enable `cpu memory
 pids`), and builds the sample project with pinned buck2:
 
@@ -635,9 +667,9 @@ pids`), and builds the sample project with pinned buck2:
   default first rung, 4 GiB, would pass the hog's cap), presses
   its 2 GiB cap into swap until the swap watch kills it, and the server's log must
   hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
-- `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running
-  container labelled with the node id and a `kbf-lease-*` cgroup is under `actions/`;
-  afterwards no labelled container and no lease directory is left;
+- `//:pause` under a fresh salt: while it sleeps, exactly one `crun` container exists
+  (one state directory under `<lease>/crun/` of the daemon's leases) and a `kbf-lease-*`
+  cgroup is under `actions/`; afterwards no container and no lease directory is left;
 - `//:pause` again, with the daemon killed mid-lease and a new one started: the server
   reruns the lease within 10 s of the new daemon's welcome, and the build succeeds on
   the farm.

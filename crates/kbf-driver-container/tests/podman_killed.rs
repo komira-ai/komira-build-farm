@@ -1,4 +1,4 @@
-//! A killed daemon's container action, against real rootless Podman and a delegated
+//! A killed daemon's container action, against real rootless `crun` and a delegated
 //! cgroup (issue #155).
 //!
 //! Run by `cargo xtask podman-tests`, like `podman.rs` (the test is `#[ignore]` with
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use kbf_daemon::Runtime as _;
 use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
 use kbf_types::Resources;
-use support::real::{Cell, delegation, describe, podman, sh};
+use support::real::{Cell, crun, delegation, describe, sh};
 use support::store_action;
 
 /// Set in the daemon's environment: the test runs its daemon half.
@@ -40,7 +40,7 @@ const PROMPT: Duration = Duration::from_secs(30);
 /// daemon started again. A restarted runtime then removes what is left (container,
 /// cgroup, scratch directory), as before.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_killed_daemons_container_action_dies_with_it() {
     if std::env::var_os(ROLE).is_some() {
         return be_the_daemon().await;
@@ -82,10 +82,11 @@ async fn a_killed_daemons_container_action_dies_with_it() {
     let left = populated(&lease).then(|| describe(&lease));
 
     // What a restarted daemon does, which also ends a red run's container.
-    let config = PodmanConfig::new(scratch.clone(), parent.to_owned(), OWNER.to_owned());
+    let mut config = PodmanConfig::new(scratch.clone(), parent.to_owned(), OWNER.to_owned());
+    config.oci.runtime = crun();
     PodmanRuntime::new(config, Arc::new(MemoryCas::new())).expect("restart");
     let name = format!("kbf-lease-{TERM}-1");
-    let names = podman(&["ps", "--all", "--format={{.Names}}"]);
+    let directory_left = scratch.join(&name).exists();
     let cgroup = lease.parent().expect("the test's cgroup");
     let _ = std::fs::remove_dir(cgroup);
     support::force_remove(&scratch);
@@ -94,7 +95,7 @@ async fn a_killed_daemons_container_action_dies_with_it() {
         "the container's processes outlived the killed daemon by {PROMPT:?}:{}",
         left.unwrap_or_default()
     );
-    assert!(!names.lines().any(|n| n == name), "container left: {names}");
+    assert!(!directory_left, "lease directory left: {name}");
     assert!(!lease.exists(), "lease cgroup left");
 }
 

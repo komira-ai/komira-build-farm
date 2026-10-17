@@ -1,24 +1,16 @@
-//! What an action's container gets beyond its files, against real rootless Podman: its
-//! environment, and its pids, `/dev/shm` and ulimit limits.
+//! What an action's container gets beyond its files, against real rootless `crun`: its
+//! environment, and its pids, `/dev/shm` and ulimit limits. The bundle the driver writes
+//! is all there is to it: no image `ENV`, no node configuration (no `containers.conf`) and
+//! no runtime default is read, so what the action sees is what these tests name.
 //!
 //! Run by `cargo xtask podman-tests`, like `podman.rs` (each test is `#[ignore]` with
-//! that reason), with `CONTAINERS_CONF_OVERRIDE` naming
-//! `fixtures/containers-override.conf`: a node configuration that sets its own
-//! environment variable, pids limit, `/dev/shm` size and ulimits. A test fails if the
-//! variable is not set, so the override cannot be dropped silently.
+//! that reason).
 
 mod support;
 
 use kbf_driver_container::ContainerLimits;
 use support::Spec;
-use support::real::{Cell, sh, var};
-
-/// Fails unless the run has the node configuration the tests are meant to resist.
-fn assert_override() {
-    let file = var("CONTAINERS_CONF_OVERRIDE");
-    let text = std::fs::read_to_string(&file).expect("read the containers.conf override");
-    assert!(text.contains("pids_limit = 999"), "{file}: {text}");
-}
+use support::real::{Cell, sh};
 
 /// An action that prints its environment with nothing between it and the container's
 /// start: `/bin/env` run directly, no shell (a shell would add `PWD` and the like).
@@ -32,17 +24,15 @@ fn env_action(env: &[(&str, &str)]) -> Spec {
     spec
 }
 
-/// Catches anything but the `Command`'s variables reaching the action (the "drop
-/// `--unsetenv-all`" mutant): the image's `PATH`, Podman's own `container`, and the
-/// node's `containers.conf` `env` would each appear (Podman sets `TERM` only for a tty,
-/// which an action never has). A `Command` that sets
-/// `HOME` and `HOSTNAME` (with a value holding a space and an `=` besides) gets
-/// exactly its variables. One that sets neither gets the two Podman adds whatever
-/// `--unsetenv-all` says: `HOSTNAME=localhost` and the busybox image's root home.
+/// Catches anything but the `Command`'s variables reaching the action (the "add the
+/// image's `ENV`" and "pass the daemon's environment on" mutants): the image's `PATH` and
+/// the daemon's own variables would each appear. A `Command` that sets `HOME` and
+/// `HOSTNAME` (with a value holding a space and an `=` besides) gets exactly its
+/// variables. One that sets neither gets the two the driver adds: `HOSTNAME=localhost`
+/// and `HOME=/root`.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_action_sees_only_the_commands_environment() {
-    assert_override();
     let cell = Cell::new("env");
     let sorted = |stdout: &str| -> Vec<String> {
         let mut lines: Vec<String> = stdout.lines().map(str::to_owned).collect();
@@ -91,14 +81,12 @@ fn expected(limits: ContainerLimits) -> String {
     format!("{pids}\n{shm_kib}k\n{nofile}\n{nofile}\n{nproc}\n{nproc}\n0\n0\n")
 }
 
-/// Catches a limit left to Podman or the node's `containers.conf` (the "drop
-/// `--pids-limit`" mutant: on the hosted runners' Podman 4.9 `pids.max` then reads
-/// `max`, no limit at all, override or not), a limit that is not the configured one,
+/// Catches a limit left to the runtime's defaults (the "drop the pids limit" mutant:
+/// `pids.max` then reads `max`, no limit at all), a limit that is not the configured one,
 /// and the action not running as the container's root.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_configured_limits_hold_inside_the_container() {
-    assert_override();
     let limits = ContainerLimits {
         pids: 321,
         shm_mib: 7,
@@ -112,12 +100,11 @@ async fn the_configured_limits_hold_inside_the_container() {
     cell.assert_clean(1);
 }
 
-/// Catches defaults rootless Podman refuses on a stock host (a ulimit above the
-/// daemon's own hard limit fails `podman start`), and defaults that do not hold.
+/// Catches defaults a stock host refuses (a ulimit above the daemon's own hard limit
+/// fails the container's start), and defaults that do not hold.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_default_limits_hold_inside_the_container() {
-    assert_override();
     let cell = Cell::new("default-limits");
     let result = cell.run(1, &sh(LIMITS)).await.expect("ran");
     assert_eq!(result.exit_code, 0, "{}", cell.stdout(&result));
@@ -126,14 +113,14 @@ async fn the_default_limits_hold_inside_the_container() {
 }
 
 /// Catches a program the container cannot start answered as the farm's fault: on
-/// real Podman and crun, a bare `argv[0]` in a Command without `PATH` (the container
+/// real `crun`, a bare `argv[0]` in a Command without `PATH` (the container
 /// gets only the Command's environment), a bare name on a `PATH` that lacks it and a
 /// path that does not exist are the action's result, exit 127; a file without the
 /// executable bit and a directory are exit 126. Each with kbf's message naming the
 /// program and where it was looked up. The red run before the fix showed each as
 /// `RuntimeError::Failed` ("the container did not run to an exit").
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_program_the_container_cannot_start_is_the_actions_failure() {
     let cell = Cell::new("program");
     let action = |argv: &[&str], env: &[(&str, &str)]| {

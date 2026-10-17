@@ -1,5 +1,5 @@
 //! `kbf-cell m2`: the M2 test. Real buck2, through `kbf-server`, to `kbf-daemon --driver
-//! container`, every action in a rootless Podman container of a pinned distroless
+//! container`, every action in a rootless `crun` container of a pinned distroless
 //! image.
 //!
 //! The cell: one `kbf-server` (blobs and metadata in directories of the cell, REAPI on 127.0.0.1:8980,
@@ -9,18 +9,18 @@
 //! it: it sets up its own cgroup (a `supervisor` leaf and `actions` beside it) and makes
 //! a lease cgroup under `actions` for each container. Its leases may use 8 GiB together.
 //!
-//! First the runner is set up as `cargo xtask podman-tests` sets one up
-//! ([`xtask::podman_tests::runner_setup`]: lingering on, so rootless Podman has a
-//! runtime directory), and the versions and the host's swap are printed (the own-limit
+//! First the versions (`buck2`, `crun`) and the host's swap are printed (the own-limit
 //! kill of `//:hog` pushes into swap).
 //!
 //! What is checked, in order; the first failure ends the run with exit status 1, after
 //! printing the last lines of the server's and the daemon's logs:
-//! 1. [`IMAGE`] is pulled, by its linux/amd64 manifest digest, into this user's image
-//!    store before the daemon starts (nodes never pull at action time). As on a farm,
-//!    the node's pre-pull and the client's `container-image` (the `container_image`
-//!    value in `m2/buck2/.buckconfig`) are separate settings: a client that names no
-//!    image, or one the node did not pull, fails its build.
+//! 1. The daemon is given [`IMAGE`] (`--image`, as a farm's unit is) and, before it says
+//!    `Hello`, fetches it from its registry by its linux/amd64 manifest digest, checks
+//!    every byte against a digest and unpacks it into its image store
+//!    (`<data>/leases/oci-images/<digest>/rootfs`). As on a farm, the node's pin and the
+//!    client's `container-image` (the `container_image` value in
+//!    `m2/buck2/.buckconfig`) are separate settings, and the store is keyed by the
+//!    digest: a client that names another image makes the node fetch that one.
 //! 2. The sample project is copied under `--work` with `kbf-m2-act` from `--bin-dir` as
 //!    its `tools/kbf-m2-act`, executable, which must be linked statically (no
 //!    `PT_INTERP` program header: the image may not hold its libraries).
@@ -37,11 +37,11 @@
 //!    exactly one requeue of it from 1 GiB booked to 2 GiB booked (the own-limit kill's
 //!    doubling), and its output is `3072`, so the second run succeeded.
 //! 7. `//:pause`, under a fresh salt so it runs, holds a lease for its sleep: while the
-//!    build runs, Podman lists exactly one running container labelled with the daemon's
-//!    node id, a `kbf-lease-*` cgroup is under `actions/`, and the build takes at least
-//!    the sleep.
-//! 8. Afterwards (within 10 s) no container so labelled is left and the lease scratch
-//!    directory holds nothing but the daemon's claim on it (`daemon-instance`).
+//!    build runs, exactly one `crun` container exists (one state directory under
+//!    `<lease>/crun/` of the daemon's leases), a `kbf-lease-*` cgroup is under
+//!    `actions/`, and the build takes at least the sleep.
+//! 8. Afterwards (within 10 s) no container is left and no lease directory is: the
+//!    daemon's scratch directory holds no `kbf-lease-*`.
 //! 9. A daemon killed mid-lease is rerun at once: `//:pause`, under a fresh salt, holds
 //!    a lease; the daemon is killed (SIGKILL to its unit's main process) and a new one
 //!    started on the same scratch directory, which names the killed one as its
@@ -54,8 +54,8 @@
 //!
 //! Each buck2 build is bounded by `--build-timeout`, so a farm that reruns an action
 //! without end fails here instead of at the job's timeout. Every log is under
-//! `<work>/logs`. Needs rootless Podman with this user's subordinate ids, systemd, and
-//! `sudo -n` for `loginctl`, `systemd-run` and `systemctl`.
+//! `<work>/logs`. Needs `crun`, `newuidmap` and `newgidmap` (package `uidmap`), this
+//! user's subordinate ids, systemd, and `sudo -n` for `systemd-run` and `systemctl`.
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use xtask::podman_tests::{default_runtime_dir, host_report, runner_setup};
+use xtask::podman_tests::host_report;
 
 use crate::cell::{
     CellError, LEASE_WAIT, OrBroken as _, POLL, Process, absolute, copy_tree, ensure,
@@ -82,16 +82,16 @@ pub const IMAGE: &str = concat!(
 const REAPI: &str = "127.0.0.1:8980";
 /// The worker listener.
 const WORKER: &str = "127.0.0.1:8981";
-/// The node id the daemon's certificate names, and its containers' `kbf.owner` label.
+/// The node id the daemon's certificate names.
 const NODE_ID: &str = "cell-node-1";
 /// The daemon's unit; the one started after the kill is `<UNIT>-2`.
 const UNIT: &str = "kbf-m2-daemon";
 /// The programs found on `PATH`.
 const SUDO: &str = "sudo";
-const PODMAN: &str = "podman";
+const CRUN: &str = "crun";
 const SYSTEMCTL: &str = "systemctl";
-/// How long a daemon's unit has to be welcomed.
-const JOIN_WAIT: Duration = Duration::from_secs(30);
+/// How long a daemon's unit has to be welcomed: it fetches [`IMAGE`] first.
+const JOIN_WAIT: Duration = Duration::from_secs(120);
 /// How long the containers and lease directories may take to go after a build.
 const LEFT_WAIT: Duration = Duration::from_secs(10);
 /// How long the server has to log the killed daemon's requeue.
@@ -105,8 +105,8 @@ const HOG_REQUEUE: &str =
     "the action passed its memory limit with 1 GiB booked; it runs again with 2 GiB booked";
 /// The server's line for a lease the killed daemon's successor reported.
 const RESTARTED: &str = "the daemon restarted, and its successor killed the run before registering";
-/// What the daemon leaves in its scratch directory: its claim on it.
-const CLAIM: &str = "daemon-instance";
+/// The prefix of a lease's scratch directory in the daemon's.
+const LEASE_PREFIX: &str = "kbf-lease-";
 /// How many lines of each log a failed run prints.
 const TAIL: usize = 80;
 /// `PT_INTERP`: the program header that names a program interpreter.
@@ -142,10 +142,13 @@ pub struct M2Args {
     /// Where cgroup v2 is mounted.
     #[arg(long, default_value = "/sys/fs/cgroup")]
     pub cgroup_root: PathBuf,
-    /// This user's runtime directory, where its systemd user manager's bus is (by
-    /// default `/run/user/<uid>`).
+    /// The daemon's data directory (its leases, image store and caches). By default a
+    /// directory of its own under the system's temporary directory, not under `--work`:
+    /// the container driver refuses a data directory with an ancestor closed to other
+    /// users (its containers' ids are not the daemon's), as a runner's home directory
+    /// may be.
     #[arg(long)]
-    pub runtime_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 }
 
 /// Runs the M2 test (the module docs say what it checks). Prints what it does on
@@ -201,7 +204,6 @@ struct Cell {
     pause: Duration,
     restart_pause: Duration,
     cgroup_root: PathBuf,
-    runtime_dir: PathBuf,
     uid: u32,
     gid: u32,
     /// The units started, stopped at the end.
@@ -213,7 +215,11 @@ impl Cell {
         let uid = rustix::process::getuid().as_raw();
         let work = absolute(&args.work)?;
         let logs = work.join("logs");
-        let leases = work.join("data").join("leases");
+        let data = match &args.data_dir {
+            Some(dir) => absolute(dir)?,
+            None => std::env::temp_dir().join(format!("kbf-m2-data-{uid}-{}", std::process::id())),
+        };
+        let leases = data.join("leases");
         for dir in [&logs, &leases] {
             std::fs::create_dir_all(dir).or_broken(&dir.display())?;
         }
@@ -231,7 +237,6 @@ impl Cell {
             pause: Duration::from_secs(args.pause_secs),
             restart_pause: Duration::from_secs(args.restart_pause_secs),
             cgroup_root: args.cgroup_root.clone(),
-            runtime_dir: args.runtime_dir.clone().unwrap_or(default_runtime_dir(uid)),
             uid,
             gid: rustix::process::getgid().as_raw(),
             units: Vec::new(),
@@ -241,13 +246,12 @@ impl Cell {
     /// Everything after setup. The processes it starts are stopped as it returns.
     fn steps(&mut self) -> Result<(), CellError> {
         self.setup_runner()?;
-        self.podman(&["pull", "-q", IMAGE])?;
-        println!("OK: pulled {IMAGE}");
         self.copy_project()?;
         let pki = crate::pki::write(&self.work.join("pki"), NODE_ID);
         let pki = pki.or_broken(&"the certificates")?;
         let _server = self.start_server(&pki)?;
         self.start_daemon(UNIT, &pki)?;
+        self.image_unpacked()?;
         let cgroup = self.cgroup_layout(UNIT)?;
         self.two_builds()?;
         self.hog()?;
@@ -257,12 +261,12 @@ impl Cell {
         self.nothing_left()
     }
 
-    /// Lingering on (shared with `cargo xtask podman-tests`), then what the log should
-    /// show of the tools and the host.
+    /// What the log should show of the tools and the host.
     fn setup_runner(&self) -> Result<(), CellError> {
-        let set = runner_setup(Path::new(SUDO), self.uid, &self.runtime_dir);
-        set.or_broken(&"the runner setup")?;
-        print!("{}", self.podman(&["--version"])?);
+        print!(
+            "{}",
+            output(Command::new(CRUN).arg("--version"), "crun --version")?
+        );
         let version = status(Command::new(&self.buck2).arg("--version"))?;
         ensure(version, "buck2 --version failed".to_owned())?;
         println!("{}", host_report(Path::new("/")));
@@ -371,7 +375,6 @@ impl Cell {
         for env in [
             joined("HOME=", Path::new(&home)),
             joined("PATH=", Path::new(&path)),
-            joined("XDG_RUNTIME_DIR=", &self.runtime_dir),
         ] {
             args.extend(["-E".into(), env]);
         }
@@ -399,7 +402,19 @@ impl Cell {
         let data = self.leases.parent().expect("a data directory");
         args.extend(["--data-dir".into(), data.into()]);
         args.extend(["--actions-memory-max-gib", "8"].map(OsString::from));
+        // The image, fetched and unpacked before the daemon says `Hello`.
+        args.extend(["--image".into(), format!("docker://{IMAGE}").into()]);
         args
+    }
+
+    /// The image the daemon was given is in its store, unpacked, under its digest.
+    fn image_unpacked(&self) -> Result<(), CellError> {
+        let hex = IMAGE.rsplit_once("@sha256:").map_or("", |(_, hex)| hex);
+        let rootfs = self.leases.join("oci-images").join(hex).join("rootfs");
+        let why = format!("the daemon joined, but {} is not there", rootfs.display());
+        ensure(rootfs.is_dir(), why)?;
+        println!("OK: the daemon fetched {IMAGE} and unpacked it");
+        Ok(())
     }
 
     /// Checks the cgroup the daemon set up in its unit `unit`; returns its directory.
@@ -515,16 +530,14 @@ impl Cell {
         build.lease(&daemon_log, before)?;
         let deadline = Instant::now() + LEASE_WAIT;
         let running = loop {
-            let running = self.containers(&["--filter", "status=running"])?;
+            let running = self.containers();
             let gave_up = !build.running()? | (Instant::now() >= deadline);
             if (running > 0) | gave_up {
                 break running;
             }
             std::thread::sleep(POLL);
         };
-        let why = format!(
-            "while //:pause ran, {running} running containers were labelled kbf.owner={NODE_ID}"
-        );
+        let why = format!("while //:pause ran, {running} crun containers existed, not one");
         ensure(running == 1, why)?;
         let actions = cgroup.join("actions");
         let lease_cgroups = names(&actions, "kbf-lease-");
@@ -554,21 +567,17 @@ impl Cell {
     fn nothing_left(&self) -> Result<(), CellError> {
         let deadline = Instant::now() + LEFT_WAIT;
         let (left, dirs) = loop {
-            let left = self.containers(&["-a"])?;
-            let dirs = names(&self.leases, "");
-            let dirs: Vec<String> = dirs.into_iter().filter(|d| d != CLAIM).collect();
+            let left = self.containers();
+            let dirs = names(&self.leases, LEASE_PREFIX);
             let clean = (left == 0) & dirs.is_empty();
             if clean | (Instant::now() >= deadline) {
                 break (left, dirs);
             }
             std::thread::sleep(POLL);
         };
-        let why = format!("{left} containers labelled kbf.owner={NODE_ID} are left");
+        let why = format!("{left} crun containers are left");
         ensure(left == 0, why)?;
-        let why = format!(
-            "the lease scratch directory holds more than the claim: {}",
-            dirs.join(" ")
-        );
+        let why = format!("lease scratch directories are left: {}", dirs.join(" "));
         ensure(dirs.is_empty(), why)?;
         println!("OK: no container and no lease directory left");
         Ok(())
@@ -637,21 +646,14 @@ impl Cell {
         Process::spawn(command, "the //:pause build")
     }
 
-    /// How many containers labelled with the node id `podman ps <filter>` lists.
-    fn containers(&self, filter: &[&str]) -> Result<usize, CellError> {
-        let label = format!("label=kbf.owner={NODE_ID}");
-        let mut args = vec!["ps"];
-        args.extend(filter);
-        args.extend(["--filter", label.as_str(), "--format", "{{.Names}}"]);
-        let listed = self.podman(&args)?;
-        Ok(listed.lines().filter(|l| !l.trim().is_empty()).count())
-    }
-
-    /// Runs podman with this user's runtime directory: its stdout.
-    fn podman(&self, args: &[&str]) -> Result<String, CellError> {
-        let mut podman = Command::new(PODMAN);
-        podman.env("XDG_RUNTIME_DIR", &self.runtime_dir).args(args);
-        output(&mut podman, &format!("podman {}", args.join(" ")))
+    /// How many `crun` containers the daemon's leases hold: `crun` keeps a state
+    /// directory per container in the `--root` the driver gives it, `<lease>/crun`, and
+    /// removes it when the container ends (`crun run` deletes what it made).
+    fn containers(&self) -> usize {
+        names(&self.leases, LEASE_PREFIX)
+            .iter()
+            .map(|lease| names(&self.leases.join(lease).join("crun"), "").len())
+            .sum()
     }
 
     /// buck2, in the project's copy.

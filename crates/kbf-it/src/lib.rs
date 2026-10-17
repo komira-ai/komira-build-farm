@@ -19,7 +19,7 @@
 //!
 //! And the M2 harness, `kbf-cell m2` ([`m2`], Linux only): it builds the sample project
 //! in `m2/` with pinned buck2 through one `kbf-server` to one `kbf-daemon --driver
-//! container` (every action in a rootless Podman container of a pinned distroless
+//! container` (every action in a rootless `crun` container of a pinned distroless
 //! image), twice, then checks the daemon's cgroup layout, an own-limit memory kill's
 //! doubled rerun, a lease held in a container, and a daemon killed mid-lease ([`m2`]
 //! says what it checks; docs/design/daemon.md, "End to end"). The image has no shell,

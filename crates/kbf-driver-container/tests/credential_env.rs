@@ -5,7 +5,9 @@
 //! what the driver started the runtime with. The stand-in `podman` hands on what it
 //! was run with at `create` too (its `env-host` knob), as Podman's `env_host` copies
 //! the host's environment when the container is created. Real `crun` hands on only the
-//! config's `process.env`, which the stand-in records and this test reads.
+//! config's `process.env`, which the stand-in records and this test reads. No Podman
+//! runs for the OCI backend at all, which the failing `podman` stub beside its `crun`
+//! records.
 //!
 //! One test in this binary: it sets variables of its own process, which is sound only
 //! while no other thread reads the environment. `tests/podman_credential.rs` checks
@@ -56,8 +58,7 @@ fn recorded(record: &std::path::Path) -> Vec<String> {
 /// (the "scrub only in `start`" mutant), whose environment the stand-in hands on
 /// under `env-host` as real Podman does; the OCI config's `process.env` (the "add this
 /// process's `AWS_*` to it" mutant in `oci::spec::action_config`), what real `crun`
-/// gives the action; and the `podman create` that unpacks an image for the OCI
-/// backend. [`NODE_VARIABLE`] is the control: it reaches the action and each record,
+/// gives the action. [`NODE_VARIABLE`] is the control: it reaches the action and each record,
 /// so an `unset` for the key is the driver's doing, not a stand-in that hands nothing
 /// on, and `HOME=/root` in `process.env` shows the config's variables were read.
 #[test]
@@ -94,8 +95,6 @@ fn the_runtime_is_started_without_the_cold_store_key() {
         fake.assert_clean(1);
 
         let oci = FakeOci::new("credential-env");
-        oci.pulled_not_unpacked();
-        std::fs::write(oci.podman_state.join("env-host"), "").expect("knob");
         let result = oci.run(1, &spec, &print_env()).await.expect("ran");
         let stdout = support::blob(&oci.cas, result.stdout_digest.as_ref());
         assert_eq!(String::from_utf8_lossy(&stdout), want, "crun");
@@ -115,10 +114,7 @@ fn the_runtime_is_started_without_the_cold_store_key() {
             .filter(|v| v.starts_with("AWS_"))
             .collect();
         assert!(keys.is_empty(), "process.env: {keys:?}");
-        no_key(
-            &recorded(&oci.podman_state.join("create-env")),
-            "podman create (unpack)",
-        );
+        assert_eq!(oci.podman_calls(), Vec::<String>::new());
         oci.assert_clean(1);
     });
 }

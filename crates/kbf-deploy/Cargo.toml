@@ -10,7 +10,7 @@ publish.workspace = true
 # The deploy tool: its kits as subcommands. A kit that changes a host does it through
 # kbf-host's plan of steps, printed by default and carried out with `--apply`. Five
 # kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
-# (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
+# (render-units, check-units, and as root install-units and swap), `mdm`
 # (fetch the pinned upstream archives; as root install the MDM services, the TLS
 # certificate, the push certificate and the enrollment profile, and link NanoDEP to
 # Apple Business Manager; verify them; sign an operator's erase request), `envoy`

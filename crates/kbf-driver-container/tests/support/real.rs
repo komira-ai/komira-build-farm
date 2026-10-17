@@ -1,11 +1,12 @@
-//! One real-Podman test's cgroup, scratch directory and runtime ([`Cell`]), shared by
-//! the test binaries that run the driver against rootless Podman
-//! (`cargo xtask podman-tests` sets up what they need).
+//! One real-`crun` test's cgroup, scratch directory and runtime ([`Cell`]), shared by
+//! the test binaries that run the driver against rootless `crun`
+//! (`cargo xtask podman-tests` sets up what they need). The image is fetched from its
+//! registry by the driver's own image store, once per machine: every cell's
+//! `oci-images` is the one store, which the first cell fills.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError, Work};
@@ -23,8 +24,8 @@ pub fn var(name: &str) -> String {
 
 /// One test's cgroup parent (under the delegated cgroup), scratch and runtime.
 pub struct Cell {
-    /// The lease term this test's leases use. Container names are unique per Podman
-    /// store, and the tests share one, so each test gets its own term.
+    /// The lease term this test's leases use: each test gets its own, so the leases of
+    /// two cells never share a name.
     pub term: u64,
     pub cgroup: PathBuf,
     pub scratch: PathBuf,
@@ -93,44 +94,62 @@ fn trace() {
     super::swap_kill::trace();
 }
 
+/// One cell at a time is made, and the image store it shares is filled by the first:
+/// a cell's start-up sweeps the store for what a killed daemon left, which must not
+/// find another cell's unpack in progress.
+static MAKING: Mutex<()> = Mutex::new(());
+
+/// The image store every cell shares, under the system temporary directory (whose
+/// ancestors every id can search, which the backend's containers need). It is kept
+/// between runs: its files are owned by subordinate ids, and an image is read-only.
+fn shared_images() -> PathBuf {
+    let uid = rustix::process::getuid().as_raw();
+    std::env::temp_dir().join(format!("kbf-oci-images-{uid}"))
+}
+
 impl Cell {
+    /// A cell whose runtime is the OCI backend, running `crun` (`KBF_TEST_CRUN`, or
+    /// `crun` on the `PATH`): its scratch directory is under the system temporary
+    /// directory, whose ancestors every id can search (the backend's containers do not
+    /// run as the test's user, and refuse a scratch directory they cannot reach).
     pub fn new(name: &str) -> Self {
         Self::with(name, |_| {})
     }
 
     /// [`Cell::new`], with `configure` applied to the runtime's configuration last.
     pub fn with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
-        Self::in_scratch(name, super::scratch(&format!("podman-{name}")), configure)
-    }
-
-    /// A cell whose runtime is the OCI backend, running `crun` (`KBF_TEST_CRUN`, or
-    /// `crun` on the `PATH`): its scratch directory is under the system temporary
-    /// directory, whose ancestors every id can search (the backend's containers do not
-    /// run as the test's user, and refuse a scratch directory they cannot reach).
-    pub fn oci(name: &str) -> Self {
-        Self::oci_with(name, |_| {})
-    }
-
-    /// [`Cell::oci`], with `configure` applied to the runtime's configuration last.
-    pub fn oci_with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
         let uid = rustix::process::getuid().as_raw();
         let scratch = std::env::temp_dir().join(format!("kbf-oci-{uid}-{name}"));
         super::force_remove(&scratch);
         std::fs::create_dir_all(&scratch).expect("create scratch");
-        // The helper containers run this test binary in its `__chown-dirs` mode (its
-        // `chown_dirs_test_hook!`); a copy in the scratch directory, since the checkout's
-        // ancestors may be closed to the container's ids.
+        // The helper containers run this test binary in its `__chown-dirs` and
+        // `__unpack-layers` modes (its `chown_dirs_test_hook!`); a copy in the scratch
+        // directory, since the checkout's ancestors may be closed to the container's ids.
         let daemon = scratch.join("kbf-daemon");
         let exe = std::env::current_exe().expect("test binary");
         if std::fs::hard_link(&exe, &daemon).is_err() {
             std::fs::copy(&exe, &daemon).expect("copy");
         }
+        // The one image store, as this cell's.
+        let images = shared_images();
+        std::fs::create_dir_all(&images).expect("the shared image store");
+        std::os::unix::fs::symlink(&images, scratch.join("oci-images")).expect("link the store");
         Self::in_scratch(name, scratch, |config| {
             config.container_runtime = kbf_driver_container::ContainerRuntime::Oci;
             config.oci.runtime = crun();
             config.oci.daemon = daemon;
             configure(config);
         })
+    }
+
+    /// The same as [`Cell::new`] (every cell is the OCI backend now).
+    pub fn oci(name: &str) -> Self {
+        Self::new(name)
+    }
+
+    /// The same as [`Cell::with`].
+    pub fn oci_with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
+        Self::with(name, configure)
     }
 
     fn in_scratch(name: &str, scratch: PathBuf, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
@@ -144,15 +163,16 @@ impl Cell {
         std::fs::create_dir(&cgroup).expect("create the test cgroup");
         std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory +pids")
             .expect("enable controllers");
-        // Each test its own owner: they share one Podman store, and a runtime removes
-        // its owner's containers when it starts.
         let mut config = PodmanConfig::new(scratch.clone(), parent, format!("kbf-test-{name}"));
         config.default_timeout = Duration::from_secs(120);
         config.kill_grace = Duration::from_secs(2);
         configure(&mut config);
         let cas = Arc::new(MemoryCas::new());
+        let making = MAKING.lock().unwrap_or_else(PoisonError::into_inner);
         let runtime =
             Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
+        fetch_test_image(&runtime);
+        drop(making);
         Self {
             term,
             cgroup,
@@ -182,7 +202,8 @@ impl Cell {
             .await
     }
 
-    /// Asserts lease `seq` left no container, cgroup or scratch directory.
+    /// Asserts lease `seq` left no container (its `crun` state, in its scratch
+    /// directory), cgroup or scratch directory.
     pub fn assert_clean(&self, seq: u64) {
         let name = self.name(seq);
         assert!(!exists(&self.scratch.join(&name)), "{name}: scratch left");
@@ -192,8 +213,14 @@ impl Cell {
             "{name}: lease cgroup left: {}",
             describe(&lease)
         );
-        let names = podman(&["ps", "--all", "--format={{.Names}}"]);
-        assert!(!names.lines().any(|n| n == name), "container left: {names}");
+    }
+
+    /// Whether lease `seq`'s container exists: `crun` keeps a state directory for it in
+    /// the lease's scratch directory (`<lease>/crun/<id>`) and removes it when the
+    /// container ends.
+    pub fn container_exists(&self, seq: u64) -> bool {
+        let name = self.name(seq);
+        exists(&self.scratch.join(&name).join("crun").join(&name))
     }
 
     pub fn stdout(&self, result: &ActionResult) -> String {
@@ -209,16 +236,31 @@ impl Drop for Cell {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir(&self.cgroup);
-            // The OCI backend's image store holds files the container's ids own; the
-            // user's own `rm` cannot delete them, `podman unshare` can.
-            if self.config.container_runtime == kbf_driver_container::ContainerRuntime::Oci {
-                let _ = Command::new("podman")
-                    .args(["unshare", "rm", "-rf", "--"])
-                    .arg(&self.scratch)
-                    .status();
-            }
+            // What a lease leaves is the driver's to remove (the files in it are owned
+            // by the container's ids); what is left here is the daemon user's own.
             super::force_remove(&self.scratch);
         }
+    }
+}
+
+/// Makes sure the store holds the test image (`KBF_TEST_IMAGE`): the first cell of a
+/// machine has the runtime fetch it from its registry, checking every byte against its
+/// digest, and unpack it. The runtime's check is async and a cell is made inside a
+/// test's runtime, so it runs on a thread of its own.
+fn fetch_test_image(runtime: &Arc<PodmanRuntime<MemoryCas>>) {
+    let image = kbf_driver_container::ImageRef::parse(&var("KBF_TEST_IMAGE")).expect("an image");
+    let runtime = Arc::clone(runtime);
+    let fetched = std::thread::spawn(move || {
+        let built = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        built.block_on(runtime.check_pinned(&image))
+    })
+    .join()
+    .expect("the fetch thread");
+    if let Err(e) = fetched {
+        panic!("the test image could not be fetched and unpacked: {e}");
     }
 }
 
@@ -232,20 +274,6 @@ pub fn crun() -> PathBuf {
         .map(|dir| dir.join("crun"))
         .find(|candidate| candidate.is_file())
         .expect("no crun on the PATH (set KBF_TEST_CRUN): run through cargo xtask podman-tests")
-}
-
-/// Runs podman (the test's own checks) and returns its stdout.
-pub fn podman(args: &[&str]) -> String {
-    let output = Command::new("podman")
-        .args(args)
-        .output()
-        .expect("run podman");
-    assert!(
-        output.status.success(),
-        "podman {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// An action running `script` with the image's `/bin/sh`, named by its path: the

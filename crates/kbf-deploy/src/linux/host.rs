@@ -22,7 +22,10 @@ use super::check::CheckError;
 
 /// The tools the verbs run, where Debian and Ubuntu put them.
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
-pub const PODMAN: &str = "/usr/bin/podman";
+/// The OCI runtime the units pass as `--oci-runtime=`, and the tools it maps ids with.
+pub const CRUN: &str = "/usr/bin/crun";
+pub const NEWUIDMAP: &str = "/usr/bin/newuidmap";
+pub const NEWGIDMAP: &str = "/usr/bin/newgidmap";
 pub const SWAPON: &str = "/usr/sbin/swapon";
 pub const SWAPOFF: &str = "/usr/sbin/swapoff";
 pub const MKSWAP: &str = "/usr/sbin/mkswap";
@@ -74,13 +77,20 @@ pub enum HostError {
     #[error("no user {0}: useradd --system --create-home {0}")]
     NoUser(String),
     #[error(
-        "{user} has no range in {file} (rootless Podman): usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {user}"
+        "{user} has no range in {file} (rootless containers): usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {user}"
     )]
     NoSubIds { user: String, file: HostPath },
     #[error(
-        "{user} does not linger, so /run/user/{uid} (Podman's run directory) ends with its last session: loginctl enable-linger {user}"
+        "{user} does not linger, so /run/user/{uid} (the unit's XDG_RUNTIME_DIR) ends with its last session: loginctl enable-linger {user}"
     )]
     NoLinger { user: String, uid: u32 },
+    #[error(
+        "{path} is missing, which the daemon's containers need: apt install {package} (or the distribution's package that provides it)"
+    )]
+    NoTool {
+        path: HostPath,
+        package: &'static str,
+    },
     #[error("{0} is missing (docs/deploy/storage-node.md, \"Files the units read\")")]
     Missing(HostPath),
     #[error("{path} is owned by uid {uid}, not {user}: chown {user} {path}")]
@@ -107,34 +117,6 @@ pub enum HostError {
     RunsAsRoot(String),
     #[error(transparent)]
     ModeCheck(#[from] super::modes::ParseError),
-
-    // image-pull
-    #[error("no image: set KBF_IMAGES or pass --image <repo>@sha256:<digest>")]
-    NoImages,
-    #[error(
-        "image-pull reads and fills {0}'s Podman store as {0}: run it with sudo, even for a dry run"
-    )]
-    PullNeedsRoot(String),
-    #[error(
-        "{image}: the store's copy has digest {got}, not the pinned one (an index digest? pin the {platform} manifest's digest)"
-    )]
-    WrongDigest {
-        image: String,
-        got: String,
-        platform: String,
-    },
-    #[error("{image} is {got}, not {want}")]
-    WrongPlatform {
-        image: String,
-        got: String,
-        want: String,
-    },
-    #[error("{0} is still not in the store after its pull")]
-    NotPulled(String),
-    /// The check after an apply failed. Steps ran, so this is a failed verb (exit 1),
-    /// not a refusal.
-    #[error("the check after the apply: {0}")]
-    AfterApply(Box<HostError>),
 
     // swap
     #[error("KBF_SWAP_SIZE={0}: give it in whole GiB, as 128G")]

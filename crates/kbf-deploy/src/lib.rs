@@ -24,8 +24,7 @@
 //! - [`linux`]: a converged storage node's systemd units, rendered from compiled-in
 //!   templates (`linux render-units`) and checked against the host's priorities
 //!   (`linux check-units`); and, as root, the units installed and the services started
-//!   (`linux install-units`), the pinned images pulled as the kbf user (`linux
-//!   image-pull`) and the swapfile (`linux swap`).
+//!   (`linux install-units`) and the swapfile (`linux swap`).
 //! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
 //!   checks of what runs (`mdm verify`); and, on an operator's own machine, an erase

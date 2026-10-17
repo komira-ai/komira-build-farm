@@ -32,11 +32,16 @@ use crate::outputs::{DIRECTORY, Identity, back_to_parent, identity};
 /// The argument after argv0 that selects this mode.
 pub const ARG: &str = "__chown-dirs";
 
-/// The exit status of this mode when `std::env::args_os` asks for it; `None` otherwise.
+/// The exit status of the helper mode (this one or [`crate::unpack_layers`]) that
+/// `std::env::args_os` asks for; `None` otherwise.
 #[must_use]
 pub fn dispatch() -> Option<u8> {
     let args: Vec<OsString> = std::env::args_os().collect();
-    (args.get(1).map(OsString::as_os_str) == Some(OsStr::new(ARG))).then(|| run(&args[2..]))
+    match args.get(1).map(OsString::as_os_str).and_then(OsStr::to_str) {
+        Some(ARG) => Some(run(&args[2..])),
+        Some(crate::unpack_layers::ARG) => Some(crate::unpack_layers::run(&args[2..])),
+        _ => None,
+    }
 }
 
 /// Makes a test binary answer in the `__chown-dirs` mode when run with it, before its

@@ -132,6 +132,9 @@ fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
     write(&exec, "/etc/subuid", "kbf:100000:65536\n", 0o644);
     write(&exec, "/etc/subgid", "kbf:100000:65536\n", 0o644);
     write(&exec, "/var/lib/systemd/linger/kbf", "", 0o644);
+    for tool in ["crun", "newuidmap", "newgidmap"] {
+        write(&exec, &format!("/usr/bin/{tool}"), "tool", 0o755);
+    }
     write(
         &exec,
         "/etc/kbf/s3.env",
@@ -197,7 +200,6 @@ fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
     let (uid, gid) = me();
     let p = plan_here(&exec, &install(), &mut Vec::new()).expect("plan");
     let want = [
-        "mkdir /usr (0755)".to_owned(),
         "mkdir /usr/local (0755)".to_owned(),
         "mkdir /usr/local/bin (0755)".to_owned(),
         format!("write /usr/local/bin/kbf-server (0755, owner {uid}:{gid}, 8 bytes)"),
@@ -206,7 +208,7 @@ fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
         "mkdir /etc/systemd/system (0755)".to_owned(),
     ];
     let got = steps(&p);
-    assert_eq!(got[..7], want);
+    assert_eq!(got[..6], want);
     let units: Vec<&String> = got
         .iter()
         .filter(|s| s.starts_with("write /etc/systemd"))
@@ -236,7 +238,7 @@ fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
         "wait up to 60s for http://127.0.0.1:8982/readyz".to_owned(),
     ];
     assert_eq!(got[got.len() - tail.len()..], tail);
-    assert_eq!(got.len(), 7 + 1 + 4 + tail.len(), "{got:#?}");
+    assert_eq!(got.len(), 6 + 1 + 4 + tail.len(), "{got:#?}");
 
     let dry = go(&mut exec, &install(), Mode::DryRun);
     assert!(
@@ -461,6 +463,24 @@ fn each_missing_prerequisite_is_refused_with_its_fix() {
             "no linger",
             |e, _| fs::remove_file(e.at("/var/lib/systemd/linger/kbf")).expect("rm"),
             |e| matches!(e, HostError::NoLinger { .. }),
+        ),
+        (
+            "no crun",
+            |e, _| fs::remove_file(e.at("/usr/bin/crun")).expect("rm"),
+            |e| matches!(e, HostError::NoTool { path, package: "crun" } if path.as_str() == "/usr/bin/crun"),
+        ),
+        (
+            "no newuidmap",
+            |e, _| fs::remove_file(e.at("/usr/bin/newuidmap")).expect("rm"),
+            |e| matches!(e, HostError::NoTool { path, package: "uidmap" } if path.as_str() == "/usr/bin/newuidmap"),
+        ),
+        (
+            "newgidmap is a directory",
+            |e, _| {
+                fs::remove_file(e.at("/usr/bin/newgidmap")).expect("rm");
+                fs::create_dir(e.at("/usr/bin/newgidmap")).expect("mkdir");
+            },
+            |e| matches!(e, HostError::NoTool { path, package: "uidmap" } if path.as_str() == "/usr/bin/newgidmap"),
         ),
         (
             "no s3.env",

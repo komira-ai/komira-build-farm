@@ -9,7 +9,6 @@
 //! kbf-deploy linux check-units --config FILE --dir DIR [--installable] [--mode MODE [--kbf-bin PATH]]
 //! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
-//! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
 //! kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--metrics URL]
 //!                              [--unit NAME] [--ready-secs N] [--apply]
@@ -44,7 +43,7 @@
 //! 0 done (or nothing to do) or 1 refused or failed. `linux render-units` and
 //! `check-units` only write into or read the directory they are given, and exit 0 done,
 //! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
-//! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
+//! `REFUSED: ...` on stderr). `linux install-units` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
 //! refused (`REFUSED: ...` on stderr). `linux meta-backup` and `meta-verify` exit 0
@@ -83,11 +82,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use kbf_types::ImageRef;
 
 use crate::envoy;
 use crate::https::Client;
-use crate::linux::{self, HostError, LinuxConfig, images, install, install_mode, meta, swap};
+use crate::linux::{self, HostError, LinuxConfig, install, install_mode, meta, swap};
 use crate::log;
 use crate::mdm::dep::{Dep, Serial};
 use crate::mdm::erase::{self, EraseArgs, Made};
@@ -248,21 +246,6 @@ enum Linux {
         /// (with --bin-dir, the new kbf too), and start it.
         #[arg(long, value_enum, conflicts_with_all = ["restart_minio", "uninstall"])]
         mode: Option<linux::Mode>,
-        /// Carry the plan out.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Pull the pinned images into the kbf user's Podman store, as that user (as root).
-    ImagePull {
-        /// The kit's settings, KEY=VALUE lines.
-        #[arg(long)]
-        config: PathBuf,
-        /// An image instead of KBF_IMAGES (repeat for more): <repo>@sha256:<digest>.
-        #[arg(long, value_parser = linux::config::image)]
-        image: Vec<ImageRef>,
-        /// The platform each image must be built for.
-        #[arg(long, default_value = linux::images::PLATFORM)]
-        platform: String,
         /// Carry the plan out.
         #[arg(long)]
         apply: bool,
@@ -638,24 +621,6 @@ fn linux_kit<E: Exec>(
                 });
             return host_verb(done, err);
         }
-        Linux::ImagePull {
-            config,
-            image,
-            platform,
-            apply,
-        } => {
-            let done = LinuxConfig::load(&config)
-                .map_err(HostError::from)
-                .and_then(|config| {
-                    let a = images::Pull {
-                        config,
-                        images: image,
-                        platform,
-                    };
-                    images::run(exec, &a, mode(apply), &mut out)
-                });
-            return host_verb(done, err);
-        }
         Linux::MetaBackup(a) => {
             return meta::cli::backup(a, exec, &meta::metrics::http_get, out, err);
         }
@@ -914,17 +879,12 @@ fn envoy_apply<E: Exec>(
     envoy::apply::run(exec, &args, mode, &mut out)
 }
 
-/// A host-changing `linux` verb's exit: 0 done, 1 a step failed (or the check after
-/// an apply did), 2 refused.
+/// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e @ HostError::Deploy(kbf_host::HostError::Step { .. })) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
-            ExitCode::FAILURE
-        }
-        Err(e @ HostError::AfterApply(_)) => {
-            let _ = writeln!(err, "FAIL {e}");
             ExitCode::FAILURE
         }
         Err(e) => {

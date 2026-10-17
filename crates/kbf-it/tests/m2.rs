@@ -2,8 +2,9 @@
 //! what M2 requires, and each one fails the run when the cell breaks it.
 //!
 //! The fakes are this test binary, run through links named `kbf-server` and `buck2` in
-//! a `--bin-dir` of the test's own, and `podman`, `sudo` and `systemctl` found first on
-//! `PATH`: a start-up hook answers as the program its argv0 names before the test
+//! a `--bin-dir` of the test's own, and `crun`, `podman` (which must never run), `sudo`
+//! and `systemctl` found first on `PATH`: a start-up hook answers as the program its argv0
+//! names before the test
 //! harness starts. Each fake appends its call to `<dir>/calls` and plants the defect
 //! `KBF_M2_FAKE_DEFECT` names, if it is one of its own. The fake `sudo` stands in for
 //! systemd too: its `systemd-run` writes what the daemon would log (`welcomed`, or the
@@ -11,12 +12,11 @@
 //! the test writes under `--cgroup-root`.
 //!
 //! The real cell is checked by the `ci / m2-container` job, which runs `kbf-cell m2`
-//! with the real server and daemon, rootless Podman, systemd, and the pinned buck2.
+//! with the real server and daemon, rootless `crun`, systemd, and the pinned buck2.
 
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,8 +54,6 @@ mod fake {
     pub const DEFECT: &str = "KBF_M2_FAKE_DEFECT";
     /// The cgroup root the test wrote.
     pub const CGROUP_ROOT: &str = "KBF_M2_FAKE_CGROUP_ROOT";
-    /// The runtime directory podman must be given.
-    pub const RUNTIME: &str = "KBF_M2_FAKE_RUNTIME";
     /// A role for a process the fakes start themselves.
     const ROLE: &str = "KBF_M2_FAKE_ROLE";
     /// The file the late writer appends to.
@@ -78,6 +76,7 @@ mod fake {
         let roles = [
             "kbf-server",
             "buck2",
+            "crun",
             "podman",
             "sudo",
             "systemctl",
@@ -91,7 +90,8 @@ mod fake {
         let code = match role.as_str() {
             "kbf-server" => server(),
             "buck2" => buck2(&args),
-            "podman" => podman(&args),
+            "crun" => crun(&args),
+            "podman" => podman(),
             "sudo" => sudo(&args),
             "systemctl" => systemctl(&args),
             _ => late_writer(),
@@ -234,9 +234,19 @@ mod fake {
                 .join("actions");
             std::fs::create_dir_all(actions.join(&name)).expect("lease cgroup");
         }
-        if defect("lease-left") {
-            std::fs::create_dir_all(work.join("data").join("leases").join(&name))
-                .expect("lease dir");
+        // The lease's scratch directory, and `crun`'s state directory for its container
+        // (`<lease>/crun/<id>`), which exists while the container does.
+        let lease = work.join("data").join("leases").join(&name);
+        let containers = if defect("no-container") {
+            0
+        } else if defect("two-containers") {
+            2
+        } else {
+            1
+        };
+        for i in 0..containers {
+            std::fs::create_dir_all(lease.join("crun").join(format!("{name}-{i}")))
+                .expect("a container's state");
         }
         let secs = args
             .iter()
@@ -250,6 +260,13 @@ mod fake {
             sleep
         };
         std::thread::sleep(sleep);
+        // The container ends and the lease is cleaned, unless a defect leaves them.
+        if !defect("container-left") {
+            let _ = std::fs::remove_dir_all(lease.join("crun"));
+        }
+        if !defect("container-left") & !defect("lease-left") {
+            let _ = std::fs::remove_dir_all(&lease);
+        }
         let failed = if restart {
             "restart-fails"
         } else {
@@ -267,42 +284,22 @@ mod fake {
         0
     }
 
-    fn podman(args: &[String]) -> i32 {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-        if runtime != std::env::var_os(RUNTIME) {
-            eprintln!("Error: no runtime directory: {runtime:?}");
-            return 125;
+    /// `crun --version`.
+    fn crun(args: &[String]) -> i32 {
+        if defect("crun-fails") {
+            eprintln!("crun: not found");
+            return 127;
         }
-        match args.first().map(String::as_str) {
-            Some("--version") => println!("podman version fake"),
-            Some("pull") if defect("pull-fails") => {
-                eprintln!("Error: initializing source: manifest unknown");
-                return 125;
-            }
-            Some("pull") => println!("sha256:{}", "d2".repeat(32)),
-            _ => {
-                let running = args.iter().any(|a| a == "status=running");
-                let shown = if running {
-                    let n = calls("podman", "status=running");
-                    if defect("no-container") {
-                        0
-                    } else if defect("two-containers") {
-                        2
-                    } else {
-                        // The container starts a moment after the lease.
-                        usize::from(n > 1)
-                    }
-                } else {
-                    // The first look finds the container still being removed.
-                    let n = calls("podman", "-a");
-                    usize::from((n == 1) | defect("container-left"))
-                };
-                for i in 0..shown {
-                    println!("kbf-lease-3-{i}");
-                }
-            }
+        if args.first().map(String::as_str) == Some("--version") {
+            println!("crun version fake");
         }
         0
+    }
+
+    /// The `podman` that must never run: it fails, and its call is on record.
+    fn podman() -> i32 {
+        eprintln!("Error: podman was removed");
+        125
     }
 
     fn sudo(args: &[String]) -> i32 {
@@ -312,7 +309,6 @@ mod fake {
         }
         let words: Vec<&str> = args[1..].iter().map(String::as_str).collect();
         match words.as_slice() {
-            ["loginctl", "enable-linger", ..] => i32::from(defect("linger-fails")),
             ["systemd-run", ..] => systemd_run(&args[1..]),
             ["systemctl", "kill", ..] => i32::from(defect("kill-fails")),
             ["systemctl", "stop", _] => 0,
@@ -336,6 +332,14 @@ mod fake {
             .expect("a data directory");
         let scratch = data.join("leases");
         std::fs::write(scratch.join("daemon-instance"), b"1\n").expect("claim");
+        // Before `welcomed`, the daemon fetched and unpacked the image it was given
+        // (`--image docker://<repo>@sha256:<hex>`): its directory in the image store.
+        let image = args.iter().position(|a| a == "--image");
+        let hex = image.and_then(|i| args[i + 1].rsplit_once("@sha256:").map(|(_, h)| h));
+        if let Some(hex) = hex.filter(|_| !defect("image-not-unpacked")) {
+            let rootfs = scratch.join("oci-images").join(hex).join("rootfs");
+            std::fs::create_dir_all(rootfs.join("kbf/root")).expect("the unpacked image");
+        }
         let delegated = args.windows(2).any(|w| w == ["-p", "Delegate=yes"]);
         if !delegated | defect("daemon-refuses") {
             let refusal = format!(
@@ -445,61 +449,18 @@ fn unique_at(name: &str, nanos: u128) -> String {
 }
 
 /// Catches: a name made of the pid and the clock alone. The tests are threads of one
-/// process, so two of them that read the clock in one tick got the same runtime
-/// directory, and the second bind of its bus failed with `AddrInUse`.
+/// process, so two of them that read the clock in one tick got the same scratch
+/// directory.
 #[test]
 fn two_names_made_at_one_instant_differ() {
     assert_ne!(unique_at("m2", 7), unique_at("m2", 7));
 }
 
-/// Catches: cells made at once by parallel tests that share a bus, a cell that names
-/// its runtime directory from the pid and the clock alone (not through [`unique`]),
-/// and a cell that leaves its runtime directory and bus behind when it is dropped.
-#[test]
-fn cells_made_at_once_have_their_own_bus_and_remove_it() {
-    const CELLS: usize = 16;
-    let barrier = std::sync::Barrier::new(CELLS);
-    let cells: Vec<Cell> = std::thread::scope(|s| {
-        let made: Vec<_> = (0..CELLS)
-            .map(|_| {
-                s.spawn(|| {
-                    barrier.wait();
-                    Cell::new("at-once", "none")
-                })
-            })
-            .collect();
-        made.into_iter()
-            .map(|h| h.join().expect("a cell"))
-            .collect()
-    });
-    let runtimes: std::collections::BTreeSet<PathBuf> =
-        cells.iter().map(|c| c.runtime.clone()).collect();
-    assert_eq!(runtimes.len(), CELLS, "{runtimes:?}");
-    // Without the clock reading the names must still differ: a cell that names its
-    // runtime directory from the pid and the clock alone passes the check above on a
-    // fine clock, but not this one, on any clock.
-    let unclocked: std::collections::BTreeSet<String> = runtimes
-        .iter()
-        .map(|runtime| {
-            let name = runtime.file_name().expect("a name").to_string_lossy();
-            let (rest, _nanos) = name.rsplit_once('-').expect("a clock reading");
-            rest.to_owned()
-        })
-        .collect();
-    assert_eq!(unclocked.len(), CELLS, "{unclocked:?}");
-    drop(cells);
-    for runtime in &runtimes {
-        assert!(!runtime.exists(), "left behind: {}", runtime.display());
-    }
-}
-
-/// One fake cell: the fakes in `<dir>/bin`, the daemon's cgroup under `<dir>/cgroup`, a
-/// runtime directory with a bus, and `kbf-cell m2`'s work directory `<dir>/work`.
+/// One fake cell: the fakes in `<dir>/bin`, the daemon's cgroup under `<dir>/cgroup`, and
+/// `kbf-cell m2`'s work directory `<dir>/work`.
 struct Cell {
     dir: PathBuf,
     defect: String,
-    runtime: PathBuf,
-    _bus: UnixListener,
 }
 
 impl Cell {
@@ -508,7 +469,7 @@ impl Cell {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
         let me = std::env::current_exe().expect("this test binary");
-        for fake in ["kbf-server", "buck2", "podman", "sudo", "systemctl"] {
+        for fake in ["kbf-server", "buck2", "crun", "podman", "sudo", "systemctl"] {
             std::os::unix::fs::symlink(&me, bin.join(fake)).expect("link a fake");
         }
         let act = match defect {
@@ -543,16 +504,9 @@ impl Cell {
             std::fs::write(unit.join("supervisor/cgroup.procs"), procs).expect("procs");
         }
 
-        // A Unix socket path is short (108 bytes); the target directory's may not be.
-        // A new directory, never an existing one: two cells must not share a bus.
-        let runtime = std::env::temp_dir().join(unique("m2"));
-        std::fs::create_dir(&runtime).expect("runtime directory");
-        let bus = UnixListener::bind(runtime.join("bus")).expect("bus");
         Self {
             dir,
             defect: defect.to_owned(),
-            runtime,
-            _bus: bus,
         }
     }
 
@@ -560,8 +514,16 @@ impl Cell {
         self.dir.join("work")
     }
 
-    /// `kbf-cell m2` with the fakes and 1 s pauses.
+    /// `kbf-cell m2` with the fakes and 1 s pauses, and the daemon's data directory in the
+    /// work directory.
     fn command(&self) -> Command {
+        let mut command = self.command_without_data_dir();
+        command.arg("--data-dir").arg(self.work().join("data"));
+        command
+    }
+
+    /// [`Cell::command`], leaving the data directory to the cell's default.
+    fn command_without_data_dir(&self) -> Command {
         let bin = self.dir.join("bin");
         let mut path = std::ffi::OsString::from(&bin);
         path.push(":");
@@ -580,13 +542,10 @@ impl Cell {
             .args(["--pause-secs", "1", "--restart-pause-secs", "1"])
             .arg("--cgroup-root")
             .arg(self.dir.join("cgroup"))
-            .arg("--runtime-dir")
-            .arg(&self.runtime)
             .env("PATH", path)
             .env(fake::DIR, &self.dir)
             .env(fake::DEFECT, &self.defect)
-            .env(fake::CGROUP_ROOT, self.dir.join("cgroup"))
-            .env(fake::RUNTIME, &self.runtime);
+            .env(fake::CGROUP_ROOT, self.dir.join("cgroup"));
         command
     }
 
@@ -608,14 +567,6 @@ impl Cell {
 
     fn args(&self, role: &str) -> Vec<String> {
         self.calls(role).into_iter().map(|(_, a)| a).collect()
-    }
-}
-
-/// The runtime directory is under the shared temporary directory, so a cell removes it
-/// and its bus. Its scratch directory stays under the target directory for a look.
-impl Drop for Cell {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
 
@@ -655,9 +606,10 @@ fn fails(defect: &str, code: i32, why: &str) -> (Cell, Output) {
 
 /// Catches: a harness that starts the server or the daemon's unit with other flags than
 /// the M2 cell needs (the unit without `Delegate=yes`, or not as this user), skips the
-/// runner setup or a check, builds in another order or place, gives podman no runtime
-/// directory, leaves the copy's `kbf-m2-act` unexecutable (the fake build fails as the
-/// farm's action would), leaves a unit running, or passes without one of its OK lines.
+/// runner setup or a check, builds in another order or place, runs Podman (the fake one
+/// fails and is on record), leaves the copy's `kbf-m2-act` unexecutable (the fake build
+/// fails as the farm's action would), leaves a unit running, or passes without one of its
+/// OK lines.
 #[test]
 fn a_cell_that_does_everything_passes() {
     let cell = Cell::new("passes", "none");
@@ -665,11 +617,11 @@ fn a_cell_that_does_everything_passes() {
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
     let stdout = text(&out.stdout);
     let lines = [
-        "podman version fake".to_owned(),
+        "crun version fake".to_owned(),
         "swap areas:".to_owned(),
-        format!("OK: pulled {IMAGE}"),
         "kbf-server listening reapi=127.0.0.1:8980".to_owned(),
         "daemon joined (kbf-m2-daemon)".to_owned(),
+        format!("OK: the daemon fetched {IMAGE} and unpacked it"),
         format!(
             "OK: the daemon's cgroup {CGROUP} holds supervisor/ (pid 4242), and it and \
              actions/ enable cpu memory pids"
@@ -719,12 +671,11 @@ fn a_cell_that_does_everything_passes() {
             "-n systemd-run --quiet --collect --unit={name} --slice=kbf-daemon.slice \
              -p Delegate=yes -p OOMScoreAdjust=-900 -p StandardError=append:{w}/logs/daemon.err \
              --uid={uid} --gid={gid} --working-directory={w} -E HOME={home} -E PATH={path} \
-             -E XDG_RUNTIME_DIR={rt} {bin}/kbf-daemon --driver container \
+             {bin}/kbf-daemon --driver container \
              --server https://127.0.0.1:8981 --cas https://127.0.0.1:8981 \
              --ca-cert {w}/pki/ca.pem --cert {w}/pki/client.pem --key {w}/pki/client.key \
              --tls-server-name localhost --node-id cell-node-1 --data-dir {w}/data \
-             --actions-memory-max-gib 8",
-            rt = cell.runtime.display(),
+             --actions-memory-max-gib 8 --image docker://{IMAGE}",
             bin = cell.dir.join("bin").display(),
         )
     };
@@ -732,7 +683,6 @@ fn a_cell_that_does_everything_passes() {
     assert_eq!(
         sudo,
         [
-            format!("-n loginctl enable-linger {uid}"),
             unit("kbf-m2-daemon"),
             "-n systemctl kill --kill-whom=main -s SIGKILL kbf-m2-daemon".to_owned(),
             unit("kbf-m2-daemon-2"),
@@ -748,21 +698,11 @@ fn a_cell_that_does_everything_passes() {
         ]
     );
 
-    let label = "--filter label=kbf.owner=cell-node-1 --format {{.Names}}";
-    let running = format!("ps --filter status=running {label}");
-    let all = format!("ps -a {label}");
-    assert_eq!(
-        cell.args("podman"),
-        [
-            "--version".to_owned(),
-            format!("pull -q {IMAGE}"),
-            running.clone(),
-            running,
-            all.clone(),
-            all.clone(),
-            all,
-        ]
-    );
+    // Podman never ran (the fake one fails and is on record), and crun was asked its
+    // version once, by the harness: every other call is the daemon's, through a runtime
+    // of its own that is not this fake.
+    assert_eq!(cell.args("podman"), Vec::<String>::new());
+    assert_eq!(cell.args("crun"), ["--version"]);
 
     let buck2 = cell.calls("buck2");
     let project = format!("{w}/project");
@@ -890,7 +830,11 @@ fn an_act_that_is_not_elf_is_refused() {
 fn a_used_work_directory_is_refused() {
     let cell = Cell::new("used-work", "none");
     std::fs::create_dir_all(cell.work().join("project")).expect("an old project");
-    let out = cell.run();
+    // Without `--data-dir`: the daemon's goes under the system's temporary directory.
+    let out = cell
+        .command_without_data_dir()
+        .output()
+        .expect("run kbf-cell m2");
     assert_eq!(out.status.code(), Some(2), "{}", both(&out));
     assert!(
         text(&out.stderr).contains("project exists; give a fresh --work"),
@@ -900,23 +844,19 @@ fn a_used_work_directory_is_refused() {
     assert!(cell.args("kbf-server").is_empty());
 }
 
-/// Catches: a harness that goes on when the runner's user cannot linger (no user
-/// manager, so rootless Podman has no runtime directory).
+/// Catches: a harness that goes on without `crun` (the runtime is not on the runner).
 #[test]
-fn a_runner_that_cannot_linger_fails() {
-    let (cell, _) = fails("linger-fails", 2, "the runner setup: sudo -n loginctl");
+fn a_runner_without_crun_fails() {
+    let (cell, _) = fails("crun-fails", 1, "FAIL: crun --version failed");
+    assert!(cell.args("kbf-server").is_empty());
     assert!(cell.args("podman").is_empty());
 }
 
-/// Catches: a harness that starts the daemon without the image pulled.
+/// Catches: a harness that accepts a daemon that joined without the image it was given
+/// in its store (every lease would fetch it, on the action path).
 #[test]
-fn a_failed_pull_fails() {
-    let (cell, _) = fails(
-        "pull-fails",
-        1,
-        &format!("FAIL: podman pull -q {IMAGE} failed"),
-    );
-    assert!(cell.args("kbf-server").is_empty());
+fn a_daemon_that_did_not_unpack_its_image_fails() {
+    fails("image-not-unpacked", 1, "FAIL: the daemon joined, but ");
 }
 
 /// Catches: a harness that goes on without the server's start line.
@@ -1057,7 +997,7 @@ fn a_lease_with_no_running_container_fails() {
     fails(
         "no-container",
         1,
-        "FAIL: while //:pause ran, 0 running containers were labelled kbf.owner=cell-node-1",
+        "FAIL: while //:pause ran, 0 crun containers existed, not one",
     );
 }
 
@@ -1067,7 +1007,7 @@ fn a_lease_with_two_running_containers_fails() {
     fails(
         "two-containers",
         1,
-        "FAIL: while //:pause ran, 2 running containers were labelled kbf.owner=cell-node-1",
+        "FAIL: while //:pause ran, 2 crun containers existed, not one",
     );
 }
 
@@ -1097,21 +1037,17 @@ fn a_pause_shorter_than_its_sleep_fails() {
 /// Catches: a harness that does not check that the containers go.
 #[test]
 fn a_container_left_behind_fails() {
-    fails(
-        "container-left",
-        1,
-        "FAIL: 1 containers labelled kbf.owner=cell-node-1 are left",
-    );
+    fails("container-left", 1, "FAIL: 1 crun containers are left");
 }
 
 /// Catches: a harness that does not check the lease scratch directory, or counts the
-/// daemon's claim on it as left behind.
+/// daemon's own directories in it (the claim, the image store) as left behind.
 #[test]
 fn a_lease_directory_left_behind_fails() {
     fails(
         "lease-left",
         1,
-        "FAIL: the lease scratch directory holds more than the claim: kbf-lease-3-1",
+        "FAIL: lease scratch directories are left: kbf-lease-3-1",
     );
 }
 

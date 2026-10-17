@@ -1,7 +1,7 @@
 //! Running a tool as another user: who the user is, read from the host while planning,
 //! and the switch the tool's process makes before it starts.
 //!
-//! A root plan that must act as a service user (pull into the kbf user's Podman store)
+//! A root plan that must act as a service user (a tool that reads or fills the kbf user's own files)
 //! gives its [`Cmd`] a [`RunUser`]. Between fork and exec the child sets the user's
 //! supplementary groups, then its group, then its uid, as `sudo -u` does. The groups
 //! come first because each call needs the rights the next one gives up, and they are

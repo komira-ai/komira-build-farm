@@ -1,23 +1,30 @@
-//! The per-node image store of the OCI backend: each image digest unpacked once into
-//! `<images>/<hex>/rootfs`, read-only afterwards, shared by every action that names it.
+//! The per-node image store of the OCI backend: each image digest fetched from its
+//! registry and unpacked once into `<images>/<hex>/rootfs`, read-only afterwards, shared
+//! by every action that names it.
 //!
-//! **Acquisition is off the action path, and uses Podman once per digest.** The node's
-//! Podman store is still where an image is pulled (`podman pull <repo>@sha256:...`,
-//! as the error for a missing image says) and where the manifest is checked
-//! (`PodmanBackend::check_store`: the digest must name one image, not an index). Then
-//! `podman export` writes the container filesystem as a tar, and a helper container
-//! ([`helper::unpack_jobs`]) extracts it with `tar` inside a user namespace that has
-//! the same mapping as an action's, so every file ends up owned by the host id the
-//! action sees as the image's own id (root is the first subordinate id), with no
-//! shifting pass. After that an action needs one `stat` of `<hex>/rootfs`.
+//! **Acquisition is the node's own and digest-verified end to end** (`kbf-image`): the
+//! manifest is fetched by the pinned digest and must hash to it (and must be one image,
+//! not an index); the config and every layer blob are hashed as they are written and
+//! must match the manifest. No container tool takes part. Then a helper container
+//! ([`helper::unpack_job`]) applies the layers with `kbf-daemon __unpack-layers` inside a
+//! user namespace that has the same mapping as an action's, so every file ends up owned
+//! by the host id the action sees as the image's own id (root is the first subordinate
+//! id), with no shifting pass. After that an action needs one `stat` of
+//! `<hex>/rootfs`.
 //!
-//! The extraction runs in a user namespace with the daemon user unmapped and the stage
-//! directory the only writable path, so a hostile tar can write nothing the daemon user
-//! owns. The tar is of an image pinned by digest.
+//! The first use of an image pays for the fetch and the unpack, on the lease's prepare
+//! step or, for the images the daemon is given with `--image`, at start; a second use
+//! (and a second daemon on the same data directory) finds the directory and fetches
+//! nothing.
 //!
-//! Single flight per digest: concurrent first uses of one image wait on one unpack; a
-//! use cancelled mid-unpack leaves another to retry (a stage directory with a different
-//! random name each time; the leftovers are removed by the sweep at the next start).
+//! The unpack runs in a user namespace with the daemon user unmapped, the stage directory
+//! the only writable path and the downloaded blobs read-only, so a hostile tar can write
+//! nothing the daemon user owns.
+//!
+//! Single flight per digest: concurrent first uses of one image wait on one fetch and
+//! unpack; a use cancelled midway leaves another to retry (a stage directory with a
+//! different random name each time; the leftovers are removed by the sweep at the next
+//! start).
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt as _;
@@ -26,11 +33,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::OnceCell;
 
-use super::{JobError, Oci, at, helper};
+use super::{JobError, Oci, at};
 use crate::image::{ImageCheckError, ImageRef};
 
 /// The directory of the rootfs under an image's directory.
-pub(crate) const ROOTFS: &str = "rootfs";
+pub(crate) use crate::unpack_layers::ROOTFS;
 
 /// The prefix of an unpack in progress.
 pub(crate) const STAGE_PREFIX: &str = ".stage-";
@@ -71,11 +78,12 @@ impl Images {
         self.rootfs_of(image.digest()).is_dir()
     }
 
-    /// Unpacks `image` unless it is, waiting for an unpack already under way.
+    /// Fetches and unpacks `image` unless it is, waiting for a fetch already under way.
     ///
     /// # Errors
-    /// The image is not in the node's Podman store, names an index, or cannot be
-    /// exported or unpacked.
+    /// The registry cannot be reached or refuses, the digest names an index or a
+    /// manifest or blob that does not hash to its digest, or the layers cannot be
+    /// unpacked.
     pub(crate) async fn ensure(&self, oci: &Oci, image: &ImageRef) -> Result<(), ImageCheckError> {
         if self.has(image) {
             return Ok(());
@@ -84,72 +92,75 @@ impl Images {
             let mut flights = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
             Arc::clone(flights.entry(hex_of(image)).or_default())
         };
-        let unpacked = flight.get_or_try_init(|| async {
-            oci.podman_backend().check_store(image).await?;
-            self.unpack(oci, image)
-                .await
-                .map_err(|e| ImageCheckError::Failed(e.to_string()))
-        });
-        unpacked.await?;
+        flight.get_or_try_init(|| self.acquire(oci, image)).await?;
         Ok(())
     }
 
-    /// Exports and unpacks `image` into a stage directory, then renames the stage to the
-    /// image's directory: presence of that name means complete. The stage is removed
-    /// whatever happens to it.
-    async fn unpack(&self, oci: &Oci, image: &ImageRef) -> Result<(), JobError> {
+    /// Fetches the layers into a directory of blobs, unpacks them into a stage directory,
+    /// then renames the stage to the image's directory: presence of that name means
+    /// complete. The blobs and the stage are removed whatever happens.
+    async fn acquire(&self, oci: &Oci, image: &ImageRef) -> Result<(), ImageCheckError> {
         let hex = hex_of(image);
         let id = unique();
         let stage = self.dir.join(format!("{STAGE_PREFIX}{hex}-{id}"));
-        let exported = self.dir.join(format!("{STAGE_PREFIX}{hex}-{id}-tar"));
-        at(&self.dir, tokio::fs::create_dir_all(&self.dir).await)?;
+        let blobs = self.dir.join(format!("{STAGE_PREFIX}{hex}-{id}-blobs"));
+        at(&self.dir, tokio::fs::create_dir_all(&self.dir).await).map_err(failed)?;
         // Searched by the container's ids on the way to an image's root, whatever umask
         // the daemon runs under.
         let open = std::fs::Permissions::from_mode(0o755);
-        at(&self.dir, tokio::fs::set_permissions(&self.dir, open).await)?;
-        let unpacked = self
-            .unpack_into(oci, image, &stage, &exported, &format!("{hex}-{id}"))
-            .await;
-        let _ = tokio::fs::remove_dir_all(&exported).await;
-        if unpacked.is_err() {
+        at(&self.dir, tokio::fs::set_permissions(&self.dir, open).await).map_err(failed)?;
+        let made = self.fetch_and_unpack(oci, image, &stage, &blobs).await;
+        // The blobs are the daemon's own files.
+        let _ = tokio::fs::remove_dir_all(&blobs).await;
+        if made.is_err() && stage.exists() {
             // The stage holds files only the container's ids own.
             let _ = oci.remove_dir_async(&stage).await;
         }
-        unpacked?;
+        made?;
         // The stage was open to the container's root; the image directory is not.
         let closed = std::fs::Permissions::from_mode(0o755);
-        at(&stage, tokio::fs::set_permissions(&stage, closed).await)?;
+        at(&stage, tokio::fs::set_permissions(&stage, closed).await).map_err(failed)?;
         let finished = self.dir.join(&hex);
-        at(&finished, tokio::fs::rename(&stage, &finished).await)
+        at(&finished, tokio::fs::rename(&stage, &finished).await).map_err(failed)
     }
 
-    /// Exports the image into `exported/image.tar` (a directory of its own, since a
-    /// helper binds directories) and unpacks it into `stage`. The throwaway container
-    /// is named for this unpack, so two daemons (or tests) sharing one Podman store
-    /// never remove each other's.
-    async fn unpack_into(
+    /// Downloads the image's layers into `blobs` (a directory the container's ids can
+    /// read), makes `stage` (open to the container's root, which is not the daemon user:
+    /// it makes the image's root inside, owned by itself) and unpacks the layers into it.
+    async fn fetch_and_unpack(
         &self,
         oci: &Oci,
         image: &ImageRef,
         stage: &Path,
-        exported: &Path,
-        unique_name: &str,
-    ) -> Result<(), JobError> {
-        // Open to the container's root, which is not the daemon user: it makes the
-        // image's root inside, owned by itself.
-        at(stage, tokio::fs::create_dir(stage).await)?;
-        let open = std::fs::Permissions::from_mode(0o777);
-        at(stage, tokio::fs::set_permissions(stage, open).await)?;
-        at(exported, tokio::fs::create_dir(exported).await)?;
-        let name = format!("kbf-image-{unique_name}");
-        let tar = exported.join(helper::TAR_FILE);
-        oci.podman_export(&image.to_string(), &name, &tar)
+        blobs: &Path,
+    ) -> Result<(), ImageCheckError> {
+        at(blobs, tokio::fs::create_dir(blobs).await).map_err(failed)?;
+        let open = std::fs::Permissions::from_mode(0o755);
+        at(blobs, tokio::fs::set_permissions(blobs, open).await).map_err(failed)?;
+        let layers = oci
+            .registry()
+            .fetch(image, blobs)
             .await
-            .map_err(JobError::Crun)?;
-        oci.unpack_tar(stage, exported).await
+            .map_err(|e| match e {
+                kbf_image::Error::Index(_) => ImageCheckError::Index(image.clone()),
+                other => ImageCheckError::Failed(other.to_string()),
+            })?;
+        let mut names = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let readable = std::fs::Permissions::from_mode(0o644);
+            let path = blobs.join(&layer.name);
+            at(&path, tokio::fs::set_permissions(&path, readable).await).map_err(failed)?;
+            names.push(layer.name);
+        }
+        at(stage, tokio::fs::create_dir(stage).await).map_err(failed)?;
+        let open = std::fs::Permissions::from_mode(0o777);
+        at(stage, tokio::fs::set_permissions(stage, open).await).map_err(failed)?;
+        oci.unpack_layers(stage, blobs, &names)
+            .await
+            .map_err(failed)
     }
 
-    /// Removes what an unpack that was killed left: the stage directories and tars.
+    /// Removes what an unpack that was killed left: the stage directories and blobs.
     /// Blocking; the files in a stage are owned by subordinate ids, so it needs `oci`.
     ///
     /// # Errors
@@ -184,6 +195,11 @@ impl Images {
             ))
         }
     }
+}
+
+/// A step of the fetch or the unpack that failed, as the check of an image reports it.
+fn failed(error: JobError) -> ImageCheckError {
+    ImageCheckError::Failed(error.to_string())
 }
 
 /// A name part unique to this process and call.

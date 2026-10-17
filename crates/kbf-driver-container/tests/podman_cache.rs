@@ -1,12 +1,13 @@
-//! The driver with the node's input cache, against real rootless Podman
+//! The driver with the node's input cache, against real rootless `crun`
 //! (`docs/design/worker-cache.md#51-container-driver-linux-rootless-podman-hard-links-into-the-overlay-lower`,
 //! tests C-1, C-2, C-12 and C-18). Run by `cargo xtask podman-tests`, as the other
-//! real-Podman tests are: each is `#[ignore]` with that reason.
+//! real-`crun` tests are: each is `#[ignore]` with that reason.
 //!
-//! A cached input is a hard link to an entry owned by the daemon's user, which
-//! `--userns=nomap` maps to nothing in the container: the overlay never writes its
-//! lower layer, and the container's root may not open the file for writing or change
-//! its mode. The driver's `__chown-dirs` helper is this test binary.
+//! A cached input is a hard link to an entry owned by the daemon's user, which the
+//! container's id mapping (no id of the daemon user) maps to nothing in the container:
+//! the overlay never writes its lower layer, and the container's root may not open the
+//! file for writing or change its mode. The driver's `__chown-dirs` and `__unpack-layers`
+//! helpers are this test binary.
 
 mod support;
 
@@ -18,9 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kbf_daemon::cache::{CacheConfig, Key};
 use kbf_daemon::cas::digest_of;
 use kbf_driver_container::{CacheUse, PodmanConfig};
-use support::real::{Cell, podman, sh};
-
-kbf_driver_container::chown_dirs_test_hook!();
+use support::real::{Cell, sh};
 
 /// An empty cache beside `config`'s scratch directory, linking with `link`. Like the
 /// scratch directory, it is emptied first: CI restores `target` from an earlier run.
@@ -81,17 +80,11 @@ fn unchanged(path: &Path, bytes: &[u8]) {
 /// lease reads its bytes. The graph driver and the overlay's mount options are
 /// printed, which is what this test proved the behaviour on.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_container_cannot_write_or_re_own_a_cached_input() {
     let cell = Cell::with("cache-c1", |config| with_cache(config, None));
-    eprintln!(
-        "graph: {}",
-        podman(&[
-            "info",
-            "--format={{.Store.GraphDriverName}} {{json .Store.GraphOptions}}"
-        ])
-        .trim()
-    );
+    // The overlay is the kernel's, mounted by `crun` inside the container's mount
+    // namespace; the mountinfo line the action prints below shows its options.
     let mut spec = sh("grep ' /kbf/root ' /proc/self/mountinfo; \
          for try in 'echo x >> in' 'truncate -s0 in' 'chmod u+w in' 'exec 3<>in' 'ln in in2 && echo y >> in2'; do \
            if sh -c \"$try\" 2>/dev/null; then echo \"WROTE: $try\"; else echo \"refused: $try\"; fi; \
@@ -115,7 +108,7 @@ async fn a_container_cannot_write_or_re_own_a_cached_input() {
 /// chown would give the cached inode to the container's root): the action appends to
 /// it, the output has the new bytes, and the entry has the old.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn an_output_that_is_an_input_is_a_private_copy() {
     let cell = Cell::with("cache-c2", |config| with_cache(config, None));
     let mut spec = sh("printf ' more' >> out/o.txt && cat same.txt");
@@ -139,7 +132,7 @@ async fn an_output_that_is_an_input_is_a_private_copy() {
 /// Mutant: the input root mounted without the overlay and its files given to the
 /// container's root, so the rewrite lands in the cache's inode.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_lease_sees_none_of_the_last_ones_changes() {
     let cell = Cell::with("cache-c12", |config| with_cache(config, None));
     let inputs = vec![
@@ -168,7 +161,7 @@ async fn a_lease_sees_none_of_the_last_ones_changes() {
 /// on one where linking the second name fails with `EMLINK`, and a `tar` of them is
 /// the same bytes both times (it records the hard link, the modes and the mtimes).
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
     let refuse = Arc::new(AtomicBool::new(false));
     let refusing = Arc::clone(&refuse);
@@ -205,7 +198,7 @@ async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
 
 // Shared read-only trees (`docs/design/fast-sandbox.md#44-correctness-an-action-cannot-modify-a-shared-tree`).
 // The daemon-side tests (`kbf-daemon/tests/trees.rs`) show which directories become mounts and
-// what a tree is on disk; the stand-in Podman shows the volume reaches the container's arguments.
+// what a tree is on disk; the stand-in `crun` shows the bind reaches the bundle.
 // Only a kernel shows the rest, below.
 
 /// A cache and an empty tree store beside `config`'s scratch directory. A store left by
@@ -239,7 +232,7 @@ fn toolchain() -> Vec<support::Input> {
 /// lease reads the tree whole. The mountinfo line of the tree is printed: it shows
 /// `ro`, which is what this test proved the behaviour on.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
     let cell = Cell::with("trees-ro", with_trees);
     let mut spec = sh("grep ' /kbf/root/tc ' /proc/self/mountinfo; \
@@ -275,7 +268,7 @@ async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
 /// one process, each time from `Cell::with`; the second run's first lease builds the
 /// tree again and finds none of its inputs in the cache, as the first run's did.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_cache_and_tree_store_start_empty_whatever_an_earlier_run_left() {
     let mut spec = sh("cat src/a; echo; ls tc/lib | wc -l");
     spec.inputs = toolchain();

@@ -50,6 +50,9 @@ hex = "0.4.3"
 httparse = "1.10.1"
 # The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.
 http-body = "1.1.0"
+# The registry client of kbf-image reads response bodies frame by frame. Already in the tree
+# through axum and tonic.
+http-body-util = "0.1.5"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
@@ -173,6 +176,7 @@ kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
+kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }

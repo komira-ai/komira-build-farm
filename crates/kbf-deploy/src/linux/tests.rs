@@ -457,8 +457,38 @@ fn rows() -> Vec<Row> {
             "",
             "FAIL server: kbf-server has no --meta-dir",
         ),
+        // runtime: Podman named as the runtime, the runtime flags left out, and the name
+        // in a comment of the unit.
+        row(
+            "daemon-runtime-podman",
+            Daemon,
+            "--container-runtime=oci",
+            "--container-runtime=podman",
+            "FAIL runtime: kbf-daemon.service passes --container-runtime=podman",
+        ),
+        row(
+            "daemon-runtime-dropped",
+            Daemon,
+            "    --container-runtime=oci \\\n",
+            "",
+            "FAIL runtime: kbf-daemon.service does not pass --container-runtime=oci",
+        ),
+        row(
+            "daemon-oci-runtime-dropped",
+            Daemon,
+            "    --oci-runtime=/usr/bin/crun \\\n",
+            "",
+            "FAIL runtime: kbf-daemon.service does not pass --oci-runtime",
+        ),
+        row(
+            "daemon-names-podman",
+            Daemon,
+            "OOMScoreAdjust=-900\n",
+            "OOMScoreAdjust=-900\n# rootless Podman\n",
+            "FAIL runtime: kbf-daemon.service line ",
+        ),
         // image: kbf-daemon exits 2 at start on a bare --image (the kit once rendered
-        // podman's form), and must run the images the settings pin.
+        // bare form), and must run the images the settings pin.
         with_image(row(
             "daemon-image-no-scheme",
             Daemon,
@@ -524,7 +554,7 @@ fn each_planted_defect_turns_its_rule_red() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
-    assert_eq!(rows.len(), 42, "rows");
+    assert_eq!(rows.len(), 46, "rows");
 }
 
 #[test]
@@ -542,7 +572,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
     };
     assert_eq!(
         refused(Which::Daemon, "Restart=on-failure", "Restart=@KBF_RESTART@").as_deref(),
-        Some("kbf-daemon.service:34: placeholder @KBF_RESTART@ has no value")
+        Some("kbf-daemon.service:36: placeholder @KBF_RESTART@ has no value")
     );
     assert_eq!(
         refused(
@@ -589,7 +619,7 @@ fn settings_change_the_units_as_documented() {
     // (`--data-dir`, `--meta-dir`), the removed KBF_META_LOG still accepted (a settings
     // file written for the old units would run with a log it never asked for); an IPv6
     // listen address written unbracketed (`2001:db8::10:8980` is no socket address);
-    // images rendered in podman's bare form or not at all; a defaulted key not taking
+    // images rendered in the bare form or not at all; a defaulted key not taking
     // its default.
     let moved = config(&[("KBF_DATA_DIR", "/srv/kbf"), ("KBF_META_DIR", "/srv/meta")]);
     let u = rendered(&moved, &Templates::BUILT_IN);
@@ -720,11 +750,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 107: unknown key KBF_RAM",
+            "line 108: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 107: KBF_RAM_GIB is already set on line 24",
+            "line 108: KBF_RAM_GIB is already set on line 24",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),
@@ -745,7 +775,7 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             example_with(&[("KBF_IMAGES", &docker)]),
-            "write the bare <repo>@sha256:<digest> (podman's form)",
+            "write the bare <repo>@sha256:<digest>",
         ),
         (
             example_with(&[("KBF_RAM_GIB", "+256")]),

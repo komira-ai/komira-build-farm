@@ -3,12 +3,39 @@
 How to run `kbf-daemon` with the container driver (`--driver=container`) on a
 dedicated Linux build host: the systemd units, swap, and how much memory to leave the
 host. What the daemon does with its cgroup is in
-[daemon.md](../design/daemon.md) (`PodmanRuntime`); this page is what the host gives it.
+[daemon.md](../design/daemon.md) (the OCI backend); this page is what the host gives it.
 
 The host runs cgroup v2 alone (the default on current distributions; otherwise boot
-with `systemd.unified_cgroup_hierarchy=1`), rootless Podman, and a `kbf` user with
-subordinate uid and gid ranges in `/etc/subuid` and `/etc/subgid` (the daemon checks
-them at start).
+with `systemd.unified_cgroup_hierarchy=1`), and a `kbf` user with a subordinate uid and
+gid range of at least 65,536 in `/etc/subuid` and `/etc/subgid` (the daemon checks
+them at start). kbf runs containers with `crun` only: no Podman is installed or used.
+
+## What the host installs
+
+The daemon makes its containers with `crun`, rootless, from the `kbf` user's account:
+
+| Needs | Where it comes from |
+|---|---|
+| `crun` at `/usr/bin/crun` (the units pass `--oci-runtime=/usr/bin/crun`); 1.14.1 is the version the tests run | the distribution's `crun` package |
+| `newuidmap` and `newgidmap`, setuid root (or holding file capabilities), on the daemon's `PATH` | the `uidmap` package |
+| a subordinate uid and gid range of at least 65,536 for `kbf` | `usermod --add-subuids 100000-165535 --add-subgids 100000-165535 kbf` |
+| kernel 5.11 or later (overlayfs inside a user namespace) | the distribution |
+| cgroup v2 delegated to the daemon's unit | the units' `Delegate=yes` |
+| every directory from `/` to `--data-dir` searchable by others (`chmod o+x`): the container's ids are not the daemon user's | the host |
+| unprivileged user namespaces allowed for `crun` | on Ubuntu 24.04, the AppArmor profile `crun` ships |
+| headroom under `kernel.keys.maxkeys` (200 per user by default; each container's session keyring counts) | `sysctl kernel.keys.maxkeys` |
+| egress to the registries the pinned images come from (`registry-1.docker.io` for `docker.io`, `gcr.io`) | the network |
+
+What an action sees of the host is only its image and its inputs: its root `/` is the
+unpacked image, **read-only** (unlike a Podman container's, which was writable
+everywhere), and only `/tmp`, `/var/tmp`, `/run`, `/root` and the input root `/kbf/root`
+are writable; an action that writes anywhere else gets `EROFS`. That is the OCI backend's
+behaviour and stays so until a writable overlay of the image is chosen.
+
+The daemon checks the id range, the directories' search permission, `crun` and the two id
+tools at start and refuses to start naming the one that is wrong. Lingering and
+`XDG_RUNTIME_DIR` are not needed by `crun`; `kbf-deploy linux install-units` still checks
+that `kbf` lingers because its units still set `XDG_RUNTIME_DIR`, until they are changed.
 
 ## Memory on the host
 
@@ -75,7 +102,7 @@ lacks it ([storage-node.md](storage-node.md#installing-on-the-host)).
 
 Set `--actions-memory-max-gib` to the host's RAM minus 4 to 8 GiB: on a 256 GiB host,
 248 to 252. The rest stays for the kernel, systemd, sshd, the daemon (whose own
-`memory.min` sits outside `actions/`) and Podman's processes. The node reports the
+`memory.min` sits outside `actions/`) and the containers' runtime processes. The node reports the
 lower of this cap and its memory as `mem_gib`, so the scheduler books no more than
 leases may use. On a host that also runs a `kbf-server` and a node of the object
 store (the [converged topology](../design/deployment-topology.md#converged-topology)),
@@ -146,11 +173,13 @@ MemoryMin=256M
 # Under a host-wide OOM the kernel kills a build before the daemon; containers get 0
 # back from the driver.
 OOMScoreAdjust=-900
-# Rootless Podman's run directory: the kbf user's systemd manager, kept by lingering
-# (loginctl enable-linger kbf).
+# Not used by crun (it runs with an explicit --root); the installer still checks that
+# the kbf user lingers (loginctl enable-linger kbf) until this line goes.
 Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
+    --container-runtime=oci \
+    --oci-runtime=/usr/bin/crun \
     --server=https://<server>:<worker port> \
     --cas=https://<server>:<worker port> \
     --ca-cert=/etc/kbf/ca.pem \

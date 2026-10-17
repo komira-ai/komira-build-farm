@@ -15,7 +15,7 @@
 //! refuses at start. Not covered: systemd itself, the held scripts and the host setup.
 //!
 //! The deviations from the rendered units are listed in [`Farm::start`]: the cold store
-//! is a directory (no MinIO), the container driver runs the stand-in `podman` over a
+//! is a directory (no MinIO), the container driver runs the stand-in `crun` over a
 //! planted cgroup tree and id files.
 
 #![cfg(target_os = "linux")]
@@ -45,19 +45,19 @@ use kbf_proto::reapi::{
     ExecuteRequest, ExecuteResponse, FileNode, GetActionResultRequest, Platform,
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
-use node::{cgroup_tree, files_holding, id_files, image_path, input_bytes, podman};
+use node::{cgroup_tree, crun, files_holding, id_files, image_path, input_bytes, podman_ran};
 use pki::Pki;
 use procs::{HANG, Proc, field};
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use units::{Rendered, config, rendered};
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-podman");
+/// The stand-in `crun` (`node::crun`).
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
@@ -77,7 +77,7 @@ fn loopback(n: usize) -> String {
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let dir = node::scratch_root()
         .join("kbf-rehearsal")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -211,7 +211,7 @@ struct Farm {
     reapi: String,
     api: u16,
     ca: Vec<u8>,
-    /// The image the actions name: what the stand-in `podman` serves.
+    /// The image the actions name: the one unpacked in each node's image store.
     image: String,
     storage_nodes: usize,
     /// The ids the frontend must list as connected, sorted.
@@ -223,9 +223,10 @@ impl Farm {
     ///
     /// The flags a test box cannot take as rendered, and what each is changed to:
     /// - the nodes' `--cold-store=s3://...` (no MinIO here) is a `file://` directory;
-    /// - `--driver=container` stays, over the stand-in `podman`: the nodes get it on
-    ///   `PATH`, their cgroup tree (`--cgroup-root`, `--self-cgroup`) is planted and
-    ///   `--id-files` stands for `/etc/subuid`.
+    /// - `--driver=container` stays, over the stand-in `crun`: `--oci-runtime=` names it,
+    ///   the id tools and a failing `podman` are on `PATH`, their cgroup tree
+    ///   (`--cgroup-root`, `--self-cgroup`) is planted and `--id-files` stands for
+    ///   `/etc/subuid`.
     ///
     /// Every other flag is the unit's.
     fn start(name: &str, storage_nodes: usize) -> Self {
@@ -287,7 +288,7 @@ impl Farm {
             let id = id.as_str();
             let root = dir.join(id);
             let bin = make_dirs(&root);
-            let image = podman(&bin, FAKE_PODMAN, &steps);
+            let image = crun(&bin, &root.join("data"), FAKE_CRUN, &steps);
             let etc = root.join("etc");
             pki.write_ca(&etc);
             pki.issue(&etc, "storage", Row::Storage, &[&host]);
@@ -303,7 +304,7 @@ impl Farm {
         let (id, host) = (DAEMON, loopback(storage_nodes + 1));
         let root = dir.join(id);
         let bin = make_dirs(&root);
-        let image = podman(&bin, FAKE_PODMAN, &steps);
+        let image = crun(&bin, &root.join("data"), FAKE_CRUN, &steps);
         let etc = root.join("etc");
         pki.write_ca(&etc);
         pki.issue(&etc, "node", Row::Daemon, &[id]);
@@ -315,15 +316,18 @@ impl Farm {
     }
 
     /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the stand-in `podman` on `PATH` and the planted cgroup tree and id files.
+    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools and a failing
+    /// `podman` on `PATH` and the planted cgroup tree and id files.
     fn launch(&mut self, dir: &Path, root: &Path, name: &str, unit: Rendered, bin: Option<&Path>) {
         let (unit, cwd, mut env) = match bin {
             Some(bin) => {
                 let mut flags = cgroup_tree(bin);
                 flags.push(format!("--id-files={}", id_files(root).display()));
                 let env = vec![("PATH".to_owned(), image_path(bin))];
+                // The rendered unit names `/usr/bin/crun`: this box's is the stand-in.
+                let runtime = [format!("--oci-runtime={}", bin.join("crun").display())];
                 // The stand-in finds its state beside the link it was run through.
-                (unit.add(&flags), bin, env)
+                (unit.replace(&runtime).add(&flags), bin, env)
             }
             None => (unit, root, Vec::new()),
         };
@@ -402,6 +406,12 @@ impl Farm {
             let status = self.procs[i].term();
             assert!(status.success(), "{status}\n{}", self.logs());
         }
+        // The `podman` first on each node's PATH fails and records that it ran: kbf
+        // never starts it.
+        for root in &self.roots {
+            let ran = podman_ran(&root.join("bin"));
+            assert_eq!(ran, "", "podman ran on {}", root.display());
+        }
     }
 
     /// The nodes (by index) that hold `bytes` in their hot or cold store.
@@ -440,7 +450,7 @@ async fn upload_action(cas: &Transfers, image: &str, input: &[u8]) -> Digest {
         }],
         ..Directory::default()
     };
-    // The stand-in `podman` runs its planted steps whatever the arguments are.
+    // The stand-in `crun` runs its planted steps whatever the arguments are.
     let command = ReapiCommand {
         arguments: vec!["true".to_owned()],
         output_paths: vec!["out/file.txt".to_owned()],

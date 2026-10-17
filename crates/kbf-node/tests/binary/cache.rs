@@ -12,7 +12,7 @@ fn logged(log: &[String], words: &[&str]) -> bool {
         .any(|line| words.iter().all(|w| line.contains(w)))
 }
 
-/// The flags of a container daemon with the stub `podman`, a stand-in cgroup tree and
+/// The flags of a container daemon with the id tools on `PATH`, a stand-in cgroup tree and
 /// a full subordinate id range, run as `name`, with its data directory `data`.
 #[cfg(target_os = "linux")]
 fn container(name: &str, data: &std::path::Path) -> (Vec<String>, std::path::PathBuf) {
@@ -20,13 +20,14 @@ fn container(name: &str, data: &std::path::Path) -> (Vec<String>, std::path::Pat
     let (_, cgroup) = super::cgroup_tree(&tls(&format!("{name}-cgroup")), "cpu memory pids");
     let mut flags = vec![
         "--driver=container".to_owned(),
+        super::OCI_RUNTIME.to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
         format!("--data-dir={}", data.display()),
         format!("--id-files={}", ids.display()),
         "--actions-memory-max-gib=1".to_owned(),
     ];
     flags.extend(cgroup);
-    let (bin, _) = super::podman_stub(&format!("{name}-bin"));
+    let (bin, _) = super::container_bin(&format!("{name}-bin"));
     (flags, bin)
 }
 
@@ -76,7 +77,8 @@ fn a_container_node_opens_its_cache_and_trees_under_the_data_dir() {
         let mode = |path: &std::path::Path| {
             std::fs::metadata(path).expect("made").permissions().mode() & 0o777
         };
-        assert_eq!(mode(&leases), 0o700);
+        // Searchable by the container's ids, which are not the daemon's.
+        assert_eq!(mode(&leases), 0o711);
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&data.join("trees")), 0o711);
         assert!(
@@ -266,6 +268,66 @@ fn the_binary_runs_as_the_chown_dirs_helper_before_it_parses_its_flags() {
     let bad = run(&["__chown-dirs", "kbf"]);
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("usage"));
+}
+
+/// Catches a binary that parses its flags before it answers as the container driver's
+/// `__unpack-layers` helper (the OCI backend's image unpack, run in a helper container):
+/// given a stage directory, a directory of blobs and one layer, it makes `rootfs` with the
+/// layer's file and the mount points the runtime binds over, and exits 0; arguments it
+/// cannot read exit 2 with a usage line; a layer it cannot read exits 1.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn the_binary_runs_as_the_unpack_layers_helper_before_it_parses_its_flags() {
+    let dir = tls("unpack-layers");
+    let (stage, blobs) = (dir.join("stage"), dir.join("blobs"));
+    std::fs::create_dir_all(&stage).expect("stage");
+    std::fs::create_dir_all(&blobs).expect("blobs");
+    let (uid, gid) = rustix_ids();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(5);
+    header.set_mode(0o644);
+    header.set_uid(u64::from(uid));
+    header.set_gid(u64::from(gid));
+    header.set_cksum();
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_data(&mut header, "etc/os-release", &b"image"[..])
+        .expect("append");
+    std::fs::write(blobs.join("0.tar"), builder.into_inner().expect("tar")).expect("layer");
+    let run = |args: &[&str]| {
+        std::process::Command::new(BIN)
+            .args(args)
+            .output()
+            .expect("spawn")
+    };
+    let (stage_arg, blobs_arg) = (stage.display().to_string(), blobs.display().to_string());
+    let bad = run(&["__unpack-layers", &stage_arg]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("usage"));
+    let ok = run(&["__unpack-layers", &stage_arg, &blobs_arg, "0.tar"]);
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert_eq!(
+        std::fs::read(stage.join("rootfs/etc/os-release")).expect("unpacked"),
+        b"image"
+    );
+    for mount_point in ["dev", "proc", "kbf/root", "sys/fs/cgroup"] {
+        assert!(
+            stage.join("rootfs").join(mount_point).is_dir(),
+            "{mount_point}"
+        );
+    }
+    assert!(stage.join("rootfs/etc/resolv.conf").is_file());
+    // The root exists now: a second unpack into the same stage is refused, not merged.
+    let again = run(&["__unpack-layers", &stage_arg, &blobs_arg, "0.tar"]);
+    assert_eq!(again.status.code(), Some(1));
 }
 
 /// This process's uid and gid.

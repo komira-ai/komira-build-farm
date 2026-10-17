@@ -24,16 +24,18 @@
 //! - `busy-once`: the next run fails as crun does when the program's exec finds it busy
 //!   (ETXTBSY), once.
 //! - `kill-fails`, `delete-fails`: that verb fails.
+//! - `delete-vanished`: `delete` finds the container's state already gone and fails, as crun does
+//!   when the `crun run` of a killed container removed it first.
 //! - `chown-fails`: a helper giving to the owner this knob holds (`1:1` or `0:0`) fails.
 //! - `rm-noop`, `rm-fails`: a removing helper does nothing / fails.
-//! - `tar-fails`: the unpacking helper's `tar` fails.
+//! - `unpack-fails`: the unpacking helper (`__unpack-layers`) fails before it unpacks.
 //! - `vanish-after-give`, `unexec-after-give`: the first helper that gives directories
 //!   removes the `crun` program it was run as / makes it not executable (a test links a
 //!   private copy, not the shared program).
 //! - `leave-state`: the run leaves its state under `--root`, as a killed `crun` does.
 //! - `exit-override`: the run exits with this status whatever the action did.
 //!
-//! Records: `calls` (one verb per line; `helper give`, `helper rm`, `helper mkdir`, `helper tar`, `helper touch`),
+//! Records: `calls` (one verb per line; `helper give`, `helper rm`, `helper unpack`),
 //! `config.json` (the last action's bundle config), `run.args`, `events` (`cgroup.kill
 //! ended the action`, `run ended`, `delete`, `chown <owner> <paths>`, `chown-dirs
 //! <owner> <dir>`), `owner` (the last owner given), `upper`, `root`, `cgroup`, `pid`,
@@ -61,6 +63,9 @@ fn main() -> ExitCode {
     let link = PathBuf::from(args.next().unwrap_or_default());
     let args: Vec<Vec<u8>> = args.map(OsString::into_vec).collect();
     let here = link.parent().unwrap_or(Path::new(".")).to_owned();
+    if link.file_name() == Some(OsStr::new("podman")) {
+        return ExitCode::from(podman_stub(&here));
+    }
     let fake = Fake {
         state: here.join("crun-state"),
         cgroot: here.join("cgroup"),
@@ -69,11 +74,33 @@ fn main() -> ExitCode {
     ExitCode::from(fake.run(&args))
 }
 
+/// Run through a link named `podman`: the stand-in for a Podman that must never run. It
+/// records that it did, in `<dir>/podman-ran`, and fails as a Podman that is not there
+/// would.
+fn podman_stub(dir: &Path) -> u8 {
+    let ran = dir.join("podman-ran");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ran);
+    if let Ok(file) = file.as_mut() {
+        let argv: Vec<_> = std::env::args().skip(1).collect();
+        let _ = writeln!(file, "podman {}", argv.join(" "));
+    }
+    refuse(
+        "fake podman: podman must not run on the OCI backend's path",
+        125,
+    )
+}
+
 struct Fake {
     link: PathBuf,
     state: PathBuf,
     cgroot: PathBuf,
 }
+
+/// The word after `/kbf/daemon` that selects the unpacking helper.
+const UNPACK: &str = "__unpack-layers";
 
 fn refuse(message: &str, code: u8) -> u8 {
     eprintln!("{message}");
@@ -429,7 +456,7 @@ impl Fake {
             else {
                 continue;
             };
-            if dest.starts_with("/t/") {
+            if dest.starts_with("/t/") || dest == "/kbf/daemon" {
                 binds.push((dest.to_owned(), PathBuf::from(source)));
             }
         }
@@ -442,32 +469,34 @@ impl Fake {
             .collect();
         match args.first().map(String::as_str) {
             Some("/usr/bin/find") => self.helper_rm(&host("/t/0")),
-            Some("/usr/bin/mkdir") => {
-                self.append("calls", b"helper mkdir");
-                for dir in args.iter().skip(1).filter(|a| a.starts_with("/t/")) {
-                    let _ = std::fs::create_dir_all(path(&host_path(&binds, dir)));
-                }
-                0
-            }
-            Some("/usr/bin/tar") => {
-                self.append("calls", b"helper tar");
-                if self.has("tar-fails") {
-                    return refuse("fake crun: tar refused", 2);
-                }
-                0
-            }
-            Some("/usr/bin/touch") => {
-                self.append("calls", b"helper touch");
-                for file in args.iter().skip(1).filter(|a| a.starts_with("/t/")) {
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path(&host_path(&binds, file)));
-                }
-                0
+            Some("/kbf/daemon") if args.get(1).map(String::as_str) == Some(UNPACK) => {
+                self.helper_unpack(&args, &binds)
             }
             Some("/kbf/daemon") => self.helper_give(&args, &host),
             other => refuse(&format!("fake crun: a helper running {other:?}"), 1),
+        }
+    }
+
+    /// `/kbf/daemon __unpack-layers /t/0 /t/1 LAYERS...`: the daemon's own mode, which is
+    /// the program the bundle binds at `/kbf/daemon`, run on the host directories the
+    /// binds name.
+    fn helper_unpack(&self, args: &[String], binds: &[(String, PathBuf)]) -> u8 {
+        self.append("calls", b"helper unpack");
+        if self.has("unpack-fails") {
+            return refuse("fake crun: unpack refused", 2);
+        }
+        let Some((_, daemon)) = binds.iter().find(|(dest, _)| dest == "/kbf/daemon") else {
+            return refuse("fake crun: the unpack helper binds no daemon", 1);
+        };
+        let mapped = args
+            .iter()
+            .skip(1)
+            .map(|a| OsString::from_vec(host_path(binds, a)));
+        match Command::new(daemon).args(mapped).status() {
+            Ok(status) => status
+                .code()
+                .map_or(1, |c| u8::try_from(c & 0xff).unwrap_or(1)),
+            Err(e) => refuse(&format!("fake crun: run {}: {e}", daemon.display()), 1),
         }
     }
 
@@ -579,6 +608,10 @@ impl Fake {
             self.kill_action();
         }
         if self.has("delete-fails") {
+            // The container's state stays, which is what a refused delete leaves.
+            if let (Some(root), Some(id)) = (&call.root, call.rest.last()) {
+                let _ = std::fs::create_dir_all(root.join(String::from_utf8_lossy(id).as_ref()));
+            }
             return refuse("fake crun: delete refused", 1);
         }
         self.touch("removed");
@@ -594,6 +627,20 @@ impl Fake {
             let dir = self.lease_cgroup();
             add_mode(&dir, 0o200);
             remove_files(&dir);
+        }
+        if self.has("delete-vanished") {
+            // As crun fails when the `crun run` of a killed container deleted the state
+            // between the listing and the open (the cleaning above is the cgroup's).
+            if let (Some(root), Some(id)) = (&call.root, call.rest.last()) {
+                let dir = root.join(String::from_utf8_lossy(id).as_ref());
+                return refuse(
+                    &format!(
+                        "cannot open directory `{}`: No such file or directory",
+                        dir.display()
+                    ),
+                    1,
+                );
+            }
         }
         0
     }

@@ -86,6 +86,8 @@ fn unusable_configurations_are_refused() {
         "node-1".to_owned(),
     );
     ok.podman = PathBuf::from("/bin/true");
+    // The Podman engine is what this test starts: only the fake-Podman tests do.
+    ok.container_runtime = ContainerRuntime::Podman;
     assert!(PodmanRuntime::new(ok.clone(), Arc::clone(&cas)).is_ok());
     let refused = |config: PodmanConfig| PodmanRuntime::new(config, Arc::clone(&cas)).err();
     for scratch in ["relative", "/a:b", "/a,b"] {

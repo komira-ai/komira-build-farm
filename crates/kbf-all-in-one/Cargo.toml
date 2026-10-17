@@ -14,13 +14,14 @@ publish.workspace = true
 name = "kbf-all-in-one"
 path = "src/main.rs"
 
-# The container driver's stand-in `podman`, which runs each action as a plain process,
+# The container driver's stand-in `crun`, which runs each action as a plain process,
 # for tests/binary.rs: the same program the driver's own tests run
-# (crates/kbf-driver-container/tests/bin/fake_podman.rs), built here because a test
-# can run only its own package's binaries. Not shipped.
+# (crates/kbf-driver-container/tests/bin/fake_crun.rs), built here because a test
+# can run only its own package's binaries. Also what a `podman` that must never run
+# is. Not shipped.
 [[bin]]
-name = "kbf-fake-podman"
-path = "../kbf-driver-container/tests/bin/fake_podman.rs"
+name = "kbf-fake-crun"
+path = "../kbf-driver-container/tests/bin/fake_crun.rs"
 test = false
 
 [dependencies]
@@ -37,8 +38,9 @@ kbf-storage.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
-# The stand-in `podman`'s (kbf-fake-podman).
+# The stand-in `crun`'s (kbf-fake-crun).
 rustix = { workspace = true, features = ["process"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "sync"] }
 tonic.workspace = true
 tracing.workspace = true
@@ -49,13 +51,13 @@ tracing-subscriber.workspace = true
 kbf-cas-conformance.workspace = true
 # The CPU pool the output walk hashes on (tests/one_read.rs).
 kbf-daemon.workspace = true
-# The image store layout the stand-in `podman` reads (tests/binary.rs).
+# The driver's output walk (tests/memory.rs, tests/one_read.rs).
 kbf-driver-container.workspace = true
 # The storage boundary the plane is checked through (tests/storage_seam.rs); where a blob is, to damage one (src/plane_tests.rs).
 kbf-meta.workspace = true
 # The store a blob is in, to damage one (src/plane_tests.rs).
 kbf-objstore.workspace = true
-# The act steps the stand-in `podman` runs as each action, through this test binary.
+# The act steps the stand-in `crun` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true
 rcgen.workspace = true

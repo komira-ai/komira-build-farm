@@ -80,7 +80,7 @@ daemon also refuses a `Start` for a lease kind its driver does not serve.
 
 | Value | Serves | Status |
 |---|---|---|
-| `container` | `action` | exists (Linux, rootless Podman) |
+| `container` | `action` | exists (Linux, rootless `crun`) |
 | `native` | `action` | exists (Macs, plain processes) |
 | `fake` | `action` | exists, for bring-up only: runs nothing |
 | `local` | `action` | exists, in tests only: `kbf-daemon`'s child-process runtime |

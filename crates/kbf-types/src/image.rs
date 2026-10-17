@@ -62,6 +62,13 @@ impl ImageRef {
         })
     }
 
+    /// The repository as named, registry host first when the value gave one
+    /// (`docker.io/library/busybox`).
+    #[must_use]
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
     /// The manifest digest, `sha256:<hex>`.
     #[must_use]
     pub fn digest(&self) -> &str {
@@ -69,7 +76,7 @@ impl ImageRef {
     }
 }
 
-/// The reference Podman resolves: `<repo>@sha256:<hex>`.
+/// The reference as a registry client names it: `<repo>@sha256:<hex>`.
 impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}@{}", self.repository, self.digest)
@@ -86,7 +93,7 @@ mod tests {
         format!("{SCHEME}{rest}")
     }
 
-    /// Catches a digest reference being mangled on its way to Podman.
+    /// Catches a digest reference being mangled on its way to the registry.
     #[test]
     fn a_digest_reference_parses() {
         let value = image(&format!("docker.io/library/busybox@sha256:{HEX}"));
@@ -96,6 +103,7 @@ mod tests {
             format!("docker.io/library/busybox@sha256:{HEX}")
         );
         assert_eq!(parsed.digest(), format!("sha256:{HEX}"));
+        assert_eq!(parsed.repository(), "docker.io/library/busybox");
     }
 
     /// Catches a registry port being taken for a tag.

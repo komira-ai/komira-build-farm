@@ -4,10 +4,9 @@
 //! only by a per-architecture manifest digest. A tag is refused by its spelling, in
 //! [`ImageRef::parse`] (in `kbf-types`, so the deploy tool checks `--image` with it too).
 //! An image index digest (a multi-architecture list) cannot be told from a manifest
-//! digest by spelling, nor by Podman's image metadata: Podman 4.9 records one `Digest`
-//! per image, the digest of its first pull, and lists every digest it was pulled by
-//! under `RepoDigests`. So the runtime reads the manifest bytes the node's store keeps
-//! under the requested digest and decides with [`manifest_kind`].
+//! digest by spelling: the node's image store fetches the manifest by the digest and
+//! refuses an index (`kbf-image`). The Podman path reads the manifest bytes Podman's
+//! store keeps under the digest instead and decides with [`manifest_kind`].
 
 use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
@@ -22,16 +21,13 @@ const SHA256: &str = "sha256:";
 /// Why this node cannot run an image named by digest.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ImageCheckError {
-    /// The node's image store does not hold it. Nodes never pull at action time; the
-    /// daemon's user pulls it once, by digest.
-    #[error(
-        "image {0} is not in this node's image store; as the daemon's user, run: podman pull {0}"
-    )]
+    /// The node's image store does not hold it.
+    #[error("image {0} is not in this node's image store")]
     Missing(ImageRef),
     /// Its digest names an image index (a multi-architecture list).
     #[error("container-image {0} names an image index; name the per-architecture manifest digest")]
     Index(ImageRef),
-    /// Podman could not be asked, or the store cannot vouch for the manifest.
+    /// The image could not be fetched or unpacked, or the store cannot vouch for it.
     #[error("{0}")]
     Failed(String),
 }

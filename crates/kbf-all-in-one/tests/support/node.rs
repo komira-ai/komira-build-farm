@@ -1,5 +1,5 @@
 //! What the tests that run a node binary share: its certificates, the stand-in
-//! `podman` and cgroup tree its container driver runs over, and the checks of what is
+//! `crun` and cgroup tree its container driver runs over, and the checks of what is
 //! on its disk. Used by this crate's tests/binary.rs and by kbf-cli's
 //! tests/storage_and_daemon.rs (through `#[path]`: a test can run only its own
 //! package's binaries, so each package that runs a node has a test of its own).
@@ -15,9 +15,28 @@ use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair, SanType};
 /// How long the test waits for what should happen promptly.
 pub(crate) const PROMPT: Duration = Duration::from_secs(60);
 
-/// The per-architecture manifest the stand-in image store holds.
+/// The per-architecture manifest whose digest names the image the node's store holds.
 pub(crate) const MANIFEST: &[u8] =
     br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+
+/// Where tests that run a container daemon put their directories: Cargo's per-target
+/// temporary directory, unless an ancestor of it is closed to other users (a home
+/// directory often is), which the container driver refuses (its containers' ids are not
+/// the daemon's, and must be able to search down to the data directory); then the
+/// system's temporary directory.
+pub(crate) fn scratch_root() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let searchable = std::fs::canonicalize(&target).is_ok_and(|real| {
+        real.ancestors()
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.permissions().mode() & 0o001 != 0))
+    });
+    if searchable {
+        target
+    } else {
+        std::env::temp_dir()
+    }
+}
 
 /// A CA, the node's certificate (`node-1`, its one DNS name, and the daemon role its
 /// worker session needs on the worker listener), the server's (`localhost`), and a
@@ -66,28 +85,45 @@ pub(crate) fn id_files(dir: &Path) -> PathBuf {
     ids
 }
 
-/// The stand-in `podman` in `bin` (a link to `fake`, the package's build of
-/// crates/kbf-driver-container/tests/bin/fake_podman.rs), and `kbf-act` beside it, with
-/// an image store holding [`MANIFEST`] as image `img1`; the stand-in runs `steps` as each
-/// action. Returns the image as an action names it.
-pub(crate) fn podman(bin: &Path, fake: &str, steps: &[&str]) -> String {
-    let state = bin.join("state");
+/// The stand-in `crun` in `bin` (a link to `fake`, the package's build of
+/// crates/kbf-driver-container/tests/bin/fake_crun.rs), `kbf-act` beside it, the id tools
+/// the OCI backend's start-up looks for on `PATH` (setuid files, as `uidmap` installs
+/// them) and a `podman` that fails and records that it ran (the same program as the
+/// stand-in: [`podman_ran`]), with the image [`MANIFEST`] names already unpacked in the
+/// node's image store under `data` (the node's `--data-dir`); the stand-in runs `steps`
+/// as each action. Returns the image as an action names it.
+pub(crate) fn crun(bin: &Path, data: &Path, fake: &str, steps: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = bin.join("crun-state");
     std::fs::create_dir_all(&state).expect("mkdir");
+    std::os::unix::fs::symlink(fake, bin.join("crun")).expect("link crun");
     std::os::unix::fs::symlink(fake, bin.join("podman")).expect("link podman");
+    for tool in ["newuidmap", "newgidmap"] {
+        let path = bin.join(tool);
+        std::fs::write(&path, b"").expect("write the tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+    }
     kbf_testkit::act::link_self(&bin.join(kbf_testkit::act::NAME)).expect("link kbf-act");
-    std::fs::write(state.join("image-id"), "img1\n").expect("image id");
     std::fs::write(state.join("nonce"), format!("{}:", std::process::id())).expect("nonce");
     let knob: String = steps.iter().map(|s| format!("{s}\n")).collect();
     std::fs::write(state.join("action"), knob).expect("action");
-    let digest = format!("sha256:{}", kbf_transfer::digest_of(MANIFEST).hash);
-    let store = state.join("store/fake-images/img1");
-    std::fs::create_dir_all(&store).expect("mkdir store");
-    let file = kbf_driver_container::image::manifest_file(&digest);
-    std::fs::write(store.join(file), MANIFEST).expect("manifest");
-    format!("docker://registry.test/tools/busybox@{digest}")
+    let hex = kbf_transfer::digest_of(MANIFEST).hash;
+    let rootfs = data.join("leases/oci-images").join(&hex).join("rootfs");
+    std::fs::create_dir_all(rootfs.join("kbf/root")).expect("an unpacked image");
+    format!("docker://registry.test/tools/busybox@sha256:{hex}")
 }
 
-/// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `podman`
+/// The flag that points the daemon at the stand-in `crun` [`crun`] put in `bin`.
+pub(crate) fn oci_runtime(bin: &Path) -> String {
+    format!("--oci-runtime={}", bin.join("crun").display())
+}
+
+/// What the `podman` of `bin` recorded: nothing, on a daemon that never runs it.
+pub(crate) fn podman_ran(bin: &Path) -> String {
+    std::fs::read_to_string(bin.join("podman-ran")).unwrap_or_default()
+}
+
+/// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `crun`
 /// looks, holding the daemon's unit; the flags that point the daemon at it.
 pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
     let root = bin.join("cgroup");
@@ -118,7 +154,7 @@ pub(crate) fn free_port() -> u16 {
         .port()
 }
 
-/// `PATH` with `bin`, where [`podman`] put the stand-in, first.
+/// `PATH` with `bin`, where [`crun`] put the id tools and the failing `podman`, first.
 pub(crate) fn image_path(bin: &Path) -> String {
     format!(
         "{}:{}",

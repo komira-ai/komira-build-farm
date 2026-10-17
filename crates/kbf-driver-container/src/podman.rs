@@ -221,11 +221,6 @@ impl Podman {
         Self { program }
     }
 
-    /// The `podman` program.
-    pub(crate) fn program(&self) -> &Path {
-        &self.program
-    }
-
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         without_credentials(command.as_std_mut());

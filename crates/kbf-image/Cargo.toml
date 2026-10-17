@@ -1,0 +1,40 @@
+[package]
+name = "kbf-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The node's image store reads: a registry client that verifies every digest on the way in
+# (hyper over rustls, so a daemon links no HTTP client the layering test forbids it) and
+# an unpacker of layer tars into a root filesystem. Everything here is already in the tree.
+[dependencies]
+bytes.workspace = true
+flate2.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+kbf-types.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+rustix = { workspace = true, features = ["process"] }
+rustls.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-rustls.workspace = true
+
+[lints]
+workspace = true

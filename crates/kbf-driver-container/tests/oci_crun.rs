@@ -1,7 +1,6 @@
 //! The OCI backend against real rootless `crun`, with the same setup as `podman.rs`
-//! (`cargo xtask podman-tests`: a `Delegate=yes` unit, the busybox image in the user's
-//! Podman store, `crun` and `uidmap` on the runner). Podman is used here only for what
-//! the backend uses it for: the image, pulled and exported once.
+//! (`cargo xtask podman-tests`: a `Delegate=yes` unit, `crun` and `uidmap` on the runner;
+//! the busybox image is fetched by the driver's own image store, digest-verified).
 //!
 //! Every test is `#[ignore]` with that reason and the verb runs them with
 //! `--include-ignored`; run without the setup a test fails, it never skips silently.
@@ -10,9 +9,6 @@
 //! `crun run`'s, and the image unpacked with the ids the action sees.
 
 mod support;
-
-// The helper containers run this binary in its `__chown-dirs` mode.
-kbf_driver_container::chown_dirs_test_hook!();
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,12 +47,12 @@ async fn run(
 
 /// Catches the sandbox being less than `config.json` says, read from inside: the
 /// action is root with every id a subordinate id, alone in its pid namespace, with the
-/// constant hostname and loopback only, behind a seccomp filter with Podman's eleven
+/// constant hostname and loopback only, behind a seccomp filter with the eleven
 /// capabilities, and with no id of the daemon user (a file the daemon owns is
 /// `nobody`'s). The first lease unpacks the image, so this also runs the whole
-/// pull-export-unpack path.
+/// fetch-and-unpack path.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_sandbox_is_what_the_config_says() {
     let cell = Cell::oci("sandbox");
     let script = r#"
@@ -117,7 +113,7 @@ fn first_subordinate_id() -> u32 {
 /// is closed by design, and this is the check that it stays closed): fifty short
 /// actions in a row, each with its own code, and a signal death as the shell reports it.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn every_exit_code_is_the_actions_own() {
     let cell = Cell::oci("exit-codes");
     let started = Instant::now();
@@ -142,11 +138,11 @@ async fn every_exit_code_is_the_actions_own() {
 }
 
 /// Catches a program crun cannot start being the farm's failure, not the action's:
-/// the same cases as the Podman path, through `crun`'s own log (a bare name with no
+/// the same cases a stand-in `crun` is run for, through `crun`'s own log (a bare name with no
 /// `PATH`, one missing on the `PATH`, a missing path: exit 127; a file that is not
 /// executable and a directory: 126), each with kbf's message.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_program_crun_cannot_start_is_the_actions_failure() {
     let cell = Cell::oci("program");
     let action = |argv: &[&str], env: &[(&str, &str)]| {
@@ -187,7 +183,7 @@ async fn a_program_crun_cannot_start_is_the_actions_failure() {
 /// hand-back, and nothing it writes to `/tmp` or elsewhere in the container's writable
 /// places comes back as an output.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn outputs_come_back_through_the_overlay_and_the_hand_over() {
     let cell = Cell::oci("outputs");
     let mut spec = sh(
@@ -215,7 +211,7 @@ async fn outputs_come_back_through_the_overlay_and_the_hand_over() {
 /// behind on real `crun`: a timed-out action keeps its partial stdout, and a killed
 /// lease is clean when `kill` returns.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn timeout_and_kill_leave_nothing_behind() {
     use kbf_daemon::Runtime;
     let cell = Cell::oci("timeout-kill");
@@ -256,7 +252,7 @@ fn store_for(cell: &Cell, spec: &Spec) -> kbf_proto::reapi::Digest {
 /// cgroup (a child of the lease's) is the configured limit, and the lease cgroup keeps
 /// its own memory limit and `memory.oom.group`.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_container_cgroup_carries_the_pids_limit_and_the_oom_group() {
     let cell = Cell::oci_with("limits", |c| c.limits.pids = 321);
     let lease = cell.cgroup.join(cell.name(1));
@@ -275,7 +271,7 @@ async fn the_container_cgroup_carries_the_pids_limit_and_the_oom_group() {
 /// Catches an image not unpacked with the ids the action sees: after the first lease,
 /// the unpacked root is owned by the first subordinate id and `/bin` inside is root's.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_unpacked_image_is_owned_by_the_containers_ids() {
     use std::os::unix::fs::MetadataExt as _;
     let cell = Cell::oci("image-owner");
@@ -324,7 +320,7 @@ fn with_trees(config: &mut kbf_driver_container::PodmanConfig) {
 /// read-write as the container's root. Every attempt is refused, the first with
 /// `EROFS`'s own words, and the next lease reads the tree whole.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_sandbox_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
     let cell = Cell::oci_with("trees-ro", with_trees);
     let mut spec = sh("grep ' /kbf/root/tc ' /proc/self/mountinfo; \

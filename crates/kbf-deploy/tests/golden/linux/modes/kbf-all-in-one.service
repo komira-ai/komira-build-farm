@@ -14,7 +14,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-# The daemon half runs rootless Podman as the kbf user.
+# The daemon half runs rootless containers (crun) as the kbf user.
 User=kbf
 Slice=kbf.slice
 # The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
@@ -45,6 +45,8 @@ ExecStart=/usr/local/bin/kbf all-in-one \
     --api-listen=127.0.0.1:8982 \
     --api-token-file=/etc/kbf/api-token \
     --driver=container \
+    --container-runtime=oci \
+    --oci-runtime=/usr/bin/crun \
     --server=https://storage-node.example.internal:8981 \
     --ca-cert=/etc/kbf/ca.pem \
     --cert=/etc/kbf/node.pem \

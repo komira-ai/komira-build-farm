@@ -1,5 +1,6 @@
-//! The container runtime behind the driver's six steps: [`Backend`], with two
-//! implementations, Podman ([`PodmanBackend`]) and `crun` driven directly (`oci`).
+//! The container runtime behind the driver's six steps: [`Backend`], with `crun` driven
+//! directly (`oci`) as the one a node runs. Podman ([`PodmanBackend`]) is still here only
+//! for the fake-Podman tests, until they are deleted; no flag selects it.
 //!
 //! The lease code in `runtime` does everything that does not depend on the runtime:
 //! the CAS, the input root, the lease cgroup and its limits, the watch, the OOM
@@ -23,13 +24,17 @@ use crate::podman::{ContainerSpec, Ended, Podman};
 use crate::program::Said;
 
 /// Which runtime a node runs its containers with (`--container-runtime`).
+///
+/// A node has one: `crun`, run from a bundle the driver writes (`oci`). Podman was
+/// measured at about twenty seconds to launch a container, `crun` at milliseconds, and
+/// was dropped; the `Podman` variant is the fake-Podman tests' until they are deleted,
+/// and cannot be named by a flag.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContainerRuntime {
-    /// Rootless Podman: `podman create` and `podman start` per action.
-    #[default]
+    /// Rootless Podman. Not selectable by flag (see [`ContainerRuntime::from_str`]).
     Podman,
-    /// `crun` run directly from a bundle the driver writes, with no Podman on the
-    /// action path (`oci`).
+    /// `crun` run directly from a bundle the driver writes (`oci`).
+    #[default]
     Oci,
 }
 
@@ -38,11 +43,12 @@ impl std::str::FromStr for ContainerRuntime {
 
     fn from_str(text: &str) -> Result<Self, String> {
         match text {
-            "podman" => Ok(Self::Podman),
             "oci" => Ok(Self::Oci),
-            other => Err(format!(
-                "{other:?} is not a container runtime: podman or oci"
-            )),
+            "podman" => Err(
+                "podman was removed: kbf runs containers with crun only (--container-runtime=oci)"
+                    .to_owned(),
+            ),
+            other => Err(format!("{other:?} is not a container runtime: oci")),
         }
     }
 }
@@ -482,17 +488,22 @@ mod tests {
     const SOON: Duration = Duration::from_secs(5);
     const PAUSE: Duration = Duration::from_millis(1);
 
-    /// Catches a runtime flag spelled differently from what the daemon's docs say, or
-    /// an unknown runtime being taken for one.
+    /// Catches Podman being selectable again, a runtime flag spelled differently from
+    /// what the daemon's docs say, or an unknown runtime being taken for one: only `oci`
+    /// parses, it is the default, and `podman` is refused by saying it was removed.
     #[test]
-    fn the_runtime_flag_parses_podman_and_oci_only() {
-        assert_eq!("podman".parse(), Ok(ContainerRuntime::Podman));
+    fn the_runtime_flag_parses_oci_only() {
         assert_eq!("oci".parse(), Ok(ContainerRuntime::Oci));
-        assert_eq!(ContainerRuntime::default(), ContainerRuntime::Podman);
+        assert_eq!(ContainerRuntime::default(), ContainerRuntime::Oci);
+        let podman = "podman".parse::<ContainerRuntime>().expect_err("removed");
+        assert!(podman.contains("podman was removed"), "{podman}");
         let refused = "runc"
             .parse::<ContainerRuntime>()
             .expect_err("not a runtime");
-        assert!(refused.contains("podman or oci"), "{refused}");
+        assert!(
+            refused.contains("is not a container runtime: oci"),
+            "{refused}"
+        );
     }
 
     /// Catches a run whose answer is lost or wrong: the thread's own failures (no

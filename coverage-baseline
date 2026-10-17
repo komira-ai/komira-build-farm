@@ -29,6 +29,7 @@ kbf-front                35      7
 kbf-guest                15      6
 kbf-history               0      0
 kbf-host                  0      0
+kbf-image                 0      0
 kbf-invocation            0      0
 kbf-it                    2      1
 kbf-log                   3      0

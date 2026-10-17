@@ -28,6 +28,7 @@ clap.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-daemon.workspace = true
+kbf-image.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 oci-spec.workspace = true
@@ -42,6 +43,7 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "r
 tracing.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 kbf-front.workspace = true
 kbf-objstore.workspace = true
 # The fake podman's actions: kbf-testkit's act steps, run by the test binary itself.
@@ -49,6 +51,8 @@ kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 # sched_getaffinity, which the real-Podman capacity test compares with.
 rustix = { workspace = true, features = ["thread"] }
+tar.workspace = true
+tokio-rustls.workspace = true
 tonic.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "test-util"] }

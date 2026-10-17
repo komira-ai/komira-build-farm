@@ -99,6 +99,9 @@ fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
     write(&exec, "/etc/subuid", "kbf:100000:65536\n", 0o644);
     write(&exec, "/etc/subgid", "kbf:100000:65536\n", 0o644);
     write(&exec, "/var/lib/systemd/linger/kbf", "", 0o644);
+    for tool in ["crun", "newuidmap", "newgidmap"] {
+        write(&exec, &format!("/usr/bin/{tool}"), "tool", 0o755);
+    }
     write(
         &exec,
         "/etc/kbf/s3.env",
@@ -386,6 +389,19 @@ fn an_install_is_refused_before_any_step() {
         fs::remove_file(exec.at("/var/lib/systemd/linger/kbf")).expect("rm");
     });
     assert!(matches!(&e, HostError::NoLinger { .. }), "{e}");
+    let e = refused("no-crun", Mode::Daemon, &|exec, _| {
+        fs::remove_file(exec.at("/usr/bin/crun")).expect("rm");
+    });
+    assert!(
+        matches!(
+            &e,
+            HostError::NoTool {
+                package: "crun",
+                ..
+            }
+        ),
+        "{e}"
+    );
     // A storage node whose settings name no S3 endpoint: its unit is not rendered.
     let (exec, _) = host("install-mode-no-endpoint");
     let mut a = install(Mode::Storage, None);

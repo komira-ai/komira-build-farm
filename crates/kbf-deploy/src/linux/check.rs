@@ -23,6 +23,8 @@
 //!   `--reapi-tls-*` flags, and a `--meta-dir` outside the daemon's data directory.
 //! - `image`: the daemon's `--image=` values are `KBF_IMAGES`, each as `docker://<entry>`,
 //!   and each passes kbf-daemon's own parser (any other value makes it exit 2 at start).
+//! - `runtime`: the daemon's unit passes `--container-runtime=oci` and `--oci-runtime=`,
+//!   and no file of it names Podman ([`super::runtime`]).
 //!
 //! Each rule reads a key's last assignment in its section, the one systemd uses.
 
@@ -33,6 +35,7 @@ use kbf_types::ImageRef;
 
 use super::config::LinuxConfig;
 use super::render::{DAEMON, DROP_IN, SERVER, SLICE};
+use super::runtime;
 use crate::template::leftovers;
 use crate::unit::{UnitError, UnitFile};
 
@@ -423,6 +426,11 @@ fn check(c: &LinuxConfig, files: [&File; 4], installable: bool) -> Report {
         if let Err(e) = ImageRef::parse(v) {
             fail("image", format!("kbf-daemon would exit 2 at start: {e}"));
         }
+    }
+
+    // runtime
+    for how in runtime::check(&daemon.name, &daemon.unit, &[(&daemon.name, &daemon.text)]) {
+        fail("runtime", how);
     }
 
     let summary = if out.is_empty() {

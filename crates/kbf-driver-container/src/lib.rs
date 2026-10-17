@@ -1,12 +1,16 @@
 //! The container driver for `kbf-daemon`: runs each `action` lease in a fresh rootless
 //! container, behind the daemon's `Runtime` trait
-//! (`docs/design/daemon.md#the-container-driver`), through Podman or, with
-//! `--container-runtime=oci`, through `crun` run directly from a bundle the driver
-//! writes (the `oci` module documents that backend).
+//! (`docs/design/daemon.md#the-container-driver`), through `crun` run directly from a
+//! bundle the driver writes (the `oci` module documents that backend; it is the only
+//! runtime a node can be given: Podman was measured at about twenty seconds per launch,
+//! `crun` at milliseconds, and its last code here is for its own tests until it is
+//! deleted).
 //!
 //! What one lease gets:
 //! - the image named by digest in the action's `container-image` platform property
-//!   (`docker://<repo>@sha256:<d>`); a tag, or an index digest, is `INVALID_ARGUMENT`;
+//!   (`docker://<repo>@sha256:<d>`); a tag, or an index digest, is `INVALID_ARGUMENT`.
+//!   The node fetches it from its registry, digest-verified end to end (`kbf-image`), and
+//!   unpacks it once;
 //! - the input root as a read-only overlay lower layer at `/kbf/root`, every write in
 //!   a per-lease upper directory that the outputs are read from. The upper directory
 //!   holds only what the action created or changed, so an output path that is already
@@ -60,15 +64,16 @@
 //!   `kbf_daemon`'s `Cas` trait, the one the daemon's CAS client implements;
 //! - [`tree`]: writing an input root (with `kbf_daemon::tree`) and reading outputs
 //!   back;
+//! - [`unpack_layers`]: the `__unpack-layers` helper mode, which applies an image's layers
+//!   in a helper container;
 //! - [`subids`]: the daemon user's subordinate id ranges, checked at startup;
 //! - [`delegate`](mod@delegate): the daemon's delegated cgroup subtree, set up at
 //!   startup, and what leases may use of the node;
 //! - `backend`: the runtime-specific part of a lease, [`ContainerRuntime`]: Podman or OCI;
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
-//! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease),
-//! image import into the node's store,
-//! networked actions, and the private Podman socket for service containers.
+//! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease) and
+//! networked actions.
 
 mod backend;
 pub mod cas;
@@ -93,6 +98,7 @@ mod remove;
 mod runtime;
 pub mod subids;
 pub mod tree;
+pub mod unpack_layers;
 
 // The keepers this crate's unit tests start come from the test binary.
 #[cfg(test)]

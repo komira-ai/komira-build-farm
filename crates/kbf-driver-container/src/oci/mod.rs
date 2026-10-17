@@ -1,14 +1,16 @@
 //! The OCI backend: each action in a fresh rootless sandbox made by `crun`, with no
-//! Podman on the action path (`--container-runtime=oci`).
+//! Podman anywhere (`--container-runtime=oci`, the only runtime a node is configured
+//! with).
 //!
 //! Per action, from the daemon user's account, with nothing running as root and no
 //! helper that unshares by itself (`crun` creates every namespace, so the only
 //! AppArmor grant for user namespaces needed is the one `crun` ships with):
 //!
-//! 1. the image is unpacked once per digest into the node's image store
-//!    ([`image`]), read-only afterwards;
+//! 1. the image is fetched from its registry and unpacked once per digest into the
+//!    node's image store ([`image`]), digest-verified end to end and read-only
+//!    afterwards;
 //! 2. the lease's directories are given to the action's root by a helper container
-//!    ([`helper`]), the work `podman unshare` does on the Podman path;
+//!    ([`helper`]);
 //! 3. a bundle is written: `config.json` ([`spec`]) plus the lease's `hosts` and
 //!    `hostname` files, with the hardening Podman supplies written out
 //!    ([`hardening`]);
@@ -56,8 +58,6 @@ use oci_spec::runtime::{LinuxIdMapping, LinuxIdMappingBuilder};
 
 pub(crate) use crun::RunEnd;
 
-use crate::backend::PodmanBackend;
-use crate::podman::Podman;
 use crate::subids::{DaemonIds, IdFiles, SubidError};
 
 /// Where the OCI backend finds its runtime and the ids it maps.
@@ -75,6 +75,12 @@ pub struct OciConfig {
     /// search. On by default; a test that runs a stand-in runtime as one user (so no
     /// other id needs to reach the lease) in a home directory closed to others turns it off.
     pub check_search: bool,
+    /// The directories `newuidmap` and `newgidmap` are looked for in (`crun` runs them
+    /// by name to map the container's ids). By default the daemon's `PATH`.
+    pub id_tool_path: Option<std::ffi::OsString>,
+    /// Registries (`host:port`) the image store may speak plain HTTP to. Empty on a node:
+    /// images come over https. A test's registry on a loopback port is the only user.
+    pub plain_http_registries: Vec<String>,
 }
 
 impl Default for OciConfig {
@@ -84,6 +90,8 @@ impl Default for OciConfig {
             daemon: std::env::current_exe().unwrap_or_default(),
             id_files: IdFiles::system(),
             check_search: true,
+            id_tool_path: std::env::var_os("PATH"),
+            plain_http_registries: Vec::new(),
         }
     }
 }
@@ -162,6 +170,13 @@ pub enum OciError {
         "{0} is not a file: the OCI backend needs the OCI runtime and this daemon's own binary"
     )]
     NoRuntime(PathBuf),
+    /// `newuidmap` or `newgidmap`, which `crun` runs to map a container's subordinate
+    /// ids, is not usable.
+    #[error(
+        "{tool}: {why}; the OCI backend maps subordinate ids with newuidmap and newgidmap \
+         (package uidmap), found on PATH and setuid root or holding file capabilities"
+    )]
+    IdTool { tool: &'static str, why: String },
     #[error("{0}")]
     Prepare(String),
     #[error("this machine's architecture ({0}) has no seccomp profile")]
@@ -208,7 +223,7 @@ pub(crate) fn at<T>(path: &Path, result: std::io::Result<T>) -> Result<T, JobErr
 pub(crate) struct Oci {
     crun: crun::Crun,
     daemon: PathBuf,
-    podman: PodmanBackend,
+    registry: kbf_image::Registry,
     ids: DaemonIds,
     arch: &'static str,
     scratch: PathBuf,
@@ -222,33 +237,24 @@ pub(crate) struct Oci {
 }
 
 impl Oci {
-    /// The backend for the leases whose scratch directories are in `scratch`, with
-    /// `podman` as the image source.
+    /// The backend for the leases whose scratch directories are in `scratch`.
     ///
     /// # Errors
     /// The daemon user has no suitable subordinate range, a directory on the way to
-    /// `scratch` is closed to others, the runtime is missing, or the node's
-    /// architecture has no seccomp profile.
+    /// `scratch` is closed to others, the runtime is missing, `newuidmap` or
+    /// `newgidmap` is not usable, or the node's architecture has no seccomp profile.
     pub(crate) fn new(
         config: &OciConfig,
         scratch: &Path,
-        podman: Podman,
         cgroup_parent: &str,
     ) -> Result<Arc<Self>, OciError> {
-        Self::on(
-            config,
-            scratch,
-            podman,
-            cgroup_parent,
-            std::env::consts::ARCH,
-        )
+        Self::on(config, scratch, cgroup_parent, std::env::consts::ARCH)
     }
 
     /// [`Oci::new`] on a machine of architecture `rust_arch` (`std::env::consts::ARCH`).
     fn on(
         config: &OciConfig,
         scratch: &Path,
-        podman: Podman,
         cgroup_parent: &str,
         rust_arch: &str,
     ) -> Result<Arc<Self>, OciError> {
@@ -258,6 +264,13 @@ impl Oci {
                 return Err(OciError::NoRuntime(program.clone()));
             }
         }
+        for tool in ["newuidmap", "newgidmap"] {
+            id_tool(tool, config.id_tool_path.as_deref())?;
+        }
+        let mut registry = kbf_image::Registry::new();
+        for authority in &config.plain_http_registries {
+            registry = registry.allow_plain_http(authority);
+        }
         let arch = hardening::profile_arch(rust_arch)
             .ok_or_else(|| OciError::Arch(rust_arch.to_owned()))?;
         at(scratch, std::fs::create_dir_all(scratch)).map_err(prepare)?;
@@ -266,10 +279,12 @@ impl Oci {
         }
         let helper_root = scratch.join("oci-helper");
         at(&helper_root, helper::prepare_rootfs(&helper_root)).map_err(prepare)?;
+        let daemon =
+            at(scratch, helper::install_daemon(scratch, &config.daemon)).map_err(prepare)?;
         let oci = Arc::new(Self {
             crun: crun::Crun::new(config.runtime.clone()),
-            daemon: config.daemon.clone(),
-            podman: PodmanBackend::new(podman),
+            daemon,
+            registry,
             ids,
             arch,
             scratch: scratch.to_owned(),
@@ -283,8 +298,9 @@ impl Oci {
         Ok(oci)
     }
 
-    pub(crate) fn podman_backend(&self) -> &PodmanBackend {
-        &self.podman
+    /// The registry client the image store fetches with.
+    pub(crate) fn registry(&self) -> &kbf_image::Registry {
+        &self.registry
     }
 
     /// The scratch directory of the lease `name`.
@@ -364,11 +380,16 @@ impl Oci {
         result
     }
 
-    /// Extracts `exported/image.tar` into `stage/rootfs` in containers with an action's user namespace
-    /// ([`helper::unpack_jobs`]).
-    pub(crate) async fn unpack_tar(&self, stage: &Path, exported: &Path) -> Result<(), JobError> {
-        let jobs = helper::unpack_jobs(stage, exported);
-        self.run_jobs("unpack", Mapping::Action, &jobs).await
+    /// Unpacks the layer files `layers` of `blobs` into `stage/rootfs` in a container
+    /// with an action's user namespace ([`helper::unpack_job`]).
+    pub(crate) async fn unpack_layers(
+        &self,
+        stage: &Path,
+        blobs: &Path,
+        layers: &[String],
+    ) -> Result<(), JobError> {
+        let job = helper::unpack_job(&self.daemon, stage, blobs, layers);
+        self.run_jobs("unpack", Mapping::Action, &[job]).await
     }
 
     /// Removes `dir` whatever ids own the files in it: the contents inside a helper
@@ -392,51 +413,6 @@ impl Oci {
         self.run_jobs("rm", Mapping::Setup, &jobs).await?;
         at(dir, tokio::fs::remove_dir(dir).await)
     }
-
-    /// Exports the image `reference` from the node's Podman store to the tar `tar`,
-    /// through a throwaway container named `name`.
-    pub(crate) async fn podman_export(
-        &self,
-        reference: &str,
-        name: &str,
-        tar: &Path,
-    ) -> Result<(), String> {
-        let program = self.podman.podman.program();
-        let os = std::ffi::OsString::from;
-        // A throwaway container a killed earlier export left under the same name.
-        let _ = podman(program, &["rm", "--force", "--ignore", name].map(os)).await;
-        let named = format!("--name={name}");
-        let create = ["create", "--pull=never", &named, reference];
-        podman(program, &create.map(os)).await?;
-        let output = format!("--output={}", tar.display());
-        let exported = podman(program, &["export", &output, name].map(os)).await;
-        let _ = podman(program, &["rm", "--force", "--ignore", name].map(os)).await;
-        exported
-    }
-}
-
-/// Runs `program` (Podman) with `args`: `Ok` if it exits 0, else what it said.
-async fn podman(program: &Path, args: &[std::ffi::OsString]) -> Result<(), String> {
-    let mut command = tokio::process::Command::new(program);
-    crate::credential::without_credentials(command.as_std_mut());
-    let output = command
-        .arg("--cgroup-manager=cgroupfs")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
-    let verb = args.first().map(|a| a.to_string_lossy().into_owned());
-    match output {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => Err(format!(
-            "podman {}: {}: {}",
-            verb.unwrap_or_default(),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-        Err(e) => Err(format!("run {}: {e}", program.display())),
-    }
 }
 
 fn prepare(error: JobError) -> OciError {
@@ -452,6 +428,36 @@ fn search_check(dir: &Path) -> Result<(), OciError> {
         if meta.permissions().mode() & 0o001 == 0 {
             return Err(OciError::NotSearchable(ancestor.to_owned()));
         }
+    }
+    Ok(())
+}
+
+/// Checks that `tool` is on `path`, runnable, and able to write a user namespace's id
+/// maps: setuid, or holding file capabilities (as some distributions install it).
+fn id_tool(tool: &'static str, path: Option<&std::ffi::OsStr>) -> Result<(), OciError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let refused = |why: String| OciError::IdTool { tool, why };
+    let (found, meta) = std::env::split_paths(path.unwrap_or_default())
+        .map(|dir| dir.join(tool))
+        .find_map(|candidate| {
+            let meta = std::fs::metadata(&candidate).ok()?;
+            meta.is_file().then_some((candidate, meta))
+        })
+        .ok_or_else(|| refused("not found on PATH".to_owned()))?;
+    let mode = meta.permissions().mode();
+    // Both facts are read: either is enough.
+    let setuid = mode & 0o4000 != 0;
+    // The value is not wanted, only whether there is one: an empty buffer asks its size.
+    let mut none: [u8; 0] = [];
+    let capable = rustix::fs::getxattr(&found, "security.capability", &mut none).is_ok();
+    if !(setuid | capable) {
+        return Err(refused(format!(
+            "{} is neither setuid nor holds file capabilities",
+            found.display()
+        )));
+    }
+    if mode & 0o111 == 0 {
+        return Err(refused(format!("{} is not executable", found.display())));
     }
     Ok(())
 }

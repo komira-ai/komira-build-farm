@@ -118,7 +118,7 @@ pub struct LinuxConfig {
     pub hot_dir: HostPath,
     /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
     pub data_dir: HostPath,
-    /// The pinned images, in podman's bare `<repo>@sha256:<digest>` form.
+    /// The pinned images, in the bare `<repo>@sha256:<digest>` form (no `docker://`).
     pub images: Vec<ImageRef>,
     pub user: String,
     pub server_user: String,
@@ -202,7 +202,7 @@ pub enum LinuxError {
         left: i128,
     },
     #[error(
-        "image '{0}': write the bare <repo>@sha256:<digest> (podman's form); render-units adds docker:// for kbf-daemon"
+        "image '{0}': write the bare <repo>@sha256:<digest>; render-units adds docker:// for kbf-daemon"
     )]
     ImageScheme(String),
     #[error(transparent)]
@@ -448,7 +448,7 @@ fn port(key: &'static str, value: &str) -> Result<u16, LinuxError> {
         })
 }
 
-/// A `KBF_IMAGES` entry: podman's bare `<repo>@sha256:<digest>`, which must pass
+/// A `KBF_IMAGES` entry: the bare `<repo>@sha256:<digest>`, which must pass
 /// kbf-daemon's own `--image` parser once `docker://` is put in front.
 pub fn image(entry: &str) -> Result<ImageRef, LinuxError> {
     if entry.starts_with("docker://") {

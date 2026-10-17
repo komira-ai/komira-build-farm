@@ -205,7 +205,15 @@ impl Crun {
     /// the container, its cgroup and its state after a `crun` that was killed. Blocking:
     /// a dropped lease cleans up from `Drop`.
     pub(crate) fn delete_blocking(&self, lease: &Path, id: &str) -> Result<(), String> {
-        self.blocking(&state_dir(lease), &["delete", "--force", id], "delete")
+        let state = state_dir(lease);
+        let deleted = self.blocking(&state, &["delete", "--force", id], "delete");
+        // A `crun run` killed with its container (a sweep's case) deletes its own state as
+        // it exits, and a `crun delete` that lost that race fails on the directory it
+        // listed: with the state gone there is nothing left to delete.
+        if deleted.is_err() && !state.join(id).exists() {
+            return Ok(());
+        }
+        deleted
     }
 
     /// Runs the helper bundle blocking: for the clean of a lease that has files only a

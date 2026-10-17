@@ -81,6 +81,28 @@ fn rows() -> Vec<Row> {
             plant: |_, t| t.replace("Slice=kbf.slice", "Slice=system.slice"),
             fails: ALL,
         },
+        // Another runtime named, the runtime flags left out, and Podman's name in a
+        // comment: each turns the rule red for the modes that run builds only.
+        Row {
+            rule: "runtime",
+            plant: |_, t| t.replace("--container-runtime=oci", "--container-runtime=runc"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "runtime",
+            plant: |_, t| t.replace("    --container-runtime=oci \\\n", ""),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "runtime",
+            plant: |_, t| t.replace("    --oci-runtime=/usr/bin/crun \\\n", ""),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "runtime",
+            plant: |_, t| first_in_service(t, "# a Podman leftover"),
+            fails: BUILDS,
+        },
         Row {
             rule: "delegate",
             plant: |_, t| first_in_service(t, "DisableControllers=cpuset"),

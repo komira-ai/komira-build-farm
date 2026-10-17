@@ -14,11 +14,12 @@ publish.workspace = true
 name = "kbf-daemon"
 path = "src/main.rs"
 
-# A stand-in `podman` for tests/binary.rs (the container driver's start-up checks).
-# Not shipped: the release jobs package the kbf-daemon binary alone.
+# A `podman` that fails and records that it ran, for tests/binary.rs: the container
+# driver must never start it. Not shipped: the release jobs package the kbf-daemon
+# binary alone.
 [[bin]]
-name = "kbf-podman-stub"
-path = "src/bin/kbf-podman-stub.rs"
+name = "kbf-no-podman"
+path = "src/bin/kbf-no-podman.rs"
 test = false
 
 [dependencies]
@@ -54,6 +55,8 @@ libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true
+# A layer tar for the `__unpack-layers` helper test (tests/binary/cache.rs).
+tar.workspace = true
 # What the unit tests give the daemon to run: kbf-testkit's act verbs and its fake
 # xcrun, xcodebuild and sandbox-exec, through links to the test binary.
 kbf-testkit.workspace = true

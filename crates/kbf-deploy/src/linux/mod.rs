@@ -30,9 +30,6 @@
 //!   scratch directories, and the services started.
 //!   With `--mode MODE` ([`install_mode`]): `kbf` (with `--bin-dir`), `kbf.slice` and
 //!   one built mode's unit, the directories its flags name, and the unit started.
-//! - `kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH]
-//!   [--apply]` ([`images`]): the pinned images in the kbf user's Podman store, pulled
-//!   as that user.
 //! - `kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]`
 //!   ([`swap`]): the swapfile, active and in `/etc/fstab`.
 //!
@@ -54,12 +51,12 @@ pub mod credential;
 mod glob;
 pub mod handover;
 pub mod host;
-pub mod images;
 pub mod install;
 pub mod install_mode;
 pub mod meta;
 pub mod modes;
 pub mod render;
+mod runtime;
 pub mod stop;
 pub mod stores;
 pub mod swap;

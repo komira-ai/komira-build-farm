@@ -4,7 +4,7 @@
 //! the same functions. See the `kbf-daemon` library for what the daemon does.
 //!
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
-//! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
+//! run: `fake` (nothing runs; for bring-up), `container` (rootless containers made by `crun`; Linux) or
 //! `native` (plain processes; for Macs), and for `whole_machine` leases on a Mac
 //! `native-whole-machine` (each lease as its own user in its GUI session, through
 //! `kbf-mac-session`; see `whole_machine`). Given more than once, the daemon has one
@@ -50,6 +50,8 @@ use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
     Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
+#[cfg(target_os = "linux")]
+use kbf_driver_container::ContainerRuntime;
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -200,20 +202,30 @@ pub struct Cli {
     require_metal_toolchain: bool,
     /// A container image this node is pinned to, as an action names it:
     /// `docker://<repo>@sha256:<digest>`, one architecture's manifest digest
-    /// (container; repeatable). At start the daemon checks each is in its user's image
-    /// store, as the prepare step of every lease does, and exits with status 2 if one
-    /// is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`).
-    /// The node's status lists them (`GET /v1/nodes`, `software.container_images`).
-    /// No work is placed by image yet: an action may still name another image.
+    /// (container; repeatable). At start the daemon makes sure each is in the node's
+    /// image store, as the prepare step of every lease does: it fetches the image from
+    /// its registry by that digest, checks every byte against a digest, and unpacks it
+    /// once. It exits with status 2 if one cannot be fetched, fails a check, or names an
+    /// image index. The node's status lists them (`GET /v1/nodes`,
+    /// `software.container_images`). No work is placed by image yet: an action may still
+    /// name another image.
     #[arg(long = "image", value_name = "IMAGE")]
     images: Vec<String>,
-    /// The runtime that runs each action's container (container): `podman`, the default,
-    /// runs `podman create` and `podman start` per action; `oci` runs each action in a
-    /// fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the
-    /// action path (Podman only pulls and exports an image once per digest). `oci` needs
-    /// the daemon user's subordinate ids in one range, `uidmap`, and every directory down
-    /// to `--data-dir` searchable by others.
-    #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
+    /// The runtime that runs each action's container (container): `oci`, the only one and
+    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
+    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
+    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
+    /// `PATH`, and every directory down to `--data-dir` searchable by others.
+    #[cfg(target_os = "linux")]
+    #[arg(long, default_value = "oci", value_name = "oci")]
+    container_runtime: ContainerRuntime,
+    /// The runtime that runs each action's container (container): `oci`, the only one and
+    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
+    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
+    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
+    /// `PATH`, and every directory down to `--data-dir` searchable by others.
+    #[cfg(not(target_os = "linux"))]
+    #[arg(long, default_value = "oci", value_name = "oci")]
     container_runtime: String,
     /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
     /// default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on
@@ -229,7 +241,7 @@ pub struct Cli {
     /// Where the kernel lists NUMA nodes (container). For tests of the placement only.
     #[arg(long, hide = true, default_value = "/sys/devices/system/node")]
     numa_dir: PathBuf,
-    /// The OCI runtime `--container-runtime=oci` runs actions with (container).
+    /// The OCI runtime that runs actions (container): `crun`.
     #[arg(long, default_value = "/usr/bin/crun")]
     oci_runtime: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
@@ -260,7 +272,7 @@ pub struct Cli {
 enum Driver {
     /// Runs nothing; every action succeeds with an empty result. For bring-up only.
     Fake,
-    /// Each action in a fresh rootless Podman container (Linux).
+    /// Each action in a fresh rootless container made by `crun` (Linux).
     Container,
     /// Each action as plain processes on the node, for Macs.
     Native,
@@ -809,8 +821,8 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
     // The drivers that link or clone leases' inputs from the cache.
     let cached = cli.drivers.contains(&Driver::Container)
         || (cfg!(target_os = "macos") && cli.drivers.contains(&Driver::Native));
-    // The OCI backend's container ids are not the daemon's: `leases` must be searchable.
-    let oci = cli.drivers.contains(&Driver::Container) && cli.container_runtime == "oci";
+    // The container ids are not the daemon's: `leases` must be searchable.
+    let oci = cli.drivers.contains(&Driver::Container);
     let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(oci);
     plan.create()?;
     for line in plan.describe() {
@@ -943,7 +955,7 @@ mod container {
         };
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
         config.placer = placer;
-        config.container_runtime = cli.container_runtime.parse()?;
+        config.container_runtime = cli.container_runtime;
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();

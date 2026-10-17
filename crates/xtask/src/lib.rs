@@ -23,9 +23,9 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `podman-tests [--sudo <path>] [--podman <path>] [--runtime-dir <path>]`
-//!   ([`podman_tests`]): the container driver's real-Podman tests on a hosted Linux
-//!   runner, each test target in its own `Delegate=yes` system unit.
+//! - `podman-tests [--sudo <path>]` ([`podman_tests`]): the container driver's real-`crun`
+//!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
+//!   unit (the name stays until the workflows that call it are renamed).
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
@@ -166,19 +166,12 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
-    /// Run the container driver's real-Podman tests on a hosted Linux runner, each
+    /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     PodmanTests {
         /// The sudo program; it is run with `-n`, so it never prompts.
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
-        /// The podman program.
-        #[arg(long, default_value = "podman")]
-        podman: PathBuf,
-        /// This user's runtime directory, where its systemd user manager's bus appears
-        /// (default: /run/user/<uid>).
-        #[arg(long)]
-        runtime_dir: Option<PathBuf>,
     },
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
@@ -392,16 +385,10 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::PodmanTests {
-            sudo,
-            podman,
-            runtime_dir,
-        } => podman_tests::run(&podman_tests::PodmanTests {
+        Verb::PodmanTests { sudo } => podman_tests::run(&podman_tests::PodmanTests {
             cargo: &cargo_program(),
             sudo: &sudo,
-            podman: &podman,
             root: &root,
-            runtime_dir: runtime_dir.as_deref(),
         }),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {

@@ -386,7 +386,7 @@ async fn an_index_digest_is_refused() {
 
 /// Catches the start-up check of a pinned image (`PodmanRuntime::check_pinned`, which
 /// `kbf-daemon --image` runs) passing an image the store does not hold, or refusing it
-/// without the exact `podman pull <repo>@sha256:<digest>` that fixes it; passing an
+/// without naming the image; passing an
 /// index digest (the manifest's kind not asked); refusing an image that is there; and
 /// pulling or running anything while it checks.
 #[tokio::test]
@@ -412,11 +412,11 @@ async fn a_pinned_image_is_checked_as_a_lease_checks_it() {
     let missing = fake.runtime.check_pinned(&present).await;
     assert_eq!(missing, Err(ImageCheckError::Missing(present.clone())));
     let why = missing.expect_err("missing").to_string();
-    let pull = format!(
-        "podman pull registry.test/tools/busybox@{}",
-        sha256(MANIFEST)
+    let name = format!("registry.test/tools/busybox@{}", sha256(MANIFEST));
+    assert_eq!(
+        why,
+        format!("image {name} is not in this node's image store")
     );
-    assert!(why.ends_with(&pull), "{why}");
     assert_eq!(fake.calls(), ["image", "info", "image", "image"]);
 }
 

@@ -29,26 +29,27 @@ use kbf_proto::reapi::{
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use node::{
-    PROMPT, Running, cgroup_tree, files_holding, id_files, image_path, input_bytes, pki, podman,
+    PROMPT, Running, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes,
+    oci_runtime, pki, podman_ran,
 };
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-podman");
+/// The stand-in `crun` (`node::crun`).
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let dir = node::scratch_root()
         .join("kbf-storage-and-daemon")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -119,15 +120,14 @@ fn node_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
 }
 
 /// Starts `kbf storage-and-daemon` with `flags`, its container driver running the
-/// stand-in `podman` in `bin`; the running node and its storage listener's address,
+/// stand-in `crun` in `bin`; the running node and its storage listener's address,
 /// from the start line.
 fn start_node(bin: &Path, flags: &[String]) -> (Running, SocketAddr) {
     let mut child = Command::new(BIN)
         .args(flags)
         .args(cgroup_tree(bin))
+        .arg(oci_runtime(bin))
         .env("PATH", image_path(bin))
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
         .current_dir(bin)
         .stdout(Stdio::piped())
         .spawn()
@@ -297,9 +297,10 @@ fn storage_and_daemon_runs_an_action_over_its_own_storage() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = podman(
+    let image = crun(
         &bin,
-        FAKE_PODMAN,
+        &dir.join("data"),
+        FAKE_CRUN,
         &["write-lines", "$UPPER/out/file.txt", "a file"],
     );
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
@@ -343,6 +344,8 @@ fn storage_and_daemon_runs_an_action_over_its_own_storage() {
     let pid = rustix::process::Pid::from_child(&running.0);
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
     assert!(running.wait().success());
+    // The `podman` first on PATH fails and records that it ran: kbf never starts it.
+    assert_eq!(podman_ran(&bin), "");
 }
 
 /// `kbf storage-and-daemon` with `flags`, `env` added to its environment; its exit

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime, StartError};
+use kbf_driver_container::{ContainerRuntime, MemoryCas, PodmanConfig, PodmanRuntime, StartError};
 use kbf_types::Resources;
 
 use super::{Spec, exists, store_action, work};
@@ -101,6 +101,9 @@ impl Fake {
         let mut config =
             PodmanConfig::new(scratch.clone(), "/actions".to_owned(), "node-1".to_owned());
         config.podman = program;
+        // The Podman engine, which no flag names any more: these are its tests, until
+        // they are deleted with it.
+        config.container_runtime = ContainerRuntime::Podman;
         config.cgroup_root = cgroup.clone();
         config.default_timeout = Duration::from_secs(60);
         config.kill_grace = Duration::from_millis(300);

@@ -36,7 +36,8 @@ use std::time::Duration;
 use super::check::check_texts;
 use super::config::LinuxConfig;
 use super::host::{
-    self, HostError, SS, SYSTEMCTL, binary, inspect, note, parents, stat, tool, under, unit_is,
+    self, CRUN, HostError, NEWGIDMAP, NEWUIDMAP, SS, SYSTEMCTL, binary, inspect, note, parents,
+    stat, tool, under, unit_is,
 };
 use super::render::{DAEMON, DROP_IN, SERVER, SLICE, Templates, render};
 use crate::unit::UnitFile;
@@ -268,7 +269,12 @@ fn preflight<E: Exec>(
     Ok((kbf, server))
 }
 
-/// `kbf` can run rootless Podman: it has subuid and subgid ranges and lingers.
+/// `kbf` can run rootless containers with `crun`: it has subuid and subgid ranges (which
+/// `newuidmap` and `newgidmap` map), the runtime and those two tools are installed, and
+/// it lingers (the unit's `XDG_RUNTIME_DIR`).
+///
+/// Whether the two tools are setuid or hold file capabilities is the daemon's start-up
+/// check: a capability is not something this kit reads.
 pub(super) fn rootless<E: Exec>(exec: &E, kbf: &RunUser) -> Result<(), HostError> {
     // A range line is `<user>:<first id>:<count>`, the user named or given by uid
     // (subuid(5); newuidmap takes either).
@@ -286,6 +292,12 @@ pub(super) fn rootless<E: Exec>(exec: &E, kbf: &RunUser) -> Result<(), HostError
                 user: kbf.name.clone(),
                 file,
             });
+        }
+    }
+    for (path, package) in [(CRUN, "crun"), (NEWUIDMAP, "uidmap"), (NEWGIDMAP, "uidmap")] {
+        let path = HostPath::new(path)?;
+        if stat(exec, &path)?.is_none_or(|m| m.kind == Kind::Dir) {
+            return Err(HostError::NoTool { path, package });
         }
     }
     if stat(exec, &under(&HostPath::new(LINGER)?, &kbf.name)?)?.is_none() {

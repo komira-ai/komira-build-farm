@@ -92,7 +92,7 @@ the OS:
 
 The 4 to 8 GiB is the same headroom as on a build host
 ([linux-build-host.md](linux-build-host.md#headroom---actions-memory-max-gib)): the
-kernel, systemd, sshd, the daemon itself and Podman's processes. A reservation is what
+kernel, systemd, sshd, the daemon itself and the containers' runtime processes. A reservation is what
 the process uses at its peak, and the same figure as its `MemoryMin=` above. The daemon
 writes the result to `actions/memory.max` and reports the lower of it and the host's
 memory as `mem_gib`, so the scheduler books no more than builds may use.
@@ -104,7 +104,7 @@ memory as `mem_gib`, so the scheduler books no more than builds may use.
 | RAM | 256 |
 | minus MinIO's reservation | 32 |
 | minus `kbf-server`'s reservation | 16 |
-| minus the OS, systemd, sshd, the daemon and Podman | 8 |
+| minus the OS, systemd, sshd, the daemon and the containers' runtime | 8 |
 | `--actions-memory-max-gib` | 200 |
 
 ## Server-only units
@@ -213,7 +213,7 @@ sudo systemctl enable --now kbf-server.service
 
 A converged host runs the server-only units above with this slice in place of theirs,
 and a daemon set up as on a build host
-([linux-build-host.md](linux-build-host.md): rootless Podman, the `kbf` user, swap),
+([linux-build-host.md](linux-build-host.md): `crun` and `uidmap`, the `kbf` user, swap),
 in the same slice, with this unit.
 
 `/etc/systemd/system/kbf.slice`:
@@ -246,6 +246,8 @@ CPUWeight=200
 Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
+    --container-runtime=oci \
+    --oci-runtime=/usr/bin/crun \
     --server=https://<storage host name>:8981 \
     --cas=https://<storage host name>:8981 \
     --ca-cert=/etc/kbf/ca.pem \
@@ -515,7 +517,7 @@ with a `REFUSED:` line on stderr.
 
 ## Installing on the host
 
-Three verbs change the host. Each runs as root, reads the host first, prints its plan
+Two verbs change the host. Each runs as root, reads the host first, prints its plan
 as `DRY-RUN:` lines and changes nothing; `--apply` carries the plan out, stopping at
 the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 done
 (or nothing to do), 1 a step or the check after an apply failed, 2 refused
@@ -524,7 +526,6 @@ the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 
 
 ```text
 sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
-sudo kbf-deploy linux image-pull --config node.conf [--image REF]... [--apply]
 sudo kbf-deploy linux install-units --config node.conf [--bin-dir DIR] [--restart-minio] [--apply]
 sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
 ```
@@ -536,13 +537,6 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   is active, since kubelet's default `failSwapOn` would take the node out of its
   cluster at its next restart; `--kubelet-allows-swap` says its config sets
   `failSwapOn: false`. `--remove` turns it off, drops the line and removes the file.
-- `image-pull` pulls each of `KBF_IMAGES` (or `--image`) missing from the kbf user's
-  rootless Podman store, as that user: its uid, its gid and all its groups (as
-  `sudo -u` gives them), `HOME` and `XDG_RUNTIME_DIR=/run/user/<uid>`. Each image in
-  the store must have its pinned digest and be `--platform` (`linux/amd64`); after an
-  apply each pulled image is checked the same way, and one still missing or not the
-  pin exits 1 with a `FAIL` line (the pulls ran, so it is not a refusal). Even a dry
-  run needs root, since it reads the store as the kbf user.
 - `install-units` checks the host (a cgroup v2 memory controller, `MINIO_UNIT` is a
   systemd unit, both users, the kbf user's subuid and subgid ranges, each a line
   keyed by its name or its uid, and linger, each key file in `KBF_ETC` its service's
@@ -651,7 +645,7 @@ backup.
   assignment that breaks the order, a slice minimum that is not the sum, a key on the
   command line, a bare `--image`) and require that rule's `FAIL` line; they
   also refuse each bad setting and a placeholder with no value. The host verbs'
-  tests (`src/linux/install_tests.rs`, `images_tests.rs`, `swap_tests.rs`) apply each
+  tests (`src/linux/install_tests.rs`, `swap_tests.rs`) apply each
   plan into a scratch directory with the tools played by a fake, check what landed,
   and require a re-run to plan nothing; each missing prerequisite is a row that must
   be refused with its own refusal. `src/user_tests.rs` runs `id` as another user

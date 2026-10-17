@@ -27,7 +27,7 @@ KBF_RAM_GIB=256
 # What MinIO and kbf-server use at their peak; also their MemoryMin=.
 MINIO_RESERVATION_GIB=32
 KBF_SERVER_RESERVATION_GIB=16
-# The kernel, systemd, sshd, the daemon and Podman: at least 4.
+# The kernel, systemd, sshd, the daemon and the build containers' runtime: at least 4.
 KBF_OS_HEADROOM_GIB=8
 # The daemon's memory.min (MemoryMin= and --supervisor-memory-min-mib).
 KBF_DAEMON_MEMORY_MIN_MIB=256
@@ -94,7 +94,8 @@ KBF_RESERVE_CPUS=
 KBF_LEASE_PLACEMENT=
 # Pinned images, space-separated, each <repo>@sha256:<64 hex> of one architecture's
 # manifest, without docker://. Each becomes the daemon's --image=docker://<entry>,
-# which it checks at start. Empty: no --image flag.
+# which it fetches from the registry at start (every byte checked against a digest) and
+# unpacks once; nothing pulls it ahead. Empty: no --image flag.
 KBF_IMAGES=
 
 # --- Paths ---

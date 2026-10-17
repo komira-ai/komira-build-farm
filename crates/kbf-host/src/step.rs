@@ -419,8 +419,8 @@ mod tests {
             ),
             (
                 Step::Run(
-                    Cmd::new(p("/usr/bin/podman"))
-                        .arg("pull")
+                    Cmd::new(p("/usr/bin/id"))
+                        .arg("-u")
                         .user(RunUser {
                             name: "kbf".to_owned(),
                             uid: 990,
@@ -430,7 +430,7 @@ mod tests {
                         })
                         .env("HOME", "/var/lib/kbf"),
                 ),
-                "run (as kbf) /usr/bin/podman pull (env HOME)",
+                "run (as kbf) /usr/bin/id -u (env HOME)",
             ),
             (
                 Step::Run(

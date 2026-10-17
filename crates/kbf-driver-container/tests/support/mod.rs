@@ -8,10 +8,15 @@ kbf_daemon::keeper_test_hook!();
 // The fake podman's actions are kbf-testkit's act steps, run by this test binary
 // through the link `kbf-act` a Fake makes (`fake.rs`).
 kbf_testkit::act_test_hook!();
+// The helper containers of the OCI backend run this binary in its `__chown-dirs` and
+// `__unpack-layers` modes, and so does the stand-in `crun` of the fake tests.
+kbf_driver_container::chown_dirs_test_hook!();
 
 pub mod fake;
 pub mod fake_oci;
 pub mod real;
+#[path = "../../../kbf-image/tests/support/registry.rs"]
+pub mod registry;
 pub mod rig;
 pub mod swap_kill;
 

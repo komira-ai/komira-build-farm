@@ -1,9 +1,10 @@
-//! The driver against real rootless Podman and a delegated cgroup.
+//! The driver against real rootless `crun` and a delegated cgroup.
 //!
-//! These need what a hosted runner has once `cargo xtask podman-tests` has set it up
-//! (the T4 spike, `docs/spikes/hosted-runners.md`): rootless Podman, a system unit with
-//! `Delegate=yes` that each test binary runs in, and a busybox image pulled by its index
-//! digest. The first test to start sets the unit's cgroup up the way `kbf-daemon` does
+//! These need what a hosted runner has (the T4 spike, `docs/spikes/hosted-runners.md`):
+//! `crun` and `uidmap`, and a system unit with `Delegate=yes` that each test binary runs
+//! in (`cargo xtask podman-tests` makes it). The busybox image is fetched from its
+//! registry by the driver's own image store (digest-verified end to end), by the first
+//! test to start. That test also sets the unit's cgroup up the way `kbf-daemon` does
 //! ([`kbf_driver_container::delegate`]: this process into `supervisor/`, `actions/`
 //! with cpu, memory and pids, `supervisor/memory.min` = [`SUPERVISOR_MEMORY_MIN`], and
 //! `actions/memory.max` = [`ACTIONS_MEMORY_MAX`]), and
@@ -14,8 +15,8 @@
 //! sets:
 //!
 //! - `KBF_TEST_IMAGE`: `docker://<repo>@sha256:<per-architecture manifest digest>`;
-//! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest (pulled by it,
-//!   so the store holds the index too).
+//! - `KBF_TEST_INDEX_IMAGE`: the same image by its image index digest, which the image
+//!   store refuses.
 
 mod support;
 
@@ -24,18 +25,18 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_daemon::{Runtime, RuntimeError, Work};
+use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_container::PodmanRuntime;
 use kbf_types::{LeaseId, Resources};
 use support::real::{
-    ACTIONS_MEMORY_MAX, Cell, MOUNT, SUPERVISOR_MEMORY_MIN, delegation, describe, podman, sh, var,
+    ACTIONS_MEMORY_MAX, Cell, MOUNT, SUPERVISOR_MEMORY_MIN, delegation, describe, sh, var,
 };
 use support::{Spec, blob, exists, store_action};
 
 /// Catches the action not seeing its inputs, environment, working directory or the
 /// constant hostname, and its exit code, stdout, stderr or outputs going uncollected.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn an_action_runs_and_its_results_are_collected() {
     let cell = Cell::new("collects");
     let mut spec =
@@ -65,7 +66,7 @@ async fn an_action_runs_and_its_results_are_collected() {
 /// metadata-only copy-up, the upper layer would hold the directory without its files,
 /// the file without its bytes, or a deleted file as a whiteout.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn outputs_are_whole_and_inputs_named_as_outputs_are_as_the_action_left_them() {
     let cell = Cell::new("overlap");
     let mut spec = sh(
@@ -159,32 +160,32 @@ async fn outputs_are_whole_and_inputs_named_as_outputs_are_as_the_action_left_th
 }
 
 /// The marker test. The action writes a uniquely named marker outside its output
-/// directory: in the container's root, its /tmp, and beside its inputs. Catches a
-/// skipped or partial clean step: after the lease ends no file of that name may exist
-/// in Podman's storage or the scratch directory, and no container may remain.
+/// directory: in its /tmp, beside its inputs, and in its writable /root and /var/tmp (the
+/// image root is read-only, so a write to `/` is refused: that is checked too). Catches a
+/// skipped or partial clean step: after the lease ends no file of that name may exist in
+/// the scratch directory (the lease's directories), and no container may remain.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_marker_test_nothing_outside_the_outputs_survives() {
     let cell = Cell::new("marker");
     let marker = format!("kbf-marker-{}", std::process::id());
     let spec = sh(&format!(
-        "echo m > /{marker}; echo m > /tmp/{marker}; echo m > /kbf/root/{marker}; ls /{marker}"
+        "echo m > /tmp/{marker}; echo m > /root/{marker}; echo m > /var/tmp/{marker}; \
+         echo m > /kbf/root/{marker}; ls /tmp/{marker}; \
+         if echo m > /{marker} 2>/dev/null; then echo root-writable; fi"
     ));
     let result = cell.run(1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "the marker was written");
-    let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
-    let graph_root = graph_root.trim();
-    let scratch = cell.scratch.to_string_lossy();
-    // The whole store, not this lease's paths: its layer is gone by now, and a marker
-    // anywhere else in the store (a committed layer, a volume) is a leak too. Other
-    // tests remove their containers while this walks, so a directory of the store may
-    // vanish under it; one in this test's scratch may not.
-    let walk = find(
-        &["podman", "unshare"],
-        &[graph_root, &scratch],
-        &[graph_root],
-        &["-name", &marker],
+    assert_eq!(
+        cell.stdout(&result),
+        format!("/tmp/{marker}\n"),
+        "the image root was writable, or /tmp was not"
     );
+    let scratch = cell.scratch.to_string_lossy();
+    // The scratch directory, which `oci-images` (a link to the shared store, which the
+    // action cannot write: its root is read-only) is in. Nothing is raced here: no other
+    // lease of this cell runs.
+    let walk = find(&["env"], &[&scratch], &[], &["-name", &marker]);
     let found = walk.unwrap_or_else(|why| panic!("{why}")).found;
     assert!(found.trim().is_empty(), "marker left behind:\n{found}");
     cell.assert_clean(1);
@@ -399,11 +400,11 @@ fn a_directory_vanishing_mid_walk_fails_nothing_else() {
     support::force_remove(&scratch);
 }
 
-/// Catches the network being on by default (the mutant drops `--network=none`, and
-/// rootless Podman's default slirp4netns adds an interface and DNS): the action must
-/// see loopback only, and a name lookup must fail.
+/// Catches the network being on (the mutant leaves out the network namespace, so the
+/// action shares the host's interfaces and DNS): the action must see loopback only, and a
+/// name lookup must fail.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn there_is_no_network_but_loopback() {
     let cell = Cell::new("network");
     let spec = sh("sed -n '3,$p' /proc/net/dev | cut -d: -f1 | tr -d ' '; \
@@ -416,7 +417,7 @@ async fn there_is_no_network_but_loopback() {
 /// Catches an image named by tag, or by index digest, being run: the action digest
 /// would not pin the bytes (the "tag instead of a digest" mutant).
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn tags_and_index_digests_are_refused() {
     let cell = Cell::new("refused");
     let image = var("KBF_TEST_IMAGE");
@@ -445,7 +446,7 @@ async fn tags_and_index_digests_are_refused() {
 /// reports: `actions/memory.max` as written (below the runner's memory), and the CPUs
 /// this process may run on (its affinity is the unit's cpuset).
 #[test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 fn the_daemons_cgroup_setup_holds_on_the_kernel() {
     let delegation = delegation();
     let own = std::fs::read_to_string("/proc/self/cgroup").expect("read");
@@ -504,7 +505,7 @@ fn the_daemons_cgroup_setup_holds_on_the_kernel() {
 /// booking x 1.5 + 512 MiB and `memory.oom.group=1` on the lease, no soft limit and
 /// swap allowed there, `cpu.weight` from the CPU, and one OOM group for the container.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_lease_cgroup_carries_the_limits() {
     let cell = Cell::new("limits");
     let action = store_action(&cell.cas, &sh("sleep 5"));
@@ -538,7 +539,7 @@ async fn the_lease_cgroup_carries_the_limits() {
 /// (docs/deploy/linux-build-host.md), so under memory pressure the kernel would pick
 /// the daemon before such a build. The action reads the kernel's default, 0.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn an_action_does_not_inherit_the_daemons_oom_score() {
     let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read");
     assert_eq!(own.trim(), "-900", "the premise: the unit lowers it");
@@ -572,8 +573,8 @@ async fn wait_for_container_cgroup(lease: &Path) -> PathBuf {
             .flatten()
             .flatten()
             .find(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                name.starts_with("libpod-") && !name.contains("conmon")
+                // The OCI backend's container cgroup: `<lease cgroup>/ctr`.
+                e.file_name() == "ctr"
             });
         if let Some(entry) = found {
             return entry.path();
@@ -614,7 +615,7 @@ async fn wait_for_program_in(container: &Path, comm: &str) {
 /// that function's wait for the action's program: the read then follows the
 /// directory's creation by at most one 5 ms poll, inside the window #88 hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn every_container_is_one_oom_group_once_its_action_runs() {
     let cell = Cell::new("oom-group-stress");
     for batch in 0..20 {
@@ -643,81 +644,11 @@ async fn every_container_is_one_oom_group_once_its_action_runs() {
     }
 }
 
-/// Catches (issue #105) the marker test's walk of Podman's store failing because a
-/// container was removed while it walked. 40 leases run, two at a time, while the walk
-/// goes over the whole store again and again; every walk must pass and find nothing.
-/// Each of `find`'s two tolerances is a mutant this turns red: a layer directory that
-/// vanishes mid-walk (no error treated as benign), and fts stopping mid-walk (no walk
-/// again).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
-async fn the_store_walk_passes_while_containers_come_and_go() {
-    let cell = Cell::new("walk-churn");
-    let pairs: Vec<Vec<Work>> = (0..20)
-        .map(|pair| {
-            (1..=2)
-                .map(|i| {
-                    let action = store_action(&cell.cas, &sh("echo churn > /tmp/churn"));
-                    cell.work(pair * 2 + i, action, Resources::new(1000, 256 << 20))
-                })
-                .collect()
-        })
-        .collect();
-    let runtime = Arc::clone(&cell.runtime);
-    let churn = tokio::spawn(async move {
-        let mut outcomes = Vec::new();
-        for pair in pairs {
-            let runs: Vec<_> = pair
-                .into_iter()
-                .map(|work| {
-                    let runtime = Arc::clone(&runtime);
-                    tokio::spawn(async move { runtime.run(work).await })
-                })
-                .collect();
-            for run in runs {
-                outcomes.push(run.await.expect("join"));
-            }
-        }
-        outcomes
-    });
-    let graph_root = podman(&["info", "--format={{.Store.GraphRoot}}"]);
-    let graph_root = graph_root.trim().to_owned();
-    let name = format!("kbf-never-written-{}", std::process::id());
-    let (mut walks, mut gave_up) = (0, 0);
-    while !churn.is_finished() {
-        let (root, name) = (graph_root.clone(), name.clone());
-        let walk = tokio::task::spawn_blocking(move || {
-            find(
-                &["podman", "unshare"],
-                &[&root],
-                &[&root],
-                &["-name", &name],
-            )
-        })
-        .await
-        .expect("join");
-        let walk = walk.unwrap_or_else(|why| panic!("walk {walks}: {why}"));
-        assert!(walk.found.trim().is_empty(), "{}", walk.found);
-        walks += 1;
-        gave_up += walk.aborted;
-    }
-    for (i, outcome) in churn.await.expect("join").into_iter().enumerate() {
-        let result = outcome.unwrap_or_else(|e| panic!("lease {}: {e:?}", i + 1));
-        assert_eq!(result.exit_code, 0, "lease {}", i + 1);
-        cell.assert_clean(i as u64 + 1);
-    }
-    assert!(
-        walks > 1,
-        "the store was walked {walks} times while leases ran"
-    );
-    println!("{walks} walks of the store while 40 leases came and went; {gave_up} walked again");
-}
-
 /// Catches a timeout that is not enforced on a real container, or that leaves it; and
 /// (issue #45) a timeout that loses what the container wrote to stdout and stderr
-/// before it was stopped, as `podman start --attach` captured it, or swaps the two.
+/// before it was stopped, as the runtime's own output files captured it, or swaps the two.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_timeout_stops_the_container() {
     let cell = Cell::new("timeout");
     let mut spec = sh("echo started; echo warming >&2; sleep 60");
@@ -734,7 +665,7 @@ async fn a_timeout_stops_the_container() {
 /// Catches `kill` returning while the container still exists, and a cancelled run
 /// (the daemon dropped its task) leaving its container behind.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn kill_and_cancel_remove_the_container() {
     let cell = Cell::new("kill");
     // Several rounds: a lease cgroup left after kill or cancel showed up once in hosted CI.
@@ -759,11 +690,12 @@ async fn kill_and_cancel_remove_the_container() {
 
 /// Catches (issue #155) a restarted daemon that leaves its killed predecessor's
 /// container running (the scheduler would run the lease again beside it), or its lease
-/// cgroup or scratch directory behind, and one that removes a container another owner
-/// labelled. The killed daemon is modelled by forgetting its run: nothing of it is
-/// dropped, so nothing of it is cleaned.
+/// cgroup or scratch directory behind, and one that removes another daemon's: each runtime
+/// has a scratch directory of its own, which its start sweeps and no other. The killed
+/// daemon is modelled by forgetting its run: nothing of it is dropped, so nothing of it is
+/// cleaned.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_restarted_runtime_removes_what_its_predecessor_left() {
     let cell = Cell::new("restart");
     let other = Cell::new("restart-other");
@@ -785,19 +717,16 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
     // Never polled or dropped again, as a daemon that was killed.
     std::mem::forget(mine);
     std::mem::forget(theirs);
-    let label = podman(&[
-        "inspect",
-        "--format={{index .Config.Labels \"kbf.owner\"}}",
-        &cell.name(1),
-    ]);
-    assert_eq!(label.trim(), "kbf-test-restart");
+    assert!(
+        cell.container_exists(1),
+        "the predecessor's container is not running"
+    );
 
     PodmanRuntime::new(cell.config.clone(), Arc::clone(&cell.cas)).expect("restart");
     cell.assert_clean(1);
-    let names = podman(&["ps", "--all", "--format={{.Names}}"]);
     assert!(
-        names.lines().any(|n| n == other.name(1)),
-        "another owner's container was removed: {names}"
+        other.container_exists(1),
+        "another daemon's container was removed"
     );
     PodmanRuntime::new(other.config.clone(), Arc::clone(&other.cas)).expect("restart");
     other.assert_clean(1);
@@ -823,13 +752,13 @@ fn ids(pid: &str) -> Vec<(&'static str, u32)> {
 }
 
 /// fleet-updates-security S10, "a container action's host uid is not the daemon's".
-/// Catches the "drop `--userns`" mutant: rootless Podman's default runs the
-/// container's root as the daemon's own uid on the host. Two views of the running
-/// action: the ids of each of its processes as the host sees them, and the owner, on
-/// the host, of a file it created. Then a kill, whose clean step removes files the
-/// container's ids still own (inside Podman's user namespace).
+/// Catches the "drop the id mappings" mutant: a container without a user namespace runs
+/// its root as the daemon's own uid on the host. Two views of the running action: the ids
+/// of each of its processes as the host sees them, and the owner, on the host, of a file
+/// it created. Then a kill, whose clean step removes files the container's ids still own
+/// (inside a helper container's user namespace).
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn no_container_id_is_the_daemons_on_the_host() {
     use std::os::unix::fs::MetadataExt;
 
@@ -872,13 +801,12 @@ async fn no_container_id_is_the_daemons_on_the_host() {
     cell.assert_clean(1);
 }
 
-/// Why `--userns=nomap` and not `auto`: rootless `auto` hands the first container
-/// all but one of the user's 65,536 subordinate ids, so a second container on the
-/// node fails in `podman create` ("not enough unused IDs in user namespace") until the
-/// first ends. Catches a switch to `auto`: lease 2 runs to completion while lease 1's
-/// container is still running.
+/// Two containers on one node, each with the daemon user's whole subordinate range
+/// mapped (a 16-bit range the kernel allows twice: each is in a user namespace of its
+/// own). Catches a mapping that hands one container ids another needs: lease 2 runs to
+/// completion while lease 1's container is still running.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn two_containers_run_at_once() {
     let cell = Cell::new("together");
     let action = store_action(&cell.cas, &sh("exec sleep 60"));
@@ -888,11 +816,7 @@ async fn two_containers_run_at_once() {
     set_up_container_cgroup(&cell.cgroup.join(cell.name(1)), "sleep").await;
 
     let second = cell.run(2, &sh("echo second")).await;
-    let still = podman(&["ps", "--format={{.Names}}"]);
-    assert!(
-        still.lines().any(|n| n == cell.name(1)),
-        "lease 1 ended before lease 2 ran: {still}"
-    );
+    assert!(cell.container_exists(1), "lease 1 ended before lease 2 ran");
     let second = second.expect("lease 2 runs beside lease 1");
     assert_eq!(second.exit_code, 0, "{second:?}");
     assert_eq!(cell.stdout(&second), "second\n");
@@ -911,7 +835,7 @@ async fn two_containers_run_at_once() {
 /// overlay copies up: input files are the container's root's too, as without a user
 /// namespace.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_action_owns_its_files_and_its_private_outputs_are_collected() {
     let cell = Cell::new("owners");
     let mut spec = sh(
@@ -941,7 +865,7 @@ async fn the_action_owns_its_files_and_its_private_outputs_are_collected() {
 /// another digest, with the image check and lease setup a real node runs; and such a
 /// lease leaving its container, cgroup or scratch behind.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_missing_input_file_is_reported_as_missing_with_its_digest() {
     use kbf_daemon::cas::{digest_of, label};
     use kbf_proto::reapi::{Action, Directory, FileNode};

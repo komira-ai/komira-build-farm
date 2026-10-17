@@ -41,15 +41,43 @@ fn config(dir: &Path, ok: bool) -> OciConfig {
         daemon: std::env::current_exe().expect("test binary"),
         id_files: files,
         check_search: false,
+        id_tool_path: Some(id_tools(dir, 0o4755, 0o4755).into_os_string()),
+        // A registry address is configured, as a test of the fetch has it.
+        plain_http_registries: vec!["127.0.0.1:1".to_owned()],
     }
 }
 
-fn podman() -> Podman {
-    Podman::new(PathBuf::from("/usr/bin/false"))
+/// A directory under `dir` with `newuidmap` and `newgidmap` of the given modes.
+fn id_tools(dir: &Path, uid_mode: u32, gid_mode: u32) -> PathBuf {
+    let tools = dir.join(format!("tools-{uid_mode:o}-{gid_mode:o}"));
+    std::fs::create_dir_all(&tools).expect("tools");
+    for (name, mode) in [("newuidmap", uid_mode), ("newgidmap", gid_mode)] {
+        let path = tools.join(name);
+        std::fs::write(&path, b"#!/bin/true\n").expect("tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    tools
 }
 
 fn start(config: &OciConfig, scratch: &Path) -> Result<Arc<Oci>, OciError> {
-    Oci::on(config, scratch, podman(), "/actions", "x86_64")
+    Oci::on(config, scratch, "/actions", "x86_64")
+}
+
+/// Catches the helpers running the daemon's binary from where it was installed: a helper
+/// with an action's ids cannot search a 0750 home directory the binary may sit in, so the
+/// daemon copies itself under the scratch directory and runs that copy.
+#[test]
+fn helpers_run_a_copy_of_the_daemon_under_the_scratch_directory() {
+    let dir = scratch("daemon-copy");
+    let oci = start(&config(&dir, true), &dir.join("s")).expect("starts");
+    assert_eq!(oci.daemon, dir.join("s/oci-bin/kbf-daemon"));
+    let mode = std::fs::metadata(&oci.daemon)
+        .expect("copy")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755);
+    let original = std::fs::read(std::env::current_exe().expect("test binary")).expect("read");
+    assert_eq!(std::fs::read(&oci.daemon).expect("copy"), original);
 }
 
 /// Catches an error that does not name the path it was about, and one that is lost.
@@ -82,7 +110,7 @@ fn the_backend_refuses_a_node_that_cannot_run_it() {
     let good = config(&dir, true);
     assert_eq!(started(&good, &dir.join("scratch")), "started");
 
-    let on = Oci::on(&good, &dir.join("s1"), podman(), "/actions", "riscv64");
+    let on = Oci::on(&good, &dir.join("s1"), "/actions", "riscv64");
     let refused = on.err().map(|e| e.to_string());
     let says = "this machine's architecture (riscv64) has no seccomp profile";
     assert_eq!(refused.as_deref(), Some(says));
@@ -124,6 +152,57 @@ fn the_backend_refuses_a_node_that_cannot_run_it() {
     std::fs::write(&good.id_files.subuid, "").expect("empty");
     let said = started(&good, &dir.join("s5"));
     assert!(said.contains("has no range"), "{said}");
+}
+
+/// Catches a node whose `crun` could not map the container's ids starting anyway, so
+/// that the first action fails instead of the start: each of the two tools missing from
+/// `PATH` (and no `PATH` at all), present but neither setuid nor holding file
+/// capabilities, or setuid but not executable, is refused naming the tool and the
+/// file; a setuid pair is accepted from the second `PATH` directory, and the first
+/// directory without the tool is passed over.
+#[test]
+fn the_backend_refuses_a_node_without_usable_id_tools() {
+    let dir = scratch("id-tools");
+    let good = config(&dir, true);
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).expect("empty");
+    let with_path = |path: Option<std::ffi::OsString>| OciConfig {
+        id_tool_path: path,
+        ..good.clone()
+    };
+    let joined = |dirs: &[&Path]| std::env::join_paths(dirs).expect("PATH");
+    let said = started(&with_path(None), &dir.join("s1"));
+    assert!(said.starts_with("newuidmap: not found on PATH"), "{said}");
+    let said = started(&with_path(Some(empty.clone().into())), &dir.join("s2"));
+    assert!(said.starts_with("newuidmap: not found on PATH"), "{said}");
+    assert!(said.contains("package uidmap"), "{said}");
+
+    let half = id_tools(&dir, 0o4755, 0o4755);
+    std::fs::remove_file(half.join("newgidmap")).expect("remove");
+    let said = started(&with_path(Some(half.into())), &dir.join("s3"));
+    assert!(said.starts_with("newgidmap: not found on PATH"), "{said}");
+
+    let plain = id_tools(&dir, 0o755, 0o4755);
+    let said = started(&with_path(Some(plain.clone().into())), &dir.join("s4"));
+    assert!(
+        said.starts_with("newuidmap: ")
+            && said.contains("is neither setuid nor holds file capabilities"),
+        "{said}"
+    );
+    assert!(
+        said.contains(&plain.join("newuidmap").display().to_string()),
+        "{said}"
+    );
+
+    let closed = id_tools(&dir, 0o4755, 0o4600);
+    let said = started(&with_path(Some(closed.into())), &dir.join("s5"));
+    assert!(
+        said.starts_with("newgidmap: ") && said.contains("is not executable"),
+        "{said}"
+    );
+
+    let both = joined(&[&empty, &id_tools(&dir, 0o4755, 0o4755)]);
+    assert_eq!(started(&with_path(Some(both)), &dir.join("s6")), "started");
 }
 
 /// Catches the search check refusing a scratch directory that is fine: one under the
@@ -346,48 +425,39 @@ fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
         json!(["/usr/bin/find", "/t/0", "-mindepth", "1", "-delete"])
     );
     // Only the daemon's own binary and the node's tools are ever run.
-    let programs = [
-        "/kbf/daemon",
-        "/usr/bin/find",
-        "/usr/bin/mkdir",
-        "/usr/bin/tar",
-        "/usr/bin/touch",
-    ];
+    let programs = ["/kbf/daemon", "/usr/bin/find"];
     for argv in [&give.args, &whole.args] {
         assert!(programs.contains(&argv[0].as_str()), "{argv:?}");
     }
 }
 
-/// Catches the unpack running anything but the four programs, in order, or a step
-/// reading or writing the wrong directory: the stage is writable and the tar is not.
+/// Catches the unpack running anything but the daemon's own `__unpack-layers` mode, or
+/// a step reading or writing the wrong directory: the stage is writable, the blobs are
+/// not, the daemon's binary is bound, and the layers follow in order as names.
 #[test]
-fn the_unpack_is_four_programs_in_order() {
-    let jobs = helper::unpack_jobs(Path::new("/s/stage"), Path::new("/s/exported"));
-    let programs: Vec<_> = jobs.iter().map(|j| j.args[0].as_str()).collect();
+fn the_unpack_is_one_daemon_mode_over_two_directories() {
+    let layers = ["0.tar.gz".to_owned(), "1.tar".to_owned()];
+    let job = helper::unpack_job(
+        Path::new("/the/daemon"),
+        Path::new("/s/stage"),
+        Path::new("/s/blobs"),
+        &layers,
+    );
     assert_eq!(
-        programs,
+        job.args,
         [
-            "/usr/bin/mkdir",
-            "/usr/bin/tar",
-            "/usr/bin/mkdir",
-            "/usr/bin/touch"
+            "/kbf/daemon",
+            "__unpack-layers",
+            "/t/0",
+            "/t/1",
+            "0.tar.gz",
+            "1.tar"
         ]
     );
-    assert_eq!(jobs[0].args[1..], ["/t/0/rootfs"]);
-    let tar = &jobs[1].args;
-    for flag in [
-        "--extract",
-        "--same-owner",
-        "--numeric-owner",
-        "--no-overwrite-dir",
-    ] {
-        assert!(tar.iter().any(|a| a == flag), "{flag} in {tar:?}");
-    }
-    assert!(jobs[2].args.contains(&"/t/0/rootfs/kbf/root".to_owned()));
-    assert!(jobs[3].args.contains(&"/t/0/rootfs/etc/hosts".to_owned()));
-    for job in &jobs {
-        assert!(job.binds[0].writable);
-        assert!(!job.binds[1].writable);
-        assert!(job.daemon.is_none());
-    }
+    assert_eq!(job.daemon.as_deref(), Some(Path::new("/the/daemon")));
+    assert_eq!(job.binds[0].source, Path::new("/s/stage"));
+    assert!(job.binds[0].writable);
+    assert_eq!(job.binds[1].source, Path::new("/s/blobs"));
+    assert!(!job.binds[1].writable);
+    assert_eq!(job.binds.len(), 2);
 }

@@ -1,4 +1,4 @@
-//! The memory policy against real rootless Podman and a real cgroup v2 kernel: each
+//! The memory policy against real rootless `crun` and a real cgroup v2 kernel: each
 //! lease's hard cap (`memory.max` = booking x 1.5 + 512 MiB) with `memory.oom.group=1`,
 //! swap left allowed, the driver's swap watch (`SwapKill`), and the classification of
 //! an OOM kill by the lease cgroup's `memory.events`: at the lease's own cap it is
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_container::SwapKill;
 use kbf_types::{LeaseId, Resources};
-use support::real::{Cell, describe, podman, sh};
+use support::real::{Cell, describe, sh};
 use support::store_action;
 use support::swap_kill::{Logs, assert_swap_kill};
 
@@ -106,7 +106,7 @@ async fn wait_for(lease: &Path, comm: &str) {
 /// Lease 1 books 16 MiB (cap 536 MiB) and reads 700 MiB into one buffer; lease 2 sleeps
 /// beside it, in the same `actions/`, and must still be running afterwards.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn past_its_cap_an_action_dies_alone_and_is_out_of_memory() {
     let cell = Cell::new("own-cap");
     write(&cell.cgroup, "memory.swap.max", "0");
@@ -131,10 +131,9 @@ async fn past_its_cap_an_action_dies_alone_and_is_out_of_memory() {
     );
     cell.assert_clean(1);
 
-    let running = podman(&["ps", "--format={{.Names}}"]);
     assert!(
-        running.lines().any(|n| n == cell.name(2)),
-        "the neighbour lease died with the one past its cap: {running}"
+        cell.container_exists(2),
+        "the neighbour lease died with the one past its cap"
     );
     cell.runtime.kill(LeaseId::new(cell.term, 2)).await;
     let outcome = second.await.expect("join");
@@ -148,7 +147,7 @@ async fn past_its_cap_an_action_dies_alone_and_is_out_of_memory() {
 /// 200 MiB; the cell, standing in for `actions/`, allows 64 MiB, so the kernel's OOM
 /// killer runs for the cell's limit, not the lease's.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn killed_by_the_actions_backstop_within_its_cap_is_a_busy_node() {
     let cell = Cell::new("backstop");
     write(&cell.cgroup, "memory.max", "64M");
@@ -174,7 +173,7 @@ async fn killed_by_the_actions_backstop_within_its_cap_is_a_busy_node() {
 /// action that books 64 MiB and holds 300 MiB, past its booking and within its cap of
 /// 608 MiB, runs to exit 0 with no swap to fall back on.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn past_its_booking_within_its_cap_an_action_runs() {
     let cell = Cell::new("buffer");
     write(&cell.cgroup, "memory.swap.max", "0");
@@ -209,7 +208,7 @@ async fn past_its_booking_within_its_cap_an_action_runs() {
 /// (podman-x86's) drops zero-filled pages for the shared zero page, so a buffer of
 /// zeros shrinks below the cap and never reaches swap.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     require_swap();
     let cell = Cell::with("swap-kill", |config| {
@@ -257,10 +256,9 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     println!("killed {took:?} after the start: {outcome:?}");
     cell.assert_clean(1);
 
-    let running = podman(&["ps", "--format={{.Names}}"]);
     assert!(
-        running.lines().any(|n| n == cell.name(2)),
-        "the neighbour lease died with the one past its cap: {running}"
+        cell.container_exists(2),
+        "the neighbour lease died with the one past its cap"
     );
     cell.runtime.kill(LeaseId::new(cell.term, 2)).await;
     let outcome = second.await.expect("join");
@@ -278,7 +276,7 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
 /// has sampled it for several seconds. Also catches a lease that reclaim cannot move
 /// to swap (a per-lease `memory.swap.max=0` mutant).
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn swapped_below_its_cap_a_lease_is_not_killed() {
     require_swap();
     const FLOOR: u64 = 8 * MIB;
@@ -373,10 +371,10 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// reaches its cap: the buffers are more than RAM and headroom (the push is forced),
 /// and the bound is below the floor (a kill is the rule's error, never the lease's).
 /// Clean file pages for the `max` events, not written ones: a lease at so tight a cap
-/// that writes is OOM-killed by the kernel (seen on both podman jobs) before its dirty
+/// that writes is OOM-killed by the kernel (seen on both real-crun jobs) before its dirty
 /// pages are written back.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     require_swap();
     const FLOOR: u64 = 192 * MIB;

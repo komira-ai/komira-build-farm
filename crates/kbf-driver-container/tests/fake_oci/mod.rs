@@ -10,8 +10,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::support::fake::{Fake, MANIFEST, image, image_by, sha256};
+use crate::support::fake::{Fake, image, sha256};
 use crate::support::fake_oci::FakeOci;
+use crate::support::registry::{Blob, FakeRegistry, Image, Item};
 use crate::support::{Spec, blob, exists};
 use kbf_daemon::RuntimeError;
 use kbf_driver_container::{ContainerLimits, IdFiles, StartError};
@@ -420,107 +421,233 @@ async fn a_failed_hand_over_fails_the_lease() {
     }
 }
 
-/// Catches the image being unpacked on the action path more than once, or without the
-/// manifest check: the first lease of an image that is pulled and not unpacked asks
-/// Podman (the store check, a throwaway container, `export`) and unpacks in a helper;
-/// the next lease finds it with a `stat` and runs no Podman.
-#[tokio::test]
-async fn an_image_is_unpacked_once_and_then_found_with_a_stat() {
-    let fake = FakeOci::new("unpack");
-    fake.pulled_not_unpacked();
-    let spec = Spec::new(&image(), "unused");
-    fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
-    assert!(fake.image_dir().join("rootfs/kbf/root").is_dir());
-    assert!(
-        fake.calls().contains(&"helper tar".to_owned()),
-        "{:?}",
-        fake.calls()
-    );
-    let podman = fake.podman_calls();
-    for verb in ["image", "create", "export"] {
-        assert!(podman.contains(&verb.to_owned()), "{verb} in {podman:?}");
-    }
-    // The tar and the stage are gone; only the unpacked image remains.
-    let left: Vec<_> = std::fs::read_dir(fake.image_dir().parent().unwrap())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        left,
-        [sha256(MANIFEST).trim_start_matches("sha256:")],
-        "{left:?}"
-    );
-
-    let (podman_before, unpacks_before) = (fake.podman_calls().len(), unpacks(&fake));
-    fake.run(2, &spec, &["exit", "0"]).await.expect("ran again");
-    assert_eq!(fake.podman_calls().len(), podman_before);
-    assert_eq!(unpacks(&fake), unpacks_before);
+/// A small image: two layers, the second adding a file and deleting one of the first's.
+fn tiny_image() -> Image {
+    Image::of(vec![
+        Blob::gzip_tar(&[
+            Item::File {
+                path: "bin/tool",
+                data: b"tool",
+                mode: 0o755,
+            },
+            Item::File {
+                path: "etc/os-release",
+                data: b"tiny",
+                mode: 0o644,
+            },
+            Item::File {
+                path: "etc/removed",
+                data: b"gone",
+                mode: 0o644,
+            },
+        ]),
+        Blob::plain_tar(&[
+            Item::File {
+                path: "etc/added",
+                data: b"added",
+                mode: 0o644,
+            },
+            Item::File {
+                path: "etc/.wh.removed",
+                data: b"",
+                mode: 0o644,
+            },
+        ]),
+    ])
 }
 
 fn unpacks(fake: &FakeOci) -> usize {
-    fake.calls().iter().filter(|c| *c == "helper tar").count()
+    fake.calls()
+        .iter()
+        .filter(|c| *c == "helper unpack")
+        .count()
 }
 
-/// Catches concurrent first uses of one image unpacking it once each (the single
-/// flight): five checks at once (what five first leases, or the `--image` checks at
-/// start, ask), one unpack.
+fn manifest_requests(fake: &FakeOci) -> usize {
+    fake.registry_requests()
+        .iter()
+        .filter(|r| r.contains("/manifests/"))
+        .count()
+}
+
+/// Catches the image being fetched or unpacked on the action path more than once, a
+/// root that is not the image's, and anything but the node's own code running: the
+/// first lease of an image that is not in the store fetches it from the registry,
+/// unpacks it in a helper (layers in order, the whiteout applied, the mount points made)
+/// and runs the action on it, with the failing `podman` stub never run; the next lease
+/// finds the directory with a `stat`, asks the registry nothing and unpacks nothing.
 #[tokio::test]
-async fn concurrent_first_uses_share_one_unpack() {
-    let fake = FakeOci::new("unpack-flight");
-    fake.pulled_not_unpacked();
-    let image = kbf_driver_container::ImageRef::parse(&image()).expect("image");
+async fn an_image_is_fetched_and_unpacked_once_and_then_found_with_a_stat() {
+    let fake = FakeOci::fetching("fetch", FakeRegistry::start().await);
+    let image = tiny_image();
+    let spec = Spec::new(&fake.publish(&image), "unused");
+    fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
+    let rootfs = fake.image_dir_of(&image.digest).join("rootfs");
+    let read = |rel: &str| std::fs::read_to_string(rootfs.join(rel)).unwrap_or_default();
+    assert_eq!(read("bin/tool"), "tool");
+    assert_eq!(read("etc/os-release"), "tiny");
+    assert_eq!(read("etc/added"), "added");
+    assert!(
+        !exists(&rootfs.join("etc/removed")),
+        "the whiteout was not applied"
+    );
+    assert!(rootfs.join("kbf/root").is_dir() && rootfs.join("etc/hosts").is_file());
+    assert_eq!(unpacks(&fake), 1, "{:?}", fake.calls());
+    assert_eq!(fake.podman_calls(), Vec::<String>::new());
+    // The blobs and the stage are gone; only the unpacked image remains.
+    assert_eq!(
+        fake.image_store(),
+        [image.digest.trim_start_matches("sha256:")],
+    );
+
+    let requests = fake.registry_requests().len();
+    fake.run(2, &spec, &["exit", "0"]).await.expect("ran again");
+    assert_eq!(fake.registry_requests().len(), requests);
+    assert_eq!(unpacks(&fake), 1);
+    assert_eq!(fake.podman_calls(), Vec::<String>::new());
+}
+
+/// Catches concurrent first uses of one image fetching it once each (the single
+/// flight): five checks at once (what five first leases, or the `--image` checks at
+/// start, ask), one manifest request and one unpack.
+#[tokio::test]
+async fn concurrent_first_uses_share_one_fetch() {
+    let fake = FakeOci::fetching("fetch-flight", FakeRegistry::start().await);
+    let reference = fake.publish(&tiny_image());
+    let image = kbf_driver_container::ImageRef::parse(&reference).expect("image");
     let checks = (0..5).map(|_| fake.runtime.check_pinned(&image));
     for checked in futures::future::join_all(checks).await {
         checked.expect("usable");
     }
+    assert_eq!(
+        manifest_requests(&fake),
+        1,
+        "{:?}",
+        fake.registry_requests()
+    );
     assert_eq!(unpacks(&fake), 1, "{:?}", fake.calls());
-    assert!(fake.image_dir().join("rootfs").is_dir());
 }
 
-/// Catches an image Podman cannot export failing the lease as the action's fault, a
-/// half-unpacked image being left for the next lease to use, and the stage and tar
-/// being left behind.
+/// Catches an image that cannot be fetched or unpacked failing the lease as the
+/// action's fault, a half-unpacked image being left for the next lease to use, and the
+/// stage or the blobs being left behind: the registry cannot find the image, the
+/// registry is down, the unpack helper fails; the action never runs, and a later lease
+/// with the fault gone fetches the image properly.
 #[tokio::test]
-async fn a_failed_unpack_fails_the_lease_and_leaves_no_image() {
-    let fake = FakeOci::new("unpack-fails");
-    fake.pulled_not_unpacked();
-    std::fs::write(fake.podman_state.join("export-fails"), "").expect("knob");
-    let outcome = fake
-        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
-        .await;
+async fn a_failed_fetch_or_unpack_fails_the_lease_and_leaves_no_image() {
+    let fake = FakeOci::fetching("fetch-fails", FakeRegistry::start().await);
+    let image = tiny_image();
+    let spec = Spec::new(&fake.publish(&image), "unused");
+    let failed = |outcome: Result<_, RuntimeError>, want: &str| {
+        let Err(RuntimeError::Failed(why)) = outcome else {
+            panic!("{want}: {outcome:?}");
+        };
+        assert!(why.contains(want), "{want}: {why}");
+    };
+    let clean = |fake: &FakeOci| {
+        assert!(
+            !exists(&fake.image_dir_of(&image.digest)),
+            "an image directory was left"
+        );
+        assert_eq!(fake.image_store(), Vec::<String>::new());
+        assert!(!fake.calls().contains(&"run".to_owned()), "an action ran");
+    };
+
+    fake.registry
+        .as_ref()
+        .unwrap()
+        .behave(|b| b.status = Some(404));
+    failed(fake.run(1, &spec, &["exit", "0"]).await, "404");
+    clean(&fake);
+    fake.registry.as_ref().unwrap().behave(|b| b.status = None);
+
+    fake.knob("unpack-fails", "");
+    failed(fake.run(2, &spec, &["exit", "0"]).await, "unpack refused");
+    clean(&fake);
+    std::fs::remove_file(fake.state.join("unpack-fails")).expect("knob");
+
+    fake.run(3, &spec, &["exit", "0"])
+        .await
+        .expect("ran once the fault was gone");
+    assert!(exists(&fake.image_dir_of(&image.digest).join("rootfs")));
+}
+
+/// Catches an image whose bytes are not its digest's running (the tampered layer: the
+/// registry serves other bytes under a layer's digest) and a manifest that is not the
+/// pinned one: the lease fails naming the digest, nothing is unpacked or left, and no
+/// action runs.
+#[tokio::test]
+async fn a_tampered_image_is_refused_before_it_is_unpacked() {
+    let fake = FakeOci::fetching("fetch-tampered", FakeRegistry::start().await);
+    let image = tiny_image();
+    let spec = Spec::new(&fake.publish(&image), "unused");
+    let layer = sha256(&image.layers[1].bytes);
+    let mut bytes = image.layers[1].bytes.clone();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    fake.registry
+        .as_ref()
+        .unwrap()
+        .publish_blob_as(&layer, &bytes);
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     let Err(RuntimeError::Failed(why)) = outcome else {
         panic!("{outcome:?}");
     };
-    assert!(why.contains("export refused"), "{why}");
-    assert!(!exists(&fake.image_dir()), "an image directory was left");
-    let stages: Vec<_> = std::fs::read_dir(fake.scratch.join("oci-images"))
-        .map(|d| d.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default();
-    assert!(stages.is_empty(), "{stages:?}");
+    assert!(why.contains(&layer) && why.contains("hashes to"), "{why}");
+    assert_eq!(unpacks(&fake), 0);
+    assert_eq!(fake.image_store(), Vec::<String>::new());
+    assert!(!fake.calls().contains(&"run".to_owned()));
+
+    // The registry answers the pinned digest with other bytes.
+    let other = Image::of(vec![Blob::plain_tar(&[Item::Dir {
+        path: "evil",
+        mode: 0o755,
+    }])]);
+    fake.registry.as_ref().unwrap().publish_manifest_as(
+        &image.digest,
+        "application/vnd.oci.image.manifest.v1+json",
+        &other.manifest,
+    );
+    let outcome = fake.run(2, &spec, &["exit", "0"]).await;
+    let Err(RuntimeError::Failed(why)) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        why.contains("hashes to") && why.contains(&image.digest),
+        "{why}"
+    );
+    assert_eq!(unpacks(&fake), 0);
 }
 
-/// Catches an image index digest running: the manifest check is the Podman path's, and
-/// holds before anything is unpacked.
+/// Catches an image index digest running (the "index accepted" mutant): the registry
+/// serves an index under the pinned digest; the refusal is the action's (`Invalid`), is
+/// made before anything is fetched but the manifest, and unpacks nothing.
 #[tokio::test]
 async fn an_index_digest_is_refused_before_it_is_unpacked() {
-    let fake = FakeOci::new("index");
+    let fake = FakeOci::fetching("fetch-index", FakeRegistry::start().await);
     let digest = sha256(crate::support::fake::INDEX);
-    fake.pulled_not_unpacked();
-    let dir = fake.podman_state.join("store/fake-images/img1");
-    std::fs::write(
-        dir.join(kbf_driver_container::image::manifest_file(&digest)),
+    let registry = fake.registry.as_ref().unwrap();
+    registry.publish_manifest_as(
+        &digest,
+        "application/vnd.oci.image.index.v1+json",
         crate::support::fake::INDEX,
-    )
-    .expect("index");
+    );
+    let reference = format!("docker://{}/test/tiny@{digest}", registry.addr);
     let outcome = fake
-        .run(1, &Spec::new(&image_by(&digest), "unused"), &["exit", "0"])
+        .run(1, &Spec::new(&reference, "unused"), &["exit", "0"])
         .await;
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(_))),
         "{outcome:?}"
     );
-    assert!(!fake.calls().contains(&"helper tar".to_owned()));
+    assert_eq!(unpacks(&fake), 0);
+    assert_eq!(
+        fake.registry_requests().len(),
+        1,
+        "{:?}",
+        fake.registry_requests()
+    );
+    assert_eq!(fake.image_store(), Vec::<String>::new());
 }
 
 /// Catches the node checks being skipped: the OCI backend refuses to start on a node
@@ -645,6 +772,18 @@ async fn a_failed_delete_fails_the_lease() {
     assert!(why.contains("crun delete"), "{why}");
 }
 
+/// Catches a clean failing a lease because `crun delete` lost a race with the `crun run`
+/// of a killed container (which deletes its own state as it exits, and is all a restarted
+/// daemon's sweep meets): the state being gone is what the delete was for.
+#[tokio::test]
+async fn a_delete_that_finds_the_state_gone_is_a_clean_lease() {
+    let fake = FakeOci::new("delete-vanished");
+    fake.knob("delete-vanished", "");
+    fake.run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await
+        .expect("ran");
+}
+
 /// Catches an action killed by a signal being reported as anything but `128 + n`, the
 /// status `crun run` ends with. (137, SIGKILL, sends the lease to the OOM classification,
 /// which reads the lease cgroup's `memory.events`: `fake_memory`'s.)
@@ -758,22 +897,4 @@ async fn exit_137_with_a_kernel_oom_event_is_out_of_memory_with_crun_too() {
         "{outcome:?}"
     );
     fake.assert_clean(1);
-}
-
-/// Catches Podman going away between two of the unpack's steps being taken for success:
-/// the lease fails as the farm's, naming the program, and no half-made image is left.
-#[tokio::test]
-async fn a_podman_that_goes_away_during_an_unpack_fails_the_lease() {
-    let fake = FakeOci::new("podman-vanishes");
-    fake.pulled_not_unpacked();
-    std::fs::write(fake.podman_state.join("vanish-after-create"), "").expect("knob");
-    let outcome = fake
-        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
-        .await;
-    let Err(RuntimeError::Failed(why)) = outcome else {
-        panic!("{outcome:?}");
-    };
-    assert!(why.contains("podman"), "{why}");
-    assert!(why.contains("No such file or directory"), "{why}");
-    assert!(!exists(&fake.image_dir()), "an image directory was left");
 }
