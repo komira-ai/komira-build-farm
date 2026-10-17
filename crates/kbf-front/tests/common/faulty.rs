@@ -79,6 +79,8 @@ struct Script {
     puts: VecDeque<PutFault>,
     gets: VecDeque<GetFault>,
     put_keys: Vec<ObjectKey>,
+    /// The length of the bytes each `get_range` answered with, in order.
+    get_lens: Vec<usize>,
     poisoned: BTreeSet<Digest>,
     puts_in_flight: usize,
     puts_in_flight_peak: usize,
@@ -154,6 +156,17 @@ impl FaultyStore {
         self.script().put_keys.clone()
     }
 
+    /// The length of the bytes each `get_range` answered with so far, in order: what a
+    /// reader pulled from the store, and how much of it at a time.
+    pub fn get_lens(&self) -> Vec<usize> {
+        self.script().get_lens.clone()
+    }
+
+    /// Forgets the lengths recorded so far (a test's setup reads footers back).
+    pub fn forget_gets(&self) {
+        self.script().get_lens.clear();
+    }
+
     /// Whether every queued fault has been used.
     pub fn script_done(&self) -> bool {
         let s = self.script();
@@ -209,7 +222,12 @@ impl ObjectStore for FaultyStore {
     ) -> Result<Bytes, ObjectStoreError> {
         let fault = self.script().gets.pop_front();
         match fault {
-            None => self.0.inner.get_range(key, range).await,
+            None => {
+                let bytes = self.0.inner.get_range(key, range).await;
+                let len = bytes.as_ref().ok().map(Bytes::len);
+                self.script().get_lens.extend(len);
+                bytes
+            }
             Some(GetFault::Transport) => Err(transport()),
             Some(GetFault::SlowDown) => Err(ObjectStoreError::Service {
                 status: 503,

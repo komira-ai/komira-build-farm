@@ -604,8 +604,8 @@ leaves out.
 
 A parameter not in this table, one given twice, or another `inline` value is `400`.
 
-**The bytes.** The blob is read through the cache's read path, the one ByteStream Read
-takes: the whole blob is checked against its digest before a byte is sent (a stored
+**The bytes.** The blob is read whole through the cache (ByteStream Read reads in pieces
+and checks as it goes, so it holds no blob): the whole blob is checked against its digest before a byte is sent (a stored
 object whose bytes are wrong is `503` and is never sent), and the read counts as a use
 of the blob for its retention, as a ByteStream Read does. The answer is
 `application/octet-stream` with `Content-Disposition: attachment`, and with `name`,

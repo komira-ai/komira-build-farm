@@ -11,7 +11,7 @@ use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
-use kbf_storage::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
+use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 
 use crate::cache::{Cache, CacheError, VerifiedBlob};
@@ -43,16 +43,21 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         Box::pin(async move { Ok(self.cache.read_blob(digest).await?) })
     }
 
-    /// The cache reads and checks whole blobs only (its range read, `read_object_range`,
-    /// is unchecked and for segment uploads), so this is [`Cache::read_blob`] and a cut
-    /// of its answer: the blob is read and checked against its digest as a whole, for any
-    /// `offset` and `limit`, before the first chunk is sent.
+    /// [`Cache::read_range`]: the blob is read from the object store (or, if it is only
+    /// staged, the write tier) in pieces of at most [`kbf_storage::READ_CHUNK_BYTES`], hashed as it
+    /// goes, and each piece's part of the range sent; the digest is compared before the
+    /// last piece is handed out. The cache keeps one digest per blob, so a range cannot
+    /// be checked alone: the bytes before `offset` are read and hashed without being
+    /// sent, and so are the bytes after `offset + limit`, which the stream reads before
+    /// it ends. A range costs the whole blob's read and hash, whatever its size, and
+    /// holds one piece (plus the one the caller holds), never the blob. A resumed read
+    /// pays it again.
     ///
-    /// Memory: the one blob (at most [`crate::MAX_BLOB_BYTES`]) is held once, until the
-    /// stream is dropped or read to the end; each chunk is a zero-copy slice of it, at
-    /// most [`READ_CHUNK_BYTES`], made when the stream is polled. A caller does not hold
-    /// the blob, but this store does: a read in pieces from the object store, checked
-    /// before it is sent, needs the cache to check a record in pieces, which it cannot.
+    /// A blob found damaged before the first chunk is handed out (any blob of one
+    /// piece) is [`StorageError::Unreachable`] in the answer; one found later is the
+    /// last item of the stream, the same error. A stream that ends cleanly delivered
+    /// only bytes of a blob that hashed to its digest; chunks that came before an error
+    /// item were not yet vouched for, and a caller that gets one discards what it has.
     fn read_range<'a>(
         &'a self,
         digest: &'a Digest,
@@ -66,8 +71,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                     offset,
                 });
             }
-            let blob = self.cache.read_blob(digest).await?;
-            Ok(chunks(blob, offset, limit))
+            let chunks = self.cache.read_range(digest, offset, limit).await?;
+            Ok(chunks
+                .map(|chunk| chunk.map_err(StorageError::from))
+                .boxed())
         })
     }
 
@@ -126,25 +133,6 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
                 .await?)
         })
     }
-}
-
-/// `blob[offset..]`, cut to `limit` bytes unless that is 0, as a stream of zero-copy
-/// slices of at most [`READ_CHUNK_BYTES`]. `blob` is the whole blob, already checked.
-fn chunks(blob: Bytes, offset: u64, limit: u64) -> ReadStream {
-    let len = blob.len();
-    let start = usize::try_from(offset).map_or(len, |o| o.min(len));
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let end = if limit == 0 {
-        len
-    } else {
-        start.saturating_add(limit).min(len)
-    };
-    futures::stream::iter(
-        (start..end)
-            .step_by(READ_CHUNK_BYTES)
-            .map(move |at| Ok(blob.slice(at..end.min(at + READ_CHUNK_BYTES)))),
-    )
-    .boxed()
 }
 
 /// The same gRPC code and message as the [`CacheError`] answers: what the store could

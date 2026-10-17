@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use kbf_auth::{Authorizers, authorize};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStream;
@@ -26,7 +27,7 @@ use crate::meta_log::MetaLog;
 use crate::recorder::Recorder;
 use crate::request_metadata::call_metadata;
 use crate::wire::Resource;
-use crate::{MAX_BLOB_BYTES, READ_CHUNK_BYTES, wire};
+use crate::{MAX_BLOB_BYTES, wire};
 
 /// The `ByteStream` service over a [`Cache`]. Read is authorized by
 /// [`Authorizers::cas_get`], Write and QueryWriteStatus by [`Authorizers::cas_put`],
@@ -66,11 +67,17 @@ impl<M, O> ByteStreamService<M, O> {
 
 #[tonic::async_trait]
 impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O> {
-    type ReadStream = stream::Iter<std::vec::IntoIter<Result<ReadResponse, Status>>>;
+    type ReadStream = BoxStream<'static, Result<ReadResponse, Status>>;
 
     /// Streams `[read_offset, read_offset + read_limit)` of the blob (to the end when
-    /// the limit is 0), in messages of at most [`READ_CHUNK_BYTES`]. The whole blob is
-    /// read and verified first, so no unverified byte is sent.
+    /// the limit is 0), in messages of at most [`crate::READ_CHUNK_BYTES`], from
+    /// [`Cache::read_range`]: the blob is read in pieces and hashed as it goes, never
+    /// held whole, and a stream that ends without an error carried only verified
+    /// bytes. A blob found damaged after bytes were sent ends the stream with
+    /// UNAVAILABLE (the bytes sent before it are not to be trusted), as one found
+    /// before the first byte is the call's error. A range reads, and hashes, the whole
+    /// blob (the cache keeps one digest per blob). Each message is one copy of its
+    /// chunk, into the generated message's `Vec`.
     async fn read(
         &self,
         request: Request<ReadRequest>,
@@ -98,21 +105,19 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
                 "read_offset {offset} is past the end of {digest}"
             )));
         }
-        let blob = self.cache.read_blob(&digest).await?;
+        let chunks = self.cache.read_range(&digest, offset, limit).await?;
         let end = match limit {
             0 => digest.size_bytes,
             n => digest.size_bytes.min(offset.saturating_add(n)),
         };
-        // Both bounds are at most the blob's length, which fits in memory.
-        let wanted = blob.slice(offset as usize..end as usize);
         self.recorder.call(&metadata, &caller, &instance, &|| {
-            CallKind::Downloaded(wanted.len() as u64)
+            CallKind::Downloaded(end - offset)
         });
-        let messages: Vec<Result<ReadResponse, Status>> = wanted
-            .chunks(READ_CHUNK_BYTES)
-            .map(|c| Ok(ReadResponse { data: c.to_vec() }))
-            .collect();
-        Ok(Response::new(stream::iter(messages)))
+        let messages = chunks.map(|chunk| {
+            let data = chunk?.to_vec();
+            Ok(ReadResponse { data })
+        });
+        Ok(Response::new(messages.boxed()))
     }
 
     /// Receives a blob from offset 0, verifies it, stores it, and only then answers

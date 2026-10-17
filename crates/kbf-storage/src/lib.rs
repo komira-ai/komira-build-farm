@@ -77,18 +77,24 @@ pub trait Storage: Send + Sync {
     /// that lost its connection reads on from the bytes it has: `offset` is where it
     /// stopped.
     ///
-    /// **What is verified.** A byte is never in a chunk unless the blob it is from has
-    /// been checked, as a whole, against its digest: a ranged read is verified as
-    /// [`Storage::read_blob`] is, whatever the range, and a blob that fails is
-    /// [`StorageError::Unreachable`], not a short or wrong chunk. So a partial range is
-    /// not "trusted from an index"; an implementation that cannot check a blob before it
-    /// sends its first byte must not offer a read of it. (A resumed read checks the blob
-    /// again.) How much an implementation holds while it verifies is its own to
-    /// document: it is a whole blob unless it can check one in pieces before sending.
+    /// **What is verified.** A stream that ends cleanly delivered only bytes of a blob
+    /// that hashes to its digest, from its first byte to its last, whatever the range:
+    /// the digest covers the whole blob, so a range cannot be checked alone, and an
+    /// implementation reads (and hashes) the rest of the blob too, the bytes before
+    /// `offset` and after the limit, and compares the digest before it ends the stream.
+    /// A blob that fails is [`StorageError::Unreachable`], never a short or wrong
+    /// ending. It is the answer's error if it is found before the first chunk is
+    /// handed out, else the stream's last item: **chunks that came before an error item
+    /// were not yet vouched for**, and a caller that gets one discards what it has. A
+    /// range thus costs a read and hash of the whole blob, not of the range, and a
+    /// resumed read pays that again; what an implementation holds meanwhile is its own
+    /// to document (the cache's is about one chunk, never the blob). A read that stops
+    /// polling the stream stops reading, and the rest of the blob is not checked.
     ///
-    /// The errors are in the answer, before the first chunk, where the code is still
-    /// open to the caller. An `offset` past the end is decided from the digest's size
-    /// alone, before the store is asked.
+    /// Errors that are known before any byte is read are in the answer, where the code
+    /// is still open to the caller. An `offset` past the end is decided from the
+    /// digest's size alone, before the store is asked. Nothing is read, and so nothing
+    /// is checked, when no byte is asked for (`offset` at the end).
     ///
     /// # Errors
     /// [`StorageError::OutOfRange`] if `offset` is past the end of the blob;

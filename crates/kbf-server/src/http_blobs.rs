@@ -8,9 +8,10 @@
 //!   parameter. Without that key, without `invocations.getAuthorizer` (the build
 //!   pages, [`crate::http_invocations`], whose links it serves), or without a policy
 //!   file, every request is `404`. `--invocations-open` fills in `allow` for both.
-//! - **Verified bytes.** The blob is read with [`Cache::read_blob`], the read path of
-//!   ByteStream Read: the whole blob is checked against its digest before a byte is
-//!   sent, and the read is a touch.
+//! - **Verified bytes.** The blob is read with [`Cache::read_blob`]: the whole blob is
+//!   checked against its digest before a byte is sent, and the read is a touch.
+//!   (ByteStream Read does not hold the blob: it reads in pieces and checks as it goes,
+//!   `Cache::read_range`.)
 //! - **Never a page.** Every answer, errors included, carries
 //!   `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`. The bytes
 //!   are `application/octet-stream` with `Content-Disposition: attachment`; `?name=` is

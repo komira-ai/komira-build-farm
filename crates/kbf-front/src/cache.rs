@@ -9,7 +9,8 @@ use bytes::Bytes;
 use futures::future;
 use kbf_meta::{
     ActionAnswer, ActionRecord, ActionWriteError, Applied, BlobAnswer, Closure, Collected, Command,
-    Epoch, Location, MetaState, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
+    Epoch, Location, MetaState, ObjectId, Retention, Role, StoreId, TierId, Touch,
+    UnreachableReason,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyError, KeyPrefix, MemoryStore, ObjectKey, ObjectStore,
@@ -474,6 +475,17 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         if is_empty_blob(digest) {
             return Ok(Bytes::new());
         }
+        let (location, staged_on) = self.find_blob(digest).await?;
+        self.fetch_answer(digest, location, staged_on).await
+    }
+
+    /// Where the index holds `digest` (and the tier it is staged on, if it is only
+    /// staged), after touching it: what every read of a non-empty blob starts from.
+    ///
+    /// # Errors
+    /// [`CacheError::NotFound`] only if the blob is not held;
+    /// [`CacheError::Unreachable`] if it is held but cannot be read.
+    async fn find_blob(&self, digest: &Digest) -> Result<(Location, Option<TierId>), CacheError> {
         let answer = self
             .touched(|s| (s.blob(digest), s.touch_for([digest])))
             .await?;
@@ -483,7 +495,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             BlobAnswer::Present {
                 location,
                 staged_on,
-            } => self.fetch_answer(digest, location, staged_on).await,
+            } => Ok((location, staged_on)),
         }
     }
 
@@ -678,6 +690,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self.fetch_from_store(digest, location, true).await
     }
 
+    /// The key of the object `digest` is at, in the one store this cache has.
+    ///
+    /// # Errors
+    /// [`CacheError::Internal`] if the index puts the blob in another store;
+    /// [`CacheError::Key`] if the key cannot be built.
+    fn store_key(&self, digest: &Digest, location: Location) -> Result<ObjectKey, CacheError> {
+        if location.store != StoreId::CONFIGURED {
+            return Err(CacheError::Internal(format!(
+                "blob {digest} is in store {}, and this cache has only store {}",
+                location.store.get(),
+                StoreId::CONFIGURED.get()
+            )));
+        }
+        self.object_key(location.object)
+    }
+
     /// [`Cache::fetch`], marking the object only if `mark`: a reader never marks an
     /// object that was staged when its query ran, because the store does not hold it
     /// yet (design section 6.1.5).
@@ -687,19 +715,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         location: Location,
         mark: bool,
     ) -> Result<Bytes, CacheError> {
-        let Location {
-            store,
-            object,
-            offset,
-        } = location;
-        if store != StoreId::CONFIGURED {
-            return Err(CacheError::Internal(format!(
-                "blob {digest} is in store {}, and this cache has only store {}",
-                store.get(),
-                StoreId::CONFIGURED.get()
-            )));
-        }
-        let key = self.object_key(object)?;
+        let Location { object, offset, .. } = location;
+        let key = self.store_key(digest, location)?;
         let range = ByteRange::new(offset, digest.size_bytes).ok_or_else(|| {
             CacheError::Internal(format!("blob {digest} has no readable range at {offset}"))
         })?;
@@ -832,6 +849,7 @@ mod batch;
 mod consistency;
 mod evict;
 mod flush;
+mod stream;
 mod tier;
 mod touches;
 mod upload;
@@ -844,6 +862,7 @@ pub use consistency::{
 };
 pub use evict::{EVICT_EVERY, EVICT_GRACE, EvictRound};
 pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
+pub use stream::BlobStream;
 pub use tier::{TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;

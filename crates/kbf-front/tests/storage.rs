@@ -264,12 +264,11 @@ async fn big(storage: &dyn Storage) -> (Digest, Vec<u8>) {
     (digest, data)
 }
 
-/// The memory bound a ranged read can claim: the blob is read whole, once, and sent as
-/// slices of that one buffer. Catches the blob collected into one message (a chunk over
-/// [`READ_CHUNK_BYTES`]) and each chunk copied out of it (a chunk not starting where
-/// the one before ended in memory, so a second copy of the blob across the stream).
+/// A chunk is at most [`READ_CHUNK_BYTES`] and the chunks, in order, are the blob.
+/// Catches the blob collected into one message (a chunk over the bound), a chunk cut
+/// short at a piece boundary mid-blob, and chunks out of order.
 #[tokio::test]
-async fn chunks_are_bounded_slices_of_one_buffer() {
+async fn chunks_are_bounded_and_in_order() {
     let storage = storage();
     let (digest, data) = big(&*storage).await;
     let chunks = read_all(&*storage, &digest, 0, 0).await;
@@ -279,12 +278,40 @@ async fn chunks_are_bounded_slices_of_one_buffer() {
         [READ_CHUNK_BYTES, READ_CHUNK_BYTES, READ_CHUNK_BYTES / 2]
     );
     assert_eq!(chunks.concat(), data);
-    let starts: Vec<usize> = chunks.iter().map(|c| c.as_ptr() as usize).collect();
-    let ends: Vec<usize> = chunks
-        .iter()
-        .map(|c| c.as_ptr() as usize + c.len())
-        .collect();
-    assert_eq!(starts[1..], ends[..2], "one buffer, in order");
+}
+
+/// A limit so large that `offset + limit` overflows is the rest of the blob. Catches
+/// `offset + limit` unsaturated (an overflow panic), and a limit that wraps to a short
+/// read or to nothing.
+#[tokio::test]
+async fn a_limit_that_overflows_the_offset_is_the_rest_of_the_blob() {
+    let storage = storage();
+    let (digest, data) = big(&*storage).await;
+    for offset in [0, 1, data.len() as u64 - 1] {
+        let rest = read_all(&*storage, &digest, offset, u64::MAX).await;
+        assert_eq!(rest.concat(), data[offset as usize..], "{offset}");
+    }
+}
+
+/// An offset of `u64::MAX` is OUT_OF_RANGE, decided from the digest; the empty blob at
+/// offset 0 is an empty stream, not NOT_FOUND (it is never stored) and not an error,
+/// and past its end is OUT_OF_RANGE as for any blob. Catches an offset narrowed to
+/// `usize` before it is compared, and the empty blob asked of the index.
+#[tokio::test]
+async fn an_offset_of_u64_max_is_out_of_range_and_the_empty_blob_reads_empty() {
+    let storage = storage();
+    let (digest, _) = big(&*storage).await;
+    let past = storage.read_range(&digest, u64::MAX, 0).await;
+    let error = past.err().expect("out of range");
+    assert!(matches!(&error, StorageError::OutOfRange { offset, .. } if *offset == u64::MAX));
+    assert_eq!(Status::from(error).code(), Code::OutOfRange);
+
+    let empty = digest_of(b"");
+    assert_eq!(read_all(&*storage, &empty, 0, 0).await.len(), 0);
+    assert_eq!(read_all(&*storage, &empty, 0, 5).await.len(), 0);
+    let past = storage.read_range(&empty, 1, 0).await;
+    let error = past.err().expect("past the empty blob");
+    assert_eq!(Status::from(error).code(), Code::OutOfRange);
 }
 
 /// Each range is the bytes it names, with the limit 0 meaning to the end: a range inside
@@ -368,8 +395,9 @@ async fn an_offset_past_the_end_is_out_of_range() {
 
 /// A held blob whose object is gone, or whose bytes are damaged, is UNAVAILABLE as
 /// `read_blob` answers it, with its message; and a range that does not touch the damaged
-/// byte is refused too, because the blob is checked whole before any chunk. Catches
-/// bytes sent on a range-only check, and a damaged blob answered NOT_FOUND.
+/// byte is refused too, because the digest covers the whole blob (these blobs are one
+/// piece, so the answer holds the error; `tests/read_range.rs` has the longer ones).
+/// Catches bytes sent on a range-only check, and a damaged blob answered NOT_FOUND.
 #[tokio::test]
 async fn a_damaged_blob_fails_every_range_as_read_blob_does() {
     let farm = Farm::start().await;
