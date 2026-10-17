@@ -44,6 +44,7 @@ fn member(id: u64, state: MemberState, report: Option<Report>) -> MemberReport {
     MemberReport {
         id: MemberId(id),
         state,
+        planned: kbf_server::storage_health::Planned::No,
         report,
     }
 }
@@ -231,6 +232,7 @@ fn position(reason: &NotIdle) -> usize {
         NotIdle::OpenWrites { .. } => 10,
         NotIdle::ReportOlderThan { .. } => 11,
         NotIdle::Unreadable(_) => 12,
+        NotIdle::PlannedDownExpired { .. } => 13,
     }
 }
 
@@ -311,6 +313,20 @@ fn every_reason_is_made_worded_and_classed() {
         ),
         (cause(None), 1, 5, 7, "member 1 silent", Class::Wait),
         (
+            vec![
+                MemberReport {
+                    planned: kbf_server::storage_health::Planned::Until(at(50)),
+                    ..member(1, MemberState::Down, ok())
+                },
+                quiet(2),
+            ],
+            1,
+            5,
+            13,
+            "member 1's planned restart ran out; it returns to active at its next beat",
+            Class::Wait,
+        ),
+        (
             cause(own(Debts::Unknown, Writes::Known(0), 5)),
             1,
             5,
@@ -358,7 +374,7 @@ fn every_reason_is_made_worded_and_classed() {
     assert_eq!(unreadable.class(), Class::Held);
     made.push(position(&unreadable));
     made.sort_unstable();
-    assert_eq!(made, (0..13).collect::<Vec<_>>(), "a reason has no case");
+    assert_eq!(made, (0..14).collect::<Vec<_>>(), "a reason has no case");
 }
 
 // Catches: the per-node view showing a value that is not fresh and known, and showing zero
@@ -662,4 +678,63 @@ fn a_membership_that_cannot_be_read_is_unreadable_and_held() {
     let refused = pair.members.node_idle(pair.a.0, 0).expect_err("unreadable");
     assert!(matches!(&refused, NotIdle::Unreadable(why) if why.contains("unreadable")));
     assert_eq!(refused.class(), Class::Held);
+}
+
+// Catches: the node that is being restarted judged by the state the restart gives it. Once an
+// operator has planned it down it is `Down` and planned, and must still be judged idle by its
+// own report (quiet, from the map that took it out); a `Down` member nobody planned is not
+// the node a rollout is stopping, and is a hold; and the member planned down is a hold for
+// any other node's restart (a second member out).
+#[test]
+fn a_node_planned_down_is_judged_by_its_report_and_another_one_holds_the_rest() {
+    let planned = |id| MemberReport {
+        planned: kbf_server::storage_health::Planned::Until(at(1_000)),
+        ..member(
+            id,
+            MemberState::Down,
+            said(Debts::Known(0), Writes::Known(0), 6, 100),
+        )
+    };
+    assert_eq!(idle(&[planned(1), quiet(2)], 1, 6), []);
+    assert_eq!(
+        idle(&[planned(1), quiet(2)], 1, 7),
+        [NotIdle::ReportOlderThan {
+            member: MemberId(1),
+            reported: 6,
+            wanted: 7
+        }]
+    );
+    let unplanned = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
+        ..planned(1)
+    };
+    assert_eq!(
+        idle(&[unplanned, quiet(2)], 1, 6),
+        [NotIdle::NodeNotActive {
+            member: MemberId(1),
+            state: MemberState::Down
+        }]
+    );
+    assert_eq!(
+        idle(&[planned(1), quiet(2), quiet(3)], 3, 5),
+        [NotIdle::OtherMemberNotActive {
+            member: MemberId(1)
+        }]
+    );
+}
+
+// Catches an off-by-one in the end of a plan, for the view and for the beat that ends it
+// (both ask `Planned::in_force`): a plan is in force one nanosecond before its end and not at
+// it; a stopped member's plan is in force (the mark holds it); none is never. Mutants: `<=`
+// for `<`.
+#[test]
+fn a_plan_is_in_force_until_its_end_and_not_at_it() {
+    use kbf_server::storage_health::Planned;
+    let end = at(1_000);
+    let before = StoreTime::from_duration(Duration::from_secs(1_000) - Duration::from_nanos(1));
+    assert!(Planned::Until(end).in_force(before));
+    assert!(!Planned::Until(end).in_force(end));
+    assert!(!Planned::Until(end).in_force(at(1_001)));
+    assert!(Planned::Stopped.in_force(at(1_000_000)));
+    assert!(!Planned::No.in_force(at(0)));
 }

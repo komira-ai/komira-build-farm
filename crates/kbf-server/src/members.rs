@@ -61,10 +61,13 @@ use prost::Message as _;
 use tokio::sync::watch;
 
 use crate::storage_health::{
-    Debts, MemberReport, NotIdle, Report, Reported, StorageHealth, Writes, node_idle,
+    Debts, MemberReport, NotIdle, Planned, Report, Reported, StorageHealth, Writes, node_idle,
     storage_health,
 };
 
+/// The value of a `down/<id>` mark written by an operator's planned restart
+/// ([`Members::plan_down`]); the sweeper's marks are empty.
+const PLANNED: &[u8] = b"planned";
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
 const ID_COUNTER: &str = "member-id";
@@ -196,9 +199,17 @@ pub enum MembershipError {
         current: u64,
     },
     /// Only `Joining`, `CatchingUp`, `Active` and `Draining` are set by hand; `Down` is
-    /// the store's verdict.
+    /// the store's verdict, or an operator's planned restart ([`Members::plan_down`]).
     #[error("a member cannot be set {0:?}")]
     NotSettable(MemberState),
+    /// Only an `Active` member can be planned down.
+    #[error("member {id} is {state:?}: only an Active member can be planned down")]
+    NotActive {
+        /// The member.
+        id: MemberId,
+        /// Its state.
+        state: MemberState,
+    },
     /// Another writer kept winning the compare-and-set.
     #[error("gave up after {ATTEMPTS} attempts against other writers")]
     Contended,
@@ -223,6 +234,12 @@ struct Row {
     boot: u64,
     #[prost(message, optional, tag = "3")]
     report: Option<StoredReport>,
+    /// The store's clock, in nanoseconds, at which an operator's planned restart of this
+    /// member ends (0: none). Past it, a heartbeat of the member returns it to `Active`.
+    /// A frontend built before this field existed drops it when it rewrites the row, so
+    /// a plan outlives it there: no plan while one serves the same store.
+    #[prost(uint64, tag = "4")]
+    planned_until_nanos: u64,
 }
 
 /// [`Report`] as stored.
@@ -277,6 +294,7 @@ struct Live {
     member: Member,
     boot: u64,
     report: Option<Report>,
+    planned_until: Option<StoreTime>,
     version: Version,
 }
 
@@ -289,15 +307,27 @@ fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
         member,
         boot: row.boot,
         report: row.report.as_ref().map(Report::from),
+        planned_until: (row.planned_until_nanos > 0)
+            .then(|| StoreTime::from_duration(Duration::from_nanos(row.planned_until_nanos))),
         version: stored.version,
     })
 }
 
-fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
+fn encode_row(
+    member: &Member,
+    boot: u64,
+    report: Option<&Report>,
+    planned_until: Option<StoreTime>,
+) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
         boot,
         report: report.map(StoredReport::from),
+        planned_until_nanos: planned_until.map_or(0, |at| {
+            u64::try_from(at.as_duration().as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        }),
     }
     .encode_to_vec()
 }
@@ -396,6 +426,9 @@ enum Touch {
     Beat(u64, Progress, Reported),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
+    /// An administrator's planned restart of an `Active` member: `Down` in the row, with
+    /// the dwell mark, in one transaction.
+    PlanDown(Duration),
 }
 
 /// The maps a process has seen: the newest, and the generation it replaced.
@@ -558,7 +591,12 @@ impl Members {
                 txn = txn.put(FORMED, Vec::new(), Cond::Any);
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
+                .put_ttl(
+                    &key,
+                    encode_row(member, boot, None, None),
+                    self.config.ttl,
+                    cond,
+                )
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
                 return Ok(());
@@ -601,6 +639,75 @@ impl Members {
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
+    /// Takes a live `Active` member out of the write path for a planned restart of at most
+    /// `for_`, and rebuilds the map: it is `Down` in the map at once, so every router, chain
+    /// and repair worker that holds the new map skips it for writes and reads its blobs from
+    /// the other owner, and a map an older build holds reads it like any `Down` member. The
+    /// `down/` mark that holds its slot for the dwell is written in the same transaction as
+    /// the row, with a value that says an operator planned it ([`Members::planned`]).
+    ///
+    /// The member keeps heartbeating until it stops and a heartbeat does not undo this, until
+    /// `for_` has passed: the first heartbeat after that returns it to `Active` through the
+    /// way a promotion goes (a controller that died, or a restart that never came, does not
+    /// strand a healthy node). It is undone sooner by [`Members::set_state`] to `Active`, or
+    /// by the member registering again (the restart did happen: `Active`, or `CatchingUp`
+    /// while it rebuilds, the mark deleted); if it stops and does not return, its row
+    /// expires and the dwell, counted from this call, decides when it leaves the map.
+    ///
+    /// **Mixed frontends.** The end of the plan lives in the member's row (tag 4), which a
+    /// frontend built before it does not know: it keeps the state `Down` when it rewrites the
+    /// row (a heartbeat, a promotion) but drops the end, so the plan would never run out.
+    /// Plan nothing down while a frontend of an older build serves the same state store.
+    ///
+    /// Asking again for a member already planned down is the same planned restart with its
+    /// end moved to `for_` from now: no new generation.
+    ///
+    /// # Errors
+    /// [`MembershipError::NotRegistered`] if the member has no live row;
+    /// [`MembershipError::NotActive`] unless it is `Active` or already planned down; the
+    /// store failing.
+    pub fn plan_down(&self, id: MemberId, for_: Duration) -> Result<Map, MembershipError> {
+        self.touch(id, Touch::PlanDown(for_))?;
+        self.refresh()?.ok_or(MembershipError::NoMap)
+    }
+
+    /// The planned restart of `id`, if there is one: see [`Planned`].
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn planned(&self, id: MemberId) -> Result<Planned, MembershipError> {
+        let row = match self.store.get(&member_key(id))? {
+            Some(stored) => Some(decode_row(&stored)?),
+            None => None,
+        };
+        self.planned_of(id, row.as_ref())
+    }
+
+    /// Whether `id` is `Down` because an operator planned it and the plan has not run out.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn planned_down(&self, id: MemberId) -> Result<bool, MembershipError> {
+        Ok(self.planned(id)?.in_force(self.store.now()))
+    }
+
+    /// `row`'s plan, or the mark's when the member has no live row (it stopped).
+    fn planned_of(&self, id: MemberId, row: Option<&Live>) -> Result<Planned, MembershipError> {
+        // A live row carries its own plan, or none; the mark speaks for a member that stopped.
+        if let Some(live) = row {
+            return Ok(live.planned_until.map_or(Planned::No, Planned::Until));
+        }
+        let marked = self
+            .store
+            .get(&down_key(id))?
+            .is_some_and(|mark| mark.value == PLANNED);
+        Ok(if marked {
+            Planned::Stopped
+        } else {
+            Planned::No
+        })
+    }
+
     /// Rewrites `id`'s row as `how` says; whether its state changed.
     fn touch(&self, id: MemberId, how: Touch) -> Result<bool, MembershipError> {
         let key = member_key(id);
@@ -627,10 +734,38 @@ impl Members {
                     if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
                         live.member.state = MemberState::Active;
                     }
+                    // A planned restart that ran out: the member is still beating, so it
+                    // never restarted (or the operator's controller is gone); it returns
+                    // by the way a promotion goes, not by waiting to be noticed.
+                    if before == MemberState::Down
+                        && live
+                            .planned_until
+                            .is_some_and(|until| !Planned::Until(until).in_force(self.store.now()))
+                    {
+                        live.member.state = MemberState::Active;
+                        live.planned_until = None;
+                    }
                     self.config.ttl
                 }
                 Touch::State(state) => {
                     live.member.state = state;
+                    live.planned_until = None;
+                    stored
+                        .expires_at
+                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                }
+                // `Down` on a live row is a plan (nothing else makes one), so a repeat is
+                // taken; so is one whose end an older frontend dropped.
+                Touch::PlanDown(_)
+                    if before != MemberState::Active && before != MemberState::Down =>
+                {
+                    return Err(MembershipError::NotActive { id, state: before });
+                }
+                // Asked again (or by a second controller): the same planned restart, its
+                // end moved to a whole `for_` from now.
+                Touch::PlanDown(for_) => {
+                    live.member.state = MemberState::Down;
+                    live.planned_until = Some(self.store.now().saturating_add(for_));
                     stored
                         .expires_at
                         .map_or(self.config.ttl, |at| at.since(self.store.now()))
@@ -638,12 +773,22 @@ impl Members {
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot, live.report.as_ref()),
+                encode_row(
+                    &live.member,
+                    live.boot,
+                    live.report.as_ref(),
+                    live.planned_until,
+                ),
                 ttl,
                 Cond::Version(stored.version),
             );
             if live.member.state == MemberState::Active && before != MemberState::Active {
                 put = put.put(FORMED, Vec::new(), Cond::Any);
+            }
+            if matches!(how, Touch::PlanDown(_)) {
+                put = put.put_ttl(down_key(id), PLANNED, self.config.dwell, Cond::Any);
+            } else if before == MemberState::Down && live.member.state != MemberState::Down {
+                put = put.delete(down_key(id), Cond::Any);
             }
             if self.store.txn(put)?.is_ok() {
                 return Ok(live.member.state != before);
@@ -744,6 +889,7 @@ impl Members {
                 MemberReport {
                     id: member.id,
                     state: member.state,
+                    planned: Planned::No,
                     report: None,
                 },
             );
@@ -754,9 +900,16 @@ impl Members {
                 MemberReport {
                     id,
                     state: live.member.state,
+                    planned: Planned::No,
                     report: live.report,
                 },
             );
+        }
+        let rows = self.read_rows()?;
+        for member in members.values_mut() {
+            if member.state == MemberState::Down {
+                member.planned = self.planned_of(member.id, rows.get(&member.id))?;
+            }
         }
         let now = self.store.now();
         Ok((members.into_values().collect(), now))

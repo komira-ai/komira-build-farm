@@ -33,6 +33,10 @@
 //! has. `Down` keeps its slot so that a flapping member remaps nothing; when the dwell
 //! ends the member leaves the map and its slice moves (a new generation).
 //!
+//! `Down` is also how an operator takes a running member out of the write path for a planned
+//! restart (`kbf-server`'s `Members::plan_down`): there is no further state on the wire, so a
+//! reader built before it reads such a member like any `Down` one.
+//!
 //! Across generations, [`Map::read_order_with_previous`] lists this generation's read
 //! order, then the previous generation's members not yet listed: a blob written before a
 //! join or a drain is found where it was.

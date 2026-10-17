@@ -146,9 +146,11 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 
 ## `POST /v1/members/{id}`
 
-An operator sets a storage member's state. The body is `{"state": "active"}` or
-`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
-the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
+An operator sets a storage member's state. The body is `{"state": "active"}`,
+`{"state": "draining"}` or `{"state": "planned_down"}` (which may add `"for_secs": N`, 1 to
+86400, default 900); the answer is
+`{"id": N, "state": "...", "generation": G}`, the map's generation after the change.
+`down` is the store's verdict, `catching_up` is what a registration says and `joining` is
 the join handoff's, so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
 registered) or is not a number, or on a server without a state store; `503` when the
@@ -158,6 +160,31 @@ by a refused request.
 
 When a member becomes `active` the cluster also records that it has formed (see below),
 in the same transaction.
+
+**A planned restart.** `planned_down` takes an `active` member out of the write path at
+once, for a restart an operator is about to make; any other state answers `409`. Today a
+write goes to the first owner that is not `down`, and a member is `down` only 30 s (a
+TTL) after its last heartbeat, while a client retries an upload for about a second and a
+half: without this, an upload whose primary is the restarting node fails. After it, the
+map (one new generation, in the answer) has the member `down`, so every router, chain
+primary and repair worker that holds the map sends writes to the other owner and reads
+the member's blobs from it, and a node or daemon that holds an older map reads it like
+any `down` member (the wire has no new state). The member keeps serving what reaches it
+and keeps heartbeating until it stops; a heartbeat does not undo this, until `for_secs` has
+passed: the first heartbeat after that returns it to `active` (a controller that died, or a
+restart that never came, does not strand a healthy node out of service). The `down/<id>`
+mark that keeps its slot for the dwell (the same time as for a member that fails) is
+written in the same transaction, with a value that says an operator planned it:
+[`GET /v1/storage`](#get-v1storage) shows `"state": "down", "planned_down": true` for it.
+The end of the plan is kept in the member's row, which a frontend built before it drops when it
+rewrites the row, so nothing is planned down while a frontend of an older build serves the same
+state store. Asking again for a member already planned down is the same plan with its end moved to
+`for_secs` from now: `200`, the same answer, no new generation. It is undone by
+`{"state": "active"}` (a restart that did not happen), or by the member
+registering again after the restart: `active` if its index is whole, `catching_up` while
+it rebuilds, the mark deleted. If it never returns, it leaves the map at the end of the
+dwell counted from this call, as any `down` member does. It survives a restart of the
+frontend: it is in the store.
 
 **When a member is `active` without this call.** A registration that says the node's
 index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
@@ -263,8 +290,8 @@ no registered member.
 { "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
   "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
   "reasons": ["3 blobs owed"],
-  "nodes": [ { "id": 1, "state": "active", "repair_debts": 3, "open_writes": 0, "generation": 12 },
-             { "id": 2, "state": "active", "repair_debts": 0, "open_writes": null, "generation": 12 } ] }
+  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12 },
+             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12 } ] }
 ```
 
 - `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
@@ -277,7 +304,8 @@ no registered member.
 - `reasons`: why the number is not zero, in that order, as a rollout would say it
   (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
   zero.
-- `nodes`: every registered member in any state, with what its newest report says:
+- `nodes`: every registered member in any state (`planned_down` is true for a `down`
+  member an operator planned, [above](#post-v1membersid)), with what its newest report says:
   `repair_debts` (the copies it owes), `open_writes` (the `Write` calls, action-cache
   commits and daemon segment uploads it has open now, an upload from `Begin` until its
   commit ends, as a primary or a replica) and `generation` (the map it held when

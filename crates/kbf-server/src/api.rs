@@ -12,8 +12,10 @@
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
 //!   is the node as it is after the action.
 //!
-//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"}`: sets a storage
-//!   member's state ([`Members::set_state`]), the operator's promotion of a joiner.
+//! - `POST /v1/members/{id}` with `{"state": "active"|"draining"|"planned_down"}`: sets a
+//!   storage member's state ([`Members::set_state`]), the operator's promotion of a joiner;
+//!   `planned_down` ([`Members::plan_down`]) takes an `Active` member out of the write path
+//!   for a planned restart at once (`409` unless it is `Active`), and `active` undoes it.
 //!
 //! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
 //!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
@@ -187,13 +189,17 @@ async fn act(
 #[serde(deny_unknown_fields)]
 struct MemberBody {
     state: MemberTarget,
+    /// With `planned_down`: how long the planned restart may last, in seconds, before the
+    /// member returns by its next heartbeat ([`PLANNED_DOWN_FOR`] if absent).
+    for_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum MemberTarget {
     Active,
     Draining,
+    PlannedDown,
 }
 
 async fn set_member_state(
@@ -218,18 +224,78 @@ async fn set_member_state(
     let want: MemberBody = match serde_json::from_slice(&body) {
         Ok(want) => want,
         Err(e) => {
-            let why = format!("a member body is {{\"state\": \"active\"|\"draining\"}}: {e}");
+            let why = format!(
+                "a member body is {{\"state\": \"active\"|\"draining\"|\"planned_down\"}}: {e}"
+            );
             return error(StatusCode::BAD_REQUEST, &why);
         }
     };
-    let (state, name) = match want.state {
-        MemberTarget::Active => (MemberState::Active, "active"),
-        MemberTarget::Draining => (MemberState::Draining, "draining"),
+    let change = match want.change() {
+        Ok(change) => change,
+        Err(why) => return error(StatusCode::BAD_REQUEST, &why),
     };
+    let name = change.name();
     // The store's calls block (its trait says so).
-    let set = tokio::task::spawn_blocking(move || members.set_state(MemberId(id), state)).await;
+    let set = tokio::task::spawn_blocking(move || change.apply(&members, MemberId(id))).await;
     member_answer(id, name, set)
 }
+
+/// What a member write asks for. Plain sync code on purpose: the handler is async, and each
+/// test binary that runs it makes its own copy of the coroutine.
+enum Change {
+    Active,
+    Draining,
+    PlannedDown(Duration),
+}
+
+impl MemberBody {
+    /// The change the body asks for.
+    ///
+    /// # Errors
+    /// Why the body is refused: `for_secs` outside 1 to a day, or given with another state.
+    fn change(&self) -> Result<Change, String> {
+        match (self.state, self.for_secs) {
+            (MemberTarget::Active, None) => Ok(Change::Active),
+            (MemberTarget::Draining, None) => Ok(Change::Draining),
+            (MemberTarget::PlannedDown, None) => Ok(Change::PlannedDown(PLANNED_DOWN_FOR)),
+            (MemberTarget::PlannedDown, Some(secs @ 1..=MAX_PLANNED_DOWN_SECS)) => {
+                Ok(Change::PlannedDown(Duration::from_secs(secs)))
+            }
+            (MemberTarget::PlannedDown, Some(_)) => {
+                Err(format!("for_secs is 1 to {MAX_PLANNED_DOWN_SECS}"))
+            }
+            (_, Some(_)) => Err("for_secs goes with planned_down only".to_owned()),
+        }
+    }
+}
+
+impl Change {
+    /// The name the answer gives the state.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Draining => "draining",
+            Self::PlannedDown(_) => "planned_down",
+        }
+    }
+
+    /// Makes the change to member `id`.
+    fn apply(self, members: &Members, id: MemberId) -> Result<Map, MembershipError> {
+        match self {
+            Self::Active => members.set_state(id, MemberState::Active),
+            Self::Draining => members.set_state(id, MemberState::Draining),
+            Self::PlannedDown(for_) => members.plan_down(id, for_),
+        }
+    }
+}
+
+/// How long a planned restart lasts when the request does not say: an update of a node,
+/// with its start and its catching up, fits in it; a controller that died does not hold the
+/// node out longer.
+pub const PLANNED_DOWN_FOR: Duration = Duration::from_secs(15 * 60);
+
+/// The longest a planned restart may be asked to last: a day.
+pub const MAX_PLANNED_DOWN_SECS: u64 = 24 * 60 * 60;
 
 /// The answer to a member write, from what the blocking call returned.
 fn member_answer(
@@ -258,6 +324,7 @@ const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
+        MembershipError::NotActive { .. } => StatusCode::CONFLICT,
         MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -440,6 +507,13 @@ mod tests {
             (
                 MembershipError::NotSettable(MemberState::Down),
                 StatusCode::BAD_REQUEST,
+            ),
+            (
+                MembershipError::NotActive {
+                    id: MemberId(4),
+                    state: MemberState::Joining,
+                },
+                StatusCode::CONFLICT,
             ),
             (store(), StatusCode::SERVICE_UNAVAILABLE),
             (MembershipError::Contended, StatusCode::SERVICE_UNAVAILABLE),
