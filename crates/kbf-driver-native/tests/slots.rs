@@ -25,7 +25,7 @@ use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
 use kbf_driver_native::slots::{Pool, SlotUser};
 use kbf_driver_native::{NativeConfig, NativeRuntime};
-use support::pool::{GID, Scratch, Users, config, ids_of, sleeper};
+use support::pool::{GID, Scratch, Users, config, ids_of, sleeper, slot_report};
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
 /// The variable that turns [`keeper_daemon`] into the daemon [`the_keeper_ends_the_slot_when_the_daemon_dies`]
@@ -160,7 +160,13 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
         !setuid_lives,
         "the setuid sleep {setuid_pid} outlived its lease"
     );
-    assert_eq!(first.exit_code, 0, "{out}");
+    assert_eq!(
+        first.exit_code,
+        0,
+        "{out}{}\n{}",
+        support::stderr(&cas, &first),
+        slot_report(std::slice::from_ref(mine))
+    );
     let [sleeper, id, tmpdir, manager] = lines[..] else {
         panic!("the action printed {out:?}");
     };
@@ -226,7 +232,10 @@ fn the_keeper_ends_the_slot_when_the_daemon_dies() {
         }
         if Instant::now() > give_up || daemon.try_wait().expect("wait").is_some() {
             let _ = daemon.kill();
-            panic!("the daemon's lease never started its sleeper");
+            panic!(
+                "the daemon's lease never started its sleeper\n{}",
+                slot_report(std::slice::from_ref(user))
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -343,7 +352,12 @@ echo "T=$(cat "${t}kbf-ci-same") H=$(cat "$h/kbf-ci-same") D=$(defaults read kbf
         let result = result.expect("ran");
         let out = stdout(&cas, &result);
         let err = support::stderr(&cas, &result);
-        assert_eq!(result.exit_code, 0, "lease {v}: {out}{err}");
+        assert_eq!(
+            result.exit_code,
+            0,
+            "lease {v}: {out}{err}\n{}",
+            slot_report(&users.0)
+        );
         assert_eq!(
             out,
             format!("T={v} H={v} D={v} K={v}\n"),
@@ -398,7 +412,8 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
         while !root(1).join("held").exists() {
             assert!(
                 Instant::now() < give_up,
-                "the first lease never held its slot"
+                "the first lease never held its slot\n{}",
+                slot_report(std::slice::from_ref(user))
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -428,7 +443,14 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
     let (first, (killed, took, waited, third)) =
         tokio::join!(support::run(&rt, &cas, 1, &hold), rest);
     let first = first.expect("the first lease ran");
-    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
+    assert_eq!(
+        first.exit_code,
+        0,
+        "{}{}\n{}",
+        stdout(&cas, &first),
+        support::stderr(&cas, &first),
+        slot_report(std::slice::from_ref(user))
+    );
     assert!(
         matches!(killed, Err(kbf_daemon::RuntimeError::Killed)),
         "the lease killed while it waited for a slot ended {killed:?}"

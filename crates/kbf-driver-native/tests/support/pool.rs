@@ -225,6 +225,64 @@ pub fn name_of(uid: u32) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// What a failed first lease needs to be classified later: for each of `users`, what
+/// the user database says, the home with its owner, mode, flags and ACLs and what it
+/// holds, the head of the user's launchd domain, and the uid's processes. Each command's
+/// output is kept whether it succeeded or not. Meant for the message of an assertion
+/// that fails, so it costs nothing when the lease passed.
+pub fn slot_report(users: &[SlotUser]) -> String {
+    let mut report = String::new();
+    for user in users {
+        let (uid, name) = (user.uid.to_string(), user.name.as_str());
+        let record = format!("/Users/{name}");
+        let home = home_of(user);
+        let home = home.to_string_lossy().into_owned();
+        let domain = format!("user/{uid}");
+        let steps: [(&str, Vec<&str>, usize); 6] = [
+            ("/usr/bin/id", vec![name], 5),
+            (
+                "/usr/bin/dscl",
+                vec![
+                    ".",
+                    "-read",
+                    record.as_str(),
+                    "UniqueID",
+                    "NFSHomeDirectory",
+                ],
+                5,
+            ),
+            ("/bin/ls", vec!["-leaOd@", home.as_str()], 5),
+            ("/bin/ls", vec!["-leaOR@", home.as_str()], 40),
+            ("/bin/launchctl", vec!["print", domain.as_str()], 30),
+            (
+                "/bin/ps",
+                vec!["-U", uid.as_str(), "-o", "pid,ppid,stat,command"],
+                40,
+            ),
+        ];
+        report.push_str(&format!("--- slot user {name} (uid {uid}) ---\n"));
+        for (program, args, lines) in steps.iter() {
+            report.push_str(&format!("$ {program} {}\n", args.join(" ")));
+            match Command::new(program).args(args).output() {
+                Ok(out) => {
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    for line in text.lines().take(*lines) {
+                        report.push_str(line);
+                        report.push('\n');
+                    }
+                    report.push_str(&format!("[{}]\n", out.status));
+                }
+                Err(why) => report.push_str(&format!("[not run: {why}]\n")),
+            }
+        }
+    }
+    report
+}
+
 /// The effective and real uid of `pid`, as `ps` reports them.
 pub fn ids_of(pid: i32) -> Option<(u32, u32)> {
     let out = Command::new("/bin/ps")
