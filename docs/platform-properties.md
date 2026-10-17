@@ -290,7 +290,12 @@ that work.
   support) or does not answer within two minutes, the lease fails with `simctl`'s
   reason and the action does not run.
 - **The action** finds the device's UDID in `KBF_SIMULATOR_UDID` (it wins over the
-  Command's environment). The device is made shut down:
+  Command's environment). The driver boots the device and waits until Xcode lists it
+  before the action runs (Xcode's list of devices can change with a boot, and a
+  device that is not listed makes `xcodebuild test -destination` fail after 30 s), so
+  the action finds it booted: `bootstatus -b` returns at once, and `simctl boot` of a
+  booted device fails. A device that does not boot or is not listed in time fails the
+  lease with the reason, and the action does not run:
 
   ```sh
   xcrun simctl bootstatus "$KBF_SIMULATOR_UDID" -b

@@ -12,12 +12,21 @@
 //!   and print the new device's UDID; otherwise the lease fails
 //!   ([`RuntimeError::Failed`]: a runtime the node lacks is the node's to fix, and the
 //!   action is not run). The action finds the UDID in [`UDID_VAR`], which wins over the
-//!   Command's environment. The device is made shut down: the action boots it (`xcrun
-//!   simctl boot "$KBF_SIMULATOR_UDID"`) or lets `xcodebuild` do it.
-//! - **Then, before the action runs**, the driver waits until Xcode lists the device,
-//!   as the action asks it: each look runs, as the action would run them (its sandbox,
-//!   its Xcode), first `xcrun xcdevice list` (cheap) and, once that names the UDID,
-//!   `xcrun xcodebuild -showdestinations` on a probe package the driver writes in the
+//!   Command's environment. The device is made shut down and then booted by the driver,
+//!   as below: an action waits on a booted device with `xcrun simctl bootstatus
+//!   "$KBF_SIMULATOR_UDID" -b` (which returns at once for one that is booted), and
+//!   `xcodebuild` uses it as it is; `simctl boot` of a booted device fails.
+//! - **Then, before the action runs**, the driver boots the device and waits until
+//!   Xcode lists it, as the action asks it. Xcode's list can change with a boot: on
+//!   hosted runners (issue #608) it listed no simulator at all, for up to over two
+//!   minutes, in the action's `xcodebuild -showdestinations` that followed the
+//!   action's own boot, though the look the driver made before the boot had listed
+//!   them. So the driver does the boot first, and looks after it. The boot is `xcrun
+//!   simctl bootstatus <udid> -b`, tried for up to [`Listing::boot`], each try
+//!   having [`Listing::look`] to answer (a try cut short leaves the boot running; the
+//!   next waits on it). Then each look runs, as the action would run them (its
+//!   sandbox, its Xcode), first `xcrun xcdevice list` (cheap) and, once that names the
+//!   UDID, `xcrun xcodebuild -showdestinations` on a probe package the driver writes in the
 //!   lease directory (removed before the action runs), which must name the UDID among
 //!   its available destinations. Looks follow every [`Listing::every`] for up to
 //!   [`Listing::within`] ([`Listing::DEFAULT`]: 15 s and 300 s), each look having
@@ -26,9 +35,9 @@
 //!   and `xcdevice list` already show the device: only the second look is the
 //!   `xcodebuild` the action runs, and an `xcodebuild test -destination
 //!   id=$KBF_SIMULATOR_UDID` started then gives up after its own 30 s
-//!   (`-destination-timeout`) and fails the action. A device not listed in time fails
-//!   the lease ([`RuntimeError::Failed`], the node's to fix) with the last listing,
-//!   and the action is not run; a kill ends the wait between two looks.
+//!   (`-destination-timeout`) and fails the action. A device not booted or not listed
+//!   in time fails the lease ([`RuntimeError::Failed`], the node's to fix) with the
+//!   last reason, and the action is not run; a kill ends the wait between two tries.
 //! - **At the end**, whatever the outcome (an exit, a failure, a timeout, a kill, a run
 //!   the daemon drops), before the lease directory is removed: the device the create
 //!   printed, and every device named for the lease in `simctl list devices` (one a
@@ -86,7 +95,9 @@ pub const ANSWER_WITHIN: Duration = Duration::from_secs(120);
 /// looks and how long each look has, before the action runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Listing {
-    /// How long after the device is made it must be listed, or the lease fails.
+    /// How long after the device is made it must be booted, or the lease fails.
+    pub boot: Duration,
+    /// How long after the device is booted it must be listed, or the lease fails.
     pub within: Duration,
     /// The pause between two looks.
     pub every: Duration,
@@ -103,7 +114,11 @@ impl Listing {
     /// a node that cannot list a device in five minutes fails the lease rather than the
     /// action. A look of `xcodebuild` takes about 15 s there, so a pause of that size
     /// keeps the node from running them back to back.
+    ///
+    /// The device is booted first, and the boot gets 600 s on its own: `bootstatus`
+    /// took up to 2 min 46 s there for the data migration of a new device.
     pub const DEFAULT: Self = Self {
+        boot: Duration::from_secs(600),
         within: Duration::from_secs(300),
         every: Duration::from_secs(15),
         look: ANSWER_WITHIN,
@@ -331,11 +346,12 @@ impl Simctl {
         }
     }
 
-    /// Waits until Xcode lists `udid`, made in `lease` (a real path) with the Xcode at
-    /// `developer_dir`, looking as [`Self::listed`] does, at once and then every
-    /// [`Listing::every`] for up to [`Listing::within`]. Each look has [`Listing::look`]
-    /// to answer, the last one too (one cut short by the deadline would say nothing of
-    /// the listing), so the wait can last that much longer. The probe project the looks
+    /// Waits until `udid`, made in `lease` (a real path), is booted and then Xcode
+    /// lists it, with the Xcode at `developer_dir`: first [`Self::booted`] for up to
+    /// [`Listing::boot`], then [`Self::listed`] for up to [`Listing::within`], a look at
+    /// once and then every [`Listing::every`]. Each look has [`Listing::look`] to
+    /// answer, the last one too (one cut short by the deadline would say nothing of
+    /// the state), so a wait can last that much longer. The probe project the looks
     /// run on is written in `lease` before the first and removed after the last. A kill
     /// (`stop`) is taken between two looks, never during one: a look runs in the lease directory,
     /// which the end removes.
@@ -348,50 +364,91 @@ impl Simctl {
     ) -> Waited<T> {
         let probe = lease.join(PROBE_DIR);
         write_probe(&probe);
-        let waited = self
-            .wait_looks(lease, &probe, udid, developer_dir, stop)
+        let (lease, probe, udid) = (lease.to_owned(), probe, udid.to_owned());
+        let developer_dir = developer_dir.map(Path::to_owned);
+        let booted = self
+            .poll(
+                self.listing.boot,
+                stop,
+                {
+                    let (lease, udid, dir) = (lease.clone(), udid.clone(), developer_dir.clone());
+                    move |simctl| simctl.booted(&lease, &udid, dir.as_deref())
+                },
+                |looks, why| {
+                    let boot = self.listing.boot;
+                    format!("{udid} not booted within {boot:?} ({looks} tries); {why}")
+                },
+            )
             .await;
+        let waited = match booted {
+            Waited::Listed(took, tries) => {
+                tracing::info!(%udid, ms = took.as_millis(), tries, "simulator booted");
+                let within = self.listing.within;
+                let said = |looks, why: &str| {
+                    format!("Xcode did not list {udid} within {within:?} ({looks} looks); {why}")
+                };
+                let show = {
+                    let (lease, probe, udid) = (lease.clone(), probe.clone(), udid.clone());
+                    move |simctl: &Self| {
+                        simctl.listed(&lease, &probe, &udid, developer_dir.as_deref())
+                    }
+                };
+                self.poll(within, stop, show, said).await
+            }
+            other => other,
+        };
         let _ = std::fs::remove_dir_all(&probe);
         waited
     }
 
-    /// [`Self::wait_listed`]'s loop of looks, on the probe project at `probe`.
-    async fn wait_looks<T>(
+    /// Runs `look` on the blocking pool at once and then every [`Listing::every`] until
+    /// it is `Ok`, for up to `within`; `gave_up` says (given the number of looks and
+    /// the last look's reason) why a wait that ran out failed.
+    async fn poll<T>(
         self: &Arc<Self>,
-        lease: &Path,
-        probe: &Path,
-        udid: &str,
-        developer_dir: Option<&Path>,
+        within: Duration,
         stop: &mut oneshot::Receiver<T>,
+        look: impl Fn(&Self) -> Result<(), String> + Send + Sync + 'static,
+        gave_up: impl FnOnce(u32, &str) -> String,
     ) -> Waited<T> {
         let started = Instant::now();
-        let listing = self.listing;
+        let look = Arc::new(look);
         let mut looks = 0;
         loop {
             looks += 1;
-            let look = tokio::task::spawn_blocking({
-                let simctl = Arc::clone(self);
-                let (lease, probe, udid) = (lease.to_owned(), probe.to_owned(), udid.to_owned());
-                let developer_dir = developer_dir.map(Path::to_owned);
-                move || simctl.listed(&lease, &probe, &udid, developer_dir.as_deref())
+            let seen = tokio::task::spawn_blocking({
+                let (simctl, look) = (Arc::clone(self), Arc::clone(&look));
+                move || (*look)(&simctl)
             });
             // No closure for the panic: a look that never panics would leave it unrun.
-            let look = look.await.unwrap_or(Err(String::from("the look panicked")));
-            let Err(why) = look else {
+            let seen = seen.await.unwrap_or(Err(String::from("the look panicked")));
+            let Err(why) = seen else {
                 return Waited::Listed(started.elapsed(), looks);
             };
-            let left = listing.within.saturating_sub(started.elapsed());
+            let left = within.saturating_sub(started.elapsed());
             if left.is_zero() {
-                return Waited::Never(format!(
-                    "Xcode did not list {udid} within {:?} ({looks} looks); {why}",
-                    listing.within
-                ));
+                return Waited::Never(gave_up(looks, &why));
             }
             tokio::select! {
-                () = tokio::time::sleep(listing.every.min(left)) => {}
+                () = tokio::time::sleep(self.listing.every.min(left)) => {}
                 Ok(by) = &mut *stop => return Waited::Stopped(by),
             }
         }
+    }
+
+    /// One try to boot `udid`: `Ok` when `xcrun simctl bootstatus <udid> -b` (boots the
+    /// device if it is shut down, and returns once the boot, with the data migration of
+    /// a new device, is done; at once for a device already booted) exits 0 within
+    /// [`Listing::look`], with the Xcode at `developer_dir`. A try that is cut short
+    /// leaves the boot running in `CoreSimulatorService`: the next one waits on it.
+    ///
+    /// The driver boots the device itself because the action does, before it asks
+    /// Xcode for destinations, and what Xcode lists after a boot is not what it listed
+    /// before (issue #608): the look must run in the state the action runs in.
+    fn booted(&self, lease: &Path, udid: &str, developer_dir: Option<&Path>) -> Result<(), String> {
+        let args = ["simctl", "bootstatus", udid, "-b"];
+        self.xcrun_in(lease, developer_dir, &args, self.listing.look, None)
+            .map(drop)
     }
 
     /// Shuts down and deletes the lease's simulator: the device the create printed and

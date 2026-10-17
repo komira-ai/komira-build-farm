@@ -76,6 +76,7 @@ fn fake_xcrun(dir: &Path, extra: &str) -> PathBuf {
         "{extra}\
          xcdevice list --timeout 5\t-\tcat {shown}\n\
          {SHOW}\t-\tcat {shown_by_xcodebuild}\n\
+         simctl bootstatus * -b\t-\texit 0\n\
          simctl create * {BAD_TYPE} *\t-\techo --stderr Invalid device type: $4 ; exit 148\n\
          simctl create * {MUTE_TYPE} *\t-\techo\n\
          simctl create * {STUCK_TYPE} *\t-\techo {STUCK}\n\
@@ -176,10 +177,11 @@ fn new_log(xcrun: &Path) {
 }
 
 /// The calls one lease that made [`UDID`] makes, when `also` are the other devices
-/// named for it at the end.
+/// named for it at the end: the create, the boot the driver waits on, and the end.
 fn lease_calls(seq: u64, also: &[&str]) -> Vec<String> {
     let mut want = vec![
         format!("create kbf-lease-1-{seq} {DEVICE_TYPE} {RUNTIME}"),
+        format!("bootstatus {UDID} -b"),
         "list devices -j".to_owned(),
     ];
     for udid in std::iter::once(&UDID).chain(also) {
@@ -243,7 +245,7 @@ async fn a_lease_that_asks_for_a_simulator_gets_its_own() {
     let plain = Spec::act(&format!("env {UDID_VAR} none"));
     let result = run(&rt, &cas, 2, &plain).await.expect("ran");
     assert_eq!(stdout(&cas, &result), "none\n");
-    assert_eq!(calls(&xcrun).len(), 6, "no simctl call for lease 2");
+    assert_eq!(calls(&xcrun).len(), 7, "no simctl call for lease 2");
 }
 
 /// Catches the end deleting what the action's lease directory says rather than what
@@ -373,7 +375,7 @@ async fn a_kill_during_the_create_still_deletes_the_simulator() {
     let killed = running.await.expect("run task");
     assert!(matches!(killed, Err(RuntimeError::Killed)), "{killed:?}");
     assert!(!ran.exists(), "the action did not run");
-    assert_eq!(calls(&xcrun)[1..], lease_calls(1, &[])[1..]);
+    assert_eq!(calls(&xcrun)[1..], lease_calls(1, &[])[2..]);
     assert!(no_leases(&config));
 }
 
@@ -387,6 +389,7 @@ fn listing_config(
 ) -> (NativeConfig, PathBuf) {
     let (mut config, xcrun) = fake_config(dir, extra);
     config.simulator_listing = Listing {
+        boot: PROMPT,
         within,
         every,
         look: Duration::from_secs(30),
@@ -538,6 +541,212 @@ async fn a_simulator_listed_at_once_adds_no_wait() {
     assert!(started.elapsed() < minute, "{:?}", started.elapsed());
     assert_eq!(looks(&xcrun), 1);
     assert_eq!(calls(&xcrun), lease_calls(1, &[]));
+}
+
+/// How many times the fake `xcrun` was asked `simctl bootstatus` in `log`.
+fn boots_in(log: &str) -> usize {
+    log.lines()
+        .filter(|line| line.contains(" simctl bootstatus "))
+        .count()
+}
+
+/// The fake's log so far.
+fn log_of(xcrun: &Path) -> String {
+    std::fs::read_to_string(format!("{}.log", xcrun.display())).unwrap_or_default()
+}
+
+/// A rule for the fake `xcrun` that answers `key` by running, in turn, the shell
+/// scripts in `scripts`, then the last again and again: the call exits as the script
+/// does. The kbf-act steps have no branch, so a queue of scripts is the order.
+fn scripts_in_turn(dir: &Path, name: &str, key: &str, scripts: &[&str]) -> String {
+    let queue = dir.join(name);
+    std::fs::create_dir_all(&queue).expect("queue");
+    let q = queue.display();
+    let mut steps = vec![format!("copy {q}/now {q}/0")];
+    for (n, script) in scripts.iter().enumerate() {
+        std::fs::write(queue.join(n.to_string()), script).expect("script");
+        if n > 0 {
+            steps.push(format!("copy {q}/{} {q}/{n}", n - 1));
+        }
+    }
+    steps.push(format!("run sh {q}/now"));
+    format!("{key}\t-\t{}\n", steps.join(" ; "))
+}
+
+/// The fake's rule for a `bootstatus` that never succeeds, as `simctl` fails a device
+/// that will not boot.
+const WONT_BOOT: &str =
+    "simctl bootstatus * -b\t-\techo --stderr Unable to boot device ; exit 149\n";
+
+/// Catches the driver asking Xcode for its destinations before the device is booted,
+/// the state the action asks in (issue #608: the look made on a device not yet
+/// booted listed 37 simulators 8 to 19 s in, and the action's own `xcodebuild
+/// -showdestinations` after its `bootstatus -b` listed none for 50 to 130 s, so
+/// `xcodebuild test -destination` failed in the action). The fake `xcodebuild` lists
+/// the device only once a `bootstatus` has run, and the fake `xcdevice` lists it at
+/// once: the driver must run the boot first, and the log must show it before every
+/// look. Mutants planted: no boot (red: the lease fails, Xcode never lists the
+/// device); the boot after the looks (red: the lease fails the same way, the first
+/// look found it not listed and the order assertion).
+#[tokio::test]
+async fn the_simulator_is_booted_before_the_looks_that_ask_xcode_for_it() {
+    let dir = scratch("sim-booted-first");
+    let (live, booted) = (dir.join("live.txt"), dir.join("booted.txt"));
+    std::fs::write(&live, showing(&[SHARED], &[])).expect("live");
+    std::fs::write(&booted, showing(&[SHARED, UDID], &[])).expect("booted");
+    let extra = format!(
+        "simctl bootstatus * -b\t-\tcopy {live} {booted}\n{SHOW}\t-\tcat {live}\n",
+        live = live.display(),
+        booted = booted.display()
+    );
+    let (config, xcrun) = listing_config(&dir, &extra, PROMPT, Duration::from_millis(10));
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let result = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
+    let result = result.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
+    let log = log_of(&xcrun);
+    let boot = log.find(" simctl bootstatus ").expect("the boot");
+    let look = log.find(SHOWING).expect("a look");
+    assert!(boot < look, "the boot after the first look:\n{log}");
+    assert_eq!(boots_in(&log), 1, "one boot, not one a look:\n{log}");
+    assert_eq!(calls(&xcrun), lease_calls(1, &[]));
+    assert!(no_leases(&config));
+}
+
+/// Catches a boot that gives up at the first try (a `bootstatus` can fail, or be cut
+/// at [`Listing::look`], while `CoreSimulatorService` is still at it; the next one
+/// waits on the boot) and a lease that runs the action before the boot ends: the
+/// fake's first two `bootstatus` exit 1, the third exits 0. The action prints the
+/// fake's log, which holds three boots and one look when it starts. Mutant planted:
+/// the wait ends at the first failed try (red: the lease fails).
+#[tokio::test]
+async fn the_driver_tries_the_boot_again_and_runs_the_action_once_it_is_booted() {
+    let dir = scratch("sim-boot-late");
+    let queue = scripts_in_turn(
+        &dir,
+        "boots",
+        "simctl bootstatus * -b",
+        &["exit 1", "exit 1", "exit 0"],
+    );
+    let (config, xcrun) = listing_config(&dir, &queue, PROMPT, Duration::from_millis(10));
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let log = format!("{}.log", xcrun.display());
+    let spec = asks(Spec::act(&format!("cat {log}")), DEVICE_TYPE);
+    let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
+    let seen = stdout(&cas, &result);
+    assert_eq!(boots_in(&seen), 3, "boots before the action ran:\n{seen}");
+    assert_eq!(shows_in(&seen), 1, "looks before the action ran:\n{seen}");
+    assert_eq!(boots_in(&log_of(&xcrun)), 3, "no boot after it was booted");
+    assert!(no_leases(&config));
+}
+
+/// Catches a device that never boots holding the lease for ever, or failing it
+/// without saying why: the lease fails as the node's (`Failed`) once [`Listing::boot`]
+/// is up, naming the device, the wait and what the last try printed; no look is made,
+/// the action does not run and the device is still deleted. Mutant planted: the
+/// failed boot ignored (red: the lease goes on to the looks and runs the action).
+#[tokio::test]
+async fn a_simulator_that_will_not_boot_fails_the_lease_saying_so() {
+    let dir = scratch("sim-never-boots");
+    let (mut config, xcrun) = listing_config(&dir, WONT_BOOT, PROMPT, Duration::from_millis(10));
+    config.simulator_listing.boot = Duration::from_millis(300);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let ran = dir.join("ran");
+    let spec = asks(
+        Spec::act(&format!("append {} x", ran.display())),
+        DEVICE_TYPE,
+    );
+    let outcome = run(&rt, &cas, 1, &spec).await;
+    let Err(RuntimeError::Failed(why)) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    let want = format!("simulator: {UDID} not booted within 300ms (");
+    assert!(why.starts_with(&want), "{why}");
+    let last =
+        format!("tries); simctl bootstatus {UDID} -b: exit status: 149: Unable to boot device");
+    assert!(why.ends_with(&last), "{why}");
+    let log = log_of(&xcrun);
+    assert!(boots_in(&log) > 1, "tried again:\n{log}");
+    assert_eq!(
+        looks_in(&log) + shows_in(&log),
+        0,
+        "no look of a device not booted"
+    );
+    assert!(!ran.exists(), "the action did not run");
+    let calls = calls(&xcrun);
+    assert_eq!(calls[0], lease_calls(1, &[])[0]);
+    assert_eq!(calls[calls.len() - 3..], lease_calls(1, &[])[2..]);
+    assert!(no_leases(&config));
+}
+
+/// Catches a kill during the wait for the boot not ending it (it would wait out
+/// [`Listing::boot`]) or running the action after it: the run ends `Killed`, the
+/// action not run, and the device is deleted.
+#[tokio::test]
+async fn a_kill_during_the_wait_for_the_boot_ends_it() {
+    let dir = scratch("sim-kill-boot");
+    let (config, xcrun) = listing_config(&dir, WONT_BOOT, PROMPT, Duration::from_millis(10));
+    let mut config = config;
+    config.simulator_listing.boot = PROMPT * 6;
+    let cas = Arc::new(MemoryCas::default());
+    let rt = Arc::new(runtime(config.clone(), &cas));
+    let ran = dir.join("ran");
+    let action = asks(
+        Spec::act(&format!("append {} x", ran.display())),
+        DEVICE_TYPE,
+    )
+    .store(&cas);
+    let running = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.run(crate::support::work(1, action, 0)).await }
+    });
+    let waited = tokio::time::timeout(PROMPT, async {
+        while boots_in(&log_of(&xcrun)) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    waited.await.expect("the driver tries the boot again");
+    let killed = tokio::time::timeout(PROMPT, rt.kill(kbf_types::LeaseId::new(1, 1)));
+    killed.await.expect("the kill ends the wait");
+    let killed = running.await.expect("run task");
+    assert!(matches!(killed, Err(RuntimeError::Killed)), "{killed:?}");
+    assert!(!ran.exists(), "the action did not run");
+    let calls = calls(&xcrun);
+    assert_eq!(calls[calls.len() - 3..], lease_calls(1, &[])[2..]);
+    assert!(no_leases(&config));
+}
+
+/// Catches a `bootstatus` that stalls (a boot with a data migration took up to 2 min
+/// 46 s) holding the wait for as long as it likes: each try has [`Listing::look`] to
+/// answer (200 ms here) and is killed after it. The fake's `bootstatus` sleeps 5 s.
+/// Mutant planted: the try given the `simctl` answer time (red: the run takes the
+/// 5 s).
+#[tokio::test]
+async fn a_boot_that_does_not_answer_is_cut_and_the_wait_still_ends() {
+    let dir = scratch("sim-boot-stalls");
+    let extra = "simctl bootstatus * -b\t-\tsleep 5\n";
+    let (mut config, xcrun) = listing_config(&dir, extra, PROMPT, Duration::from_millis(10));
+    config.simulator_listing.boot = Duration::from_millis(500);
+    config.simulator_listing.look = Duration::from_millis(200);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let started = std::time::Instant::now();
+    let outcome = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
+    let Err(RuntimeError::Failed(why)) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(why.contains("no answer within 200ms"), "{why}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(boots_in(&log_of(&xcrun)) > 1);
+    assert!(no_leases(&config));
 }
 
 /// Catches the driver's wait standing for another question than the action's (issue
@@ -838,6 +1047,7 @@ async fn a_simulator_that_cannot_be_deleted_fails_the_lease() {
     assert_eq!(
         calls(&xcrun)[1..],
         [
+            format!("bootstatus {STUCK} -b"),
             "list devices -j".to_owned(),
             format!("shutdown {STUCK}"),
             format!("delete {STUCK}")
@@ -849,7 +1059,7 @@ async fn a_simulator_that_cannot_be_deleted_fails_the_lease() {
         shown.starts_with("Err(Failed(\"simulator: simctl list devices -j: "),
         "{shown}"
     );
-    assert_eq!(calls(&xcrun)[4..], lease_calls(2, &[]));
+    assert_eq!(calls(&xcrun)[5..], lease_calls(2, &[]));
     assert!(
         no_leases(&config),
         "the lease directories are removed anyway"
@@ -859,7 +1069,7 @@ async fn a_simulator_that_cannot_be_deleted_fails_the_lease() {
 /// Catches: `simctl` run outside the actions' sandbox (the daemon would run a
 /// developer tool, which reads `xcrun`'s cache that leases can write, unsandboxed) or
 /// with another lease directory; `create` not given the Xcode the action names (its
-/// runtimes are that Xcode's); and the end run with that Xcode or the daemon's own
+/// runtimes are that Xcode's) or the boot not given it; and the end run with that Xcode or the daemon's own
 /// `DEVELOPER_DIR` rather than the node's Xcode (so the start sweep, which knows no
 /// Xcode, ends devices the same way).
 #[tokio::test]
@@ -878,6 +1088,8 @@ async fn simctl_runs_under_the_sandbox_with_the_actions_xcode() {
     let extra = format!(
         "simctl create *\tDEVELOPER_DIR={developer}\tappend {seen} create ${{KBF_LEASE}} ; echo {UDID}\n\
          simctl create *\t-\techo --stderr not the actions Xcode ; exit 9\n\
+         simctl bootstatus *\tDEVELOPER_DIR={developer}\tappend {seen} bootstatus ${{KBF_LEASE}}\n\
+         simctl bootstatus *\t-\techo --stderr not the actions Xcode ; exit 9\n\
          simctl list *\tDEVELOPER_DIR=\tappend {seen} list ${{KBF_LEASE}} ; cat {}\n\
          simctl list *\t-\techo --stderr not the nodes Xcode ; exit 9\n\
          simctl shutdown *\tDEVELOPER_DIR=\tappend {seen} shutdown ${{KBF_LEASE}}\n\
@@ -899,7 +1111,9 @@ async fn simctl_runs_under_the_sandbox_with_the_actions_xcode() {
     let lease = lease.display();
     assert_eq!(
         std::fs::read_to_string(dir.join("seen")).expect("seen"),
-        format!("create {lease}\nlist {lease}\nshutdown {lease}\ndelete {lease}\n")
+        format!(
+            "create {lease}\nbootstatus {lease}\nlist {lease}\nshutdown {lease}\ndelete {lease}\n"
+        )
     );
 }
 
@@ -1239,9 +1453,11 @@ mod real {
     /// -showdestinations` does not list from the sandbox, or lists only after
     /// [`LISTED_BY`] seconds (so `xcodebuild test -destination id=$KBF_SIMULATOR_UDID`
     /// with its default timeout could not use it), and a booted device left running or
-    /// registered after the lease. The driver waits before the action runs until
-    /// `xcrun xcdevice list` names the device and its own sandboxed `xcodebuild
-    /// -showdestinations` lists it (issue #608), so this checks that its wait stands
+    /// registered after the lease. The driver boots the device and waits before the action runs until
+    /// `xcrun xcdevice list` names it and its own sandboxed `xcodebuild
+    /// -showdestinations` lists it (issue #608); the action's `bootstatus -b` then
+    /// returns at once, and a try that lists none prints how many devices are booted
+    /// and the `CoreSimulator` processes. This checks that its wait stands
     /// for what the action's own `xcodebuild` sees: its first try is expected to list
     /// the device. The driver's own looks (their time and the simulators each listed)
     /// are in its log lines "xcodebuild -showdestinations look". The action keeps trying for [`POLL_FOR`] seconds;
@@ -1276,6 +1492,10 @@ mod real {
                sims=$(grep -c 'platform:iOS Simulator, arch' \"$TMPDIR/shown\" || true)\n\
                waited=$(($(date +%s) - start))\n\
                echo \"showdestinations try $try at $waited s: exit $rc, lists the lease's device $found, iOS simulators listed $sims\" >&2\n\
+               if [ \"$found\" != 1 ]; then\n\
+                 xcrun simctl list devices 2>&1 | grep -c Booted >&2 || true\n\
+                 pgrep -fl CoreSimulator >&2 || true\n\
+               fi\n\
                if [ \"$found\" = 1 ] || [ \"$waited\" -ge {POLL_FOR} ]; then break; fi\n\
                sleep 5\n\
              done\n\
