@@ -1,0 +1,45 @@
+[package]
+name = "kbf-enroll"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The node's side of enrollment (docs/design/install-and-enrollment.md, sections 4 and 5.4
+# to 5.8): `kbf.toml`, the token file, the pinned first contact, the key and certificate
+# files, `Enroll` and `Renew` over `kbf.enroll.v1`, and the cold-store keys call. A
+# library: the `kbf node` and `kbf enroll` verbs that call it are another crate's.
+[dependencies]
+kbf-peer.workspace = true
+kbf-proto.workspace = true
+kbf-types.workspace = true
+base64.workspace = true
+hex.workspace = true
+hyper-util = { workspace = true, features = ["tokio"] }
+libc.workspace = true
+rcgen.workspace = true
+rustix = { workspace = true, features = ["process"] }
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tokio-rustls.workspace = true
+toml.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
+tower-service.workspace = true
+tracing.workspace = true
+x509-parser = { workspace = true, features = ["verify"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true, features = ["x509-parser"] }
+time.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

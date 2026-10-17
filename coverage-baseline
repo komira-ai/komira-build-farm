@@ -24,6 +24,7 @@ kbf-daemon               16      1
 kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
+kbf-enroll                0      0
 kbf-estimator             -      -
 kbf-front                35      7
 kbf-guest                15      6
