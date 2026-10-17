@@ -1,0 +1,32 @@
+[package]
+name = "kbf-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The node's end of a pull-based update: it learns the release the frontend wants over
+# the session the daemon holds, copies the bytes the frontend serves into an inbox
+# directory, and reports what it finds there. It decides nothing about trust: a root
+# helper verifies the release's build attestation before anything is installed.
+[dependencies]
+futures.workspace = true
+hex.workspace = true
+kbf-proto.workspace = true
+kbf-threads.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The release service the fetch tests talk to: a server on a loopback port.
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

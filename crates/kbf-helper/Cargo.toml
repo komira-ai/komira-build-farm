@@ -1,0 +1,35 @@
+[package]
+name = "kbf-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The root helper of the pull-based updates (docs/design/pull-updates.md, section 7). It
+# has no socket and no network: it polls the inbox the unprivileged `kbf` writes (offers to
+# stage, orders to act on), stages and swaps releases through kbf-installer, restarts the
+# one configured service, and writes the world-readable status.json the node reads. It
+# never runs a binary it staged as root (kbf-installer runs it as an unprivileged user).
+[[bin]]
+name = "kbf-helper"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kbf-host.workspace = true
+kbf-installer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
+kbf-installer = { workspace = true, features = ["testkit"] }
+kbf-update.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

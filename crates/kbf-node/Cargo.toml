@@ -29,6 +29,7 @@ kbf-outputs.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
+kbf-update.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tonic.workspace = true

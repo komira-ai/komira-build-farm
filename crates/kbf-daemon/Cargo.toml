@@ -31,6 +31,8 @@ kbf-storage.workspace = true
 # The Cas trait, and the transfer engine the binary's runtimes use.
 kbf-transfer.workspace = true
 kbf-types.workspace = true
+# The update client the session feeds (`update_link`).
+kbf-update.workspace = true
 libc.workspace = true
 prost.workspace = true
 prost-types.workspace = true

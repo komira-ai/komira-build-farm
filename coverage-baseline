@@ -27,6 +27,7 @@ kbf-driver-native         0      0
 kbf-estimator             -      -
 kbf-front                35      7
 kbf-guest                15      6
+kbf-helper                0      0
 kbf-history               0      0
 kbf-host                  0      0
 kbf-installer             0      0
@@ -62,6 +63,7 @@ kbf-tls                   0      0
 kbf-transfer              0      0
 kbf-types                 3      2
 kbf-ui                    0      0
+kbf-update                0      0
 kbf-updater               0      0
 kbf-vmm                   0      0
 xtask                     0      0

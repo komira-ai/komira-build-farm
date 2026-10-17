@@ -29,13 +29,8 @@
 //! The step needs a reboot exactly when `/run/reboot-required` exists afterwards, and
 //! the reboot is a one-step plan, `/usr/bin/systemctl reboot`.
 //!
-//! **Not done yet: restarting what it replaced.** Nothing restarts `kbf-daemon` (or the
-//! updater) after its binary is renamed over. Until a reboot, the old daemon keeps
-//! running, and its `/proc/<pid>/exe` is the old file, which no longer hashes to the
-//! file at `--daemon-path`; the caller check (`caller`, on Linux) then refuses every
-//! request from it. So after a set that changes `kbf-daemon` and does not reboot, the
-//! daemon is locked out of the updater until it is restarted. The restart (with the
-//! daemon's drain) is left for the change that adds the systemd units.
+//! **Not done yet: restarting what it replaced.** Nothing restarts a service after its binary
+//! is renamed over; the pull-based helper (`kbf-helper`) does that with versioned directories.
 
 use std::fmt::Display;
 use std::fs;

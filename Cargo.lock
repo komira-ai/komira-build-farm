@@ -1485,6 +1485,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "prost-types",
@@ -1632,6 +1633,21 @@ dependencies = [
  "libc",
  "subtle",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-helper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-host",
+ "kbf-installer",
+ "kbf-update",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1857,6 +1873,7 @@ dependencies = [
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "rcgen",
@@ -2193,11 +2210,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-update"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hex",
+ "kbf-proto",
+ "kbf-threads",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
- "clap",
  "hex",
  "kbf-host",
  "libc",

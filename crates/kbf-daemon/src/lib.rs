@@ -71,6 +71,7 @@ pub mod tree;
 pub mod trees;
 #[cfg(target_os = "macos")]
 pub mod uid;
+mod update_link;
 #[cfg(target_os = "linux")]
 pub mod usage;
 mod window;
@@ -80,6 +81,10 @@ mod window;
 /// commit it was built from (12 hex digits), or `unknown` when the build had no git
 /// checkout (issue #170). `build.rs` embeds the commit.
 pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
+
+/// The commit this build is from (12 hex digits, or `unknown`): the `+` part of
+/// [`DAEMON_VERSION`], and what the update client reports as the commit running.
+pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
@@ -98,6 +103,7 @@ pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
+pub use update_link::UpdateLink;
 
 // The unit tests run this test binary as kbf-testkit's `kbf-act` (src/usage.rs).
 #[cfg(test)]

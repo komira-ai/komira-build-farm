@@ -7,20 +7,15 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The root helper that installs signed software sets on a node
-# (docs/design/fleet-updates-security.md, S3 and S4.1).
-[[bin]]
-name = "kbf-updater"
-path = "src/main.rs"
-
+# The signed software set library (docs/design/fleet-updates-security.md, S3): the verbs over an
+# applier. The binary and the socket are gone; the root helper is kbf-helper.
 [dependencies]
 base64.workspace = true
-clap.workspace = true
 hex.workspace = true
 kbf-host.workspace = true
 libc.workspace = true
 ring.workspace = true
-rustix = { workspace = true, features = ["fs", "net", "process", "system"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

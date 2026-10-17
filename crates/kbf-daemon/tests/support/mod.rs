@@ -20,7 +20,7 @@ use std::time::Duration;
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
     Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, Runtime,
-    Runtimes, TlsFiles,
+    Runtimes, TlsFiles, UpdateLink,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -234,6 +234,30 @@ impl Peer {
         self.send(server_message::Message::UpdateOrder(
             kbf_proto::update::UpdateOrder::default(),
         ));
+    }
+
+    /// An `UpdateOffer` of `offer`.
+    pub fn update_offer(&self, offer: kbf_proto::update::UpdateOffer) {
+        self.send(server_message::Message::UpdateOffer(offer));
+    }
+
+    /// An `UpdateOrder` of `order`.
+    pub fn update_order(&self, order: kbf_proto::update::UpdateOrder) {
+        self.send(server_message::Message::UpdateOrder(order));
+    }
+
+    /// The next `UpdateStatus` that `pick` accepts, skipping others.
+    pub async fn update_status(
+        &mut self,
+        mut pick: impl FnMut(&kbf_proto::update::UpdateStatus) -> bool,
+    ) -> kbf_proto::update::UpdateStatus {
+        self.expect(PROMPT, |m| match m {
+            daemon_message::Message::UpdateStatus(s) => pick(s).then(|| s.clone()),
+            _ => None,
+        })
+        .await
+        .expect("an UpdateStatus")
+        .1
     }
 
     /// A Welcome that names no lease epoch and carries `map`.
@@ -601,6 +625,30 @@ impl Harness<FakeRuntime> {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    /// Starts a server and a daemon with the update link `update` ([`Daemon::with_update`]),
+    /// whose fake runtime takes `run_for` per lease.
+    pub async fn with_update(name: &str, run_for: Duration, update: UpdateLink) -> Self {
+        let runtime = Arc::new(FakeRuntime::new(run_for));
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(update),
+        )
+        .await
+    }
 }
 
 impl<R: Runtime> Harness<R> {
@@ -681,6 +729,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -706,6 +755,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(phase),
+            None,
             None,
             None,
         )
@@ -738,6 +788,7 @@ impl<R: Runtime> Harness<R> {
             phase,
             Some((stall, above)),
             None,
+            None,
         )
         .await
     }
@@ -755,6 +806,7 @@ impl<R: Runtime> Harness<R> {
             runtime,
             Duration::from_secs(40),
             configure,
+            None,
             None,
             None,
             None,
@@ -786,6 +838,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(holder),
+            None,
         )
         .await
     }
@@ -802,6 +855,7 @@ impl<R: Runtime> Harness<R> {
         phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
+        update: Option<UpdateLink>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -859,6 +913,9 @@ impl<R: Runtime> Harness<R> {
         }
         if let Some(holder) = map {
             daemon = daemon.with_map(holder);
+        }
+        if let Some(update) = update {
+            daemon = daemon.with_update(update);
         }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {

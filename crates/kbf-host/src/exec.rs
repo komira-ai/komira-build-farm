@@ -265,7 +265,11 @@ fn write_file(full: &Path, perms: Perms, owner: Option<Owner>, bytes: &[u8]) -> 
     file.write_all(bytes)?;
     set_perms_owner(&tmp, perms, owner)?;
     file.sync_all()?;
-    fs::rename(&tmp, full)
+    fs::rename(&tmp, full)?;
+    // The rename is in the directory, not yet on disk: without this a power cut can bring
+    // back the old file after a caller was told the new one is there.
+    // A path with no parent is `/`, which was not written; a file always has one.
+    fs::File::open(full.parent().unwrap_or(Path::new("/")))?.sync_all()
 }
 
 fn set_perms_owner(full: &Path, perms: Perms, owner: Option<Owner>) -> io::Result<()> {

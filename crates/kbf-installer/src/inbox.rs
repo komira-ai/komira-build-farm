@@ -120,6 +120,45 @@ impl Entry {
         Ok(names)
     }
 
+    /// The directory `name` inside this entry, opened relative to it without following a
+    /// link, so a link put in the writer's place of `name` is refused instead of followed
+    /// out of the entry.
+    pub fn sub(&self, name: &str) -> Result<Entry, Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: name.to_owned(),
+            fault,
+        };
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\0']) {
+            return Err(refuse(InboxFault::BadName));
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let dir = rustix::fs::openat(&self.dir, name, flags, Mode::empty())
+            .map_err(|e| refuse(fault_of(e, InboxFault::NotADirectory)))?;
+        Ok(Entry {
+            dir,
+            mode: self.mode,
+            name: format!("{}/{name}", self.name),
+        })
+    }
+
+    /// Remove the file `name` from the entry, by `unlinkat` on the entry's descriptor: the
+    /// name is one component of the directory that was opened, so no link in the writer's
+    /// control can send the removal elsewhere (it removes a link itself, never its target).
+    /// A name that is not there is removed already.
+    pub fn remove_file(&self, name: &str) -> Result<(), Refusal> {
+        let refuse = |fault| Refusal::Inbox {
+            name: name.to_owned(),
+            fault,
+        };
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\0']) {
+            return Err(refuse(InboxFault::BadName));
+        }
+        match rustix::fs::unlinkat(&self.dir, name, rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(refuse(fault_of(e, InboxFault::NotRegular))),
+        }
+    }
+
     /// Open the file `name` beneath the entry and judge it by its descriptor: a regular
     /// file with one link, not empty, of at most `cap` bytes.
     pub fn open_file(&self, name: &str, cap: u64) -> Result<File, Refusal> {

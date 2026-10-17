@@ -100,6 +100,7 @@ use crate::pressure;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
+use crate::update_link::UpdateLink;
 use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -221,6 +222,8 @@ pub struct Daemon {
     /// Where the storage map of `Welcome` and `MapUpdate` goes, if the daemon routes by
     /// one; see [`Self::with_map`].
     map: Option<MapLink>,
+    /// The update client; see [`Self::with_update`].
+    update: UpdateLink,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
@@ -270,6 +273,7 @@ enum Wake {
     Phase,
     Pressure,
     MapAsked,
+    Update,
 }
 
 impl Daemon {
@@ -315,6 +319,7 @@ impl Daemon {
             phase_now: NodePhase::Serving,
             pressure: None,
             map: None,
+            update: UpdateLink::off(),
             events: None,
             leases: Leases::new(runtimes, done_tx),
             done,
@@ -336,6 +341,23 @@ impl Daemon {
     #[must_use]
     pub fn with_map(mut self, holder: Arc<kbf_mapsync::MapHolder>) -> Self {
         self.map = Some(MapLink::new(holder));
+        self
+    }
+
+    /// Lets the update client settle its gate; when it changed, the frontend is told in a
+    /// new `Hello`. A method of its own, not lines in the session loop: the loop is one
+    /// function in every test binary and the ratchet counts the best of those binaries.
+    fn settle_update(&mut self, tx: &UnboundedSender<DaemonMessage>) {
+        if self.update.settle(tx) {
+            send(tx, daemon_message::Message::Hello(self.hello()));
+        }
+    }
+
+    /// Hands the frontend's update offers and orders to `update`, reports its status, and
+    /// takes no lease while it holds the update gate. Without one the daemon reports nothing.
+    #[must_use]
+    pub fn with_update(mut self, update: UpdateLink) -> Self {
+        self.update = update;
         self
     }
 
@@ -431,6 +453,9 @@ impl Daemon {
     /// The phase every Hello carries: the runtime's, or memory pressure in place of
     /// serving while the backstop has the node paused.
     fn phase(&self) -> NodePhase {
+        if let Some(why) = self.update.gate() {
+            return NodePhase::Quarantined(why);
+        }
         match &self.pressure {
             Some(backstop) if backstop.paused && self.phase_now == NodePhase::Serving => {
                 NodePhase::MemoryPressure
@@ -618,6 +643,7 @@ impl Daemon {
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
         self.new_map_stream(map);
+        self.update.new_stream(epoch.unwrap_or(0), &tx);
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -652,6 +678,7 @@ impl Daemon {
                 Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
                 Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
                 () = map_asked(self.map.as_mut()) => Wake::MapAsked,
+                Some(()) = self.update.changed() => Wake::Update,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
@@ -690,9 +717,10 @@ impl Daemon {
                     }
                 }
                 // The request for a map is sent below, whatever woke the loop.
-                Wake::Pressure | Wake::MapAsked => {}
+                Wake::Pressure | Wake::MapAsked | Wake::Update => {}
             }
             self.ask_map(&tx);
+            self.settle_update(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
                 tracing::info!(phase = self.phase().name(), "node phase changed");
@@ -846,12 +874,9 @@ impl Daemon {
                     link.take(update.map);
                 }
             }
-            // The update client of a later change takes these; until then a daemon that
-            // is offered or ordered an update goes on with its session.
-            Some(
-                server_message::Message::UpdateOffer(_) | server_message::Message::UpdateOrder(_),
-            ) => {
-                tracing::debug!("an update message ignored: this daemon takes no updates yet");
+            Some(server_message::Message::UpdateOffer(offer)) => self.update.offer(offer),
+            Some(server_message::Message::UpdateOrder(order)) => {
+                self.update.order(order, &self.leases, &self.unacked);
             }
             None => tracing::warn!("an empty server message ignored"),
         }
@@ -890,6 +915,10 @@ impl Daemon {
                     "contact with the server is lost; not starting",
                 )
             })
+        } else if let Some(why) = self.update.gate() {
+            start
+                .lease_id
+                .map(|id| failure(lease_id(id), Code::Unavailable, why))
         } else {
             self.leases.start(start)
         };
@@ -1077,7 +1106,7 @@ fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
 
 /// Queues a message on the stream. A message for a stream that is gone is dropped: a
 /// Result stays in the daemon's unacknowledged set and is resent on the next stream.
-fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
+pub(crate) fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
     let _ = tx.unbounded_send(DaemonMessage {
         message: Some(message),
     });

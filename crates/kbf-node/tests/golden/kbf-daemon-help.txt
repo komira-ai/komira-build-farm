@@ -61,6 +61,9 @@ Options:
       --cas <CAS>
           The server's worker listener, an `https://` URL (normally `--server`'s), that the container and native drivers read and write blobs through, over mutual TLS with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`. Plain `http://` is refused: the worker listener admits each blob call by the daemon's certificate. Every driver's blobs go through one transfer engine, over one connection, within the `--transfer-*` limits
 
+      --update-dir <DIR>
+          The update directory: the daemon fetches the release the frontend offers into its `inbox/`, over the connection `--cas` names, and reads the root helper's `status.json` there. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+
       --data-dir <DIR>
           The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached.
           

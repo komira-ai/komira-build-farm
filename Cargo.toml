@@ -174,6 +174,7 @@ kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-host = { path = "crates/kbf-host" }
+kbf-helper = { path = "crates/kbf-helper" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
@@ -206,6 +207,7 @@ kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
+kbf-update = { path = "crates/kbf-update" }
 # The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

@@ -83,24 +83,3 @@ pub fn scratch(name: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
-
-/// A scratch directory and a short alias for it, `/proc/<pid>/fd/<n>`, valid while the
-/// value lives. A Unix socket path is limited to 107 bytes, which a target directory can
-/// exceed (coverage builds nest it deeper). Child processes can use the alias too.
-pub struct ShortDir {
-    _dir: std::fs::File,
-    /// The alias.
-    pub path: PathBuf,
-}
-
-/// [`scratch`], with a short alias.
-pub fn short_dir(name: &str) -> ShortDir {
-    use std::os::fd::AsRawFd as _;
-    let dir = std::fs::File::open(scratch(name)).unwrap();
-    let path = PathBuf::from(format!(
-        "/proc/{}/fd/{}",
-        std::process::id(),
-        dir.as_raw_fd()
-    ));
-    ShortDir { _dir: dir, path }
-}

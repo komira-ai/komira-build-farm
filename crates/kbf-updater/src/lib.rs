@@ -14,17 +14,12 @@
 //! - [`updater`]: the three verbs over an [`apply::Applier`].
 //! - [`apply`]: the applier interface, a fake for tests, and the apt-snapshot applier,
 //!   which changes the node only through `kbf-host`'s plans.
-//! - `caller` and `server` (Linux): the caller check, the kernel floor, the refusal to
-//!   run beside `--driver native`, and the socket.
 //!
-//! On macOS the helper needs the per-lease user first (S4.3); until then only the
-//! portable parts build there and the binary refuses to start.
+//! There is no socket and no binary any more: the root helper of the pull-based updates is
+//! `kbf-helper`, which polls an inbox and refuses nobody by caller (docs/design/pull-updates.md).
+//! What stays is the signed-set library, for the release key the pull design defers.
 
 pub mod apply;
-#[cfg(target_os = "linux")]
-pub mod caller;
-#[cfg(target_os = "linux")]
-pub mod server;
 pub mod set;
 pub mod signed;
 pub mod state;
