@@ -667,6 +667,7 @@ where
         recorder.clone(),
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
+        history.as_ref().map(crate::history::History::reads),
     );
     let api_routes = crate::api::router(
         Arc::clone(&farm),

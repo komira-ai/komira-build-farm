@@ -103,7 +103,7 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
         State::Idle => "idle",
     };
     let summary = Summary::of(inv);
-    json!({
+    let mut value = json!({
         "id": inv.key().to_string(),
         "url": Value::Null,
         "tool": tool,
@@ -129,7 +129,20 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
             "wall_ms": summary.wall.list(inv, Phase::Wall, base),
             "execution_ms": summary.execution.list(inv, Phase::Execution, base),
         },
-    })
+    });
+    restored_keys(inv, &mut value);
+    value
+}
+
+/// Adds the keys only a record read back from history has to `value`, the invocation's
+/// answer: `restored`, and, when it has a hole, `gap_from`. A live record has neither.
+fn restored_keys(inv: &Invocation, value: &mut Value) {
+    if inv.from_history() {
+        value["restored"] = Value::Bool(true);
+        if let Some(gap) = inv.gap_from() {
+            value["gap_from"] = rfc3339(gap).into();
+        }
+    }
 }
 
 /// How many actions `top_slowest` lists per phase.
@@ -524,7 +537,18 @@ fn attempt(a: &Attempt) -> Value {
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
     measured(a, &mut keys);
+    run_keys(a, &mut keys);
     Value::Object(keys)
+}
+
+/// Adds the run the history writer minted for attempt `a`, if it did: its id and the link
+/// to it.
+fn run_keys(a: &Attempt, keys: &mut Map<String, Value>) {
+    if let Some(id) = a.run_id {
+        let id = hex::encode(id);
+        keys.insert("run_href".to_owned(), format!("/v1/runs/{id}").into());
+        keys.insert("run_id".to_owned(), id.into());
+    }
 }
 
 fn outcome(o: Option<&Outcome>) -> Value {

@@ -7,12 +7,12 @@ use kbf_history::records::{HitHow, MemoryKill, RunOutcome};
 use kbf_history::{Event, EventQueue, InvRef, Minter, QueueLimits};
 use kbf_invocation::{
     ActionRow, ActionShape, Attempt, AttemptEnd, Ended, EndedKind, How, Listing, NumaBytes,
-    Outcome, Output, ReapiTimes, RecordKey, Run, RunUsage, WallTime,
+    Outcome, Output, ReapiTimes, RecordKey, Run, RunUsage, Target, TargetKind, Text, WallTime,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, DigestFunction, Failure, LeaseId, LostWhy, WorkerId};
 
-use super::{HistoryTap, OPEN_CAP};
+use super::{HistoryTap, OPEN_CAP, RUN_INDEX_CAP, RunIndex};
 use kbf_front::Tap as _;
 
 fn digest(n: u8) -> Digest {
@@ -112,9 +112,10 @@ fn record_of(
 }
 
 /// Catches: a field of the row dropped or put in another's place on its way to the
-/// record: the action, result, command, logs, shape, configuration, test flag, node,
-/// lease, every time, the cgroup block (its NUMA bytes by node) and the outputs; and the
-/// id the tap returns not the record's.
+/// record: the action, result, command, logs, shape, configuration, test flag, target
+/// and its kind, node, lease, every time (the attempt's own queue, start and end among
+/// them), the cgroup block (its NUMA bytes by node, its wall time) and the outputs; and
+/// the id the tap returns not the record's.
 #[test]
 fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
     let mut a = attempt(Some(AttemptEnd::Accepted));
@@ -184,7 +185,10 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
     r.shape = Some(Box::new(ActionShape {
         key: 0x0123_4567_89ab_cdef,
         cfg: Some("7a3c1e9f0b2d4c68".to_owned()),
-        target: None,
+        target: Some(Target {
+            kind: TargetKind::Anon,
+            label: Text::sent("root//pkg:name"),
+        }),
         test: true,
     }));
     let (rec, id) = record_of(&r, 1, EndedKind::Finished);
@@ -201,6 +205,15 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
     assert_eq!(rec.shape, 0x0123_4567_89ab_cdef);
     assert_eq!(rec.cfg, "7a3c1e9f0b2d4c68");
     assert!(rec.test);
+    assert_eq!(
+        (rec.target.as_str(), rec.target_kind),
+        ("root//pkg:name", 2)
+    );
+    assert_eq!(
+        (rec.attempt_queued_us, rec.started_us, rec.ended_us),
+        (10_000, 30_000, 40_000),
+        "the attempt's own times, not the first submission's"
+    );
     assert_eq!(rec.node, "node-a");
     assert_eq!((rec.lease_epoch, rec.lease_seq), (3, 9));
     assert_eq!((rec.outcome(), rec.exit_code), (RunOutcome::Ok, 0));
@@ -243,6 +256,7 @@ fn a_finished_attempt_keeps_what_the_row_and_the_attempt_hold() {
         [2, 3, 4, 5, 6, 7, 8]
     );
     assert_eq!(c.numa_bytes, [80, 90], "by node, the node past 63 left out");
+    assert_eq!(c.wall_us, 1);
     let outputs: Vec<_> = rec
         .outputs
         .iter()
@@ -581,4 +595,81 @@ fn the_open_list_is_bounded() {
     );
     assert!(closed.contains(&Some("b00001".to_owned())));
     assert!(closed.contains(&Some(format!("b{OPEN_CAP:05}"))));
+}
+
+/// Catches: a target kind that does not round-trip (a BXL function shown as a rule's
+/// target), and a run of an action with no target given one.
+#[test]
+fn a_target_keeps_its_kind_and_a_run_without_one_keeps_none() {
+    for (kind, number) in [
+        (TargetKind::Target, 1),
+        (TargetKind::Anon, 2),
+        (TargetKind::Bxl, 3),
+    ] {
+        let mut r = row(
+            vec![attempt(Some(AttemptEnd::Accepted))],
+            Some(Outcome::Ok { exit_code: 0 }),
+        );
+        r.shape = Some(Box::new(ActionShape {
+            key: 1,
+            cfg: None,
+            target: Some(Target {
+                kind,
+                label: Text::sent("t"),
+            }),
+            test: false,
+        }));
+        let (rec, _) = record_of(&r, 0, EndedKind::Finished);
+        assert_eq!((rec.target.as_str(), rec.target_kind), ("t", number));
+    }
+    let plain = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let (rec, _) = record_of(&plain, 0, EndedKind::Finished);
+    assert_eq!((rec.target.as_str(), rec.target_kind), ("", 0));
+}
+
+/// Catches: a run id the tap minted that the live record cannot be found by (the run
+/// route would answer from history only, and not at all before the chunk is written), a
+/// record found for an id the tap did not mint, and a map that grows without bound: past
+/// its bound the oldest ids go, and the newest stay.
+#[test]
+fn the_run_index_finds_what_was_minted_and_forgets_the_oldest() {
+    let rig = rig(16);
+    let r = row(
+        vec![attempt(Some(AttemptEnd::Accepted))],
+        Some(Outcome::Ok { exit_code: 0 }),
+    );
+    let id = rig
+        .tap
+        .ended(&ended("b", EndedKind::Finished, Some(0)), &r)
+        .expect("an id");
+    let runs = rig.tap.runs();
+    assert_eq!(runs.find(&id), Some((key("b"), 0)));
+    assert_eq!(runs.find(&[0xEE; 12]), None);
+
+    let index = RunIndex::default();
+    for n in 0..=RUN_INDEX_CAP as u64 {
+        let mut id = [0; 12];
+        id[4..].copy_from_slice(&n.to_be_bytes());
+        index.note(id, key("b"), 0);
+    }
+    let first = [0; 12];
+    let mut last = [0; 12];
+    last[4..].copy_from_slice(&(RUN_INDEX_CAP as u64).to_be_bytes());
+    assert_eq!(index.find(&first), None, "the oldest is forgotten");
+    assert_eq!(index.find(&last), Some((key("b"), 0)));
+}
+
+/// Catches: a tap that cannot be shown in a failure message (the recorder's task and the
+/// tests print it), with its run index.
+#[test]
+fn a_tap_shows_as_itself() {
+    let rig = rig(16);
+    let shown = format!("{:?}", rig.tap);
+    assert!(
+        shown.contains("HistoryTap") && shown.contains("RunIndex"),
+        "{shown}"
+    );
 }

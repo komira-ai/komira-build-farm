@@ -775,3 +775,42 @@ async fn metrics_aggregate_queue_and_run_times_reruns_and_usage() {
     assert_eq!(joined["peak_memory_bytes"], Value::Null);
     server.stop().await;
 }
+
+/// Catches: a server that keeps history answering a record held nowhere (not by the
+/// recorder, not in history) with anything but the `no_record` of one that does not:
+/// history is asked after the recorder and answers the same.
+#[tokio::test]
+async fn a_record_held_nowhere_is_no_record_when_history_is_on() {
+    use kbf_history::{HistoryRoot, IndexRoot};
+    use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+    use kbf_server::history::{Options, over};
+    use kbf_server::{EpochPolicy, StateStore};
+    use kbf_state::fake::{Fake, Flaw};
+    use kbf_state::{ManualClock, Store};
+
+    let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    ));
+    let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
+    let history = over(
+        MemoryStore::new(Capabilities::default()),
+        root,
+        Arc::clone(&store),
+        IndexRoot::default(),
+        Options::default(),
+    );
+    let state = StateStore {
+        store,
+        epoch: EpochPolicy::Keep,
+        members: Default::default(),
+        history: Some(history),
+    };
+    let policy = Policy::from_json(PAGES_ONLY).expect("a policy");
+    let server = Server::start_over(policy, kbf_front::DEFAULT_INVOCATION_MEMORY, Some(state));
+    let missing = server.get("/v1/invocations/nowhere").await;
+    assert_eq!(missing.code, 404, "{}", missing.json);
+    assert_eq!(missing.json["error"], "no_record");
+    assert_eq!(missing.json["id"], "nowhere");
+    server.stop().await;
+}

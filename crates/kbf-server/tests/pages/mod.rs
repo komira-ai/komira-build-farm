@@ -16,7 +16,7 @@ use kbf_invocation::{
 };
 use kbf_objstore::MemoryStore;
 use kbf_sched::RequeueReason;
-use kbf_server::{Api, Listeners, bind_server_with_policy};
+use kbf_server::{Api, Listeners, StateStore, bind_server_with_state};
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, WorkerId};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +55,12 @@ fn loopback() -> SocketAddr {
 impl Server {
     /// A server running `policy`, its records within `memory` bytes.
     pub fn start(policy: Policy, memory: usize) -> Self {
+        Self::start_over(policy, memory, None)
+    }
+
+    /// [`Server::start`], keeping the scheduler's state in `state` and writing the build
+    /// history it names, if any.
+    pub fn start_over(policy: Policy, memory: usize, state: Option<StateStore>) -> Self {
         let cache = Arc::new(Cache::memory());
         let listeners = Listeners {
             reapi: loopback(),
@@ -83,9 +89,15 @@ impl Server {
             token: None,
             local_cache: None,
         };
-        let bound =
-            bind_server_with_policy(Arc::clone(&cache), listeners, Some(api), policy, shutdown)
-                .expect("bind");
+        let bound = bind_server_with_state(
+            Arc::clone(&cache),
+            listeners,
+            Some(api),
+            policy,
+            state,
+            shutdown,
+        )
+        .expect("bind");
         let api = bound.api.expect("an API address");
         let recorder = bound.recorder.clone();
         let serving = tokio::spawn(async move { bound.serving.await.expect("serve") });

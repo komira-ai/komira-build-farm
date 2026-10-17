@@ -9,13 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use kbf_front::Tap;
 use kbf_history::{
     EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Limits, Minter, Offload, Offloaded,
-    QueueLimits, Writer, WriterId,
+    QueueLimits, Reader, Writer, WriterId,
 };
 use kbf_objstore::ObjectStore;
 use kbf_state::Store;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use super::reads::{HistoryReads, Shared};
 use super::stats::Stats;
 use super::tap::HistoryTap;
 
@@ -60,6 +61,7 @@ impl Default for Options {
 pub struct History {
     tap: Arc<HistoryTap>,
     stats: Arc<Stats>,
+    reads: Arc<HistoryReads>,
     task: Pin<Box<dyn Future<Output = ()> + Send>>,
     stop: oneshot::Sender<()>,
 }
@@ -70,6 +72,12 @@ impl History {
     pub fn tap(&self) -> Arc<dyn Tap> {
         let tap: Arc<dyn Tap> = self.tap.clone();
         tap
+    }
+
+    /// What the build pages read history with.
+    #[must_use]
+    pub fn reads(&self) -> Arc<HistoryReads> {
+        Arc::clone(&self.reads)
     }
 
     /// What history counts.
@@ -112,6 +120,8 @@ pub fn over<O: ObjectStore>(
     let queue = Arc::new(EventQueue::new(options.queue));
     let minter = Arc::new(Minter::new(0));
     let index = HistoryIndex::new(state, index_root, Arc::new(Blocking));
+    let objects = Shared(Arc::new(objects));
+    let reader = Reader::new(objects.clone(), root.clone(), index.clone());
     let writer = Writer::new(
         objects,
         root,
@@ -122,6 +132,7 @@ pub fn over<O: ObjectStore>(
         options.limits,
     );
     let tap = Arc::new(HistoryTap::new(Arc::clone(&queue), minter));
+    let reads = Arc::new(HistoryReads::new(reader, tap.runs()));
     let stats = Arc::new(Stats::new(queue));
     let (stop, stopped) = oneshot::channel();
     let task = Box::pin(run(
@@ -134,6 +145,7 @@ pub fn over<O: ObjectStore>(
     History {
         tap,
         stats,
+        reads,
         task,
         stop,
     }

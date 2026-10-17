@@ -41,6 +41,10 @@ use crate::records::{
 use crate::run_id::RunId;
 use crate::scoped::Scoped;
 
+/// The test an instance name must pass for a read to answer with its records. `Sync`, so
+/// that a read's future is `Send` and can be awaited on a runtime worker.
+pub type Allow<'a> = &'a (dyn Fn(&str) -> bool + Sync);
+
 /// Why a read failed (as opposed to finding nothing).
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
@@ -196,11 +200,7 @@ impl<O: ObjectStore> Reader<O> {
     /// # Errors
     /// [`ReadError`] when the index or the object store fails, or a row or object does
     /// not decode.
-    pub async fn run(
-        &self,
-        id: RunId,
-        allow: &dyn Fn(&str) -> bool,
-    ) -> Result<Option<RunView>, ReadError> {
+    pub async fn run(&self, id: RunId, allow: Allow<'_>) -> Result<Option<RunView>, ReadError> {
         // Events reach the writer out of order, so two chunks' sequence ranges may
         // overlap: try each chunk whose range holds the run, in order (one or two).
         for at in self.locate(id).await? {
@@ -245,7 +245,7 @@ impl<O: ObjectStore> Reader<O> {
     pub async fn invocation(
         &self,
         inv: &InvKey,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<InvocationView>, ReadError> {
         let Some(header) = self.header(inv, allow).await? else {
             return Ok(None);
@@ -284,6 +284,27 @@ impl<O: ObjectStore> Reader<O> {
         }))
     }
 
+    /// The instance names invocation `inv`'s header lists, one index row and no object
+    /// read: the names a caller must be allowed on before [`Reader::invocation`] or
+    /// [`Reader::records`] is given an `allow` built from them. `None` when history
+    /// holds no such invocation, and, failing closed, when the list is empty or the
+    /// writer truncated it: no set of allowed names covers such an invocation, so it
+    /// is answered as not held, to every caller alike.
+    ///
+    /// # Errors
+    /// As [`Reader::run`].
+    pub async fn invocation_instances(
+        &self,
+        inv: &InvKey,
+    ) -> Result<Option<Vec<String>>, ReadError> {
+        let key = self.index.root().invid(inv);
+        let Some(row) = self.index.get(key.clone()).await? else {
+            return Ok(None);
+        };
+        let header = decode_row::<InvocationHeader>(&key, &row.value)?;
+        Ok(listed_whole(&header).then_some(header.instances))
+    }
+
     /// A page of invocation `inv`'s records: up to `chunks` chunks (at least 1, at most
     /// [`MAX_PAGE_CHUNKS`]) after `after`, read all at once, if history holds the
     /// invocation and `allow` accepts every instance it lists. Records of instances
@@ -296,7 +317,7 @@ impl<O: ObjectStore> Reader<O> {
         inv: &InvKey,
         after: Option<&ChunkCursor>,
         chunks: usize,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<RecordsPage>, ReadError> {
         if self.header(inv, allow).await?.is_none() {
             return Ok(None);
@@ -326,7 +347,7 @@ impl<O: ObjectStore> Reader<O> {
     async fn header(
         &self,
         inv: &InvKey,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<InvocationHeader>, ReadError> {
         let key = self.index.root().invid(inv);
         let Some(row) = self.index.get(key.clone()).await? else {
@@ -416,10 +437,14 @@ fn chunk_object_key(root: &HistoryRoot, inv: &InvKey, c: &Chunk) -> ObjectKey {
 /// Whether `allow` accepts every instance `header` lists, and the list is whole: an
 /// empty list (no record names an instance) or one the writer truncated cannot show
 /// that every instance is allowed, so it fails closed.
-fn all_allow(header: &InvocationHeader, allow: &dyn Fn(&str) -> bool) -> bool {
-    !header.instances.is_empty()
-        && !header.instances_truncated
-        && header.instances.iter().all(|i| allow(i))
+fn all_allow(header: &InvocationHeader, allow: Allow<'_>) -> bool {
+    listed_whole(header) && header.instances.iter().all(|i| allow(i))
+}
+
+/// Whether `header` lists every instance its invocation used: the list is not empty
+/// and the writer did not truncate it.
+fn listed_whole(header: &InvocationHeader) -> bool {
+    !header.instances.is_empty() && !header.instances_truncated
 }
 
 fn footer_range(row: &ChunkRow) -> Result<ByteRange, FormatError> {
@@ -461,7 +486,7 @@ fn decode_record(bytes: &[u8]) -> Result<ChunkBody, ReadError> {
     })?)
 }
 
-fn find_run(block: &[ChunkBody], id: RunId, allow: &dyn Fn(&str) -> bool) -> Option<RunRecord> {
+fn find_run(block: &[ChunkBody], id: RunId, allow: Allow<'_>) -> Option<RunRecord> {
     block.iter().find_map(|b| match b {
         ChunkBody::Run(r) if r.run_id() == id && allow(&r.instance) => Some(r.clone()),
         _ => None,
@@ -476,11 +501,7 @@ fn find_failed(block: &[ChunkBody], seq: u32) -> Option<FailedRun> {
 }
 
 /// Adds the allowed records of one whole chunk to `view`.
-fn add_records(
-    view: &mut RecordsPage,
-    object: &[u8],
-    allow: &dyn Fn(&str) -> bool,
-) -> Result<(), ReadError> {
+fn add_records(view: &mut RecordsPage, object: &[u8], allow: Allow<'_>) -> Result<(), ReadError> {
     let decoded = container::decode(object)?;
     for record in &decoded.records {
         let body = decode_record(record)?;

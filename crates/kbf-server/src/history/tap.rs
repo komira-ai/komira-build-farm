@@ -4,7 +4,7 @@
 //! offers the events to the writer's bounded queue; it never waits for the writer, the
 //! object store or the state store.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kbf_front::Tap;
@@ -14,7 +14,7 @@ use kbf_history::records::{
 use kbf_history::{Event, EventQueue, InvRef, Minter};
 use kbf_invocation::{
     ActionRow, Attempt, AttemptEnd, Ended, EndedKind, How, MemoryKillKind, NumaBytes, Outcome,
-    RecordKey, WallTime,
+    RecordKey, TargetKind, WallTime,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure};
@@ -29,6 +29,37 @@ const OPEN_CAP: usize = 4096;
 /// the list is indexed by node.
 const MAX_NUMA_NODES: u32 = 64;
 
+/// The runs [`RunIndex`] remembers, at most. Run ids are time-ordered, so past it the
+/// oldest is forgotten, and its run is read from history instead of the recorder.
+const RUN_INDEX_CAP: usize = 1 << 16;
+
+/// Where the live record of each recently minted run id is: its record's key and the
+/// row. It is bounded ([`RUN_INDEX_CAP`], some 6 MiB), and a hint: the reader checks that
+/// the row still holds the run before it answers from it.
+#[derive(Debug, Default)]
+pub struct RunIndex(Mutex<BTreeMap<[u8; 12], (RecordKey, usize)>>);
+
+impl RunIndex {
+    fn map(&self) -> MutexGuard<'_, BTreeMap<[u8; 12], (RecordKey, usize)>> {
+        // A map; a panic elsewhere leaves it whole.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes that `id` was minted for an attempt of row `row` of `key`'s record.
+    pub(crate) fn note(&self, id: [u8; 12], key: RecordKey, row: usize) {
+        let mut map = self.map();
+        map.insert(id, (key, row));
+        while map.len() > RUN_INDEX_CAP {
+            map.pop_first();
+        }
+    }
+
+    /// The record and row `id` was minted for, if still remembered.
+    pub(crate) fn find(&self, id: &[u8; 12]) -> Option<(RecordKey, usize)> {
+        self.map().get(id).cloned()
+    }
+}
+
 /// The tap the recorder task calls, over the history writer's queue and the minter.
 #[derive(Debug)]
 pub struct HistoryTap {
@@ -37,15 +68,23 @@ pub struct HistoryTap {
     /// The record names (`<id>` or `<id>~<n>`) an event was offered for since their last
     /// close.
     open: Mutex<BTreeSet<String>>,
+    /// Where the live record of each run it minted is.
+    runs: Arc<RunIndex>,
 }
 
 impl HistoryTap {
-    pub(super) fn new(queue: Arc<EventQueue>, minter: Arc<Minter>) -> Self {
+    pub(crate) fn new(queue: Arc<EventQueue>, minter: Arc<Minter>) -> Self {
         Self {
             queue,
             minter,
             open: Mutex::new(BTreeSet::new()),
+            runs: Arc::new(RunIndex::default()),
         }
+    }
+
+    /// Where the live record of each run this tap minted is.
+    pub(crate) fn runs(&self) -> Arc<RunIndex> {
+        Arc::clone(&self.runs)
     }
 
     fn open(&self) -> MutexGuard<'_, BTreeSet<String>> {
@@ -76,7 +115,9 @@ impl HistoryTap {
     /// The run of `row`'s attempt `i`, which settled at `at`: minted, queued and its
     /// id. `None` when the row has no such attempt, or the queue dropped the record
     /// (an id that names nothing is not kept).
-    fn run(&self, name: &str, row: &ActionRow, i: usize, at: WallTime) -> Option<[u8; 12]> {
+    fn run(&self, ended: &Ended, row: &ActionRow, i: usize) -> Option<[u8; 12]> {
+        let (name, at) = (ended.key.to_string(), ended.at);
+        let name = name.as_str();
         let attempt = row.attempts.get(i)?;
         let inv = InvRef::named(name);
         let minted = self.minter.mint(&inv.key, at.unix_micros() / 1000);
@@ -88,10 +129,13 @@ impl HistoryTap {
             failed: None,
             stream_opened_ms: minted.stream_opened_ms,
         });
-        if queued {
-            self.opened(name);
+        if !queued {
+            return None;
         }
-        queued.then(|| minted.id.to_bytes())
+        self.opened(name);
+        let id = minted.id.to_bytes();
+        self.runs.note(id, ended.key.clone(), ended.row);
+        Some(id)
     }
 }
 
@@ -108,9 +152,7 @@ impl Tap for HistoryTap {
             }
             return None;
         }
-        ended
-            .attempt
-            .and_then(|i| self.run(&name, row, i, ended.at))
+        ended.attempt.and_then(|i| self.run(ended, row, i))
     }
 
     fn idle(&self, key: &RecordKey) {
@@ -151,7 +193,7 @@ fn hit_record(row: &ActionRow, at: WallTime) -> HitRecord {
 /// The run id is the caller's. What the in-memory row has no source for is left at its
 /// default: the input root, the wait reason, the partition, the farm reruns and the
 /// presubmit time.
-fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
+pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
     let run = attempt.run.as_deref();
     let (outcome, exit_code) = outcome_of(row, attempt);
     let kill = attempt.memory_kill().unwrap_or(MemoryKillKind::None);
@@ -187,6 +229,7 @@ fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
     let log = |d: Option<&Digest>| d.map(wire);
     let times = run.map(|r| r.times).unwrap_or_default();
     let first_queued = row.attempts.first().map_or(attempt.queued, |a| a.queued);
+    let target = row.shape.as_deref().and_then(|s| s.target.as_ref());
     RunRecord {
         instance: row.instance.clone(),
         action: Some(wire(&row.action)),
@@ -201,6 +244,11 @@ fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
             .and_then(|s| s.cfg.clone())
             .unwrap_or_else(|| "-".to_owned()),
         test: row.shape.as_deref().is_some_and(|s| s.test),
+        attempt_queued_us: micros(Some(attempt.queued)),
+        started_us: micros(attempt.started),
+        ended_us: micros(attempt.ended),
+        target: target.map(|t| t.label.value.clone()).unwrap_or_default(),
+        target_kind: target.map_or(0, |t| kind_number(t.kind)),
         node: attempt.worker.as_str().to_owned(),
         lease_epoch: attempt.lease.term,
         lease_seq: attempt.lease.seq,
@@ -231,6 +279,7 @@ fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
             throttled_us: u.cpu_throttled_micros.unwrap_or(0),
             memory_peak_bytes: u.memory_peak_bytes.unwrap_or(0),
             numa_bytes: numa(&u.numa),
+            wall_us: u.wall_micros,
         }),
         outputs: listing.map_or_else(Vec::new, |l| {
             l.outputs
@@ -250,6 +299,16 @@ fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
             0
         },
         ..RunRecord::default()
+    }
+}
+
+/// What a run record's `target_kind` holds for `kind`: 1 a rule's target, 2 an anonymous
+/// target, 3 a BXL function.
+const fn kind_number(kind: TargetKind) -> u32 {
+    match kind {
+        TargetKind::Target => 1,
+        TargetKind::Anon => 2,
+        TargetKind::Bxl => 3,
     }
 }
 

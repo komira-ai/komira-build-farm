@@ -83,6 +83,7 @@ pub mod handover;
 pub mod health;
 pub mod history;
 pub mod http_blobs;
+mod http_history;
 pub mod http_invocations;
 pub mod identity;
 pub mod join;

@@ -945,4 +945,12 @@ async fn an_s3_history_store_takes_its_key_pair_from_the_environment() {
         .all(|name| std::env::var(name).is_ok());
     let real = args.history.open(Some(&state));
     assert_eq!(real.is_ok(), held, "{:?}", real.err());
+    // The flags and their error show as what they are.
+    if let Err(refused) = &real {
+        let shown = format!("{:?} {refused:?}", args.history.clone());
+        assert!(
+            shown.contains("history_objects") && shown.contains("Store"),
+            "{shown}"
+        );
+    }
 }

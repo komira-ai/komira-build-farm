@@ -163,6 +163,25 @@ async fn a_tap_that_mints_no_id_leaves_the_attempt_without_one() {
     assert_eq!(record.rows()[0].attempts[0].run_id, None);
 }
 
+/// Catches: a recording task with no tap that stops (it unwrapped the sweep's interval,
+/// which only a tap makes, while selecting), so that no event of a server that keeps no
+/// history was ever applied and every build page was empty. The wait is the failure's
+/// bound, not a measure: an applied event completes it at once.
+#[tokio::test]
+async fn a_recording_with_no_tap_applies_events() {
+    let (recorder, recording) = Recorder::new(1 << 20, 64);
+    tokio::spawn(recording.run());
+    queue(&recorder, "build", 1, 7);
+    recorder.emit(granted(7, 1));
+    recorder.emit(finished_ok(7, 1));
+    tokio::time::timeout(Duration::from_secs(30), recorder.caught_up())
+        .await
+        .expect("the recording task applies the events");
+    let record = recorder.get(&key("build")).expect("a record");
+    assert_eq!(record.rows()[0].attempts.len(), 1);
+    assert_eq!(record.rows()[0].attempts[0].run_id, None);
+}
+
 /// Catches: an idle record never reported (history would hold its chunk open for ever),
 /// one reported before it is idle, and one reported on every sweep rather than once.
 /// The records' times are the wall clock's; the sweep's cadence is the paused clock's.

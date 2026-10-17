@@ -143,6 +143,10 @@ pub struct Cgroup {
     /// Memory per NUMA node, bytes, by node number.
     #[prost(uint64, repeated, tag = "8")]
     pub numa_bytes: Vec<u64>,
+    /// Wall time from the action's start to its exit, microseconds. Added after the
+    /// first chunks were written: a record without it reads 0.
+    #[prost(uint64, tag = "9")]
+    pub wall_us: u64,
 }
 
 /// One output of a run.
@@ -262,6 +266,26 @@ pub struct RunRecord {
     /// the first chunks were written: a record without it reads `false`.
     #[prost(bool, tag = "33")]
     pub test: bool,
+    /// When the operation was queued for this attempt (submitted, or queued again after
+    /// the attempt before it), microseconds; 0 when not kept. `timestamps.queued_us`
+    /// is the first submission, so it cannot give this. Added after the first chunks
+    /// were written.
+    #[prost(uint64, tag = "34")]
+    pub attempt_queued_us: u64,
+    /// When the attempt's worker was sent the Start, microseconds; 0: never.
+    #[prost(uint64, tag = "35")]
+    pub started_us: u64,
+    /// When the attempt ended, microseconds; 0: it had not.
+    #[prost(uint64, tag = "36")]
+    pub ended_us: u64,
+    /// The target the action's own output paths name, as the server read it; empty when
+    /// they name none.
+    #[prost(string, tag = "37")]
+    pub target: String,
+    /// What kind of owner `target` names: 0 none or unknown, 1 a rule's target, 2 an
+    /// anonymous target, 3 a BXL function.
+    #[prost(uint32, tag = "38")]
+    pub target_kind: u32,
 }
 
 impl RunRecord {

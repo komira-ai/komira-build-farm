@@ -492,6 +492,49 @@ record of another caller of the same id ([invocations.md](design/invocations.md#
 It is matched as the bytes of the path: a percent-encoded character (`%3C`, `%6F`) is
 `404`, as is anything else.
 
+**With `--history-objects`** a record the in-memory records do not hold (the server
+restarted, or the record was removed at the bound) is read back from build history
+(`docs/design/ui-data.md` 5.5), and every route above answers from it as it does from a
+live record: filters, `sort=` and page tokens included. Without the flag nothing below
+applies and the routes are as described above.
+
+- **Authorized on every instance, in two steps.** The invocation's instance names are read
+  from its header and each is asked of `invocations.getAuthorizer`; the records are then
+  read and checked against exactly those names. An instance added in between is `503`
+  (send the request again). A header whose instance list is empty or was cut at its bound
+  cannot be checked whole, so the invocation answers `no_record` to every caller.
+- **What a restored record says.** `"restored": true` on the invocation, and, when history
+  has a hole (the invocation was never closed, or records were dropped), `"complete":
+  false` and `"gap_from"`: the time the last chunk that did land was written, from which
+  on records may be missing. `first_seen` and `last_seen` are those of the first and last
+  record, not of the first and last call.
+- **What it does not keep.** `tool`, `tool_version`, `correlated_invocations_id` and
+  `collisions` are empty; the counters are those the rows show (`ac_miss`, `blobs_*` and
+  `bytes_*` are 0); a row has no `target`, `mnemonic`, `configuration`, `action_id` or
+  `operation` of its own (the `shape` has the target the server read), no `usage` in its
+  action answer, an output's `executable` is `false`, and a cache hit has no listing. An
+  attempt's end and the row's outcome are read from the run's class: a failed run's gRPC
+  status code and a lost run's cause are not kept (see `restore.rs`). A cgroup counter the
+  daemon could not read is 0.
+- **Pages.** A page token made for a record the recorder held answers `no_record` once
+  the record is read back instead, and so does one made for a restored record that has
+  since left the 64 MiB cache of restored records. At most 50,000 records are read for one
+  invocation; past that the record is `rows_capped` and not complete.
+
+**`GET /v1/runs/{run_id}`** (with `--history-objects`; otherwise `404` as any unknown
+route) is one attempt: the instance, `lease` (`term.seq`), `worker`, `queued`, `granted`,
+`started` and `ended`, `class` (`ok`, `failed`, `timed_out`, `memory_killed`, `infra`,
+`lost`), `exit_code` for a run that exited, the memory kill and the booking, cap, raised
+booking, memory used and limit of a killed run, the REAPI times and cgroup `usage` the
+daemon reported, the digests of the action, command, result and logs, and the `shape`
+(its key, `cfg`, target and whether it is a test). A key the record has no value for is
+left out. The run is read from the in-memory record while it is held and from history
+after, in one rendering: the answer is the same before and after a restart. The run's one
+instance is asked of `invocations.getAuthorizer` before anything is answered. `{run_id}`
+is 24 lowercase hex digits, which the attempts of the build pages give as `run_id` and
+`run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end`, tails and
+transfer counters.
+
 **The invocation:**
 
 ```json
@@ -627,8 +670,8 @@ ran out are listed with the rest, failed or not.
 | `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
 | `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names: each one its calls used and each one a row holds, on every route |
-| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
-| `503` | the record gained an instance name while it was read: send the request again |
+| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart; with `--history-objects`, and not in history either), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
+| `503` | the record gained an instance name while it was read: send the request again; with `--history-objects`, history could not be read (`{"error": "build history cannot be read right now"}`) |
 
 **A record that is not held** answers `{"error": "no_record", "id": "<id>",
 "records_since": "<time>"}` ([invocations-api.md](design/invocations-api.md#410-a-record-that-is-gone)).
