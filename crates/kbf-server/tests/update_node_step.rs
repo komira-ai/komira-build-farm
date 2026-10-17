@@ -12,12 +12,12 @@ mod support;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    Alert, Command, DaemonLoad, Facts, GateFail, GiveBack, HoldReason, HostPhase, Policy, Severity,
-    SlotOp,
+    Alert, Command, DaemonLoad, Facts, GateFail, Generation, GiveBack, HoldReason, HostPhase,
+    Policy, Severity, Slot, SlotOp,
 };
 use support::{
-    BOOT, IDLE, NEXT_ORDER, NOW, activate, busy, gave_back, host_mut, id, linux, linux_fleet,
-    member_mut, policy, run, step_for, storage_fleet, t,
+    BOOT, GENERATION, IDLE, NEXT_ORDER, NOW, activate, busy, gave_back, host_mut, linux,
+    linux_fleet, member_mut, policy, run, step_for, storage_fleet, t, waiting_in,
 };
 
 const MIN: u64 = 60;
@@ -40,10 +40,53 @@ fn selected_cordons_once_the_claim_is_visible_and_the_gate_holds() {
 #[test]
 fn a_lost_claim_changes_nothing() {
     let mut f = storage_fleet();
-    f.slot = Some(id("s2"));
+    f.slot = Slot::default();
+    support::hold(&mut f, "s2");
     let moved = run(&f, "s1", &HostPhase::Selected, 0);
     assert_eq!(moved.next, HostPhase::Pending);
     assert_eq!(moved.commands, Vec::new());
+}
+
+/// Catches: the storage place and the daemon-only places read as one. A storage host's
+/// claim is lost only to another storage host: daemon-only hosts in a step (a full set of
+/// them) take nothing from it; and a daemon-only host's claim is lost only when all
+/// `max_hosts_out` places for hosts are held, however free the storage place is.
+#[test]
+fn the_storage_place_and_the_host_places_are_separate() {
+    let mut f = support::facts(
+        vec![
+            support::storage("s1", 1),
+            linux("d1"),
+            linux("d2"),
+            linux("d3"),
+        ],
+        support::members(3),
+    );
+    support::hold(&mut f, "d1");
+    let moved = run(&f, "s1", &HostPhase::Selected, 0);
+    assert_eq!(moved.next, HostPhase::Selected, "a free storage place");
+    assert_eq!(moved.commands, vec![Command::CasSlot(SlotOp::Claim)]);
+
+    // One place for hosts, held by d1: d2's claim is lost.
+    let lost = run(&f, "d2", &HostPhase::Selected, 0);
+    assert_eq!(lost.next, HostPhase::Pending);
+    assert_eq!(lost.commands, Vec::new());
+
+    // Three places: d2 may claim, and d3 after it is lost only when they are all held.
+    let three = Policy {
+        max_hosts_out: 3,
+        ..policy()
+    };
+    let claim = step_for(&f, "d2", &HostPhase::Selected, 0, &three);
+    assert_eq!(claim.next, HostPhase::Selected);
+    support::hold(&mut f, "d2");
+    let claim = step_for(&f, "d3", &HostPhase::Selected, 0, &three);
+    assert_eq!(claim.next, HostPhase::Selected);
+    support::hold(&mut f, "d3");
+    let mut full = f.clone();
+    full.hosts.push(linux("d4"));
+    let lost = step_for(&full, "d4", &HostPhase::Selected, 0, &three);
+    assert_eq!(lost.next, HostPhase::Pending);
 }
 
 /// Catches: a claim not yet visible read as lost (the host gives up on a CAS that
@@ -51,7 +94,7 @@ fn a_lost_claim_changes_nothing() {
 #[test]
 fn a_claim_not_yet_visible_is_claimed_again() {
     let mut f = storage_fleet();
-    f.slot = None;
+    f.slot = Slot::default();
     let moved = run(&f, "s1", &HostPhase::Selected, 0);
     assert_eq!(moved.next, HostPhase::Selected);
     assert_eq!(moved.commands, vec![Command::CasSlot(SlotOp::Claim)]);
@@ -128,7 +171,7 @@ fn a_host_that_disconnects_before_the_cordon_is_given_back_untouched() {
 #[test]
 fn a_claim_that_never_shows_is_given_back_at_the_health_limit() {
     let mut f = storage_fleet();
-    f.slot = None;
+    f.slot = Slot::default();
     let before = run(&f, "s1", &HostPhase::Selected, 119);
     assert_eq!(before.next, HostPhase::Selected);
     assert_eq!(before.commands, vec![Command::CasSlot(SlotOp::Claim)]);
@@ -674,4 +717,89 @@ fn a_mark_that_is_gone_or_a_reopened_write_gives_the_host_back_at_the_write_limi
         assert_eq!(at.next, HostPhase::Pending);
         assert_eq!(at.commands, gave_back(true, GiveBack::WritesNotQuiet));
     }
+}
+
+// A run that was replaced.
+
+/// A world in which a newer generation than the one on the rows has been offered.
+fn replaced(mut f: Facts) -> Facts {
+    f.generation = Generation(GENERATION.0 + 1);
+    f
+}
+
+/// Catches: a host that has done nothing irreversible going on to activate a release that a
+/// newer offer (a rollback, or a newer release) has replaced. Every step from the claim to
+/// the gate gives the host back when the run's generation is above the one on the host's
+/// row: `Selected` without an uncordon (nothing was cordoned), the others with it, and the
+/// mark undone where it was written. The step it would otherwise have taken is not taken,
+/// whatever it was waiting for.
+#[test]
+fn a_host_before_the_activate_order_is_given_back_when_a_newer_generation_is_offered() {
+    let selected = replaced(storage_fleet());
+    let moved = run(&selected, "s1", &HostPhase::Selected, 0);
+    assert_eq!(moved.next, HostPhase::Pending);
+    assert_eq!(
+        moved.commands,
+        vec![
+            Command::CasSlot(SlotOp::Release),
+            Command::Alert(Alert::GaveBack(GiveBack::Superseded)),
+        ]
+    );
+    for (phase, marked) in [
+        (HostPhase::Cordoned, false),
+        (HostPhase::WaitingLeases, false),
+        (HostPhase::PlannedDown, true),
+        (HostPhase::Gated, true),
+    ] {
+        let moved = run(&replaced(waiting_in(&phase)), "s1", &phase, 5);
+        assert_eq!(moved.next, HostPhase::Pending, "{phase:?}");
+        assert_eq!(
+            moved.commands,
+            gave_back(marked, GiveBack::Superseded),
+            "{phase:?}"
+        );
+        // The same world under the run that started the host goes on as before.
+        let kept = run(&waiting_in(&phase), "s1", &phase, 5);
+        assert_ne!(kept.next, HostPhase::Pending, "{phase:?}");
+    }
+}
+
+/// Catches: a replaced run that reaches a host past the activate order. The helper has the
+/// order and the node is restarting: nothing here can be undone, so the step goes on exactly
+/// as it would under the run that started the host (it finishes, and the rollback walks it
+/// back afterwards).
+#[test]
+fn a_host_past_the_activate_order_finishes_whatever_is_offered() {
+    for phase in [
+        HostPhase::Activating,
+        HostPhase::RejoiningStorage,
+        HostPhase::Repairing,
+        HostPhase::Confirming,
+    ] {
+        let same = run(&waiting_in(&phase), "s1", &phase, 5);
+        let newer = run(&replaced(waiting_in(&phase)), "s1", &phase, 5);
+        assert_eq!(newer, same, "{phase:?}");
+        assert!(
+            newer
+                .commands
+                .iter()
+                .all(|c| !matches!(c, Command::Alert(Alert::GaveBack(_)))),
+            "{phase:?}"
+        );
+    }
+}
+
+/// Catches: a Mac that was waiting for its leases when the run was replaced being deferred
+/// ("done with N deferred") as if it had missed its wait. It is given back to `Pending`, and
+/// picked in the new run when it is idle.
+#[test]
+fn a_mac_waiting_for_its_leases_in_a_replaced_run_is_pending_not_deferred() {
+    let mut f = support::facts(vec![support::mac("m1", "xcode16")], support::members(3));
+    support::hold(&mut f, "m1");
+    let host = host_mut(&mut f, "m1");
+    host.cordoned = Some(true);
+    host.load = Some(busy(1));
+    let moved = run(&replaced(f), "m1", &HostPhase::WaitingLeases, 5);
+    assert_eq!(moved.next, HostPhase::Pending);
+    assert_eq!(moved.commands, gave_back(false, GiveBack::Superseded));
 }

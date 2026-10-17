@@ -24,6 +24,7 @@ use super::command::Command;
 use super::gate::{GateFail, GateMode, storage_gate};
 use super::node_step::HostPhase;
 use super::policy::Policy;
+use super::slot::{Slot, SlotClass};
 
 /// A release, by whatever the controller compares: a commit or a software-set digest.
 /// Only equality is defined, so a rollback is another target and never "an older one".
@@ -44,23 +45,43 @@ impl Release {
     }
 }
 
-/// The serial of a run (`update/desired`): it grows with every release the controller
-/// offers, and a rollback is a new release with a higher serial (section 2.11). A host row
-/// carries the serial of the run that wrote it.
+/// The generation of a run (`update/desired`): it grows with every change of the desired
+/// release, and a rollback is the older release under a higher generation (section 2.11;
+/// `pull-updates.md` section 5). A higher generation is a new run. A host row carries the
+/// generation of the run that wrote it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Serial(pub u64);
+pub struct Generation(pub u64);
 
-/// The id of an order to a host's helper. Monotonic: a helper refuses a lower id than it
-/// has seen, and a status it reports names the order it answers, so a status left over from
-/// an earlier update is never read as the answer to this one (section 6.1).
+/// The id of an order to a host's helper: the store's epoch and a number drawn from a
+/// counter of that epoch. A helper refuses a lower id than it has seen, and a status it
+/// reports names the order it answers, so a status left over from an earlier update is never
+/// read as the answer to this one (section 6.1).
+///
+/// The epoch comes first in the order, so a store restored from a backup, whose counters have
+/// gone back, still issues ids above every id of the store it replaced: it opens at a later
+/// epoch ([`super::Controller::new`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OrderId(pub u64);
+pub struct OrderId {
+    /// The epoch of the store that issued it.
+    pub epoch: u64,
+    /// The number within the epoch.
+    pub seq: u64,
+}
 
 impl OrderId {
-    /// The id after this one.
+    /// The id `seq` of `epoch`.
+    #[must_use]
+    pub const fn new(epoch: u64, seq: u64) -> Self {
+        Self { epoch, seq }
+    }
+
+    /// The id after this one in the same epoch.
     #[must_use]
     pub const fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        Self {
+            epoch: self.epoch,
+            seq: self.seq.saturating_add(1),
+        }
     }
 }
 
@@ -168,9 +189,9 @@ pub struct HostRecord {
     pub phase: HostPhase,
     /// When it entered that phase.
     pub since: FarmTime,
-    /// The run that wrote the row. A row of an earlier run does not say this run's host
-    /// is done ([`HostRecord::is_open_in`]).
-    pub serial: Serial,
+    /// The generation of the run that wrote the row. A row of an earlier run does not say
+    /// this run's host is done ([`HostRecord::is_open_in`]).
+    pub generation: Generation,
     /// The activation order of this update: set with the row that enters `Activating`
     /// ([`super::Transition::order`]), and what a status must name to count.
     pub order: OrderId,
@@ -180,15 +201,28 @@ pub struct HostRecord {
 }
 
 impl HostRecord {
+    /// The row of a host no run has touched: `Pending`, written by no run (generation 0,
+    /// before the first offer), with no order and no mark.
+    #[must_use]
+    pub const fn unstarted() -> Self {
+        Self {
+            phase: HostPhase::Pending,
+            since: FarmTime::from_millis(0),
+            generation: Generation(0),
+            order: OrderId::new(0, 0),
+            boot_before: None,
+        }
+    }
+
     /// Whether the picker may start the host in the run `run`: a host that has not begun
     /// or was deferred, and a finished host of an *earlier* run, because a rollback walks
     /// back the hosts the forward run finished (section 2.11). `Held` and every step are
     /// never open: they hold the run.
     #[must_use]
-    pub fn is_open_in(&self, run: Serial) -> bool {
+    pub fn is_open_in(&self, run: Generation) -> bool {
         match self.phase {
             HostPhase::Pending | HostPhase::Deferred => true,
-            HostPhase::Done => self.serial < run,
+            HostPhase::Done => self.generation < run,
             HostPhase::Selected
             | HostPhase::Cordoned
             | HostPhase::WaitingLeases
@@ -206,8 +240,8 @@ impl HostRecord {
     /// Whether the host was deferred in the run `run` (it missed its lease wait once, and
     /// is not forced again). A `Deferred` row of an earlier run is a fresh start.
     #[must_use]
-    pub fn was_deferred_in(&self, run: Serial) -> bool {
-        self.phase == HostPhase::Deferred && self.serial >= run
+    pub fn was_deferred_in(&self, run: Generation) -> bool {
+        self.phase == HostPhase::Deferred && self.generation >= run
     }
 
     /// The commands a controller that restarted runs again for the phase it reads: the
@@ -315,6 +349,24 @@ impl HostFacts {
     pub fn is_back_at(&self, target: &Release) -> bool {
         self.connected && self.release.as_ref() == Some(target)
     }
+
+    /// Whether it can take work now, as the capacity floor counts it: connected, placement
+    /// shows it uncordoned (unknown is not), and its record says it is not in a step. The
+    /// record counts as well as placement because placement lags a cordon that was ordered.
+    #[must_use]
+    pub fn is_serving(&self) -> bool {
+        self.connected && self.cordoned == Some(false) && !self.record.phase.in_step()
+    }
+
+    /// Which slot the host takes when a run claims one for it.
+    #[must_use]
+    pub const fn slot_class(&self) -> SlotClass {
+        if self.is_storage() {
+            SlotClass::Storage
+        } else {
+            SlotClass::Host
+        }
+    }
 }
 
 /// The whole fleet at one look.
@@ -323,8 +375,8 @@ pub struct Facts {
     /// The release the run drives every host to. A rollback is the same run with the old
     /// release here: hosts are compared with `==`, never ordered.
     pub target: Release,
-    /// The serial of the run (`update/desired`).
-    pub serial: Serial,
+    /// The generation of the run (`update/desired`).
+    pub generation: Generation,
     /// The id the next order will carry: greater than every id issued so far. The
     /// controller draws it from the store's counter and, when a [`super::Transition`]
     /// names an order, counts it as used.
@@ -333,8 +385,8 @@ pub struct Facts {
     pub hosts: Vec<HostFacts>,
     /// Every storage member.
     pub members: Vec<MemberFacts>,
-    /// Who holds `update/slot`; `None` if nobody does.
-    pub slot: Option<WorkerId>,
+    /// Who holds `update/slot`.
+    pub slot: Slot,
     /// The Mac classes some queued operation asks for; `None` if unknown.
     pub queued_classes: Option<BTreeSet<PlatformClass>>,
     /// When the picker started waiting for an idle host: the run's start (E8) or the last
@@ -356,17 +408,25 @@ impl Facts {
     }
 
     /// How many hosts other than `host`, of its platform (a Linux host or a Mac of its
-    /// class), can take work now: connected and not cordoned. Placement unknown does not
-    /// count. This is what remains if `host` is cordoned (section 2.8, `min_serving`).
+    /// class), can take work now: connected, not cordoned and not in a step
+    /// ([`HostFacts::is_serving`]). Placement unknown does not count. This is what remains
+    /// if `host` is cordoned (section 2.8, `min_serving`).
     #[must_use]
     pub fn serving_peers(&self, host: &HostFacts) -> usize {
+        self.serving_peers_without(host, &[])
+    }
+
+    /// [`Facts::serving_peers`] with the hosts `gone` counted out as well: the hosts the
+    /// picker has already chosen in the same look, which are not yet shown cordoned.
+    #[must_use]
+    pub fn serving_peers_without(&self, host: &HostFacts, gone: &[&WorkerId]) -> usize {
         self.hosts
             .iter()
             .filter(|other| {
                 other.id != host.id
                     && other.platform == host.platform
-                    && other.connected
-                    && other.cordoned == Some(false)
+                    && other.is_serving()
+                    && !gone.contains(&&other.id)
             })
             .count()
     }
@@ -383,9 +443,9 @@ impl Facts {
 pub enum SlotView {
     /// This host.
     Mine,
-    /// Another host: the claim was lost.
+    /// Others: the slot of the host's class is full, so the claim was lost.
     Other,
-    /// Nobody, or not yet visible.
+    /// Room in the host's class, or the claim is not yet visible.
     Free,
 }
 
@@ -428,13 +488,18 @@ impl<'a> Observations<'a> {
         self.host.member.and_then(|id| self.facts.member(id))
     }
 
-    /// Who holds the slot.
+    /// Whether the host holds a slot: it does, or the slot of its class is full of others
+    /// (`max_hosts_out` is the room for daemon-only hosts and Macs), or there is room and
+    /// the claim is not visible yet.
     #[must_use]
-    pub fn slot(&self) -> SlotView {
-        match &self.facts.slot {
-            Some(holder) if *holder == self.host.id => SlotView::Mine,
-            Some(_) => SlotView::Other,
-            None => SlotView::Free,
+    pub fn slot(&self, max_hosts_out: usize) -> SlotView {
+        let slot = &self.facts.slot;
+        if slot.holds(&self.host.id) {
+            SlotView::Mine
+        } else if slot.has_room(self.host.slot_class(), max_hosts_out) {
+            SlotView::Free
+        } else {
+            SlotView::Other
         }
     }
 

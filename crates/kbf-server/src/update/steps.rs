@@ -93,6 +93,12 @@ impl Ctx<'_> {
         }
     }
 
+    /// Whether a higher generation than the one that started the host has been offered. A
+    /// host that has done nothing irreversible is then given back ([`decide`]).
+    fn superseded(&self) -> bool {
+        self.record().generation < self.obs.facts().generation
+    }
+
     /// A host that cannot be sent the activate order is given back (steps 2 to 5).
     fn disconnected(&self) -> Option<Transition> {
         (!self.obs.host().connected).then(|| self.back(GiveBack::Disconnected))
@@ -144,6 +150,17 @@ pub(super) fn decide(obs: &Observations<'_>, policy: &Policy, now: FarmTime) -> 
         HostPhase::Pending | HostPhase::Deferred | HostPhase::Done | HostPhase::Held { .. } => {
             ctx.stay(Vec::new())
         }
+        // Steps 1 to 5 have done nothing the host cannot be given back from: a run that has
+        // been replaced does not activate its release on them.
+        HostPhase::Selected
+        | HostPhase::Cordoned
+        | HostPhase::WaitingLeases
+        | HostPhase::PlannedDown
+        | HostPhase::Gated
+            if ctx.superseded() =>
+        {
+            ctx.back(GiveBack::Superseded)
+        }
         HostPhase::Selected => selected(&ctx),
         HostPhase::Cordoned => cordoned(&ctx),
         HostPhase::WaitingLeases => waiting_leases(&ctx),
@@ -166,8 +183,8 @@ pub(super) fn decide(obs: &Observations<'_>, policy: &Policy, now: FarmTime) -> 
 
 /// Step 1: the claim is visible, G_S still holds and the capacity floor is met.
 fn selected(ctx: &Ctx<'_>) -> Transition {
-    match ctx.obs.slot() {
-        // Another host holds the slot: nothing changed here.
+    match ctx.obs.slot(ctx.policy.max_hosts_out) {
+        // The slot of its class is full of others: nothing changed here.
         SlotView::Other => return Transition::to(HostPhase::Pending, Vec::new()),
         // The claim may not be visible yet; it is claimed again, for the health limit.
         SlotView::Free if ctx.waited >= ctx.policy.health_limit => {

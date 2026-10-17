@@ -19,9 +19,9 @@ use kbf_server::update::{
     PolicyError, Release, Severity, SlotOp, Transition, Work,
 };
 use support::{
-    BOOT, NEW, NEXT_ORDER, NOW, OLD, ORDER, SERIAL, activate, confirm, facts, host_mut, id, linux,
-    linux_fleet, mac, member_mut, members, policy, record_move, report, report_of, run, run_row,
-    step_for, storage, storage_fleet, t, waiting_in,
+    BOOT, EPOCH, GENERATION, NEW, NEXT_ORDER, NOW, OLD, ORDER, activate, confirm, facts, host_mut,
+    id, linux, linux_fleet, mac, member_mut, members, policy, record_move, report, report_of, run,
+    run_row, step_for, storage, storage_fleet, t, waiting_in,
 };
 
 const MIN: u64 = 60;
@@ -86,13 +86,21 @@ fn a_status_that_names_another_order_is_no_report() {
         HelperStatus::Reverted,
         HelperStatus::Refused,
     ];
-    for order in [OrderId(ORDER.0 - 1), OrderId(0), OrderId(ORDER.0 + 1)] {
+    // An id of the row's epoch below it and above it, none at all, and the row's own
+    // number in the epoch before (a restored store's earlier life).
+    let others = [
+        OrderId::new(ORDER.epoch, ORDER.seq - 1),
+        OrderId::new(0, 0),
+        OrderId::new(ORDER.epoch, ORDER.seq + 1),
+        OrderId::new(ORDER.epoch - 1, ORDER.seq),
+    ];
+    for order in others {
         for status in statuses {
             for phase in &phases {
                 let mut f = waiting_in(phase);
                 host_mut(&mut f, "s1").helper = report_of(order, status);
                 let moved = run(&f, "s1", phase, 10);
-                let why = format!("{phase:?} {status:?} of order {}", order.0);
+                let why = format!("{phase:?} {status:?} of order {order:?}");
                 assert_eq!(moved.next, *phase, "{why}");
                 assert_eq!(moved.commands, Vec::new(), "{why}");
             }
@@ -101,7 +109,8 @@ fn a_status_that_names_another_order_is_no_report() {
     // A daemon-only host back at the target does not confirm on a stale flip either.
     let mut f = linux_fleet();
     host_mut(&mut f, "d1").release = Some(Release::new(NEW));
-    host_mut(&mut f, "d1").helper = report_of(OrderId(ORDER.0 - 1), HelperStatus::Confirmed);
+    host_mut(&mut f, "d1").helper =
+        report_of(support::order(ORDER.seq - 1), HelperStatus::Confirmed);
     let moved = run(&f, "d1", &HostPhase::Activating, 10);
     assert_eq!(moved.next, HostPhase::Activating);
     // ... and the same status naming the row's order does.
@@ -599,10 +608,27 @@ fn the_default_policy_is_the_designs_and_fits_the_membership_it_reads() {
     assert_eq!(p.health_limit, secs(2 * MIN));
     assert_eq!(p.repair_wait, secs(5 * MIN));
     assert_eq!(p.min_serving, 0);
+    assert_eq!(p.max_hosts_out, 1);
     assert_eq!(p.mac_force_after, None);
     assert_eq!(p.rebuild_limit, None);
     assert!(p.write_limit * 2 + p.ttl < p.restart_deadline());
     assert_eq!(p.validate(), Ok(()));
+}
+
+/// Catches: a policy with no place for daemon-only hosts and Macs accepted, which no host
+/// of those kinds could ever be started under. One place is the least; the default is one.
+#[test]
+fn a_policy_with_no_place_for_hosts_is_refused() {
+    let none = Policy {
+        max_hosts_out: 0,
+        ..policy()
+    };
+    assert_eq!(none.validate(), Err(PolicyError::NoHostsOut));
+    let one = Policy {
+        max_hosts_out: 1,
+        ..policy()
+    };
+    assert_eq!(one.validate(), Ok(()));
 }
 
 /// Catches: a policy whose waits cannot be kept. Steps 4 and 5 may each wait a write
@@ -669,8 +695,10 @@ fn apply(f: &mut Facts, name: &str, commands: &[Command]) {
     let target = f.target.clone();
     for command in commands {
         match command {
-            Command::CasSlot(SlotOp::Claim) => f.slot = Some(id(name)),
-            Command::CasSlot(SlotOp::Release) => f.slot = None,
+            Command::CasSlot(SlotOp::Claim) => support::hold(f, name),
+            Command::CasSlot(SlotOp::Release) => {
+                f.slot.release(&id(name));
+            }
             Command::Cordon => host_mut(f, name).cordoned = Some(true),
             Command::Uncordon => {
                 host_mut(f, name).cordoned = Some(false);
@@ -864,12 +892,12 @@ fn entry_commands_name_the_activate_order_for_one_phase_only() {
         },
         HostPhase::Deferred,
     ];
-    let order = OrderId(77);
+    let order = OrderId::new(EPOCH, 77);
     for phase in &phases {
         let record = HostRecord {
             phase: phase.clone(),
             since: t(0),
-            serial: SERIAL,
+            generation: GENERATION,
             order,
             boot_before: None,
         };

@@ -77,7 +77,7 @@ fn a_held_host_stays_held_whatever_it_sees() {
 #[test]
 fn a_mac_waits_60_minutes_for_its_leases_and_is_then_deferred() {
     let mut f = facts(vec![mac("m1", "arm64"), mac("m2", "arm64")], members(3));
-    f.slot = Some(id("m1"));
+    support::hold(&mut f, "m1");
     host_mut(&mut f, "m1").cordoned = Some(true);
     host_mut(&mut f, "m1").load = Some(busy(1));
     let phase = HostPhase::WaitingLeases;
@@ -183,8 +183,9 @@ fn random_host(rng: &mut SimRng, shape: Shape, noise: u32) -> HostFacts {
     }
     // A status names the row's order, an older one or one the row does not know.
     let order = match rng.below(10) {
-        0 => OrderId(ORDER.0 - 1),
-        1 => OrderId(ORDER.0 + 1),
+        0 => support::order(ORDER.seq - 1),
+        1 => support::order(ORDER.seq + 1),
+        2 => OrderId::new(ORDER.epoch - 1, ORDER.seq),
         _ => ORDER,
     };
     h.helper = if pct(rng, noise) {
@@ -241,11 +242,16 @@ fn random_facts(rng: &mut SimRng, shape: Shape, noise: u32) -> (Facts, Policy) {
         }
         f.members.push(random_member(rng, n, noise));
     }
-    f.slot = if pct(rng, noise) {
-        one_of(rng, &[None, Some(id("someone-else"))])
+    // Nobody holds the place, someone else holds the host's kind of place, or the host does.
+    let holder = if pct(rng, noise) {
+        one_of(rng, &[None, Some("someone-else")])
     } else {
-        Some(id("h"))
+        Some("h")
     };
+    if let Some(name) = holder {
+        let class = f.hosts[0].slot_class();
+        support::hold_as(&mut f, name, class);
+    }
     let mut policy = support::policy();
     policy.min_serving = one_of(rng, &[0, 0, 1, 2]);
     (f, policy)
@@ -419,7 +425,7 @@ fn the_node_step_obeys_its_table_over_random_observations() {
                 // Back in `Pending` or `Deferred` from a step it freed the slot, unless
                 // the slot was never its own.
                 let freed = moved.commands.contains(&Command::CasSlot(SlotOp::Release));
-                let lost = *phase == HostPhase::Selected && f.slot.as_ref() != Some(&id("h"));
+                let lost = *phase == HostPhase::Selected && !f.slot.holds(&id("h"));
                 let left = matches!(moved.next, HostPhase::Pending | HostPhase::Deferred);
                 assert!(!left || freed || lost, "{why}");
             }

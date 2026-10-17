@@ -95,6 +95,13 @@ impl HostPhase {
         }
     }
 
+    /// Whether the host holds a place in `update/slot`: it is in a step, or `Held` (the
+    /// place stays held while a person decides).
+    #[must_use]
+    pub const fn holds_place(&self) -> bool {
+        self.in_step() || matches!(self, Self::Held { .. })
+    }
+
     /// Steps 2 to 5: nothing is irreversible yet, so every failure gives the host back
     /// (section 2.6: "uncordon, `Pending`").
     #[must_use]
@@ -205,7 +212,7 @@ impl Transition {
     pub fn select() -> Self {
         Self::to(
             HostPhase::Selected,
-            HostPhase::Selected.entry_commands(OrderId(0)),
+            HostPhase::Selected.entry_commands(OrderId::new(0, 0)),
         )
     }
 

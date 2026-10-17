@@ -1,7 +1,8 @@
 //! The picker (`docs/design/split-mode-updates.md` sections 2.6, 2.7 and 2.10, #898): who
-//! goes next. One host at a time, idle first, D3 after `idle_wait`, G_S failing closed for
-//! storage hosts, and the rules for Macs. The seeded property test over random fleets is
-//! in `update_pick_props.rs`.
+//! goes next. One storage host at a time, daemon-only hosts and Macs up to `max_hosts_out`
+//! beside it, idle first, D3 after `idle_wait`, G_S failing closed for storage hosts, and
+//! the rules for Macs. The seeded property test over random fleets is in
+//! `update_pick_props.rs`.
 //!
 //! Each test names the defect it would catch. The mutants that were planted to see each
 //! group go red are listed in the pull request.
@@ -14,12 +15,12 @@ use std::time::Duration;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    DaemonLoad, Facts, GateFail, HoldReason, HostPhase, Pick, Platform, PlatformClass, Policy,
-    Release, Serial, Skip, WaitReason, pick,
+    DaemonLoad, Facts, GateFail, Generation, HoldReason, HostPhase, Pick, Picked, Platform,
+    PlatformClass, Policy, Release, Skip, WaitReason, pick,
 };
 use kbf_types::FarmTime;
 use support::{
-    IDLE, NEW, NOW, OLD, SERIAL, busy, facts, host_mut, id, linux, mac, member_mut, members,
+    GENERATION, IDLE, NEW, NOW, OLD, busy, facts, host_mut, id, linux, mac, member_mut, members,
     policy, storage, t,
 };
 
@@ -29,11 +30,22 @@ fn pick_now(f: &Facts) -> Pick {
     pick(f, &policy(), t(NOW))
 }
 
+/// The answer that starts `name` alone.
 fn go(name: &str, force: bool) -> Pick {
-    Pick::Host {
-        host: id(name),
-        force,
-    }
+    goes(&[(name, force)])
+}
+
+/// The answer that starts these hosts, in this order.
+fn goes(hosts: &[(&str, bool)]) -> Pick {
+    Pick::Hosts(
+        hosts
+            .iter()
+            .map(|(name, force)| Picked {
+                host: id(name),
+                force: *force,
+            })
+            .collect(),
+    )
 }
 
 fn wait(why: WaitReason) -> Pick {
@@ -49,51 +61,7 @@ fn phase(f: &mut Facts, name: &str, phase: HostPhase) {
     host_mut(f, name).record.phase = phase;
 }
 
-// One host at a time.
-
-/// Catches: a host picked while the slot is held — by another host, or by a controller
-/// of the old release.
-#[test]
-fn nothing_starts_while_the_slot_is_held() {
-    let mut f = facts(vec![linux("d1"), linux("d2")], members(3));
-    f.slot = Some(id("d1"));
-    assert_eq!(pick_now(&f), wait(WaitReason::SlotHeld(id("d1"))));
-}
-
-/// Catches: a second host starting while one is in a step, for any of the ten steps. Out
-/// comes from the record: here the busy host's member still reads `Active` and fresh, its
-/// placement `Some(false)` (a cordon not yet shown), and the slot is not yet visible; only
-/// the record says a step has begun.
-#[test]
-fn nothing_starts_while_a_host_is_in_a_step_whatever_the_member_rows_say() {
-    let steps = [
-        HostPhase::Selected,
-        HostPhase::Cordoned,
-        HostPhase::WaitingLeases,
-        HostPhase::PlannedDown,
-        HostPhase::Gated,
-        HostPhase::Activating,
-        HostPhase::RejoiningStorage,
-        HostPhase::Repairing,
-        HostPhase::Confirming,
-        HostPhase::RejoiningWork,
-    ];
-    for step in steps {
-        let hosts = vec![
-            storage("s1", 1),
-            storage("s2", 2),
-            storage("s3", 3),
-            linux("d1"),
-        ];
-        let mut f = facts(hosts, members(3));
-        phase(&mut f, "s1", step.clone());
-        assert_eq!(
-            pick_now(&f),
-            wait(WaitReason::HostInStep(id("s1"))),
-            "{step:?}"
-        );
-    }
-}
+// The run's rows. The places are in `update_places.rs`.
 
 /// Catches: the run going on past a held host. A failure holds the run (section 2.1);
 /// "not Held" is also true of the host itself, which is never a candidate.
@@ -141,7 +109,7 @@ fn a_host_with_no_reported_release_is_never_picked_and_never_counted_done() {
 }
 
 /// Catches: a rollback that cannot reach the hosts the forward run finished. A rollback is
-/// the old release offered with a higher serial (section 2.11); the forward run left every
+/// the old release offered with a higher generation (section 2.11); the forward run left every
 /// host `Done`, and those rows are history, not this run's finish. Each host is picked once
 /// in the new run (a host `Done` in it is not picked again however late it reports), the
 /// run ends when every host is, and a hold from the earlier run still holds this one.
@@ -150,23 +118,26 @@ fn a_rollback_walks_back_hosts_the_forward_run_finished() {
     let hosts = vec![linux("a"), linux("b"), storage("s", 1)];
     let mut f = facts(hosts, members(3));
     f.target = Release::new(OLD);
-    f.serial = Serial(SERIAL.0 + 1);
+    f.generation = Generation(GENERATION.0 + 1);
     for name in ["a", "b", "s"] {
         let host = host_mut(&mut f, name);
         host.release = Some(Release::new(NEW));
         host.record.phase = HostPhase::Done;
-        host.record.serial = SERIAL;
+        host.record.generation = GENERATION;
     }
     let mut order = Vec::new();
-    while let Pick::Host { host, force } = pick_now(&f) {
-        assert!(!force);
-        let name = host.as_str().to_owned();
-        // Done in this run; the heartbeat still reports the release it left.
-        let run = f.serial;
-        let row = &mut host_mut(&mut f, &name).record;
-        row.phase = HostPhase::Done;
-        row.serial = run;
-        order.push(name);
+    // The storage host and the first daemon-only host start together; the second follows.
+    while let Pick::Hosts(picked) = pick_now(&f) {
+        for p in picked {
+            assert!(!p.force);
+            let name = p.host.as_str().to_owned();
+            // Done in this run; the heartbeat still reports the release it left.
+            let run = f.generation;
+            let row = &mut host_mut(&mut f, &name).record;
+            row.phase = HostPhase::Done;
+            row.generation = run;
+            order.push(name);
+        }
         assert!(order.len() <= 3, "a host was picked twice: {order:?}");
     }
     assert_eq!(order, ["s", "a", "b"]);
@@ -175,24 +146,24 @@ fn a_rollback_walks_back_hosts_the_forward_run_finished() {
     // A hold of the earlier run is a person's to decide, in this run too.
     let reason = HoldReason::Reverted;
     host_mut(&mut f, "a").record.phase = HostPhase::Held { reason };
-    host_mut(&mut f, "a").record.serial = SERIAL;
+    host_mut(&mut f, "a").record.generation = GENERATION;
     assert_eq!(pick_now(&f), wait(WaitReason::RunHeld(id("a"))));
 }
 
 /// Catches: a `Done` row of the *same* run read as open (the rollback fix applied to
-/// every serial): `Done` is final for the run that wrote it.
+/// every generation): `Done` is final for the run that wrote it.
 #[test]
 fn a_done_row_is_open_only_to_a_later_run() {
     let mut f = facts(vec![linux("a")], members(3));
     phase(&mut f, "a", HostPhase::Done);
     assert_eq!(pick_now(&f), wait(WaitReason::NothingToUpdate));
-    f.serial = Serial(SERIAL.0 - 1);
+    f.generation = Generation(GENERATION.0 - 1);
     assert_eq!(
         pick_now(&f),
         wait(WaitReason::NothingToUpdate),
-        "a row from a later serial than the run is not this run's to redo"
+        "a row from a later generation than the run is not this run's to redo"
     );
-    f.serial = Serial(SERIAL.0 + 1);
+    f.generation = Generation(GENERATION.0 + 1);
     assert_eq!(pick_now(&f), go("a", false));
 }
 
@@ -271,14 +242,27 @@ fn storage_first_is_a_tiebreak_and_not_a_barrier() {
         storage("e-storage", 3),
     ];
     let mut f = facts(hosts, members(3));
-    assert_eq!(pick_now(&f), go("c-storage", false));
+    // Storage first, then Linux, then the Mac; the one place for storage hosts and the one
+    // for the others are separate, so the best of each kind goes together.
+    assert_eq!(
+        pick_now(&f),
+        goes(&[("c-storage", false), ("b-linux", false)])
+    );
     phase(&mut f, "c-storage", HostPhase::Done);
-    assert_eq!(pick_now(&f), go("d-storage", false));
+    phase(&mut f, "b-linux", HostPhase::Done);
+    assert_eq!(
+        pick_now(&f),
+        goes(&[("d-storage", false), ("a-mac", false)])
+    );
     phase(&mut f, "d-storage", HostPhase::Done);
     phase(&mut f, "e-storage", HostPhase::Done);
-    assert_eq!(pick_now(&f), go("b-linux", false));
-    phase(&mut f, "b-linux", HostPhase::Done);
     assert_eq!(pick_now(&f), go("a-mac", false));
+    // Without the Linux host the Mac is next to the storage host, not behind all of them.
+    phase(&mut f, "e-storage", HostPhase::Pending);
+    assert_eq!(
+        pick_now(&f),
+        goes(&[("e-storage", false), ("a-mac", false)])
+    );
 
     // A busy storage node does not hold back an idle Linux host.
     let mut f = facts(vec![storage("s1", 1), linux("d1")], members(3));
@@ -683,7 +667,7 @@ fn a_deferral_of_an_earlier_run_is_a_fresh_start() {
         wait(WaitReason::NoneEligible(skipped))
     );
     // The next run: `m2` is already at the target, so only `m1` is a candidate.
-    f.serial = Serial(SERIAL.0 + 1);
+    f.generation = Generation(GENERATION.0 + 1);
     host_mut(&mut f, "m2").release = Some(Release::new(NEW));
     assert_eq!(pick(&f, &policy, t(NOW)), go("m1", true));
 }
@@ -852,9 +836,15 @@ fn a_rollback_is_the_same_walk_with_the_old_release_as_the_target() {
             host_mut(&mut f, name).release = Some(Release::new(release));
         }
         let mut order = Vec::new();
-        while let Pick::Host { host, force } = pick_now(&f) {
-            assert!(!force);
-            let name = host.as_str().to_owned();
+        // Three daemon-only hosts and one place for them: one at a time.
+        loop {
+            let answer = pick_now(&f);
+            let Pick::Hosts(picked) = &answer else {
+                break;
+            };
+            assert_eq!(picked.len(), 1, "{answer:?}");
+            assert!(!picked[0].force);
+            let name = picked[0].host.as_str().to_owned();
             host_mut(&mut f, &name).release = Some(Release::new(target));
             order.push(name);
         }

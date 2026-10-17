@@ -6,9 +6,9 @@ use super::gate::GateFail;
 /// An operation on `update/slot`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotOp {
-    /// Compare-and-set the slot to this host.
+    /// Compare-and-set a place for this host, if the places of its kind have room.
     Claim,
-    /// Free the slot, if this host holds it.
+    /// Free the place this host holds, if it holds one.
     Release,
 }
 
@@ -20,7 +20,7 @@ pub enum SlotOp {
 /// order id, and a helper that has seen an id must not act on it again (section 6.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Claim or free the global slot.
+    /// Claim or free the host's place in `update/slot`.
     CasSlot(SlotOp),
     /// `POST /v1/nodes/{node}:cordon`: placement skips the node.
     Cordon,
@@ -32,9 +32,14 @@ pub enum Command {
     MarkDown,
     /// Delete the mark: the member returns by its next heartbeat.
     Undown,
-    /// Order the host's helper to flip to the target release and restart. An error from
-    /// the order means "swapped, maybe": the controller never retries it with a new id
-    /// (section 5.1).
+    /// Order the host's helper to flip to the host's commit and restart. When the order is
+    /// not taken the controller cannot know whether the helper swapped (section 5.1 counts
+    /// that as "swapped, maybe"). It does not revert: the helper reverts itself by its own
+    /// timer. Section 5.1 also says "never retry", which this controller keeps in the sense
+    /// that it never orders a second activation: it gives the *same* order id again at every
+    /// look until the order is taken or the step's activate limit holds the run, and never
+    /// draws a new id for the host ([`super::Transport::activate`]). A helper acts on an id
+    /// once, so the repeat cannot swap twice. That is a choice the design leaves open.
     Activate {
         /// The id of the order; the helper's status names it.
         order: OrderId,
@@ -84,6 +89,11 @@ pub enum GiveBack {
     WritesNotQuiet,
     /// G_S is shut (steps 1, 3, 4 and 5).
     GateClosed(GateFail),
+    /// A higher generation was offered (a rollback, or a newer release) while the host had
+    /// done nothing irreversible, so the release it was started for is not activated on it.
+    /// Not in the design's table: it says a rollback is a higher generation and walks the
+    /// hosts back, not what a host in steps 1 to 5 does meanwhile.
+    Superseded,
 }
 
 /// Why a run is held for a person (section 5.1: a failure holds the run, never retried,

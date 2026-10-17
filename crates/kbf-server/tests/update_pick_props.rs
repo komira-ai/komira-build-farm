@@ -10,14 +10,16 @@
 //! earlier run. The picker is judged against the facts it was given, by an oracle that is
 //! written out below and shares no code with it.
 //!
-//! Asserted for every world: at most one host in a step, never a storage pick while G_S is
-//! false or unknown or its writes unreported, never a disconnected or cordoned host, never
-//! a finished (in this run) or held one, never a host that would leave fewer than
-//! `min_serving` of its platform, Macs never forced by default, a forced pick only after
-//! its wait and only when nothing is idle, an idle host never passed over, a forced pick
-//! made once the wait is over and a host could be forced, the last Mac of a class only when
-//! no queued operation needs it, and the same answer twice. A guard at the end fails the
-//! test if the worlds did not exercise each branch.
+//! Asserted for every world: at most one storage host out and `max_hosts_out` others (the
+//! places the slot and the records show taken, and those the answer takes, together), never
+//! a storage pick while G_S is false or unknown or its writes unreported, never a
+//! disconnected or cordoned host, never a finished (in this run) or held one, never a host
+//! that would leave fewer than `min_serving` of its platform with the other hosts of the
+//! answer gone too, Macs never forced by default, a forced pick only after its wait, alone,
+//! and only when nothing is idle, an idle host never passed over, a forced pick made once
+//! the wait is over and a host could be forced, the last Mac of a class only when no queued
+//! operation needs it (the other Macs of the answer gone too), and the same answer twice. A
+//! guard at the end fails the test if the worlds did not exercise each branch.
 
 #[path = "update_support/mod.rs"]
 mod support;
@@ -27,14 +29,14 @@ use std::time::Duration;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    DaemonLoad, Facts, HostFacts, HostKind, HostPhase, MemberFacts, Pick, Platform, PlatformClass,
-    Policy, Release, Serial, pick,
+    DaemonLoad, Facts, Generation, HostFacts, HostKind, HostPhase, MemberFacts, Pick, Picked,
+    Platform, PlatformClass, Policy, Release, SlotClass, pick,
 };
 use kbf_sim::{Chance, SimRng};
-use support::{IDLE, NEW, NOW, OLD, SERIAL, busy, facts, id, linux, mac, member, storage, t};
+use support::{GENERATION, IDLE, NEW, NOW, OLD, busy, facts, linux, mac, member, storage, t};
 
 const MIN: u64 = 60;
-const SEEDS: u64 = 3_000;
+const SEEDS: u64 = 10_000;
 
 fn pct(rng: &mut SimRng, p: u32) -> bool {
     rng.chance(Chance::percent(p))
@@ -117,7 +119,7 @@ fn random_host(rng: &mut SimRng, name: &str, kind: u64, link: u64) -> HostFacts 
     };
     h.record.phase = random_phase(rng);
     // The row was written by an earlier run, this one, or (a controller bug) a later one.
-    h.record.serial = Serial(SERIAL.0 - 1 + rng.below(3));
+    h.record.generation = Generation(GENERATION.0 - 1 + rng.below(3));
     h
 }
 
@@ -141,16 +143,26 @@ fn random_world(rng: &mut SimRng) -> (Facts, Policy) {
     }
     let mut f = facts(hosts, members);
     // This run, or the one after it (a rollback), so that earlier rows are history.
-    f.serial = Serial(SERIAL.0 + rng.below(2));
-    // The lag: a host the record says is in a step, whose live state says it is serving.
+    f.generation = Generation(GENERATION.0 + rng.below(2));
+    // The lag: a host the record says is in a step, whose live state says it is serving;
+    // its place is held or not yet shown.
     if pct(rng, 20) {
         let at = usize::try_from(rng.below(count)).expect("an index");
         f.hosts[at].record.phase = HostPhase::WaitingLeases;
         if pct(rng, 50) {
-            f.slot = Some(f.hosts[at].id.clone());
+            support::hold(&mut f, &format!("h{at}"));
         }
-    } else if pct(rng, 6) {
-        f.slot = Some(id("somebody"));
+        // A second host in a step, so that the places of one kind can fill.
+        if pct(rng, 30) {
+            let other = usize::try_from(rng.below(count)).expect("an index");
+            if other != at {
+                f.hosts[other].record.phase = HostPhase::Gated;
+            }
+        }
+    } else if pct(rng, 8) {
+        // A place held by a host that is not in the run, of either kind.
+        let class = [SlotClass::Storage, SlotClass::Host][usize::from(pct(rng, 50))];
+        support::hold_as(&mut f, "somebody", class);
     }
     f.queued_classes = match rng.below(10) {
         0 => None,
@@ -171,6 +183,9 @@ fn random_world(rng: &mut SimRng) -> (Facts, Policy) {
     }
     if pct(rng, 25) {
         policy.min_serving = 1 + usize::try_from(rng.below(2)).expect("small");
+    }
+    if pct(rng, 50) {
+        policy.max_hosts_out = 1 + usize::try_from(rng.below(3)).expect("small");
     }
     (f, policy)
 }
@@ -200,17 +215,44 @@ fn gate_open(f: &Facts, host: &HostFacts, policy: &Policy) -> bool {
 fn open(f: &Facts, h: &HostFacts) -> bool {
     match h.record.phase {
         HostPhase::Pending | HostPhase::Deferred => true,
-        HostPhase::Done => h.record.serial < f.serial,
+        HostPhase::Done => h.record.generation < f.generation,
         _ => false,
     }
 }
 
-/// Hosts of the same platform, other than `h`, connected and shown uncordoned.
-fn serving_others(f: &Facts, h: &HostFacts) -> usize {
+/// Hosts of the same platform, other than `h` and the `gone` ones, connected and shown
+/// uncordoned, and not in a step by their record.
+fn serving_others(f: &Facts, h: &HostFacts, gone: &[&str]) -> usize {
     let serves = |o: &&HostFacts| {
-        o.id != h.id && o.platform == h.platform && o.connected && o.cordoned == Some(false)
+        o.id != h.id
+            && o.platform == h.platform
+            && o.connected
+            && o.cordoned == Some(false)
+            && !o.record.phase.in_step()
+            && !gone.contains(&o.id.as_str())
     };
     f.hosts.iter().filter(serves).count()
+}
+
+/// The places taken: storage hosts and other hosts that are in a step by their record or
+/// hold a place in the slot, each counted once.
+fn out_counts(f: &Facts) -> (usize, usize) {
+    let mut storage = BTreeSet::new();
+    let mut others = BTreeSet::new();
+    for h in f.hosts.iter().filter(|h| h.record.phase.in_step()) {
+        if h.is_storage() {
+            storage.insert(h.id.as_str().to_owned());
+        } else {
+            others.insert(h.id.as_str().to_owned());
+        }
+    }
+    if let Some(holder) = &f.slot.storage {
+        storage.insert(holder.host.as_str().to_owned());
+    }
+    for holder in &f.slot.hosts {
+        others.insert(holder.host.as_str().to_owned());
+    }
+    (storage.len(), others.len())
 }
 
 /// Whether a Linux or storage host may be picked now, and whether it is idle: connected,
@@ -228,7 +270,7 @@ fn eligible_linux(f: &Facts, h: &HostFacts, policy: &Policy) -> Option<bool> {
         && h.release.as_ref().is_some_and(|r| *r != f.target)
         && h.connected
         && h.cordoned == Some(false)
-        && serving_others(f, h) >= policy.min_serving;
+        && serving_others(f, h, &[]) >= policy.min_serving;
     let load = h.load.filter(|_| ok)?;
     let quiet = h.open_writes.unwrap_or(1) == 0 && h.routed_writes.unwrap_or(1) == 0;
     let writes_ok = h.kind == HostKind::DaemonOnly || quiet;
@@ -251,6 +293,8 @@ struct Seen {
     earlier_run_picks: u64,
     floor_picks: u64,
     busy_writes_storage_picks: u64,
+    /// Answers that start more than one host.
+    multi: u64,
 }
 
 fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
@@ -262,50 +306,59 @@ fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
         "{why}: not the same answer twice"
     );
 
-    let in_step = f.hosts.iter().any(|h| h.record.phase.in_step());
     let held = f
         .hosts
         .iter()
         .any(|h| matches!(h.record.phase, HostPhase::Held { .. }));
-    if in_step || f.slot.is_some() || held {
+    let (out_storage, out_others) = out_counts(f);
+    let room_storage = 1usize.saturating_sub(out_storage);
+    let room_others = policy.max_hosts_out.saturating_sub(out_others);
+    if held || (room_storage == 0 && room_others == 0) {
         seen.waits_in_step += 1;
         assert!(
             matches!(answer, Pick::Wait { .. }),
-            "{why}: a host was picked with another in a step, the slot held or the run held: {answer:?}"
+            "{why}: a host was picked with the run held or every place taken: {answer:?}"
         );
         return;
     }
+    let room = |h: &HostFacts| {
+        if h.is_storage() {
+            room_storage
+        } else {
+            room_others
+        }
+    };
 
     let elapsed = now.saturating_duration_since(f.wait_since);
     // An idle host that can be picked, a Linux daemon-only one or a storage one with G_S
-    // open, is never passed over for a forced pick, nor left waiting: the answer is some
-    // idle host, not forced.
+    // open, with a place free for its kind, is never passed over for a forced pick, nor
+    // left waiting: the answer is idle hosts, none forced.
     let idle_ok = f
         .hosts
         .iter()
-        .any(|h| eligible_linux(f, h, policy) == Some(true));
+        .any(|h| room(h) > 0 && eligible_linux(f, h, policy) == Some(true));
     if idle_ok {
         seen.idle_linux_checked += 1;
         assert!(
-            matches!(answer, Pick::Host { force: false, .. }),
+            matches!(&answer, Pick::Hosts(p) if p.iter().all(|x| !x.force)),
             "{why}: an idle host was passed over: {answer:?}"
         );
     }
     // Once the idle wait is over and a host could be forced (a busy one that is not a
-    // Mac and was not deferred in this run), some host is picked.
+    // Mac and was not deferred in this run, with a place free), some host is picked.
     let forceable = f.hosts.iter().any(|h| {
-        let deferred = h.record.phase == HostPhase::Deferred && h.record.serial >= f.serial;
-        eligible_linux(f, h, policy) == Some(false) && !deferred
+        let deferred = h.record.phase == HostPhase::Deferred && h.record.generation >= f.generation;
+        room(h) > 0 && eligible_linux(f, h, policy) == Some(false) && !deferred
     });
     if !idle_ok && forceable && elapsed >= policy.idle_wait {
         seen.forced_expected += 1;
         assert!(
-            matches!(answer, Pick::Host { .. }),
+            matches!(answer, Pick::Hosts(_)),
             "{why}: nothing was picked though a host could be forced: {answer:?}"
         );
     }
 
-    let Pick::Host { host, force } = answer else {
+    let Pick::Hosts(picked) = answer else {
         for h in f
             .hosts
             .iter()
@@ -316,8 +369,50 @@ fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
         }
         return;
     };
+    // The answer as a set: no host twice, the places of each kind not overrun, and a
+    // forced host alone.
+    let names: Vec<&str> = picked.iter().map(|p| p.host.as_str()).collect();
+    let distinct: BTreeSet<&str> = names.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        names.len(),
+        "{why}: a host twice: {names:?}"
+    );
+    let in_storage = |p: &Picked| f.host(&p.host).is_some_and(HostFacts::is_storage);
+    let storage_n = picked.iter().filter(|p| in_storage(p)).count();
+    assert!(
+        storage_n <= room_storage,
+        "{why}: {storage_n} storage hosts with {out_storage} out: {names:?}"
+    );
+    assert!(
+        picked.len() - storage_n <= room_others,
+        "{why}: {names:?} with {out_others} others out and {} places",
+        policy.max_hosts_out
+    );
+    assert!(
+        picked.len() == 1 || picked.iter().all(|p| !p.force),
+        "{why}: a forced host with others: {picked:?}"
+    );
+    seen.multi += u64::from(picked.len() > 1);
+    for p in &picked {
+        check_host(f, policy, seen, why, &names, &p.host, p.force, elapsed);
+    }
+}
+
+/// The rules for one host of the answer `names`.
+#[allow(clippy::too_many_arguments)]
+fn check_host(
+    f: &Facts,
+    policy: &Policy,
+    seen: &mut Seen,
+    why: &str,
+    names: &[&str],
+    host: &kbf_types::WorkerId,
+    force: bool,
+    elapsed: Duration,
+) {
     seen.picks += 1;
-    let h = f.host(&host).expect("a picked host is in the facts");
+    let h = f.host(host).expect("a picked host is in the facts");
     assert!(h.connected, "{why}: {host} is disconnected");
     assert_eq!(
         h.cordoned,
@@ -331,7 +426,8 @@ fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
         release.is_some_and(|r| *r != f.target),
         "{why}: {host} runs {release:?}"
     );
-    let serving = serving_others(f, h);
+    // The other hosts of the answer are not yet shown cordoned, but they are going.
+    let serving = serving_others(f, h, names);
     assert!(
         serving >= policy.min_serving,
         "{why}: {host} leaves {serving} serving, under the floor {}",
@@ -349,7 +445,7 @@ fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
             elapsed >= policy.idle_wait,
             "{why}: forced after {elapsed:?}"
         );
-        let deferred = h.record.phase == HostPhase::Deferred && h.record.serial >= f.serial;
+        let deferred = h.record.phase == HostPhase::Deferred && h.record.generation >= f.generation;
         assert!(!deferred, "{why}: {host} was forced after it was deferred");
     } else {
         assert!(idle, "{why}: {host} is not idle and was not forced");
@@ -376,8 +472,14 @@ fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
             }
             Some(_) => {}
         }
+        // Another Mac of the class that keeps serving: not in a step, not in the answer.
         let served = f.hosts.iter().any(|o| {
-            o.id != h.id && o.platform == h.platform && o.connected && o.cordoned == Some(false)
+            o.id != h.id
+                && o.platform == h.platform
+                && o.connected
+                && o.cordoned == Some(false)
+                && !o.record.phase.in_step()
+                && !names.contains(&o.id.as_str())
         });
         let needed = f
             .queued_classes
@@ -391,15 +493,18 @@ fn check(f: &Facts, policy: &Policy, seen: &mut Seen, why: &str) {
     }
 }
 
-/// Catches, over 3,000 seeded worlds with lagging facts, each of: a second host started
-/// while one is in a step (the record, not the member row, says so), a storage host picked
-/// with G_S shut, any part of it unknown, or its writes unreported, a disconnected,
-/// cordoned, finished or held host picked, a host picked that leaves fewer than the floor
-/// serving, a Mac forced by default or before its own wait, the last Mac of a class updated
-/// under a queue that needs it, a forced pick before `idle_wait` or of an idle host or of a
-/// host already deferred, an idle host passed over, no pick once the wait is over and a host
-/// could be forced, a host finished by an earlier run not offered again to a later one, and
-/// an answer that changes when asked twice.
+/// Catches, over 10,000 seeded worlds with lagging facts, each of: a second storage host
+/// started while one is in a step, more daemon-only hosts and Macs than `max_hosts_out`
+/// (the record, not the member row, says what is out; a storage host out takes none of their
+/// places), a host started twice in an answer, a storage host picked with G_S shut, any part
+/// of it unknown, or its writes unreported, a disconnected, cordoned, finished or held host
+/// picked, a host picked that leaves fewer than the floor serving (the others of the same
+/// answer counted as gone), a Mac forced by default or before its own wait, the last Mac of
+/// a class updated under a queue that needs it (or two Macs of one class together), a forced
+/// pick before `idle_wait` or of an idle host or of a host already deferred or with others,
+/// an idle host passed over, no pick once the wait is over and a host could be forced, a
+/// host finished by an earlier run not offered again to a later one, and an answer that
+/// changes when asked twice.
 #[test]
 fn the_picker_keeps_its_rules_over_random_fleets_with_lagging_facts() {
     let mut seen = Seen::default();
@@ -421,6 +526,7 @@ fn the_picker_keeps_its_rules_over_random_fleets_with_lagging_facts() {
         && seen.gate_shut_storage_idle > 100
         && seen.earlier_run_picks > 20
         && seen.floor_picks > 50
-        && seen.busy_writes_storage_picks > 10;
+        && seen.busy_writes_storage_picks > 10
+        && seen.multi > 100;
     assert!(reached, "the worlds did not reach every rule: {seen:?}");
 }

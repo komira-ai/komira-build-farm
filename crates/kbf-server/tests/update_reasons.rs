@@ -6,10 +6,8 @@
 #[path = "update_support/mod.rs"]
 mod support;
 
-use kbf_server::update::{
-    Alert, HoldReason, HostPhase, HostRecord, OrderId, Release, Serial, Severity,
-};
-use support::{NOW, SERIAL, t};
+use kbf_server::update::{Alert, Generation, HoldReason, HostPhase, HostRecord, Release, Severity};
+use support::{GENERATION, NOW, ORDER, t};
 
 /// Catches: a hold that leaves the binary healthy, or the node already put back, paging a
 /// person as if data availability were at risk (or the other way round).
@@ -63,14 +61,14 @@ fn only_pending_deferred_and_earlier_done_rows_are_open() {
     let row = |phase| HostRecord {
         phase,
         since: t(NOW),
-        serial: SERIAL,
-        order: OrderId(1),
+        generation: GENERATION,
+        order: ORDER,
         boot_before: None,
     };
-    let later = Serial(SERIAL.0 + 1);
-    assert!(row(HostPhase::Pending).is_open_in(SERIAL));
-    assert!(row(HostPhase::Deferred).is_open_in(SERIAL));
-    assert!(!row(HostPhase::Done).is_open_in(SERIAL));
+    let later = Generation(GENERATION.0 + 1);
+    assert!(row(HostPhase::Pending).is_open_in(GENERATION));
+    assert!(row(HostPhase::Deferred).is_open_in(GENERATION));
+    assert!(!row(HostPhase::Done).is_open_in(GENERATION));
     assert!(row(HostPhase::Done).is_open_in(later));
     for phase in [
         HostPhase::Selected,

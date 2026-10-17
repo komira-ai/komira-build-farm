@@ -11,11 +11,14 @@ use std::collections::BTreeSet;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_server::update::{
-    Alert, Command, DaemonLoad, Facts, GiveBack, HelperReport, HelperStatus, HostFacts, HostKind,
-    HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass, Policy, Release, Serial,
-    SlotOp, Transition, step,
+    Alert, Command, DaemonLoad, Facts, Generation, GiveBack, HelperReport, HelperStatus, Holder,
+    HostFacts, HostKind, HostPhase, HostRecord, MemberFacts, OrderId, Platform, PlatformClass,
+    Policy, Release, Slot, SlotClass, SlotOp, Transition, step,
 };
 use kbf_types::{FarmTime, WorkerId};
+
+pub mod harness;
+pub mod world;
 
 /// The release every host runs at the start.
 pub const OLD: &str = "v1";
@@ -23,12 +26,19 @@ pub const OLD: &str = "v1";
 pub const NEW: &str = "v2";
 /// The time of the look, in seconds. Large, so a test can say a step began hours before.
 pub const NOW: u64 = 1_000_000;
-/// The serial of the run.
-pub const SERIAL: Serial = Serial(7);
+/// The generation of the run.
+pub const GENERATION: Generation = Generation(7);
+/// The store's epoch the orders of these tests are drawn under.
+pub const EPOCH: u64 = 1;
 /// The activation order a host's row holds (the one the host's current update was given).
-pub const ORDER: OrderId = OrderId(41);
+pub const ORDER: OrderId = OrderId::new(EPOCH, 41);
 /// The id the fleet will give the next order.
-pub const NEXT_ORDER: OrderId = OrderId(42);
+pub const NEXT_ORDER: OrderId = OrderId::new(EPOCH, 42);
+
+/// The order `n` of the tests' epoch.
+pub const fn order(n: u64) -> OrderId {
+    OrderId::new(EPOCH, n)
+}
 /// A member's boot counter, and the one a host's row recorded at the mark.
 pub const BOOT: u64 = 10;
 
@@ -98,7 +108,7 @@ fn host(name: &str, kind: HostKind, platform: Platform, member: Option<u64>) -> 
         record: HostRecord {
             phase: HostPhase::Pending,
             since: t(0),
-            serial: SERIAL,
+            generation: GENERATION,
             order: ORDER,
             boot_before: Some(BOOT),
         },
@@ -149,14 +159,35 @@ pub fn members(n: u64) -> Vec<MemberFacts> {
 pub fn facts(hosts: Vec<HostFacts>, members: Vec<MemberFacts>) -> Facts {
     Facts {
         target: Release::new(NEW),
-        serial: SERIAL,
+        generation: GENERATION,
         next_order: NEXT_ORDER,
         hosts,
         members,
-        slot: None,
+        slot: Slot::default(),
         queued_classes: Some(BTreeSet::new()),
         wait_since: t(NOW),
     }
+}
+
+/// Gives `name` a place in the slot, of the kind the host in `facts` takes. A name that is
+/// not a host of the run takes a place of `class_if_unknown`.
+pub fn hold_as(facts: &mut Facts, name: &str, class_if_unknown: SlotClass) {
+    let class = facts
+        .host(&id(name))
+        .map_or(class_if_unknown, HostFacts::slot_class);
+    let holder = Holder {
+        host: id(name),
+        order: ORDER,
+    };
+    assert!(
+        facts.slot.claim(class, holder, usize::MAX),
+        "{name} could not take a place"
+    );
+}
+
+/// [`hold_as`] for a host of the run.
+pub fn hold(facts: &mut Facts, name: &str) {
+    hold_as(facts, name, SlotClass::Host);
 }
 
 /// The member `n` of `facts`, to change.
@@ -186,7 +217,7 @@ pub fn policy() -> Policy {
 pub fn storage_fleet() -> Facts {
     let hosts = vec![storage("s1", 1), storage("s2", 2), storage("s3", 3)];
     let mut f = facts(hosts, members(3));
-    f.slot = Some(id("s1"));
+    hold(&mut f, "s1");
     host_mut(&mut f, "s1").cordoned = Some(true);
     f
 }
@@ -195,7 +226,7 @@ pub fn storage_fleet() -> Facts {
 /// members that no host is linked to.
 pub fn linux_fleet() -> Facts {
     let mut f = facts(vec![linux("d1"), linux("d2")], members(3));
-    f.slot = Some(id("d1"));
+    hold(&mut f, "d1");
     host_mut(&mut f, "d1").cordoned = Some(true);
     f
 }
