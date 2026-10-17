@@ -19,9 +19,9 @@
 //! Index calls go through the [`HistoryIndex`]'s offload, so the reader's `async fn`s
 //! may be awaited on a runtime worker.
 //!
-//! TODO: read the index with a bounded range scan once the `kbf-state` trait has one
-//! (suite clause C8, added by a sibling change); until then both lookups use
-//! `scan_prefix`, which returns every row under the prefix.
+//! The two lookups above (a stream's rows, an invocation's chunk rows) still use
+//! `scan_prefix`: each prefix holds one stream's or one invocation's rows, a few. The
+//! lists across builds (`listing`) read bounded ranges (suite clause C8).
 
 use std::fmt;
 use std::str::FromStr;
@@ -177,7 +177,9 @@ struct Located {
 pub struct Reader<O> {
     objects: Scoped<O>,
     root: HistoryRoot,
-    index: HistoryIndex,
+    pub(crate) index: HistoryIndex,
+    /// Index rows one list page scans at most.
+    pub(crate) scan_budget: usize,
 }
 
 impl<O: ObjectStore> Reader<O> {
@@ -188,7 +190,16 @@ impl<O: ObjectStore> Reader<O> {
             objects: Scoped::history(objects, &root),
             root,
             index,
+            scan_budget: crate::listing::MAX_SCAN,
         }
+    }
+
+    /// The same reader, scanning at most `rows` (at least 1) index rows for one page of
+    /// a list, where the default is [`MAX_SCAN`](crate::MAX_SCAN).
+    #[must_use]
+    pub fn scanning_at_most(mut self, rows: usize) -> Reader<O> {
+        self.scan_budget = rows.max(1);
+        self
     }
 
     /// The run `id`, if history holds it and its instance is allowed.
@@ -416,7 +427,7 @@ fn chunk_object_key(root: &HistoryRoot, inv: &InvKey, c: &Chunk) -> ObjectKey {
 /// Whether `allow` accepts every instance `header` lists, and the list is whole: an
 /// empty list (no record names an instance) or one the writer truncated cannot show
 /// that every instance is allowed, so it fails closed.
-fn all_allow(header: &InvocationHeader, allow: &dyn Fn(&str) -> bool) -> bool {
+pub(crate) fn all_allow(header: &InvocationHeader, allow: &dyn Fn(&str) -> bool) -> bool {
     !header.instances.is_empty()
         && !header.instances_truncated
         && header.instances.iter().all(|i| allow(i))
@@ -436,7 +447,7 @@ fn decode_tail(tail: &Bytes) -> Result<Footer, ReadError> {
     Ok(container::decode_footer(tail)?.1)
 }
 
-fn decode_row<M: Message + Default>(key: &str, value: &[u8]) -> Result<M, ReadError> {
+pub(crate) fn decode_row<M: Message + Default>(key: &str, value: &[u8]) -> Result<M, ReadError> {
     M::decode(value).map_err(|e| ReadError::Row {
         key: key.to_owned(),
         message: e.to_string(),
