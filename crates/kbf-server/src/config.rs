@@ -226,12 +226,16 @@ pub struct Args {
     /// PEM CA that client certificates must chain to. Each must also name the role the
     /// method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker
     /// session and blob calls, the storage role (`urn:kbf:role:storage`) for
-    /// `kbf.map.v1.Membership`; a frontend certificate may call nothing here.
+    /// `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance
+    /// id and of the address it registers; a frontend certificate may call nothing here.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
     /// The worker listener's deny list: certificate serials, public keys and node ids
     /// it refuses (format in the `identity` module docs). Read at start, then again at
-    /// every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs
+    /// every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob
+    /// calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect
+    /// without a restart. A `node` entry also refuses a storage certificate with that DNS
+    /// name. A list that cannot be read after start refuses all of those calls. Needs
     /// mutual TLS.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
     pub worker_deny_list: Option<PathBuf>,

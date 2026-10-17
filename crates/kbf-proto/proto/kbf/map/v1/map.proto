@@ -80,7 +80,8 @@ service Membership {
   // as JOINING, or CATCHING_UP when the request says it is rebuilding its index.
   rpc Register(RegisterRequest) returns (RegisterResponse);
   // Keeps the member's row alive, and carries the end of a rebuild (CATCHING_UP to
-  // ACTIVE). NOT_FOUND means the row expired (or never was): register again.
+  // ACTIVE). NOT_FOUND means the row expired (or never was): register again. Under mutual
+  // TLS PERMISSION_DENIED means the caller's certificate does not name the member's address.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -91,9 +92,13 @@ enum Role {
 
 message RegisterRequest {
   Role role = 1;
-  // Stable across restarts of one node; the key of its member id.
+  // Stable across restarts of one node; the key of its member id. Under mutual TLS the
+  // host of it (`host` or `host:port`) must be one of the DNS or IP names in the caller's
+  // certificate, or the registration is PERMISSION_DENIED.
   string instance_id = 2;
-  // The address callers dial.
+  // The address callers dial. Under mutual TLS its host must be named by the caller's
+  // certificate the same way, and a Heartbeat for the member must come from a
+  // certificate that names it.
   string addr = 3;
   // Relative capacity: its share of the digests, at least 1.
   uint32 weight = 4;

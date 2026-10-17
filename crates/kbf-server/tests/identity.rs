@@ -161,6 +161,63 @@ fn the_deny_list_parses_every_entry_or_names_the_bad_line() {
     }
 }
 
+/// Catches: a storage node's certificate judged by one name only, or by none. A storage
+/// certificate carries several names, and a `node` entry denies it when any DNS name in
+/// it is listed (an IP name is no node id, and a listed name that is only a prefix or in
+/// another case is not that node); its serial and key are judged as for a daemon, a
+/// listed node being reported before them.
+///
+/// Mutant seen red: only the first DNS name looked at.
+#[test]
+fn a_storage_certificate_is_denied_by_any_of_its_names_its_serial_or_its_key() {
+    let several = PeerCert::from_der(&cert(
+        vec![
+            SanType::IpAddress([192, 0, 2, 1].into()),
+            dns("node-a"),
+            dns("node-a.farm.example"),
+            role("storage"),
+        ],
+        "cn",
+        &[0x0a],
+    ))
+    .expect("certificate");
+    let denied = |text: &str| Denied::parse(text).expect("a list");
+    assert_eq!(
+        denied("node node-a.farm.example").refuses_cert(&several),
+        Some("node node-a.farm.example".to_owned())
+    );
+    assert_eq!(
+        denied("node node-a").refuses_cert(&several),
+        Some("node node-a".to_owned())
+    );
+    for not_listed in [
+        "node node-b",
+        "node node-",
+        "node NODE-A",
+        "node 192.0.2.1",
+        "",
+    ] {
+        assert_eq!(
+            denied(not_listed).refuses_cert(&several),
+            None,
+            "{not_listed}"
+        );
+    }
+    assert_eq!(
+        denied("serial 0A").refuses_cert(&several),
+        Some("certificate serial a".to_owned())
+    );
+    let key = format!("spki-sha256 {}", several.spki_sha256());
+    assert_eq!(
+        denied(&key).refuses_cert(&several),
+        Some(format!("public key {}", several.spki_sha256()))
+    );
+    assert_eq!(
+        denied(&format!("{key}\nserial 0a\nnode node-a")).refuses_cert(&several),
+        Some("node node-a".to_owned())
+    );
+}
+
 /// Catches: a server that starts with a deny list it cannot read or parse (the first
 /// daemon would find out instead of the operator).
 #[test]

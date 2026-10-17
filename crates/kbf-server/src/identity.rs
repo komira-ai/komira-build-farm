@@ -29,6 +29,10 @@
 //! the entry is added, and a blob call is refused PERMISSION_DENIED from the first
 //! call after it. A deny list that cannot be read or parsed refuses every check (fail
 //! closed) until it is fixed, which ends every connected stream within one heartbeat.
+//! A storage node's `Register` and `Heartbeat` ([`crate::members_rpc`]) are checked against
+//! the same list by its certificate ([`DenyList::admit_cert`]): a listed serial or key,
+//! or any DNS name in it that is a listed node, is refused PERMISSION_DENIED, and an
+//! unusable list UNAVAILABLE.
 //! Replace the file by renaming a new one over it: an in-place edit that keeps the
 //! size and lands within the filesystem's timestamp granularity may go unseen until
 //! the next change.
@@ -169,10 +173,7 @@ impl Peers {
         else {
             return Ok(());
         };
-        let denied = deny_list.current().await.map_err(|e| {
-            tracing::error!(error = %e, "the deny list refuses every stream until it is fixed");
-            Status::unavailable(format!("the server's deny list is unusable: {e}"))
-        })?;
+        let denied = deny_list.current().await.map_err(|e| unusable(&e))?;
         match denied.refuses(peer, node_id) {
             Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
             None => Ok(()),
@@ -199,6 +200,12 @@ impl Peers {
         self.admit(Some(&peer), &node).await?;
         Ok(node)
     }
+}
+
+/// The refusal for a deny list that cannot be read: every check fails, and says so.
+fn unusable(e: &DenyListError) -> Status {
+    tracing::error!(error = %e, "the deny list refuses every check until it is fixed");
+    Status::unavailable(format!("the server's deny list is unusable: {e}"))
 }
 
 /// The deny list file. Clones share what was last read.
@@ -278,6 +285,21 @@ impl DenyList {
         }
     }
 
+    /// Whether the certificate `peer` is denied now, for a caller that speaks for every
+    /// name in it, as a storage node does when it registers and heartbeats
+    /// ([`crate::members_rpc`]): its serial or key is listed, or any DNS name in it is a
+    /// listed node.
+    ///
+    /// # Errors
+    /// PERMISSION_DENIED: it is denied. UNAVAILABLE: the file cannot be read or parsed.
+    pub async fn admit_cert(&self, peer: &PeerCert) -> Result<(), Status> {
+        let denied = self.current().await.map_err(|e| unusable(&e))?;
+        match denied.refuses_cert(peer) {
+            Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
+            None => Ok(()),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<LastRead>> {
         self.last.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -336,7 +358,22 @@ impl Denied {
         if self.nodes.contains(node_id) {
             return Some(format!("node {node_id}"));
         }
-        let peer = peer?;
+        self.refuses_key(peer?)
+    }
+
+    /// Why the certificate `peer` is denied, if it is, for a caller that speaks for every
+    /// name in it: a listed node is any of its DNS names, then its serial and key as in
+    /// [`Denied::refuses`].
+    #[must_use]
+    pub fn refuses_cert(&self, peer: &PeerCert) -> Option<String> {
+        match peer.names.iter().find(|name| self.nodes.contains(*name)) {
+            Some(node) => Some(format!("node {node}")),
+            None => self.refuses_key(peer),
+        }
+    }
+
+    /// Why `peer` is denied by its serial or its key.
+    fn refuses_key(&self, peer: &PeerCert) -> Option<String> {
         if self.serials.contains(&peer.serial) {
             return Some(format!("certificate serial {}", peer.serial));
         }

@@ -4,12 +4,16 @@
 //! frontend presents a certificate that names its role and verifies the node's against
 //! its CA and the host in the `--storage` URL (docs/design/architecture-v2.md, section 9),
 //! over a real node (`kbf_server::storage_node`), the proxy's raw HTTP/2 path (ByteStream)
-//! and its tonic path (FindMissing, the action cache).
+//! and its tonic path (FindMissing, the action cache), and the certificate rules of the
+//! membership service on its worker listener (`frontend/membership_tls.rs`).
 
 mod support;
 
 #[path = "frontend/handover.rs"]
 mod handover;
+
+#[path = "frontend/membership_tls.rs"]
+mod membership_tls;
 
 use std::future::pending;
 use std::net::SocketAddr;

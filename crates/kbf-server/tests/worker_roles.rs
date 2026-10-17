@@ -4,13 +4,16 @@
 //! storage certificate registers and heartbeats and a daemon certificate opens its
 //! session, side by side; each is refused every method of the other; a frontend
 //! certificate is refused every method; and a method not in the table is refused for
-//! every certificate and in plain text.
+//! every certificate and in plain text. Past the role, a storage certificate registers
+//! and beats only for the names it carries, and the worker listener's deny list applies
+//! to it as it does to a daemon's.
 
 #[path = "support/hooked.rs"]
 mod hooked;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -19,6 +22,7 @@ use std::time::Duration;
 use futures::channel::mpsc::unbounded;
 use hooked::Hooked;
 use kbf_front::Cache;
+use kbf_map::{MemberId, MemberState};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proto::reapi::FindMissingBlobsRequest;
@@ -27,16 +31,17 @@ use kbf_proto::worker::{
     Capability, DaemonMessage, Hello, ServerMessage, daemon_message, server_message,
     worker_client::WorkerClient,
 };
-use kbf_server::members::{MembershipConfig, PROTOCOL};
+use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::worker_roles::{WORKER_LISTENER_ROLES, WorkerRolesLayer, admit, roles_for};
-use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{DenyList, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
 use kbf_state::Store;
 use kbf_storage::service::{Admission, PeerRole, ROLE_URI_PREFIX};
 use kbf_tls::TlsSource;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
+use sha2::{Digest, Sha256};
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::codegen::{Service, http};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -119,6 +124,14 @@ fn role(name: &str) -> SanType {
             .try_into()
             .expect("an IA5 name"),
     )
+}
+
+fn dns(name: &str) -> SanType {
+    SanType::DnsName(name.try_into().expect("an IA5 name"))
+}
+
+fn ip(text: &str) -> SanType {
+    SanType::IpAddress(text.parse().expect("an IP address"))
 }
 
 /// A self-signed certificate with these subjectAltNames, as DER.
@@ -286,6 +299,13 @@ async fn the_layer_answers_a_refusal_itself_and_passes_an_admitted_call_on() {
     assert_eq!(format!("{open:?}"), "WorkerRolesLayer { admission: Open }");
 }
 
+/// A client certificate and what a deny list line spells about it.
+struct Client {
+    identity: Identity,
+    /// SHA-256 of its SubjectPublicKeyInfo, lower-case hex.
+    spki_sha256: String,
+}
+
 /// A cell CA, the worker listener's certificate, and role certificates on demand.
 struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,
@@ -308,6 +328,11 @@ impl Pki {
 
     /// The worker listener's mutual TLS: a `localhost` server certificate (no role).
     fn worker_tls(&self) -> WorkerTls {
+        self.worker_tls_denying(None)
+    }
+
+    /// [`Pki::worker_tls`] with a deny list, read again at every check.
+    fn worker_tls_denying(&self, deny_list: Option<DenyList>) -> WorkerTls {
         let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().expect("key");
@@ -320,27 +345,48 @@ impl Pki {
                 Some(self.ca.pem().as_bytes()),
             )
             .expect("server TLS"),
-            deny_list: None,
+            deny_list,
         }
     }
 
     /// A client certificate for node `node-a` (its one DNS name, as a daemon's must be)
     /// naming `who`.
     fn client(&self, who: PeerRole) -> Identity {
-        let mut params = CertificateParams::new(vec!["node-a".to_owned()]).expect("params");
+        self.client_named(who, vec![dns("node-a")], None).identity
+    }
+
+    /// A client certificate carrying exactly `names` (DNS and IP subjectAltNames) and the
+    /// role `who`, with `serial` if one is given.
+    fn client_named(&self, who: PeerRole, names: Vec<SanType>, serial: Option<u64>) -> Client {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.subject_alt_names = names;
         params.subject_alt_names.push(role(who.name()));
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.serial_number = serial.map(SerialNumber::from);
         let key = KeyPair::generate().expect("key");
         let cert = params.signed_by(&key, &self.ca).expect("sign");
-        Identity::from_pem(cert.pem(), key.serialize_pem())
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.der()).expect("parse");
+        let spki_sha256 = Sha256::digest(parsed.public_key().raw)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Client {
+            identity: Identity::from_pem(cert.pem(), key.serialize_pem()),
+            spki_sha256,
+        }
     }
 
     /// A connection to the worker listener at `addr` presenting `who`'s certificate.
     async fn channel(&self, addr: SocketAddr, who: PeerRole) -> Channel {
+        self.channel_as(addr, self.client(who)).await
+    }
+
+    /// A connection to the worker listener at `addr` presenting `identity`.
+    async fn channel_as(&self, addr: SocketAddr, identity: Identity) -> Channel {
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(self.ca.pem()))
             .domain_name("localhost")
-            .identity(self.client(who));
+            .identity(identity);
         Endpoint::from_shared(format!("https://{addr}"))
             .expect("endpoint")
             .tls_config(tls)
@@ -376,6 +422,11 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
 /// A frontend with a state store, so its worker listener serves `Membership` as well
 /// as the daemons' calls. Returns the worker listener's address.
 fn frontend(worker_tls: Option<WorkerTls>) -> SocketAddr {
+    frontend_over(worker_tls).0
+}
+
+/// [`frontend`], and the state store behind it, so a test can read the map it keeps.
+fn frontend_over(worker_tls: Option<WorkerTls>) -> (SocketAddr, Arc<Hooked>) {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
@@ -397,19 +448,35 @@ fn frontend(worker_tls: Option<WorkerTls>) -> SocketAddr {
     )
     .expect("binds");
     tokio::spawn(bound.serving);
-    bound.worker
+    (bound.worker, store)
 }
 
+/// The storage node `node-a`, as the certificate `Pki::client` mints for it names it.
 fn registration() -> pb::RegisterRequest {
+    register_as("node-a:8982", "node-a:8982")
+}
+
+/// A registration under `instance` that says it is dialled at `addr`.
+fn register_as(instance: &str, addr: &str) -> pb::RegisterRequest {
     pb::RegisterRequest {
         role: pb::Role::Storage.into(),
-        instance_id: "storage-a".to_owned(),
-        addr: "192.0.2.1:8982".to_owned(),
+        instance_id: instance.to_owned(),
+        addr: addr.to_owned(),
         weight: 1,
         zone: "a".to_owned(),
         protocol: PROTOCOL,
         ..pb::RegisterRequest::default()
     }
+}
+
+/// The state member `id` is in, in the map the store holds.
+fn state_of(store: &Arc<Hooked>, id: u64) -> MemberState {
+    let members = Members::new(
+        Arc::clone(&store.fake) as Arc<dyn Store>,
+        MembershipConfig::default(),
+    );
+    let map = members.current_map().expect("read").expect("a map");
+    map.member(MemberId(id)).expect("the member").state
 }
 
 /// Opens a worker session for node-a on `channel` and waits for its `Welcome`, or the
@@ -614,4 +681,363 @@ async fn a_method_missing_from_the_table_is_refused_on_the_wire() {
         .register(registration())
         .await
         .expect("plain text serves a listed method");
+}
+
+/// A client of the membership service presenting a storage certificate that carries
+/// `names`.
+async fn storage_node(
+    pki: &Pki,
+    worker: SocketAddr,
+    names: Vec<SanType>,
+) -> MembershipClient<Channel> {
+    let client = pki.client_named(PeerRole::Storage, names, None);
+    MembershipClient::new(pki.channel_as(worker, client.identity).await)
+}
+
+/// Catches a storage certificate that may register any instance id and address. Before
+/// the check, the certificate for `node-a` registered under another host's instance id
+/// (taking over that member's id and raising its boot, which left the real node's
+/// heartbeats superseded) or with another host's address (so peers and frontends dialled
+/// a node the attacker named). Here the certificate names `node-a` and every
+/// registration that puts another host in the instance id or the address is
+/// PERMISSION_DENIED, naming the value and the certificate's names, and writes nothing
+/// (the first registration admitted is member 1). Shapes that read like `node-a` but
+/// are another host (a longer name, a prefixed one, userinfo in front of another host)
+/// are refused; the host of `host:port`, a bare host, and the name in another case are
+/// admitted, each its own member.
+///
+/// Mutants seen red: the instance id left unchecked; the address left unchecked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_certificate_registers_only_the_instance_and_address_it_names() {
+    let pki = Pki::new();
+    let worker = frontend(Some(pki.worker_tls()));
+    let mut node = storage_node(&pki, worker, vec![dns("node-a")]).await;
+    for (instance, addr, offending) in [
+        ("node-b:8982", "node-a:8982", "node-b:8982"),
+        ("node-a:8982", "node-b:8982", "node-b:8982"),
+        ("node-b:1", "node-c:1", "node-b:1"),
+        ("node-a.example:1", "node-a:1", "node-a.example:1"),
+        ("anode-a:1", "node-a:1", "anode-a:1"),
+        ("node-a:1", "node-a@node-b:8982", "node-a@node-b:8982"),
+        ("node-a:1", "node-a:1/x", "node-a:1/x"),
+    ] {
+        let status = node
+            .register(register_as(instance, addr))
+            .await
+            .expect_err(offending);
+        assert_eq!(status.code(), Code::PermissionDenied, "{instance} {addr}");
+        let message = status.message();
+        assert!(message.contains(offending), "{message}");
+        assert!(
+            message.contains("node-a"),
+            "the certificate's names: {message}"
+        );
+    }
+    for (want, (instance, addr)) in [
+        ("node-a:9999", "node-a:8982"),
+        ("node-a", "node-a"),
+        ("NODE-A:1", "Node-A:2"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let joined = node
+            .register(register_as(instance, addr))
+            .await
+            .expect("admitted")
+            .into_inner();
+        let id = u64::try_from(want).expect("small") + 1;
+        assert_eq!(
+            joined.member_id, id,
+            "{instance} {addr}: no refusal wrote a member"
+        );
+    }
+}
+
+/// Catches a certificate with no name for the host taken for one that has. A storage
+/// certificate with only its role, with a wildcard name (no wildcard is matched, not even
+/// against its own spelling), with an IP written as a DNS name, or with another host's
+/// IP registers nothing: PERMISSION_DENIED, saying to reissue the certificate with the
+/// node's names. A certificate that does name the host is member 1 afterwards, so none
+/// of the refusals wrote a member.
+///
+/// Mutants seen red: a name starting `*.` matched against the host's parent domain;
+/// a DNS name compared to an IP host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_with_no_covering_name_registers_nothing() {
+    let pki = Pki::new();
+    let worker = frontend(Some(pki.worker_tls()));
+    for (names, host) in [
+        (vec![], "node-a:1"),
+        (vec![dns("*.farm.example")], "node-a.farm.example:1"),
+        (vec![dns("*.farm.example")], "*.farm.example:1"),
+        (vec![dns("192.0.2.1")], "192.0.2.1:1"),
+        (vec![ip("192.0.2.2")], "192.0.2.1:1"),
+        (vec![dns("node-b")], "node-a:1"),
+    ] {
+        let mut node = storage_node(&pki, worker, names.clone()).await;
+        let status = node
+            .register(register_as(host, host))
+            .await
+            .expect_err(host);
+        assert_eq!(status.code(), Code::PermissionDenied, "{names:?} {host}");
+        assert!(
+            status.message().contains("reissue"),
+            "{names:?} {host}: {}",
+            status.message()
+        );
+    }
+    let mut named = storage_node(&pki, worker, vec![dns("node-a")]).await;
+    let joined = named
+        .register(registration())
+        .await
+        .expect("a certificate that names the host registers")
+        .into_inner();
+    assert_eq!(joined.member_id, 1, "no refusal wrote a member");
+}
+
+/// Catches an IP name matched as text. A certificate with the IP names `::1` and
+/// `192.0.2.1` covers an address whose host is that IP in any spelling (the bracketed
+/// literal with or without a port, the expanded form), and nothing else: another IP,
+/// and an unbracketed `::1:8982` (an IPv6 address of its own, not `::1` and a port).
+///
+/// Mutant seen red: the port cut at the last `:` whatever comes before it (`::1:8982`
+/// read as `::1` and a port).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ip_name_covers_the_host_of_the_address_in_any_spelling() {
+    let pki = Pki::new();
+    let worker = frontend(Some(pki.worker_tls()));
+    let mut node = storage_node(&pki, worker, vec![ip("::1"), ip("192.0.2.1")]).await;
+    for host in [
+        "[::1]:8982",
+        "[0:0:0:0:0:0:0:1]:9",
+        "[::1]",
+        "192.0.2.1:8982",
+        "192.0.2.1",
+    ] {
+        node.register(register_as(host, host))
+            .await
+            .unwrap_or_else(|e| panic!("{host} is covered: {e}"));
+    }
+    for host in ["[::2]:1", "192.0.2.2:1", "::1:8982", "[::1", "[::1]x"] {
+        let status = node
+            .register(register_as(host, host))
+            .await
+            .expect_err(host);
+        assert_eq!(status.code(), Code::PermissionDenied, "{host}");
+    }
+}
+
+/// Catches a heartbeat that any storage certificate may send for any member, and a
+/// registration that takes another node's instance over. Node A (`node-a`) registers
+/// rebuilding (`CatchingUp`) and node B (`node-b`) registers beside it. B's certificate
+/// then beats A's member id with A's boot, saying the rebuild is done: PERMISSION_DENIED,
+/// and A stays `CatchingUp` (before the check this promoted A to `Active`). With another
+/// boot it is the same PERMISSION_DENIED and not the FAILED_PRECONDITION that would tell
+/// B the boot is wrong (the check comes before the boot is compared, so a foreign
+/// certificate learns nothing about a boot). B registering A's instance id is refused
+/// and A's boot is still the live one. A's own certificate still gets
+/// FAILED_PRECONDITION for a wrong boot, and its right one promotes it.
+///
+/// Mutants seen red: the holder check removed from the heartbeat; the check placed after
+/// the boot comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_certificate_beats_only_for_the_member_whose_address_it_names() {
+    let pki = Pki::new();
+    let (worker, store) = frontend_over(Some(pki.worker_tls()));
+    let mut a = storage_node(&pki, worker, vec![dns("node-a")]).await;
+    let mut b = storage_node(&pki, worker, vec![dns("node-b")]).await;
+    let first = a
+        .register(pb::RegisterRequest {
+            catching_up: true,
+            ..registration()
+        })
+        .await
+        .expect("A registers")
+        .into_inner();
+    let second = b
+        .register(register_as("node-b:8982", "node-b:8982"))
+        .await
+        .expect("B registers")
+        .into_inner();
+    assert_eq!(state_of(&store, first.member_id), MemberState::CatchingUp);
+
+    let beat = |joined: &pb::RegisterResponse, boot: u64| pb::HeartbeatRequest {
+        member_id: joined.member_id,
+        boot,
+        catching_up: false,
+        ..pb::HeartbeatRequest::default()
+    };
+    for boot in [first.boot, first.boot + 7] {
+        let status = b
+            .heartbeat(beat(&first, boot))
+            .await
+            .expect_err("B beats A's member");
+        assert_eq!(status.code(), Code::PermissionDenied, "boot {boot}");
+        assert!(
+            status.message().contains(&first.member_id.to_string()),
+            "{}",
+            status.message()
+        );
+    }
+    assert_eq!(
+        state_of(&store, first.member_id),
+        MemberState::CatchingUp,
+        "B's certificate did not say A's rebuild is done"
+    );
+
+    let takeover = b
+        .register(register_as("node-a:8982", "node-b:8982"))
+        .await
+        .expect_err("B registers A's instance");
+    assert_eq!(takeover.code(), Code::PermissionDenied);
+
+    let stale = a
+        .heartbeat(beat(&first, first.boot + 7))
+        .await
+        .expect_err("a wrong boot");
+    assert_eq!(stale.code(), Code::FailedPrecondition);
+    a.heartbeat(beat(&first, first.boot))
+        .await
+        .expect("A's boot is still the live one");
+    assert_eq!(state_of(&store, first.member_id), MemberState::Active);
+    b.heartbeat(beat(&second, second.boot))
+        .await
+        .expect("B beats its own member");
+}
+
+/// Where a test's deny list lives.
+fn list_path(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("worker-roles");
+    std::fs::create_dir_all(&dir).expect("directory");
+    dir.join(name)
+}
+
+/// Replaces the list at `path` by renaming a new file over it, as the list's module docs
+/// ask, so the server sees the change at its next check.
+fn write_list(path: &Path, text: &str) {
+    let staged = path.with_extension("new");
+    std::fs::write(&staged, text).expect("write");
+    std::fs::rename(&staged, path).expect("replace");
+}
+
+/// Catches `--worker-deny-list` that stops at the daemons: a storage certificate named
+/// in the list kept registering and beating. Four storage nodes register and beat while
+/// the list is empty. The list then names node A's certificate by serial (in the
+/// list's spelling, not the DER's), node B's by public key and node C's node id, and not
+/// node D: the three are refused Register and Heartbeat PERMISSION_DENIED, saying what
+/// matched, and D goes on. Emptying the list lets A beat again (the list is read at
+/// every check).
+///
+/// Mutants seen red: Register not checked; Heartbeat not checked; the node entry matched
+/// against nothing (only serial and key looked at).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
+    let pki = Pki::new();
+    let path = list_path("storage.list");
+    write_list(&path, "# nobody yet\n");
+    let list = DenyList::open(&path).expect("the list");
+    let worker = frontend(Some(pki.worker_tls_denying(Some(list))));
+    let mut nodes = Vec::new();
+    for (name, serial) in [
+        ("node-a", 0x0a1b),
+        ("node-b", 2),
+        ("node-c", 3),
+        ("node-d", 4),
+    ] {
+        let cert = pki.client_named(PeerRole::Storage, vec![dns(name)], Some(serial));
+        let mut client = MembershipClient::new(pki.channel_as(worker, cert.identity).await);
+        let host = format!("{name}:8982");
+        let joined = client
+            .register(register_as(&host, &host))
+            .await
+            .expect("registers while nothing is listed")
+            .into_inner();
+        let beat = pb::HeartbeatRequest {
+            member_id: joined.member_id,
+            boot: joined.boot,
+            ..pb::HeartbeatRequest::default()
+        };
+        client.heartbeat(beat).await.expect("beats");
+        nodes.push((client, host, beat, cert.spki_sha256));
+    }
+
+    let key_of_b = nodes[1].3.clone();
+    write_list(
+        &path,
+        &format!("serial 0A:1B\nspki-sha256 {key_of_b}\nnode node-c\n"),
+    );
+    for (at, matched) in [
+        (0, "denied: certificate serial a1b".to_owned()),
+        (1, format!("denied: public key {key_of_b}")),
+        (2, "denied: node node-c".to_owned()),
+    ] {
+        let (client, host, beat, _) = &mut nodes[at];
+        let registered = client
+            .register(register_as(host.as_str(), host.as_str()))
+            .await
+            .expect_err("a listed certificate registers");
+        assert_eq!(registered.code(), Code::PermissionDenied, "{host}");
+        assert_eq!(registered.message(), matched);
+        let beaten = client
+            .heartbeat(*beat)
+            .await
+            .expect_err("a listed certificate beats");
+        assert_eq!(beaten.code(), Code::PermissionDenied, "{host}");
+        assert_eq!(beaten.message(), matched);
+    }
+    let (client, host, beat, _) = &mut nodes[3];
+    client.heartbeat(*beat).await.expect("D is not listed");
+    client
+        .register(register_as(host.as_str(), host.as_str()))
+        .await
+        .expect("D registers again");
+
+    write_list(&path, "");
+    let (client, _, beat, _) = &mut nodes[0];
+    client
+        .heartbeat(*beat)
+        .await
+        .expect("A is no longer listed");
+}
+
+/// Catches an unreadable deny list that lets storage nodes through: it refuses every
+/// Register and Heartbeat UNAVAILABLE (a node retries those) until the file is fixed,
+/// as it refuses a daemon's stream, and says the list is unusable.
+///
+/// Mutant seen red: a list that fails to parse treated as an empty one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unusable_deny_list_refuses_membership_calls_unavailable() {
+    let pki = Pki::new();
+    let path = list_path("broken.list");
+    write_list(&path, "serial 0a\n");
+    let list = DenyList::open(&path).expect("the list");
+    let worker = frontend(Some(pki.worker_tls_denying(Some(list))));
+    let mut node = MembershipClient::new(pki.channel(worker, PeerRole::Storage).await);
+    let joined = node
+        .register(registration())
+        .await
+        .expect("registers")
+        .into_inner();
+    let beat = pb::HeartbeatRequest {
+        member_id: joined.member_id,
+        boot: joined.boot,
+        ..pb::HeartbeatRequest::default()
+    };
+
+    write_list(&path, "this is not an entry\n");
+    let registered = node.register(registration()).await.expect_err("refused");
+    let beaten = node.heartbeat(beat).await.expect_err("refused");
+    for status in [registered, beaten] {
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(
+            status.message().contains("deny list is unusable"),
+            "{}",
+            status.message()
+        );
+    }
+    write_list(&path, "serial 0a\n");
+    node.heartbeat(beat)
+        .await
+        .expect("the fixed list admits it");
 }

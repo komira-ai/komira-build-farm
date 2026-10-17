@@ -195,11 +195,16 @@ async fn a_panic_in_the_store_fails_one_call() {
         .expect("the next call works");
 }
 
-fn leaf(role: &str) -> Vec<u8> {
+/// A certificate naming `role` and the DNS names `names`.
+fn leaf(role: &str, names: &[&str]) -> Vec<u8> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.subject_alt_names = vec![SanType::URI(
+    params.subject_alt_names = names
+        .iter()
+        .map(|name| SanType::DnsName((*name).try_into().expect("IA5")))
+        .collect();
+    params.subject_alt_names.push(SanType::URI(
         format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
-    )];
+    ));
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let key = KeyPair::generate().expect("key");
     params.self_signed(&key).expect("cert").der().to_vec()
@@ -208,16 +213,30 @@ fn leaf(role: &str) -> Vec<u8> {
 /// Catches: registration open to the wrong role. Under mutual TLS only a certificate that
 /// names the role `storage` may register: a daemon's or a frontend's is PERMISSION_DENIED,
 /// none is UNAUTHENTICATED, bytes that are no certificate are UNAUTHENTICATED; plain text
-/// admits everyone, as the storage listener does.
+/// admits everyone, as the storage listener does. An admitted storage certificate comes
+/// back with the names it holds (the role URI is not one), none in plain text; whether
+/// they cover an instance is `Register`'s check, over the wire in `worker_roles.rs`.
 #[test]
 fn only_the_storage_role_may_register() {
     let members = Arc::new(Members::new(Hooked::new() as Arc<dyn Store>, config()));
     let certified = MembershipService::new(Arc::clone(&members), Admission::Certified);
     let open = MembershipService::new(members, Admission::Open);
-    assert!(open.admit_leaf(None).is_ok());
-    assert!(certified.admit_leaf(Some(&leaf("storage"))).is_ok());
+    assert_eq!(open.admit_leaf(None).expect("open"), None);
+    let names = certified
+        .admit_leaf(Some(&leaf("storage", &["node-a"])))
+        .expect("admitted")
+        .expect("a certified caller has names");
+    assert_eq!(names.to_string(), "node-a");
+    assert!(names.covers("node-a") && !names.covers("storage"));
+    let nameless = certified
+        .admit_leaf(Some(&leaf("storage", &[])))
+        .expect("the role is all this checks")
+        .expect("names");
+    assert_eq!(nameless.to_string(), "no DNS or IP name");
     for role in ["daemon", "frontend"] {
-        let e = certified.admit_leaf(Some(&leaf(role))).expect_err(role);
+        let e = certified
+            .admit_leaf(Some(&leaf(role, &["node-a"])))
+            .expect_err(role);
         assert_eq!(e.code(), Code::PermissionDenied, "{role}");
         assert!(e.message().contains(role), "{}", e.message());
     }

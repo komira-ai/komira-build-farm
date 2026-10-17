@@ -763,7 +763,6 @@ impl<'a> Prepared<'a> {
         log_state(durable, farm.term(), farm.lease_epoch());
 
         let sockets = sockets(adopted, &listeners, api.as_ref(), flags.handover.is_some())?;
-        let peers_certified = listeners.worker_tls.is_some();
         let (mut worker_server, peers, worker_tls) = worker_peers(
             keepalive(
                 flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -822,6 +821,7 @@ impl<'a> Prepared<'a> {
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
         );
+        let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -834,7 +834,6 @@ impl<'a> Prepared<'a> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
-        let membership = membership(members.clone(), peers_certified);
         let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);

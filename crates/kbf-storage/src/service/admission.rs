@@ -11,8 +11,13 @@
 //! `urn:kbf:role:<name>` ([`ROLE_URI_PREFIX`]), read by `kbf_peer::role_of`; [`role_of`]
 //! here is it with the refusal as a gRPC status, and `kbf-server`'s worker listener asks
 //! it too.
+//!
+//! **Names** are `kbf-peer`'s as well ([`names_of`]): the DNS and IP subjectAltNames, which
+//! `kbf-server`'s `Membership` service checks against a storage node's instance id and
+//! address at `Register` and `Heartbeat`. The storage endpoints here check the role only.
 //! Not here, and planned in section 9 and phase P7: the deny list and node-name checks
-//! of `kbf-server`'s worker listener, and the signed storage-access grant.
+//! on these endpoints (the worker listener's `Membership` calls apply its deny list and
+//! its node-name rule already), and the signed storage-access grant.
 //!
 //! Plain text ([`Admission::Open`]) has no identity to read, so it admits every call but a
 //! copy from another storage node ([`Endpoint::WriteLeg`]), which only a certified storage
@@ -20,7 +25,7 @@
 //! tests and trials on one machine, as the worker listener's `Peers::Unauthenticated`.
 
 use kbf_peer::RoleError;
-pub use kbf_peer::{PeerRole, ROLE_URI_PREFIX};
+pub use kbf_peer::{PeerNames, PeerRole, ROLE_URI_PREFIX, host_of};
 use tonic::{Request, Status};
 
 /// The endpoints with their own expectation of who calls.
@@ -162,8 +167,22 @@ impl Admission {
 /// UNAUTHENTICATED: the bytes are not a certificate. PERMISSION_DENIED: it names no
 /// role or several, or a name that is no role.
 pub fn role_of(der: &[u8]) -> Result<PeerRole, Status> {
-    kbf_peer::role_of(der).map_err(|e| match e {
+    kbf_peer::role_of(der).map_err(|e| refusal(&e))
+}
+
+/// The DNS and IP names a DER certificate carries (`kbf_peer::names_of`), a refusal as
+/// the status every listener that takes a client certificate answers it.
+///
+/// # Errors
+/// UNAUTHENTICATED: the bytes are not a certificate.
+pub fn names_of(der: &[u8]) -> Result<PeerNames, Status> {
+    kbf_peer::names_of(der).map_err(|e| refusal(&e))
+}
+
+/// The status a certificate that gives no identity is answered with.
+fn refusal(e: &RoleError) -> Status {
+    match e {
         RoleError::NotACertificate(_) => Status::unauthenticated(e.to_string()),
         RoleError::Count(_) | RoleError::Unknown(_) => Status::permission_denied(e.to_string()),
-    })
+    }
 }

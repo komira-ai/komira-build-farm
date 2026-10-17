@@ -43,6 +43,11 @@
 //! handoff and the operator call); a heartbeat changes no other state: a `Joining` member
 //! waits for the handoff, and a member that is `Draining`, `Active` or `Down` stays so
 //! whatever it reports.
+//!
+//! **Who may beat.** The row keeps the member's address, and a heartbeat names the member by
+//! its (public, sequential) id and boot, so the caller says whether it is the holder of the
+//! address ([`Members::heartbeat`]); the rpc layer answers that with the caller's
+//! certificate. The row is read, the holder asked and only then the boot compared.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -154,6 +159,10 @@ pub enum MembershipError {
     /// The state store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The caller is not at the member's address: its certificate names no host of it
+    /// (see [`Members::heartbeat`]). The message gives no more than the member id.
+    #[error("member {0} is not at an address the caller's certificate names")]
+    NotHolder(MemberId),
     /// The registration is malformed.
     #[error("invalid registration: {0}")]
     Invalid(&'static str),
@@ -500,16 +509,26 @@ impl Members {
     /// `progress` says it is done, makes it `Active` and rebuilds the map. Returns the
     /// generation of the current map.
     ///
+    /// `holder` says whether the caller may speak for a member at an address (its
+    /// certificate names the address's host): it is asked of the address on the row,
+    /// before the boot is compared and in the same pass as the rewrite, so a caller that
+    /// is not the holder learns nothing of the row's boot or state, not even that its boot
+    /// is wrong (it can tell a row that lapsed, `NotRegistered`, from a live one it does
+    /// not hold, `NotHolder`, and member ids and states are in the map every node gets
+    /// anyway), and promotes nothing. `None` asks no one.
+    ///
     /// # Errors
     /// [`MembershipError::NotRegistered`] if the row expired (register again);
+    /// [`MembershipError::NotHolder`] if `holder` refuses the row's address;
     /// [`MembershipError::Superseded`] if `boot` is not the row's; the store failing.
     pub fn heartbeat(
         &self,
         id: MemberId,
         boot: u64,
         progress: Progress,
+        holder: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress))? {
+        if self.touch(id, Touch::Beat(boot, progress), holder)? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -525,12 +544,18 @@ impl Members {
         if state == MemberState::Down {
             return Err(MembershipError::NotSettable(state));
         }
-        self.touch(id, Touch::State(state))?;
+        self.touch(id, Touch::State(state), None)?;
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
-    /// Rewrites `id`'s row as `how` says; whether its state changed.
-    fn touch(&self, id: MemberId, how: Touch) -> Result<bool, MembershipError> {
+    /// Rewrites `id`'s row as `how` says; whether its state changed. `holder` is
+    /// [`Members::heartbeat`]'s.
+    fn touch(
+        &self,
+        id: MemberId,
+        how: Touch,
+        holder: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<bool, MembershipError> {
         let key = member_key(id);
         for _ in 0..ATTEMPTS {
             let stored = self
@@ -538,6 +563,10 @@ impl Members {
                 .get(&key)?
                 .ok_or(MembershipError::NotRegistered(id))?;
             let mut live = decode_row(&stored)?;
+            // Before anything the caller said is compared with the row.
+            if holder.is_some_and(|holds| !holds(&live.member.addr)) {
+                return Err(MembershipError::NotHolder(id));
+            }
             let before = live.member.state;
             let ttl = match how {
                 Touch::Beat(boot, _) if boot != live.boot => {

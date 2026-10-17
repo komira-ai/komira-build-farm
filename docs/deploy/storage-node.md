@@ -195,8 +195,10 @@ What each group of flags does:
   The proxy health-checks the server with `grpc.health.v1` on this listener
   ([api.md](../api.md#grpchealthv1-on-the-reapi-listener)).
 - **The worker listener** serves daemons over mutual TLS: their certificates must
-  chain to `--worker-client-ca`, and the deny list is read again at every `Hello` and
-  `Heartbeat` ([worker-protocol.md](../design/worker-protocol.md)).
+  chain to `--worker-client-ca`, and the deny list is read again at every check: a
+  daemon's `Hello`, `Heartbeat` and other calls, and a storage node's `Register` and
+  `Heartbeat`, so a deny list that cannot be read refuses the storage nodes too
+  ([worker-protocol.md](../design/worker-protocol.md)).
 - **The operator API** (`/v1`, `/healthz`, `/readyz`) answers reads to whoever reaches
   it, so it is bound to loopback; writes need the token in `--api-token-file`, owned
   by `kbf-server` with mode 0600 or 0400 ([api.md](../api.md)).

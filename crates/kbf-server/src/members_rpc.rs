@@ -10,29 +10,54 @@
 //! a connected node is the next change (it can ride `Heartbeat`'s answer).
 //!
 //! **Who may call.** Under mutual TLS ([`Admission::Certified`]) the caller's certificate
-//! must name the role `storage`; without TLS every call is admitted, as on the storage
-//! listener.
+//! must name the role `storage`, and must not be on the deny list if the server has one
+//! ([`MembershipService::with_deny_list`]: the worker listener's, read again at every
+//! call, an unreadable one refusing every call UNAVAILABLE). Without TLS every call is
+//! admitted, as on the storage listener.
+//!
+//! **Whose instance and address.** A storage certificate speaks for the hosts it names, its
+//! DNS and IP subjectAltNames ([`names_of`]). `Register` is refused PERMISSION_DENIED
+//! unless they cover the host of the `instance_id` and of the `addr` (`host` or
+//! `host:port`: [`host_of`]), so one node's certificate cannot register another's
+//! instance, which would take over its member id and supersede its heartbeats, nor
+//! advertise another's address. `Heartbeat` is checked the same way against the address
+//! on the member's row ([`Members::heartbeat`]), before the boot is looked at. Plain text
+//! binds nothing.
 
 use std::sync::Arc;
 
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
-use kbf_storage::service::{Admission, PeerRole, role_of};
+use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, names_of, role_of};
 use tonic::{Request, Response, Status};
 
+use crate::identity::{DenyList, PeerCert};
 use crate::members::{Members, MembershipError, Progress, Registrant};
 
 /// The service over `members`, admitting callers as `admission` says.
 pub struct MembershipService {
     members: Arc<Members>,
     admission: Admission,
+    deny_list: Option<DenyList>,
 }
 
 impl MembershipService {
-    /// The service over `members`.
+    /// The service over `members`, with no deny list.
     #[must_use]
     pub fn new(members: Arc<Members>, admission: Admission) -> Self {
-        Self { members, admission }
+        Self {
+            members,
+            admission,
+            deny_list: None,
+        }
+    }
+
+    /// The service refusing the certificates and nodes `deny_list` lists, if there is one
+    /// (it applies under mutual TLS only: plain text has no certificate to list).
+    #[must_use]
+    pub fn with_deny_list(mut self, deny_list: Option<DenyList>) -> Self {
+        self.deny_list = deny_list;
+        self
     }
 
     /// The service as a tonic server, ready to add to a listener.
@@ -41,24 +66,35 @@ impl MembershipService {
         MembershipServer::new(self)
     }
 
-    fn admit<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    /// Admits the caller of `request`: its role, the deny list, and the names it holds
+    /// (`None` in plain text).
+    async fn admit<T>(&self, request: &Request<T>) -> Result<Option<PeerNames>, Status> {
         let certs = kbf_tls::peer_certs(request);
-        let leaf = certs.as_deref().and_then(|chain| chain.first());
-        self.admit_leaf(leaf.map(AsRef::as_ref))
+        let leaf = certs
+            .as_deref()
+            .and_then(|chain| chain.first())
+            .map(AsRef::as_ref);
+        let names = self.admit_leaf(leaf)?;
+        if let (Some(_), Some(deny_list), Some(der)) = (&names, &self.deny_list, leaf) {
+            let peer = PeerCert::from_der(der).map_err(Status::unauthenticated)?;
+            deny_list.admit_cert(&peer).await?;
+        }
+        Ok(names)
     }
 
-    /// Admits a caller whose verified chain starts with `leaf`.
+    /// Admits a caller whose verified chain starts with `leaf`; the DNS and IP names it
+    /// holds, or `None` without mutual TLS.
     ///
     /// # Errors
     /// Under mutual TLS, UNAUTHENTICATED without a certificate; PERMISSION_DENIED for any
     /// role but `storage` (see [`role_of`]).
-    pub fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<(), Status> {
+    pub fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<Option<PeerNames>, Status> {
         if self.admission == Admission::Open {
-            return Ok(());
+            return Ok(None);
         }
         let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         match role_of(der)? {
-            PeerRole::Storage => Ok(()),
+            PeerRole::Storage => names_of(der).map(Some),
             other => Err(Status::permission_denied(format!(
                 "role {} may not register as a storage node",
                 other.name()
@@ -67,10 +103,25 @@ impl MembershipService {
     }
 }
 
+/// Whether `names` cover the host of `value`, the `field` of a registration.
+///
+/// # Errors
+/// PERMISSION_DENIED: they do not, saying what the certificate names and what to do.
+fn covered(names: &PeerNames, field: &str, value: &str) -> Result<(), Status> {
+    if names.covers(host_of(value)) {
+        return Ok(());
+    }
+    Err(Status::permission_denied(format!(
+        "the storage certificate's names ({names}) do not cover {field} {value:?}; \
+         reissue it with the node's DNS or IP names"
+    )))
+}
+
 /// The gRPC answer for a membership failure.
 fn status(e: MembershipError) -> Status {
     let message = e.to_string();
     match e {
+        MembershipError::NotHolder(_) => Status::permission_denied(message),
         MembershipError::Invalid(_) => Status::invalid_argument(message),
         MembershipError::Protocol { .. } | MembershipError::Superseded { .. } => {
             Status::failed_precondition(message)
@@ -101,12 +152,16 @@ impl Membership for MembershipService {
         &self,
         request: Request<pb::RegisterRequest>,
     ) -> Result<Response<pb::RegisterResponse>, Status> {
-        self.admit(&request)?;
+        let names = self.admit(&request).await?;
         let req = request.into_inner();
         if pb::Role::try_from(req.role) != Ok(pb::Role::Storage) {
             return Err(Status::invalid_argument(
                 "role must be ROLE_STORAGE: only storage nodes register",
             ));
+        }
+        if let Some(names) = &names {
+            covered(names, "instance_id", &req.instance_id)?;
+            covered(names, "addr", &req.addr)?;
         }
         let who = Registrant {
             instance_id: req.instance_id,
@@ -131,14 +186,20 @@ impl Membership for MembershipService {
         &self,
         request: Request<pb::HeartbeatRequest>,
     ) -> Result<Response<pb::HeartbeatResponse>, Status> {
-        self.admit(&request)?;
+        let names = self.admit(&request).await?;
         let req = request.into_inner();
         let members = Arc::clone(&self.members);
         let id = kbf_map::MemberId(req.member_id);
         let have = req.have_generation;
         let progress = Progress::from_wire(req.catching_up);
         let (map_generation, map) = blocking(move || {
-            let generation = members.heartbeat(id, req.boot, progress)?;
+            // In plain text there are no names, and any caller holds any member.
+            let holds = |addr: &str| {
+                names
+                    .as_ref()
+                    .is_none_or(|names| names.covers(host_of(addr)))
+            };
+            let generation = members.heartbeat(id, req.boot, progress, Some(&holds))?;
             // Read only for a node that is behind: most beats carry no map.
             let newer = if generation > have {
                 members.current_map()?.filter(|map| map.generation() > have)

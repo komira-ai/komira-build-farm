@@ -249,10 +249,10 @@ async fn a_draining_or_expired_member_shows_its_state_until_it_leaves() {
     // Only `a` and `b` keep beating: `c` lapses, and is Down in the map.
     clock.advance(TTL - Duration::from_secs(1));
     frontend
-        .heartbeat(a.id, a.boot, Progress::CatchingUp)
+        .heartbeat(a.id, a.boot, Progress::CatchingUp, None)
         .expect("beat a");
     frontend
-        .heartbeat(b.id, b.boot, Progress::CaughtUp)
+        .heartbeat(b.id, b.boot, Progress::CaughtUp, None)
         .expect("beat b");
     clock.advance(Duration::from_secs(2));
     frontend.refresh().expect("refreshed");

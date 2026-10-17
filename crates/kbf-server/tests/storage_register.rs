@@ -224,7 +224,12 @@ async fn a_node_whose_row_lapsed_registers_again() {
     // member has the id it had.
     until("the node to register again", || {
         f.members
-            .heartbeat(MemberId(1), 2, kbf_server::members::Progress::CaughtUp)
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                None,
+            )
             .ok()
     })
     .await;
@@ -434,9 +439,13 @@ impl Pki {
         }
     }
 
-    /// A certificate for `localhost` naming `role`, good for serving and for calling.
+    /// A certificate for `localhost` and `127.0.0.1` (the address a node registers when it
+    /// is bound there) naming `role`, good for serving and for calling.
     fn cert(&self, role: &str) -> (String, String) {
         let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress([127, 0, 0, 1].into()));
         params.subject_alt_names.push(SanType::URI(
             format!("{ROLE_URI_PREFIX}{role}").try_into().expect("IA5"),
         ));
@@ -510,6 +519,83 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
         .await
         .expect_err("denied");
     assert_eq!(denied.code(), Code::PermissionDenied);
+}
+
+/// Catches: a registration admitted for an address the node's certificate does not
+/// name. Over mutual TLS a frontend takes a node's word for where it is dialled only if
+/// the certificate it presented names that host: with a certificate for `localhost` and
+/// `127.0.0.1`, an instance id or an address on another host is PERMISSION_DENIED (the
+/// message says which and what the certificate names), and the node's own addresses
+/// (bound IP, the name, either with a port) register, as a real node's do in the other
+/// tests of this file.
+///
+/// Mutant seen red: the address left unchecked (a registration for `192.0.2.9` with the
+/// instance id of `localhost`).
+#[tokio::test]
+async fn over_mutual_tls_a_node_registers_only_where_its_certificate_names_it() {
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let (cert, key) = pki.cert("storage");
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+        .identity(Identity::from_pem(cert, key));
+    let channel = Endpoint::from_shared(format!("https://localhost:{}", f.worker.port()))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS")
+        .connect_lazy();
+    let join = |instance: &str, addr: &str| {
+        let who = NodeIdentity {
+            instance_id: instance.to_owned(),
+            addr: addr.to_owned(),
+            zone: String::new(),
+            weight: 1,
+        };
+        Joiner::new(channel.clone(), who, 5 * MS)
+    };
+    for (instance, addr, offending) in [
+        ("192.0.2.9:1", "127.0.0.1:1", "192.0.2.9:1"),
+        ("127.0.0.1:1", "192.0.2.9:1", "192.0.2.9:1"),
+    ] {
+        let denied = join(instance, addr)
+            .register()
+            .await
+            .expect_err("another host");
+        assert_eq!(denied.code(), Code::PermissionDenied, "{instance} {addr}");
+        assert!(denied.message().contains(offending), "{}", denied.message());
+        assert!(
+            denied.message().contains("127.0.0.1"),
+            "{}",
+            denied.message()
+        );
+    }
+    assert!(
+        f.members.current_map().expect("read").is_none(),
+        "nothing was written"
+    );
+    for (want, (instance, addr)) in [
+        ("127.0.0.1:4000", "127.0.0.1:4000"),
+        ("localhost:4000", "localhost:4001"),
+        ("localhost", "127.0.0.1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let joined = join(instance, addr).register().await.expect("named");
+        let id = u64::try_from(want).expect("small") + 1;
+        assert_eq!(joined.member_id, id, "{instance} {addr}");
+    }
 }
 
 /// Catches: a retry that does not back off (a down frontend would be hit at the base

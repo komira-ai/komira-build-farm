@@ -370,18 +370,22 @@ pub(crate) fn map_of(
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
-/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// under worker TLS only the storage role may call it, each certificate for the names it
+/// holds and not if the listener's deny list refuses it. Not generic, for the same reason
 /// as [`sweeping`].
 pub(crate) fn membership(
     members: Option<Arc<Members>>,
-    certified: bool,
+    peers: &Peers,
 ) -> Option<MembershipServer<MembershipService>> {
-    let admission = if certified {
-        Admission::Certified
-    } else {
-        Admission::Open
+    let (admission, deny_list) = match peers {
+        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Unauthenticated => (Admission::Open, None),
     };
-    Some(MembershipService::new(members?, admission).server())
+    Some(
+        MembershipService::new(members?, admission)
+            .with_deny_list(deny_list)
+            .server(),
+    )
 }
 
 /// Expires members while the server runs. Never completes; with no state store there
@@ -633,7 +637,6 @@ where
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
-    let peers_certified = listeners.worker_tls.is_some();
     let (mut worker_server, peers, worker_tls) = worker_peers(
         keepalive(
             flow_control(Server::builder(), listeners.stream_limits.worker),
@@ -714,6 +717,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let membership = membership(members.clone(), &peers);
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -725,7 +729,6 @@ where
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);

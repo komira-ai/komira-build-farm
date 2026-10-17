@@ -85,10 +85,10 @@ Options:
           PEM private key of the worker listener
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance id and of the address it registers; a frontend certificate may call nothing here
 
       --worker-deny-list <WORKER_DENY_LIST>
-          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs mutual TLS
+          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect without a restart. A `node` entry also refuses a storage certificate with that DNS name. A list that cannot be read after start refuses all of those calls. Needs mutual TLS
 
       --tls-reload-interval-secs <TLS_RELOAD_INTERVAL_SECS>
           How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start

@@ -75,7 +75,9 @@ use tonic::service::Routes;
 use crate::replicate::{self, Chain, MapSource};
 use crate::{Storage, StorageError};
 
-pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
+pub use admission::{
+    Admission, Endpoint, PeerNames, PeerRole, ROLE_URI_PREFIX, host_of, names_of, role_of,
+};
 pub use catch_up::CatchUp;
 pub use client::RemoteStorage;
 pub(crate) use client::lift;
