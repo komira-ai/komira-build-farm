@@ -119,6 +119,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_listen",
     "api_listen",
     "api_token_file",
+    "releases_dir",
     "readyz_store_timeout_ms",
     "worker_tls_cert",
     "worker_tls_key",
@@ -383,6 +384,7 @@ impl FrontendFlags {
 fn routed_of(
     members: Option<&Arc<Members>>,
     flags: &FrontendFlags,
+    storage: &RemoteStorage,
 ) -> Result<Option<Arc<Routed>>, ConfigError> {
     let Some(members) = members else {
         return Ok(None);
@@ -396,10 +398,9 @@ fn routed_of(
         return Ok(None);
     };
     let maps = Arc::new(FrontMaps::new(Arc::clone(members)));
-    Ok(Some(Arc::new(Routed::over_tls(
-        maps,
-        Arc::new(TlsNodes::new(ca, identity)),
-    ))))
+    Ok(Some(Arc::new(
+        Routed::over_tls(maps, Arc::new(TlsNodes::new(ca, identity))).bootstrapped(storage.clone()),
+    )))
 }
 
 /// A started frontend: bound, not yet serving.
@@ -735,7 +736,7 @@ impl<'a> Prepared<'a> {
         let timeout = listeners.store_probe_timeout;
         let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
         let state_store = store_of(state.as_ref());
-        let routed = routed_of(members.as_ref(), flags)?;
+        let routed = routed_of(members.as_ref(), flags, &storage)?;
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -805,12 +806,14 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
+        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         let api_routes = crate::api::router(
             Arc::clone(&farm),
-            api.and_then(|api| api.token),
+            token.clone(),
             Arc::clone(&drain),
             members.clone(),
         )
+        .merge(crate::release::router(releases.clone(), token))
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(
             backend.clone(),
@@ -917,6 +920,7 @@ impl<'a> Prepared<'a> {
             let worker_stopped = worker_stop.fired();
             let worker_serve = worker_server
                 .add_service(worker_service)
+                .add_service(crate::release::service(releases))
                 .add_optional_service(membership)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`), or by a handover.

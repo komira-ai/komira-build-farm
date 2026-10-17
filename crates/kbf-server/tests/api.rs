@@ -109,6 +109,7 @@ fn start_with(token: Option<ApiToken>) -> Server {
         listen: loopback(),
         token,
         local_cache: None,
+        releases: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -373,6 +374,7 @@ async fn an_api_address_in_use_is_refused() {
         listen: addr,
         token: None,
         local_cache: None,
+        releases: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {

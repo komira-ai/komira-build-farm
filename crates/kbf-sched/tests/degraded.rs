@@ -275,6 +275,7 @@ fn losses_the_store_holds_count_toward_the_cap() {
                 worker: WorkerId::new(NODE),
             }),
             losses: before,
+            fate: None,
         };
         s.recover(TERM, OperationId(10), 20, vec![held]);
         assert_eq!(s.losses(OperationId(3)), Some(before));

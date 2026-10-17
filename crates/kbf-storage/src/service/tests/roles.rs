@@ -135,6 +135,50 @@ fn a_certificate_must_name_exactly_one_known_role() {
     }
 }
 
+/// Catches the unowned-copy marker honoured from a role other than the frontend: under
+/// mutual TLS only a certificate naming `frontend` may send it (every other role, no
+/// certificate and a certificate with no role may not); plain text has no identity and
+/// admits it as it admits every call but a copy.
+#[test]
+fn only_the_frontend_may_ask_for_an_unowned_copy() {
+    for role in PeerRole::ALL {
+        let leaf = der(vec![uri(role.name())]);
+        assert_eq!(
+            Admission::Certified.permits_unowned_leaf(Some(&leaf)),
+            role == PeerRole::Frontend,
+            "{role:?}"
+        );
+    }
+    assert!(!Admission::Certified.permits_unowned_leaf(None));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(b"not DER")));
+    assert!(!Admission::Certified.permits_unowned_leaf(Some(&der(vec![]))));
+    assert!(Admission::Open.permits_unowned_leaf(None));
+}
+
+/// Catches an unowned marker that changes what a chain copy is: a leg that carries the marker
+/// is still a leg (judged by a copy's rules: stored where the map says the node owns the blob,
+/// refused where it does not), never an unowned local write. Only a call with no leg, that asked,
+/// from a caller that may ask, is taken as an unowned copy. (Admission already refuses a leg
+/// from any caller but a storage node, and a storage node may not ask for an unowned copy, so
+/// no call reaches the guard with both; it is tested where it is decided.)
+#[test]
+fn a_chain_copy_with_the_unowned_marker_is_still_a_chain_copy() {
+    use super::super::generation::takes_unowned;
+    use kbf_map::MemberId;
+    let leg = Some(MemberId(2));
+    for marked in [false, true] {
+        for permitted in [false, true] {
+            assert!(
+                !takes_unowned(leg, marked, permitted),
+                "{marked} {permitted}"
+            );
+        }
+    }
+    assert!(takes_unowned(None, true, true));
+    assert!(!takes_unowned(None, true, false));
+    assert!(!takes_unowned(None, false, true));
+}
+
 /// A CA, the server's certificate, and client certificates by role.
 pub(crate) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,

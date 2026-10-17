@@ -12,8 +12,8 @@ use kbf_state::{
     Versioned,
 };
 use kbf_types::{
-    ActionKey, Answer, Digest, DigestFunction, Failure, FencePolicy, LeaseKind, Outcome, Qos,
-    Refusal, RefusalRecord, Resources, Waiting,
+    ActionKey, Answer, Digest, DigestFunction, Failure, FencePolicy, LeaseKind, MemoryKill,
+    MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, Waiting,
 };
 
 use super::*;
@@ -181,6 +181,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 request: request(1),
                 lease: None,
                 losses: 0,
+                fate: None,
             }],
             cordons: Vec::new(),
         }
@@ -246,7 +247,9 @@ fn a_stale_complete_is_rejected() {
     durable
         .persist(&[Effect::Start(start(4, 0))])
         .expect("first grant");
-    durable.requeued(&requeue(4, 0), None).expect("given up");
+    durable
+        .requeued(&requeue(4, 0), None, None)
+        .expect("given up");
     durable
         .persist(&[Effect::Start(start(4, 1))])
         .expect("second grant");
@@ -290,12 +293,14 @@ fn a_given_up_lease_requeues_its_operation_once() {
     durable
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
-    durable.requeued(&requeue(4, 0), None).expect("given up");
+    durable
+        .requeued(&requeue(4, 0), None, None)
+        .expect("given up");
     let stored = durable.load().expect("load");
     assert_eq!(stored.operations[0].lease, None);
     assert!(keys(&store).contains(&"queue/0000000000000004".to_owned()));
     durable
-        .requeued(&requeue(4, 0), None)
+        .requeued(&requeue(4, 0), None, None)
         .expect("again, nothing changes");
     let again = durable.load().expect("load");
     assert_eq!(again, stored);
@@ -307,7 +312,7 @@ fn a_given_up_lease_requeues_its_operation_once() {
         })])
         .expect("refused");
     durable
-        .requeued(&requeue(4, 0), None)
+        .requeued(&requeue(4, 0), None, None)
         .expect("a finished operation has nothing to put back");
     assert!(!keys(&store).iter().any(|k| k.starts_with("queue/")));
 }
@@ -363,14 +368,14 @@ fn a_loss_count_lives_with_its_operation() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 0), Some(2))
+        .requeued(&requeue(4, 0), Some(2), None)
         .expect("a lost lease");
     assert_eq!(durable.load().expect("load").operations[0].losses, 2);
     durable
         .persist(&[Effect::Start(start(4, 1))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 1), None)
+        .requeued(&requeue(4, 1), None, None)
         .expect("not a lost lease");
     assert_eq!(durable.load().expect("load").operations[0].losses, 2);
     durable
@@ -394,7 +399,7 @@ fn a_refusal_removes_the_loss_count() {
         .persist(&[Effect::Start(start(4, 0))])
         .expect("grant");
     durable
-        .requeued(&requeue(4, 0), Some(3))
+        .requeued(&requeue(4, 0), Some(3), None)
         .expect("a lost lease");
     let refusal = Refusal {
         operation: OperationId(4),
@@ -725,4 +730,146 @@ fn an_operation_is_ended_queued_running_or_gone() {
         Progress::Ended(finished),
         "the result wins over the rows of the operation that are still there"
     );
+}
+
+fn killed(operation: u64, seq: u64) -> Requeue {
+    Requeue {
+        reason: RequeueReason::OutOfMemory {
+            booked: 4 << 30,
+            raised: 16 << 30,
+        },
+        ..requeue(operation, seq)
+    }
+}
+
+fn a_fate() -> Fate {
+    Fate {
+        booked_bytes: 16 << 30,
+        memory_runs: vec![
+            MemoryRun {
+                worker: WorkerId::new("node-a"),
+                booked: 4 << 30,
+                kill: MemoryKill::OwnLimit { cap: 64 << 30 },
+            },
+            MemoryRun {
+                worker: WorkerId::new("node-b"),
+                booked: 16 << 30,
+                kill: MemoryKill::NodePressure,
+            },
+        ],
+    }
+}
+
+/// Catches: a fate that is written apart from the queue row (a crash between them leaves
+/// a queued operation at its old booking, or a fate for an operation not queued), one the
+/// load does not return with its operation, and one that outlives its operation's end by
+/// a finish or by a refusal.
+#[test]
+fn a_fate_lives_and_dies_with_its_operation() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    for operation in [4, 5] {
+        durable
+            .submitted(OperationId(operation), &request(1 + operation as u8))
+            .expect("submit");
+        durable
+            .persist(&[Effect::Start(start(operation, 0))])
+            .expect("grant");
+        durable
+            .requeued(&killed(operation, 0), None, Some(&a_fate()))
+            .expect("a kill");
+    }
+    let stored = durable.load().expect("load");
+    assert!(stored.operations.iter().all(|op| op.fate == Some(a_fate())));
+    assert_eq!(
+        keys(&store)
+            .iter()
+            .filter(|k| k.starts_with("fate/"))
+            .count(),
+        2
+    );
+
+    // Finished by a result, and refused: neither leaves the row.
+    durable
+        .persist(&[Effect::Start(start(4, 1))])
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(4, 1))])
+        .expect("finished");
+    durable
+        .persist(&[Effect::Refuse(Refusal {
+            operation: OperationId(5),
+            waiters: Vec::new(),
+            reason: "no worker".to_owned(),
+        })])
+        .expect("refused");
+    assert_eq!(
+        keys(&store)
+            .iter()
+            .filter(|k| k.starts_with("fate/"))
+            .count(),
+        0
+    );
+}
+
+/// Catches: a fate row read as anything but what was written: another version, a row cut
+/// short, bytes after the last run, an unknown kind of kill. The farm refuses to start
+/// over such a store rather than book a guess.
+#[test]
+fn a_fate_row_that_is_not_one_is_refused() {
+    let row = fate::encode(&a_fate()).expect("encodes");
+    assert_eq!(fate::decode(&row), Ok(a_fate()));
+    let mut other = row.clone();
+    other[0] = 2;
+    let mut longer = row.clone();
+    longer.push(0);
+    // The last run is a node-pressure kill: its kind is the row's last byte.
+    let mut kind = row.clone();
+    *kind.last_mut().expect("a row") = 9;
+    for (bad, why) in [
+        (other, "not a version 1 fate"),
+        (row[..row.len() - 1].to_vec(), "the row ends early"),
+        (longer, "bytes after the last run"),
+        (kind, "not a kind of memory kill"),
+        (Vec::new(), "the row ends early"),
+    ] {
+        assert_eq!(fate::decode(&bad), Err(why));
+    }
+}
+
+/// Catches: a fate row with a worker name that is not text accepted, a fate too large to
+/// write encoded anyway (a truncated length), a requeue whose fate cannot be written
+/// reported as success, and a load that skips a fate row it cannot read instead of
+/// refusing the store.
+#[test]
+fn a_fate_that_cannot_be_written_or_read_is_refused() {
+    let mut row = fate::encode(&a_fate()).expect("encodes");
+    // Version, booking, count, then the first name's length (2): its first byte.
+    row[1 + 8 + 4 + 2] = 0xff;
+    assert_eq!(fate::decode(&row), Err("a worker name is not text"));
+
+    let mut huge = a_fate();
+    huge.memory_runs[0].worker = WorkerId::new("n".repeat(usize::from(u16::MAX) + 1));
+    assert_eq!(fate::encode(&huge), None);
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(4), &request(5))
+        .expect("submit");
+    durable
+        .persist(&[Effect::Start(start(4, 0))])
+        .expect("grant");
+    let error = durable
+        .requeued(&killed(4, 0), None, Some(&huge))
+        .expect_err("too large");
+    assert!(error.to_string().contains("fate/0000000000000004"));
+    assert!(
+        !keys(&store).iter().any(|k| k.starts_with("queue/")),
+        "nothing of the requeue landed"
+    );
+
+    put(&store, "fate/0000000000000004", vec![2]);
+    let error = durable.load().expect_err("a fate of another version");
+    assert!(error.to_string().contains("not a version 1 fate"));
 }

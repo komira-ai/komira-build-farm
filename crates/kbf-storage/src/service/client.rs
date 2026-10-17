@@ -29,7 +29,7 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
-use super::{MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, wire};
+use super::{MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, UNOWNED_HEADER, wire};
 use crate::{Answer, PutStream, ReadStream, Storage, StorageError};
 
 /// The largest message of a `Write`'s data.
@@ -66,6 +66,36 @@ impl RemoteStorage {
     /// begun keeps the generation it read.
     pub fn set_map_generation(&self, generation: u64) {
         self.generation.store(generation, Ordering::Relaxed);
+    }
+
+    /// [`Storage::put`], or [`Storage::put_unowned`] if `unowned`: hashed here, sent in
+    /// messages of at most 1 MiB, and answered once the node holds it.
+    fn put_as(&self, bytes: Bytes, unowned: bool) -> Answer<'_, Digest> {
+        Box::pin(async move {
+            let digest = kbf_segments::sha256(&bytes);
+            let upload = self.uploads.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                "uploads/storage-client-{}-{upload}/blobs/{}/{}",
+                std::process::id(),
+                digest.hash_hex(),
+                digest.size_bytes
+            );
+            let requests = write_messages(name, bytes);
+            let mut request = self.tag(stream::iter(requests));
+            if unowned {
+                request
+                    .metadata_mut()
+                    .insert(UNOWNED_HEADER, MetadataValue::from_static("1"));
+            }
+            let response = self.bytestream().write(request).await.map_err(other)?;
+            let committed = response.into_inner().committed_size;
+            if committed as u64 != digest.size_bytes {
+                return Err(StorageError::Internal(format!(
+                    "{digest} was acknowledged as {committed} bytes"
+                )));
+            }
+            Ok(digest)
+        })
     }
 
     /// The generation a call made now carries.
@@ -275,29 +305,13 @@ impl Storage for RemoteStorage {
     /// Hashed here, sent in messages of at most 1 MiB, and answered once the node holds
     /// it.
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
-        Box::pin(async move {
-            let digest = kbf_segments::sha256(&bytes);
-            let upload = self.uploads.fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                "uploads/storage-client-{}-{upload}/blobs/{}/{}",
-                std::process::id(),
-                digest.hash_hex(),
-                digest.size_bytes
-            );
-            let requests = write_messages(name, bytes);
-            let response = self
-                .bytestream()
-                .write(self.tag(stream::iter(requests)))
-                .await
-                .map_err(other)?;
-            let committed = response.into_inner().committed_size;
-            if committed as u64 != digest.size_bytes {
-                return Err(StorageError::Internal(format!(
-                    "{digest} was acknowledged as {committed} bytes"
-                )));
-            }
-            Ok(digest)
-        })
+        self.put_as(bytes, false)
+    }
+
+    /// A write marked [`UNOWNED_HEADER`]: the node stores one copy although the map places
+    /// the blob elsewhere.
+    fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        self.put_as(bytes, true)
     }
 
     /// Always `None`: a streamed write over the wire is [`Storage::put`]'s messages.

@@ -17,8 +17,8 @@ use tonic::{Code, Request, Status};
 
 use super::farm::Farm;
 use crate::replicate::{ChainConfig, LEG_HEADER};
-use crate::service::MAP_GENERATION_HEADER;
 use crate::service::tests::fake::{StreamFault, patterned, sha};
+use crate::service::{MAP_GENERATION_HEADER, RemoteStorage};
 use crate::{Storage, StorageError};
 
 pub(super) const MIB: usize = 1 << 20;
@@ -325,6 +325,80 @@ async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
         !held(&farm, 0, &digest),
         "committed under a placement the map had left"
     );
+}
+
+/// Catches the copy an action-cache commit needs on the action's owner being refused: the
+/// owner of an action is not the primary of the blobs of its entry, a plain write there is
+/// "not the primary", and the commit failed (a repeat of an action ran again on a farm of
+/// three). An unowned write to a node that owns nothing stores one copy there and none is
+/// forwarded or owed; to the blob's primary it is a plain write (the replica holds it
+/// too). Mutants: the unowned marker ignored by the node (refused); taken as local at the
+/// primary (no replica copy).
+#[tokio::test]
+async fn an_unowned_copy_is_stored_on_a_node_that_owns_nothing() {
+    let farm = Farm::start(3, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 64, 6);
+    let digest = sha(&bytes);
+    farm.publish(&map);
+
+    let outsider = farm.client(2, 1);
+    let refused = outsider.put(Bytes::from(bytes.clone())).await;
+    assert!(
+        matches!(&refused, Err(StorageError::Invalid(m)) if m.contains("not the primary")),
+        "{refused:?}"
+    );
+    assert!(!held(&farm, 2, &digest));
+
+    let stored = outsider
+        .put_unowned(Bytes::from(bytes.clone()))
+        .await
+        .expect("an unowned copy is taken");
+    assert_eq!(stored, digest);
+    assert!(held(&farm, 2, &digest), "the copy is on the node");
+    assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
+
+    let other = farm.blob(&map, 0, 1, 64, 7);
+    let other_digest = sha(&other);
+    farm.client(0, 1)
+        .put_unowned(Bytes::from(other))
+        .await
+        .expect("the primary takes it");
+    assert!(held(&farm, 0, &other_digest) && held(&farm, 1, &other_digest));
+    assert!(!held(&farm, 2, &other_digest));
+}
+
+/// Catches an unowned-copy marker honoured from any caller: it skips the chain (no forward,
+/// no repair debt), so only the frontend's identity may send it. A daemon or a storage node
+/// that sends the header gets the plain-write rule (INVALID_ARGUMENT, not the primary) and
+/// nothing is stored; a frontend's is stored as one copy. Mutant: the node honouring the
+/// header whatever the certificate names.
+#[tokio::test]
+async fn an_unowned_copy_is_honoured_only_for_the_frontends_identity() {
+    let farm = Farm::start(3, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    farm.publish(&map);
+    let bytes = farm.blob(&map, 0, 1, 64, 8);
+    let digest = sha(&bytes);
+
+    for role in ["daemon", "storage"] {
+        let refused = RemoteStorage::new(farm.channel_role(2, role), 1)
+            .put_unowned(Bytes::from(bytes.clone()))
+            .await;
+        assert!(
+            matches!(&refused, Err(StorageError::Invalid(m)) if m.contains("not the primary")),
+            "{role}: {refused:?}"
+        );
+        assert!(!held(&farm, 2, &digest), "{role}");
+    }
+
+    let stored = RemoteStorage::new(farm.channel_role(2, "frontend"), 1)
+        .put_unowned(Bytes::from(bytes))
+        .await
+        .expect("the frontend's copy is taken");
+    assert_eq!(stored, digest);
+    assert!(held(&farm, 2, &digest));
+    assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
 /// Catches a write taken by the wrong node: a client write to the replica (not the

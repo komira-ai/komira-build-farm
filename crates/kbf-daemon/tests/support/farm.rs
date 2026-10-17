@@ -2,7 +2,6 @@
 //! over SQLite and storage nodes that register with it (what `kbf storage-and-daemon`
 //! starts as its storage half). Shared by tests/map_wiring.rs and tests/member_wiring.rs.
 
-use std::future::pending;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -12,6 +11,7 @@ use std::time::Duration;
 
 use kbf_map::{Map, MemberId};
 use kbf_mapsync::MapHolder;
+use kbf_server::NodeMap;
 use kbf_server::frontend::{self, FrontendHandle, start_frontend};
 use kbf_server::storage_half::{self, StorageHalf};
 use kbf_server::storage_node;
@@ -145,12 +145,27 @@ pub fn front(pki: &Pki, dir: &Path) -> Front {
 }
 
 /// A storage node that registers with `front`, started as `kbf storage-and-daemon` starts
-/// its storage half, serving in the background.
+/// its storage half, serving in the background until stopped ([`NodeUnderTest::stop`]) or
+/// dropped.
 pub async fn node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnderTest {
+    try_node(pki, front, name, dir, "127.0.0.1:0")
+        .await
+        .expect("the node starts")
+}
+
+/// [`node`] listening on `listen` (a restarted node keeps its address, and so its member),
+/// and the error when it cannot start (its address still held, say).
+pub async fn try_node(
+    pki: &Pki,
+    front: &Front,
+    name: &str,
+    dir: &Path,
+    listen: &str,
+) -> Result<NodeUnderTest, Box<dyn std::error::Error>> {
     let own = pki.cert(name, "storage", &["localhost"]);
     let argv = [
         "storage".to_owned(),
-        "--storage-listen=127.0.0.1:0".to_owned(),
+        format!("--storage-listen={listen}"),
         format!("--cold-store=file://{}", dir.join("cold").display()),
         format!("--meta-dir={}", dir.join("meta").display()),
         format!("--frontend=https://localhost:{}", front.worker.port()),
@@ -158,26 +173,67 @@ pub async fn node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnder
         format!("--storage-tls-key={}", own.key.display()),
         format!("--storage-client-ca={}", pki.ca().display()),
     ];
-    let flags = storage_node::parse(
+    let mut flags = storage_node::parse(
         &storage_node::command()
             .try_get_matches_from(argv)
             .expect("the node's flags"),
     )
     .expect("parses");
-    let half = storage_half::start(&flags, || Ok(pending::<()>()))
-        .await
-        .expect("the node starts");
+    // Passes often, so a debt is settled soon after its owner returns.
+    flags.repair.interval = Duration::from_millis(50);
+    let (stop, stopped) = oneshot::channel::<()>();
+    let half = storage_half::start(&flags, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .await?;
     let (addr, storage, maps, in_process) =
         (half.addr, half.storage(), half.maps(), half.in_process());
-    tokio::spawn(StorageHalf::serve(half));
-    NodeUnderTest {
+    let repairs = half.repairs();
+    let serving = tokio::spawn(StorageHalf::serve(half));
+    Ok(NodeUnderTest {
         addr,
         storage,
         in_process,
         maps,
         me: None,
         chain: None,
+        half: Some(HalfParts {
+            repairs,
+            stop,
+            serving,
+        }),
+    })
+}
+
+/// A map source of a node the frontend has not sent a map to.
+struct NoMap;
+
+impl MapSource for NoMap {
+    fn current(&self) -> Option<Arc<Map>> {
+        None
     }
+
+    fn me(&self) -> Option<MemberId> {
+        None
+    }
+}
+
+/// The storage service, in-process, of a node that holds no map: it judges every call by
+/// one and so refuses them all (UNAVAILABLE).
+pub fn unmapped_in_process() -> InProcess {
+    let service = Arc::new(
+        StorageService::new(
+            Spy::streaming() as Arc<dyn Storage>,
+            Admission::Open,
+            Config {
+                write_bytes_in_flight: 64 << 20,
+            },
+        )
+        .with_map(Arc::new(NoMap)),
+    );
+    service.in_process()
 }
 
 /// What a chain node learns of the map: the holder the frontend's maps arrive in, and the
@@ -203,9 +259,9 @@ impl MapSource for HeldMap {
 /// A storage node that is a node of a chain (R = 2): its service judges every call by the
 /// map the frontend sends it and, as the primary of a blob, copies it to the replica
 /// before it answers. It registers with `front` as `kbf storage-and-daemon`'s half does.
-/// The store is a [`Spy`] that takes a blob as a stream, which the real cache does not
-/// yet and a chain's primary needs; the server does not wire a chain yet either, so the
-/// service is built here.
+/// The service is built here, over a [`Spy`] store that takes a blob as a stream and
+/// with a `CatchUp` the test sets (the real half builds neither), and its map source
+/// is one whose member id the test sets ([`NodeUnderTest::is_member`]).
 pub async fn chain_node(pki: &Pki, front: &Front, name: &str, dir: &Path) -> NodeUnderTest {
     chain_node_with(pki, front, name, dir, CatchUp::caught_up()).await
 }
@@ -287,7 +343,7 @@ pub async fn chain_node_with(
             .serve_with_incoming(incoming),
     );
     let joiner = flags
-        .joiner(addr, Arc::clone(&maps))
+        .joiner(addr, Arc::new(NodeMap::new(Arc::clone(&maps))))
         .expect("the joiner")
         .expect("a frontend");
     tokio::spawn(joiner.run());
@@ -297,6 +353,7 @@ pub async fn chain_node_with(
         in_process: service.in_process(),
         maps,
         me: Some(held),
+        half: None,
         chain: Some(ChainParts {
             repairs,
             server: server.abort_handle(),
@@ -315,6 +372,14 @@ pub struct NodeUnderTest {
     me: Option<Arc<HeldMap>>,
     /// A chain node's repair journal and the task that serves its listener.
     chain: Option<ChainParts>,
+    /// What a node started as the real storage half keeps to be stopped and asked.
+    half: Option<HalfParts>,
+}
+
+struct HalfParts {
+    repairs: Option<Arc<Repairs>>,
+    stop: oneshot::Sender<()>,
+    serving: tokio::task::JoinHandle<Result<(), kbf_server::ServeError>>,
 }
 
 struct ChainParts {
@@ -347,6 +412,29 @@ impl NodeUnderTest {
             .collect()
     }
 
+    /// The copies a node started by [`node`] owes, from its repair journal.
+    pub fn owes(&self) -> Vec<Digest> {
+        let half = self.half.as_ref().expect("a node started by `node`");
+        half.repairs
+            .as_ref()
+            .expect("a node of a farm replicates, so it keeps a repair journal")
+            .open_records()
+            .iter()
+            .map(|record| record.digest)
+            .collect()
+    }
+
+    /// Stops a node started by [`node`] and waits for its listener to end; what it held
+    /// (the cache, and with it the lock on its metadata directory) is released with it.
+    pub async fn stop(self) {
+        let half = self.half.expect("a node started by `node`");
+        let _ = half.stop.send(());
+        half.serving
+            .await
+            .expect("the node's task ends")
+            .expect("the node serves until stopped");
+    }
+
     pub async fn holds(&self, digest: &Digest) -> bool {
         self.storage
             .find_missing(std::slice::from_ref(digest))
@@ -354,6 +442,23 @@ impl NodeUnderTest {
             .expect("find missing")
             .is_empty()
     }
+}
+
+/// `condition`'s answer once it has one, polled; a deadline only ends a hang.
+pub async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
+    what: &str,
+    mut condition: impl FnMut() -> F,
+) -> T {
+    let found = timeout(HANG, async {
+        loop {
+            if let Some(found) = condition().await {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("never happened: {what}"))
 }
 
 /// The map in `holder` once it has `members` members.

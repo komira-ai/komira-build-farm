@@ -268,6 +268,11 @@ impl Farm {
             .lazy_client(self.nodes[node].switch.addr, "frontend")
     }
 
+    /// A channel to node `node` as a caller of `role`.
+    pub(crate) fn channel_role(&self, node: usize, role: &str) -> Channel {
+        self.pki.lazy_client(self.nodes[node].switch.addr, role)
+    }
+
     /// A channel to node `node` as another storage node (the role that sends a copy).
     pub(crate) fn storage_channel(&self, node: usize) -> Channel {
         self.pki

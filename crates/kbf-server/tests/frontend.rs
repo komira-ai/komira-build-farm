@@ -1164,6 +1164,105 @@ async fn the_api_listener_serves_metrics_in_the_prometheus_text_format() {
     assert!(body.contains("# TYPE "), "{body}");
 }
 
+/// Catches `--releases-dir` accepted without an operator API: the store is filled by `PUT
+/// /v1/releases/...` on that API, so a store with nowhere to be written would be a silent
+/// no-op. Both `kbf frontend` and `kbf-server` refuse the flag without `--api-listen`.
+///
+/// Mutant seen red: `requires = "api_listen"` dropped from the flag.
+#[test]
+fn releases_dir_needs_the_operator_api() {
+    let refused = frontend::command().try_get_matches_from([
+        "frontend",
+        "--storage=http://127.0.0.1:1",
+        "--releases-dir=/x",
+    ]);
+    let e = refused.expect_err("no --api-listen");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    let server =
+        kbf_server::Args::command().try_get_matches_from(["kbf-server", "--releases-dir=/x"]);
+    let e = server.expect_err("no --api-listen");
+    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    // With the API it parses.
+    frontend::command()
+        .try_get_matches_from([
+            "frontend",
+            "--storage=http://127.0.0.1:1",
+            "--api-listen=127.0.0.1:0",
+            "--releases-dir=/x",
+        ])
+        .expect("parses");
+}
+
+/// Catches a frontend that takes `--releases-dir` and does not mount the release store: a
+/// tarball put on its operator API with the token comes back through `ReleaseService.Fetch`
+/// on its worker listener, and a put without the token is refused.
+///
+/// Mutants seen red: the router not merged in `frontend.rs`; the service not added to its
+/// worker server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
+    use kbf_proto::update::FetchRequest;
+    use kbf_proto::update::release_service_client::ReleaseServiceClient;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch_dir("frontend-releases");
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, format!("{token}\n")).expect("token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let node = Node::start().await;
+    let front = Front::start(
+        &flags(&[
+            &format!("--storage=http://{}", node.addr),
+            &format!("--api-token-file={}", token_file.display()),
+            &format!("--releases-dir={}", dir.join("releases").display()),
+        ])
+        .expect("parses"),
+    )
+    .await;
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let tarball = b"a tarball".to_vec();
+    let put = |auth: bool| {
+        let (api, tarball) = (front.api, tarball.clone());
+        async move {
+            let mut stream = TcpStream::connect(api).await.expect("connect");
+            let auth = if auth {
+                format!("Authorization: Bearer {token}\r\n")
+            } else {
+                String::new()
+            };
+            let head = format!(
+                "PUT /v1/releases/{commit}/linux-x86_64/kbf HTTP/1.1\r\nHost: kbf\r\n{auth}Connection: close\r\nContent-Length: {}\r\n\r\n",
+                tarball.len()
+            );
+            stream.write_all(head.as_bytes()).await.expect("write");
+            stream.write_all(&tarball).await.expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            response[9..12].parse::<u16>().expect("a status")
+        }
+    };
+    assert_eq!(put(false).await, 401);
+    assert_eq!(put(true).await, 201);
+    let mut client = ReleaseServiceClient::connect(format!("http://{}", front.worker))
+        .await
+        .expect("connect");
+    let mut stream = client
+        .fetch(FetchRequest {
+            sha256: hex::encode(Sha256::digest(&tarball)),
+        })
+        .await
+        .expect("fetch")
+        .into_inner();
+    let mut got = Vec::new();
+    while let Some(chunk) = stream.message().await.expect("chunk") {
+        got.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(got, tarball);
+    std::fs::remove_dir_all(&dir).expect("clean");
+}
+
 /// Catches a `--reapi-tls-cert` and `--reapi-tls-key` that a frontend takes and does not
 /// serve (clients would find plain text where the flags promised TLS): the REAPI listener
 /// answers a health check over TLS for the certificate's name and does not answer in

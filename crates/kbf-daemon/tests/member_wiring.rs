@@ -24,11 +24,12 @@ use kbf_daemon::{
 use kbf_map::{Member, MemberId};
 use kbf_mapsync::MapHolder;
 use kbf_route::Nodes;
-use kbf_storage::service::CatchUp;
+use kbf_storage::service::{CatchUp, InProcess};
 use kbf_storage::{Storage, StorageError};
 use kbf_transfer::{CasError, RoutedCas, TransferConfig, proto_digest};
 use support::farm::{
     NodeUnderTest, Pki, blob_owned_by, chain_node, chain_node_with, digest, front, map_of,
+    unmapped_in_process,
 };
 use support::scratch;
 
@@ -94,11 +95,7 @@ fn daemon(pki: &Pki, front: &support::farm::Front, name: &str) -> (Arc<MapHolder
 
 /// The process of `node`: its daemon half's plane over `held`, its own member in-process.
 fn process(node: NodeUnderTest, id: MemberId, held: Arc<MapHolder>, tls: &TlsFiles) -> Process {
-    let local = LocalMember::new(
-        node.addr.to_string(),
-        node.in_process.clone(),
-        Arc::clone(&node.maps),
-    );
+    let local = LocalMember::new(node.addr.to_string(), node.in_process.clone());
     assert_eq!(local.addr(), node.addr.to_string());
     let dialled = Arc::new(Counted {
         inner: kbf_daemon::storage_nodes(tls, kbf_daemon::Liveness::default()).expect("TLS files"),
@@ -265,22 +262,18 @@ async fn a_daemon_half_behind_its_node_is_told_so_by_its_own_node() {
 }
 
 /// A plane with the map of `source`'s node held in a holder of its own, and the local
-/// member `local` whose node holds `node_map`.
+/// member `local` served in-process by `node`.
 fn plane_over(
     daemon_map: Option<&kbf_map::Map>,
     local: &Process,
-    node_map: &Arc<MapHolder>,
+    node: InProcess,
     tls: &TlsFiles,
 ) -> Arc<RoutedCas> {
     let held = Arc::new(MapHolder::new());
     if let Some(map) = daemon_map {
         assert!(held.offer(map.clone()));
     }
-    let member = LocalMember::new(
-        local.node.addr.to_string(),
-        local.node.in_process.clone(),
-        Arc::clone(node_map),
-    );
+    let member = LocalMember::new(local.node.addr.to_string(), node);
     let nodes = kbf_daemon::storage_nodes(tls, kbf_daemon::Liveness::default()).expect("TLS files");
     member_cas(held, member, nodes, &TransferConfig::default())
 }
@@ -288,11 +281,12 @@ fn plane_over(
 /// Catches the no-map rule not holding. Until the daemon half holds a map, a write fails
 /// UNAVAILABLE and reaches no node, its own included (the defect: a daemon with no map
 /// wrote to its own node as if it were the owner). Until the storage half holds a map,
-/// its own member is refused as its listener refuses every call, and a blob owned by
-/// another member goes on to its owner.
+/// its own member is refused by the storage service's own check, as its listener refuses
+/// every call (the node here is a service that holds none), and a blob owned by another
+/// member goes on to its owner.
 ///
-/// Mutants: the gate on the node's own map removed (the second write lands on A with the
-/// node's map empty); the router asked for a local write when no map is held (the first
+/// Mutants: the service's map check skipped on the in-process path (the second write is
+/// taken by the node with an empty map); the router asked for a local write when no map is held (the first
 /// write lands on A).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_half_writes_nowhere_until_it_and_its_node_hold_a_map() {
@@ -302,28 +296,26 @@ async fn a_daemon_half_writes_nowhere_until_it_and_its_node_hold_a_map() {
     let own_digest = digest(&own);
 
     // No map for the daemon half: nothing is written, not even to its own node.
-    let cas = plane_over(None, &a, &a.node.maps, &tls);
+    let cas = plane_over(None, &a, a.node.in_process.clone(), &tls);
     let refused = cas.put(own.clone()).await.expect_err("no map");
     assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
     assert!(!a.node.holds(&own_digest).await, "nothing reached A");
 
     // A map for the daemon half, none for its node: its own member is refused ...
-    let empty = Arc::new(MapHolder::new());
-    let cas = plane_over(Some(&map), &a, &empty, &tls);
+    let cas = plane_over(Some(&map), &a, unmapped_in_process(), &tls);
     let refused = cas.put(own.clone()).await.expect_err("the node has no map");
     assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
     assert!(
-        refused.to_string().contains("no storage map yet"),
+        refused.to_string().contains("has not been given a map"),
         "{refused}"
     );
-    assert!(!a.node.holds(&own_digest).await, "nothing reached A");
     // ... and a blob another member owns is not.
     let theirs = blob_owned_by(&map, b.id, "theirs");
     cas.put(theirs.clone()).await.expect("B takes it");
     assert!(b.node.holds(&digest(&theirs)).await);
 
     // The node holds a map: its own member is used.
-    let cas = plane_over(Some(&map), &a, &a.node.maps, &tls);
+    let cas = plane_over(Some(&map), &a, a.node.in_process.clone(), &tls);
     cas.put(own).await.expect("A takes it");
     assert!(a.node.holds(&own_digest).await);
 }

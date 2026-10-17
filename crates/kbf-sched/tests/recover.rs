@@ -6,12 +6,12 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Event, Input, OpState, Recovered, RecoveredLease, Request, Requeue,
+    DaemonInstance, Event, Fate, Input, OpState, Recovered, RecoveredLease, Request, Requeue,
     RequeueReason, Scheduler,
 };
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, LeaseKind,
-    OperationId, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    MemoryKill, MemoryRun, OperationId, Qos, Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -74,6 +74,7 @@ fn queued(operation: u64, request: Request) -> Recovered {
         waiter: WaiterId(operation),
         lease: None,
         losses: 0,
+        fate: None,
     }
 }
 
@@ -307,4 +308,57 @@ fn an_exclusive_recovered_lease_keeps_its_node_to_itself() {
             "{effects:?}"
         );
     }
+}
+
+/// Catches: a fate a scheduler ignores (the operation books its submitted memory again
+/// and the ladder starts over), one that lowers a larger booking, and memory runs that are
+/// not held again or not given back by `fate()` for the next write.
+#[test]
+fn a_fate_restores_the_booking_and_the_memory_runs() {
+    let fate = Fate {
+        booked_bytes: 16 * GIB,
+        memory_runs: vec![MemoryRun {
+            worker: node("node-a"),
+            booked: GIB,
+            kill: MemoryKill::NodePressure,
+        }],
+    };
+    let mut small = queued(3, request(3));
+    small.fate = Some(fate.clone());
+    let mut big = queued(
+        4,
+        Request {
+            resources: Resources::new(1_000, 32 * GIB),
+            ..request(4)
+        },
+    );
+    big.fate = Some(fate.clone());
+    let s = recovered(vec![small, big, queued(5, request(5))]);
+    assert_eq!(s.fate(OperationId(3)), Some(fate.clone()));
+    assert_eq!(
+        s.fate(OperationId(4)).map(|f| f.booked_bytes),
+        Some(32 * GIB),
+        "a booking fell"
+    );
+    assert_eq!(s.fate(OperationId(5)), None);
+    assert_eq!(
+        s.memory_runs(OperationId(3)),
+        Some(fate.memory_runs.as_slice())
+    );
+}
+
+/// Catches: `fate()` answering for an operation the scheduler does not hold, and a fate
+/// with no runs that books memory it should not or that leaves a phantom entry of runs
+/// behind (a raised booking is kept; no kills are held).
+#[test]
+fn a_fate_without_runs_raises_the_booking_and_holds_no_kills() {
+    let mut raised = queued(6, request(6));
+    raised.fate = Some(Fate {
+        booked_bytes: 8 * GIB,
+        memory_runs: Vec::new(),
+    });
+    let s = recovered(vec![raised]);
+    assert_eq!(s.fate(OperationId(99)), None, "an operation not held");
+    assert_eq!(s.fate(OperationId(6)), None, "no kills to hand on");
+    assert!(s.memory_state().runs_by_operation().is_empty());
 }

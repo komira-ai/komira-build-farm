@@ -114,6 +114,36 @@ order, with its software and where it is in placement:
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
+## `GET /v1/members`
+
+The storage members of the current map, as the `Membership` service keeps them
+(`kbf.map.v1.Membership`; [architecture-v2.md](design/architecture-v2.md) section 6),
+in the map's order. A read, open like `GET /v1/nodes`; it takes no write. Storage
+members are not the daemon nodes of `/v1/nodes`: a storage node registers with a
+frontend, a daemon opens a worker stream.
+
+```json
+{ "generation": 7,
+  "members": [
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1 },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1 },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2 }
+] }
+```
+
+| Field | Meaning |
+|---|---|
+| `generation` | the map's generation; `0` with an empty `members` before the first member has registered |
+| `id` | the member id the store assigned at registration (the `member_id` of `RegisterResponse`) |
+| `addr` | the address callers dial |
+| `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
+| `weight` | its share of the digests relative to the others |
+
+A registered member is `joining` until something promotes it with `Members::set_state`;
+the server does not promote on its own yet, so a script that waits for `active` waits
+for that. A server without a state store keeps no members and answers `404`; a state
+store that cannot be read answers `503`.
+
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
 An operator takes a node out of placement, drains it, or returns it
@@ -787,8 +817,11 @@ frontend mounts `kbf_server::release::router`; without a store both answer `503`
   order above, a platform `complete` when both tarballs have their attestation. A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. The wiring must mount `Fetch` only behind the worker listener's mutual TLS, and
-  decide who may read `GET /v1/releases` where it mounts the router.
+  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
+  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
+  store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
+  update endpoint answers `503`.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

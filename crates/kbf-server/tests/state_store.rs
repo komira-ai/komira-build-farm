@@ -5,6 +5,7 @@
 //! the farm's clock is tokio's, paused: nothing here waits. The tests that restart the
 //! farm over its store run a second time over a real SQLite file, closed and reopened.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
@@ -19,13 +20,18 @@ use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStor
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
-    StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, Fenced, ManualClock, Revision, ScanPage, ScanRange,
+    Store, StoreError, StoreTime, Txn, Versioned,
 };
-use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Resources, WorkerId};
+use kbf_types::{
+    ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, MemoryRun, OperationId, Qos, Resources,
+    WorkerId,
+};
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/fate.rs"]
+mod fate;
 #[path = "state_store/handover.rs"]
 mod handover;
 
@@ -264,6 +270,26 @@ impl Disk {
             members: Default::default(),
             history: None,
         }))
+    }
+
+    /// A farm over the store that holds the writer generation after the newest one, as a
+    /// process started over the file does ([`kbf_state::Fenced`]): once another farm takes
+    /// the next one, every write of this farm fails and none lands.
+    fn generation_farm(&self) -> TestFarm {
+        let store: Arc<dyn Store> = self.store.clone();
+        let fenced = Fenced::take(store, None).expect("the next generation");
+        Farm::new(
+            Arc::new(Cache::memory()),
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        )
+        .with_state(Some(StateStore {
+            store: Arc::new(fenced),
+            epoch: EpochPolicy::Keep,
+            members: Default::default(),
+            history: None,
+        }))
+        .expect("a farm over the store")
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.

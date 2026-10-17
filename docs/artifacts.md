@@ -40,6 +40,11 @@ it as it does every macOS binary (below), but no CI job runs `kbf-deploy`'s test
 macOS: the bytes are known to start, and nothing more is claimed for them until a job
 tests the crate there.
 
+A pull request into `feature/arch-v2` builds only the Linux files: the macOS job and the
+sums are skipped there to spare the macOS runners, and the push to `feature/arch-v2`
+builds and attests all of them for its head. A newer push to `feature/arch-v2` cancels
+the older push's run; every commit on `main` keeps a run of its own.
+
 `<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
 --locked --release`), mode 0755, owned by 0:0, and nothing else. `cargo xtask package`

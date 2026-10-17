@@ -84,6 +84,10 @@ pub use in_process::InProcess;
 /// The metadata entry that carries the map generation on the standard calls.
 pub const MAP_GENERATION_HEADER: &str = "kbf-map-generation";
 
+/// The metadata entry that marks a `Write` as a copy the caller needs on this node
+/// although the map does not place the blob here ([`crate::Storage::put_unowned`]).
+pub const UNOWNED_HEADER: &str = "kbf-unowned-copy";
+
 /// The largest gRPC message the service decodes and sends: a full 16 MiB batch and room
 /// around it, `kbf-front`'s `MAX_MESSAGE_BYTES` (a test pins the two equal).
 pub const MAX_MESSAGE_BYTES: usize = (16 << 20) + (1 << 20);

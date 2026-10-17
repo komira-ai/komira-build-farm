@@ -244,6 +244,31 @@ async fn an_entry_is_committed_with_its_blobs_copied_to_the_actions_owner() {
     assert_eq!(found.map(|(d, _)| d), Some(e.result.1));
 }
 
+/// Catches a closure copy made with a plain write: a node in a chain refuses a blob it is
+/// not the primary of, and the action's owner is rarely the primary of the entry's blobs, so
+/// the commit failed and a repeat of the action ran again. The copy is an unowned write:
+/// with the owner refusing plain writes the blobs are stored and the entry is committed.
+#[tokio::test]
+async fn the_closure_copy_is_taken_by_an_owner_that_refuses_plain_writes() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    cluster.node(3).check_closure();
+    cluster.node(3).refuse_plain_puts();
+    let e = entry(&map);
+    cluster.node(1).hold(&e.output.0);
+    cluster.node(2).hold(&e.result.0);
+
+    router
+        .commit_with_closure(Role::Daemon, e.action, e.record)
+        .await
+        .expect("committed");
+    assert_eq!(
+        cluster.node(3).commits.lock().expect("lock").clone(),
+        [e.action]
+    );
+}
+
 /// Catches a copy of what the owner already has: a blob the owner holds is not read from
 /// anyone or written again.
 #[tokio::test]

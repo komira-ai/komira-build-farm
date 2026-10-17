@@ -115,6 +115,19 @@ pub trait Storage: Send + Sync {
     /// store failed.
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest>;
 
+    /// [`Storage::put`] of a copy the caller needs on this node although the map does not
+    /// place the blob here: the blobs of an action-cache entry, which the node checks
+    /// against what it holds itself. A node that serves a chain stores the blob as one
+    /// copy (nothing is forwarded, nobody owes a replica) where [`Storage::put`] would be
+    /// refused as not the primary; a node that is the blob's primary treats it as
+    /// [`Storage::put`]. The default is [`Storage::put`].
+    ///
+    /// # Errors
+    /// As [`Storage::put`].
+    fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        self.put(bytes)
+    }
+
     /// A stream for one blob of `size` bytes, written as its bytes arrive and never
     /// held whole in memory: [`PutStream::append`] each chunk, [`PutStream::finish`]
     /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` only when the

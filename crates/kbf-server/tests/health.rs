@@ -192,6 +192,7 @@ fn start_on(prefix: &str, listeners: Listeners) -> Server {
         listen: loopback,
         token: None,
         local_cache: None,
+        releases: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let shutdown = async move {

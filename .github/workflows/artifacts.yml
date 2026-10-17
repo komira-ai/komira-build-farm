@@ -6,7 +6,8 @@
 # commit's files.
 #
 # On a pull request or in the merge queue this is a build check: everything is built,
-# signed, packaged and summed, and nothing is attested. On a push to main or to
+# signed, packaged and summed, and nothing is attested (a pull request into
+# feature/arch-v2 skips darwin-arm64, and so the sums, to spare the macOS runners). On a push to main or to
 # feature/arch-v2, the attest job signs build provenance for every file and an SBOM
 # attestation for every tarball, and the verify job then checks them, for the branch
 # that was pushed, as the planned deployment job is to. Only attest may hold `id-token:
@@ -29,11 +30,14 @@ on:
 
 permissions: {}
 
-# A pull request's newer run replaces its older one. Every commit on main gets its own
-# group, so no commit's run is cancelled or dropped while queued.
+# A pull request's newer run replaces its older one, and so does a newer push to
+# feature/arch-v2: only its head needs attested files, and a superseded push run would
+# otherwise hold a macOS runner for hours (each push had its own group, and pushes
+# queued 2-4 h behind each other for the few macOS runners). Every commit on main still
+# gets its own group, so no main commit's run is cancelled or dropped while queued.
 concurrency:
-  group: artifacts-${{ github.event_name == 'push' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: artifacts-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,6 +55,10 @@ defaults:
 
 jobs:
   darwin-arm64:
+    # Not for pull requests into feature/arch-v2: nothing is attested from a pull request,
+    # macOS runners are the scarce ones, and the push to feature/arch-v2 builds and
+    # attests darwin-arm64 for its head. Pull requests into main still build it.
+    if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' }}
     runs-on: macos-15
     timeout-minutes: 45
     permissions:

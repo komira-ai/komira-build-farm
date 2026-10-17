@@ -265,8 +265,7 @@ mod tests {
         let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
             .await
             .expect("the storage half starts");
-        let local =
-            kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process(), half.maps());
+        let local = kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process());
         // `start_member` builds the plane when the native driver is set up, on a thread of
         // its own: dropping the daemon's runtime in the test's would panic.
         let start = |ca: String, local: kbf_daemon::LocalMember| {

@@ -141,6 +141,8 @@ pub struct Node {
     pub action_gets: AtomicUsize,
     /// What `put` answers instead of the digest, if set.
     put_answer: Mutex<Option<Digest>>,
+    /// A plain `put` is refused as a node in a chain refuses a blob it is not the primary of.
+    chain_rule: AtomicBool,
     /// A commit is refused as `Absent` unless the node holds the entry's result blob and
     /// closure, as a storage node does.
     pub check_closure: AtomicBool,
@@ -163,6 +165,7 @@ impl Node {
             commits: Mutex::default(),
             action_gets: AtomicUsize::new(0),
             put_answer: Mutex::default(),
+            chain_rule: AtomicBool::new(false),
             check_closure: AtomicBool::new(false),
         })
     }
@@ -280,6 +283,18 @@ impl Node {
         self.puts.lock().expect("lock").clone()
     }
 
+    fn store(&self, bytes: Bytes) -> Digest {
+        let digest = self.hold(&bytes);
+        self.puts.lock().expect("lock").push(digest);
+        self.put_answer.lock().expect("lock").unwrap_or(digest)
+    }
+
+    /// Plain writes are refused from now on, as a chain's node refuses a blob it is not the
+    /// primary of; [`Storage::put_unowned`] still stores.
+    pub fn refuse_plain_puts(&self) {
+        self.chain_rule.store(true, Ordering::SeqCst);
+    }
+
     fn check_down(&self) -> Result<(), StorageError> {
         if self.down.load(Ordering::SeqCst) {
             return Err(unavailable());
@@ -375,9 +390,17 @@ impl Storage for Node {
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
         Box::pin(async move {
             self.check()?;
-            let digest = self.hold(&bytes);
-            self.puts.lock().expect("lock").push(digest);
-            Ok(self.put_answer.lock().expect("lock").unwrap_or(digest))
+            if self.chain_rule.load(Ordering::SeqCst) {
+                return Err(StorageError::Invalid("not the primary of the blob".into()));
+            }
+            Ok(self.store(bytes))
+        })
+    }
+
+    fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
+        Box::pin(async move {
+            self.check()?;
+            Ok(self.store(bytes))
         })
     }
 

@@ -47,12 +47,13 @@ use kbf_proto::worker::{
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, LOSS_REQUEUES, MemoryLadder, OpState,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, Input, LOSS_REQUEUES, MemoryLadder, OpState,
     Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
-    OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    MemoryRun, OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting,
+    WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
@@ -219,7 +220,7 @@ struct State {
     /// Until it has, it still holds the lease and no queue row for the operation, so
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
-    unsettled: Vec<(Requeue, Option<u32>)>,
+    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>)>,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
     /// When each node's session row in the state store was last written.
@@ -346,6 +347,14 @@ impl Farm {
     #[must_use]
     pub fn queued_operations(&self) -> u64 {
         self.lock().sched.queued_len() as u64
+    }
+
+    /// The memory runs of every operation this farm holds that was killed for memory,
+    /// oldest first ([`kbf_sched::MemoryState::runs_by_operation`]): what a successor
+    /// farm over the same state store must hold too.
+    #[must_use]
+    pub fn memory_runs(&self) -> BTreeMap<OperationId, Vec<MemoryRun>> {
+        self.lock().sched.memory_state().runs_by_operation()
     }
 
     /// Execute and WaitExecution operation streams open now

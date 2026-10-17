@@ -327,7 +327,11 @@ struct RoutedPlane {
 impl RoutedPlane {
     /// The router, when the map is to be routed by.
     fn routing(&self) -> Option<&Router> {
-        self.routed.active().then(|| self.routed.router())
+        if self.routed.active() {
+            return Some(self.routed.router());
+        }
+        self.routed.tag_bootstrap();
+        None
     }
 }
 

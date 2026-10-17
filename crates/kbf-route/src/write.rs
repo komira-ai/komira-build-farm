@@ -76,9 +76,12 @@ impl Router {
     /// blob larger than the budget is copied when it has the budget to itself.
     ///
     /// The blobs pass through this process once. The owner takes a blob it does not own
-    /// because a storage node checks neither ownership nor the caller's generation on a
-    /// write today; when it does, and a write is acknowledged by its replicas (av2-11,
-    /// av2-12), the entry carries those acknowledgements and this copy goes away.
+    /// through [`Storage::put_unowned`]: a node that serves a chain refuses a plain write
+    /// of a blob it is not the primary of. When a write is acknowledged by its replicas
+    /// (av2-11, av2-12), the entry carries those acknowledgements and this copy goes away.
+    /// The copy is an extra, not the replicated one: each blob is still held by its own
+    /// owners (the daemon's upload or [`Router::put`] went through the chain), and the node
+    /// takes the marker only from the frontend's certificate.
     ///
     /// # Errors
     /// Every owner of the action is down; a blob of the entry that no owner holds (the
@@ -148,7 +151,8 @@ impl Router {
         } else {
             self.read_blob(&digest).await?
         };
-        let stored = node.put(bytes).await?;
+        // The action's owner is rarely the blob's: it holds the blob as one more copy.
+        let stored = node.put_unowned(bytes).await?;
         if stored != digest {
             return Err(StorageError::Internal(format!(
                 "a node stored the blob {digest} as {stored}"

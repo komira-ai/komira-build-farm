@@ -26,8 +26,8 @@
 //!     under `--advertise-addr`, or the bound address) goes in-process to the storage
 //!     half, with no socket; any other goes over mutual TLS to its owner. **No map, no
 //!     write**: until the daemon holds a map every call fails UNAVAILABLE (there is no
-//!     `--cas` leg to fall back on), and until the storage half holds one it refuses its
-//!     own member as its listener refuses every call, `no storage map yet`. The
+//!     `--cas` leg to fall back on), and until the storage half holds one its service refuses
+//!     every call, its own member's included (UNAVAILABLE, as it refuses any caller's). The
 //!     in-process plane of the one-box mode moves output files without spooling them
 //!     (`Cas::intake`); the routed plane does not yet.
 //! - **One cache**: when the hot store is a directory on `--data-dir`'s filesystem, as
@@ -165,7 +165,7 @@ fn routes_by_map(flags: &Flags) -> bool {
 #[cfg(target_os = "linux")]
 fn local_member(flags: &Flags, half: &StorageHalf) -> LocalMember {
     let addr = flags.storage.registers_as(half.addr);
-    LocalMember::new(addr, half.in_process(), half.maps())
+    LocalMember::new(addr, half.in_process())
 }
 
 /// The daemon half's start over `half` (the module docs, **The daemon half**).

@@ -265,6 +265,9 @@ impl StorageProbe {
     /// The action-cache lookup, at the owners or at the one node.
     async fn ask(&self) -> Result<(), kbf_storage::StorageError> {
         let digest = probe_digest();
+        if let Some(routed) = &self.routed {
+            routed.tag_bootstrap();
+        }
         match self.routed.as_ref().filter(|routed| routed.active()) {
             Some(routed) => routed.router().action_result(&digest).await.map(drop),
             None => self.storage.action_result(&digest).await.map(drop),

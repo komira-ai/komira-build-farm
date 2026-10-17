@@ -54,13 +54,19 @@ impl StorageService {
         &self,
         requested: u64,
         leg_from: Option<MemberId>,
+        unowned: bool,
         mut messages: Messages,
     ) -> Result<u64, Status> {
         let view = self.view(requested).await?;
         let first = next_or(&mut messages, "write stream sent no message").await?;
         let digest = super::wire::write_resource(&first.resource_name)?;
         let size = digest.size_bytes;
-        let plan = self.plan(view.as_ref(), &digest, leg_from)?;
+        let (plan, view) = match self.plan(view.as_ref(), &digest, leg_from) {
+            // A copy the caller needs here though the map places the blob elsewhere: one
+            // copy, outside the chain (no replica, no debt, no placement to confirm).
+            Err(StorageError::Invalid(_)) if unowned => (Plan::Local, None),
+            planned => (planned?, view),
+        };
         if self.storage.find_missing(&[digest]).await?.is_empty() {
             return Ok(size);
         }

@@ -214,6 +214,23 @@ impl MemoryState {
             .map_or(&[][..], |op| op.runs.as_slice())
     }
 
+    /// Every held operation's memory runs, oldest first: what a successor that took the
+    /// operations over must hold too.
+    #[must_use]
+    pub fn runs_by_operation(&self) -> BTreeMap<OperationId, Vec<MemoryRun>> {
+        self.ops
+            .iter()
+            .map(|(id, kills)| (*id, kills.runs.clone()))
+            .collect()
+    }
+
+    /// Takes up the kills `operation` had before, in a scheduler that holds it now.
+    pub(super) fn restore(&mut self, operation: OperationId, runs: Vec<MemoryRun>) {
+        if !runs.is_empty() {
+            self.ops.insert(operation, OpKills { runs });
+        }
+    }
+
     /// Forgets the kills of `operation`, which the scheduler has dropped.
     pub(super) fn forget(&mut self, operation: OperationId) {
         self.ops.remove(&operation);

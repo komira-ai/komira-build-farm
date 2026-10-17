@@ -104,6 +104,28 @@ impl Admission {
         self.check_leaf(leaf.map(AsRef::as_ref), endpoint)
     }
 
+    /// Whether the caller of `request` may mark a write as an unowned copy
+    /// ([`crate::Storage::put_unowned`]): only the frontend's identity may, since such a
+    /// write is never forwarded to a second owner and owes no repair. Plain text has no
+    /// identity and takes the rule of every other call but a copy: admitted.
+    #[must_use]
+    pub fn permits_unowned<T>(&self, request: &Request<T>) -> bool {
+        let certs = kbf_tls::peer_certs(request);
+        let leaf = certs.as_deref().and_then(|chain| chain.first());
+        self.permits_unowned_leaf(leaf.map(AsRef::as_ref))
+    }
+
+    /// [`Admission::permits_unowned`] for a caller whose verified chain starts with `leaf`.
+    #[must_use]
+    pub fn permits_unowned_leaf(&self, leaf: Option<&[u8]>) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Certified => leaf
+                .and_then(|der| role_of(der).ok())
+                .is_some_and(|role| role == PeerRole::Frontend),
+        }
+    }
+
     /// [`Admission::check`] for a caller whose verified chain starts with `leaf`.
     ///
     /// # Errors

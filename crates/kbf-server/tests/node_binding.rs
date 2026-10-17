@@ -660,6 +660,7 @@ async fn a_revoked_daemon_cannot_report_its_status() {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
         local_cache: None,
+        releases: None,
     };
     let bound = bind_server_with_api(Arc::new(Cache::memory()), listeners, Some(api), pending())
         .expect("bind");

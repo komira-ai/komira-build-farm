@@ -97,6 +97,6 @@ pub use scheduler::memory::{
     FARM_RERUNS, LadderError, MEMORY_FLOORS, MemoryLadder, MemoryState, NOT_STARTED_RERUNS,
 };
 pub use scheduler::{
-    FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Recovered, RecoveredLease, Scheduler,
+    FINISHED_RETENTION, Fate, OpState, PLACEMENT_ROUND, Recovered, RecoveredLease, Scheduler,
     UNSERVABLE_WAIT,
 };

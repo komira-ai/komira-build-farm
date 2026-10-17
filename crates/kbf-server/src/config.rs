@@ -198,6 +198,14 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// The release store (`docs/design/pull-updates.md`, section 6): a directory where the
+    /// tarballs of a release and their build attestations are kept, uploaded with
+    /// `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the
+    /// token) and fetched by the nodes through `ReleaseService.Fetch` on the worker
+    /// listener, behind its mutual TLS. Made if missing. Without it every update endpoint
+    /// answers 503 saying so.
+    #[arg(long, value_name = "DIR", requires = "api_listen")]
+    pub releases_dir: Option<PathBuf>,
     /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
     /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
     /// accepts, with no `invocations` or `blobs` key in the policy file
@@ -480,6 +488,13 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The release store's directory cannot be made.
+    #[error("--releases-dir {dir}: {source}", dir = dir.display())]
+    Releases {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// The REAPI policy file cannot be read.
     #[error("--reapi-auth-policy: read {path}: {source}")]
     PolicyRead {
@@ -723,10 +738,21 @@ impl Args {
             .map(ApiToken::from_file)
             .transpose()?;
         let local_cache = self.local_cache.clone();
+        let releases = self
+            .releases_dir
+            .as_deref()
+            .map(|dir| crate::release::ReleaseStore::open(dir, crate::release::Limits::default()))
+            .transpose()
+            .map_err(|source| ConfigError::Releases {
+                dir: self.releases_dir.clone().unwrap_or_default(),
+                source,
+            })?
+            .map(Arc::new);
         Ok(Some(Api {
             listen,
             token,
             local_cache,
+            releases,
         }))
     }
 

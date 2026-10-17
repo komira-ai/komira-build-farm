@@ -24,17 +24,17 @@
 //! `--advertise-addr`, or the address it bound (which must then not be a wildcard). The node
 //! never talks to the state store. The maps the frontend sends it (at registration, and at
 //! any heartbeat that finds it behind) are kept in a [`kbf_mapsync::MapHolder`]
-//! ([`StorageHandle::maps`]). Until the first one arrives the node answers every call
-//! UNAVAILABLE `no storage map yet` ([`crate::serve::bind_storage_gated`]): it does not know
-//! the farm's members, so it cannot know which blobs are its own. Every request still
-//! carries a generation, which the node ignores; the `STALE_MAP` check is the storage
-//! service's.
+//! ([`StorageHandle::maps`]), which the node's storage service reads: until the first one
+//! arrives it serves nothing (UNAVAILABLE), it answers a caller whose map is not the
+//! current one STALE_MAP, and under mutual TLS it is a link of the chain that copies a
+//! write to the blob's second owner, with the repair worker that makes a copy owed
+//! ([`StorageHandle::repairs`]); all as [`crate::replication`] says.
 
 use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -46,6 +46,7 @@ use kbf_log::FarmLogId;
 use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
@@ -53,7 +54,9 @@ use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joiner};
-use crate::serve::{ServeError, StorageListener, bind_storage_gated};
+use crate::node_map::NodeMap;
+use crate::replication::{REPAIR_DIR, bind_node};
+use crate::serve::{ServeError, StorageListener};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
@@ -114,6 +117,8 @@ pub struct StorageFlags {
     pub zone: String,
     /// The weight to register with.
     pub weight: u32,
+    /// How the repair worker of a node that registered with a frontend is paced.
+    pub repair: RepairConfig,
 }
 
 /// The command line of `kbf storage`: [`Args`]'s, those it takes shown and the rest
@@ -252,6 +257,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
         advertise,
         zone: text(REGISTRATION[2]).unwrap_or_default(),
         weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
+        repair: RepairConfig::default(),
     })
 }
 
@@ -290,6 +296,23 @@ impl StorageFlags {
         })
     }
 
+    /// The certificate this node calls with and the CA it trusts, as the flags name them:
+    /// for its registration with an `https://` frontend and for its calls to the other
+    /// storage nodes; `None` without the TLS flags.
+    ///
+    /// # Errors
+    /// A TLS file cannot be read.
+    pub fn peer_tls(&self) -> Result<Option<ClientTlsConfig>, ConfigError> {
+        let Some([cert, key, ca]) = &self.tls else {
+            return Ok(None);
+        };
+        let identity = Identity::from_pem(crate::config::read(cert)?, crate::config::read(key)?);
+        let ca = Certificate::from_pem(crate::config::read(ca)?);
+        Ok(Some(
+            ClientTlsConfig::new().identity(identity).ca_certificate(ca),
+        ))
+    }
+
     /// The address the node registers under, and so the one its member of the map
     /// carries: `--advertise-addr`, or the address it `bound`.
     #[must_use]
@@ -298,26 +321,21 @@ impl StorageFlags {
     }
 
     /// The registration with `--frontend`, for a node bound at `bound`, keeping the maps it
-    /// is sent in `maps`; `None` without the flag. Connects lazily, so a frontend that is down at start is waited for.
+    /// is sent in `node` and telling it which member it is; `None` without the flag.
+    /// Connects lazily, so a frontend that is down at start is waited for.
     ///
     /// # Errors
     /// A TLS file cannot be read or is refused; the URL is refused.
     pub fn joiner(
         &self,
         bound: SocketAddr,
-        maps: Arc<MapHolder>,
+        node: Arc<NodeMap>,
     ) -> Result<Option<Joiner>, Box<dyn Error>> {
         let Some(url) = &self.frontend else {
             return Ok(None);
         };
         let mut endpoint = Endpoint::from_shared(url.clone())?;
-        if let (true, Some([cert, key, ca])) = (url.starts_with("https://"), &self.tls) {
-            let tls = ClientTlsConfig::new()
-                .identity(Identity::from_pem(
-                    crate::config::read(cert)?,
-                    crate::config::read(key)?,
-                ))
-                .ca_certificate(Certificate::from_pem(crate::config::read(ca)?));
+        if let (true, Some(tls)) = (url.starts_with("https://"), self.peer_tls()?) {
             endpoint = endpoint.tls_config(tls)?;
         }
         let addr = self.registers_as(bound);
@@ -328,7 +346,7 @@ impl StorageFlags {
             weight: self.weight,
         };
         let joiner = Joiner::new(endpoint.connect_lazy(), identity, join::RETRY_BASE);
-        Ok(Some(joiner.with_maps(maps)))
+        Ok(Some(joiner.with_node(node)))
     }
 
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
@@ -350,10 +368,19 @@ pub struct StorageHandle {
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
     maps: Arc<MapHolder>,
+    repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
+    _repair: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
+    /// The copies this node owes: its repair journal. `None` for a node that does not
+    /// replicate (no `--frontend`, or one that admits callers in plain text).
+    #[must_use]
+    pub fn repairs(&self) -> Option<Arc<Repairs>> {
+        self.repairs.clone()
+    }
+
     /// The storage map this node holds: what the frontend sent it when it registered and
     /// at each heartbeat that found it behind. Empty for a node with no `--frontend`.
     #[must_use]
@@ -379,6 +406,7 @@ impl StorageHandle {
             _flusher,
             _pass,
             _joiner,
+            _repair,
             ..
         } = self;
         serving.await
@@ -453,12 +481,14 @@ where
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
+    // After the log is open: it refuses a directory that holds files it did not write.
+    let repair_dir = stores.meta_dir.join(REPAIR_DIR);
     assemble(
         flags,
         listener,
         stores.hot.as_ref(),
         (meta, store, prefix, log),
-        shutdown,
+        (shutdown, &repair_dir),
         pass,
     )
     .await
@@ -470,7 +500,7 @@ async fn assemble<O, S, F>(
     listener: StorageListener,
     hot: Option<&Hot>,
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
-    shutdown: S,
+    (shutdown, repair_dir): (S, &Path),
     pass: Option<StartPass<RaftMetaLog<StdFs>>>,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
@@ -489,25 +519,20 @@ where
     });
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let storage = Arc::new(CacheStorage::new(cache, flags.segments()));
-    let maps = Arc::new(MapHolder::new());
-    // A node that registers with a frontend is one of several: it serves nothing until
-    // it holds the map. One box (no `--frontend`) serves at once.
-    let gate = flags.frontend.as_ref().map(|_| Arc::clone(&maps));
-    let bound = bind_storage_gated(storage, listener, gate, shutdown()?)?;
-    let _joiner = flags
-        .joiner(bound.addr, Arc::clone(&maps))?
-        .map(|joiner| AbortOnDrop(tokio::spawn(joiner.run())));
+    let node = bind_node(flags, listener, storage, repair_dir, Box::pin(shutdown()?))?;
     Ok(StorageHandle {
-        addr: bound.addr,
+        addr: node.addr,
         start_line: format!(
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
-            bound.addr
+            node.addr
         ),
-        serving: Box::pin(bound.serving),
+        serving: node.serving,
         _flusher,
         _pass,
-        maps,
-        _joiner,
+        maps: node.maps,
+        repairs: node.repairs,
+        _joiner: node.joiner,
+        _repair: node.repair,
     })
 }
 

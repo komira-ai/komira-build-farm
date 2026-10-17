@@ -48,6 +48,15 @@ impl Owner {
         }
     }
 
+    /// The node, tagged with map `generation` from now on (on every clone of it).
+    fn tagged(&self, generation: u64) -> Self {
+        self.storage.set_map_generation(generation);
+        Self {
+            generation,
+            ..self.clone()
+        }
+    }
+
     /// The node's name.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -107,13 +116,20 @@ impl Owners {
         self.routed.as_deref().filter(|routed| routed.active())
     }
 
+    /// The fixed list, each node tagged with the generation of the map held when there is
+    /// a map to read it from: a node that holds a map refuses a call tagged 0.
     fn fixed(&self) -> Arc<[Owner]> {
-        Arc::clone(
+        let nodes = Arc::clone(
             &self
                 .nodes
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        );
+        let Some(routed) = &self.routed else {
+            return nodes;
+        };
+        let generation = routed.bootstrap_generation();
+        nodes.iter().map(|owner| owner.tagged(generation)).collect()
     }
 
     /// The nodes that hold `digest`, in the order a read tries them: the map's, this

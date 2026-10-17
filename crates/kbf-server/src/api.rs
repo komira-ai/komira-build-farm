@@ -4,6 +4,8 @@
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
 //!   software status each sent and where it is in placement ([`crate::fleet`]).
+//! - `GET /v1/members`: the storage members of the current map, as the gRPC
+//!   `Membership` service keeps them ([`crate::members::Members`]).
 //! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
 //!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
@@ -40,7 +42,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kbf_map::{Map, MemberId, MemberState};
 use kbf_types::WorkerId;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::drain::{Drain, DrainStatus};
 use crate::farm::{Farm, NodeAction};
@@ -59,6 +61,9 @@ pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
 
 /// The path of `GET /v1/nodes`.
 pub const NODES: &str = "/v1/nodes";
+
+/// The path of `GET /v1/members`.
+pub const MEMBERS: &str = "/v1/members";
 
 /// The path of `POST /v1/nodes/{node}:{verb}`, with `node` percent-encoded (every byte
 /// but an ASCII letter, digit, `-`, `.`, `_` or `~`), so a node id that holds a `/`, a
@@ -90,7 +95,8 @@ struct ApiState {
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
-/// `POST /v1/members/{id}` changes (the same value the `Membership` service registers into).
+/// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
+/// `Membership` service registers into).
 /// Writes read the peer address from
 /// [`ConnectInfo`]: serve them with `into_make_service_with_connect_info`.
 pub fn router(
@@ -101,6 +107,7 @@ pub fn router(
 ) -> Router {
     Router::new()
         .route(NODES, get(nodes))
+        .route(MEMBERS, get(members_view))
         .route("/v1/nodes/{target}", post(act))
         .route("/v1/members/{id}", post(set_member_state))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
@@ -153,6 +160,79 @@ async fn begin_drain(
 
 async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &api.farm.nodes())
+}
+
+/// One storage member of the map.
+#[derive(Debug, Serialize)]
+struct MemberView {
+    id: u64,
+    addr: String,
+    state: &'static str,
+    weight: u32,
+}
+
+/// The storage members of the current map.
+#[derive(Debug, Serialize)]
+struct MembersView {
+    generation: u64,
+    members: Vec<MemberView>,
+}
+
+/// A member's state as `GET /v1/members` names it. Exhaustive: a new state fails to
+/// compile here instead of reaching operators unnamed.
+const fn state_name(state: MemberState) -> &'static str {
+    match state {
+        MemberState::Joining => "joining",
+        MemberState::CatchingUp => "catching_up",
+        MemberState::Active => "active",
+        MemberState::Draining => "draining",
+        MemberState::Down => "down",
+    }
+}
+
+async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
+    let Some(members) = api.members.clone() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "this server keeps no storage members: it has no --state-store",
+        );
+    };
+    // The store's calls block (its trait says so).
+    let map = match tokio::task::spawn_blocking(move || members.current_map()).await {
+        Ok(Ok(map)) => map,
+        Ok(Err(e)) => {
+            let code = match e {
+                MembershipError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return error(code, &e.to_string());
+        }
+        Err(e) => {
+            let why = format!("membership task: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, &why);
+        }
+    };
+    // No map until the first member registers: generation 0 is "no map seen".
+    let view = map.map_or(
+        MembersView {
+            generation: 0,
+            members: Vec::new(),
+        },
+        |map| MembersView {
+            generation: map.generation(),
+            members: map
+                .members()
+                .iter()
+                .map(|m| MemberView {
+                    id: m.id.0,
+                    addr: m.addr.clone(),
+                    state: state_name(m.state),
+                    weight: m.weight,
+                })
+                .collect(),
+        },
+    );
+    json(StatusCode::OK, &view)
 }
 
 async fn act(

@@ -10,7 +10,7 @@ mod recover;
 mod state;
 mod view;
 
-pub use recover::{Recovered, RecoveredLease};
+pub use recover::{Fate, Recovered, RecoveredLease};
 pub use state::OpState;
 
 use std::cmp::Reverse;

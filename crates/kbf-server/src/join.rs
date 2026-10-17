@@ -6,7 +6,9 @@
 //! **The map.** The registration answers with the frontend's map, and a heartbeat that
 //! says which generation the node holds is answered with the map when the frontend's is
 //! newer. Each goes into the node's [`MapHolder`] (which keeps the newest and never goes
-//! back), so a node learns every bump from its own beat, with no push to lose.
+//! back), so a node learns every bump from its own beat, with no push to lose. A caller
+//! that routed by a map the node has not been sent ([`MapHolder::reach`]) makes it beat at
+//! once instead of at the next interval.
 //! Every call says whether the node is still rebuilding its index ([`CatchUp`], the state
 //! its storage service reads): a node that registers while rebuilding enters the map as
 //! `CatchingUp`, and the first heartbeat after [`CatchUp::finish`] makes it `Active`.
@@ -14,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_map::Map;
+use kbf_map::{Map, MemberId};
 use kbf_mapsync::MapHolder;
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
@@ -23,6 +25,7 @@ use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::members::PROTOCOL;
+use crate::node_map::NodeMap;
 
 /// The first wait after a failure.
 pub const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -68,7 +71,7 @@ pub struct Joiner {
     identity: Identity,
     retry: Duration,
     catch_up: CatchUp,
-    maps: Arc<MapHolder>,
+    node: Arc<NodeMap>,
 }
 
 impl Joiner {
@@ -81,16 +84,17 @@ impl Joiner {
             identity,
             retry,
             catch_up: CatchUp::caught_up(),
-            maps: Arc::new(MapHolder::new()),
+            node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
         }
     }
 
-    /// Keeps the maps this node is sent in `maps`, which whatever else the node runs
-    /// (the checks of its storage service, its replication) reads. The joiner starts
-    /// with a holder of its own.
+    /// Keeps the maps this node is sent in `node`'s holder, which whatever else the node
+    /// runs reads (the checks of its storage service, its replication), and tells `node`
+    /// which member it is once it has registered ([`NodeMap`]). The joiner starts with a
+    /// node of its own.
     #[must_use]
-    pub fn with_maps(mut self, maps: Arc<MapHolder>) -> Self {
-        self.maps = maps;
+    pub fn with_node(mut self, node: Arc<NodeMap>) -> Self {
+        self.node = node;
         self
     }
 
@@ -101,7 +105,7 @@ impl Joiner {
         match Map::try_from(map) {
             Ok(map) => {
                 let generation = map.generation();
-                if self.maps.offer(map) {
+                if self.node.maps().offer(map) {
                     tracing::info!(generation, "storage map taken");
                 }
             }
@@ -137,6 +141,7 @@ impl Joiner {
             .await?
             .into_inner();
         self.take(answer.map.clone());
+        self.node.registered(MemberId(answer.member_id));
         Ok(Joined {
             member_id: answer.member_id,
             boot: answer.boot,
@@ -156,7 +161,7 @@ impl Joiner {
             .heartbeat(pb::HeartbeatRequest {
                 member_id: joined.member_id,
                 boot: joined.boot,
-                have_generation: self.maps.generation(),
+                have_generation: self.node.maps().generation(),
                 catching_up: self.catch_up.is_catching_up(),
             })
             .await?
@@ -166,8 +171,10 @@ impl Joiner {
     }
 
     /// Registers and heartbeats for ever. A failed call waits [`backoff`] and tries
-    /// again; a NOT_FOUND heartbeat registers again.
+    /// again; a NOT_FOUND heartbeat registers again. A heartbeat is also sent at once when
+    /// a caller asks for a map newer than the node's ([`MapHolder::reach`]).
     pub async fn run(mut self) {
+        let mut asks = self.node.maps().asks();
         let mut failures = 0_u32;
         loop {
             let this = loop {
@@ -183,7 +190,13 @@ impl Joiner {
             failures = 0;
             tracing::info!(member = this.member_id, boot = this.boot, "registered");
             loop {
-                tokio::time::sleep(this.interval).await;
+                // A beat is due at the interval, and at once when a caller routed by a map
+                // this node has not been sent ([`MapHolder::reach`] records the generation it
+                // wants): waiting out the interval would refuse its calls for that long.
+                tokio::select! {
+                    () = tokio::time::sleep(this.interval) => {}
+                    _ = asks.changed() => {}
+                }
                 match self.beat(&this).await {
                     Ok(_) => failures = 0,
                     Err(e) if e.code() == Code::NotFound => {

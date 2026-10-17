@@ -7,7 +7,8 @@
 //!
 //! - The daemon role opens a worker session (`kbf.worker.v1.Worker/Session`, which also
 //!   carries the storage map to the daemon) and makes the blob calls: `ByteStream`,
-//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`.
+//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`, and
+//!   fetches the release it was offered (`kbf.update.v1.ReleaseService/Fetch`).
 //! - The storage role registers and heartbeats (`kbf.map.v1.Membership`); a storage
 //!   node gets the map in those answers.
 //! - The frontend role may call nothing here.
@@ -77,6 +78,9 @@ pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
         "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
         DAEMON,
     ),
+    // The node's update client fetches the release it was offered (the daemon half of a
+    // storage-and-daemon host presents its daemon certificate).
+    ("/kbf.update.v1.ReleaseService/Fetch", DAEMON),
     ("/kbf.worker.v1.Segments/Begin", DAEMON),
     ("/kbf.worker.v1.Segments/PutRange", DAEMON),
     ("/kbf.worker.v1.Segments/Commit", DAEMON),

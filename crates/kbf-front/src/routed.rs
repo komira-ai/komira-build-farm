@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kbf_map::Member;
 use kbf_route::{MapSource, Nodes, Placement, Router, TlsNodes};
 use kbf_storage::StorageError;
+use kbf_storage::service::RemoteStorage;
 use kbf_types::Digest;
 use tonic::transport::Channel;
 
@@ -53,6 +54,9 @@ pub struct Routed {
     channels: Arc<dyn Channels>,
     /// A map with two members or more has been seen.
     settled: AtomicBool,
+    /// The handles to the `--storage` node the frontend calls while it is not routing by the
+    /// map ([`Routed::bootstrapped`]).
+    bootstrap: Vec<RemoteStorage>,
 }
 
 impl std::fmt::Debug for Routed {
@@ -75,6 +79,32 @@ impl Routed {
             maps,
             channels,
             settled: AtomicBool::new(false),
+            bootstrap: Vec::new(),
+        }
+    }
+
+    /// The same, also tagging the calls made through `storage`, the handle to the
+    /// `--storage` node, with the generation of the map held ([`Routed::tag_bootstrap`]).
+    #[must_use]
+    pub fn bootstrapped(mut self, storage: RemoteStorage) -> Self {
+        self.bootstrap.push(storage);
+        self
+    }
+
+    /// The generation of the map held now; 0 before the first.
+    #[must_use]
+    pub fn bootstrap_generation(&self) -> u64 {
+        self.maps.current().map_or(0, |view| view.map.generation())
+    }
+
+    /// Tags the handles of [`Routed::bootstrapped`] with the map's generation now. A
+    /// node that holds a map judges every call by it and refuses 0 as behind, and while
+    /// the map has one member the frontend calls only the `--storage` node, so each call
+    /// that does is tagged first and follows every bump.
+    pub fn tag_bootstrap(&self) {
+        let generation = self.bootstrap_generation();
+        for storage in &self.bootstrap {
+            storage.set_map_generation(generation);
         }
     }
 

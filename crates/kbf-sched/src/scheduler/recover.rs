@@ -3,7 +3,7 @@
 
 use std::cmp::Reverse;
 
-use kbf_types::{LeaseId, LeaseKind, OperationId, WaiterId, WorkerId};
+use kbf_types::{LeaseId, LeaseKind, MemoryRun, OperationId, WaiterId, WorkerId};
 
 use super::{Held, OpState, Operation, Scheduler, StartSent, Worker};
 use crate::fence::LEASE_GRACE;
@@ -24,6 +24,21 @@ pub struct Recovered {
     /// How many of its leases were lost before (counted by
     /// [`Scheduler::with_loss_requeues`]), as the store holds it.
     pub losses: u32,
+    /// What the operation's kills for memory changed, as the store holds it; `None` for
+    /// an operation that has none (or a store written before the row existed).
+    pub fate: Option<Fate>,
+}
+
+/// What an operation's kills for memory changed in the scheduler, which a scheduler that
+/// takes the operation over must hold too: the memory it books now (raised by the kill),
+/// and its runs killed for memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fate {
+    /// The memory booking the next run takes, in bytes: [`Request::resources`]'s
+    /// `memory_bytes` after the raise. The request in the store is the submitted one.
+    pub booked_bytes: u64,
+    /// The operation's runs killed for memory, oldest first.
+    pub memory_runs: Vec<MemoryRun>,
 }
 
 /// A committed lease of a [`Recovered`] operation.
@@ -36,6 +51,18 @@ pub struct RecoveredLease {
 }
 
 impl Scheduler {
+    /// What the memory kills of `operation` changed, to write down for a successor; `None`
+    /// when it has none, or the scheduler no longer holds it.
+    #[must_use]
+    pub fn fate(&self, operation: OperationId) -> Option<Fate> {
+        let op = self.ops.get(&operation)?;
+        let memory_runs = self.memory.runs(operation);
+        (!memory_runs.is_empty()).then(|| Fate {
+            booked_bytes: op.request.resources.memory_bytes,
+            memory_runs: memory_runs.to_vec(),
+        })
+    }
+
     /// Takes `operations` up in an empty scheduler, which grants leases under `term`
     /// from `next_seq` and operation ids from `next_operation` on (both past every id
     /// the store ever named, finished operations' included, so no id names two).
@@ -67,7 +94,20 @@ impl Scheduler {
                 waiter,
                 lease,
                 losses,
+                fate,
             } = recovered;
+            let mut request = request;
+            if let Some(Fate {
+                booked_bytes,
+                memory_runs,
+            }) = fate
+            {
+                // A booking never falls: the store's request may carry a larger one than
+                // the row (a floor applied at submit).
+                let memory = &mut request.resources.memory_bytes;
+                *memory = (*memory).max(booked_bytes);
+                self.memory.restore(id, memory_runs);
+            }
             if request.joinable() {
                 self.in_flight.insert(request.key.clone(), id);
             }
