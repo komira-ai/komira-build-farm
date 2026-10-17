@@ -1,7 +1,8 @@
 //! Every asset `.github/workflows/artifacts.yml` packages gets an SBOM attestation.
 //!
 //! The attest job names each tarball and its SBOM by hand, one `actions/attest-sbom`
-//! step per tarball, and runs only on a push to `main`; the verify job after it refuses
+//! step per tarball (in the attest job of its platform group), and runs only on a push to
+//! `main` or `feature/arch-v2`; the verify job after it refuses
 //! a tarball with no SBOM attestation (`cargo xtask verify-assets attestations`). So a
 //! binary added to a build job's `Package` steps without its attest step passes every
 //! pull request check and turns `main` red. [`unattested`] reads both lists from the
@@ -82,15 +83,19 @@ fn sbom_attested(workflow: &str, job: &str) -> Result<Vec<(String, String)>, Str
 }
 
 /// What differs between the assets the workflow packages and the SBOM attestations its
-/// job `attest_job` signs: one line per packaged tarball with no step attesting it with
+/// jobs `attest_jobs` (one per platform group) sign together: one line per packaged tarball with no step attesting it with
 /// its own SBOM, and one per step naming a pair no job packages. An error when the
 /// workflow packages nothing (the lint would pass vacuously) or a step cannot be read.
-pub fn unattested(workflow: &str, attest_job: &str) -> Result<Vec<String>, String> {
+pub fn unattested(workflow: &str, attest_jobs: &[&str]) -> Result<Vec<String>, String> {
     let packaged = packaged(workflow)?;
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    let attested = sbom_attested(workflow, attest_job)?;
+    let mut attested = Vec::new();
+    for job in attest_jobs {
+        attested.extend(sbom_attested(workflow, job)?);
+    }
+    let attest_job = attest_jobs.join("` or `");
     let mut wrong = Vec::new();
     let mut expected = Vec::new();
     for (name, platform) in &packaged {
@@ -125,7 +130,7 @@ fn every_packaged_asset_has_an_sbom_attestation() {
     // for an asset no longer built.
     let path = super::ARTIFACTS_WORKFLOW;
     let text = std::fs::read_to_string(super::repo_root().join(path)).expect(path);
-    match unattested(&text, "attest") {
+    match unattested(&text, super::release_artifacts::ATTEST_JOBS) {
         Ok(wrong) => assert!(wrong.is_empty(), "{path}:\n{}", wrong.join("\n")),
         Err(e) => panic!("{path}: {e}"),
     }
@@ -177,15 +182,21 @@ mod rules {
     fn a_workflow_attesting_every_packaged_asset_passes() {
         // Catches: the lint misreading the package line (quoted path, directory part)
         // or the step's inputs, so a correct workflow is refused.
-        assert_eq!(unattested(&workflow(&BUILT, &both()), "attest"), Ok(vec![]));
+        assert_eq!(
+            unattested(&workflow(&BUILT, &both()), &["attest"]),
+            Ok(vec![])
+        );
     }
 
     #[test]
     fn a_packaged_asset_without_its_attest_step_is_named() {
         // Catches: the defect the lint exists for, a second binary packaged with no
         // attest-sbom step (as kbf-deploy would be without its own).
-        let wrong = unattested(&workflow(&BUILT, &step(BUILT[0], BUILT[0], "")), "attest")
-            .expect("readable");
+        let wrong = unattested(
+            &workflow(&BUILT, &step(BUILT[0], BUILT[0], "")),
+            &["attest"],
+        )
+        .expect("readable");
         assert_eq!(wrong.len(), 1, "{wrong:?}");
         assert!(
             wrong[0].starts_with("kbf-b for linux-arm64 is packaged"),
@@ -202,7 +213,7 @@ mod rules {
             step(BUILT[0], BUILT[0], ""),
             step(BUILT[1], BUILT[0], "")
         );
-        let wrong = unattested(&workflow(&BUILT, &attest), "attest").expect("readable");
+        let wrong = unattested(&workflow(&BUILT, &attest), &["attest"]).expect("readable");
         assert_eq!(wrong.len(), 2, "{wrong:?}");
         assert!(wrong[0].starts_with("kbf-b for linux-arm64"), "{wrong:?}");
         assert!(wrong[1].ends_with("a pair no job packages"), "{wrong:?}");
@@ -212,7 +223,7 @@ mod rules {
     fn an_attest_step_for_an_asset_no_job_packages_is_named() {
         // Catches: a binary dropped from the build with its attest step left behind,
         // which fails the attest job on main (the file does not exist).
-        let wrong = unattested(&workflow(&BUILT[..1], &both()), "attest").expect("readable");
+        let wrong = unattested(&workflow(&BUILT[..1], &both()), &["attest"]).expect("readable");
         assert_eq!(wrong.len(), 1, "{wrong:?}");
         assert!(wrong[0].contains("kbf-b-"), "{wrong:?}");
     }
@@ -227,7 +238,7 @@ mod rules {
                 step(BUILT[0], BUILT[0], ""),
                 step(BUILT[1], BUILT[1], extra)
             );
-            let got = unattested(&workflow(&BUILT, &attest), "attest");
+            let got = unattested(&workflow(&BUILT, &attest), &["attest"]);
             assert!(
                 got.as_ref().is_err_and(|e| e.contains("is under `if:`")),
                 "{extra}: {got:?}"
@@ -239,10 +250,10 @@ mod rules {
     fn a_workflow_packaging_nothing_is_refused() {
         // Catches: the lint passing vacuously when the package lines move or change
         // their spelling, so it reads none.
-        let got = unattested(&workflow(&[], &both()), "attest");
+        let got = unattested(&workflow(&[], &both()), &["attest"]);
         assert!(got.is_err(), "{got:?}");
         let commented = workflow(&BUILT, &both()).replace("cargo xtask package", "# cargo");
-        assert!(unattested(&commented, "attest").is_err());
+        assert!(unattested(&commented, &["attest"]).is_err());
     }
 
     #[test]
@@ -250,7 +261,7 @@ mod rules {
         // Catches: a package line whose binary or platform the lint cannot read skipped
         // silently, so its asset is never compared.
         let w = workflow(&BUILT, &both()).replace("--platform linux-arm64", "linux-arm64");
-        let got = unattested(&w, "attest");
+        let got = unattested(&w, &["attest"]);
         assert!(
             got.as_ref()
                 .is_err_and(|e| e.contains("without --binary and --platform")),

@@ -54,8 +54,10 @@ pub const SIGNING_IF: &str = "${{ github.event_name == 'push' && (github.ref == 
 
 /// The jobs that build on one platform, named by it, and the signing and verifying jobs.
 const BUILD_JOBS: &[&str] = &["darwin-arm64", "linux-x86_64", "linux-arm64"];
-const ATTEST_JOB: &str = "attest";
-const VERIFY_JOB: &str = "verify";
+/// The signing and verifying jobs, one pair per platform group, so the Linux files are
+/// attested without waiting for the macOS build.
+pub const ATTEST_JOBS: &[&str] = &["attest-linux", "attest-darwin-arm64"];
+const VERIFY_JOBS: &[&str] = &["verify-linux", "verify-darwin-arm64"];
 const DARWIN_JOB: &str = "darwin-arm64";
 
 /// The lines of a step's script, leading blanks dropped.
@@ -139,7 +141,7 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             "`push` runs the workflow for {branches:?}, not exactly {PUSH_BRANCHES:?}"
         ));
     }
-    for job in [ATTEST_JOB, VERIFY_JOB] {
+    for job in ATTEST_JOBS.iter().chain(VERIFY_JOBS) {
         let condition = workflows::job_condition(workflow, job)?;
         if condition.as_deref() != Some(SIGNING_IF) {
             out.push(format!(
@@ -148,53 +150,58 @@ fn signing(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
-    let attest = workflows::job_steps(workflow, ATTEST_JOB)?;
-    let provenance = attest.iter().find(|s| {
-        s.uses
-            .as_deref()
-            .is_some_and(|u| u.starts_with("actions/attest-build-provenance@"))
-    });
-    match provenance {
-        None => out.push(format!(
-            "the job `{ATTEST_JOB}` has no actions/attest-build-provenance step"
-        )),
-        Some(step) => {
-            let subjects = step
-                .with
-                .iter()
-                .find(|(k, _)| k == "subject-checksums")
-                .map(|(_, v)| v.as_str());
-            if subjects != Some("dist/SHA256SUMS") {
-                out.push(format!(
-                    "the provenance step of `{ATTEST_JOB}` does not cover `dist/SHA256SUMS`, but {subjects:?}"
-                ));
-            }
-            if step.conditional {
-                out.push(format!(
-                    "the provenance step of `{ATTEST_JOB}` is under `if:` or `continue-on-error:`"
-                ));
+    for attest_job in ATTEST_JOBS {
+        let attest = workflows::job_steps(workflow, attest_job)?;
+        let provenance = attest.iter().find(|s| {
+            s.uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("actions/attest-build-provenance@"))
+        });
+        match provenance {
+            None => out.push(format!(
+                "the job `{attest_job}` has no actions/attest-build-provenance step"
+            )),
+            Some(step) => {
+                let subjects = step
+                    .with
+                    .iter()
+                    .find(|(k, _)| k == "subject-checksums")
+                    .map(|(_, v)| v.as_str());
+                if subjects != Some("dist/SHA256SUMS") {
+                    out.push(format!(
+                        "the provenance step of `{attest_job}` does not cover `dist/SHA256SUMS`, but {subjects:?}"
+                    ));
+                }
+                if step.conditional {
+                    out.push(format!(
+                        "the provenance step of `{attest_job}` is under `if:` or `continue-on-error:`"
+                    ));
+                }
             }
         }
     }
-    let verify = workflows::job_steps(workflow, VERIFY_JOB)?;
-    let verifying = verify.iter().find_map(|s| {
-        lines(s).find_map(|l| args(l, "cargo xtask verify-assets attestations ").map(|a| (s, a)))
-    });
-    match verifying {
-        None => out.push(format!(
-            "the job `{VERIFY_JOB}` does not run `cargo xtask verify-assets attestations`"
-        )),
-        Some((step, words)) => {
-            let at = words.iter().position(|w| *w == "--source-ref");
-            if at.and_then(|i| words.get(i + 1)) != Some(&"$GITHUB_REF") {
-                out.push(format!(
-                    "the job `{VERIFY_JOB}` verifies attestations without `--source-ref \"$GITHUB_REF\"`, so a push to a branch other than main would be checked as main (or any branch as any)"
-                ));
-            }
-            if step.conditional {
-                out.push(format!(
-                    "the attestation check of `{VERIFY_JOB}` is under `if:` or `continue-on-error:`"
-                ));
+    for verify_job in VERIFY_JOBS {
+        let verify = workflows::job_steps(workflow, verify_job)?;
+        let verifying = verify.iter().find_map(|s| {
+            lines(s)
+                .find_map(|l| args(l, "cargo xtask verify-assets attestations ").map(|a| (s, a)))
+        });
+        match verifying {
+            None => out.push(format!(
+                "the job `{verify_job}` does not run `cargo xtask verify-assets attestations`"
+            )),
+            Some((step, words)) => {
+                let at = words.iter().position(|w| *w == "--source-ref");
+                if at.and_then(|i| words.get(i + 1)) != Some(&"$GITHUB_REF") {
+                    out.push(format!(
+                        "the job `{verify_job}` verifies attestations without `--source-ref \"$GITHUB_REF\"`, so a push to a branch other than main would be checked as main (or any branch as any)"
+                    ));
+                }
+                if step.conditional {
+                    out.push(format!(
+                        "the attestation check of `{verify_job}` is under `if:` or `continue-on-error:`"
+                    ));
+                }
             }
         }
     }
@@ -371,12 +378,16 @@ mod rules {
                 }
             }
         }
-        w.push_str(&format!(
-            "  attest:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@0123 # v4\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
-        ));
-        w.push_str(&format!(
-            "  verify:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\"\n"
-        ));
+        for platform in ["linux", "darwin-arm64"] {
+            w.push_str(&format!(
+                "  attest-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@0123 # v4\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
+            ));
+        }
+        for platform in ["linux", "darwin-arm64"] {
+            w.push_str(&format!(
+                "  verify-{platform}:\n    if: {SIGNING_IF}\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo xtask verify-assets attestations dist --repo \"$GITHUB_REPOSITORY\" --workflow-ref \"$GITHUB_WORKFLOW_REF\" --source-ref \"$GITHUB_REF\"\n"
+            ));
+        }
         w
     }
 
@@ -435,7 +446,7 @@ mod rules {
         // would sign), narrowed to main (the development branch unattested), or left
         // without an `if:`; and a push trigger of other branches than the pinned two.
         let line = format!("    if: {SIGNING_IF}\n");
-        for (k, job) in ["attest", "verify"].into_iter().enumerate() {
+        for (k, job) in ATTEST_JOBS.iter().chain(VERIFY_JOBS).enumerate() {
             for to in [
                 "if: ${{ github.event_name == 'push' }}",
                 "if: ${{ github.ref == 'refs/heads/main' }}",
@@ -445,11 +456,15 @@ mod rules {
                 // The k-th `if:` of the signing jobs, replaced.
                 let w = good();
                 let parts: Vec<&str> = w.split(&line).collect();
-                assert_eq!(parts.len(), 3, "attest and verify");
+                assert_eq!(
+                    parts.len(),
+                    5,
+                    "the attest and verify jobs of both platform groups"
+                );
                 let mut planted = String::new();
                 for (i, part) in parts.iter().enumerate() {
                     planted.push_str(part);
-                    if i < 2 {
+                    if i < 4 {
                         planted.push_str(&if i == k {
                             format!("    {to}\n")
                         } else {
@@ -498,7 +513,7 @@ mod rules {
                 "      - uses: actions/attest-build-provenance@0123 # v4\n",
                 "      - if: always()\n        uses: actions/attest-build-provenance@0123 # v4\n",
             ),
-            &["provenance step of `attest` is under `if:`"],
+            &["provenance step of `attest-linux` is under `if:`"],
         );
     }
 
@@ -519,7 +534,7 @@ mod rules {
                 "      - run: cargo xtask verify-assets attestations",
                 "      - if: always()\n        run: cargo xtask verify-assets attestations",
             ),
-            &["attestation check of `verify` is under `if:`"],
+            &["attestation check of `verify-linux` is under `if:`"],
         );
         names(
             &broken("verify-assets attestations", "verify-assets sums"),

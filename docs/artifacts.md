@@ -103,7 +103,7 @@ one is added, dropped or renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` or to `feature/arch-v2` | The same, then the `attest` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and nothing else. The `verify` job then assembles `SHA256SUMS` again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`). |
+| Push to `main` or to `feature/arch-v2` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`). |
 
 An attestation names the ref it was signed on: `refs/heads/main` or
 `refs/heads/feature/arch-v2`. The second is there so that a rehearsal of a deployment
@@ -112,17 +112,17 @@ they mean, and an asset attested on `feature/arch-v2` does not verify as `main`'
 release (below) verifies as `main` and only takes the files of a push run on `main`, so
 a file built from the development branch is never released.
 
-Only the `attest` job holds `id-token: write` and `attestations: write`, and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write`, and only
 under the exact `if:` that limits it to a push to `main` or to `feature/arch-v2` (the
-`verify` job runs under the same one). The workflow lint
+`verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, and in one
 whose `if:` is any other spelling, so no pull request or merge-queue run holds a token
 that can sign an attestation. No repository code runs in
-`attest` and nothing is built there: it holds those scopes for the pinned signing
+an `attest-*` job and nothing is built there: it holds those scopes for the pinned signing
 actions alone. Every action is pinned by commit SHA, and that lint refuses one that
 is not.
 
-The attest job names each tarball and its SBOM, one `actions/attest-sbom` step per
+The attest job of a platform group names each tarball of the group and its SBOM, one `actions/attest-sbom` step per
 tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
 `main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
@@ -132,7 +132,7 @@ step for a tarball no job packages.
 ## Where the files are, and for how long
 
 The assets are workflow artifacts of the run (`assets-darwin-arm64`,
-`assets-linux-x86_64`, `assets-linux-arm64`, `sha256sums`). GitHub keeps workflow
+`assets-linux-x86_64`, `assets-linux-arm64`, `sha256sums` for the whole commit, `sha256sums-linux` and `sha256sums-darwin-arm64` for the platform groups). GitHub keeps workflow
 artifacts for at most 90 days, so nothing may depend on them for longer: a script that
 must still fetch an asset later pins a release asset (below). The attestations
 themselves do not expire with the artifacts.
