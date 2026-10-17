@@ -68,7 +68,7 @@ pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
 pub use handover::LOST_LOOKS;
 pub use phase::Reported;
 
-use self::durable::Durable;
+use self::durable::{Durable, Undone};
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{
@@ -221,6 +221,27 @@ struct State {
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
     unsettled: Vec<(Requeue, Option<u32>, Option<Fate>)>,
+    /// The effects of committed records whose rows the state store has not taken, one
+    /// batch per record, oldest first. A batch leaves only when the store has taken every
+    /// row of it, in order, and nothing is carried out (no `Start`, no answer) before its
+    /// row is written, so a store that refuses holds the farm's later effects behind the
+    /// earliest refused one ([`State::release_unwritten`]).
+    unwritten: VecDeque<VecDeque<Effect>>,
+    /// The detail of a report whose answer waits in `unwritten`, by lease, for the answer
+    /// to be settled with it when the store takes the answer's rows.
+    parked: BTreeMap<LeaseId, Detail>,
+    /// The `done/` rows the state store has not taken, oldest first
+    /// ([`State::retry_results`]).
+    undone: Vec<Undone>,
+    /// The held effect whose last try was refused as unreachable: a "row is gone" for
+    /// this effect and no other may be its own applied work
+    /// ([`State::release_unwritten`]).
+    retrying: Option<Effect>,
+    /// Writes given up on for good: dropped as stale or fenced, past their retention,
+    /// or over the cap ([`Farm::dropped_writes`]).
+    write_drops: u64,
+    /// The most committed records `unwritten` holds before a new one is dropped.
+    held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
     /// When each node's session row in the state store was last written.
@@ -232,6 +253,9 @@ struct State {
     /// in a row found it neither unfinished nor ended.
     looks: BTreeMap<OperationId, u8>,
 }
+
+/// How many committed records the farm holds for a state store that refuses them.
+const HELD_CAP: usize = 4096;
 
 /// What a finished operation tells its callers, and the action-cache entry to write
 /// first, if any.
@@ -288,6 +312,12 @@ impl Farm {
                 recorded: BTreeSet::new(),
                 durable: None,
                 unsettled: Vec::new(),
+                unwritten: VecDeque::new(),
+                parked: BTreeMap::new(),
+                undone: Vec::new(),
+                retrying: None,
+                write_drops: 0,
+                held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
                 fenced: false,
@@ -347,6 +377,21 @@ impl Farm {
     #[must_use]
     pub fn queued_operations(&self) -> u64 {
         self.lock().sched.queued_len() as u64
+    }
+
+    /// Writes to the state store the farm gave up on for good: held effects dropped as
+    /// stale or on a fence, `done/` rows past their retention, records over the cap.
+    #[must_use]
+    pub fn dropped_writes(&self) -> u64 {
+        self.lock().write_drops
+    }
+
+    /// Held-back committed records the farm keeps for a refusing state store at most.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_held_cap(self, cap: usize) -> Self {
+        self.lock().held_cap = cap;
+        self
     }
 
     /// The memory runs of every operation this farm holds that was killed for memory,
@@ -662,10 +707,24 @@ impl Farm {
                 run,
             };
             let (answers, accepted) = state.take_report(now, worker, operation, report);
+            // The detail is this lease's: an answer the store held back earlier, released
+            // by this input, is settled with its own.
             let settled: Vec<Settled> = answers
                 .iter()
-                .map(|a| state.settle(a, detail.take()))
+                .map(|a| {
+                    state.settle(
+                        a,
+                        if a.lease == lease {
+                            detail.take()
+                        } else {
+                            None
+                        },
+                    )
+                })
                 .collect();
+            if let Some(detail) = detail {
+                state.park(lease, detail);
+            }
             (settled, accepted)
         };
         for settled in answers {
@@ -981,9 +1040,22 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
+        // effects an earlier refusal held back: one of them may be an answer.
+        let answering = matches!(
+            event,
+            Event::Tick | Event::Heartbeat { .. } | Event::Report { .. }
+        );
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
         self.log_requeues();
+        if answering {
+            // Before this input's own effects: they follow what was held back.
+            for effect in self.release_unwritten().into_iter().rev() {
+                effects.push_front(effect);
+            }
+        }
+        self.retry_results();
         let mut answers = Vec::new();
         while let Some(effect) = effects.pop_front() {
             match effect {
@@ -993,11 +1065,18 @@ impl State {
                     }
                     // Appended is committed; the effects of the commit (the `Start`, the
                     // answer) are carried out only once the state store has taken what
-                    // they settle.
+                    // they settle. What it refuses is kept and written again, in order,
+                    // until it takes it or a newer writer fences it.
                     let committed = Event::Committed(record);
                     let next = self.sched.apply(Input::new(now, committed));
-                    if self.durably("a committed record", |d| d.persist(&next)) {
-                        effects.extend(next);
+                    if self.unwritten.len() >= self.held_cap {
+                        self.write_drops += 1;
+                        tracing::error!(cap = self.held_cap, "records over the cap: one dropped");
+                        continue;
+                    }
+                    self.unwritten.push_back(next.into());
+                    if answering || self.unwritten.len() == 1 {
+                        effects.extend(self.release_unwritten());
                     }
                 }
                 Effect::Start(start) => self.start(start),
@@ -1076,7 +1155,7 @@ impl State {
         // reads the result here. A store that does not take it is logged and the callers
         // here are answered all the same.
         let retention = self.finished_retention;
-        self.durably("a result", |d| d.done(operation, finished, retention));
+        self.keep_result(operation, finished, retention);
         self.machine.keep_finished(operation, waiters);
         self.forget_dropped();
     }
@@ -1246,6 +1325,8 @@ impl State {
     /// finished retention. `detail` is what the accepted report carried beyond its
     /// outcome, if anything.
     fn settle(&mut self, answer: &Answer, detail: Option<Detail>) -> Settled {
+        // The report's detail, kept while the store held its answer back.
+        let detail = detail.or_else(|| self.parked.remove(&answer.lease));
         self.machine.forget_leases(answer.operation);
         let waiters: Vec<&Waiter> = answer
             .waiters
