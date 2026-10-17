@@ -14,6 +14,7 @@ use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Described, Dispatch, Finished, Stage, Submission};
 use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, ServerMessage, server_message};
+use kbf_sched::fence::START_GRACE;
 use kbf_sched::{DaemonInstance, Request};
 use kbf_server::farm::{Reported, StreamId};
 use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStore};
@@ -30,6 +31,8 @@ use kbf_types::{
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/budgets.rs"]
+mod budgets;
 #[path = "state_store/fate.rs"]
 mod fate;
 #[path = "state_store/handover.rs"]

@@ -65,13 +65,6 @@ pub enum RequeueReason {
 }
 
 impl RequeueReason {
-    /// Whether the give-up follows a kill for memory, which changes what the scheduler
-    /// books and holds for the operation (a raised booking, a memory run).
-    #[must_use]
-    pub const fn is_memory_kill(&self) -> bool {
-        matches!(self, Self::OutOfMemory { .. } | Self::NodeMemoryPressure)
-    }
-
     /// Whether the give-up is a lost lease: the node was silent, the daemon was
     /// replaced, restarted or reconnected without the lease. They count toward the cap
     /// on lost leases ([`crate::LOSS_REQUEUES`]). The ones a worker reports, the memory

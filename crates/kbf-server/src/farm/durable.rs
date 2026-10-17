@@ -17,12 +17,15 @@
 //!   is written at the grant and at the end, never to renew it);
 //! - `loss/<operation>`: how many of the operation's leases were lost, while it is
 //!   unfinished and has lost any ([`kbf_sched::LOSS_REQUEUES`] refuses it);
-//! - `fate/<operation>`: what the operation's kills for memory changed: the raised
-//!   booking and the memory runs ([`kbf_sched::Fate`]), written in the transaction of the
-//!   requeue that follows a kill and deleted with the operation's other rows, so a
-//!   successor (after a handover or a crash) books the next rung instead of starting the
-//!   ladder over. A store with no row for an operation books and counts as it did before
-//!   the row existed;
+//! - `fate/<operation>`: what the operation's faults changed: the raised booking and the
+//!   memory runs of its kills for memory, the farm runs it used, the nodes placement
+//!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
+//!   in the transaction of every requeue that follows a fault (whole, so the newest row
+//!   is the whole state) and deleted with the operation's other rows. A successor (after
+//!   a handover or a crash) books the next rung and spends the budgets that are left
+//!   instead of starting over. A store with no row for an operation books and counts as
+//!   it did before the row existed; a row written before the budgets were (version 1)
+//!   carries none of them;
 //! - `done/<operation>`: how a finished or refused operation ended, kept for the finished
 //!   retention (at least [`DONE_FLOOR`]) so a process that did not finish it can still
 //!   answer the callers of it: a tag byte and the `ExecuteResponse` ([`kbf_front::Finished`]);
@@ -477,8 +480,9 @@ impl Durable {
     /// that has finished has nothing to put back.
     ///
     /// `losses` is the operation's count of lost leases, to write down if the give-up is
-    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the kill changed, if
-    /// the give-up is a kill for memory: it goes in the same transaction as the queue row.
+    /// one ([`kbf_sched::RequeueReason::is_loss`]). `fate` is what the operation's faults
+    /// changed so far, if they changed anything: it goes in the same transaction as the
+    /// queue row.
     pub(super) fn requeued(
         &self,
         requeue: &Requeue,
@@ -738,11 +742,7 @@ impl State {
             };
             // Taken now, not when the store takes the write: a later kill must not
             // reach an earlier requeue's row.
-            let fate = if requeue.reason.is_memory_kill() {
-                self.sched.fate(requeue.operation)
-            } else {
-                None
-            };
+            let fate = self.sched.fate(requeue.operation);
             self.unsettled.push((requeue.clone(), losses, fate));
         }
         let pending = std::mem::take(&mut self.unsettled);

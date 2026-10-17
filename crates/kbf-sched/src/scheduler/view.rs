@@ -1,6 +1,8 @@
 //! The scheduler's read-only view: what it knows of an operation, a worker and the
 //! queue, for the caller that carries out its effects.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use kbf_types::{FarmRun, LeaseId, NodePhase, OperationId, Qos, Resources, WaiterId, WorkerId};
 
 use super::{OpState, Scheduler};
@@ -27,6 +29,17 @@ impl Scheduler {
     #[must_use]
     pub fn farm_runs(&self, operation: OperationId) -> Option<&[FarmRun]> {
         self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
+    }
+
+    /// The workers placement skips for each operation that has any: the ones its runs
+    /// ended on as the farm's fault, and the ones that dropped its `Start`.
+    #[must_use]
+    pub fn avoided(&self) -> BTreeMap<OperationId, BTreeSet<WorkerId>> {
+        self.ops
+            .iter()
+            .filter(|(_, op)| !op.avoid.is_empty())
+            .map(|(id, op)| (*id, op.avoid.clone()))
+            .collect()
     }
 
     /// The operation in flight that a submission of `request` would join: its

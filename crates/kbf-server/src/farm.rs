@@ -357,6 +357,14 @@ impl Farm {
         self.lock().sched.memory_state().runs_by_operation()
     }
 
+    /// The workers placement skips for each operation that has any
+    /// ([`kbf_sched::Scheduler::avoided`]): what a successor farm over the same state
+    /// store must hold too.
+    #[must_use]
+    pub fn avoided(&self) -> BTreeMap<OperationId, BTreeSet<WorkerId>> {
+        self.lock().sched.avoided()
+    }
+
     /// Execute and WaitExecution operation streams open now
     /// (`kbf_front_open_executions`).
     #[must_use]

@@ -12,8 +12,8 @@ use kbf_state::{
     Versioned,
 };
 use kbf_types::{
-    ActionKey, Answer, Digest, DigestFunction, Failure, FencePolicy, LeaseKind, MemoryKill,
-    MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, Waiting,
+    ActionKey, Answer, Digest, DigestFunction, Failure, FarmFault, FarmRun, FencePolicy, LeaseKind,
+    LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, Waiting,
 };
 
 use super::*;
@@ -757,6 +757,29 @@ fn a_fate() -> Fate {
                 kill: MemoryKill::NodePressure,
             },
         ],
+        farm_runs: vec![
+            FarmRun {
+                worker: WorkerId::new("node-a"),
+                fault: FarmFault::NodeMemoryPressure,
+            },
+            FarmRun {
+                worker: WorkerId::new("node-b"),
+                fault: FarmFault::Lost(LostWhy::DaemonRestarted),
+            },
+            FarmRun {
+                worker: WorkerId::new("node-c"),
+                fault: FarmFault::Lost(LostWhy::Fenced),
+            },
+            FarmRun {
+                worker: WorkerId::new("node-c"),
+                fault: FarmFault::Infra,
+            },
+        ],
+        avoid: ["node-a", "node-b", "node-c"]
+            .map(WorkerId::new)
+            .into_iter()
+            .collect(),
+        not_started: 3,
     }
 }
 
@@ -813,28 +836,104 @@ fn a_fate_lives_and_dies_with_its_operation() {
 }
 
 /// Catches: a fate row read as anything but what was written: another version, a row cut
-/// short, bytes after the last run, an unknown kind of kill. The farm refuses to start
-/// over such a store rather than book a guess.
+/// short, bytes after the last field, an unknown kind of kill, of farm fault or of loss, a
+/// worker name that is not text. The farm refuses to start over such a store rather than
+/// book a guess.
 #[test]
 fn a_fate_row_that_is_not_one_is_refused() {
     let row = fate::encode(&a_fate()).expect("encodes");
     assert_eq!(fate::decode(&row), Ok(a_fate()));
     let mut other = row.clone();
-    other[0] = 2;
+    other[0] = 3;
     let mut longer = row.clone();
     longer.push(0);
-    // The last run is a node-pressure kill: its kind is the row's last byte.
-    let mut kind = row.clone();
-    *kind.last_mut().expect("a row") = 9;
-    for (bad, why) in [
-        (other, "not a version 1 fate"),
+    // Two runs, a worker's name and the kind of its kill, in a row of memory runs only.
+    let two_kills = Fate {
+        farm_runs: Vec::new(),
+        avoid: std::collections::BTreeSet::new(),
+        not_started: 0,
+        ..a_fate()
+    };
+    let mut kind = fate::encode(&two_kills).expect("encodes");
+    // Version 2 ends with the three empty budgets: two counts (4 bytes each) and a number
+    // (4); before them, the last memory run's kind.
+    let at = kind.len() - 12 - 1;
+    kind[at] = 9;
+    let mut rows = vec![
+        (other, "not a version 1 or 2 fate"),
         (row[..row.len() - 1].to_vec(), "the row ends early"),
-        (longer, "bytes after the last run"),
+        (longer, "bytes after the last field"),
         (kind, "not a kind of memory kill"),
         (Vec::new(), "the row ends early"),
-    ] {
+    ];
+    let mut bad = |fate: &Fate, change: &dyn Fn(&mut Vec<u8>), why| {
+        let mut row = fate::encode(fate).expect("encodes");
+        change(&mut row);
+        rows.push((row, why));
+    };
+    let one_run = |fault| Fate {
+        booked_bytes: 1,
+        farm_runs: vec![FarmRun {
+            worker: WorkerId::new("n"),
+            fault,
+        }],
+        ..Fate::default()
+    };
+    // [version, booked 8, memory runs 4, farm runs 4, name 2+1, kind, (reason), avoid 4, not started 4]
+    let kind_at = 1 + 8 + 4 + 4 + 3;
+    bad(
+        &one_run(FarmFault::Infra),
+        &|r| r[kind_at] = 9,
+        "not a kind of farm fault",
+    );
+    bad(
+        &one_run(FarmFault::Lost(LostWhy::Fenced)),
+        &|r| r[kind_at + 1] = 9,
+        "not a reason the farm lost a run",
+    );
+    let named = Fate {
+        avoid: [WorkerId::new("n")].into_iter().collect(),
+        ..Fate::default()
+    };
+    // The avoided worker's name is the byte after its 2-byte length.
+    let name_at = 1 + 8 + 4 + 4 + 4 + 2;
+    bad(
+        &Fate {
+            booked_bytes: 1,
+            ..named
+        },
+        &|r| r[name_at] = 0xff,
+        "a worker name is not text",
+    );
+    for (bad, why) in rows {
         assert_eq!(fate::decode(&bad), Err(why));
     }
+}
+
+/// Catches: a row written before the budgets were (version 1: the booking and the memory
+/// runs only) refused, or read with budgets it never held. It loads with every budget
+/// empty.
+#[test]
+fn a_version_1_fate_row_still_loads() {
+    let mut row = vec![1];
+    row.extend((16u64 << 30).to_be_bytes());
+    row.extend(1u32.to_be_bytes());
+    row.extend(6u16.to_be_bytes());
+    row.extend(b"node-a");
+    row.extend((4u64 << 30).to_be_bytes());
+    row.push(0);
+    assert_eq!(
+        fate::decode(&row),
+        Ok(Fate {
+            booked_bytes: 16 << 30,
+            memory_runs: vec![MemoryRun {
+                worker: WorkerId::new("node-a"),
+                booked: 4 << 30,
+                kill: MemoryKill::NodePressure,
+            }],
+            ..Fate::default()
+        })
+    );
 }
 
 /// Catches: a fate row with a worker name that is not text accepted, a fate too large to
@@ -869,7 +968,7 @@ fn a_fate_that_cannot_be_written_or_read_is_refused() {
         "nothing of the requeue landed"
     );
 
-    put(&store, "fate/0000000000000004", vec![2]);
+    put(&store, "fate/0000000000000004", vec![3]);
     let error = durable.load().expect_err("a fate of another version");
-    assert!(error.to_string().contains("not a version 1 fate"));
+    assert!(error.to_string().contains("not a version 1 or 2 fate"));
 }

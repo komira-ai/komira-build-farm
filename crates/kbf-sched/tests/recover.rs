@@ -10,8 +10,9 @@ use kbf_sched::{
     RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, LeaseKind,
-    MemoryKill, MemoryRun, OperationId, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmFault, FarmRun, FarmTime,
+    LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Qos, Resources, StateMachine,
+    WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -322,6 +323,7 @@ fn a_fate_restores_the_booking_and_the_memory_runs() {
             booked: GIB,
             kill: MemoryKill::NodePressure,
         }],
+        ..Fate::default()
     };
     let mut small = queued(3, request(3));
     small.fate = Some(fate.clone());
@@ -347,6 +349,73 @@ fn a_fate_restores_the_booking_and_the_memory_runs() {
     );
 }
 
+/// Catches: a farm run, an avoided node or a not-started count a successor drops (the
+/// operation gets `FARM_RERUNS` more reruns, placement offers it the node that lost it,
+/// and a node that drops every `Start` gets `NOT_STARTED_RERUNS` more); and `fate()`
+/// giving back less than it took up, so the next write loses it. Also an operation with
+/// no fault: no fate to write.
+#[test]
+fn a_fate_restores_the_budgets() {
+    let fate = Fate {
+        booked_bytes: GIB,
+        farm_runs: vec![
+            FarmRun {
+                worker: node("node-a"),
+                fault: FarmFault::Lost(LostWhy::Fenced),
+            },
+            FarmRun {
+                worker: node("node-b"),
+                fault: FarmFault::Infra,
+            },
+        ],
+        avoid: [node("node-a"), node("node-b")].into_iter().collect(),
+        not_started: 2,
+        ..Fate::default()
+    };
+    let mut faulted = queued(3, request(3));
+    faulted.fate = Some(fate.clone());
+    let s = recovered(vec![faulted, queued(4, request(4))]);
+    assert_eq!(s.fate(OperationId(3)), Some(fate.clone()));
+    assert_eq!(s.farm_runs(OperationId(3)), Some(fate.farm_runs.as_slice()));
+    assert_eq!(s.fate(OperationId(4)), None);
+    assert_eq!(s.farm_runs(OperationId(4)), Some(&[][..]));
+}
+
+/// Catches: `is_empty` calling a fate empty while one of its parts holds something (a
+/// row never written for it), or non-empty for a fate that changed nothing (a row
+/// written at every requeue).
+#[test]
+fn a_fate_is_empty_only_when_every_part_is() {
+    assert!(Fate::default().is_empty());
+    let run = FarmRun {
+        worker: node("node-a"),
+        fault: FarmFault::Infra,
+    };
+    let parts = [
+        Fate {
+            memory_runs: vec![MemoryRun {
+                worker: node("node-a"),
+                booked: GIB,
+                kill: MemoryKill::NodePressure,
+            }],
+            ..Fate::default()
+        },
+        Fate {
+            farm_runs: vec![run],
+            ..Fate::default()
+        },
+        Fate {
+            avoid: [node("node-a")].into_iter().collect(),
+            ..Fate::default()
+        },
+        Fate {
+            not_started: 1,
+            ..Fate::default()
+        },
+    ];
+    assert!(parts.iter().all(|part| !part.is_empty()));
+}
+
 /// Catches: `fate()` answering for an operation the scheduler does not hold, and a fate
 /// with no runs that books memory it should not or that leaves a phantom entry of runs
 /// behind (a raised booking is kept; no kills are held).
@@ -356,6 +425,7 @@ fn a_fate_without_runs_raises_the_booking_and_holds_no_kills() {
     raised.fate = Some(Fate {
         booked_bytes: 8 * GIB,
         memory_runs: Vec::new(),
+        ..Fate::default()
     });
     let s = recovered(vec![raised]);
     assert_eq!(s.fate(OperationId(99)), None, "an operation not held");
