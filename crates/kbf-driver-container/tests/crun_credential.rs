@@ -9,12 +9,12 @@
 //! copy (`tests/credential_env.rs` checks that on a stand-in `crun`; this checks the real
 //! one's container). The files: a container holds nothing of the node's but its image,
 //! its input root and the shared trees (no node configuration can mount a directory into
-//! every container, as Podman's `containers.conf` could), and the daemon's own files are
+//! every container), and the daemon's own files are
 //! unmapped ids to it: a file of the daemon's user, mode `0600`, is `nobody`'s to the
 //! action. The key file here is on the input root's path, so a mount that did reach the
 //! action would be read: the control is a file of mode `0644` beside it, which is.
 //!
-//! Run by `cargo xtask podman-tests`, like `podman.rs` (the test is `#[ignore]` with
+//! Run by `cargo xtask crun-tests`, like `crun.rs` (the test is `#[ignore]` with
 //! that reason). One test in this binary: it sets variables of its own process (the
 //! key), which is sound only while no other thread reads the environment.
 
@@ -42,7 +42,7 @@ const SCRIPT: &str = "echo \"env: ${AWS_ACCESS_KEY_ID:-unset} ${AWS_SECRET_ACCES
 /// directories for the secret finds nothing. The control, a
 /// `0644` file given as an input, is read, so the search reads what it can.
 #[test]
-#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 fn an_action_cannot_read_the_cold_store_key() {
     // SAFETY: the only test of this binary, and nothing before this starts a thread,
     // so no other thread of this process reads the environment meanwhile.

@@ -30,7 +30,7 @@ use kbf_proto::reapi::{
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use node::{
     PROMPT, Running, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes,
-    oci_runtime, pki, podman_ran,
+    oci_runtime, pki,
 };
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -344,8 +344,6 @@ fn storage_and_daemon_runs_an_action_over_its_own_storage() {
     let pid = rustix::process::Pid::from_child(&running.0);
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
     assert!(running.wait().success());
-    // The `podman` first on PATH fails and records that it ran: kbf never starts it.
-    assert_eq!(podman_ran(&bin), "");
 }
 
 /// `kbf storage-and-daemon` with `flags`, `env` added to its environment; its exit

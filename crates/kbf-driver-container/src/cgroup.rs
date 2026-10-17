@@ -3,10 +3,9 @@
 //!
 //! The daemon owns an `actions/` cgroup in its delegated subtree (`crate::delegate`).
 //! For each lease the driver makes a child with the lease's limits and puts the
-//! container under it (`--cgroup-parent`). The lease cgroup outlives the container, so
+//! container under it (`cgroupsPath`). The lease cgroup outlives the container, so
 //! after the action ends its `memory.events` still says whether the kernel OOM killer
-//! ran inside it, and whose limit made it run: Podman's own `OOMKilled` flag is not
-//! trusted (it reads false rootless; see the hosted-runner spike).
+//! ran inside it, and whose limit made it run.
 //!
 //! Memory (the build-host policy): a hard cap per lease, `memory.max` = booking x 1.5 +
 //! 512 MiB (the native driver's limit), with `memory.oom.group=1` on the lease, so an
@@ -37,8 +36,7 @@ const SUBTREE_PINNED: &str = "+cpu +memory +pids +cpuset";
 /// 512 MiB, the cap's headroom above 1.5 x the booking.
 const HEADROOM: u64 = 512 << 20;
 /// How often, and how long apart, removal retries a lease cgroup that is still busy:
-/// a process still exiting, or Podman's exit hook (`podman container cleanup`, which
-/// conmon starts inside the lease) still running.
+/// a process still exiting.
 const REMOVE_TRIES: u32 = 100;
 const REMOVE_PAUSE: Duration = Duration::from_millis(50);
 
@@ -222,8 +220,8 @@ pub(crate) async fn presses_into_swap(
 pub(crate) struct LeaseCgroup {
     /// The directory, under the cgroup filesystem's mount.
     dir: PathBuf,
-    /// The same cgroup as Podman's `--cgroup-parent` names it: relative to the mount,
-    /// starting with `/`.
+    /// The same cgroup as the bundle's `cgroupsPath` parent names it: relative to the
+    /// mount, starting with `/`.
     name: String,
 }
 
@@ -264,7 +262,7 @@ impl LeaseCgroup {
         Ok(())
     }
 
-    /// The name Podman's `--cgroup-parent` takes.
+    /// The name the bundle's `cgroupsPath` is made under.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -587,8 +585,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
     }
 
-    /// Catches a cgroup that vanishes between its listing and its `rmdir` (Podman
-    /// removing its own cgroup meanwhile) failing the clean. `<dir>/sub/..` lists
+    /// Catches a cgroup that vanishes between its listing and its `rmdir` (the
+    /// runtime removing its own cgroup meanwhile) failing the clean. `<dir>/sub/..` lists
     /// `<dir>`, whose pass removes `sub`; the `rmdir` of `<dir>/sub/..` then finds no
     /// `sub` to walk through (ENOENT), as if the cgroup had gone.
     #[test]
@@ -757,7 +755,7 @@ mod tests {
         })
     }
 
-    /// Catches the false positive seen on podman-arm (a lease killed as out of memory
+    /// Catches the false positive seen on the real-crun arm job (a lease killed as out of memory
     /// for swap the host put there): the absolute-swap rule. Host reclaim moved
     /// 143265792 bytes of the lease to swap below its cap (`max` 0), a few pages were
     /// read back (143233024), then the lease pressed its cap (`max` 156 to 7205) and

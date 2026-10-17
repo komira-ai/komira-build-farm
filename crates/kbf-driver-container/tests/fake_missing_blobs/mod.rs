@@ -1,12 +1,12 @@
 //! How the driver reports an input blob the CAS does not hold, against the stand-in
-//! `podman` (`support/fake.rs`). `docs/design/daemon.md` asks for
+//! `crun` (`support/fake.rs`). `docs/design/daemon.md` asks for
 //! `RuntimeError::MissingBlob` with the blob's `hash/size`, which the lease reports as
 //! `FAILED_PRECONDITION` with a `MISSING` violation, the answer that asks a client to
 //! upload the blob and retry. The native driver already reports it that way. (The
 //! server does not forward that violation to the client yet; see
 //! `docs/design/failure-classes.md`.)
 //!
-//! A module of `fake_podman.rs`, not a test binary of its own, for the reason
+//! A module of `fake_crun.rs`, not a test binary of its own, for the reason
 //! `fake_memory` gives: the coverage job counts the driver's lines per test binary.
 
 use kbf_daemon::cas::{digest_of, label};
@@ -32,7 +32,7 @@ fn action_with(fake: &Fake, change: impl FnOnce(&mut Action)) -> Digest {
 /// (`Failed`, the defect of issue #130: the client gets INTERNAL and never uploads),
 /// as the client's malformed action (`Invalid`), or as a missing blob that names
 /// another digest (the client would upload the wrong one). Each case also leaves the
-/// lease clean and never reaches `podman create`.
+/// lease clean and never reaches `crun run`.
 #[tokio::test]
 async fn a_missing_input_blob_is_reported_as_missing_with_its_digest() {
     let fake = Fake::new("missing-blobs");
@@ -86,7 +86,7 @@ async fn a_missing_input_blob_is_reported_as_missing_with_its_digest() {
         );
         fake.assert_clean(seq);
     }
-    assert!(!fake.calls().contains(&"create".to_owned()));
+    assert_eq!(fake.starts(), 0);
 }
 
 /// Catches the opposite defect at the two call sites that fetch messages: an Action or
@@ -112,5 +112,5 @@ async fn an_undecodable_action_or_command_is_invalid_not_missing() {
         );
         fake.assert_clean(seq);
     }
-    assert!(!fake.calls().contains(&"create".to_owned()));
+    assert_eq!(fake.starts(), 0);
 }

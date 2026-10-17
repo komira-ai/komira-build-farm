@@ -1,5 +1,5 @@
 //! What a swap-watch kill (`SwapKill`) promises, checked the same way against the stand-in
-//! `podman` and against a real kernel: the outcome and the watch's own log line.
+//! `crun` and against a real kernel: the outcome and the watch's own log line.
 
 use std::cell::RefCell;
 use std::fmt::Debug;
@@ -90,7 +90,7 @@ fn kill_line(line: &str) -> Option<(u64, u64, u64)> {
 ///
 /// Not `used` past the cap by the threshold: by the sample the watch kills at, reclaim
 /// at the cap may have left the lease's RAM below the cap, so RAM plus swap can be
-/// short of cap + threshold while the lease's own swap is past the threshold (podman-arm
+/// short of cap + threshold while the lease's own swap is past the threshold (crun-arm
 /// once killed at 478 MB of RAM under a 562 MB cap plus 146 MB of its own swap).
 pub fn assert_swap_kill<T: Debug>(
     outcome: &Result<T, RuntimeError>,

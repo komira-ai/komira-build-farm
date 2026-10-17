@@ -457,21 +457,14 @@ fn rows() -> Vec<Row> {
             "",
             "FAIL server: kbf-server has no --meta-dir",
         ),
-        // runtime: Podman named as the runtime, the runtime flags left out, and the name
-        // in a comment of the unit.
+        // runtime: a runtime flag the daemon no longer has, and the runtime program left
+        // out.
         row(
-            "daemon-runtime-podman",
+            "daemon-runtime-flag",
             Daemon,
-            "--container-runtime=oci",
-            "--container-runtime=podman",
-            "FAIL runtime: kbf-daemon.service passes --container-runtime=podman",
-        ),
-        row(
-            "daemon-runtime-dropped",
-            Daemon,
-            "    --container-runtime=oci \\\n",
-            "",
-            "FAIL runtime: kbf-daemon.service does not pass --container-runtime=oci",
+            "    --driver=container \\\n",
+            "    --driver=container \\\n    --container-runtime=oci \\\n",
+            "FAIL runtime: kbf-daemon.service passes --container-runtime=oci",
         ),
         row(
             "daemon-oci-runtime-dropped",
@@ -479,13 +472,6 @@ fn rows() -> Vec<Row> {
             "    --oci-runtime=/usr/bin/crun \\\n",
             "",
             "FAIL runtime: kbf-daemon.service does not pass --oci-runtime",
-        ),
-        row(
-            "daemon-names-podman",
-            Daemon,
-            "OOMScoreAdjust=-900\n",
-            "OOMScoreAdjust=-900\n# rootless Podman\n",
-            "FAIL runtime: kbf-daemon.service line ",
         ),
         // image: kbf-daemon exits 2 at start on a bare --image (the kit once rendered
         // bare form), and must run the images the settings pin.
@@ -554,7 +540,7 @@ fn each_planted_defect_turns_its_rule_red() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
-    assert_eq!(rows.len(), 46, "rows");
+    assert_eq!(rows.len(), 44, "rows");
 }
 
 #[test]
@@ -572,7 +558,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
     };
     assert_eq!(
         refused(Which::Daemon, "Restart=on-failure", "Restart=@KBF_RESTART@").as_deref(),
-        Some("kbf-daemon.service:36: placeholder @KBF_RESTART@ has no value")
+        Some("kbf-daemon.service:35: placeholder @KBF_RESTART@ has no value")
     );
     assert_eq!(
         refused(

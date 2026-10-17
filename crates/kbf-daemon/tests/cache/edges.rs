@@ -74,7 +74,6 @@ fn directories_the_cache_cannot_own_are_refused() {
         (Disabled::Locked, "locked"),
         (Disabled::NoBudget, "no-budget"),
         (Disabled::NativeSameUid, "native-same-uid"),
-        (Disabled::GraphDriver("fuse".into()), "graph-driver"),
     ] {
         assert_eq!(disabled.reason(), word);
         assert!(disabled.to_string().starts_with(word), "{disabled}");

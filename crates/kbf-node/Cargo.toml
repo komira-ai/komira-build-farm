@@ -14,14 +14,6 @@ publish.workspace = true
 name = "kbf-daemon"
 path = "src/main.rs"
 
-# A `podman` that fails and records that it ran, for tests/binary.rs: the container
-# driver must never start it. Not shipped: the release jobs package the kbf-daemon
-# binary alone.
-[[bin]]
-name = "kbf-no-podman"
-path = "src/bin/kbf-no-podman.rs"
-test = false
-
 [dependencies]
 clap.workspace = true
 kbf-daemon.workspace = true
@@ -36,7 +28,7 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# The container driver runs rootless Podman under cgroup v2, and builds on Linux only.
+# The container driver runs rootless `crun` under cgroup v2, and builds on Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
 kbf-driver-container.workspace = true
 

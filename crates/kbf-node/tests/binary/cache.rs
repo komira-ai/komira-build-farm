@@ -27,7 +27,7 @@ fn container(name: &str, data: &std::path::Path) -> (Vec<String>, std::path::Pat
         "--actions-memory-max-gib=1".to_owned(),
     ];
     flags.extend(cgroup);
-    let (bin, _) = super::container_bin(&format!("{name}-bin"));
+    let bin = super::container_bin(&format!("{name}-bin"));
     (flags, bin)
 }
 

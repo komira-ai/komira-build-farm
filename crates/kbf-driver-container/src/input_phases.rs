@@ -20,10 +20,9 @@ use kbf_daemon::tree::WritePhases;
 pub(crate) struct InputPhases {
     /// Fetching the Action and the Command.
     pub action_ms: u64,
-    /// Checking the action's image (`check_image`, the backend's `check_pinned`): with
-    /// Podman, reading its manifest in Podman's image store; with the OCI backend, one
-    /// `stat` of its unpacked directory, except for the first lease of a digest, which
-    /// pays the store check, `podman export` and the unpack here.
+    /// Checking the action's image (`check_image`, `Oci::check_pinned`): one `stat` of
+    /// its unpacked directory, except for the first lease of a digest, which pays the
+    /// fetch and the unpack here.
     pub image_ms: u64,
     /// Writing the input root.
     pub write: WritePhases,
@@ -31,9 +30,8 @@ pub(crate) struct InputPhases {
     pub trees_built: u64,
     /// `refuse_hidden_working_directory` and `prepare_outputs`.
     pub prep_ms: u64,
-    /// Giving the overlay to the container's user (`give_overlay`, the backend's `give`):
-    /// with Podman, `podman unshare chown` (and the helper's `__chown-dirs` with the
-    /// cache); with the OCI backend, one helper container running `__chown-dirs`.
+    /// Giving the overlay to the container's user (`give_overlay`, `Oci::give`): one
+    /// helper container running `__chown-dirs`.
     pub chown_ms: u64,
     /// The cgroup: its OOM count, creating it, and its keeper.
     pub cgroup_ms: u64,

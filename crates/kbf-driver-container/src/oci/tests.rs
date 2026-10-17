@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use super::*;
-use crate::backend::{Backend, Running};
 use crate::subids::IdFiles;
 
 fn scratch(name: &str) -> PathBuf {
@@ -249,22 +248,6 @@ fn the_start_removes_the_unpacks_a_killed_daemon_left() {
         images.join(".stage-cc-1-1").exists(),
         "kept when it could not be removed"
     );
-}
-
-/// Catches `ended` taking a Podman start for a `crun run` (it has no end to read).
-#[tokio::test]
-async fn ended_needs_a_crun_run_that_has_ended() {
-    let dir = scratch("ended");
-    let oci = start(&config(&dir, true), &dir.join("scratch")).expect("started");
-    let child = tokio::process::Command::new("true").spawn().expect("spawn");
-    let ended = oci
-        .ended(
-            &crate::podman::tests::spec(),
-            &Running::Process(child),
-            Path::new("/nonexistent-kbf/stderr"),
-        )
-        .await;
-    assert_eq!(ended, Err("this start is not a crun run".to_owned()));
 }
 
 /// Catches a helper root that is not idempotent (the second lease to prepare it fails on

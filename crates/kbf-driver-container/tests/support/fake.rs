@@ -1,17 +1,22 @@
-//! One test's stand-in `podman`, fake cgroup mount, scratch directory and runtime,
-//! shared by the test binaries that run the driver's steps without real Podman.
+//! One test's stand-in `crun`, fake cgroup mount, scratch directory and runtime, shared
+//! by the test binaries that run the driver without real `crun`.
 //!
-//! The stand-in is the program `kbf-fake-podman` (`tests/bin/fake_podman.rs`, which
-//! lists its knobs and records); `tests/fake_golden.rs` pins what it answers.
+//! The stand-in is the program `kbf-fake-crun` (`tests/bin/fake_crun.rs`, which lists
+//! its knobs and records). By default the image is already unpacked in the node's image
+//! store (a directory a real unpack would have made), so a lease finds it with one
+//! `stat`; [`Fake::fetching`] leaves it to be fetched from a registry in this process
+//! and unpacked, which the stand-in `crun` does by running the daemon's own
+//! `__unpack-layers` mode.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_container::{ContainerRuntime, MemoryCas, PodmanConfig, PodmanRuntime, StartError};
+use kbf_driver_container::{ContainerConfig, ContainerRuntime, IdFiles, MemoryCas, StartError};
 use kbf_types::Resources;
 
+use super::registry::{FakeRegistry, Image};
 use super::{Spec, exists, store_action, work};
 
 /// The per-architecture manifest every fake image store holds.
@@ -33,12 +38,12 @@ pub fn image() -> String {
     image_by(&sha256(MANIFEST))
 }
 
-/// The stand-in `podman` the tests link: `kbf-fake-podman`.
+/// The stand-in `crun` the tests link: `kbf-fake-crun`.
 pub fn program() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-podman"))
+    PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-crun"))
 }
 
-/// Links `dir/kbf-act`, the program the fake podman in `dir` runs as each action, to
+/// Links `dir/kbf-act`, the program the fake `crun` in `dir` runs as each action, to
 /// this test binary, which answers as `kbf-act` through it (`act_test_hook!` in
 /// `support/mod.rs`).
 pub fn link_act(dir: &Path) {
@@ -58,17 +63,53 @@ pub fn action_knob(steps: &[impl AsRef<str>]) -> String {
         .collect()
 }
 
-/// One test's fake Podman, fake cgroup mount, scratch directory and runtime.
+/// For `Fake::with`: replaces the `crun` link by a private copy of the program, which
+/// a knob may then remove or make not executable (`vanish-after-give`,
+/// `unexec-after-give`) without touching the program every test shares.
+pub fn private_runtime(config: &mut ContainerConfig) {
+    let at = config.oci.runtime.clone();
+    std::fs::remove_file(&at).expect("remove the link");
+    std::fs::copy(program(), &at).expect("copy the program");
+}
+
+/// One test's fake `crun`, fake cgroup mount, scratch directory and runtime.
 pub struct Fake {
     pub dir: PathBuf,
+    /// The stand-in `crun`'s state and knobs.
     pub state: PathBuf,
+    /// The registry in this process, for a fake made with [`Fake::fetching`].
+    pub registry: Option<FakeRegistry>,
     pub cgroup: PathBuf,
     pub scratch: PathBuf,
-    pub config: PodmanConfig,
+    pub config: ContainerConfig,
     pub cas: Arc<MemoryCas>,
-    pub runtime: Arc<PodmanRuntime<MemoryCas>>,
-    /// Written to `state/nonce`; the fake puts it in the action's `FAKE_LEASE`.
+    pub runtime: Arc<ContainerRuntime<MemoryCas>>,
     nonce: String,
+}
+
+/// The id files of a daemon user with one range of 65,536 subordinate ids at 100000.
+fn id_files(dir: &Path) -> IdFiles {
+    let files = IdFiles::in_dir(dir);
+    std::fs::create_dir_all(dir).expect("mkdir ids");
+    std::fs::write(&files.passwd, "root:x:0:0::/:/bin/sh\n").expect("passwd");
+    let uid = rustix::process::getuid().as_raw();
+    for file in [&files.subuid, &files.subgid] {
+        std::fs::write(file, format!("{uid}:100000:65536\n")).expect("subid file");
+    }
+    files
+}
+
+/// A directory of `newuidmap` and `newgidmap` that satisfy the start-up check.
+fn id_tools(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tools = dir.join("id-tools");
+    std::fs::create_dir_all(&tools).expect("mkdir tools");
+    for name in ["newuidmap", "newgidmap"] {
+        let path = tools.join(name);
+        std::fs::write(&path, b"").expect("tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+    }
+    tools
 }
 
 impl Fake {
@@ -77,84 +118,166 @@ impl Fake {
     }
 
     /// [`Fake::new`], with `configure` applied to the runtime's configuration last.
-    pub fn with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
-        let dir = super::scratch(&format!("fake-{name}"));
-        let state = dir.join("state");
+    pub fn with(name: &str, configure: impl FnOnce(&mut ContainerConfig)) -> Self {
+        Self::build(name, None, configure)
+    }
+
+    /// A fake whose image is not in the node's store: `registry` serves it, and the
+    /// first lease (or check) fetches and unpacks it.
+    pub fn fetching(name: &str, registry: FakeRegistry) -> Self {
+        Self::build(name, Some(registry), |_| {})
+    }
+
+    fn build(
+        name: &str,
+        registry: Option<FakeRegistry>,
+        configure: impl FnOnce(&mut ContainerConfig),
+    ) -> Self {
+        let dir = super::scratch(&format!("fake-oci-{name}"));
+        let state = dir.join("crun-state");
         let cgroup = dir.join("cgroup");
         let scratch = dir.join("scratch");
         for d in [&state, &cgroup.join("actions"), &scratch] {
             std::fs::create_dir_all(d).expect("mkdir");
         }
-        // A symlink, not a written copy: exec'ing a file this process just wrote can
-        // fail with ETXTBSY while another test thread forks.
-        let program = dir.join("podman");
-        std::os::unix::fs::symlink(self::program(), &program).expect("link podman");
-        link_act(&dir);
-        std::fs::write(state.join("image-id"), "img1\n").expect("image id");
-        // Unique to this Fake, so what a failed earlier run left in the same checkout
-        // is not taken for this run's action.
+        let crun = dir.join("crun");
+        std::os::unix::fs::symlink(program(), &crun).expect("link crun");
+        super::fake::link_act(&dir);
+        if registry.is_none() {
+            // The unpacked image: where a real unpack of the pinned image would leave it.
+            let hex = sha256(MANIFEST);
+            let rootfs = scratch
+                .join("oci-images")
+                .join(hex.trim_start_matches("sha256:"))
+                .join("rootfs");
+            std::fs::create_dir_all(rootfs.join("kbf/root")).expect("rootfs");
+        }
         let since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after 1970");
         let nonce = format!("{}-{}:", std::process::id(), since_epoch.as_nanos());
         std::fs::write(state.join("nonce"), &nonce).expect("nonce");
-        let mut config =
-            PodmanConfig::new(scratch.clone(), "/actions".to_owned(), "node-1".to_owned());
-        config.podman = program;
-        // The Podman engine, which no flag names any more: these are its tests, until
-        // they are deleted with it.
-        config.container_runtime = ContainerRuntime::Podman;
+        let mut config = ContainerConfig::new(scratch.clone(), "/actions".to_owned());
+        config.oci.runtime = crun;
+        config.oci.id_files = id_files(&dir.join("ids"));
+        config.oci.id_tool_path = Some(id_tools(&dir).into_os_string());
+        if let Some(registry) = &registry {
+            config.oci.plain_http_registries = vec![registry.addr.clone()];
+        }
+        // The stand-in runs as the test's user, so no other id needs to reach the lease,
+        // and a home directory closed to others is fine.
+        config.oci.check_search = false;
         config.cgroup_root = cgroup.clone();
         config.default_timeout = Duration::from_secs(60);
         config.kill_grace = Duration::from_millis(300);
         configure(&mut config);
         let cas = Arc::new(MemoryCas::new());
         let runtime =
-            Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
-        // The start's own sweep (`ps`) is not a lease's: `calls` records leases only.
-        // (`tests/restart.rs` checks the sweep.)
-        let _ = std::fs::remove_file(state.join("calls"));
-        let fake = Self {
+            Arc::new(ContainerRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
+        Self {
             dir,
             state,
+            registry,
             cgroup,
             scratch,
             config,
             cas,
             runtime,
             nonce,
-        };
-        fake.store_manifest(&sha256(MANIFEST), MANIFEST);
-        fake
-    }
-
-    /// Puts `bytes` in the fake image store as image img1's manifest under `digest`.
-    pub fn store_manifest(&self, digest: &str, bytes: &[u8]) {
-        let dir = self.state.join("store/fake-images/img1");
-        std::fs::create_dir_all(&dir).expect("mkdir store");
-        let file = kbf_driver_container::image::manifest_file(digest);
-        std::fs::write(dir.join(file), bytes).expect("write manifest");
+        }
     }
 
     pub fn knob(&self, name: &str, contents: &str) {
         std::fs::write(self.state.join(name), contents).expect("write knob");
     }
 
-    pub fn calls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.state.join("calls"))
+    fn lines(&self, name: &str) -> Vec<String> {
+        std::fs::read_to_string(self.state.join(name))
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
     }
 
-    /// What the fake recorded, in order (see `tests/bin/fake_podman.rs`).
+    /// The verbs the stand-in `crun` was run with, in order (`run`, `kill`, `delete`,
+    /// `helper give`, `helper rm`, `helper mkdir`, `helper tar`, `helper touch`).
+    pub fn calls(&self) -> Vec<String> {
+        self.lines("calls")
+    }
+
+    /// What the stand-in recorded, in order (see `tests/bin/fake_crun.rs`).
     pub fn events(&self) -> Vec<String> {
-        std::fs::read_to_string(self.state.join("events"))
+        self.lines("events")
+    }
+
+    /// The runtime fails the next run itself, before the action runs.
+    pub fn runtime_breaks(&self) {
+        self.knob("crun-error", "cannot create the container");
+    }
+
+    /// The next run fails as `crun` does when the program's exec finds it busy.
+    pub fn busy_once(&self) {
+        self.knob("busy-once", "");
+    }
+
+    /// The pid of the last action, as the stand-in published it.
+    pub fn action_pid(&self) -> String {
+        std::fs::read_to_string(self.state.join("pid"))
+            .expect("pid")
+            .trim()
+            .to_owned()
+    }
+
+    /// How many times `crun run` was run.
+    pub fn starts(&self) -> usize {
+        self.calls().iter().filter(|c| *c == "run").count()
+    }
+
+    /// The registry's requests so far.
+    pub fn registry_requests(&self) -> Vec<String> {
+        self.registry
+            .as_ref()
+            .map(FakeRegistry::requests)
             .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
+    }
+
+    /// The `config.json` of the last action's bundle.
+    pub fn config_json(&self) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.state.join("config.json")).expect("config.json");
+        serde_json::from_str(&text).expect("json")
+    }
+
+    /// The image's directory in the node's image store.
+    pub fn image_dir(&self) -> PathBuf {
+        self.image_dir_of(&sha256(MANIFEST))
+    }
+
+    /// The directory in the node's image store of the image with manifest `digest`.
+    pub fn image_dir_of(&self, digest: &str) -> PathBuf {
+        self.scratch
+            .join("oci-images")
+            .join(digest.trim_start_matches("sha256:"))
+    }
+
+    /// The names in the image store's directory.
+    pub fn image_store(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.scratch.join("oci-images"))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Publishes `image` on this fake's registry and returns the reference an action
+    /// names it by.
+    pub fn publish(&self, image: &Image) -> String {
+        let registry = self.registry.as_ref().expect("a fake made with `fetching`");
+        registry.publish(image);
+        image.reference(&registry.addr, "test/tiny")
     }
 
     pub fn lease_dir(&self, seq: u64) -> PathBuf {
@@ -165,23 +288,21 @@ impl Fake {
         self.cgroup.join(format!("actions/kbf-lease-1-{seq}"))
     }
 
-    /// Asserts the lease left nothing behind.
-    pub fn assert_clean(&self, seq: u64) {
-        assert!(!exists(&self.lease_dir(seq)), "scratch directory left");
-        assert!(!exists(&self.lease_cgroup(seq)), "lease cgroup left");
-        self.assert_start_reaped_before_rm();
-        self.assert_action_gone(seq);
-    }
-
-    /// The environment entry the fake gives lease `seq`'s action.
     fn marker(&self, seq: u64) -> String {
         format!("FAKE_LEASE={}/actions/kbf-lease-1-{seq}", self.nonce)
     }
 
-    /// Asserts lease `seq`'s action runs and carries the marker
-    /// [`Fake::assert_action_gone`] looks for: the positive control that keeps that
-    /// check from passing because nothing ever carried the marker. Waits up to five
-    /// seconds, since the pid file is written before the action has exec'd.
+    /// Asserts the lease left nothing behind, and nothing of its action runs.
+    pub fn assert_clean(&self, seq: u64) {
+        assert!(!exists(&self.lease_dir(seq)), "scratch directory left");
+        assert!(!exists(&self.lease_cgroup(seq)), "lease cgroup left");
+        assert!(
+            !self.state.join("run-not-reaped-at-delete").exists(),
+            "crun delete ran before crun run was reaped"
+        );
+        self.assert_action_gone(seq);
+    }
+
     pub fn assert_action_running(&self, seq: u64) {
         let marker = self.marker(seq);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -194,11 +315,6 @@ impl Fake {
         }
     }
 
-    /// Asserts nothing the lease's action started still runs. The fake gives the action
-    /// `FAKE_LEASE=<this Fake's nonce><lease cgroup name>` and its children inherit it,
-    /// so that is the fake's stand-in for membership of the lease cgroup. Waits up to
-    /// five seconds, since a SIGKILL takes effect when its target next runs; a zombie
-    /// (no environment left) has ended.
     pub fn assert_action_gone(&self, seq: u64) {
         let marker = self.marker(seq);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -215,20 +331,8 @@ impl Fake {
         }
     }
 
-    /// Asserts no `podman rm` so far ran while a `podman start` the driver ran was
-    /// still there (running, or exited but not reaped).
-    pub fn assert_start_reaped_before_rm(&self) {
-        assert!(
-            !self.state.join("start-not-reaped-at-rm").exists(),
-            "podman rm ran before podman start was reaped"
-        );
-    }
-
-    /// Sets what the fake runs as the next action: the act steps `steps`, `;` between
-    /// two (see `tests/bin/fake_podman.rs` for the `$ROOT`, `$UPPER` and `$CG` they
-    /// may start an argument with).
     pub fn action(&self, steps: &[impl AsRef<str>]) {
-        self.knob("action", &action_knob(steps));
+        self.knob("action", &super::fake::action_knob(steps));
     }
 
     /// Runs lease `seq` of `spec`, the fake running the act steps `steps` as its
@@ -257,8 +361,8 @@ impl Fake {
     }
 
     /// A second runtime on this fake's configuration, as a restarted daemon makes.
-    pub fn restart(&self) -> Result<PodmanRuntime<MemoryCas>, StartError> {
-        PodmanRuntime::new(self.config.clone(), Arc::clone(&self.cas))
+    pub fn restart(&self) -> Result<ContainerRuntime<MemoryCas>, StartError> {
+        ContainerRuntime::new(self.config.clone(), Arc::clone(&self.cas))
     }
 
     pub async fn wait_for_start(&self) {
@@ -270,45 +374,10 @@ impl Fake {
         }
         panic!("the action never started");
     }
-}
 
-/// Finds what still runs of one [`Fake`], also once the Fake is gone.
-pub struct Probe {
-    /// The fake's `podman` path, as each run of it has it in its argv.
-    program: PathBuf,
-    /// `FAKE_LEASE=<nonce>`: the prefix of what the fake's actions carry.
-    marker: String,
-}
-
-impl Probe {
-    pub fn of(fake: &Fake) -> Self {
-        Self {
-            program: fake.dir.join("podman"),
-            marker: format!("FAKE_LEASE={}", fake.nonce),
-        }
-    }
-
-    /// The pids of what still runs of the fake: a `podman` it was run as (any verb),
-    /// or an action it started (one whose environment carries the fake's nonce). A
-    /// zombie has neither left, so it does not count: it runs nothing.
-    pub fn processes(&self) -> Vec<u32> {
-        let program = self.program.as_os_str().as_encoded_bytes();
-        let marker = self.marker.as_bytes();
-        pids_where(|pid| {
-            let in_argv = std::fs::read(format!("/proc/{pid}/cmdline"))
-                .is_ok_and(|argv| argv.split(|b| *b == 0).any(|a| a == program));
-            in_argv || has_env(pid, |e| e.starts_with(marker))
-        })
-    }
-}
-
-impl Fake {
     /// Waits, at most ten seconds, until nothing of this fake runs ([`Probe::processes`]).
     /// Until then something may still write into `state` or the scratch directory, and
-    /// removing them races it ("Directory not empty"). A lease the driver cleaned has
-    /// nothing left; a killed daemon's `podman start` has no parent waiting for it and
-    /// writes its status and events once the restarted runtime's sweep has ended its
-    /// action (issues #157, #194).
+    /// removing them races it ("Directory not empty").
     fn wait_until_nothing_runs(&self) {
         let probe = Probe::of(self);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -327,7 +396,36 @@ impl Fake {
     }
 }
 
-/// The pids of this user's processes whose environment holds `entry` (`NAME=value`).
+/// Finds what still runs of one [`Fake`], also once the Fake is gone.
+pub struct Probe {
+    /// The fake's `crun` path, as each run of it has it in its argv.
+    program: PathBuf,
+    /// `FAKE_LEASE=<nonce>`: the prefix of what the fake's actions carry.
+    marker: String,
+}
+
+impl Probe {
+    pub fn of(fake: &Fake) -> Self {
+        Self {
+            program: fake.dir.join("crun"),
+            marker: format!("FAKE_LEASE={}", fake.nonce),
+        }
+    }
+
+    /// The pids of what still runs of the fake: a `crun` it was run as (any verb), or an
+    /// action it started (one whose environment carries the fake's nonce). A zombie has
+    /// neither left, so it does not count: it runs nothing.
+    pub fn processes(&self) -> Vec<u32> {
+        let program = self.program.as_os_str().as_encoded_bytes();
+        let marker = self.marker.as_bytes();
+        pids_where(|pid| {
+            let in_argv = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|argv| argv.split(|b| *b == 0).any(|a| a == program));
+            in_argv || has_env(pid, |e| e.starts_with(marker))
+        })
+    }
+}
+
 fn running_with_env(entry: &[u8]) -> Vec<u32> {
     pids_where(|pid| has_env(pid, |e| e == entry))
 }
@@ -336,9 +434,6 @@ fn has_env(pid: u32, test: impl Fn(&[u8]) -> bool) -> bool {
     std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| env.split(|b| *b == 0).any(test))
 }
 
-/// The pids in `/proc` that pass `test`. A process that ends while it is read, or is
-/// not ours to read, fails any test that reads it, so it is skipped; a `/proc` that
-/// cannot be listed fails the test rather than reading as "nothing runs".
 fn pids_where(test: impl Fn(u32) -> bool) -> Vec<u32> {
     std::fs::read_dir("/proc")
         .expect("list /proc")

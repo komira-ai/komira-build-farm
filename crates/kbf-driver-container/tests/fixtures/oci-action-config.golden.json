@@ -242,9 +242,9 @@
   "ociVersion": "1.0.0",
   "process": {
     "args": [
-      "sh",
-      "-c",
-      "echo \"a b\""
+      "tool",
+      "--flag",
+      "a b"
     ],
     "capabilities": {
       "ambient": [],

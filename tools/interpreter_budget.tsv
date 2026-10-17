@@ -27,11 +27,8 @@
 [test-interpreters]
 crates/kbf-daemon/tests/support/memory.rs	Spec::user_shell: the tests of how the daemon ends a user's own /bin/sh -c command and the background job it starts (`&`, `wait`); every other action runs kbf-testkit act
 crates/kbf-deploy/src/pilot/server_tests.rs	data: a #!/bin/sh file planted where the server binary goes, refused as not an ELF executable; nothing runs it
-crates/kbf-driver-container/src/podman.rs	data: the sh -c argv a create-arguments test expects in --entrypoint; nothing runs it
 crates/kbf-driver-container/src/program.rs	data: sh as another program's name in the crun lookup-report test; nothing runs it
-crates/kbf-driver-container/tests/fake_podman.rs	data: #!/bin/sh as the bytes of an input file whose executable bit a run must keep, and of an output file an action writes; nothing runs them
-crates/kbf-driver-container/tests/podman.rs	find -exec sh -c removes sibling directories while the output walk reads them: the race needs a program find runs between two directory reads
-crates/kbf-driver-container/tests/support/mod.rs	Spec::new: the real-Podman tests' action is sh -c inside the test image (busybox), which holds no kbf binary
+crates/kbf-driver-container/tests/support/mod.rs	Spec::new: the real-crun tests' action is sh -c inside the test image (busybox), which holds no kbf binary
 crates/kbf-driver-container/tests/support/real.rs	sh(): the same action naming the image's /bin/sh by path, since the action's environment has no PATH
 crates/kbf-driver-container/tests/tree.rs	data: #!/bin/sh bytes as an executable file's content in the tree write and collect tests; nothing runs them
 crates/kbf-driver-native/src/network.rs	data: /bin/sh as the program in the sandbox-exec wrapping tests; nothing runs it

@@ -19,7 +19,7 @@ path = "src/main.rs"
 # for tests/storage_and_daemon.rs and tests/rehearsal_in_a_box.rs: the program
 # kbf-all-in-one's tests run, built here because a test can run only its own package's
 # binaries, under a name of its own so a workspace build does not write two binaries to
-# one path. Also what a `podman` that must never run is. Not shipped.
+# one path. Not shipped.
 [[bin]]
 name = "kbf-cli-fake-crun"
 path = "../kbf-driver-container/tests/bin/fake_crun.rs"

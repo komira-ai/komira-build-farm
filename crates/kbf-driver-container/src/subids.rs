@@ -1,7 +1,7 @@
 //! The node check the container driver needs before its first lease: the daemon's
 //! user owns a range of subordinate uids and gids.
 //!
-//! Every container runs with `--userns=nomap` (see `podman::create_args`): its ids
+//! Every container runs in a user namespace whose ids
 //! map only to the daemon user's subordinate ids, never to the user itself. A user
 //! with no range in `/etc/subuid` or `/etc/subgid` gets no container at all, and one
 //! with fewer than [`MIN_SUBORDINATE_IDS`] gets containers in which an image's files
@@ -60,9 +60,9 @@ pub enum SubidError {
     },
     #[error(
         "{file} has no range for the daemon's user {user}: the container driver runs \
-         every container with --userns=nomap, whose ids map only to subordinate ids. \
+         every container in a user namespace whose ids map only to subordinate ids. \
          Add one (usermod --add-subuids 100000-165535 --add-subgids 100000-165535 \
-         <user>), then run `podman system migrate` as that user"
+         <user>)"
     )]
     Missing { file: PathBuf, user: String },
     #[error(
@@ -310,7 +310,7 @@ mod tests {
                 "{text}"
             );
             assert!(text.contains("kbf (uid 990)"), "{text}");
-            assert!(text.contains("--userns=nomap"), "{text}");
+            assert!(text.contains("map only to subordinate ids"), "{text}");
             assert!(text.contains("usermod --add-subuids"), "{text}");
         }
         let files = files("unknown-user", Some(full), Some(full));

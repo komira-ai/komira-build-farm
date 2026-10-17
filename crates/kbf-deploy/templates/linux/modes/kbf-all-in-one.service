@@ -45,7 +45,6 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
     --api-listen=127.0.0.1:@KBF_API_PORT@ \
     --api-token-file=@KBF_API_TOKEN_FILE@ \
     --driver=container \
-    --container-runtime=oci \
     --oci-runtime=/usr/bin/crun \
     --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --ca-cert=@KBF_ETC@/ca.pem \

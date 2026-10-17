@@ -308,8 +308,8 @@ fn made(dir: &Path) -> impl FnOnce(std::io::Error) -> DataDirError {
     }
 }
 
-/// The container driver's cache and trees, for the driver to open once Podman's storage
-/// passed its checks; `None`, after a warning, when the filesystem is too small or the
+/// The container driver's cache and trees, for the driver to open; `None`, after a
+/// warning, when the filesystem is too small or the
 /// daemon's own path is unknown.
 ///
 /// No plan, no cache. The cache is the node's one cache with local storage if `data`
@@ -702,7 +702,11 @@ mod tests {
         assert_eq!(mode(&fresh.cache()), 0o700, "the cache stays the daemon's");
         let old = plan_at("old", false);
         old.create().expect("create");
-        assert_eq!(mode(&old.leases()), 0o700, "podman keeps 0700");
+        assert_eq!(
+            mode(&old.leases()),
+            0o700,
+            "without the container driver leases stays 0700"
+        );
         let old = plan_at("old", true);
         old.create().expect("repair");
         assert_eq!(mode(&old.leases()), 0o711, "an existing 0700 is repaired");

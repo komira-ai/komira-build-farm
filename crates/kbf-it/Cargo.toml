@@ -38,7 +38,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic.workspace = true
 tracing-subscriber.workspace = true
-# `kbf-cell m2` sets the runner up with `cargo xtask podman-tests`'s own function.
+# `kbf-cell m2` sets the runner up with `cargo xtask crun-tests`'s own function.
 xtask.workspace = true
 
 [dev-dependencies]

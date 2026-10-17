@@ -1,12 +1,12 @@
-//! Who owns a lease's files, against the stand-in `podman` (`support/fake.rs`).
+//! Who owns a lease's files, against the stand-in `crun` (`support/fake.rs`).
 //!
-//! Every container runs with `--userns=nomap`, so its root is a subordinate id, not
-//! the daemon's user. The driver gives the overlay's directories to that id before the
-//! container is created and takes them back once it has exited, before reading the
-//! outputs. The fake records each `podman unshare chown` and changes no owner (a test
-//! runs as one user); while the overlay is the container's once `start` has ended, it
-//! makes the upper directory unreadable, as a stranger's private files would be, until
-//! the hand-back. `tests/podman.rs` checks the ids on real Podman.
+//! Every container's root is a subordinate id, not the daemon's user. The driver gives
+//! the overlay's directories to that id before the container runs and takes them back
+//! once it has exited, before reading the outputs. The fake records each hand-over (a
+//! helper container) and changes no owner (a test runs as one user); while the overlay
+//! is the container's once the run has ended, it makes the upper directory unreadable,
+//! as a stranger's private files would be, until the hand-back. `tests/crun.rs` checks
+//! the ids on real `crun`.
 
 mod support;
 
@@ -42,31 +42,31 @@ async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.output_files.len(), 1, "{result:?}");
     let lease = fake.lease_dir(1);
-    let dirs = ["root", "upper", "work"]
+    let dirs = ["root", "upper", "work", "rw"]
         .map(|d| lease.join(d).display().to_string())
         .join(" ");
     let events: Vec<String> = fake
         .events()
         .into_iter()
-        .filter(|e| e.starts_with("chown ") || e == "start ended")
+        .filter(|e| e.starts_with("chown ") || e == "run ended")
         .collect();
     assert_eq!(
         events,
         [
             format!("chown 1:1 {dirs}"),
-            "start ended".to_owned(),
+            "run ended".to_owned(),
             format!("chown 0:0 {dirs}"),
         ]
     );
     let calls = fake.calls();
-    let first_chown = calls.iter().position(|c| c == "unshare chown");
-    let create = calls.iter().position(|c| c == "create");
-    assert!(first_chown < create, "{calls:?}");
+    let first_give = calls.iter().position(|c| c == "helper give");
+    let run = calls.iter().position(|c| c == "run");
+    assert!(first_give < run, "{calls:?}");
     fake.assert_clean(1);
 }
 
 /// The `inputs phases:` line's `chown_ms` is the hand-over's time: with the fake's
-/// `podman unshare chown` to the container's owner sleeping 200 ms, it is at least 200
+/// helper giving to the container's owner sleeping 200 ms, it is at least 200
 /// (a lower bound only: a loaded machine adds time, never removes it). Catches the
 /// timer read before `give_overlay` runs (0), the hand-over timed into another field,
 /// and no line or more than one per lease.
@@ -98,7 +98,7 @@ async fn the_inputs_phases_line_times_the_hand_over() {
 }
 
 /// Catches a failed hand-over being ignored. Before the container: the action would
-/// run unable to write, so nothing is created. After it: the outputs would be read
+/// run unable to write, so nothing is run. After it: the outputs would be read
 /// as a stranger, so the lease fails rather than report what it could see. Either
 /// way the lease is an infrastructure failure and leaves nothing.
 #[tokio::test]
@@ -110,10 +110,10 @@ async fn a_failed_hand_over_fails_the_lease_and_leaves_nothing() {
     let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why))
-            if why.starts_with("podman unshare chown: ") && why.contains("chown refused")),
+            if why.contains("chown refused")),
         "{outcome:?}"
     );
-    assert!(!fake.calls().contains(&"create".to_owned()));
+    assert_eq!(fake.starts(), 0);
     fake.assert_clean(1);
 
     fake.knob("chown-fails", "0:0");
@@ -130,8 +130,8 @@ async fn a_failed_hand_over_fails_the_lease_and_leaves_nothing() {
 }
 
 /// Catches the hand-back running on a lease that never reached collect: a timed-out
-/// container may still be stopping, and its files are removed inside Podman's user
-/// namespace instead (the clean step's fallback).
+/// container may still be stopping, and its files are removed by a helper container
+/// instead (the clean step's fallback).
 #[tokio::test]
 async fn a_timed_out_lease_is_not_handed_back() {
     let fake = Fake::new("chown-timeout");

@@ -41,7 +41,7 @@ The biggest things to add:
 - **[F]** `invocations.md` section 9 says only PRs 1, 2, 3 and 5 have landed. The read API (PR 4) is in the code: `crates/kbf-server/src/http_invocations.rs:101-102`, routes at `crates/kbf-server/src/http_invocations/pages.rs:171-181`.
 - **[F]** `invocations.md` section 1 and the `scheduler.md` Accounting text say no driver fills `ResourceUsage`. The container driver does (`crates/kbf-driver-container/src/cgroup_usage.rs:140-175`); the native driver does not (no `ResourceUsage` in `crates/kbf-driver-native/src`).
 - **[F]** `failure-classes.md` section 9 says no metrics endpoint exists; `GET /metrics` exists (`crates/kbf-server/src/metrics.rs:24-40`).
-- **[F]** `failure-classes.md` 6.3 (`:719-721`) says flakes are recorded in "a bounded table on the server today"; none exists (`git grep -il flake crates` finds two test files only: `crates/kbf-daemon/tests/local.rs`, `crates/kbf-driver-container/tests/fake_podman.rs`).
+- **[F]** `failure-classes.md` 6.3 (`:719-721`) says flakes are recorded in "a bounded table on the server today"; none exists (`git grep -il flake crates` finds two test files only: `crates/kbf-daemon/tests/local.rs`, `crates/kbf-driver-container/tests/fake_crun.rs`).
 
 ## 1. Decisions
 

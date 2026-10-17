@@ -1,9 +1,9 @@
 //! The times the driver writes into a result's `ExecutedActionMetadata`, against the
-//! stand-in `podman` (`support/fake.rs`). Buck2 reports an action's execution time
+//! stand-in `crun` (`support/fake.rs`). Buck2 reports an action's execution time
 //! as `execution_completed_timestamp - execution_start_timestamp`; a result without
 //! them reads as an action that took no time (issue #517).
 //!
-//! A module of `fake_podman.rs`, not a test binary of its own, for the reason
+//! A module of `fake_crun.rs`, not a test binary of its own, for the reason
 //! `fake_memory` gives: the coverage job counts the driver's lines per test binary.
 
 use std::time::{Duration, SystemTime};

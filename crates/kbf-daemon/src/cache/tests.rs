@@ -210,7 +210,6 @@ async fn a_panic_on_the_blocking_pool_is_resumed() {
         (super::Disabled::LeaseName, "lease-name"),
         (super::Disabled::NoBudget, "no-budget"),
         (super::Disabled::NativeSameUid, "native-same-uid"),
-        (super::Disabled::GraphDriver(String::new()), "graph-driver"),
     ] {
         assert_eq!(disabled.reason(), word);
     }

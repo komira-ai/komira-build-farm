@@ -29,7 +29,6 @@ Environment=XDG_RUNTIME_DIR=/run/user/1500
 # the continued lines below: systemd 239 and older read one into the command line.)
 ExecStart=/usr/local/bin/kbf daemon \
     --driver=container \
-    --container-runtime=oci \
     --oci-runtime=/usr/bin/crun \
     --server=https://frontend.example.internal:8981 \
     --cas=https://frontend.example.internal:8981 \

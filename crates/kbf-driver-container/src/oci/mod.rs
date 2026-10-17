@@ -1,6 +1,5 @@
-//! The OCI backend: each action in a fresh rootless sandbox made by `crun`, with no
-//! Podman anywhere (`--container-runtime=oci`, the only runtime a node is configured
-//! with).
+//! The container runtime: each action in a fresh rootless sandbox made by `crun`, the
+//! only container runtime kbf has.
 //!
 //! Per action, from the daemon user's account, with nothing running as root and no
 //! helper that unshares by itself (`crun` creates every namespace, so the only
@@ -12,8 +11,8 @@
 //! 2. the lease's directories are given to the action's root by a helper container
 //!    ([`helper`]);
 //! 3. a bundle is written: `config.json` ([`spec`]) plus the lease's `hosts` and
-//!    `hostname` files, with the hardening Podman supplies written out
-//!    ([`hardening`]);
+//!    `hostname` files, with the capability set, masked paths and seccomp filter written
+//!    out ([`hardening`]);
 //! 4. `crun run` runs the bundle in the foreground ([`crun`]): its exit status is the
 //!    action's, so there is no moment at which the container is stopped but its exit
 //!    code is unknown (kbf#658);
@@ -25,11 +24,11 @@
 //! upper directory, which outputs are read from); shared read-only trees
 //! ([`kbf_daemon::trees::SharedMount`]) bound inside it; `/tmp`, `/var/tmp`, `/run` and
 //! `/root` as the lease's own disk directories ([`spec::WRITABLE`]); `/dev`, `/proc`,
-//! `/sys` and `/dev/shm` as for any container. Where Podman gives a writable copy of
-//! the whole image, this backend gives a read-only image and those four directories.
+//! `/sys` and `/dev/shm` as for any container. The image is read-only; those four
+//! directories are where an action writes besides the exec root.
 //!
 //! **Ids:** inside the container, id 0 is the first subordinate id of the daemon user
-//! ([`DaemonIds`]), the same as `--userns=nomap`; the daemon user itself is not mapped, so
+//! ([`DaemonIds`]), the daemon user itself is not mapped, so
 //! the inodes it owns (the cache's files, the shared trees) are `nobody`'s to the
 //! action. The node needs one range of at least 65,536 subordinate ids in
 //! `/etc/subuid` and `/etc/subgid`, and every directory from `/` down to the scratch
@@ -38,7 +37,7 @@
 //!
 //! **cgroups:** the container's cgroup is `<lease cgroup>/ctr`, made by `crun` in the
 //! daemon's delegated subtree with the pids limit and `memory.oom.group=1`; memory and
-//! CPU limits stay on the lease cgroup, as on the Podman path.
+//! CPU limits stay on the lease cgroup.
 
 pub(crate) mod crun;
 pub(crate) mod hardening;
@@ -99,8 +98,9 @@ impl Default for OciConfig {
 /// Which user namespace a container is made in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mapping {
-    /// The daemon user is id 0 and the subordinate range starts at id 1: the namespace
-    /// `podman unshare` enters ([`DaemonIds::setup_mappings`]).
+    /// The daemon user is id 0 and the subordinate range starts at id 1
+    /// ([`DaemonIds::setup_mappings`]): the namespace in which the daemon user's files
+    /// are given to the action's ids and back.
     Setup,
     /// An action's: id 0 is the first subordinate id ([`DaemonIds::action_mappings`]).
     Action,

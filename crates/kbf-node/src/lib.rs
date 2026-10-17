@@ -50,8 +50,6 @@ use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, FarmCas,
     Liveness, MapHolder, NodeReport, Runtime, Runtimes,
 };
-#[cfg(target_os = "linux")]
-use kbf_driver_container::ContainerRuntime;
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -211,22 +209,6 @@ pub struct Cli {
     /// name another image.
     #[arg(long = "image", value_name = "IMAGE")]
     images: Vec<String>,
-    /// The runtime that runs each action's container (container): `oci`, the only one and
-    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
-    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
-    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
-    /// `PATH`, and every directory down to `--data-dir` searchable by others.
-    #[cfg(target_os = "linux")]
-    #[arg(long, default_value = "oci", value_name = "oci")]
-    container_runtime: ContainerRuntime,
-    /// The runtime that runs each action's container (container): `oci`, the only one and
-    /// the default, runs each action in a fresh rootless sandbox through `--oci-runtime`
-    /// (`crun`) directly. Podman is not supported. It needs the daemon user's
-    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
-    /// `PATH`, and every directory down to `--data-dir` searchable by others.
-    #[cfg(not(target_os = "linux"))]
-    #[arg(long, default_value = "oci", value_name = "oci")]
-    container_runtime: String,
     /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
     /// default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on
     /// one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with
@@ -241,7 +223,10 @@ pub struct Cli {
     /// Where the kernel lists NUMA nodes (container). For tests of the placement only.
     #[arg(long, hide = true, default_value = "/sys/devices/system/node")]
     numa_dir: PathBuf,
-    /// The OCI runtime that runs actions (container): `crun`.
+    /// The OCI runtime that runs each action's container (container): `crun`, run
+    /// directly. Each action gets a fresh rootless sandbox. It needs the daemon user's
+    /// subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on
+    /// `PATH`, and every directory down to `--data-dir` searchable by others.
     #[arg(long, default_value = "/usr/bin/crun")]
     oci_runtime: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
@@ -328,8 +313,8 @@ pub fn dispatch_helpers() -> Option<ExitCode> {
     if let Some(code) = kbf_driver_native::slots::dispatch() {
         return Some(code);
     }
-    // So is the container driver's `__chown-dirs` helper, which it runs inside Podman's
-    // user namespace with the input cache.
+    // So is the container driver's `__chown-dirs` helper, which it runs in a helper
+    // container.
     #[cfg(target_os = "linux")]
     if let Some(code) = kbf_driver_container::chown_dirs::dispatch() {
         return Some(ExitCode::from(code));
@@ -874,8 +859,8 @@ mod container {
     use std::time::Duration;
 
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, ImageRef, LeasePlacement, OutputLimits, PodmanConfig,
-        PodmanRuntime, SwapKill,
+        ContainerConfig, ContainerLimits, ContainerRuntime, IdFiles, ImageRef, LeasePlacement,
+        OutputLimits, SwapKill,
     };
 
     use super::{Cli, Error, ImageUnusable, Node, scratch};
@@ -953,9 +938,8 @@ mod container {
                 kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, whole_host)?
             }
         };
-        let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        let mut config = ContainerConfig::new(scratch, parent);
         config.placer = placer;
-        config.container_runtime = cli.container_runtime;
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();
@@ -970,7 +954,7 @@ mod container {
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::data_dir::given(plan.as_ref(), &cli.data);
-        let runtime = PodmanRuntime::new(config, cas)?;
+        let runtime = ContainerRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
         node.add(Arc::new(runtime))?;
@@ -982,7 +966,7 @@ mod container {
     /// node's image store, one architecture's manifest. The first that is not stops the
     /// start, with its fix.
     async fn check_images<C: Cas>(
-        runtime: &PodmanRuntime<C>,
+        runtime: &ContainerRuntime<C>,
         images: &[String],
     ) -> Result<(), ImageUnusable> {
         for value in images {

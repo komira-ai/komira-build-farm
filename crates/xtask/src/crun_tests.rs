@@ -1,9 +1,8 @@
-//! `cargo xtask podman-tests`: the container driver's real-`crun` tests
-//! (`crates/kbf-driver-container/tests/podman*.rs` and `oci_crun.rs`, every test
-//! `#[ignore]` with the reason) on a GitHub-hosted Linux runner. The verb keeps its name
-//! until the workflows that call it can be renamed with it; no Podman is involved:
-//! kbf runs containers with `crun` only, and each test's image is fetched from its
-//! registry by the driver's own image store (`kbf-image`), digest-verified.
+//! `cargo xtask crun-tests`: the container driver's real-`crun` tests
+//! (`crates/kbf-driver-container/tests/crun*.rs` and `oci_crun.rs`, every test
+//! `#[ignore]` with the reason) on a GitHub-hosted Linux runner. kbf runs containers
+//! with `crun` only, and each test's image is fetched from its registry by the driver's
+//! own image store (`kbf-image`), digest-verified.
 //!
 //! - this architecture's busybox manifest is one of two pinned digests ([`manifest_for`]),
 //!   so no index is resolved here and the tests name the image as a daemon is told to: by
@@ -53,29 +52,29 @@ pub struct Target {
 /// The real-`crun` test targets, in the order they run.
 pub const TARGETS: &[Target] = &[
     Target {
-        name: "podman",
+        name: "crun",
         nocapture: false,
     },
     Target {
-        name: "podman_memory",
+        name: "crun_memory",
         nocapture: false,
     },
     Target {
-        name: "podman_killed",
+        name: "crun_killed",
         nocapture: false,
     },
     Target {
-        name: "podman_cache",
+        name: "crun_cache",
         nocapture: true,
     },
     Target {
-        name: "podman_env",
+        name: "crun_env",
         nocapture: false,
     },
     // The node's cold-store key reaches no action through the runtime's environment or
     // its files.
     Target {
-        name: "podman_credential",
+        name: "crun_credential",
         nocapture: false,
     },
     // The sandbox as `config.json` says it, read from inside.
@@ -122,7 +121,7 @@ fn read_or_na(root: &Path, file: &str) -> String {
 }
 
 /// How the kernel under `root` (`/` on a runner) reclaims into swap, which the swap
-/// tests in `podman_memory.rs` depend on, and its swap areas: lines for the log.
+/// tests in `crun_memory.rs` depend on, and its swap areas: lines for the log.
 pub fn host_report(root: &Path) -> String {
     format!(
         "kernel {}; vm.swappiness {}; zswap {}; lru_gen {}; THP {}\nswap areas:\n{}",
@@ -177,7 +176,7 @@ pub fn systemd_run_args(u: &Unit<'_>) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["systemd-run", "--quiet", "--wait", "--collect", "--pipe"]
         .map(OsString::from)
         .into();
-    args.push(format!("--unit=kbf-podman-tests-{}", u.target.name).into());
+    args.push(format!("--unit=kbf-crun-tests-{}", u.target.name).into());
     args.extend(
         [
             "--slice=kbf-daemon.slice",
@@ -209,8 +208,8 @@ pub fn systemd_run_args(u: &Unit<'_>) -> Vec<OsString> {
     args
 }
 
-/// What `podman-tests` runs and where.
-pub struct PodmanTests<'a> {
+/// What `crun-tests` runs and where.
+pub struct CrunTests<'a> {
     /// The cargo program (on `cargo xtask`, the `CARGO` cargo sets).
     pub cargo: &'a OsStr,
     /// The sudo program; it is run with `-n`, so it never prompts.
@@ -226,7 +225,7 @@ pub struct PodmanTests<'a> {
 /// # Errors
 /// A step failed (the first one's error), or one or more targets failed (one line
 /// each, after every target ran).
-pub fn run(p: &PodmanTests<'_>) -> Result<Vec<String>, Error> {
+pub fn run(p: &CrunTests<'_>) -> Result<Vec<String>, Error> {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
     println!("{}", host_report(Path::new("/")));

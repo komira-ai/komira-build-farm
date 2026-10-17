@@ -2,7 +2,7 @@
 //! what M2 requires, and each one fails the run when the cell breaks it.
 //!
 //! The fakes are this test binary, run through links named `kbf-server` and `buck2` in
-//! a `--bin-dir` of the test's own, and `crun`, `podman` (which must never run), `sudo`
+//! a `--bin-dir` of the test's own, and `crun`, `sudo`
 //! and `systemctl` found first on `PATH`: a start-up hook answers as the program its argv0
 //! names before the test
 //! harness starts. Each fake appends its call to `<dir>/calls` and plants the defect
@@ -77,7 +77,6 @@ mod fake {
             "kbf-server",
             "buck2",
             "crun",
-            "podman",
             "sudo",
             "systemctl",
             "late-writer",
@@ -91,7 +90,6 @@ mod fake {
             "kbf-server" => server(),
             "buck2" => buck2(&args),
             "crun" => crun(&args),
-            "podman" => podman(),
             "sudo" => sudo(&args),
             "systemctl" => systemctl(&args),
             _ => late_writer(),
@@ -296,12 +294,6 @@ mod fake {
         0
     }
 
-    /// The `podman` that must never run: it fails, and its call is on record.
-    fn podman() -> i32 {
-        eprintln!("Error: podman was removed");
-        125
-    }
-
     fn sudo(args: &[String]) -> i32 {
         if args.first().map(String::as_str) != Some("-n") {
             eprintln!("sudo: a password is required");
@@ -469,7 +461,7 @@ impl Cell {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
         let me = std::env::current_exe().expect("this test binary");
-        for fake in ["kbf-server", "buck2", "crun", "podman", "sudo", "systemctl"] {
+        for fake in ["kbf-server", "buck2", "crun", "sudo", "systemctl"] {
             std::os::unix::fs::symlink(&me, bin.join(fake)).expect("link a fake");
         }
         let act = match defect {
@@ -606,8 +598,7 @@ fn fails(defect: &str, code: i32, why: &str) -> (Cell, Output) {
 
 /// Catches: a harness that starts the server or the daemon's unit with other flags than
 /// the M2 cell needs (the unit without `Delegate=yes`, or not as this user), skips the
-/// runner setup or a check, builds in another order or place, runs Podman (the fake one
-/// fails and is on record), leaves the copy's `kbf-m2-act` unexecutable (the fake build
+/// runner setup or a check, builds in another order or place, leaves the copy's `kbf-m2-act` unexecutable (the fake build
 /// fails as the farm's action would), leaves a unit running, or passes without one of its
 /// OK lines.
 #[test]
@@ -698,10 +689,8 @@ fn a_cell_that_does_everything_passes() {
         ]
     );
 
-    // Podman never ran (the fake one fails and is on record), and crun was asked its
-    // version once, by the harness: every other call is the daemon's, through a runtime
-    // of its own that is not this fake.
-    assert_eq!(cell.args("podman"), Vec::<String>::new());
+    // crun was asked its version once, by the harness: every other call is the daemon's,
+    // through a runtime of its own that is not this fake.
     assert_eq!(cell.args("crun"), ["--version"]);
 
     let buck2 = cell.calls("buck2");
@@ -849,7 +838,6 @@ fn a_used_work_directory_is_refused() {
 fn a_runner_without_crun_fails() {
     let (cell, _) = fails("crun-fails", 1, "FAIL: crun --version failed");
     assert!(cell.args("kbf-server").is_empty());
-    assert!(cell.args("podman").is_empty());
 }
 
 /// Catches: a harness that accepts a daemon that joined without the image it was given

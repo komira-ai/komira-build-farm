@@ -1,13 +1,12 @@
-//! Short-lived helper containers: the "setup namespace" work Podman's `podman unshare`
-//! does today, done by `crun` itself.
+//! Short-lived helper containers: the "setup namespace" work, done by `crun` itself.
 //!
 //! A directory the daemon user owns can be given to the action's root (a subordinate
 //! id), read back, or deleted once it holds files owned by subordinate ids, only from
 //! inside a user namespace that maps both the daemon user and the subordinate range.
 //! A helper is that namespace: container id 0 is the daemon user, container ids
 //! `1..=65536` are the subordinate range ([`DaemonIds::setup_mappings`]), so an action's
-//! root (host subordinate id 0) is helper id 1, the same `1:1` the Podman path chowns
-//! to. `crun` creates it; AppArmor's grant for user namespaces is `crun`'s own profile,
+//! root (host subordinate id 0) is helper id 1, the `1:1` it is given directories as.
+//! `crun` creates it; AppArmor's grant for user namespaces is `crun`'s own profile,
 //! so the daemon needs no profile of its own.
 //!
 //! A helper runs one program, never a shell: this daemon's own binary in its

@@ -96,7 +96,6 @@ fn each_mode_renders_its_full_flag_set() {
             "--frontend=https://front.example.internal:8981",
             "--advertise-addr=storage-node.example.internal:8983",
             "--driver=container",
-            "--container-runtime=oci",
             "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
@@ -114,7 +113,6 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Daemon),
         words(&[
             "--driver=container",
-            "--container-runtime=oci",
             "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--cas=https://front.example.internal:8981",

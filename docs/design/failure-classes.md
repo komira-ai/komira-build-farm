@@ -368,12 +368,12 @@ These need no guessing, only keeping the reason the daemon already writes:
   kernel raises on the program's own fault (SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE) is
   Action. A SIGSEGV someone else sent with `kill` cannot be told apart, and is accepted
   as Action.
-- **Driver errors** (`RuntimeError::Failed`): setup, cgroup, podman, CAS I/O, clean.
+- **Driver errors** (`RuntimeError::Failed`): setup, cgroup, `crun`, CAS I/O, clean.
   Farm. A clean that fails after a good run (`kbf-driver-native/src/runtime.rs:352`)
   keeps the good result and withdraws the node's scratch capability instead of
   discarding the work.
 - **Kernel OOM.** The container driver reads the lease cgroup's `memory.events` on
-  exit 137 and whenever Podman recorded no exit (section 6.1).
+  exit 137 and whenever `crun` reported an error and no exit (section 6.1).
 - **Control faults**: fence (`ABORTED`), contact lost (`UNAVAILABLE`), lease kind not
   served, the named Xcode absent, outputs not stored (`farm.rs:539-542`). Farm.
 - **Request errors**: no arguments, image by tag, an output's parent that would be made
@@ -468,8 +468,8 @@ itself at its cap is now more than a threshold; swap that host pressure moved wh
 the lease was below its cap never counts), or
 by the kernel's OOM killer for that cap (swap full), which the lease cgroup's
 `memory.events` shows with `oom_kill`, `oom` and `max`. The container driver reads
-those counters when the action ends with SIGKILL (137), when Podman recorded no exit,
-or when Podman could not be asked, and reports either kill as `MEMORY_KILL_OWN_LIMIT`;
+those counters when the action ends with SIGKILL (137) or when `crun` reported an
+error and no exit, and reports either kill as `MEMORY_KILL_OWN_LIMIT`;
 a kernel kill by the node's `actions/` limit or the host (`oom_kill` without `oom` in
 the lease) is `MEMORY_KILL_NODE_PRESSURE`, which says nothing about the booking
 ([daemon.md](daemon.md), "Cgroups and limits"). A SIGKILL kbf did not send and cannot
@@ -835,16 +835,15 @@ when a client can use it.
 `FAILED_PRECONDITION` for output over the size limit (and, if the lean of 6.1 O1 is
 taken, for an action that needs more memory than any node offers, which is Action, not
 Request, and says so in its `ErrorInfo`). Program not found: a path inside the input root is Action (exit 127 with kbf's message on stderr,
-as a shell and podman would; a spec departure, section 5); an absolute path outside it,
+as a shell would; a spec departure, section 5); an absolute path outside it,
 missing on this node while peers of the same platform have it, is environment drift,
 so Farm.
 
 **Done for program not found** (#275, both drivers). Container: the image is pinned by
 digest and the environment is the Command's alone, so when crun reports it cannot find
 or execute `argv[0]` the answer is the action's exit 127 or 126, kbf's message (the
-program and the Command's `PATH`, or that it sets none) then Podman's words on stderr.
-Only crun's own lookup report counts, not Podman's wrapping, which it also puts on mount
-and cgroup faults. Native: a relative path, or a bare name on a `PATH` of relative
+program and the Command's `PATH`, or that it sets none) then crun's words on stderr.
+Only crun's own lookup report counts, not its other errors (a mount or cgroup fault). Native: a relative path, or a bare name on a `PATH` of relative
 entries only, is the action's 127 or 126; an absolute path, an absolute `PATH` entry or
 the default `PATH` stays Farm, its message naming the `PATH` searched. Telling drift
 from a typo by asking peers is not built.

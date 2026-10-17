@@ -23,8 +23,8 @@
 //!   `--reapi-tls-*` flags, and a `--meta-dir` outside the daemon's data directory.
 //! - `image`: the daemon's `--image=` values are `KBF_IMAGES`, each as `docker://<entry>`,
 //!   and each passes kbf-daemon's own parser (any other value makes it exit 2 at start).
-//! - `runtime`: the daemon's unit passes `--container-runtime=oci` and `--oci-runtime=`,
-//!   and no file of it names Podman ([`super::runtime`]).
+//! - `runtime`: the daemon's unit passes `--oci-runtime=` and no `--container-runtime`
+//!   ([`super::runtime`]).
 //!
 //! Each rule reads a key's last assignment in its section, the one systemd uses.
 
@@ -429,7 +429,7 @@ fn check(c: &LinuxConfig, files: [&File; 4], installable: bool) -> Report {
     }
 
     // runtime
-    for how in runtime::check(&daemon.name, &daemon.unit, &[(&daemon.name, &daemon.text)]) {
+    for how in runtime::check(&daemon.name, &daemon.unit) {
         fail("runtime", how);
     }
 

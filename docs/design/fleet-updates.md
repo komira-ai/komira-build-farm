@@ -608,7 +608,7 @@ open-core (7.6).
   signature; the set pins which snapshot and kernel (S3.1).
 - `kbf-updater apply` runs a full upgrade against the snapshot, then reboots only if
   `/run/reboot-required` exists.
-- Podman fit: cgroup v2 only; the profile's drop-in on `user@.service` delegates
+- Rootless `crun` fit: cgroup v2 only; the profile's drop-in on `user@.service` delegates
   `cpu cpuset io memory pids`, and the post-update gate rechecks it
   ([rootless cgroup v2](https://rootlesscontaine.rs/getting-started/common/cgroup2/))
   **[V]**.

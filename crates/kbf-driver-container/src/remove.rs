@@ -152,7 +152,7 @@ mod tests {
 
     /// Catches an entry the daemon's user cannot remove (its directory is not
     /// writable) being skipped, or reported as success: the removal fails, so the
-    /// clean step falls back to `podman unshare`.
+    /// clean step falls back to a helper container.
     #[test]
     fn an_entry_that_cannot_be_unlinked_fails_the_removal() {
         let dir = scratch("remove-readonly");

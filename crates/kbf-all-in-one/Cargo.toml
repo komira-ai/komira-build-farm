@@ -17,8 +17,7 @@ path = "src/main.rs"
 # The container driver's stand-in `crun`, which runs each action as a plain process,
 # for tests/binary.rs: the same program the driver's own tests run
 # (crates/kbf-driver-container/tests/bin/fake_crun.rs), built here because a test
-# can run only its own package's binaries. Also what a `podman` that must never run
-# is. Not shipped.
+# can run only its own package's binaries. Not shipped.
 [[bin]]
 name = "kbf-fake-crun"
 path = "../kbf-driver-container/tests/bin/fake_crun.rs"

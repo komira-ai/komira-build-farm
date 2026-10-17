@@ -1,7 +1,7 @@
 //! Every blob a directory output names is in the CAS when the driver returns its
-//! result, against the stand-in `podman` (`support/fake.rs`).
+//! result, against the stand-in `crun` (`support/fake.rs`).
 //!
-//! A module of `fake_podman.rs`, not a test binary of its own, for the reason
+//! A module of `fake_crun.rs`, not a test binary of its own, for the reason
 //! `fake_memory` gives: the coverage job counts the driver's lines per test binary.
 
 use crate::support::fake::{Fake, image};

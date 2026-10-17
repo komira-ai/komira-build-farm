@@ -1,7 +1,7 @@
-//! The driver's steps against a stand-in `podman` (`support/fake.rs`) that runs
-//! each action as a plain process, and a plain directory standing in for the cgroup
-//! mount. These run on any Linux machine; `podman.rs` runs the same promises against
-//! real rootless Podman.
+//! The driver's steps against a stand-in `crun` (`support/fake.rs`) that runs each
+//! action as a plain process, and a plain directory standing in for the cgroup mount.
+//! These run on any Linux machine; `crun.rs` runs the same promises against real
+//! rootless `crun`.
 
 mod conformance;
 mod fake_cache;
@@ -10,7 +10,6 @@ mod fake_directory_blobs;
 mod fake_memory;
 mod fake_missing_blobs;
 mod fake_oci;
-mod fake_stopped;
 mod fake_usage;
 mod support;
 
@@ -20,7 +19,7 @@ use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_types::Resources;
-use support::fake::{Fake, INDEX, MANIFEST, image, image_by, sha256};
+use support::fake::{Fake, image};
 use support::{Spec, blob, exists, store_action, tree, work};
 /// Catches each part of a run going missing: inputs not written (or written without
 /// the executable bit), the working directory or output parents not made, outputs,
@@ -33,7 +32,7 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     spec.working_directory = "pkg".to_owned();
     spec.inputs = vec![
         ("pkg/src/in.txt", b"input bytes", false),
-        ("tool.sh", b"#!/bin/sh\n", true),
+        ("tool.sh", b"a tool\n", true),
     ];
     spec.symlinks = vec![("pkg/link-in", "src/in.txt")];
     spec.outputs = vec![
@@ -73,7 +72,7 @@ async fn a_run_collects_everything_and_leaves_nothing() {
         ";",
         "write-lines",
         "$UPPER/pkg/out/dir/run.sh",
-        "#!/bin/sh",
+        "a program",
         ";",
         "chmod",
         "755",
@@ -155,7 +154,7 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     );
 
     fake.assert_clean(1);
-    assert!(fake.calls().contains(&"rm".to_owned()));
+    assert!(fake.calls().contains(&"delete".to_owned()));
 }
 
 /// Catches `--lease-placement=numa-node` not reaching the lease cgroup: the lease must
@@ -347,7 +346,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Catches an image named by tag reaching Podman (the "tag instead of a digest"
+/// Catches an image named by tag reaching `crun` (the "tag instead of a digest"
 /// mutant): refused as the client's error before anything is created.
 #[tokio::test]
 async fn a_tag_is_refused_before_anything_runs() {
@@ -358,136 +357,7 @@ async fn a_tag_is_refused_before_anything_runs() {
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("digest")),
         "{outcome:?}"
     );
-    assert!(
-        fake.calls().is_empty(),
-        "podman was called: {:?}",
-        fake.calls()
-    );
-    fake.assert_clean(1);
-}
-
-/// Catches an image index digest being run (the store holds the image, pulled through
-/// the index): one action digest would mean a different image on each architecture.
-#[tokio::test]
-async fn an_index_digest_is_refused() {
-    let fake = Fake::new("index");
-    let index = sha256(INDEX);
-    fake.store_manifest(&index, INDEX);
-    let outcome = fake
-        .run(1, &Spec::new(&image_by(&index), "unused"), &["exit", "0"])
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("image index")),
-        "{outcome:?}"
-    );
-    assert_eq!(fake.calls(), ["image", "info"]);
-    fake.assert_clean(1);
-}
-
-/// Catches the start-up check of a pinned image (`PodmanRuntime::check_pinned`, which
-/// `kbf-daemon --image` runs) passing an image the store does not hold, or refusing it
-/// without naming the image; passing an
-/// index digest (the manifest's kind not asked); refusing an image that is there; and
-/// pulling or running anything while it checks.
-#[tokio::test]
-async fn a_pinned_image_is_checked_as_a_lease_checks_it() {
-    use kbf_driver_container::{ImageCheckError, ImageRef};
-
-    let fake = Fake::new("pinned");
-    let present = ImageRef::parse(&image()).expect("an image by digest");
-    assert_eq!(fake.runtime.check_pinned(&present).await, Ok(()));
-
-    let index = sha256(INDEX);
-    fake.store_manifest(&index, INDEX);
-    let listed = ImageRef::parse(&image_by(&index)).expect("an image by digest");
-    let refused = fake.runtime.check_pinned(&listed).await;
-    assert_eq!(refused, Err(ImageCheckError::Index(listed.clone())));
-    let why = refused.expect_err("an index").to_string();
-    assert!(
-        why.contains("name the per-architecture manifest digest"),
-        "{why}"
-    );
-
-    std::fs::remove_file(fake.state.join("image-id")).expect("rm");
-    let missing = fake.runtime.check_pinned(&present).await;
-    assert_eq!(missing, Err(ImageCheckError::Missing(present.clone())));
-    let why = missing.expect_err("missing").to_string();
-    let name = format!("registry.test/tools/busybox@{}", sha256(MANIFEST));
-    assert_eq!(
-        why,
-        format!("image {name} is not in this node's image store")
-    );
-    assert_eq!(fake.calls(), ["image", "info", "image", "image"]);
-}
-
-/// Catches a missing image being pulled or run anyway (nodes never pull at action
-/// time; a node without the image is the farm's failure, not the client's), and an
-/// image store that cannot vouch for the manifest being trusted.
-#[tokio::test]
-async fn an_image_the_store_cannot_vouch_for_is_an_infrastructure_failure() {
-    let fake = Fake::new("no-image");
-    let spec = Spec::new(&image(), "unused");
-    // (what the failure says, how to break the store, how to mend it)
-    type Case<'a> = (&'a str, &'a dyn Fn(), &'a dyn Fn());
-    let cases: [Case; 4] = [
-        (
-            "not in this node's image store",
-            &|| std::fs::remove_file(fake.state.join("image-id")).expect("rm"),
-            &|| fake.knob("image-id", "img1\n"),
-        ),
-        ("info refused", &|| fake.knob("info-fails", ""), &|| {
-            std::fs::remove_file(fake.state.join("info-fails")).expect("rm")
-        }),
-        (
-            "holds no manifest",
-            &|| fake.knob("image-id", "img2\n"),
-            &|| fake.knob("image-id", "img1\n"),
-        ),
-        (
-            "hashes to",
-            &|| fake.store_manifest(&sha256(MANIFEST), INDEX),
-            &|| fake.store_manifest(&sha256(MANIFEST), MANIFEST),
-        ),
-    ];
-    for (seq, (want, break_it, mend_it)) in cases.iter().enumerate() {
-        let seq = seq as u64 + 1;
-        break_it();
-        let outcome = fake.run(seq, &spec, &["exit", "0"]).await;
-        assert!(
-            matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains(want)),
-            "{want}: {outcome:?}"
-        );
-        fake.assert_clean(seq);
-        mend_it();
-    }
-    let result = fake.run(9, &spec, &["exit", "0"]).await.expect("mended");
-    assert_eq!(result.exit_code, 0);
-}
-
-/// Catches a timeout that is not enforced, or that leaves the container behind; and
-/// (issue #45) a timeout that loses what the action wrote to stdout and stderr before
-/// it was stopped, or swaps the two.
-#[tokio::test]
-async fn a_timeout_stops_the_action_and_cleans_up() {
-    let fake = Fake::new("timeout");
-    let mut spec = Spec::new(&image(), "unused");
-    // Room for the two echoes to land before the timeout on a loaded runner.
-    spec.timeout = Some(Duration::from_secs(1));
-    let outcome = fake
-        .run(
-            1,
-            &spec,
-            &[
-                "echo", "started", ";", "echo", "--stderr", "warming", ";", "sleep", "30",
-            ],
-        )
-        .await;
-    let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
-        panic!("{outcome:?}");
-    };
-    assert_eq!(blob(&fake.cas, stdout.as_ref()), b"started\n");
-    assert_eq!(blob(&fake.cas, stderr.as_ref()), b"warming\n");
-    assert!(fake.calls().contains(&"kill".to_owned()));
+    assert!(fake.calls().is_empty(), "crun was run: {:?}", fake.calls());
     fake.assert_clean(1);
 }
 
@@ -535,30 +405,11 @@ async fn a_timed_out_log_past_its_limit_is_left_out() {
     }
 }
 
-/// Catches `kill` returning before the work has stopped and the lease is clean, and a
-/// killed lease reported as anything but Killed.
-#[tokio::test]
-async fn kill_stops_the_action_and_returns_once_clean() {
-    let fake = Fake::new("kill");
-    let spec = Spec::new(&image(), "unused");
-    fake.action(&["sleep", "30"]);
-    let action = store_action(&fake.cas, &spec);
-    let runtime = Arc::clone(&fake.runtime);
-    let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
-    fake.wait_for_start().await;
-    fake.runtime.kill(kbf_types::LeaseId::new(1, 1)).await;
-    fake.assert_clean(1);
-    let outcome = run.await.expect("join");
-    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
-    // Killing a lease that is not running does nothing and returns.
-    fake.runtime.kill(kbf_types::LeaseId::new(1, 1)).await;
-}
-
 /// Catches the fake running an action through a shell, or through any program but
-/// the act program it is given (`kbf-act` beside `podman`, a link to this test
-/// binary). The process `start` runs, whose pid the fake publishes, must execute this
+/// the act program it is given (`kbf-act` beside `crun`, a link to this test
+/// binary). The process the run starts, whose pid the fake publishes, must execute this
 /// binary: a shell that forks the act program shows its own executable there. Its
-/// environment must be `start`'s own plus the four the fake sets: a shell that
+/// environment must be the fake `crun`'s own plus the four the fake sets: a shell that
 /// `exec`s the act program in its place (as `bash -c` does with a single command)
 /// leaves the same executable, but adds what it exports, such as bash's `_`. (Seen:
 /// with the fake starting `bash -c '"$0" "$@"' kbf-act ...`, the executable check
@@ -595,7 +446,7 @@ async fn the_action_is_the_act_program_and_no_shell() {
     assert_eq!(
         environment(&pid),
         environment(&start),
-        "something between `podman start` and the action changed its environment"
+        "something between `crun run` and the action changed its environment"
     );
     let result = run.await.expect("join").expect("ran");
     assert_eq!(result.exit_code, 0);
@@ -604,14 +455,14 @@ async fn the_action_is_the_act_program_and_no_shell() {
 
 /// Catches the kill path skipping `cgroup.kill` after the SIGTERM grace period: an
 /// action that ignores SIGTERM must die from the lease cgroup's `cgroup.kill`, and
-/// `podman start` must then end on its own within the second grace period. Without
-/// that step `podman start` is killed after the second grace period (so it never
-/// records its end) and only the clean step's `cgroup.kill` ends the action.
+/// `crun run` must then end on its own within the second grace period. Without that
+/// step the run is aborted after the second grace period (so it never records its end)
+/// and only the clean step's `cgroup.kill` ends the action.
 #[tokio::test]
 async fn sigterm_ignored_falls_back_to_cgroup_kill() {
     // Slack for a loaded machine, without changing what is checked. The fake notices
     // cgroup.kill by polling, and the default 300 ms grace can pass before it looks;
-    // a skipped cgroup.kill still shows, since `start` then ends only by the kill
+    // a skipped cgroup.kill still shows, since the run then ends only by the abort
     // after the second grace. The timeout gives the action time to ignore SIGTERM: a
     // SIGTERM before that ends it in the first grace, with no cgroup.kill.
     let fake = Fake::with("cgroup-kill", |c| c.kill_grace = Duration::from_secs(3));
@@ -624,44 +475,42 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
         matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
-    // The overlay's owners are `tests/userns.rs`'s to check.
+    // The overlay's owners are `userns.rs`'s to check.
     let events: Vec<_> = fake
         .events()
         .into_iter()
-        .filter(|e| !e.starts_with("chown "))
+        .filter(|e| !e.starts_with("chown"))
         .collect();
-    let expected = ["cgroup.kill ended the action", "start ended", "rm"];
+    let expected = ["cgroup.kill ended the action", "run ended", "delete"];
     assert_eq!(events, expected, "{events:?}");
     fake.assert_clean(1);
 }
 
-/// Catches a cancelled run (the daemon dropped its task) leaving its container, cgroup
-/// or scratch directory behind, or cleaning while `podman start` may still run (kbf
-/// #157: a clean that only sent it SIGKILL left it a zombie at `podman rm`).
+/// Catches a dropped run whose clean does not kill the lease cgroup before `crun delete`
+/// (a run dropped mid-start leaves `crun create` in the lease, and `delete --force` does
+/// not wait for it), and a dropped run whose clean fails leaving what it could remove:
+/// the scratch directory is gone, the action ended, and `crun run` was reaped before the
+/// delete.
 #[tokio::test]
-async fn a_dropped_run_still_cleans_up() {
-    let fake = Fake::new("dropped");
+async fn a_dropped_run_kills_the_cgroup_before_the_delete_and_survives_a_failed_one() {
+    let fake = Fake::new("dropped-delete");
     let spec = Spec::new(&image(), "unused");
     fake.action(&["sleep", "30"]);
     let action = store_action(&fake.cas, &spec);
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
     fake.wait_for_start().await;
-    // Positive control: what `assert_clean` must find gone is there to find.
-    fake.assert_action_running(1);
     run.abort();
     assert!(run.await.expect_err("cancelled").is_cancelled());
     fake.assert_clean(1);
-    assert!(fake.calls().contains(&"rm".to_owned()));
-    // On real Podman a run dropped mid-start leaves `crun create` in the lease, and
-    // `podman rm --force` does not wait for it; the clean kills the cgroup first.
+    assert!(fake.calls().contains(&"delete".to_owned()));
     assert!(
-        fake.state.join("killed-before-rm").exists(),
-        "podman rm ran before cgroup.kill"
+        fake.state.join("killed-before-delete").exists(),
+        "crun delete ran before cgroup.kill"
     );
 
     // A dropped run whose clean fails still removes what it can (and logs the rest).
-    fake.knob("rm-fails", "");
+    fake.knob("delete-fails", "");
     let action = store_action(&fake.cas, &spec);
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(2, action, Resources::default())).await });
@@ -671,17 +520,19 @@ async fn a_dropped_run_still_cleans_up() {
     run.abort();
     assert!(run.await.expect_err("cancelled").is_cancelled());
     assert!(!exists(&fake.lease_dir(2)), "scratch left");
-    fake.assert_start_reaped_before_rm();
-    // The clean's cgroup.kill ended the action although `podman rm` then failed.
+    assert!(
+        !fake.state.join("run-not-reaped-at-delete").exists(),
+        "crun delete ran before crun run was reaped"
+    );
+    // The clean's cgroup.kill ended the action although `crun delete` then failed.
     fake.assert_action_gone(2);
 }
 
-/// Catches (issue #157) a dropped run whose clean removes the lease while the `podman
-/// start` it ran may still be there: the start would write into the removed
-/// directories after the clean, as the flake did. `a_dropped_run_still_cleans_up`'s
-/// first half, 200 times over with the CPUs busy (`support::CpuHog`), so a timing one
-/// run passes by luck shows up. The mutant skips `reap` in the lease's clean: `rm`
-/// then finds `start` still there.
+/// Catches (issue #157) a dropped run whose clean removes the lease while the `crun run`
+/// it started may still be there: the run would write into the removed directories
+/// after the clean, as the flake did. `conformance`'s dropped run, 200 times over with
+/// the CPUs busy (`support::CpuHog`), so a timing one run passes by luck shows up. The
+/// mutant skips `reap` in the lease's clean: `delete` then finds the run still there.
 #[tokio::test]
 async fn no_round_of_a_dropped_run_races_the_clean() {
     let _hog = support::CpuHog::start();
@@ -697,50 +548,6 @@ async fn no_round_of_a_dropped_run_races_the_clean() {
         assert!(run.await.expect_err("cancelled").is_cancelled());
         fake.assert_clean(1);
     }
-}
-
-/// Catches Podman's own failures being reported as the action's result.
-#[tokio::test]
-async fn podman_failures_are_infrastructure_failures() {
-    let fake = Fake::new("podman-fails");
-    let spec = Spec::new(&image(), "unused");
-    fake.knob("create-fails", "");
-    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("create refused")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(1);
-    assert!(
-        fake.calls().contains(&"rm".to_owned()),
-        "a half-made container is removed"
-    );
-
-    std::fs::remove_file(fake.state.join("create-fails")).expect("rm knob");
-    fake.knob("status-override", "created 0\n");
-    let outcome = fake.run(2, &spec, &["exit", "0"]).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("did not run")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(2);
-
-    fake.knob("status-override", "exited many\n");
-    let outcome = fake.run(3, &spec, &["exit", "0"]).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("exit code")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(3);
-
-    std::fs::remove_file(fake.state.join("status-override")).expect("rm knob");
-    fake.knob("inspect-fails", "");
-    let outcome = fake.run(4, &spec, &["exit", "0"]).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("inspect refused")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(4);
 }
 
 /// Catches the driver's own file steps failing silently or as the action's result: an
@@ -786,134 +593,19 @@ async fn the_drivers_own_file_failures_are_infrastructure_failures() {
 #[tokio::test]
 async fn a_failed_run_with_a_failed_clean_reports_the_run() {
     let fake = Fake::new("both-fail");
-    fake.knob("create-fails", "");
-    fake.knob("rm-fails", "");
+    fake.runtime_breaks();
+    fake.knob("delete-fails", "");
     let outcome = fake
         .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
         .await;
     assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("create refused")),
+        matches!(outcome, Err(RuntimeError::Failed(ref why))
+            if why.contains("cannot create the container") && !why.contains("delete refused")),
         "{outcome:?}"
     );
 }
 
-/// Catches a missing Podman program being reported as anything but the farm's
-/// failure.
-#[tokio::test]
-async fn a_missing_podman_is_an_infrastructure_failure() {
-    let fake = Fake::new("no-podman");
-    std::fs::remove_file(fake.dir.join("podman")).expect("unlink podman");
-    let outcome = fake
-        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("run ")),
-        "{outcome:?}"
-    );
-    fake.assert_clean(1);
-}
-
-/// Catches the kill path giving up early: when SIGTERM cannot be sent and the
-/// container survives `cgroup.kill`, the driver still stops `podman start` and
-/// removes the container by force. Also catches a fake that ignores `kill-fails`:
-/// then SIGTERM ends the action, `podman start` ends by itself (`start ended`), and
-/// the test no longer tests what its name says.
-#[tokio::test]
-async fn the_kill_path_ends_even_when_every_signal_fails() {
-    let fake = Fake::new("stubborn");
-    fake.knob("kill-fails", "");
-    let mut spec = Spec::new(&image(), "unused");
-    spec.timeout = Some(Duration::from_millis(200));
-    // With its lease cgroup gone, cgroup.kill cannot be written either.
-    let outcome = fake
-        .run(1, &spec, &["remove", "$CG", ";", "sleep", "30"])
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
-        "{outcome:?}"
-    );
-    let events = fake.events();
-    assert!(
-        !events.contains(&"start ended".to_owned()),
-        "the action ended before the driver killed podman start: {events:?}"
-    );
-    fake.assert_clean(1);
-}
-
-/// Catches a failed clean step being ignored: a dirty node must fail the lease.
-#[tokio::test]
-async fn a_failed_clean_fails_the_lease() {
-    let fake = Fake::new("rm-fails");
-    fake.knob("rm-fails", "");
-    let outcome = fake
-        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("clean:")),
-        "{outcome:?}"
-    );
-}
-
-/// Catches scratch the daemon's user cannot delete (no permissions left, or another
-/// container user's files) being left behind: removal falls back to `podman unshare`.
-#[tokio::test]
-async fn unremovable_scratch_falls_back_to_podman_unshare() {
-    let fake = Fake::new("unshare");
-    let spec = Spec::new(&image(), "unused");
-    let locked = [
-        "mkdir",
-        "$UPPER/locked",
-        ";",
-        "write-lines",
-        "$UPPER/locked/f",
-        ";",
-        "chmod",
-        "000",
-        "$UPPER/locked",
-    ];
-    let result = fake.run(1, &spec, &locked).await.expect("ran");
-    assert_eq!(result.exit_code, 0);
-    assert!(fake.calls().contains(&"unshare rm".to_owned()));
-    fake.assert_clean(1);
-
-    // A directory the daemon's user can list but not write: its entries cannot be
-    // unlinked, so this falls back too.
-    let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare rm").count();
-    let before = unshares(&fake);
-    let readonly = [
-        "mkdir",
-        "$UPPER/ro",
-        ";",
-        "write-lines",
-        "$UPPER/ro/f",
-        ";",
-        "chmod",
-        "500",
-        "$UPPER/ro",
-    ];
-    let result = fake.run(4, &spec, &readonly).await.expect("ran");
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(unshares(&fake), before + 1);
-    fake.assert_clean(4);
-
-    // verify-clean: a removal that claims success but leaves the directory is caught.
-    fake.knob("unshare-noop", "");
-    let outcome = fake.run(2, &spec, &locked).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("still exists")),
-        "{outcome:?}"
-    );
-
-    std::fs::remove_file(fake.state.join("unshare-noop")).expect("rm knob");
-    fake.knob("unshare-fails", "");
-    let outcome = fake.run(3, &spec, &locked).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("unshare refused")),
-        "{outcome:?}"
-    );
-}
-
-/// Catches actions that cannot be run safely reaching Podman: no arguments, an
+/// Catches actions that cannot be run safely reaching `crun`: no arguments, an
 /// output path or working directory that climbs out of the exec root, a negative
 /// timeout. Each is the client's error.
 #[tokio::test]
@@ -936,11 +628,7 @@ async fn invalid_actions_are_refused_before_anything_runs() {
         );
         fake.assert_clean(seq as u64 + 1);
     }
-    assert!(
-        fake.calls().is_empty(),
-        "podman was called: {:?}",
-        fake.calls()
-    );
+    assert!(fake.calls().is_empty(), "crun was run: {:?}", fake.calls());
 }
 
 /// Catches the driver advertising itself under another name, or taking leases of a
@@ -985,13 +673,13 @@ async fn incomplete_actions_are_refused() {
     for seq in 1..=2 {
         fake.assert_clean(seq);
     }
-    assert!(!fake.calls().contains(&"create".to_owned()));
+    assert_eq!(fake.starts(), 0);
 }
 
-/// Catches the action's environment not reaching Podman, and an output path that is
+/// Catches the action's environment not reaching the bundle, and an output path that is
 /// neither file, directory nor symlink being reported as an output.
 #[tokio::test]
-async fn the_environment_reaches_podman_and_odd_outputs_are_left_out() {
+async fn the_environment_reaches_the_bundle_and_odd_outputs_are_left_out() {
     let fake = Fake::new("env");
     let mut spec = Spec::new(&image(), "unused");
     spec.env = vec![("FOO".to_owned(), "a b=c".to_owned())];
@@ -1000,44 +688,14 @@ async fn the_environment_reaches_podman_and_odd_outputs_are_left_out() {
         .run(1, &spec, &["mkfifo", "$UPPER/pipe"])
         .await
         .expect("ran");
-    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
-    assert!(args.lines().any(|a| a == "--env=FOO=a b=c"), "{args}");
+    let env = fake.config_json()["process"]["env"].clone();
+    assert!(
+        env.as_array()
+            .is_some_and(|env| env.iter().any(|e| e == "FOO=a b=c")),
+        "{env}"
+    );
     assert!(result.output_files.is_empty() && result.output_directories.is_empty());
     assert!(result.output_symlinks.is_empty());
-    fake.assert_clean(1);
-}
-
-/// Catches the configured container limits not reaching `podman create` (a flag left
-/// to Podman's defaults or the node's `containers.conf`), and the environment or the
-/// user left to the image: the lease's create carries `--unsetenv-all`, `--user=0:0`
-/// and each limit from the driver's configuration.
-#[tokio::test]
-async fn the_configured_limits_reach_podman_create() {
-    let fake = Fake::with("limits", |config| {
-        config.limits = kbf_driver_container::ContainerLimits {
-            pids: 71,
-            shm_mib: 72,
-            nofile: 73,
-            nproc: 74,
-        };
-    });
-    let mut spec = Spec::new(&image(), "unused");
-    spec.env = vec![("A".to_owned(), "1".to_owned())];
-    fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
-    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
-    let args: Vec<&str> = args.lines().collect();
-    for expected in [
-        "--unsetenv-all",
-        "--user=0:0",
-        "--pids-limit=71",
-        "--shm-size=72m",
-        "--ulimit=nofile=73:73",
-        "--ulimit=nproc=74:74",
-    ] {
-        assert!(args.contains(&expected), "{expected} missing: {args:?}");
-    }
-    let env: Vec<_> = args.iter().filter(|a| a.starts_with("--env")).collect();
-    assert_eq!(env, [&"--env=A=1"], "{args:?}");
     fake.assert_clean(1);
 }
 
@@ -1055,30 +713,15 @@ async fn a_node_that_cannot_prepare_fails_the_lease() {
     );
     fake.assert_clean(1);
 
+    // A file where the lease's scratch directory goes.
     std::fs::create_dir(fake.cgroup.join("actions")).expect("mkdir actions");
-    std::fs::remove_dir(&fake.scratch).expect("rm scratch");
+    std::fs::write(fake.lease_dir(2), b"in the way").expect("a file in the way");
     let outcome = fake.run(2, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(_))),
         "{outcome:?}"
     );
-    assert!(!fake.calls().contains(&"create".to_owned()));
-}
-
-/// Catches a Podman that disappears mid-lease (a package upgrade) being reported as
-/// anything but the farm's failure, or stopping the scratch directory's removal.
-#[tokio::test]
-async fn a_podman_gone_after_create_fails_the_lease() {
-    let fake = Fake::new("vanish");
-    fake.knob("vanish-after-create", "");
-    let outcome = fake
-        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("run ")),
-        "{outcome:?}"
-    );
-    assert!(!exists(&fake.lease_dir(1)), "scratch left");
+    assert_eq!(fake.starts(), 0);
 }
 
 /// Catches an output whose parent the action replaced with a file failing the lease
@@ -1312,7 +955,7 @@ async fn an_output_below_an_input_symlink_named_as_an_output_is_refused() {
     let scratch = fake.lease_dir(1);
     let scratch = scratch.parent().expect("the scratch directory");
     assert!(!exists(&scratch.join("escaped")));
-    assert!(!fake.calls().contains(&"create".to_owned()));
+    assert_eq!(fake.starts(), 0);
 }
 
 /// Catches a working directory hidden by an input symlink being run: the directory the
@@ -1334,7 +977,7 @@ async fn a_hidden_working_directory_is_refused_before_anything_runs() {
         "{outcome:?}"
     );
     fake.assert_clean(1);
-    assert!(!fake.calls().contains(&"create".to_owned()));
+    assert_eq!(fake.starts(), 0);
     spec.symlinks = Vec::new();
 
     // An output beside the inputs, under an input directory, still runs.
@@ -1351,25 +994,26 @@ async fn a_hidden_working_directory_is_refused_before_anything_runs() {
 
 /// Catches a kill that waits for a slow prepare step (an input fetch, an image store
 /// query) to finish before it stops the lease: the fence of a node that lost contact
-/// would wait as long. Here `podman image inspect` hangs for 30 s; the kill must
-/// return, with the lease Killed and clean, well before that.
+/// would wait as long. Here the helper container that gives the lease's directories to
+/// the container hangs for 30 s; the kill must return, with the lease Killed and clean,
+/// well before that.
 #[tokio::test]
 async fn a_kill_during_prepare_stops_it_at_once() {
     let fake = Fake::new("kill-prepare");
-    fake.knob("image-hangs", "");
+    fake.knob("give-hangs", "");
     let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
     for _ in 0..500 {
-        if fake.calls().contains(&"image".to_owned()) {
+        if fake.calls().contains(&"helper give".to_owned()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(
         fake.calls(),
-        ["image"],
-        "prepare never reached the image check"
+        ["helper give"],
+        "prepare never reached the hand-over"
     );
     let kill = fake.runtime.kill(kbf_types::LeaseId::new(1, 1));
     tokio::time::timeout(Duration::from_secs(10), kill)
@@ -1396,7 +1040,7 @@ async fn a_deep_junk_tree_is_cleaned_without_taking_the_daemon_down() {
     let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     assert!(!exists(&tree), "the junk tree never reached the lease");
-    assert!(!fake.calls().contains(&"unshare rm".to_owned()));
+    assert!(!fake.calls().contains(&"helper rm".to_owned()));
     fake.assert_clean(1);
     let result = fake
         .run(2, &spec, &["exit", "0"])

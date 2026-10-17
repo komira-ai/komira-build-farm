@@ -88,8 +88,8 @@ impl TreeConfig {
 }
 
 /// A host directory a driver mounts read-only into the action's input root. The
-/// driver's other half of this interface: the OCI runtime backend and the podman
-/// driver both take these from [`Inputs::mounts`].
+/// driver's other half of this interface: the container driver takes these from
+/// [`Inputs::mounts`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedMount {
     /// Where it appears, from the input root: `/`-separated, no leading slash, never

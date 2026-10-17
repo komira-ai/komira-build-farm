@@ -1,23 +1,18 @@
 //! The node's cold-store key does not reach an action through the runtime's
-//! environment, against the stand-in `podman` and `crun` (`support/fake.rs`,
-//! `support/fake_oci.rs`). Each stand-in runs the action with its own environment, as a
-//! runtime that copies the host's into a container would, so what the action sees is
-//! what the driver started the runtime with. The stand-in `podman` hands on what it
-//! was run with at `create` too (its `env-host` knob), as Podman's `env_host` copies
-//! the host's environment when the container is created. Real `crun` hands on only the
-//! config's `process.env`, which the stand-in records and this test reads. No Podman
-//! runs for the OCI backend at all, which the failing `podman` stub beside its `crun`
-//! records.
+//! environment, against the stand-in `crun` (`support/fake.rs`). The stand-in runs the
+//! action with its own environment, as a runtime that copies the host's into a
+//! container would, so what the action sees is what the driver started the runtime
+//! with. Real `crun` hands on only the config's `process.env`, which the stand-in
+//! records and this test reads.
 //!
 //! One test in this binary: it sets variables of its own process, which is sound only
-//! while no other thread reads the environment. `tests/podman_credential.rs` checks
-//! the same on real rootless Podman, with the key file besides.
+//! while no other thread reads the environment. `tests/crun_credential.rs` checks the
+//! same on real rootless `crun`, with the key file besides.
 
 mod support;
 
 use support::Spec;
 use support::fake::{Fake, image};
-use support::fake_oci::FakeOci;
 
 /// The key's two variables, as the unit's `EnvironmentFile=` sets them.
 const KEY: [(&str, &str); 2] = [
@@ -41,26 +36,14 @@ fn print_env() -> Vec<String> {
     steps
 }
 
-/// The variables of `record` (the stand-in `podman`'s `create-env`: `NAME=value`, each
-/// followed by a NUL).
-fn recorded(record: &std::path::Path) -> Vec<String> {
-    let bytes = std::fs::read(record).expect("create-env");
-    String::from_utf8_lossy(&bytes)
-        .split('\0')
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Catches Podman or `crun` started with the key in its environment (the "drop
+/// Catches `crun` started with the key in its environment (the "drop
 /// `without_credentials`" mutant at each start site the lease goes through): the
-/// stand-in hands it to the action, which prints it. That includes `podman create`
-/// (the "scrub only in `start`" mutant), whose environment the stand-in hands on
-/// under `env-host` as real Podman does; the OCI config's `process.env` (the "add this
-/// process's `AWS_*` to it" mutant in `oci::spec::action_config`), what real `crun`
-/// gives the action. [`NODE_VARIABLE`] is the control: it reaches the action and each record,
-/// so an `unset` for the key is the driver's doing, not a stand-in that hands nothing
-/// on, and `HOME=/root` in `process.env` shows the config's variables were read.
+/// stand-in hands it to the action, which prints it. That includes the OCI config's
+/// `process.env` (the "add this process's `AWS_*` to it" mutant in
+/// `oci::spec::action_config`), what real `crun` gives the action. [`NODE_VARIABLE`] is
+/// the control: it reaches the action, so an `unset` for the key is the driver's doing,
+/// not a stand-in that hands nothing on, and `HOME=/root` in `process.env` shows the
+/// config's variables were read.
 #[test]
 fn the_runtime_is_started_without_the_cold_store_key() {
     // SAFETY: the only test of this binary, and the first thing it does: no other
@@ -78,28 +61,12 @@ fn the_runtime_is_started_without_the_cold_store_key() {
     runtime.block_on(async {
         let spec = Spec::new(&image(), "unused");
 
-        let node = format!("{}={}", NODE_VARIABLE.0, NODE_VARIABLE.1);
-        let no_key = |env: &[String], what: &str| {
-            assert!(env.contains(&node), "{what}: no {node} in {env:?}");
-            let keys: Vec<_> = env.iter().filter(|v| v.starts_with("AWS_")).collect();
-            assert!(keys.is_empty(), "{what}: {keys:?}");
-        };
-
         let fake = Fake::new("credential-env");
-        fake.knob("env-host", "");
         let result = fake.run(1, &spec, &print_env()).await.expect("ran");
         let stdout = support::blob(&fake.cas, result.stdout_digest.as_ref());
-        assert_eq!(String::from_utf8_lossy(&stdout), want, "podman");
-        assert_eq!(result.exit_code, 0);
-        no_key(&recorded(&fake.state.join("create-env")), "podman create");
-        fake.assert_clean(1);
-
-        let oci = FakeOci::new("credential-env");
-        let result = oci.run(1, &spec, &print_env()).await.expect("ran");
-        let stdout = support::blob(&oci.cas, result.stdout_digest.as_ref());
         assert_eq!(String::from_utf8_lossy(&stdout), want, "crun");
         assert_eq!(result.exit_code, 0);
-        let process_env: Vec<String> = oci.config_json()["process"]["env"]
+        let process_env: Vec<String> = fake.config_json()["process"]["env"]
             .as_array()
             .expect("process.env")
             .iter()
@@ -114,7 +81,6 @@ fn the_runtime_is_started_without_the_cold_store_key() {
             .filter(|v| v.starts_with("AWS_"))
             .collect();
         assert!(keys.is_empty(), "process.env: {keys:?}");
-        assert_eq!(oci.podman_calls(), Vec::<String>::new());
-        oci.assert_clean(1);
+        fake.assert_clean(1);
     });
 }

@@ -396,7 +396,7 @@ async fn a_second_lease_of_a_toolchain_tree_fetches_nothing() {
     stop(cache, &gates);
 }
 
-/// C-18 (the link half; `kbf-driver-container`'s Podman test runs `stat` and `tar` in a
+/// C-18 (the link half; `kbf-driver-container`'s real-`crun` test runs `stat` and `tar` in a
 /// container). Catches a fallback per name instead of per key per lease: two files of
 /// one blob are one inode on a run that links, and on a run where linking the second
 /// name fails with `EMLINK`, with the same mode, mtime and bytes both times.

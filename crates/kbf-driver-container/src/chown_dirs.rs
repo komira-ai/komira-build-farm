@@ -1,14 +1,13 @@
 //! The `__chown-dirs` mode of the `kbf-daemon` binary: gives a lease's input root's
-//! directories, and only its directories, to an owner, run inside Podman's user
-//! namespace (`podman unshare <kbf-daemon> __chown-dirs <uid>:<gid> <dir>`) or, for the
-//! OCI backend, inside a helper container, which also gives whole directory trees in
+//! directories, and only its directories, to an owner, run inside a helper container
+//! (`oci::helper`), which also gives whole directory trees in
 //! the same process (`__chown-dirs <uid>:<gid> <dir>|- --whole <dir>...`: `-` for no
 //! directories-only tree; every entry below each `--whole` directory, symlinks
 //! themselves and never what they point to, by descriptor too).
 //!
 //! With the input cache, a lease's input files are hard links to the cache's entries
-//! (`docs/design/worker-cache.md#51-container-driver-linux-rootless-podman-hard-links-into-the-overlay-lower`).
-//! `podman unshare chown -hR` over the input root would re-own every cached inode, so
+//! (`docs/design/worker-cache.md#51-container-driver-linux-rootless-crun-hard-links-into-the-overlay-lower`).
+//! A recursive `chown -h` over the input root would re-own every cached inode, so
 //! that an action could write it. `chown` has no type filter, so the driver runs this
 //! instead: a walk by descriptor, in the style of `remove`, that opens each directory
 //! relative to its parent with `O_NOFOLLOW`, changes its owner, and leaves every other
@@ -45,7 +44,7 @@ pub fn dispatch() -> Option<u8> {
 }
 
 /// Makes a test binary answer in the `__chown-dirs` mode when run with it, before its
-/// test harness starts: for the driver's tests that run real Podman, whose helper is
+/// test harness starts: for the driver's tests that run real `crun`, whose helper is
 /// the test binary itself.
 #[macro_export]
 macro_rules! chown_dirs_test_hook {

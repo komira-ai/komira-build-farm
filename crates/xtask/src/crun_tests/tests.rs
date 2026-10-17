@@ -122,7 +122,7 @@ fn common(name: &str) -> Vec<String> {
         "--wait",
         "--collect",
         "--pipe",
-        &format!("--unit=kbf-podman-tests-{name}"),
+        &format!("--unit=kbf-crun-tests-{name}"),
         "--slice=kbf-daemon.slice",
         "-p",
         "Delegate=yes",
@@ -179,12 +179,12 @@ fn nocapture_goes_to_the_timing_targets_only_and_every_target_runs_in_order() {
     assert_eq!(
         names,
         [
-            "podman",
-            "podman_memory",
-            "podman_killed",
-            "podman_cache",
-            "podman_env",
-            "podman_credential",
+            "crun",
+            "crun_memory",
+            "crun_killed",
+            "crun_cache",
+            "crun_env",
+            "crun_credential",
             "oci_crun"
         ]
     );
@@ -201,7 +201,7 @@ fn nocapture_goes_to_the_timing_targets_only_and_every_target_runs_in_order() {
     };
     assert_eq!(with("CONTAINERS_CONF"), Vec::<&str>::new());
     assert_eq!(with("XDG_RUNTIME_DIR="), Vec::<&str>::new());
-    assert_eq!(with("--nocapture"), ["podman_cache", "oci_crun"]);
+    assert_eq!(with("--nocapture"), ["crun_cache", "oci_crun"]);
     assert_eq!(with("Delegate=yes"), names);
 }
 

@@ -246,7 +246,6 @@ CPUWeight=200
 Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
-    --container-runtime=oci \
     --oci-runtime=/usr/bin/crun \
     --server=https://<storage host name>:8981 \
     --cas=https://<storage host name>:8981 \

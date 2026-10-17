@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use xtask::podman_tests::host_report;
+use xtask::crun_tests::host_report;
 
 use crate::cell::{
     CellError, LEASE_WAIT, OrBroken as _, POLL, Process, absolute, copy_tree, ensure,

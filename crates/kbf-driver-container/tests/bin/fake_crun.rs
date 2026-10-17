@@ -16,8 +16,13 @@
 //! - `delete --force <id>`: kills the last action and removes the container's state.
 //!
 //! Knobs (files in `crun-state/` the test writes):
-//! - `action`: the act steps the action runs, one argument per line, as in
-//!   `kbf-fake-podman` (`$ROOT`, `$UPPER`, `$CG` expanded; `kbf-act` beside the link).
+//! - `action`: the arguments, each followed by a newline, of what the run executes:
+//!   `kbf-act` beside the `crun` link (kbf-testkit's act steps, through a link the test
+//!   makes), with `ROOT`, `UPPER` and `CG` in its environment, in a session and process
+//!   group of its own and stdin from `/dev/null`; `cgroup.kill` and `delete` kill the
+//!   whole group. An argument that starts with `$ROOT`, `$UPPER` or `$CG`, followed by
+//!   nothing or `/`, has that name replaced by its path. No shell runs: the action is
+//!   the act program itself.
 //! - `nonce`: this Fake's marker; the action inherits `FAKE_LEASE=<nonce><cgroup>`.
 //! - `crun-error`: the run fails before the action starts, with this text as an error
 //!   record in the `--log` file and `crun-error-code` (default 1) as its status.
@@ -27,6 +32,8 @@
 //! - `delete-vanished`: `delete` finds the container's state already gone and fails, as crun does
 //!   when the `crun run` of a killed container removed it first.
 //! - `chown-fails`: a helper giving to the owner this knob holds (`1:1` or `0:0`) fails.
+//! - `chown-sleeps`: a helper giving to the owner this knob holds sleeps 200 ms first (a
+//!   slow hand-over).
 //! - `rm-noop`, `rm-fails`: a removing helper does nothing / fails.
 //! - `unpack-fails`: the unpacking helper (`__unpack-layers`) fails before it unpacks.
 //! - `vanish-after-give`, `unexec-after-give`: the first helper that gives directories
@@ -34,12 +41,22 @@
 //!   private copy, not the shared program).
 //! - `leave-state`: the run leaves its state under `--root`, as a killed `crun` does.
 //! - `exit-override`: the run exits with this status whatever the action did.
+//! - `error-after-run`: after the action ended, the run logs this text as an error record
+//!   and exits 1: a `crun` that reports a failure once the container is gone.
+//! - `give-hangs`: the helper that gives directories sleeps 30 seconds first (a slow
+//!   prepare step).
+//! - `block-log`: the helper that gives the directories to the container (`1:1`) makes a
+//!   directory where the log file this knob names (`stdout` or `stderr`) goes in the
+//!   lease's directory, so the driver cannot create it.
 //!
 //! Records: `calls` (one verb per line; `helper give`, `helper rm`, `helper unpack`),
 //! `config.json` (the last action's bundle config), `run.args`, `events` (`cgroup.kill
 //! ended the action`, `run ended`, `delete`, `chown <owner> <paths>`, `chown-dirs
 //! <owner> <dir>`), `owner` (the last owner given), `upper`, `root`, `cgroup`, `pid`,
 //! `start-pid`, `run-not-reaped-at-delete`.
+//!
+//! The read-only binds of shared trees below `/kbf/root/` are modelled by making the
+//! empty mount point in the input root a symlink to the tree.
 //!
 //! The fake changes no owner (the test runs as one user), but models what an owner other
 //! than the daemon's means: when a run ends while the overlay is the container's (`1:1`
@@ -63,34 +80,12 @@ fn main() -> ExitCode {
     let link = PathBuf::from(args.next().unwrap_or_default());
     let args: Vec<Vec<u8>> = args.map(OsString::into_vec).collect();
     let here = link.parent().unwrap_or(Path::new(".")).to_owned();
-    if link.file_name() == Some(OsStr::new("podman")) {
-        return ExitCode::from(podman_stub(&here));
-    }
     let fake = Fake {
         state: here.join("crun-state"),
         cgroot: here.join("cgroup"),
         link,
     };
     ExitCode::from(fake.run(&args))
-}
-
-/// Run through a link named `podman`: the stand-in for a Podman that must never run. It
-/// records that it did, in `<dir>/podman-ran`, and fails as a Podman that is not there
-/// would.
-fn podman_stub(dir: &Path) -> u8 {
-    let ran = dir.join("podman-ran");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ran);
-    if let Ok(file) = file.as_mut() {
-        let argv: Vec<_> = std::env::args().skip(1).collect();
-        let _ = writeln!(file, "podman {}", argv.join(" "));
-    }
-    refuse(
-        "fake podman: podman must not run on the OCI backend's path",
-        125,
-    )
 }
 
 struct Fake {
@@ -328,6 +323,7 @@ impl Fake {
                 }
             }
         }
+        self.mount_trees(config);
         // The state `crun run` keeps while the container exists, under `--root`.
         let state_marker = call
             .root
@@ -429,6 +425,13 @@ impl Fake {
                 .unwrap_or(code),
             None => code,
         };
+        let code = match self.read("error-after-run") {
+            Some(text) => {
+                self.log_error(call, String::from_utf8_lossy(&text).trim());
+                1
+            }
+            None => code,
+        };
         // `crun run` deletes the container as it exits (unless a test models a `crun`
         // that was killed: its state stays for `delete --force`).
         if !self.has("leave-state") {
@@ -445,6 +448,29 @@ impl Fake {
             let _ = std::fs::set_permissions(upper, std::fs::Permissions::from_mode(0o000));
         }
         u8::try_from(code & 0xff).unwrap_or(1)
+    }
+
+    /// Stands in for the read-only binds of shared trees below the exec root: the empty
+    /// mount point in the input root becomes a symlink to the tree, so the action reads
+    /// it. (A symlink is writable through; the read-only mount is checked on real
+    /// `crun`.)
+    fn mount_trees(&self, config: &Value) {
+        let root = self.cat("root");
+        for mount in config["mounts"].as_array().into_iter().flatten() {
+            let (Some(inside), Some(source)) = (
+                mount["destination"]
+                    .as_str()
+                    .and_then(|d| d.strip_prefix("/kbf/root/")),
+                mount["source"].as_str(),
+            ) else {
+                continue;
+            };
+            let host = path(&root).join(inside);
+            // Already a symlink when the run is started again (a retried exec).
+            if std::fs::remove_dir(&host).is_ok() {
+                let _ = std::os::unix::fs::symlink(source, &host);
+            }
+        }
     }
 
     /// A helper container: the host directory each `/t/<n>` bind names.
@@ -526,6 +552,9 @@ impl Fake {
     /// `/kbf/daemon __chown-dirs OWNER DIRS|- --whole TREES...`.
     fn helper_give(&self, args: &[String], host: &dyn Fn(&str) -> Vec<u8>) -> u8 {
         self.append("calls", b"helper give");
+        if self.has("give-hangs") {
+            std::thread::sleep(Duration::from_secs(30));
+        }
         // A runtime that goes away (or stops being executable) once it has run a helper.
         if self.has("vanish-after-give") {
             let _ = std::fs::remove_file(&self.link);
@@ -558,8 +587,24 @@ impl Fake {
             ]
             .concat(),
         );
+        if self.has("chown-sleeps") && self.cat("chown-sleeps") == owner.as_bytes() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
         if self.has("chown-fails") && self.cat("chown-fails") == owner.as_bytes() {
             return refuse("fake crun: chown refused", 1);
+        }
+        if owner == "1:1"
+            && let Some(log) = self.read("block-log")
+        {
+            // The lease's directory is the parent of the `upper` directory given.
+            let lease = paths
+                .iter()
+                .map(|p| path(p))
+                .find(|p| p.file_name() == Some(OsStr::new("upper")))
+                .and_then(Path::parent);
+            if let Some(lease) = lease {
+                let _ = std::fs::create_dir(lease.join(OsStr::from_bytes(log.trim_ascii())));
+            }
         }
         self.write_line("owner", owner.as_bytes());
         if owner == "0:0" && self.has("upper-mode") {
@@ -628,6 +673,15 @@ impl Fake {
             add_mode(&dir, 0o200);
             remove_files(&dir);
         }
+        // The cgroup of the container deleted, when no run of it was recorded: a lease
+        // that failed before its run started still has the files the driver wrote.
+        if let Some(id) = call.rest.last() {
+            let dir = self.cgroot.join("actions").join(OsStr::from_bytes(id));
+            if dir.is_dir() {
+                add_mode(&dir, 0o200);
+                remove_files(&dir);
+            }
+        }
         if self.has("delete-vanished") {
             // As crun fails when the `crun run` of a killed container deleted the state
             // between the listing and the open (the cleaning above is the cgroup's).
@@ -650,8 +704,7 @@ impl Fake {
         text.parse().ok().and_then(Pid::from_raw)
     }
 
-    /// SIGKILL to the last action and its process group, returning once it has ended
-    /// (see `kbf-fake-podman`, which this follows).
+    /// SIGKILL to the last action and its process group, returning once it has ended.
     fn kill_action(&self) {
         let Some(pid) = self.pid() else {
             return;

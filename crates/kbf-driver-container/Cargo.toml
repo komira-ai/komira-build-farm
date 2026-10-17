@@ -7,15 +7,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The tests' stand-in `podman` (tests/support/fake.rs links it).
+# The tests' stand-in `crun` (tests/support/fake.rs links it).
 # Not shipped: the release jobs build only kbf-node's and kbf-server's binaries.
-[[bin]]
-name = "kbf-fake-podman"
-path = "tests/bin/fake_podman.rs"
-test = false
-
-# The tests' stand-in `crun` for the OCI backend (tests/support/fake_oci.rs links it).
-# Not shipped either.
 [[bin]]
 name = "kbf-fake-crun"
 path = "tests/bin/fake_crun.rs"
@@ -23,7 +16,6 @@ test = false
 
 [dependencies]
 async-trait.workspace = true
-base64.workspace = true
 clap.workspace = true
 futures.workspace = true
 hex.workspace = true
@@ -46,10 +38,10 @@ tracing.workspace = true
 flate2.workspace = true
 kbf-front.workspace = true
 kbf-objstore.workspace = true
-# The fake podman's actions: kbf-testkit's act steps, run by the test binary itself.
+# The fake crun's actions: kbf-testkit's act steps, run by the test binary itself.
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
-# sched_getaffinity, which the real-Podman capacity test compares with.
+# sched_getaffinity, which the real-crun capacity test compares with.
 rustix = { workspace = true, features = ["thread"] }
 tar.workspace = true
 tokio-rustls.workspace = true

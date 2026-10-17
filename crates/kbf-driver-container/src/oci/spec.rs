@@ -1,8 +1,8 @@
 //! `config.json` for one action's container, built with `oci-spec`'s typed builders.
 //!
-//! The counterpart of `podman::create_args`: each flag Podman is given there has its
-//! line here (the table is in [`action_config`]'s documentation), and what Podman adds
-//! on its own is [`hardening`](super::hardening).
+//! Each isolation setting of an action's container has its line here (the table is in
+//! [`action_config`]'s documentation); the capability set, masked paths and seccomp
+//! filter are [`hardening`](super::hardening).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,20 +18,19 @@ use oci_spec::runtime::{
 use super::hardening::{
     CAPABILITIES, MASKED_PATHS, READONLY_PATHS, SeccompError, held_capabilities, seccomp,
 };
-use crate::podman::{ContainerSpec, EXEC_ROOT};
+use crate::container::{ContainerSpec, EXEC_ROOT};
 use crate::subids::DaemonIds;
 
 /// The OCI version the file declares (what `crun spec` writes).
 const OCI_VERSION: &str = "1.0.0";
 
-/// The hostname of every action's container: Podman's, and so the same on every node.
+/// The hostname of every action's container, the same on every node.
 pub(crate) const HOSTNAME: &str = "localhost";
 
 /// The lease directories an action's container writes to, and the destination of each:
 /// disk-backed (a `tmpfs` would count against the lease's memory), owned by the
 /// container's root, discarded with the lease. The image's root is read-only; these are
-/// the places an action writes besides `/kbf/root` (Podman's container root is writable
-/// everywhere, a difference the PR description states).
+/// the places an action writes besides `/kbf/root`.
 pub(crate) const WRITABLE: [(&str, &str); 4] = [
     ("tmp", "/tmp"),
     ("var-tmp", "/var/tmp"),
@@ -193,9 +192,7 @@ fn rlimit(typ: PosixRlimitType, value: u64) -> PosixRlimit {
     )
 }
 
-/// The namespaces a container gets, each new: the same six Podman gives an action
-/// (`--network=none` leaves the network namespace with loopback only) and a private
-/// cgroup namespace.
+/// The namespaces a container gets, each new (the network namespace has loopback only).
 pub(crate) fn namespaces() -> Vec<LinuxNamespace> {
     use LinuxNamespaceType::{Cgroup, Ipc, Mount, Network, Pid, User, Uts};
     [Pid, Network, Ipc, Uts, User, Cgroup, Mount]
@@ -205,8 +202,8 @@ pub(crate) fn namespaces() -> Vec<LinuxNamespace> {
 }
 
 /// The process environment: the Command's variables, then `HOSTNAME` and `HOME` unless
-/// it sets them, as Podman 4.9 adds them (`podman::create_args`): `HOSTNAME=localhost`
-/// and the home of uid 0, `/root`, which are the same on every node.
+/// it sets them: `HOSTNAME=localhost` and the home of uid 0, `/root`, which are the same
+/// on every node.
 pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = env.iter().map(|(n, v)| format!("{n}={v}")).collect();
     for (name, default) in [("HOSTNAME", HOSTNAME), ("HOME", "/root")] {
@@ -219,19 +216,19 @@ pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
 
 /// The `config.json` of the container for `spec`.
 ///
-/// | Podman (`podman::create_args`)           | here                                              |
+/// | Isolation                                | `config.json`                                     |
 /// |------------------------------------------|---------------------------------------------------|
-/// | `--network=none`                         | a new network namespace, nothing configured (crun brings `lo` up) |
-/// | `--userns=nomap`, `--user=0:0`           | `uidMappings`/`gidMappings` container `0..65536` to the daemon user's first subordinate range; `process.user` 0:0 |
-/// | `--unsetenv-all`, `--env`                | `process.env` is the Command's variables only      |
-/// | `--entrypoint`, `--workdir`              | `process.args`, `process.cwd`                      |
-/// | `--cgroup-parent`, `memory.oom.group=1`  | `cgroupsPath` a child of the lease cgroup, `unified` `memory.oom.group`       |
-/// | `--pids-limit`                           | `resources.pids.limit`                             |
-/// | `--ulimit nofile, nproc`                 | `process.rlimits`                                  |
-/// | `--shm-size`                             | the `/dev/shm` tmpfs `size=`                       |
-/// | `--oom-score-adj=0`                      | `process.oomScoreAdj`                              |
-/// | `--hostname=localhost`                   | `hostname`                                         |
-/// | `--volume root:/kbf/root:O,...`          | an `overlay` mount at `/kbf/root`                  |
+/// | no network                               | a new network namespace, nothing configured (crun brings `lo` up) |
+/// | no id of the daemon user, root inside    | `uidMappings`/`gidMappings` container `0..65536` to the daemon user's first subordinate range; `process.user` 0:0 |
+/// | only the Command's environment           | `process.env` is the Command's variables only      |
+/// | the Command's argv and directory         | `process.args`, `process.cwd`                      |
+/// | the lease cgroup, `memory.oom.group=1`   | `cgroupsPath` a child of the lease cgroup, `unified` `memory.oom.group`       |
+/// | a pids limit                             | `resources.pids.limit`                             |
+/// | `nofile` and `nproc` ulimits             | `process.rlimits`                                  |
+/// | `/dev/shm` size                          | the `/dev/shm` tmpfs `size=`                       |
+/// | the kernel's default OOM score           | `process.oomScoreAdj`                              |
+/// | hostname `localhost`                     | `hostname`                                         |
+/// | the input root, writes in `upper`        | an `overlay` mount at `/kbf/root`                  |
 ///
 /// No memory or CPU limit is set here: the lease cgroup carries them.
 ///
@@ -342,7 +339,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::podman::tests::spec;
+    use crate::container::tests::spec;
     use kbf_daemon::trees::SharedMount;
 
     fn ids() -> DaemonIds {
@@ -456,10 +453,10 @@ mod tests {
         );
     }
 
-    /// Catches the Command's variables being reordered or dropped, and Podman's two
-    /// defaults being added when the Command sets them (or not added when it does not).
+    /// Catches the Command's variables being reordered or dropped, and the two defaults
+    /// being added when the Command sets them (or not added when it does not).
     #[test]
-    fn the_environment_is_the_commands_then_podmans_two_defaults() {
+    fn the_environment_is_the_commands_then_the_two_defaults() {
         let var = |n: &str, v: &str| (n.to_owned(), v.to_owned());
         assert_eq!(environment(&[]), ["HOSTNAME=localhost", "HOME=/root"]);
         assert_eq!(

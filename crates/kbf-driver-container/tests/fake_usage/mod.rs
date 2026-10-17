@@ -1,9 +1,9 @@
 //! What the driver reports of the lease cgroup's counters (`cpu.stat`, `memory.peak`,
-//! `memory.numa_stat`), against the stand-in `podman` and a plain directory standing in
+//! `memory.numa_stat`), against the stand-in `crun` and a plain directory standing in
 //! for the cgroup mount: the action's act steps write the files as the kernel would,
 //! and the result's `ResourceUsage` and the daemon's `lease phases:` line are read back.
 //!
-//! A module of `fake_podman.rs`, not a test binary of its own, like `fake_memory`
+//! A module of `fake_crun.rs`, not a test binary of its own, like `fake_memory`
 //! (the coverage job counts the runtime's generic lines per build of a binary).
 
 use std::time::Duration;

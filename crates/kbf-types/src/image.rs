@@ -134,7 +134,7 @@ mod tests {
         );
     }
 
-    /// Catches malformed references reaching Podman, which might resolve them some
+    /// Catches malformed references reaching a runtime, which might resolve them some
     /// other way (a short name searched in registries, a different digest algorithm).
     #[test]
     fn malformed_references_are_refused() {

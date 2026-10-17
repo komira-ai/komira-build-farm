@@ -1,10 +1,10 @@
-//! What Podman supplies to a container besides the flags `podman::create_args` passes,
-//! written out for the OCI backend: `crun` applies only what `config.json` holds, so
-//! the capability set, the masked and read-only paths and the seccomp filter that
-//! Podman 4.9 adds on its own are listed here, from the same sources, and pinned.
+//! What a container is given besides the settings `spec` writes: `crun` applies only
+//! what `config.json` holds, so the capability set, the masked and read-only paths and
+//! the seccomp filter are listed here, from the containers/common release below, and
+//! pinned.
 //!
 //! - **Capabilities:** containers.conf's `default_capabilities` of containers/common
-//!   v0.57.4 (the library Podman 4.9 builds): the eleven in [`CAPABILITIES`], for the
+//!   v0.57.4: the eleven in [`CAPABILITIES`], for the
 //!   bounding, effective, permitted and ambient sets; the inheritable set is empty.
 //!   They are capabilities of the container's own user namespace, whose ids are the
 //!   daemon user's subordinate ids: they give an action's root nothing over an inode
@@ -21,7 +21,7 @@
 //! - **Also set:** `noNewPrivileges`, `oom_score_adj` 0, a private cgroup namespace, and
 //!   `/sys/fs/cgroup` read-only (`spec`).
 //!
-//! Left out, on purpose: Podman's `net.ipv4.ping_group_range` and
+//! Left out, on purpose: the `net.ipv4.ping_group_range` and
 //! `net.ipv4.ip_unprivileged_port_start` sysctls (an action has loopback only) and the
 //! `gid=5` option of `/dev/pts` (`crun spec --rootless` leaves it out too).
 
@@ -230,7 +230,7 @@ mod tests {
     }
 
     /// Catches an edit of the vendored profile that does not move its pin (and so
-    /// escapes review as "the profile Podman uses").
+    /// escapes review as "the containers/common profile").
     #[test]
     fn the_profile_is_the_pinned_one() {
         assert_eq!(sha256(PROFILE), PROFILE_SHA256);
@@ -263,7 +263,7 @@ mod tests {
     /// Catches capability filtering applied backwards: without `CAP_SYS_ADMIN` the
     /// filter must refuse `bpf`; holding it must allow it. The pinned capability set
     /// has none of it. (`mount` and `unshare` are in the pinned profile's plain allow
-    /// list, as in Podman's: the kernel refuses them without the capability.)
+    /// list: the kernel refuses them without the capability.)
     #[test]
     fn the_capability_set_decides_the_privileged_calls() {
         let plain = seccomp("amd64", &CAPABILITIES).expect("plain");

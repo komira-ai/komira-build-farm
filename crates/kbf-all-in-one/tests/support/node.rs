@@ -87,9 +87,8 @@ pub(crate) fn id_files(dir: &Path) -> PathBuf {
 
 /// The stand-in `crun` in `bin` (a link to `fake`, the package's build of
 /// crates/kbf-driver-container/tests/bin/fake_crun.rs), `kbf-act` beside it, the id tools
-/// the OCI backend's start-up looks for on `PATH` (setuid files, as `uidmap` installs
-/// them) and a `podman` that fails and records that it ran (the same program as the
-/// stand-in: [`podman_ran`]), with the image [`MANIFEST`] names already unpacked in the
+/// the container driver's start-up looks for on `PATH` (setuid files, as `uidmap` installs
+/// them), with the image [`MANIFEST`] names already unpacked in the
 /// node's image store under `data` (the node's `--data-dir`); the stand-in runs `steps`
 /// as each action. Returns the image as an action names it.
 pub(crate) fn crun(bin: &Path, data: &Path, fake: &str, steps: &[&str]) -> String {
@@ -97,7 +96,6 @@ pub(crate) fn crun(bin: &Path, data: &Path, fake: &str, steps: &[&str]) -> Strin
     let state = bin.join("crun-state");
     std::fs::create_dir_all(&state).expect("mkdir");
     std::os::unix::fs::symlink(fake, bin.join("crun")).expect("link crun");
-    std::os::unix::fs::symlink(fake, bin.join("podman")).expect("link podman");
     for tool in ["newuidmap", "newgidmap"] {
         let path = bin.join(tool);
         std::fs::write(&path, b"").expect("write the tool");
@@ -116,11 +114,6 @@ pub(crate) fn crun(bin: &Path, data: &Path, fake: &str, steps: &[&str]) -> Strin
 /// The flag that points the daemon at the stand-in `crun` [`crun`] put in `bin`.
 pub(crate) fn oci_runtime(bin: &Path) -> String {
     format!("--oci-runtime={}", bin.join("crun").display())
-}
-
-/// What the `podman` of `bin` recorded: nothing, on a daemon that never runs it.
-pub(crate) fn podman_ran(bin: &Path) -> String {
-    std::fs::read_to_string(bin.join("podman-ran")).unwrap_or_default()
 }
 
 /// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `crun`
@@ -154,7 +147,7 @@ pub(crate) fn free_port() -> u16 {
         .port()
 }
 
-/// `PATH` with `bin`, where [`crun`] put the id tools and the failing `podman`, first.
+/// `PATH` with `bin`, where [`crun`] put the id tools, first.
 pub(crate) fn image_path(bin: &Path) -> String {
     format!(
         "{}:{}",

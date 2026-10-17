@@ -22,7 +22,7 @@ flate2.workspace = true
 hex.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
-# The runner user's uid and gid, and `uname -m`, for `podman-tests`.
+# The runner user's uid and gid, and `uname -m`, for `crun-tests`.
 rustix = { workspace = true, features = ["process", "system"] }
 serde_json.workspace = true
 rustls.workspace = true

@@ -249,7 +249,7 @@ fn log_start(name: &str, what: &str, took: Duration, log: &[String]) {
     );
 }
 
-/// [`runs_until_sigterm`], with `path` searched first for programs (`podman`).
+/// [`runs_until_sigterm`], with `path` searched first for programs (`newuidmap`).
 fn runs_until_sigterm_with_path(
     name: &str,
     extra: &[String],
@@ -559,12 +559,10 @@ fn each_driver_starts_and_stops_on_sigterm() {
             "--actions-memory-max-gib=1".to_owned(),
         ];
         container.extend(cgroup_flags);
-        let (bin, log) = container_bin("container-bin");
+        let bin = container_bin("container-bin");
         let status = runs_until_sigterm_with_path("container", &container, Some(&bin));
         assert!(status.success(), "{status}");
-        // Podman is first on PATH and fails when run: the daemon never starts it, and
-        // the OCI backend's own state (its helper root) is what the start made.
-        assert!(!log.exists(), "podman ran: {}", read(&log));
+        // The container driver's own state (its helper root) is what the start made.
         assert!(
             data.join("leases/oci-helper").is_dir(),
             "no OCI helper root"
@@ -593,7 +591,7 @@ fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String)
     }
     let ids = id_files(&format!("{name}-ids"), "65536");
     let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu cpuset memory pids");
-    let (bin, _) = container_bin(&format!("{name}-bin"));
+    let bin = container_bin(&format!("{name}-bin"));
     let mut flags = vec![
         "--driver=container".to_owned(),
         OCI_RUNTIME.to_owned(),
@@ -680,55 +678,18 @@ fn a_placement_without_the_container_driver_is_refused() {
 /// file, since the start-up never runs it (no lease runs here).
 const OCI_RUNTIME: &str = "--oci-runtime=/usr/bin/true";
 
-/// A directory to put first in `PATH` for a container daemon, and the file it logs to.
-/// It holds `newuidmap` and `newgidmap` as the `uidmap` package installs them (setuid;
-/// the OCI backend's start-up looks for both) and a `podman` that fails and logs
-/// (`kbf-no-podman`, linked in as `podman`): kbf runs containers with `crun` only, so
-/// the daemon must never start it, and the returned log must stay absent. A symlink to
-/// the built binary, not a written file: exec'ing a file this process just wrote can
-/// fail with ETXTBSY while another test thread forks.
-fn container_bin(name: &str) -> (PathBuf, PathBuf) {
+/// A directory to put first in `PATH` for a container daemon. It holds `newuidmap` and
+/// `newgidmap` as the `uidmap` package installs them (setuid; the container driver's
+/// start-up looks for both).
+fn container_bin(name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = tls(name);
-    let log = bin.join("podman.log");
-    let _ = std::fs::remove_file(bin.join("podman"));
-    let stub = env!("CARGO_BIN_EXE_kbf-no-podman");
-    std::os::unix::fs::symlink(stub, bin.join("podman")).expect("link podman");
     for tool in ["newuidmap", "newgidmap"] {
         let path = bin.join(tool);
         std::fs::write(&path, b"").expect("write the tool");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
     }
-    (bin, log)
-}
-
-/// Catches a tripwire that cannot trip: every container test above puts this `podman`
-/// first on `PATH` and asserts its log stays absent, which proves nothing if it does not
-/// log when it is run. Run through its link by path, and by bare name through a `PATH`
-/// whose first directory lacks it (as the daemon would start `podman`), it records its
-/// arguments, says so and exits 125.
-#[test]
-fn the_podman_that_must_never_run_fails_and_records_the_call() {
-    let (bin, log) = container_bin("no-podman-bin");
-    let decoy = tls("no-podman-decoy");
-    let by_path = Command::new(bin.join("podman"))
-        .args(["pull", "image"])
-        .output()
-        .expect("spawn");
-    assert_eq!(by_path.status.code(), Some(125));
-    assert!(
-        String::from_utf8_lossy(&by_path.stderr).contains("podman was removed"),
-        "{by_path:?}"
-    );
-    assert_eq!(read(&log), "pull\nimage\n");
-    let path = format!("{}:{}", decoy.display(), bin.display());
-    let by_name = Command::new("podman")
-        .env("PATH", path)
-        .arg("ps")
-        .output()
-        .expect("spawn");
-    assert_eq!(by_name.status.code(), Some(125));
-    assert_eq!(read(&log), "pull\nimage\nps\n");
+    bin
 }
 
 /// A stand-in cgroup v2 mount in `dir`, of plain directories, for the container
@@ -774,7 +735,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
     let ids = id_files("capacity-ids", "65536");
     let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
     std::fs::write(unit.join("memory.min"), "0\n").expect("plant");
-    let (bin, _) = container_bin("capacity-bin");
+    let bin = container_bin("capacity-bin");
     let log = dir.join("daemon.log");
     let path = format!(
         "{}:{}",
@@ -890,7 +851,7 @@ fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
     let ids = id_files("reserve-ids", "65536");
     let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
     std::fs::remove_file(unit.join("cpuset.cpus.effective")).expect("no cpuset");
-    let (bin, _) = container_bin("reserve-bin");
+    let bin = container_bin("reserve-bin");
     let log = dir.join("daemon.log");
     let path = format!(
         "{}:{}",
@@ -967,7 +928,7 @@ fn a_container_node_given_its_actions_cgroup_writes_only_its_cap() {
         "--cgroup-parent=/kbf.slice/kbf-daemon.service/actions".to_owned(),
         "--actions-memory-max-gib=2".to_owned(),
     ]);
-    let (bin, _) = container_bin("adopted-bin");
+    let bin = container_bin("adopted-bin");
     let status = runs_until_sigterm_with_path("adopted", &flags, Some(&bin));
     assert!(status.success(), "{status}");
     assert_eq!(read(&actions.join("memory.max")), "2147483648");
@@ -1198,15 +1159,14 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
 }
 
 /// Catches `--oci-runtime` not reaching the driver: a node told to run actions through a
-/// runtime that is not there refuses to start, naming it; `--container-runtime=podman`
-/// being taken (Podman was removed: the parser refuses it, saying so); and any other
-/// runtime than `oci` being taken.
+/// runtime that is not there refuses to start, naming it; and a `--container-runtime`
+/// flag being taken (`crun` is the only runtime, so there is no flag to choose one).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "the container driver is Linux-only"
 )]
-fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
+fn a_node_needs_its_oci_runtime() {
     let ids = id_files("oci-ids", "65536");
     let (_unit, cgroup_flags) = cgroup_tree(&tls("oci-cgroup"), "cpu memory pids");
     let absent = ids.join("no-such-crun");
@@ -1217,7 +1177,6 @@ fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
         format!("--data-dir={}", ids.display()),
         format!("--id-files={}", ids.display()),
         "--actions-memory-max-gib=1".to_owned(),
-        "--container-runtime=oci".to_owned(),
         format!("--oci-runtime={}", absent.display()),
     ];
     container.extend(cgroup_flags);
@@ -1229,17 +1188,11 @@ fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
         .expect("spawn");
     let status = refused_within(&mut child, "oci", &log);
     assert_eq!(status.code(), Some(1));
-    let says = format!("the OCI backend: {} is not a file", absent.display());
+    let says = format!("the container runtime: {} is not a file", absent.display());
     let stderr = read(&log);
     assert!(stderr.contains(&says), "{stderr}");
 
-    for (runtime, says) in [
-        (
-            "podman",
-            "podman was removed: kbf runs containers with crun only",
-        ),
-        ("runc", "\"runc\" is not a container runtime: oci"),
-    ] {
+    for runtime in ["oci", "runc"] {
         let out = Command::new(BIN)
             .args(base(&ids))
             .args(["--driver=fake", &format!("--container-runtime={runtime}")])
@@ -1247,7 +1200,10 @@ fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
             .expect("spawn");
         assert_eq!(out.status.code(), Some(2), "{runtime}");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(says), "{runtime}: {stderr}");
+        assert!(
+            stderr.contains("unexpected argument '--container-runtime"),
+            "{runtime}: {stderr}"
+        );
     }
 }
 
@@ -1276,7 +1232,7 @@ fn refused_within(
 /// Catches the `--container-*` limits not reaching the container driver's
 /// configuration (`config.limits = limits(cli)` in `container::start`): the driver
 /// would create every container with `ContainerLimits::DEFAULT` whatever the flags
-/// say. The driver refuses a limit of 0 before it asks Podman anything, so a daemon
+/// say. The driver refuses a limit of 0 before it runs anything, so a daemon
 /// given one 0 limit exits non-zero naming that limit; a daemon whose flags never
 /// reach the driver gets the defaults, starts, and is killed after 30 s. One case per
 /// limit, so a flag left out of the wiring is caught on its own.
@@ -1295,7 +1251,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
     ] {
         let dir = tls(&format!("zero-{name}"));
         let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
-        let (bin, podman_log) = container_bin(&format!("zero-{name}-bin"));
+        let bin = container_bin(&format!("zero-{name}-bin"));
         let log = dir.join("stderr");
         let path = format!(
             "{}:{}",
@@ -1323,9 +1279,8 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
         let says = format!("kbf-daemon: the container {name} limit must be at least 1");
         assert!(stderr.contains(&says), "{flag}: {stderr}");
         // The limits are checked after the cgroup setup and before the start-up
-        // sweep: `actions/` is made, and Podman was never asked for leftovers.
+        // sweep: `actions/` is made.
         assert!(unit.join("actions").is_dir(), "{flag}: {stderr}");
-        assert!(!podman_log.exists(), "{flag}: podman ran: {stderr}");
     }
 }
 
@@ -1703,7 +1658,7 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
 /// (a good image first, one that cannot be fetched second), and only the last one
 /// deciding (the other way round). Each daemon still running after 30 s has started, and
 /// fails the test. An image whose digest names an index is refused by the fetch before
-/// anything is unpacked: that is `tests/fake_podman.rs`'s (`fake_oci`), which has a
+/// anything is unpacked: that is `tests/fake_crun.rs`'s (`fake_oci`), which has a
 /// registry to serve one. Linux only, as the driver is.
 #[cfg(target_os = "linux")]
 #[test]
@@ -1741,7 +1696,7 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
     ];
     for (name, images, stored, says) in cases {
         let dir = tls(name);
-        let (bin, podman_log) = container_bin(&format!("{name}-bin"));
+        let bin = container_bin(&format!("{name}-bin"));
         if stored {
             unpacked_image(&dir, MANIFEST);
         }
@@ -1766,7 +1721,6 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
             !log.contains(FIRST_ATTEMPT),
             "{name}: it tried a session: {log}"
         );
-        assert!(!podman_log.exists(), "{name}: podman ran: {log}");
     }
 }
 
@@ -1782,7 +1736,7 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
     let dir = tls("image-listed");
     let front = front::Front::start(&dir);
     let ids = id_files("image-listed-ids", "65536");
-    let (bin, _) = container_bin("image-listed-bin");
+    let bin = container_bin("image-listed-bin");
     let other = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
     let third = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#;
     for manifest in [MANIFEST, other, third] {

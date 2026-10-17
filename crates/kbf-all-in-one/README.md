@@ -123,7 +123,7 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   over a server started as `kbf-server` starts, with a write tier and without. The
   transfer engine runs the same checks in `kbf-cas-conformance`'s own tests.
 - `tests/binary.rs`: the binary end to end. One action runs on the container driver over
-  the driver's own stand-in `podman` (`kbf-fake-podman`, built from
+  the driver's own stand-in `crun` (`kbf-fake-crun`, built from
   `kbf-driver-container`'s source, which runs the action as a plain process) and a cgroup
   tree of plain directories; its output file, output directory, stdout and stderr are
   read back over REAPI; SIGTERM ends the process with 0. The binary is given no `--cas`,

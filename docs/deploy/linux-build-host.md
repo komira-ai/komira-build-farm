@@ -8,7 +8,7 @@ host. What the daemon does with its cgroup is in
 The host runs cgroup v2 alone (the default on current distributions; otherwise boot
 with `systemd.unified_cgroup_hierarchy=1`), and a `kbf` user with a subordinate uid and
 gid range of at least 65,536 in `/etc/subuid` and `/etc/subgid` (the daemon checks
-them at start). kbf runs containers with `crun` only: no Podman is installed or used.
+them at start). kbf runs containers with `crun` only.
 
 ## What the host installs
 
@@ -27,10 +27,10 @@ The daemon makes its containers with `crun`, rootless, from the `kbf` user's acc
 | egress to the registries the pinned images come from (`registry-1.docker.io` for `docker.io`, `gcr.io`) | the network |
 
 What an action sees of the host is only its image and its inputs: its root `/` is the
-unpacked image, **read-only** (unlike a Podman container's, which was writable
-everywhere), and only `/tmp`, `/var/tmp`, `/run`, `/root` and the input root `/kbf/root`
-are writable; an action that writes anywhere else gets `EROFS`. That is the OCI backend's
-behaviour and stays so until a writable overlay of the image is chosen.
+unpacked image, **read-only**, and only `/tmp`, `/var/tmp`, `/run`, `/root` and the
+input root `/kbf/root` are writable; an action that writes anywhere else gets `EROFS`.
+That is the driver's behaviour and stays so until a writable overlay of the image is
+chosen.
 
 The daemon checks the id range, the directories' search permission, `crun` and the two id
 tools at start and refuses to start naming the one that is wrong. Lingering and
@@ -178,7 +178,6 @@ OOMScoreAdjust=-900
 Environment=XDG_RUNTIME_DIR=/run/user/<kbf uid>
 ExecStart=/usr/local/bin/kbf-daemon \
     --driver=container \
-    --container-runtime=oci \
     --oci-runtime=/usr/bin/crun \
     --server=https://<server>:<worker port> \
     --cas=https://<server>:<worker port> \

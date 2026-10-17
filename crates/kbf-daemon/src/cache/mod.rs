@@ -224,9 +224,6 @@ pub enum Disabled {
     /// The Linux native driver: actions run as the cache's owner and could write it.
     #[error("native-same-uid: native actions run as the daemon's user and could write the cache")]
     NativeSameUid,
-    /// Podman's storage is not one the cache's overlay checks passed on.
-    #[error("graph-driver: {0}")]
-    GraphDriver(String),
 }
 
 impl Disabled {
@@ -239,7 +236,6 @@ impl Disabled {
             Self::LeaseName => "lease-name",
             Self::NoBudget => "no-budget",
             Self::NativeSameUid => "native-same-uid",
-            Self::GraphDriver(_) => "graph-driver",
         }
     }
 }

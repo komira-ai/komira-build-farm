@@ -1,7 +1,7 @@
 //! A killed daemon's container action, against real rootless `crun` and a delegated
 //! cgroup (issue #155).
 //!
-//! Run by `cargo xtask podman-tests`, like `podman.rs` (the test is `#[ignore]` with
+//! Run by `cargo xtask crun-tests`, like `crun.rs` (the test is `#[ignore]` with
 //! that reason). The daemon here is a second run of this test binary, which runs the
 //! test's other half (the variable [`ROLE`] set): it starts a lease and, once its
 //! container's program runs, prints where the lease is and waits. This half SIGKILLs
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kbf_daemon::Runtime as _;
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
+use kbf_driver_container::{ContainerConfig, ContainerRuntime, MemoryCas};
 use kbf_types::Resources;
 use support::real::{Cell, crun, delegation, describe, sh};
 use support::store_action;
@@ -29,7 +29,6 @@ const READY: &str = "kbf-killed-daemon-ready";
 /// This test's own lease term: the daemon is another process, whose terms would
 /// otherwise start at 1 and name the same containers as this binary's other tests.
 const TERM: u64 = 155_155;
-const OWNER: &str = "kbf-test-killed";
 /// How long the container's processes may outlive the SIGKILL.
 const PROMPT: Duration = Duration::from_secs(30);
 
@@ -40,7 +39,7 @@ const PROMPT: Duration = Duration::from_secs(30);
 /// daemon started again. A restarted runtime then removes what is left (container,
 /// cgroup, scratch directory), as before.
 #[tokio::test]
-#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn a_killed_daemons_container_action_dies_with_it() {
     if std::env::var_os(ROLE).is_some() {
         return be_the_daemon().await;
@@ -82,9 +81,9 @@ async fn a_killed_daemons_container_action_dies_with_it() {
     let left = populated(&lease).then(|| describe(&lease));
 
     // What a restarted daemon does, which also ends a red run's container.
-    let mut config = PodmanConfig::new(scratch.clone(), parent.to_owned(), OWNER.to_owned());
+    let mut config = ContainerConfig::new(scratch.clone(), parent.to_owned());
     config.oci.runtime = crun();
-    PodmanRuntime::new(config, Arc::new(MemoryCas::new())).expect("restart");
+    ContainerRuntime::new(config, Arc::new(MemoryCas::new())).expect("restart");
     let name = format!("kbf-lease-{TERM}-1");
     let directory_left = scratch.join(&name).exists();
     let cgroup = lease.parent().expect("the test's cgroup");

@@ -29,7 +29,7 @@ mod node;
 
 use node::{
     PROMPT, Running, cgroup_tree, crun, files_holding, free_port, id_files, image_path,
-    input_bytes, oci_runtime, pki, podman_ran,
+    input_bytes, oci_runtime, pki,
 };
 
 // The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
@@ -77,8 +77,7 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
 }
 
 /// The binary with `flags` (a one-node farm in `dir`, [`farm_flags`]) whose container
-/// driver runs the stand-in `crun` in `bin`, with the id tools and a failing `podman`
-/// found through `path`.
+/// driver runs the stand-in `crun` in `bin`, with the id tools found through `path`.
 fn farm(dir: &Path, bin: &Path, path: &str, flags: Vec<String>) -> Command {
     let mut command = Command::new(BIN);
     command
@@ -226,8 +225,6 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
     let status = running.wait();
     assert!(status.success(), "{status}");
-    // The `podman` first on PATH fails and records that it ran: kbf never starts it.
-    assert_eq!(podman_ran(&bin), "");
 }
 
 /// Catches the daemon's helper re-execs dispatched after the flags are read, or not at

@@ -222,8 +222,9 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
   outputs and delete its directory although the lease user wrote them. On Macs the
   lease directory carries an inherited ACL entry granting `_kbf` read and delete, so
   every file the lease user creates inherits it. On Linux the files belong to the
-  container's mapped uids; the daemon reads and removes them through `podman unshare`
-  (as `main` already removes directories) or an idmapped mount.
+  container's mapped uids; the daemon reads and removes them through a helper
+  container in the setup user namespace (`crates/kbf-driver-container/src/oci/helper.rs`)
+  or an idmapped mount.
 - **Which leases get what.** Every Mac lease gets `user-create`, `run` and
   `user-delete`. The session switch (L2) is only for whole-machine leases that need a
   GUI session; the leak scan only for whole-machine leases.
@@ -377,13 +378,13 @@ socket mode 0660. Two controls, the first being the one that matters:
    - Mac: every action and probe runs as a lease user via `run`. On `main` the native
      driver runs actions as the daemon's own user (`crates/kbf-driver-native/src/lib.rs`),
      so `kbf-updater` ships on Macs only with the per-lease user.
-   - Linux: rootless Podman's default maps a container's uid 0 to the daemon's uid on
-     the host, leaving only the mount and pid namespaces to hide the socket. The
-     container driver therefore runs every container with `--userns=nomap`
-     (`crates/kbf-driver-container/src/podman.rs`), so no container uid or gid maps
-     to the daemon's; `--userns=auto` was refused because, rootless, one container
-     takes a whole 65,536-id range and the next cannot start ([daemon.md](daemon.md),
-     User namespaces). Both helpers refuse to start on a Linux node whose daemon uses
+   - Linux: a rootless container whose uid 0 mapped to the daemon's uid on the host
+     would leave only the mount and pid namespaces to hide the socket. The container
+     driver therefore gives every container a user namespace that maps the daemon
+     user's subordinate ids and nothing of the daemon user
+     (`crates/kbf-driver-container/src/oci/mod.rs`, `DaemonIds::action_mappings`), so
+     no container uid or gid maps to the daemon's ([daemon.md](daemon.md), User
+     namespaces). Both helpers refuse to start on a Linux node whose daemon uses
      `--driver native`.
    - VMs: `kbf-vmm` (#85) runs as its own dedicated non-admin uid outside the group,
      started through `kbf-mac-session run` or by its own launchd user, never as

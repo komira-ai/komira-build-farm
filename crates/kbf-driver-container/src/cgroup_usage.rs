@@ -19,7 +19,7 @@ use std::time::Duration;
 use kbf_proto::worker::{CgroupUsage, NumaNodeBytes, ResourceUsage};
 
 /// How often [`NumaSample::watch`] reads `memory.numa_stat` while the action runs, unless
-/// `PodmanConfig::numa_every` says otherwise.
+/// `ContainerConfig::numa_every` says otherwise.
 pub(crate) const NUMA_EVERY: Duration = Duration::from_secs(1);
 
 /// The counters of `cpu.stat` the usage takes.
@@ -102,7 +102,7 @@ pub(crate) struct NumaSample {
 
 impl NumaSample {
     /// A sample that adds one to `counted` for each reading of `memory.numa_stat` that
-    /// held memory ([`crate::PodmanRuntime::numa_samples`]).
+    /// held memory ([`crate::ContainerRuntime::numa_samples`]).
     pub(crate) fn counting(counted: Arc<AtomicU64>) -> Self {
         Self {
             best: BTreeMap::new(),

@@ -1,11 +1,11 @@
-//! `cargo xtask podman-tests` as CI runs it: the real binary, with `xtask-fake` as
+//! `cargo xtask crun-tests` as CI runs it: the real binary, with `xtask-fake` as
 //! cargo (printing the JSON messages each test writes for it) and as sudo (recording
 //! the `systemd-run` it was asked to run).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use xtask::podman_tests::{BUSYBOX_AMD64, BUSYBOX_ARM64, TARGETS, arch_for};
+use xtask::crun_tests::{BUSYBOX_AMD64, BUSYBOX_ARM64, TARGETS, arch_for};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -64,7 +64,7 @@ impl Run {
         Run { root, bin }
     }
 
-    /// `podman-tests` with the fakes, the cargo `cargo`, and the sudo `program` (`None`:
+    /// `crun-tests` with the fakes, the cargo `cargo`, and the sudo `program` (`None`:
     /// the fake), planting `defect` (or none): exit code, stdout and stderr.
     fn xtask(
         &self,
@@ -74,7 +74,7 @@ impl Run {
     ) -> (Option<i32>, String, String) {
         let fake = self.bin.join("sudo");
         let mut cmd = Command::new(XTASK);
-        cmd.arg("--root").arg(&self.root).arg("podman-tests");
+        cmd.arg("--root").arg(&self.root).arg("crun-tests");
         cmd.arg("--sudo").arg(program.unwrap_or(fake.as_path()));
         cmd.env("CARGO", cargo).env("HOME", HOME).env("PATH", PATH);
         match defect {
@@ -110,7 +110,7 @@ impl Run {
         let package = self.root.join("crates/kbf-driver-container");
         format!(
             "{cwd}: -n systemd-run --quiet --wait --collect --pipe \
-             --unit=kbf-podman-tests-{target} --slice=kbf-daemon.slice -p Delegate=yes \
+             --unit=kbf-crun-tests-{target} --slice=kbf-daemon.slice -p Delegate=yes \
              -p OOMScoreAdjust=-900 --uid={uid} --gid={gid} --working-directory={package} \
              -E HOME={HOME} -E PATH={PATH} \
              -E KBF_TEST_IMAGE=docker://docker.io/library/busybox@{manifest} \
@@ -128,26 +128,26 @@ impl Run {
     /// Every unit's line, in the order the targets run.
     fn units(&self) -> String {
         [
-            self.unit("podman", "", ""),
-            self.unit("podman_memory", "", ""),
-            self.unit("podman_killed", "", ""),
-            self.unit("podman_cache", "", " --nocapture"),
-            self.unit("podman_env", "", ""),
-            self.unit("podman_credential", "", ""),
+            self.unit("crun", "", ""),
+            self.unit("crun_memory", "", ""),
+            self.unit("crun_killed", "", ""),
+            self.unit("crun_cache", "", " --nocapture"),
+            self.unit("crun_env", "", ""),
+            self.unit("crun_credential", "", ""),
             self.unit("oci_crun", "", " --nocapture"),
         ]
         .concat()
     }
 }
 
-/// The build the verb asks cargo for: every real-Podman target, as JSON, as this user.
+/// The build the verb asks cargo for: every real-`crun` target, as JSON, as this user.
 const BUILD: &str = "test --locked --no-run --message-format=json -p kbf-driver-container \
-                     --test podman --test podman_memory --test podman_killed --test podman_cache \
-                     --test podman_env --test podman_credential --test oci_crun\n";
+                     --test crun --test crun_memory --test crun_killed --test crun_cache \
+                     --test crun_env --test crun_credential --test oci_crun\n";
 
 /// Catches any step of the script dropped or reordered: the targets not built (or built
 /// without --locked, or not all of them) before any unit starts, the machine's pinned
-/// busybox manifest not named, anything run with Podman or in a user session, and a
+/// busybox manifest not named, anything run in a user session, and a
 /// target's unit missing, run with the wrong binary, or with the wrong settings (see the
 /// unit tests of `systemd_run_args` for each one).
 #[test]
@@ -190,7 +190,7 @@ fn a_failed_target_fails_the_verb_after_every_target_ran() {
     let (code, _, err) = run.xtask(
         Path::new(FAKE),
         None,
-        Some("fails:--unit=kbf-podman-tests-podman,--unit=kbf-podman-tests-podman_cache"),
+        Some("fails:--unit=kbf-crun-tests-crun,--unit=kbf-crun-tests-crun_cache"),
     );
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(run.sudo_args(), run.units());
@@ -206,8 +206,8 @@ fn a_failed_target_fails_the_verb_after_every_target_ran() {
     assert!(
         err.ends_with(&format!(
             "xtask: {}{}",
-            failed("podman"),
-            failed("podman_cache")
+            failed("crun"),
+            failed("crun_cache")
         )),
         "{err}"
     );
@@ -223,9 +223,9 @@ fn a_failed_build_starts_no_unit() {
     assert_eq!(run.sudo_args(), "");
     assert!(
         err.ends_with(
-            "xtask: cargo test --no-run -p kbf-driver-container --test podman --test \
-             podman_memory --test podman_killed --test podman_cache --test podman_env --test \
-             podman_credential --test oci_crun \
+            "xtask: cargo test --no-run -p kbf-driver-container --test crun --test \
+             crun_memory --test crun_killed --test crun_cache --test crun_env --test \
+             crun_credential --test oci_crun \
              failed: exit status: 101\n"
         ),
         "{err}"
@@ -240,7 +240,7 @@ fn a_target_missing_from_the_build_starts_no_unit() {
     let messages = std::fs::read_to_string(run.root.join("cargo-messages")).expect("messages");
     let without: String = messages
         .lines()
-        .filter(|l| !l.contains(r#""name":"podman_killed""#))
+        .filter(|l| !l.contains(r#""name":"crun_killed""#))
         .map(|l| format!("{l}\n"))
         .collect();
     std::fs::write(run.root.join("cargo-messages"), without).expect("messages");
@@ -248,7 +248,7 @@ fn a_target_missing_from_the_build_starts_no_unit() {
     assert_eq!(code, Some(1));
     assert_eq!(run.sudo_args(), "");
     assert!(
-        err.ends_with("xtask: cargo built 0 test binaries for the target `podman_killed`, not 1\n"),
+        err.ends_with("xtask: cargo built 0 test binaries for the target `crun_killed`, not 1\n"),
         "{err}"
     );
 }

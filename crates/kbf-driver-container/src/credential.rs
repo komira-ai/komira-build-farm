@@ -5,18 +5,16 @@
 //! A node that holds the key gets it from its unit's `EnvironmentFile=`, which systemd
 //! reads as root, so the key is in this process's environment as the provider-standard
 //! `AWS_*` variables (`kbf_server::config::s3_store` reads `AWS_ACCESS_KEY_ID` and
-//! `AWS_SECRET_ACCESS_KEY`). An action gets only its `Command`'s variables (Podman's
-//! `--unsetenv-all` and `--env`, the OCI backend's `process.env`), and it runs as a
-//! subordinate id of the daemon's user (`--userns=nomap`, or the OCI backend's
-//! mappings), which a key file of mode `0600` does not let in. That is the action's
-//! side. This module is the runtime's: Podman and `crun` are started without any
-//! variable of [`CREDENTIAL_PREFIX`], so no runtime feature that copies the host's
-//! environment into a container (Podman's `env_host`, a bare `--env NAME`, an
-//! `--env PREFIX*`) has the key to copy.
+//! `AWS_SECRET_ACCESS_KEY`). An action gets only its `Command`'s variables (the
+//! bundle's `process.env`), and it runs as a subordinate id of the daemon's user (the
+//! bundle's id mappings), which a key file of mode `0600` does not let in. That is the
+//! action's side. This module is the runtime's: `crun` is started without any variable
+//! of [`CREDENTIAL_PREFIX`], so no runtime feature that copies the host's environment
+//! into a container has the key to copy.
 //!
-//! `tests/credential_env.rs` checks it on the stand-in runtimes, which hand their own
-//! environment to the action; `tests/podman_credential.rs` checks both sides on real
-//! rootless Podman.
+//! `tests/credential_env.rs` checks it on the stand-in runtime, which hands its own
+//! environment to the action; `tests/crun_credential.rs` checks both sides on real
+//! `crun`.
 
 use std::ffi::OsString;
 use std::process::Command;
@@ -68,7 +66,7 @@ mod tests {
             "aws_lower",
             "AWS",
         ];
-        let mut command = Command::new("podman");
+        let mut command = Command::new("crun");
         remove_credentials(&mut command, names.map(OsString::from));
         let mut removed: Vec<_> = command
             .get_envs()

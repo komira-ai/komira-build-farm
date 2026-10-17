@@ -1,7 +1,7 @@
 //! `xtask-fake`: what this crate's tests run in place of `cargo`, of a built
 //! `kbf-server`, of `gh` and of `sudo`, so `build-commit stamps` is tested
 //! without building the server, `verify-assets attestations` without GitHub, and
-//! `sudo-test` and `podman-tests` without root or systemd.
+//! `sudo-test` and `crun-tests` without root or systemd.
 //!
 //! - Run under any name but `kbf-server`, `gh` or `sudo`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working

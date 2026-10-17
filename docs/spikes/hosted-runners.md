@@ -1,6 +1,11 @@
 # Spike: what GitHub-hosted runners can carry
 
-kbf's infrastructure tests need rootless Podman, cgroup v2 limits and delegation,
+> **Status.** kbf runs containers with `crun` only. This spike was measured with the
+> container tool the project used then; its numbers on cgroup v2 delegation, user
+> namespaces and `crun` 1.14.1 still hold, and the container-tool rows are a record of
+> the measurement, not of what kbf runs.
+
+kbf's infrastructure tests need rootless containers, cgroup v2 limits and delegation,
 I/O control, a network-less container, MinIO and several servers on one machine.
 This spike measured which of those a GitHub-hosted runner provides, on x86 and arm.
 It is a measurement, not a decision. Each farm test that needs real infrastructure

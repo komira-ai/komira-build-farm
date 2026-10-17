@@ -50,7 +50,7 @@ fn every_daemon_units_flags_parse_with_kbf_daemons_parser() {
 fn the_rendered_daemon_unit_parses_with_kbf_daemons_parser() {
     // Catches: a `kbf-deploy linux` template naming a kbf-daemon flag the binary does
     // not have or a value it refuses, and the pinned images rendered in a form the
-    // daemon refuses at start (podman's bare `<repo>@sha256:<digest>`), which makes it
+    // daemon refuses at start (a bare `<repo>@sha256:<digest>`), which makes it
     // exit 2. The flag parser takes `--image` as text; the daemon checks the form at
     // start with `ImageRef::parse`, which this test runs on each value.
     use kbf_deploy::linux::{LinuxConfig, Templates, render::render};

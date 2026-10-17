@@ -662,7 +662,7 @@ fn checks_pass_and_fail_on_what_they_name() {
 
 /// Catches: `zeros` writing other than that many zero bytes, or on the wrong stream;
 /// `leads` printing other than whether the process leads its group and its session
-/// (a test that the fake podman starts the action in a session of its own would pass
+/// (a test that the fake crun starts the action in a session of its own would pass
 /// either way); `ignore-signal` not ignoring the signal, or reporting a signal that
 /// cannot be ignored as ignored.
 #[test]

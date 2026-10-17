@@ -125,7 +125,8 @@ pub(crate) fn qualifies(
     reserved: &Reserved<'_>,
     limits: Limits,
 ) -> bool {
-    // A destination with ':' or ',' would end a podman `--volume` field early.
+    // A destination with ':' or ',' is never a shared tree: mount paths stay free of
+    // separators.
     summary.files >= limits.min_files
         && summary.bytes <= limits.max_bytes
         && !path.contains([':', ','])

@@ -23,9 +23,9 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
-//! - `podman-tests [--sudo <path>]` ([`podman_tests`]): the container driver's real-`crun`
+//! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
-//!   unit (the name stays until the workflows that call it are renamed).
+//!   unit.
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
@@ -41,11 +41,11 @@ use clap::{Parser, Subcommand};
 
 pub mod budget;
 pub mod build_commit;
+pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
 pub mod package;
-pub mod podman_tests;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
@@ -168,7 +168,7 @@ enum Verb {
     Release(ReleaseVerb),
     /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
-    PodmanTests {
+    CrunTests {
         /// The sudo program; it is run with `-n`, so it never prompts.
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
@@ -385,7 +385,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::PodmanTests { sudo } => podman_tests::run(&podman_tests::PodmanTests {
+        Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,
             root: &root,

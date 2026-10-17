@@ -1,6 +1,6 @@
 //! One real-`crun` test's cgroup, scratch directory and runtime ([`Cell`]), shared by
 //! the test binaries that run the driver against rootless `crun`
-//! (`cargo xtask podman-tests` sets up what they need). The image is fetched from its
+//! (`cargo xtask crun-tests` sets up what they need). The image is fetched from its
 //! registry by the driver's own image store, once per machine: every cell's
 //! `oci-images` is the one store, which the first cell fills.
 
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError, Work};
-use kbf_driver_container::{MemoryCas, PodmanConfig, PodmanRuntime};
+use kbf_driver_container::{ContainerConfig, ContainerRuntime, MemoryCas};
 use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_types::{LeaseId, Resources};
 
@@ -18,7 +18,7 @@ use super::{Spec, blob, exists, store_action, work};
 
 pub fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
-        panic!("{name} is not set: run these tests through cargo xtask podman-tests")
+        panic!("{name} is not set: run these tests through cargo xtask crun-tests")
     })
 }
 
@@ -29,9 +29,9 @@ pub struct Cell {
     pub term: u64,
     pub cgroup: PathBuf,
     pub scratch: PathBuf,
-    pub config: PodmanConfig,
+    pub config: ContainerConfig,
     pub cas: Arc<MemoryCas>,
-    pub runtime: Arc<PodmanRuntime<MemoryCas>>,
+    pub runtime: Arc<ContainerRuntime<MemoryCas>>,
 }
 
 static TERMS: AtomicU64 = AtomicU64::new(1);
@@ -46,7 +46,7 @@ pub const ACTIONS_MEMORY_MAX: u64 = 4 << 30;
 pub const SUPERVISOR_MEMORY_MIN: u64 = 256 << 20;
 
 /// The unit's cgroup, set up by the code `kbf-daemon` runs, once per test process.
-/// Each test binary runs in a unit of its own (`cargo xtask podman-tests`), so each
+/// Each test binary runs in a unit of its own (`cargo xtask crun-tests`), so each
 /// sets up a fresh one; a second start from the `supervisor/` leaf is tested on a fake
 /// cgroup tree (`src/delegate_tests.rs`).
 pub fn delegation() -> &'static kbf_driver_container::Delegation {
@@ -60,7 +60,7 @@ pub fn delegation() -> &'static kbf_driver_container::Delegation {
             Some(ACTIONS_MEMORY_MAX),
         )
         .unwrap_or_else(|e| {
-            panic!("set up the delegated cgroup (run through cargo xtask podman-tests): {e}")
+            panic!("set up the delegated cgroup (run through cargo xtask crun-tests): {e}")
         })
     })
 }
@@ -108,7 +108,7 @@ fn shared_images() -> PathBuf {
 }
 
 impl Cell {
-    /// A cell whose runtime is the OCI backend, running `crun` (`KBF_TEST_CRUN`, or
+    /// A cell running `crun` (`KBF_TEST_CRUN`, or
     /// `crun` on the `PATH`): its scratch directory is under the system temporary
     /// directory, whose ancestors every id can search (the backend's containers do not
     /// run as the test's user, and refuse a scratch directory they cannot reach).
@@ -117,7 +117,7 @@ impl Cell {
     }
 
     /// [`Cell::new`], with `configure` applied to the runtime's configuration last.
-    pub fn with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
+    pub fn with(name: &str, configure: impl FnOnce(&mut ContainerConfig)) -> Self {
         let uid = rustix::process::getuid().as_raw();
         let scratch = std::env::temp_dir().join(format!("kbf-oci-{uid}-{name}"));
         super::force_remove(&scratch);
@@ -135,24 +135,17 @@ impl Cell {
         std::fs::create_dir_all(&images).expect("the shared image store");
         std::os::unix::fs::symlink(&images, scratch.join("oci-images")).expect("link the store");
         Self::in_scratch(name, scratch, |config| {
-            config.container_runtime = kbf_driver_container::ContainerRuntime::Oci;
             config.oci.runtime = crun();
             config.oci.daemon = daemon;
             configure(config);
         })
     }
 
-    /// The same as [`Cell::new`] (every cell is the OCI backend now).
-    pub fn oci(name: &str) -> Self {
-        Self::new(name)
-    }
-
-    /// The same as [`Cell::with`].
-    pub fn oci_with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
-        Self::with(name, configure)
-    }
-
-    fn in_scratch(name: &str, scratch: PathBuf, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
+    fn in_scratch(
+        name: &str,
+        scratch: PathBuf,
+        configure: impl FnOnce(&mut ContainerConfig),
+    ) -> Self {
         trace();
         let term = TERMS.fetch_add(1, Ordering::Relaxed);
         let parent = format!("{}/{name}", delegation().actions);
@@ -163,14 +156,14 @@ impl Cell {
         std::fs::create_dir(&cgroup).expect("create the test cgroup");
         std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory +pids")
             .expect("enable controllers");
-        let mut config = PodmanConfig::new(scratch.clone(), parent, format!("kbf-test-{name}"));
+        let mut config = ContainerConfig::new(scratch.clone(), parent);
         config.default_timeout = Duration::from_secs(120);
         config.kill_grace = Duration::from_secs(2);
         configure(&mut config);
         let cas = Arc::new(MemoryCas::new());
         let making = MAKING.lock().unwrap_or_else(PoisonError::into_inner);
         let runtime =
-            Arc::new(PodmanRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
+            Arc::new(ContainerRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
         fetch_test_image(&runtime);
         drop(making);
         Self {
@@ -247,7 +240,7 @@ impl Drop for Cell {
 /// machine has the runtime fetch it from its registry, checking every byte against its
 /// digest, and unpack it. The runtime's check is async and a cell is made inside a
 /// test's runtime, so it runs on a thread of its own.
-fn fetch_test_image(runtime: &Arc<PodmanRuntime<MemoryCas>>) {
+fn fetch_test_image(runtime: &Arc<ContainerRuntime<MemoryCas>>) {
     let image = kbf_driver_container::ImageRef::parse(&var("KBF_TEST_IMAGE")).expect("an image");
     let runtime = Arc::clone(runtime);
     let fetched = std::thread::spawn(move || {
@@ -273,7 +266,7 @@ pub fn crun() -> PathBuf {
     std::env::split_paths(&path)
         .map(|dir| dir.join("crun"))
         .find(|candidate| candidate.is_file())
-        .expect("no crun on the PATH (set KBF_TEST_CRUN): run through cargo xtask podman-tests")
+        .expect("no crun on the PATH (set KBF_TEST_CRUN): run through cargo xtask crun-tests")
 }
 
 /// An action running `script` with the image's `/bin/sh`, named by its path: the

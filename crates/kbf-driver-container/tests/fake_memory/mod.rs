@@ -1,13 +1,13 @@
-//! How the driver reports a lease killed for memory, against the stand-in `podman`
+//! How the driver reports a lease killed for memory, against the stand-in `crun`
 //! (`support/fake.rs`) and a plain directory standing in for the cgroup mount:
 //! the action's act steps write the lease cgroup's `memory.events`, `memory.current` and
-//! `memory.swap.current` as the kernel would. `podman_memory.rs` runs the same promises
+//! `memory.swap.current` as the kernel would. `crun_memory.rs` runs the same promises
 //! against a real kernel.
 //!
-//! A module of `fake_podman.rs`, not a test binary of its own. The coverage job counts
-//! the lines of the driver's generic `PodmanRuntime` per build of it; split across two
+//! A module of `fake_crun.rs`, not a test binary of its own. The coverage job counts
+//! the lines of the driver's generic `ContainerRuntime` per build of it; split across two
 //! test binaries, the swap watch's paths (run here) and the timeout and kill paths (run
-//! in `fake_podman.rs`) each counted as missed in the other binary's build.
+//! in `fake_crun.rs`) each counted as missed in the other binary's build.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::{Duration, Instant};
@@ -183,12 +183,12 @@ async fn a_memory_kill_says_whose_limit_ran_out() {
     fake.assert_clean(4);
 }
 
-/// Catches the lease cgroup's counters read only on exit 137: when Podman recorded no
-/// exit (`NotRun`) or could not be asked (`inspect` fails), a kill the counters show is
-/// still reported as the memory kill it was, by whose limit, and not as Podman's
-/// failure. Without a kill in the counters, what Podman said is reported.
+/// Catches the lease cgroup's counters read only on exit 137: when `crun` reported an
+/// error and no exit (`NotRun`), a kill the counters show is still reported as the memory
+/// kill it was, by whose limit, and not as `crun`'s failure. Without a kill in the
+/// counters, what `crun` said is reported.
 #[tokio::test]
-async fn a_memory_kill_without_an_exit_from_podman_is_still_reported() {
+async fn a_memory_kill_without_an_exit_from_crun_is_still_reported() {
     let fake = Fake::new("oom-no-exit");
     let spec = Spec::new(&image(), "unused");
     let own = Steps::default()
@@ -199,7 +199,7 @@ async fn a_memory_kill_without_an_exit_from_podman_is_still_reported() {
         .cgroup("memory.events", &["max 0", "oom 0", "oom_kill 2"])
         .exit(137);
 
-    fake.knob("status-override", "stopped -1\n");
+    fake.knob("error-after-run", "cannot clean up the container");
     let outcome = fake.run(1, &spec, &own).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used: 5_000_000_000, limit }) if limit == CAP),
@@ -212,26 +212,13 @@ async fn a_memory_kill_without_an_exit_from_podman_is_still_reported() {
         "{outcome:?}"
     );
     fake.assert_clean(2);
-    // No kill in the counters: Podman's word stands.
+    // No kill in the counters: `crun`'s word stands.
     let outcome = fake.run(3, &spec, &["exit", "137"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("did not run to an exit")),
         "{outcome:?}"
     );
     fake.assert_clean(3);
-    std::fs::remove_file(fake.state.join("status-override")).expect("unset");
-
-    fake.knob("inspect-fails", "");
-    let outcome = fake.run(4, &spec, &own).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
-        "{outcome:?}"
-    );
-    let outcome = fake.run(5, &spec, &["exit", "137"]).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("inspect")),
-        "{outcome:?}"
-    );
 }
 
 /// A fake whose swap watch samples every 20 ms with `floor` bytes and `percent`.
@@ -347,7 +334,7 @@ fn reclaimed_below_the_cap() -> Vec<String> {
 }
 
 /// Catches a kill check that wants RAM plus swap past the cap by the threshold (the
-/// check podman-arm failed on a correct kill): at the kill sample this lease holds
+/// check the arm job failed on a correct kill): at the kill sample this lease holds
 /// 1 MiB less than its cap in RAM and 1.25 MiB of its own swap, past the 1 MiB floor,
 /// so it is past its cap by only 256 KiB. Also catches the watch missing (exit 0) and a
 /// threshold that drops the floor (the "0 floor" mutant kills at the first 256 KiB of
@@ -462,7 +449,7 @@ async fn the_swap_threshold_follows_the_configuration() {
 }
 
 /// Catches the swap watch's kill hanging, or reported as anything but the lease's
-/// out-of-memory kill, when `cgroup.kill` cannot be written and `podman start`
+/// out-of-memory kill, when `cgroup.kill` cannot be written and `crun run`
 /// outlives the grace period; and anything of the lease left behind afterwards.
 ///
 /// The test, not the action, writes the lease cgroup's counters, one step after
@@ -471,10 +458,10 @@ async fn the_swap_threshold_follows_the_configuration() {
 /// (`n/a`, a sample the watch skips) before the lease cgroup goes read-only, and only
 /// then does the swap read 1 MiB. So the first sample the watch reads is its kill
 /// sample, whenever it takes it, and its `cgroup.kill` fails. The lease cgroup stays
-/// read-only to the end: the clean's own `cgroup.kill` fails too, and `podman rm
+/// read-only to the end: the clean's own `cgroup.kill` fails too, and `crun delete
 /// --force` is what ends the action. (Made writable again by the action after a
 /// sleep, the cgroup was still read-only at the clean on a slow runner, and the
-/// fake's `rm` left its counters behind: "lease cgroup left".)
+/// fake's `delete` left its counters behind: "lease cgroup left".)
 #[tokio::test]
 async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
     let fake = Fake::with("swap-kill-fails", |config| {
@@ -487,7 +474,7 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
     let cgroup = fake.lease_cgroup(1);
     let write = |file: &str, text: &str| std::fs::write(cgroup.join(file), text).expect(file);
     let steps = async {
-        // The driver makes the lease cgroup before `podman start` publishes the pid.
+        // The driver makes the lease cgroup before `crun run` publishes the pid.
         fake.wait_for_start().await;
         write("memory.current", "5000\n");
         write("memory.events", "max 1\noom 0\noom_kill 0\n");
@@ -504,7 +491,7 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
         "{outcome:?}"
     );
     // The kill waits out the grace, not the action's 30 s: a kill that waits for
-    // `podman start` without a bound returns only once the action has ended.
+    // `crun run` without a bound returns only once the action has ended.
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "{:?}",
@@ -524,7 +511,7 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
 /// Catches a kernel OOM kill at the lease's own cap reported with the swap watch's
 /// numbers (RAM plus swap at a sample) rather than `memory.peak`, and the watch
 /// killing a lease the host swapped for what that lease then pushes at its cap below
-/// the threshold. The samples are the lease's in a podman-arm run of
+/// the threshold. The samples are the lease's in an arm run of
 /// `swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed` (a 192 MiB floor): host
 /// reclaim moved 315 MB to swap with `max` 0, then at its cap the lease pushed 68 MB
 /// more, and the kernel's OOM killer ran at that cap (`oom 1`, `oom_kill 13`). The

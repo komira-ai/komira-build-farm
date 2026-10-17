@@ -466,11 +466,11 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The container driver against real rootless Podman, each test binary inside a
-  # Delegate=yes system unit (crates/xtask/src/podman_tests.rs; the T4 spike found both
+  # The container driver against real rootless `crun`, each test binary inside a
+  # Delegate=yes system unit (crates/xtask/src/crun_tests.rs; the T4 spike found both
   # arches carry it). The same tests show as ignored, with their reason, in the plain
   # test jobs above.
-  podman-x86:
+  crun-x86:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -489,7 +489,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo xtask podman-tests
+      - run: cargo xtask crun-tests
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -501,9 +501,9 @@ jobs:
 
   # The M2 test: pinned buck2 builds the sample project in crates/kbf-it/m2 remote-only
   # through kbf-server to kbf-daemon --driver container, every action in a rootless
-  # Podman container of distroless base-debian12 pinned by its amd64 manifest digest
+  # `crun` container of distroless base-debian12 pinned by its amd64 manifest digest
   # (`kbf-cell m2`, crates/kbf-it/src/m2.rs, says what is checked; it sets the runner
-  # up as `cargo xtask podman-tests` does). x86_64 only: the image digest is the amd64
+  # up as `cargo xtask crun-tests` does). x86_64 only: the image digest is the amd64
   # one.
   m2-container:
     runs-on: ubuntu-24.04
@@ -549,7 +549,7 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  podman-arm:
+  crun-arm:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     permissions:
@@ -568,7 +568,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo xtask podman-tests
+      - run: cargo xtask crun-tests
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

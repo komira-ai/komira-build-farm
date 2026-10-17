@@ -45,7 +45,7 @@ use kbf_proto::reapi::{
     ExecuteRequest, ExecuteResponse, FileNode, GetActionResultRequest, Platform,
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
-use node::{cgroup_tree, crun, files_holding, id_files, image_path, input_bytes, podman_ran};
+use node::{cgroup_tree, crun, files_holding, id_files, image_path, input_bytes};
 use pki::Pki;
 use procs::{HANG, Proc, field};
 use prost::Message as _;
@@ -210,7 +210,7 @@ impl Farm {
     /// The flags a test box cannot take as rendered, and what each is changed to:
     /// - the nodes' `--cold-store=s3://...` (no MinIO here) is a `file://` directory;
     /// - `--driver=container` stays, over the stand-in `crun`: `--oci-runtime=` names it,
-    ///   the id tools and a failing `podman` are on `PATH`, their cgroup tree
+    ///   the id tools are on `PATH`, their cgroup tree
     ///   (`--cgroup-root`, `--self-cgroup`) is planted and `--id-files` stands for
     ///   `/etc/subuid`.
     ///
@@ -302,8 +302,8 @@ impl Farm {
     }
 
     /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools and a failing
-    /// `podman` on `PATH` and the planted cgroup tree and id files.
+    /// the unit's `--oci-runtime` made the stand-in `crun`, the id tools on `PATH` and
+    /// the planted cgroup tree and id files.
     fn launch(&mut self, dir: &Path, root: &Path, name: &str, unit: Rendered, bin: Option<&Path>) {
         let (unit, cwd, mut env) = match bin {
             Some(bin) => {
@@ -388,12 +388,6 @@ impl Farm {
         for i in (0..self.procs.len()).rev() {
             let status = self.procs[i].term();
             assert!(status.success(), "{status}\n{}", self.logs());
-        }
-        // The `podman` first on each node's PATH fails and records that it ran: kbf
-        // never starts it.
-        for root in &self.roots {
-            let ran = podman_ran(&root.join("bin"));
-            assert_eq!(ran, "", "podman ran on {}", root.display());
         }
     }
 

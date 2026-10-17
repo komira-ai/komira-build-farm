@@ -3,7 +3,7 @@
 //! is all there is to it: no image `ENV`, no node configuration (no `containers.conf`) and
 //! no runtime default is read, so what the action sees is what these tests name.
 //!
-//! Run by `cargo xtask podman-tests`, like `podman.rs` (each test is `#[ignore]` with
+//! Run by `cargo xtask crun-tests`, like `crun.rs` (each test is `#[ignore]` with
 //! that reason).
 
 mod support;
@@ -31,7 +31,7 @@ fn env_action(env: &[(&str, &str)]) -> Spec {
 /// variables. One that sets neither gets the two the driver adds: `HOSTNAME=localhost`
 /// and `HOME=/root`.
 #[tokio::test]
-#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_action_sees_only_the_commands_environment() {
     let cell = Cell::new("env");
     let sorted = |stdout: &str| -> Vec<String> {
@@ -85,7 +85,7 @@ fn expected(limits: ContainerLimits) -> String {
 /// `pids.max` then reads `max`, no limit at all), a limit that is not the configured one,
 /// and the action not running as the container's root.
 #[tokio::test]
-#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_configured_limits_hold_inside_the_container() {
     let limits = ContainerLimits {
         pids: 321,
@@ -103,7 +103,7 @@ async fn the_configured_limits_hold_inside_the_container() {
 /// Catches defaults a stock host refuses (a ulimit above the daemon's own hard limit
 /// fails the container's start), and defaults that do not hold.
 #[tokio::test]
-#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_default_limits_hold_inside_the_container() {
     let cell = Cell::new("default-limits");
     let result = cell.run(1, &sh(LIMITS)).await.expect("ran");
@@ -120,7 +120,7 @@ async fn the_default_limits_hold_inside_the_container() {
 /// program and where it was looked up. The red run before the fix showed each as
 /// `RuntimeError::Failed` ("the container did not run to an exit").
 #[tokio::test]
-#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn a_program_the_container_cannot_start_is_the_actions_failure() {
     let cell = Cell::new("program");
     let action = |argv: &[&str], env: &[(&str, &str)]| {

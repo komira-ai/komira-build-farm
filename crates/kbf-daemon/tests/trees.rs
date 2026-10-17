@@ -4,8 +4,8 @@
 //! eviction that spares what a lease holds, and what the tree on disk is.
 //!
 //! What this file cannot show: that a running container's write into a mount fails
-//! `EROFS` (needs a mount namespace); `kbf-driver-container`'s `podman_trees.rs` does,
-//! on real rootless Podman. Here the other barrier is checked: the tree's files are not
+//! `EROFS` (needs a mount namespace); `kbf-driver-container`'s `crun_cache.rs` does,
+//! on real rootless `crun`. Here the other barrier is checked: the tree's files are not
 //! writable by anyone, and are the cache's inodes.
 #![cfg(target_os = "linux")]
 
@@ -564,8 +564,8 @@ async fn at_most_max_mounts_trees_the_largest_first() {
 }
 
 /// A tree larger than the store's budget is never built (a store that cannot hold it
-/// would build and evict it for every lease); a path that podman's `--volume` syntax
-/// would split is linked, not mounted.
+/// would build and evict it for every lease); a path with ':' or ','
+/// in it is linked, not mounted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_the_store_cannot_hold_or_name_is_linked() {
     let kit = kit("trees-too-big", |c| c.max_bytes = 1000);
@@ -628,7 +628,7 @@ async fn eviction_takes_the_least_recent_unpinned_tree_and_never_a_pinned_one() 
 /// A symlink in a tree stays a symlink (its target is not followed on the host or
 /// rewritten), counts as a file, and a hard-linked pair (two names of one blob) is one
 /// inode: so `link(2)` of a tree file into the input root is a link across the mount in
-/// the container (`EXDEV`; documented in `trees`, shown on real Podman), and two names
+/// the container (`EXDEV`; documented in `trees`, shown on real `crun`), and two names
 /// in a tree share their inode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn symlinks_stay_symlinks_and_equal_files_share_an_inode() {

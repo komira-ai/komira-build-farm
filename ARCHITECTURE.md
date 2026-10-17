@@ -145,7 +145,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, input and output trees, the input cache |
 | `kbf-transfer` | no | the shared blob transfer engine: the `Cas` trait, and `Transfers`, one per daemon process: one HTTP/2 connection to the worker listener with explicit windows, one in-flight limit and byte budget for every lease, one fetch per digest however many leases ask, FindMissing before every upload, resumed reads after a broken connection, and each lease's `TransferStats` ([worker-cache.md](docs/design/worker-cache.md) section 4) |
-| `kbf-driver-container` | no | the rootless `crun` execution driver (the OCI backend; Podman is not used) |
+| `kbf-driver-container` | no | the rootless `crun` execution driver |
 | `kbf-image` | no | the node's image source: a digest-verified registry client (hyper over rustls) and the layer unpacker (whiteouts, ownership, in-root path resolution) |
 | `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
 | `kbf-node` | no | the worker daemon as a library (flags, the driver `--driver` names, the data directory `--data-dir` (`leases/`, the input cache and the input trees, sized from the filesystem), `start` returning a `NodeHandle`, over the transfer engine; `start_with`, over a data plane the caller makes) and the `kbf-daemon` binary, a thin main over it. Only a combined binary may link both this and `kbf-server` (`kbf-it` `layering`) |

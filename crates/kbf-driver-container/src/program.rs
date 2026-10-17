@@ -4,24 +4,20 @@
 //! its environment is the `Command`'s alone. A program the OCI runtime cannot find or
 //! execute there would be the same on every node, so it is the `Command`'s fault
 //! (docs/design/failure-classes.md, 6.7): answered as the action's result, exit 127
-//! (not found) or 126 (found, not an executable file), as a shell and `podman run`
-//! answer, with kbf's message on stderr before Podman's own words. A non-zero exit is
-//! never cached.
+//! (not found) or 126 (found, not an executable file), as a shell answers, with kbf's
+//! message on stderr before `crun`'s own words. A non-zero exit is never cached.
 //!
-//! Only crun's own report of its program lookup counts (crun 1.14, under the nodes'
-//! Podman 4.9): ``executable file `<argv[0]>` not found in $PATH`` for any `ENOENT`,
-//! and `open executable: ` for a file it may not execute or that is not a regular
-//! file. Podman's wrapping does not count: it calls every runtime "No such file or
-//! directory" "a command that was not found" (a missing mount source among them) and
-//! every "Operation not permitted" "OCI permission denied" (a cgroup it may not write),
-//! which are the farm's. Neither does a report from any other runtime: that start
-//! stays the farm's failure, with Podman's words in it.
+//! Only crun's own report of its program lookup counts (crun 1.14): ``executable file
+//! `<argv[0]>` not found in $PATH`` for any `ENOENT`, and `open executable: ` for a file
+//! it may not execute or that is not a regular file. Any other report (a missing mount
+//! source, a cgroup it may not write) is the farm's: that start stays the farm's
+//! failure, with `crun`'s words in it.
 
 use std::path::{Path, PathBuf};
 
 use kbf_daemon::RuntimeError;
 
-use crate::podman::{ContainerSpec, EXEC_ROOT};
+use crate::container::{ContainerSpec, EXEC_ROOT};
 use crate::runtime::failed;
 
 /// How much of the runtime's words are read back when the container did not run.
@@ -35,7 +31,7 @@ pub(crate) enum Unstartable {
 }
 
 impl Unstartable {
-    /// What the action answers: the shell's and `podman run`'s exit codes.
+    /// What the action answers: the shell's exit codes.
     pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::NotFound => 127,
@@ -44,8 +40,8 @@ impl Unstartable {
     }
 }
 
-/// What crun's report in `said` (`podman start`'s stderr, for a container that did not
-/// run) says of `program`, if it is a report of the program lookup.
+/// What crun's report in `said` (for a container that did not run) says of `program`, if
+/// it is a report of the program lookup.
 pub(crate) fn classify(program: &str, said: &str) -> Option<Unstartable> {
     if said.contains(&format!("executable file `{program}` not found in $PATH")) {
         Some(Unstartable::NotFound)
@@ -85,62 +81,26 @@ pub(crate) fn message(
     format!("kbf: the action's program `{program}` {what} {place}")
 }
 
-/// Where a runtime's own words about a container that did not run are, and what they are
-/// called in the messages built from them.
+/// Where `crun`'s own words about a container that did not run are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Said {
-    /// The file the words are read from.
+    /// `crun`'s JSON log, which the words are read from.
     source: PathBuf,
     /// The action's stderr file, which a lookup report is rewritten into.
     stderr: PathBuf,
-    kind: Kind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    /// `podman start`'s stderr, which is the action's stderr file.
-    Podman,
-    /// `crun`'s JSON log.
-    Crun,
 }
 
 impl Said {
-    /// Podman's: what `podman start` wrote to the action's `stderr` file.
-    pub(crate) fn podman(stderr: &Path) -> Self {
-        Self {
-            source: stderr.to_owned(),
-            stderr: stderr.to_owned(),
-            kind: Kind::Podman,
-        }
-    }
-
-    /// `crun`'s: the error records of its `--log` file `log`, in the same words as
-    /// Podman relays them (`crun: <message>`); the action's own stderr stays `stderr`.
+    /// The error records of `crun`'s `--log` file `log`, as `crun: <message>`; the
+    /// action's own stderr stays `stderr`.
     pub(crate) fn crun(log: &Path, stderr: &Path) -> Self {
         Self {
             source: log.to_owned(),
             stderr: stderr.to_owned(),
-            kind: Kind::Crun,
         }
     }
 
-    /// The runtime's name in "the container did not run to an exit: <it> reports ...".
-    fn reports(&self) -> &'static str {
-        match self.kind {
-            Kind::Podman => "podman",
-            Kind::Crun => "crun",
-        }
-    }
-
-    /// What the words are called after the semicolon.
-    fn label(&self) -> &'static str {
-        match self.kind {
-            Kind::Podman => "podman start",
-            Kind::Crun => "crun log",
-        }
-    }
-
-    /// At most [`SAID_MAX`] bytes of the words.
+    /// At most [`SAID_MAX`] bytes of the log, as its error records.
     pub(crate) async fn read(&self) -> std::io::Result<String> {
         use tokio::io::AsyncReadExt as _;
         let mut bytes = Vec::new();
@@ -149,17 +109,12 @@ impl Said {
             .take(SAID_MAX)
             .read_to_end(&mut bytes)
             .await?;
-        let text = String::from_utf8_lossy(&bytes);
-        Ok(match self.kind {
-            Kind::Podman => text.trim().to_owned(),
-            Kind::Crun => crun_words(&text),
-        })
+        Ok(crun_words(&String::from_utf8_lossy(&bytes)))
     }
 }
 
 /// The error records of a `crun --log-format=json` log, as `crun: <message>` joined by
-/// `; ` (what Podman relays of them). A line that is not a JSON record, and a record of
-/// another level, are left out.
+/// `; `. A line that is not a JSON record, and a record of another level, are left out.
 pub(crate) fn crun_words(log: &str) -> String {
     log.lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -167,12 +122,6 @@ pub(crate) fn crun_words(log: &str) -> String {
         .filter_map(|record| record["msg"].as_str().map(|msg| format!("crun: {msg}")))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// What `podman start` wrote to `stderr` (its own words: the container did not run),
-/// at most [`SAID_MAX`] bytes of it.
-pub(crate) async fn said(stderr: &Path) -> std::io::Result<String> {
-    Said::podman(stderr).read().await
 }
 
 /// Whether the report is crun's exec of the program failing with `ETXTBSY`
@@ -201,18 +150,9 @@ pub(crate) async fn not_run(
         .map_err(|e| failed(&said.source, &e))?
     {
         Ok(why) => Ok(why.exit_code()),
-        Err(words) => {
-            let words = if words.is_empty() {
-                "(nothing on stderr)"
-            } else {
-                &words
-            };
-            Err(RuntimeError::Failed(format!(
-                "the container did not run to an exit: {} reports {state:?}; {}: {words}",
-                said.reports(),
-                said.label()
-            )))
-        }
+        Err(words) => Err(RuntimeError::Failed(format!(
+            "the container did not run to an exit: crun reports {state:?}; crun log: {words}"
+        ))),
     }
 }
 
@@ -226,11 +166,7 @@ async fn answer(spec: &ContainerSpec, said: &Said) -> std::io::Result<Result<Uns
     };
     let message = message(why, program, &spec.env, &spec.working_directory);
     tracing::info!(container = %spec.name, "{message}");
-    tokio::fs::write(
-        &said.stderr,
-        format!("{message}\n{}: {words}\n", said.label()),
-    )
-    .await?;
+    tokio::fs::write(&said.stderr, format!("{message}\ncrun log: {words}\n")).await?;
     Ok(Ok(why))
 }
 
@@ -242,8 +178,8 @@ mod tests {
         `env` not found in $PATH: No such file or directory: OCI runtime attempted to invoke \
         a command that was not found";
 
-    /// Catches a lookup report for another program taken for this one's, Podman's
-    /// wrapping taken for crun's report (a mount source it could not find, a cgroup
+    /// Catches a lookup report for another program taken for this one's, another
+    /// report of crun's taken for the lookup (a mount source it could not find, a cgroup
     /// file it may not write: the farm's), and the two kinds swapped.
     #[test]
     fn only_crun_reporting_the_lookup_counts() {
@@ -264,20 +200,20 @@ mod tests {
         assert_eq!(Unstartable::NotExecutable.exit_code(), 126);
     }
 
-    /// Catches a Podman report the driver cannot read back taken for anything but the
-    /// farm's failure, naming the file.
+    /// Catches a log the driver cannot read back taken for anything but the farm's
+    /// failure, naming the file.
     #[tokio::test]
     async fn a_report_that_cannot_be_read_is_the_farms() {
-        let stderr = Path::new("/nonexistent/kbf-lease/stderr");
+        let log = Path::new("/nonexistent/kbf-lease/crun.log");
         let outcome = not_run(
-            &crate::podman::tests::spec(),
-            &Said::podman(stderr),
-            "created 0",
+            &crate::container::tests::spec(),
+            &Said::crun(log, Path::new("/nonexistent/kbf-lease/stderr")),
+            "exited 1",
         )
         .await;
         assert_eq!(
             format!("{outcome:?}"),
-            "Err(Failed(\"/nonexistent/kbf-lease/stderr: No such file or directory (os error 2)\"))"
+            "Err(Failed(\"/nonexistent/kbf-lease/crun.log: No such file or directory (os error 2)\"))"
         );
     }
 
@@ -331,7 +267,7 @@ mod tests {
     /// a runtime failure), an error record lost, a line that is not a record breaking
     /// the rest, and the words not matching what the lookup classifier reads.
     #[test]
-    fn crun_words_are_its_error_records_in_podmans_form() {
+    fn crun_words_are_its_error_records() {
         let words = crun_words(LOG);
         assert_eq!(
             words,
@@ -353,7 +289,7 @@ mod tests {
         let stderr = dir.join("stderr");
         std::fs::write(&log, LOG).expect("log");
         std::fs::write(&stderr, b"the action's own words\n").expect("stderr");
-        let mut spec = crate::podman::tests::spec();
+        let mut spec = crate::container::tests::spec();
         spec.argv = vec!["env".to_owned()];
         let said = Said::crun(&log, &stderr);
         assert_eq!(not_run(&spec, &said, "exited 1").await.expect("127"), 127);
@@ -389,34 +325,16 @@ mod tests {
         assert!(text_file_busy(&said).await);
     }
 
-    /// Catches a runtime that said nothing named as if it had said something: the
-    /// farm's failure then says so.
-    #[tokio::test]
-    async fn a_runtime_that_said_nothing_is_named_so() {
-        let dir = scratch("said-nothing");
-        let report = dir.join("stderr");
-        std::fs::write(&report, b"").expect("report");
-        let outcome = not_run(
-            &crate::podman::tests::spec(),
-            &Said::podman(&report),
-            "created 0",
-        )
-        .await;
-        let why = outcome.expect_err("the farm's failure").to_string();
-        assert!(why.contains("podman reports \"created 0\""), "{why}");
-        assert!(why.ends_with("(nothing on stderr)"), "{why}");
-    }
-
     /// Catches a report that opens but cannot be read, and a rewritten stderr that cannot
     /// be written, passed over as if nothing happened: each is the farm's failure, naming
     /// the file (a directory opens, and fails to be read or written).
     #[tokio::test]
     async fn a_report_read_or_rewrite_that_fails_is_the_farms() {
         let dir = scratch("io-fails");
-        let mut spec = crate::podman::tests::spec();
+        let mut spec = crate::container::tests::spec();
         spec.argv = vec!["env".to_owned()];
 
-        let unreadable = not_run(&spec, &Said::podman(&dir), "created 0").await;
+        let unreadable = not_run(&spec, &Said::crun(&dir, &dir.join("stderr")), "exited 1").await;
         let why = unreadable.expect_err("unreadable").to_string();
         assert!(why.contains(&format!("{}: ", dir.display())), "{why}");
 
