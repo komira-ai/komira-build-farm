@@ -16,6 +16,7 @@ use kbf_history::{Allow, IndexRoot, ListQuery, ListedInvocation, PageCursor};
 use serde_json::{Value, json};
 
 use super::{Cross, reply};
+use crate::history::HistoryReads;
 use crate::http_history::query::{Query, at_ms, bad};
 use crate::http_history::scope::Scope;
 use crate::http_history::unreadable;
@@ -69,18 +70,63 @@ async fn read(cross: &Cross, parts: &Parts) -> Result<Value, Response> {
     // Every instance asked about, not only those listed: an invocation shows when all the
     // instances it used are allowed.
     let allow: Allow<'_> = &|instance: &str| scope.allows(instance);
+    let filter = Listing {
+        since_ms,
+        until_ms,
+        state,
+        size,
+        after: after.as_ref(),
+    };
+    let reads = &cross.durable.reads;
+    let Merged { items, next } = merged(reads, &instances, &filter, allow).await?;
+    let mut answer =
+        json!({"invocations": items.iter().map(|i| item(&i.header)).collect::<Vec<_>>()});
+    if let Some(next) = next {
+        answer["next_page"] = q.next_page(ROUTE, size, &q.token(ROUTE, &next)).into();
+    }
+    if partial {
+        answer["partial"] = true.into();
+    }
+    Ok(answer)
+}
+
+/// What a page of the list is asked for besides the instances.
+pub(super) struct Listing<'a> {
+    pub(super) since_ms: u64,
+    pub(super) until_ms: u64,
+    pub(super) state: Option<InvState>,
+    pub(super) size: usize,
+    pub(super) after: Option<&'a PageCursor>,
+}
+
+/// A page of the merged lists of several instances.
+pub(super) struct Merged {
+    /// The invocations, newest first, one each.
+    pub(super) items: Vec<ListedInvocation>,
+    /// Where the next page starts, as the text a page token carries; `None` after the
+    /// last.
+    pub(super) next: Option<String>,
+}
+
+/// The newest `filter.size` invocations of `instances` after `filter.after`, merged and
+/// each shown once; `allow` accepts the instances every invocation listed used.
+pub(super) async fn merged(
+    reads: &HistoryReads,
+    instances: &[String],
+    filter: &Listing<'_>,
+    allow: Allow<'_>,
+) -> Result<Merged, Response> {
     let queries: Vec<ListQuery<'_>> = instances
         .iter()
         .map(|instance| ListQuery {
             instance,
-            since_ms,
-            until_ms,
-            state,
-            limit: size,
-            after: after.as_ref(),
+            since_ms: filter.since_ms,
+            until_ms: filter.until_ms,
+            state: filter.state,
+            limit: filter.size,
+            after: filter.after,
         })
         .collect();
-    let reads = &cross.durable.reads;
     let pages = futures::future::try_join_all(
         queries
             .iter()
@@ -110,22 +156,17 @@ async fn read(cross: &Cross, parts: &Parts) -> Result<Value, Response> {
     // One entry per invocation: the same invocation listed under two instances has the
     // same key time and so the same tail.
     merged.dedup_by(|a, b| a.0 == b.0);
-    let more = merged.len() > size;
-    merged.truncate(size);
+    let more = merged.len() > filter.size;
+    merged.truncate(filter.size);
     let next = if more {
         merged.last().map(|(tail, _)| tail.clone())
     } else {
         covered
     };
-    let mut answer =
-        json!({"invocations": merged.iter().map(|(_, i)| item(&i.header)).collect::<Vec<_>>()});
-    if let Some(next) = next {
-        answer["next_page"] = q.next_page(ROUTE, size, &q.token(ROUTE, &next)).into();
-    }
-    if partial {
-        answer["partial"] = true.into();
-    }
-    Ok(answer)
+    Ok(Merged {
+        items: merged.into_iter().map(|(_, item)| item).collect(),
+        next,
+    })
 }
 
 /// One invocation of the list, from its header.

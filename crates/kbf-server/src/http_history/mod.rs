@@ -151,10 +151,20 @@ impl Durable {
             .map_err(|bad| bad_answer(&bad, &name, since))
     }
 
-    /// Every run and hit record of `key` that `allow` accepts, up to [`MAX_RECORDS`],
-    /// and whether there were more. `None` when the reader no longer answers for the
+    /// Every run and hit record of `key` that `allow` accepts, up to [`MAX_RECORDS`], and
+    /// whether there were more. `None` when the reader no longer answers for the
     /// invocation (its header lists an instance `allow` does not).
     async fn gather(&self, key: &InvKey, allow: Allow<'_>) -> Result<Option<Gathered>, ReadError> {
+        self.gather_up_to(key, allow, self.max_records).await
+    }
+
+    /// [`Durable::gather`], up to `max_records` records.
+    async fn gather_up_to(
+        &self,
+        key: &InvKey,
+        allow: Allow<'_>,
+        max_records: usize,
+    ) -> Result<Option<Gathered>, ReadError> {
         let (mut runs, mut hits) = (Vec::new(), Vec::new());
         let mut after: Option<ChunkCursor> = None;
         loop {
@@ -169,7 +179,7 @@ impl Durable {
             hits.extend(page.hits);
             // The last page, or as many records as one read takes.
             let more = page.next;
-            let capped = more.is_some() && runs.len() + hits.len() >= self.max_records;
+            let capped = more.is_some() && runs.len() + hits.len() >= max_records;
             if more.is_none() || capped {
                 return Ok(Some(Gathered { runs, hits, capped }));
             }

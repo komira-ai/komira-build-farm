@@ -61,6 +61,7 @@ use crate::rows::{ShapeKind, ShapeRow};
 use crate::run_id::{Minter, StreamId};
 use crate::scoped::Scoped;
 use crate::status::{self, Observed};
+use crate::today::{TODAY_BYTES, Today, TodayRun};
 
 const MS_PER_DAY: u64 = 86_400_000;
 
@@ -99,6 +100,9 @@ pub struct Limits {
     pub header_reads_per_step: usize,
     /// The shape and status rows' bounds.
     pub derived: DerivedLimits,
+    /// Bytes of today's runs held in memory at most ([`Today`]); the oldest are
+    /// forgotten first.
+    pub today_bytes: usize,
 }
 
 impl Default for Limits {
@@ -116,6 +120,7 @@ impl Default for Limits {
             invocations: 4096,
             header_reads_per_step: 256,
             derived: DerivedLimits::default(),
+            today_bytes: TODAY_BYTES,
         }
     }
 }
@@ -228,6 +233,7 @@ struct Core {
     pending: Pending,
     kept: Kept,
     derived: Derived,
+    today: Arc<Today>,
     drops: Drops,
     /// An index transaction failed this step: the index is not draining.
     index_failed: bool,
@@ -265,6 +271,7 @@ impl<O: ObjectStore> Writer<O> {
                 pending: Pending::new(limits.pending),
                 kept: Kept::new(limits.kept),
                 derived: Derived::new(limits.derived),
+                today: Arc::new(Today::new(limits.today_bytes)),
                 drops: Drops::default(),
                 index_failed: false,
                 refill_failed: false,
@@ -419,6 +426,13 @@ impl<O: ObjectStore> Writer<O> {
         self.objects.get_range(&object.key, range).await
     }
 
+    /// Today's runs, which the writer feeds from the events it drains. The reads that
+    /// have no day index yet hold this handle.
+    #[must_use]
+    pub fn today(&self) -> Arc<Today> {
+        Arc::clone(&self.core.today)
+    }
+
     /// The writer's drop counts.
     #[must_use]
     pub fn drops(&self) -> Drops {
@@ -462,6 +476,7 @@ impl Core {
     /// Takes the queued events into the invocations' chunks.
     fn take_events(&mut self, now_ms: u64) {
         self.minter.forget_before(Day::from_ms(now_ms));
+        self.today.begin(now_ms);
         for event in self.queue.drain() {
             self.ingest(event, now_ms);
         }
@@ -773,6 +788,7 @@ impl Core {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, Some(record.stream), now_ms);
                 self.observe(&inv, &record);
+                self.today.push(TodayRun::of(&record));
                 let state = self.state(&inv.key);
                 note(&mut state.header, &record.instance, record.time_ms);
                 state.header.runs += 1;

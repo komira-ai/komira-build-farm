@@ -6,10 +6,12 @@
 //! right, `edges` what goes wrong or is refused.
 
 mod edges;
+mod grid;
 mod kit;
 mod list;
 #[path = "../pages/mod.rs"]
 mod pages;
 mod shapes;
+mod today;
 #[path = "../history_read/world.rs"]
 mod world;

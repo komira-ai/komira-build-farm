@@ -33,8 +33,10 @@ use super::{Durable, unreadable};
 use crate::http_blobs::refusal;
 use crate::http_invocations::{InvocationReaders, json, pages_off};
 
+mod grid;
 mod list;
 mod shapes;
+mod today;
 
 /// How long the instance names read from the index are used again.
 pub(super) const NAMES_FRESH: Duration = Duration::from_secs(60);
@@ -171,6 +173,9 @@ pub(crate) fn router(readers: Option<InvocationReaders>, durable: Arc<Durable>) 
         .route("/v1/tests", get(shapes::tests))
         .route("/v1/shapes/{key}", get(shapes::one))
         .route("/v1/shapes/{key}/runs", get(shapes::runs))
+        .route("/v1/grid", get(grid::page))
+        .route("/v1/actions/{digest}/runs", get(today::of_action))
+        .route("/v1/runs", get(today::on_node))
         .with_state(state)
 }
 

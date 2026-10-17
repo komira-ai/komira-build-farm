@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use crate::kit::{indexed, run, shape};
 use crate::pages::{PAGES_ONLY, Server};
-use crate::world::{ONLY_A, World, ran};
+use crate::pages::{digest, text};
+use crate::world::{ONLY_A, World, ran, ran_action};
 
 const SHARED: u64 = 0x1111_1111_1111_1111;
 const THEIRS: u64 = 0x3333_3333_3333_3333;
@@ -25,8 +26,9 @@ fn names(answer: &Value, list: &str, field: &str) -> Vec<String> {
 
 /// A server over history with two instances' builds: `mine` on `a/main`, `theirs` on `b`
 /// and `span` on both. Test `SHARED` fails on both instances, `THEIRS` only on `b`;
-/// `COMPILE` is no test, on `a/main`.
-async fn two_instances(world: &World) {
+/// `COMPILE` is no test, on `a/main`. Action 7 ran on both instances. The server is
+/// running, with today's runs in its index.
+async fn two_instances(world: &World) -> Server {
     let a = world.start(ONLY_A);
     let mut events = run("mine", "a/main", shape(SHARED, "c", true, None), 1, 2);
     events.extend(run(
@@ -40,16 +42,18 @@ async fn two_instances(world: &World) {
     events.extend(run("theirs", "b", shape(THEIRS, "c", true, None), 4, 2));
     events.extend(ran("span", "a/main", 5, 5, 0));
     events.extend(ran("span", "b", 6, 6, 0));
+    events.extend(ran_action("mine", "a/main", 7, 7, 7, 0));
+    events.extend(ran_action("theirs", "b", 7, 8, 8, 0));
     a.feed(events).await;
-    world.flushed("mine", 2).await;
-    world.flushed("theirs", 2).await;
+    world.flushed("mine", 3).await;
+    world.flushed("theirs", 3).await;
     world.flushed("span", 2).await;
     indexed(world, 4, 3).await;
     crate::kit::until("every by-status row", || {
         world.rows("ui/statusx/failing/").len() == 3
     })
     .await;
-    a.stop().await;
+    a
 }
 
 /// Catches (security, ui-data 8; mutants "authorize only the query's `instance=`" and "a
@@ -62,7 +66,53 @@ async fn two_instances(world: &World) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_caller_sees_only_its_instances_on_every_route() {
     let world = World::new();
-    two_instances(&world).await;
+    let a = two_instances(&world).await;
+
+    // Today's runs: the index holds both instances', and the caller sees one.
+    let instances = |answer: &Value| -> Vec<String> { names(answer, "runs", "instance") };
+    let action = format!("/v1/actions/{}/runs", text(&digest(7)));
+    let by_digest = a.ok(&action).await;
+    assert_eq!(instances(&by_digest), ["a/main"], "{by_digest}");
+    let on_node = a.ok("/v1/runs?node=node-a").await;
+    let listed = instances(&on_node);
+    assert!(
+        !listed.is_empty() && listed.iter().all(|i| i == "a/main"),
+        "{on_node}"
+    );
+    assert_eq!(
+        listed.len(),
+        4,
+        "mine's three runs and span's one: {on_node}"
+    );
+    for route in [
+        format!("{action}?instance=b"),
+        "/v1/runs?node=node-a&instance=b".to_owned(),
+        format!("/v1/grid?shapes={SHARED:016x}&last=5&instance=b"),
+    ] {
+        assert_eq!(a.get(&route).await.code, 403, "{route}");
+    }
+    // The grid: only builds whose every instance the caller may read.
+    let shapes = format!("{SHARED:016x}");
+    let own = a
+        .ok(&format!("/v1/grid?shapes={shapes}&invocations=mine"))
+        .await;
+    assert_eq!(own["rows"].as_array().map(Vec::len), Some(1), "{own}");
+    assert_eq!(own["rows"][0]["instance"], "a/main");
+    for refused in ["theirs", "span", "mine,theirs", "nonesuch"] {
+        let answer = a
+            .get(&format!("/v1/grid?shapes={shapes}&invocations={refused}"))
+            .await;
+        assert_eq!(answer.code, 404, "{refused}: {}", answer.json);
+        assert_eq!(
+            answer.json["error"], "no_record",
+            "a refused build is a missing one"
+        );
+        assert!(answer.json.get("rows").is_none());
+    }
+    let last = a.ok(&format!("/v1/grid?shapes={shapes}&last=5")).await;
+    assert_eq!(names(&last, "columns", "id"), ["mine"], "{last}");
+    a.stop().await;
+
     let b = world.start(ONLY_A);
 
     let list = b.ok("/v1/invocations").await;
@@ -190,6 +240,12 @@ async fn commit_filter_is_400() {
         assert!(answer.json.get("invocations").is_none());
     }
     assert_eq!(a.get("/v1/invocations").await.code, 200);
+    // The grid has no commit columns either.
+    let grid = a
+        .get("/v1/grid?shapes=1111111111111111&last=1&columns=commit")
+        .await;
+    assert_eq!(grid.code, 400, "{}", grid.json);
+    assert_eq!(grid.json["error"], "needs_report");
     a.stop().await;
 }
 
@@ -232,9 +288,46 @@ async fn a_bad_query_or_token_is_400_with_a_name() {
             "/v1/shapes/1111111111111111/runs?instance=main",
             "/v1/shapes/1111111111111111/runs?cfg=c",
             "/v1/shapes/1111111111111111?page_size=0",
+            // The grid: what to read and which builds.
+            "/v1/grid?last=1",
+            "/v1/grid?shapes=xyz&last=1",
+            "/v1/grid?shapes=1111111111111111",
+            "/v1/grid?shapes=1111111111111111&last=1&invocations=a",
+            "/v1/grid?shapes=1111111111111111&last=0",
+            "/v1/grid?shapes=1111111111111111&last=51",
+            "/v1/grid?shapes=1111111111111111&last=many",
+            "/v1/grid?shapes=1111111111111111&invocations=a,a",
+            "/v1/grid?shapes=1111111111111111&invocations=a,,b",
+            "/v1/grid?shapes=1111111111111111&last=1&columns=bogus",
+            "/v1/grid?shapes=1111111111111111&last=1&foo=1",
+            // Today's runs.
+            "/v1/actions/nonsense/runs",
+            "/v1/actions/nonsense/runs?page_size=0",
+            "/v1/runs",
+            "/v1/runs?node=a&class=exploded",
+            "/v1/runs?node=a&from=2030-01-02T00:00:00Z&to=2030-01-01T00:00:00Z",
+            "/v1/runs?node=a&from=lately",
+            "/v1/runs?node=a&page_size=201",
         ]
         .map(str::to_owned)
-        .into(),
+        .into_iter()
+        .chain([
+            format!(
+                "/v1/grid?shapes={}&last=1",
+                (0..51)
+                    .map(|i| format!("{i:016x}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            format!(
+                "/v1/grid?shapes=1111111111111111&invocations={}",
+                (0..51)
+                    .map(|i| format!("i{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ])
+        .collect(),
     )
     .await;
     expect(
@@ -270,6 +363,13 @@ async fn a_bad_query_or_token_is_400_with_a_name() {
             format!("/v1/shapes?page_token={}", token("/v1/shapes\n\n99:ab")),
             format!("/v1/shapes?page_token={}", token("/v1/shapes\n\n1:\u{e9}")),
             format!("/v1/shapes?page_token={}", token("/v1/shapes\n\n1:a\u{1}")),
+            // Today's runs: a position that is no number.
+            format!("/v1/runs?node=a&page_token={}", token("/v1/runs\n\nx")),
+            format!(
+                "/v1/actions/{}-1/runs?page_token={}",
+                "00".repeat(32),
+                token("/v1/actions/{digest}/runs\n\nx")
+            ),
         ]
         .into(),
     )
@@ -288,6 +388,9 @@ async fn the_routes_follow_the_build_pages_policy() {
         "/v1/tests",
         "/v1/shapes/1111111111111111",
         "/v1/shapes/1111111111111111/runs?instance=main&cfg=c",
+        "/v1/grid?shapes=1111111111111111&last=1",
+        "/v1/actions/00-1/runs",
+        "/v1/runs?node=a",
     ];
     let world = World::new();
     let denied = world.start(
@@ -330,6 +433,9 @@ async fn without_history_the_routes_do_not_exist() {
         "/v1/tests?status=slower",
         "/v1/shapes/1111111111111111",
         "/v1/shapes/1111111111111111/runs?instance=a&cfg=b",
+        "/v1/grid?shapes=1111111111111111&last=1",
+        "/v1/actions/00-1/runs",
+        "/v1/runs?node=a",
     ] {
         let answer = server.get(route).await;
         assert_eq!(answer.code, unknown.code, "{route}");

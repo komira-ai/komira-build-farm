@@ -10,6 +10,7 @@ mod scoped;
 mod sqlite;
 mod status;
 mod support;
+mod today;
 mod writer;
 mod writer_bounds;
 mod writer_rows;

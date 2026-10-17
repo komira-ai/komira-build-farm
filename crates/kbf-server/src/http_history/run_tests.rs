@@ -267,7 +267,7 @@ mod recorder_side {
     use kbf_front::{Recorder, Tap};
     use kbf_history::{
         EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, Minter, QueueLimits, Reader,
-        RunId,
+        RunId, Today,
     };
     use kbf_invocation::{
         Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Metadata, Outcome,
@@ -344,7 +344,8 @@ mod recorder_side {
         ));
         let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("a prefix")).expect("a root");
         let index = HistoryIndex::new(store, IndexRoot::default(), Arc::new(Inline));
-        let reads = HistoryReads::new(Reader::new(objects, root, index), Arc::clone(&runs));
+        let today = Arc::new(Today::new(0));
+        let reads = HistoryReads::new(Reader::new(objects, root, index), Arc::clone(&runs), today);
         let state = RunState {
             recorder,
             readers: None,

@@ -223,7 +223,7 @@ fn time(us: u64) -> Value {
 }
 
 /// A run's class, by the name the API gives it.
-fn class(outcome: RunOutcome) -> &'static str {
+pub(super) fn class(outcome: RunOutcome) -> &'static str {
     match outcome {
         RunOutcome::Unspecified => "unspecified",
         RunOutcome::Ok => "ok",

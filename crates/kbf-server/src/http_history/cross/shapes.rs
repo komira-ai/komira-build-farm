@@ -294,7 +294,7 @@ fn ring_run(r: &RingRun) -> Value {
 }
 
 /// The key `text` is: 16 lowercase hex digits.
-fn parse_key(text: &str) -> Result<u64, Response> {
+pub(super) fn parse_key(text: &str) -> Result<u64, Response> {
     let valid = text.len() == 16 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     valid
         .then(|| u64::from_str_radix(text, 16).ok())

@@ -287,6 +287,19 @@ pub fn measured(t: u64) -> Run {
 /// The events of action `n` of invocation `id` on `instance`: queued as operation
 /// `op`, run on a node and finished with `exit_code`.
 pub fn ran(id: &str, instance: &str, n: u8, op: u64, exit_code: i32) -> Vec<Event> {
+    ran_action(id, instance, n, n, op, exit_code)
+}
+
+/// [`ran`] for the action whose digest is that of `action`, at the time of `n`: the same
+/// action run again, later.
+pub fn ran_action(
+    id: &str,
+    instance: &str,
+    action: u8,
+    n: u8,
+    op: u64,
+    exit_code: i32,
+) -> Vec<Event> {
     let t = u64::from(n) * 1_000;
     let l = listing(
         digest(100 + u64::from(n)),
@@ -295,7 +308,7 @@ pub fn ran(id: &str, instance: &str, n: u8, op: u64, exit_code: i32) -> Vec<Even
         (Some(digest(140 + u64::from(n))), None),
     );
     vec![
-        queued(id, instance, later(t), digest(u64::from(n)), op),
+        queued(id, instance, later(t), digest(u64::from(action)), op),
         granted(op, 1, "node-a", later(t + 10)),
         started(op, 1, later(t + 12)),
         Event::Ran {

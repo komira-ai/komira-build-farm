@@ -10,7 +10,7 @@ use futures::future::BoxFuture;
 use kbf_history::{
     Allow, ChunkCursor, InstanceList, InvKey, InvocationPage, InvocationView, ListQuery,
     PageCursor, ReadError, Reader, RecordsPage, RunId, RunView, ShapeEntry, ShapePage, StatusEntry,
-    StatusKind, StatusPage,
+    StatusKind, StatusPage, Today,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
@@ -253,14 +253,25 @@ impl<O: ObjectStore> Source for Reader<O> {
 pub struct HistoryReads {
     source: Box<dyn Source>,
     runs: Arc<RunIndex>,
+    today: Arc<Today>,
 }
 
 impl HistoryReads {
-    pub(crate) fn new<O: ObjectStore>(reader: Reader<O>, runs: Arc<RunIndex>) -> Self {
+    pub(crate) fn new<O: ObjectStore>(
+        reader: Reader<O>,
+        runs: Arc<RunIndex>,
+        today: Arc<Today>,
+    ) -> Self {
         Self {
             source: Box::new(reader),
             runs,
+            today,
         }
+    }
+
+    /// The runs of today the writer holds in memory.
+    pub(crate) fn today(&self) -> &Today {
+        &self.today
     }
 
     /// Where the live record of each recently minted run is.

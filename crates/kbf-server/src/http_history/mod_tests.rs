@@ -5,7 +5,7 @@
 use kbf_history::records::{RunOutcome, RunRecord, WireDigest};
 use kbf_history::{
     Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvKey, InvRef,
-    InvocationView, Limits, Minter, QueueLimits, Reader, Writer, WriterId,
+    InvocationView, Limits, Minter, QueueLimits, Reader, Today, Writer, WriterId,
 };
 use kbf_invocation::WallTime;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore, PageSize};
@@ -79,7 +79,7 @@ async fn rig(name: &str, n: u64) -> Rig {
         }
     }
     let reader = Reader::new(objects.clone(), root, index);
-    let reads = HistoryReads::new(reader, Arc::default());
+    let reads = HistoryReads::new(reader, Arc::default(), Arc::new(Today::new(0)));
     Rig {
         durable: Durable::new(Arc::new(reads)),
         objects,

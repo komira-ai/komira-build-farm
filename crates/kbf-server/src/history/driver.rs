@@ -131,8 +131,9 @@ pub fn over<O: ObjectStore>(
         Arc::clone(&queue),
         options.limits,
     );
+    let today = writer.today();
     let tap = Arc::new(HistoryTap::new(Arc::clone(&queue), minter));
-    let reads = Arc::new(HistoryReads::new(reader, tap.runs()));
+    let reads = Arc::new(HistoryReads::new(reader, tap.runs(), today));
     let stats = Arc::new(Stats::new(queue));
     let (stop, stopped) = oneshot::channel();
     let task = Box::pin(run(
