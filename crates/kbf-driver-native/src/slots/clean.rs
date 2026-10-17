@@ -373,6 +373,31 @@ mod tests {
         assert!(!fake.calls().contains(&Call::Recreate));
     }
 
+    /// Catches a recreate decision that remembers the first attempt's failed kill
+    /// (`again.processes || first.processes`): a first attempt whose kill failed, then
+    /// a retry whose kill succeeded and found no survivor but failed on the home, makes
+    /// the user again, because no process of the uid lives at the second attempt.
+    #[test]
+    fn a_kill_that_failed_only_at_the_first_attempt_does_not_quarantine_the_slot() {
+        let fake = Fake::failing(Step::Kill, 1);
+        fake.fails.borrow_mut().insert(Step::Home, 1);
+        assert_eq!(
+            clean(&fake),
+            Outcome::Recreated {
+                why: "home: home failed".to_owned()
+            }
+        );
+        // The first attempt stops at the failed kill, the retry runs every step and
+        // looks twice, the recreate follows and the attempt after it is whole.
+        let mut want = [Step::Bootout, Step::Schedules, Step::Kill]
+            .map(Call::Run)
+            .to_vec();
+        want.extend(whole_attempt());
+        want.push(Call::Recreate);
+        want.extend(whole_attempt());
+        assert_eq!(fake.calls(), want);
+    }
+
     /// Catches a slot given back although its user could not be made again, or was
     /// made again and still not clean: either quarantines it, saying why.
     #[test]
