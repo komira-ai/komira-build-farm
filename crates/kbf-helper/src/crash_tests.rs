@@ -123,8 +123,11 @@ impl World {
         )
     }
     fn order(&self, id: u64, verb: &str, commit: &str) {
+        self.order_in(id, 1, verb, commit);
+    }
+    fn order_in(&self, id: u64, epoch: u64, verb: &str, commit: &str) {
         fs::write(self.root.join("var/lib/kbf-updater/inbox/orders").join(format!("{id:020}.json")),
-            format!("{{\"order_id\":{id},\"epoch\":1,\"verb\":\"{verb}\",\"commit\":\"{commit}\",\"window_s\":600}}")).unwrap();
+            format!("{{\"order_id\":{id},\"epoch\":{epoch},\"verb\":\"{verb}\",\"commit\":\"{commit}\",\"window_s\":600}}")).unwrap();
     }
     fn restarts(&self) -> usize {
         self.host
@@ -200,6 +203,15 @@ fn prep(scn: &str, tag: &str) -> World {
             pass(&w, T0 + 3);
             w.order(7, "revert", A);
         }
+        // A revert from a restored store: epoch 2 counts its ids again, so id 1 is newer
+        // than id 6 of epoch 1.
+        "revert_in_a_new_epoch" => {
+            w.order(5, "activate", B);
+            pass(&w, T0);
+            w.order(6, "confirm", B);
+            pass(&w, T0 + 3);
+            w.order_in(1, 2, "revert", A);
+        }
         "expire" => {
             w.order(5, "activate", B);
             pass(&w, T0);
@@ -270,6 +282,11 @@ fn kill_at_every_step_of_an_activate() {
 #[test]
 fn kill_at_every_step_of_a_revert() {
     kill_at_every_step_of("revert");
+}
+
+#[test]
+fn kill_at_every_step_of_a_revert_in_a_new_epoch() {
+    kill_at_every_step_of("revert_in_a_new_epoch");
 }
 
 #[test]

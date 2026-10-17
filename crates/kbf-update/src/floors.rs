@@ -1,5 +1,5 @@
 //! What the client remembers across restarts so that it never goes backwards: the newest
-//! offer generation it has completed, and the newest order id it has accepted. One file,
+//! offer generation it has completed, and the newest order (epoch, then id) it has accepted. One file,
 //! `DIR/client.json`, replaced whole by a rename.
 
 use std::fs::{self, File, OpenOptions};
@@ -17,6 +17,10 @@ pub struct Floors {
     pub generation: u64,
     /// The newest order id accepted; 0 before any.
     pub order_id: u64,
+    /// The epoch of that order. Orders are ordered by epoch, then id: a restored store
+    /// raises the epoch and counts its ids again. 0 in a file written before this field.
+    #[serde(default)]
+    pub order_epoch: u64,
 }
 
 /// Why the file cannot be used.

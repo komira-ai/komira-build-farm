@@ -253,3 +253,37 @@ async fn an_order_that_cannot_be_recorded_is_refused() {
     );
     assert_eq!(rig.handle.gate(), None, "no gate without an order");
 }
+
+/// Catches a store restore that the node refuses: orders are ordered by (epoch, id). After
+/// epoch 7 id 7 is accepted, epoch 8 id 3 is too (the restored store counts again), then
+/// epoch 7 is older whatever its id, and the floor survives a restart as the pair.
+///
+/// Mutant seen red: the floor compared by id alone (epoch 8 id 3 is refused as below 7).
+#[tokio::test]
+async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
+    let target = commit(9);
+    let rig = rig_with_helper("epoch-floor", "", &target);
+    let as_epoch = |rig: &super::harness::Rig, id: u64, epoch: u64, verb: Verb| {
+        let mut o = order(id, verb, &target);
+        o.epoch = epoch;
+        rig.handle.order(&o, epoch, NO_LEASES)
+    };
+    assert_eq!(as_epoch(&rig, 7, 7, Verb::Activate), Decision::Accepted);
+    assert_eq!(as_epoch(&rig, 3, 8, Verb::Confirm), Decision::Accepted);
+    assert_eq!(
+        why(&as_epoch(&rig, 9, 7, Verb::Activate)),
+        "order 9 is of epoch 7, older than the newest accepted, 8"
+    );
+    assert_eq!(
+        why(&as_epoch(&rig, 2, 8, Verb::Activate)),
+        "order id 2 is not above the newest accepted, 3"
+    );
+    assert_eq!(as_epoch(&rig, 3, 8, Verb::Confirm), Decision::Replayed);
+    // The same id in another epoch is not a replay: epoch 9 id 3 is a new order, written.
+    assert_eq!(as_epoch(&rig, 3, 9, Verb::Confirm), Decision::Accepted);
+    let rig = rig.restart();
+    assert_eq!(
+        why(&as_epoch(&rig, 9, 7, Verb::Activate)),
+        "order 9 is of epoch 7, older than the newest accepted, 9"
+    );
+}

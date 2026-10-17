@@ -12,9 +12,11 @@ use serde::Deserialize;
 /// The suffix of an order file.
 pub const SUFFIX: &str = ".json";
 
-/// How far ahead of the last acknowledged id an order may be. The client's ids come from a
-/// counter that grows by one; a far larger one would put every real order below the floor.
-pub const MAX_JUMP: u64 = 1_000_000;
+/// How far above the last acted-on epoch an order's may be. Epochs move only when a store is
+/// restored (a handover keeps it), so a jump of more than this is a mistake or an attack;
+/// either would put every real order below it. Such an order is refused, not acknowledged.
+/// Not applied to the first order a host acts on (it has no epoch to measure from).
+pub const MAX_EPOCH_JUMP: u64 = 1000;
 
 /// The biggest order file read.
 pub const MAX_BYTES: u64 = 4096;
@@ -31,6 +33,8 @@ pub enum Verb {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
     pub id: u64,
+    /// The `Welcome` epoch of the session the node received it in.
+    pub epoch: u64,
     pub verb: Verb,
     pub commit: CommitId,
     /// The confirm window the frontend asks for; the helper clamps it.
@@ -54,9 +58,6 @@ pub enum OrderFault {
 #[serde(deny_unknown_fields)]
 struct Raw {
     order_id: u64,
-    // The client checked the epoch against its session before writing the file; it is
-    // read so that a file with a missing field is refused like any other malformed one.
-    #[allow(dead_code)]
     epoch: u64,
     verb: String,
     commit: String,
@@ -91,6 +92,7 @@ pub fn parse(file_id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
     let commit = CommitId::new(&raw.commit).map_err(|_| OrderFault::BadCommit(raw.commit))?;
     Ok(Order {
         id: raw.order_id,
+        epoch: raw.epoch,
         verb,
         commit,
         window_s: raw.window_s,

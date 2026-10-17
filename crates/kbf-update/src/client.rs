@@ -329,11 +329,23 @@ impl Shared {
         }
         // The same order again is answered, not written twice. (If its file is missing,
         // the first try died between recording the id and writing it: write it now.)
-        if id > 0 && id == core.floors.order_id && self.inbox.has_order(id) {
+        if id > 0
+            && id == core.floors.order_id
+            && epoch == core.floors.order_epoch
+            && self.inbox.has_order(id)
+        {
             core.acked_order = id;
             return Decision::Replayed;
         }
-        if id == 0 || id < core.floors.order_id {
+        // Epoch first, then id: a restored store raises the epoch and counts ids again, so
+        // a lower id of a newer epoch is newer, and any id of an older epoch is not.
+        if epoch < core.floors.order_epoch {
+            return Decision::Refused(format!(
+                "order {id} is of epoch {epoch}, older than the newest accepted, {}",
+                core.floors.order_epoch
+            ));
+        }
+        if id == 0 || (epoch == core.floors.order_epoch && id < core.floors.order_id) {
             return Decision::Refused(format!(
                 "order id {id} is not above the newest accepted, {}",
                 core.floors.order_id
@@ -360,6 +372,7 @@ impl Shared {
         }
         let floors = Floors {
             order_id: id,
+            order_epoch: epoch,
             ..core.floors
         };
         if let Err(e) = self.floors.save(&floors) {

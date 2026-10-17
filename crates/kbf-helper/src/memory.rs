@@ -30,6 +30,11 @@ pub struct StagedFacts {
 pub struct Memory {
     /// The newest order acted on (acted on includes refused).
     pub acked_order_id: u64,
+    /// The epoch of that order: a frontend's `Welcome` epoch, which a restored store
+    /// raises. An order is newer than the last when its epoch is higher, or the same and
+    /// its id is higher; ids come from one counter in the store, not from this host, so
+    /// no gap between them is a reason to refuse.
+    pub acked_epoch: u64,
     pub event: Event,
     /// Why the last offer or order was refused, or what was reverted.
     pub refusal: String,

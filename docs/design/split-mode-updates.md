@@ -108,7 +108,7 @@ Inputs: the signed manifest per pool and platform, whose `meta` is `kbf --versio
 `protocol`, `min_protocol`, `state_schema`, `profile`, `version`; **[F]** `crates/kbf-cli/src/version.rs`) plus the fields of
 3.6; and the same facts of every running host (each reports them in registration). Checks:
 
-1. **Signature and freshness**: chain to the pinned root, pool, platform, expiry, serial above the installed one and the floor.
+1. **Freshness**: the offer's generation is above the newest the host has seen, and an order is newer than the last by (epoch, then id); there is no serial floor (a rollback is the old release offered again with a higher generation).
 2. **Every host is known and connected.** A host that reports no build halts the plan with its name; it is never skipped.
 3. **Order** (rule in 3.3): the frontend moves first, except a downgrade across a protocol difference, where the nodes move first.
    Refused as a flag day if no order keeps every host inside the frontend's accepted range at every instant.

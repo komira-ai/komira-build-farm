@@ -270,29 +270,48 @@ impl<E: Exec> Helper<E> {
             .collect();
         files.sort();
         for (id, name) in files {
-            if id > memory.acked_order_id.saturating_add(order::MAX_JUMP) {
-                // An id this far ahead would put every real order below the floor.
-                refuse(
-                    memory,
-                    &format!("order {id} is too far ahead of {}", memory.acked_order_id),
-                );
-            } else if id > memory.acked_order_id {
-                let read = dir
-                    .open_file(&name, order::MAX_BYTES)
-                    .and_then(|mut f| read_capped(&mut f, order::MAX_BYTES, &name));
-                let parsed = read
-                    .map_err(|r| format!("{}: {r}", r.code()))
-                    .and_then(|bytes| order::parse(id, &bytes).map_err(|e| e.to_string()));
-                match parsed {
-                    Ok(o) => {
-                        self.act(&o, now, memory)?;
-                        memory.acked_order_id = id;
-                    }
-                    // Not acknowledged: a garbage file must not move the floor.
-                    Err(why) => refuse(memory, &format!("order file {name}: {why}")),
+            let read = dir
+                .open_file(&name, order::MAX_BYTES)
+                .and_then(|mut f| read_capped(&mut f, order::MAX_BYTES, &name));
+            let parsed = read
+                .map_err(|r| format!("{}: {r}", r.code()))
+                .and_then(|bytes| order::parse(id, &bytes).map_err(|e| e.to_string()));
+            match parsed {
+                Ok(o)
+                    if memory.acked_epoch != 0
+                        && o.epoch > memory.acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) =>
+                {
+                    refuse(
+                        memory,
+                        &format!(
+                            "order {id} is from epoch {}, more than {} above the last acted on ({}): \
+                             not acted on",
+                            o.epoch,
+                            order::MAX_EPOCH_JUMP,
+                            memory.acked_epoch
+                        ),
+                    );
                 }
-                self.save(memory)?;
+                Ok(o) if o.epoch < memory.acked_epoch => {
+                    refuse(
+                        memory,
+                        &format!(
+                            "order {id} is from epoch {}, older than the last acted on ({})",
+                            o.epoch, memory.acked_epoch
+                        ),
+                    );
+                }
+                // The same epoch and an id not above the last: a replay, dropped silently.
+                Ok(o) if o.epoch == memory.acked_epoch && o.id <= memory.acked_order_id => {}
+                Ok(o) => {
+                    self.act(&o, now, memory)?;
+                    memory.acked_order_id = o.id;
+                    memory.acked_epoch = o.epoch;
+                }
+                // Not acknowledged: a garbage file must not move the floor.
+                Err(why) => refuse(memory, &format!("order file {name}: {why}")),
             }
+            self.save(memory)?;
             if let Err(r) = dir.remove_file(&name) {
                 refuse(memory, &format!("{}: {r}", r.code()));
             }
@@ -345,7 +364,9 @@ impl<E: Exec> Helper<E> {
     fn activate(&mut self, order: &Order, now: u64) -> Result<Done, String> {
         let ordered = activate::Order {
             commit: order.commit.clone(),
-            order_id: order.id.to_string(),
+            // The epoch is part of the name: a restored store counts ids again, and an activation
+            // under the same id as a pending one would be taken for its repeat.
+            order_id: format!("{}-{}", order.epoch, order.id),
             serial: order.id,
         };
         let arm = self.arm(order);

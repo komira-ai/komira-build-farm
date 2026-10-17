@@ -501,34 +501,55 @@ fn orders_are_acted_on_in_id_order() {
     );
 }
 
-/// Catches an order id that wedges the helper: one far above the last acknowledged id is
-/// refused and removed without being acknowledged, so the real orders after it still run.
+fn order_in_epoch(id: u64, epoch: u64, verb: &str, commit: &str) -> String {
+    order_json(id, verb, commit).replace("\"epoch\":1", &format!("\"epoch\":{epoch}"))
+}
+
+/// Catches an order refused for how far its id is from this host's last: ids come from one
+/// counter in the frontend's store, so a host that was not ordered for a long while sees a
+/// big gap. A gap of two million in the same epoch is acted on; an order from an older
+/// epoch is refused whatever its id (a restored store cannot replay old orders); an order
+/// from a newer epoch is acted on even with a lower id (the restored store counts again).
 ///
-/// Mutant seen red: the jump check dropped (u64::MAX is acknowledged; the real order is
-/// then below the floor).
+/// Mutants seen red: a jump cap on the id (the gap is refused); the epoch ignored (the
+/// stale order runs, the newer epoch's lower id is dropped as a replay).
 #[test]
-fn an_order_id_far_ahead_does_not_move_the_floor() {
-    let mut rig = Rig::new("order-jump");
+fn orders_are_ordered_by_epoch_then_id_and_a_gap_is_no_reason_to_refuse() {
+    let mut rig = Rig::new("order-epoch");
     rig.put_offer(1, B);
     let mut stager = stage_b(rig.layout.clone());
     rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(
-        crate::order::MAX_JUMP + 1,
-        &order_json(crate::order::MAX_JUMP + 1, "revert", A),
-    );
+    let big = 2_000_000;
+    rig.put_order(big, &order_in_epoch(big, 7, "activate", B));
     rig.cycle(T0 + 3);
-    assert_eq!(rig.status()["state"], "refused");
+    assert_eq!(
+        rig.state().current,
+        Some(c(B)),
+        "a gap of two million is acted on"
+    );
+    assert_eq!(rig.status()["acked_order_id"], big);
+    // An older epoch with a higher id: refused, nothing moves.
+    rig.put_order(big + 5, &order_in_epoch(big + 5, 6, "revert", A));
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.state().current, Some(c(B)));
+    // The swap is still on trial, which outranks the refusal in the word; the reason shows.
+    assert_eq!(rig.status()["state"], "activated_unconfirmed");
     assert!(
         rig.status()["refusal"]
             .as_str()
             .expect("text")
-            .contains("too far ahead")
+            .contains("epoch")
     );
-    assert_eq!(rig.status()["acked_order_id"], 0);
-    assert_eq!(fs::read_dir(rig.orders()).expect("dir").count(), 0);
-    rig.put_order(5, &order_json(5, "activate", B));
-    rig.cycle(T0 + 6);
+    assert_eq!(rig.status()["acked_order_id"], big);
+    // The same epoch and the same id again: a replay, dropped without a word.
+    rig.put_order(big, &order_in_epoch(big, 7, "revert", A));
+    rig.cycle(T0 + 9);
     assert_eq!(rig.state().current, Some(c(B)));
+    // A newer epoch counts from its own start: a lower id is acted on.
+    rig.put_order(3, &order_in_epoch(3, 8, "revert", A));
+    rig.cycle(T0 + 12);
+    assert_eq!(rig.state().current, Some(c(A)));
+    assert_eq!(rig.status()["acked_order_id"], 3);
 }
 
 /// Catches helper.json readable by the service user, and status.json not (the node reads
@@ -767,4 +788,74 @@ fn an_expiry_that_cannot_revert_is_reported() {
     assert_eq!(rig.status()["state"], "activated_unconfirmed");
     assert!(!rig.status()["refusal"].as_str().expect("text").is_empty());
     assert_eq!(rig.restarts(), before);
+}
+
+/// Catches an epoch that wedges the helper: epochs move only when a store is restored, so
+/// an order more than a thousand epochs above the last acted on is refused with a reason in
+/// status.json and NOT acknowledged, and the next real order (epoch 8) still runs. The first
+/// order a host acts on is measured from nothing and is taken at any epoch.
+///
+/// Mutants seen red: the check dropped (the huge epoch is acknowledged and epoch 8 is then
+/// refused as older); the first-order exemption dropped (a host whose store is at epoch
+/// 5000 never takes an order).
+#[test]
+fn an_epoch_far_above_the_last_is_refused_without_moving_the_floor() {
+    let mut rig = Rig::new("epoch-jump");
+    rig.put_offer(1, B);
+    let mut stager = stage_b(rig.layout.clone());
+    rig.helper.cycle(T0, &mut stager).expect("stage");
+    // The first order, at an epoch of 5000: taken.
+    rig.put_order(1, &order_in_epoch(1, 5000, "activate", B));
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.status()["acked_order_id"], 1);
+    // Far above: refused, said so, not acknowledged.
+    rig.put_order(
+        2,
+        &order_in_epoch(2, 5000 + crate::order::MAX_EPOCH_JUMP + 1, "revert", A),
+    );
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.state().current, Some(c(B)));
+    let refusal = rig.status()["refusal"].as_str().expect("text").to_owned();
+    assert!(
+        refusal.contains("more than") && refusal.contains("epoch"),
+        "{refusal}"
+    );
+    assert_eq!(rig.status()["acked_order_id"], 1);
+    // Exactly at the limit, and a real next epoch, are taken.
+    rig.put_order(
+        3,
+        &order_in_epoch(3, 5000 + crate::order::MAX_EPOCH_JUMP, "revert", A),
+    );
+    rig.cycle(T0 + 9);
+    assert_eq!(rig.state().current, Some(c(A)));
+    assert_eq!(rig.status()["acked_order_id"], 3);
+}
+
+/// Catches an activation named by its id alone: the same commit ordered under the same id
+/// in two epochs (a restored store counts again) must be two different activations. With a
+/// swap of the first still on trial, the second is refused as another order's swap pending
+/// and restarts nothing; named by the id alone it would pass for the first's repeat.
+///
+/// Mutant seen red: `order_id: order.id.to_string()` (no refusal; the repeat restarts again).
+#[test]
+fn the_same_id_in_two_epochs_is_two_activations() {
+    let mut rig = Rig::new("same-id");
+    rig.put_offer(1, B);
+    let mut stager = stage_b(rig.layout.clone());
+    rig.helper.cycle(T0, &mut stager).expect("stage");
+    rig.put_order(5, &order_in_epoch(5, 7, "activate", B));
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.restarts(), 1);
+    let pending = rig.state().pending_confirm.expect("on trial");
+    assert_eq!(pending.order_id.as_deref(), Some("7-5"));
+    rig.put_order(5, &order_in_epoch(5, 8, "activate", B));
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.restarts(), 1, "not the first one's repeat");
+    let refusal = rig.status()["refusal"].as_str().expect("text").to_owned();
+    assert!(
+        refusal.contains("pending") || refusal.contains("swap"),
+        "{refusal}"
+    );
+    assert_eq!(rig.status()["acked_order_id"], 5);
 }
