@@ -56,7 +56,9 @@ fn run(
 
 /// Whether `file` carries the quarantine attribute.
 pub fn quarantined(runner: &dyn Runner, file: &Path, timeout: Duration) -> Result<bool, Refusal> {
-    let args = vec!["-p".into(), QUARANTINE.into(), file.into()];
+    // `-s`: the file itself, not what a link in its place points at (the file is the
+    // unprivileged process's, and this runs before the attestation is checked).
+    let args = vec!["-s".into(), "-p".into(), QUARANTINE.into(), file.into()];
     let ran = run(runner, "xattr", XATTR, args, timeout)?;
     let stderr = String::from_utf8_lossy(&ran.stderr);
     match ran.code {

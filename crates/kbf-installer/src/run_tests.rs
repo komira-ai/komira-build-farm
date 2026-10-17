@@ -2,6 +2,10 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use super::*;
+
+/// A descriptor number no test of this crate holds, so running the pre-exec closure in
+/// this process closes nothing that matters.
+const HIGH_FD: u32 = 600;
 use crate::fixtures::{me, scratch_dir};
 
 fn spawn(program: &str, args: &[&str]) -> Spawn {
@@ -86,9 +90,16 @@ fn the_exit_status_and_both_outputs_are_reported_apart() {
 fn a_program_past_its_timeout_is_killed_and_reported() {
     let mut s = spawn("/bin/sleep", &["600"]);
     s.timeout = Duration::from_millis(200);
+    let started = Instant::now();
     let ran = SystemRunner.run(&s).expect("sleep runs");
     assert!(ran.timed_out);
     assert_eq!(ran.code, None);
+    // The kill is not waited on forever: the run returns in the timeout and a little.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// Catches an output kept without bound (a program printing without end would fill the
@@ -233,7 +244,215 @@ fn the_real_calls_with_the_ids_the_process_has_succeed_or_are_refused_for_a_user
     // coverage is not written out): the same three calls, the first of which already
     // needs root.
     assert_eq!(
-        in_child(me())().map_err(|e| e.kind()),
+        before_exec(Some(me()), Inherited::Range(HIGH_FD))().map_err(|e| e.kind()),
         [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
     );
+}
+
+/// Two descriptors of this process at fixed numbers no other test uses (dup2 onto them): the
+/// one at `HIGH_FD` and the one below it, closed on drop. They are not close-on-exec, as a
+/// leak from the helper's parent would not be.
+struct Fixed {
+    below: libc::c_int,
+    first: libc::c_int,
+}
+
+impl Fixed {
+    fn new() -> Fixed {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/").expect("open");
+        let at = |fd: libc::c_int| {
+            // SAFETY: dup2 onto a number this test owns (above anything the other tests of
+            // this crate open); it is closed in drop.
+            let got = unsafe { libc::dup2(file.as_raw_fd(), fd) };
+            assert_eq!(got, fd, "dup2 onto {fd}: is the descriptor limit above it?");
+            fd
+        };
+        Fixed {
+            below: at(HIGH_FD as libc::c_int - 1),
+            first: at(HIGH_FD as libc::c_int),
+        }
+    }
+
+    /// Both descriptors as they were made: not close-on-exec.
+    fn unmark(&self) {
+        for fd in [self.below, self.first] {
+            // SAFETY: clearing the flags of descriptors this value owns.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        }
+    }
+}
+
+impl Drop for Fixed {
+    fn drop(&mut self) {
+        for fd in [self.below, self.first] {
+            // SAFETY: closing the descriptors this value made.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn cloexec_set(fd: libc::c_int) -> bool {
+    // SAFETY: F_GETFD on a number reports its flags, or EBADF.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    flags & libc::FD_CLOEXEC != 0
+}
+
+/// Whether a real child started with `how` holds descriptor `fd` (`readlink` opens none of
+/// its own, so it finds the link only if the child inherited the descriptor).
+fn child_holds(fd: libc::c_int, how: Inherited) -> bool {
+    let link = format!("/proc/self/fd/{fd}");
+    let ran = start(&spawn("/usr/bin/readlink", &[&link]), how).expect("readlink runs");
+    ran.code == Some(0)
+}
+
+/// Catches a program that inherits a descriptor the helper's parent left open (a lock file,
+/// a socket), at the boundary: the descriptor numbered `first` is kept from the program and
+/// the one below it is left alone, by `close_range` and by the listing way (macOS, and a
+/// sandbox without `close_range`), which finds `>= first` and nothing lower. Run in this
+/// process on descriptors at fixed numbers, whatever other tests hold, then in a real child.
+///
+/// Mutants seen red: both ways doing nothing; `>` for `>=` in the listing.
+#[test]
+fn the_child_inherits_no_descriptor_from_the_first_up() {
+    let fixed = Fixed::new();
+    let first = HIGH_FD;
+    let found = listed_in(Path::new(FD_DIR), first).expect("the descriptor directory lists");
+    assert!(found.contains(&fixed.first), "{found:?}");
+    assert!(!found.contains(&fixed.below), "{found:?}");
+    before_exec(None, Inherited::Listed(found.clone()))().expect("marks them");
+    assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+    fixed.unmark();
+    before_exec(None, Inherited::Range(first))().expect("the range call");
+    assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
+    fixed.unmark();
+    // A real child, by the range way and by the listing: `first` is not inherited, below it is.
+    assert!(!child_holds(fixed.first, Inherited::Range(first)));
+    assert!(child_holds(fixed.below, Inherited::Range(first)));
+    assert!(!child_holds(fixed.first, Inherited::Listed(found.clone())));
+    // The listing starting one higher leaves `first` alone: the boundary is `>=`.
+    let higher = listed_in(Path::new(FD_DIR), first + 1).expect("lists");
+    assert!(!higher.contains(&fixed.first));
+}
+
+/// The constant the runner starts from: 0, 1 and 2 are the program's own, 3 is the first it
+/// must not inherit.
+#[test]
+fn descriptors_from_three_up_are_not_inherited() {
+    assert_eq!(FIRST_INHERITED, 3);
+}
+
+/// Catches an error in keeping descriptors from a program that is swallowed: a program that
+/// might hold a descriptor it should not is not run. The marking failing ends the start with
+/// that error; a range call the kernel refuses is an error of its own; a failed probe falls
+/// back to the listing, and a listing that fails ends the choice with its error, not a guess.
+///
+/// Mutants seen red: the marking's `?` dropped; the listing's error replaced by `Range`.
+#[test]
+fn a_failure_to_keep_descriptors_from_the_program_ends_the_start() {
+    let err =
+        start(&spawn("/usr/bin/true", &[]), Inherited::Fails(libc::EPERM)).expect_err("fails");
+    assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    // The kernel refuses a range whose end is below its start.
+    let err = range_cloexec(5, 3).expect_err("EINVAL");
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    let enosys = || Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    // The probe failed and the directory cannot be listed: the error.
+    let err = Inherited::choose(3, enosys(), Path::new("/no/such/descriptor/dir")).err();
+    assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+    // The probe failed and the directory lists: the listed way.
+    let chosen = Inherited::choose(3, enosys(), Path::new(FD_DIR)).expect("listed");
+    assert!(matches!(chosen, Inherited::Listed(_)));
+    // A descriptor that is not open is skipped, not an error.
+    cloexec(HIGH_FD as libc::c_int + 300).expect("a closed descriptor is fine");
+}
+
+/// Catches what a program leaves running in its own group: the program ends at once, having
+/// started a `sleep` that stays in the group (this test binary, run as the program, starts
+/// it and exits); the run kills the group before returning, so the sleeper is gone.
+///
+/// Mutant seen red: the group not killed after a normal exit.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_a_program_leaves_in_its_group_dies_with_the_run() {
+    let dir = scratch_dir("run-group");
+    let mut s = spawn(
+        std::env::current_exe()
+            .expect("this binary")
+            .to_str()
+            .expect("utf-8"),
+        &[
+            "--ignored",
+            "--exact",
+            "run::tests::leaves_a_sleeper",
+            "--nocapture",
+        ],
+    );
+    s.cwd = dir.clone();
+    let ran = SystemRunner.run(&s).expect("the test binary runs");
+    assert_eq!(ran.code, Some(0), "{}", text(&ran.stderr));
+    let pid: libc::pid_t = std::fs::read_to_string(dir.join("pid"))
+        .expect("the pid file")
+        .trim()
+        .parse()
+        .expect("a pid");
+    // SAFETY: signal 0 only asks whether the process exists.
+    let alive = || unsafe { libc::kill(pid, 0) } == 0;
+    for _ in 0..100 {
+        if !alive() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A killed child that nobody waits for stays a zombie until its parent (init) reaps
+    // it; `kill(pid, 0)` still succeeds then, so read the state instead.
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let dead = state.is_empty() || state.contains(") Z ") || state.contains(") X ");
+    assert!(dead, "the sleeper is still running: {state}");
+}
+
+/// The program of `what_a_program_leaves_in_its_group_dies_with_the_run`: started only by
+/// that test (it is ignored in a normal run). Starts a sleeper in its own group, records its
+/// pid in `pid` in the working directory, and exits.
+#[test]
+#[ignore = "run as a child program by what_a_program_leaves_in_its_group_dies_with_the_run"]
+// The sleeper is left running on purpose: the run under test has to kill it.
+#[allow(clippy::zombie_processes)]
+fn leaves_a_sleeper() {
+    let sleeper = std::process::Command::new("/usr/bin/sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep starts");
+    std::fs::write("pid", sleeper.id().to_string()).expect("pid");
+}
+
+/// Catches a program named by a relative path being looked up on a `PATH` the helper
+/// never meant: refused before anything starts.
+#[test]
+fn a_relative_program_is_refused() {
+    let err = SystemRunner.run(&spawn("ls", &[])).expect_err("refused");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+/// Catches a timeout defeated by a descendant that left the process group and keeps the
+/// pipes: `setsid` forks `sleep` into a group of its own with the output open, the program
+/// itself ends, and the run still returns within the read grace instead of when the sleep
+/// does.
+///
+/// Mutant seen red: the readers joined with no grace (the run takes the sleep's thirty
+/// seconds).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_that_left_the_group_cannot_hold_the_run() {
+    let started = Instant::now();
+    let ran = SystemRunner
+        .run(&spawn("/usr/bin/setsid", &["/usr/bin/sleep", "30"]))
+        .expect("setsid runs");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(ran.code, Some(0));
+    assert!(ran.stdout.is_empty());
 }

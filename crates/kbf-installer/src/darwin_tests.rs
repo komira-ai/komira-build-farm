@@ -81,7 +81,10 @@ fn xattr_is_asked_for_the_quarantine_attribute_of_the_file() {
         .iter()
         .map(|a| a.to_str().expect("utf-8"))
         .collect();
-    assert_eq!(args, ["-p", "com.apple.quarantine", "/inbox/kbf.tar.gz"]);
+    assert_eq!(
+        args,
+        ["-s", "-p", "com.apple.quarantine", "/inbox/kbf.tar.gz"]
+    );
     assert!(call.env.is_empty());
     assert_eq!(
         (call.cwd.as_path(), call.run_as, call.timeout),

@@ -250,6 +250,8 @@ fn a_release_directory_with_other_content_is_refused() {
 struct BadCopy {
     host: ScratchHost,
     skip: bool,
+    /// The file whose copy lands wrong: the path ends with this.
+    hit: &'static str,
 }
 
 impl Exec for BadCopy {
@@ -272,7 +274,7 @@ impl Exec for BadCopy {
         match step {
             Step::WriteFile {
                 path, perms, owner, ..
-            } if path.as_str().ends_with("/kbf") => {
+            } if path.as_str().ends_with(self.hit) => {
                 if self.skip {
                     return Ok(());
                 }
@@ -304,7 +306,11 @@ fn a_copy_whose_sha256_differs_is_refused_before_the_switch() {
         (true, "none (no file)".to_owned()),
     ] {
         let (host, root) = host(&format!("badcopy-{skip}"));
-        let mut exec = BadCopy { host, skip };
+        let mut exec = BadCopy {
+            host,
+            skip,
+            hit: "/kbf",
+        };
         let a = Install {
             commit: c(A),
             from: from.clone(),
@@ -312,6 +318,42 @@ fn a_copy_whose_sha256_differs_is_refused_before_the_switch() {
         let err = install(&mut exec, &root, me(), &a, Mode::Apply, &mut Vec::new())
             .expect_err("a bad copy");
         let path = format!("/usr/local/kbf/releases/{A}/kbf");
+        assert_eq!(
+            err.to_string(),
+            format!("the copy at {path} has sha256 {got}; the source has {want}")
+        );
+        assert_eq!(link(&exec.host, "current"), None);
+        assert_eq!(state::read_unlocked(&root).expect("read"), None);
+    }
+}
+
+/// Catches a copy checked for the first binary only: in a release of two binaries the
+/// second lands with other bytes (or not at all) and is refused the same way, before any
+/// link or state names the release.
+///
+/// Mutant seen red: the read-back loop over `source.binaries` cut to its first element.
+#[test]
+fn every_binary_of_a_release_is_read_back_not_only_the_first() {
+    let from = source("badcopy2", "kbf A", None);
+    fs::write(from.join("kbf-daemon"), "daemon A").expect("daemon");
+    for (skip, got) in [
+        (false, sha256(b"tampered")),
+        (true, "none (no file)".to_owned()),
+    ] {
+        let (host, root) = host(&format!("badcopy2-{skip}"));
+        let mut exec = BadCopy {
+            host,
+            skip,
+            hit: "/kbf-daemon",
+        };
+        let a = Install {
+            commit: c(A),
+            from: from.clone(),
+        };
+        let err = install(&mut exec, &root, me(), &a, Mode::Apply, &mut Vec::new())
+            .expect_err("a bad copy of the second binary");
+        let want = sha256(b"daemon A");
+        let path = format!("/usr/local/kbf/releases/{A}/kbf-daemon");
         assert_eq!(
             err.to_string(),
             format!("the copy at {path} has sha256 {got}; the source has {want}")

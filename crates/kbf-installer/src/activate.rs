@@ -15,8 +15,7 @@
 //! is carried out, and the release `previous` names is intact either way.
 //!
 //! - [`activate`]: an order names a staged release. The state gets `current` = the new
-//!   release, `previous` = the one that ran, `staged` cleared, the order's serial as the
-//!   floor, and a `pending_confirm` naming the order, then the links follow. The caller
+//!   release, `previous` = the one that ran, `staged` cleared, and a `pending_confirm` naming the order, then the links follow. The caller
 //!   restarts the service afterwards. A repeat of the same order, or an order for the
 //!   release already current, changes nothing.
 //! - [`confirm`]: the new release came up and says so; the swap is kept. It must name
@@ -57,9 +56,6 @@ pub struct Order {
     pub commit: CommitId,
     /// Names the order: a repeat is a no-op and the confirm must carry it.
     pub order_id: String,
-    /// Increases with every release the operator signs; below the host's floor it is
-    /// refused.
-    pub serial: u64,
 }
 
 /// When the window to confirm starts.
@@ -188,12 +184,6 @@ pub fn activate<E: Exec>(
         converge(exec, &state, out)?;
         return Ok(Activated::AlreadyCurrent);
     }
-    if order.serial < state.order_floor {
-        return Err(ReleaseError::BelowFloor {
-            serial: order.serial,
-            floor: state.order_floor,
-        });
-    }
     if !has_binary(exec, &order.commit) {
         return Err(ReleaseError::NotInstalled(order.commit.clone()));
     }
@@ -208,7 +198,7 @@ pub fn activate<E: Exec>(
             order_id: Some(order.order_id.clone()),
             starts_left,
         }),
-        order_floor: order.serial,
+        order_floor: state.order_floor,
     };
     lock.write(&next)?;
     converge(exec, &next, out)?;

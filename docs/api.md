@@ -764,6 +764,32 @@ treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the no
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
 
+## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
+
+The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
+release and their build attestations, kept as uploaded. Not served by any listener until the
+frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
+`--releases-dir`.
+
+- `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
+  `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
+  `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
+  into a path as it arrived.
+- `PUT` takes the file as the body, with the write gates of the section "Who may write" except
+  the JSON content type (loopback peer, no `Origin`, the bearer token). A tarball is at most
+  512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
+  a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
+  visible.
+- `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
+  `200` with the same answer, other bytes are `409` and change nothing.
+- `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
+  "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
+  order above, a platform `complete` when both tarballs have their attestation. A component is
+  listed when its tarball is stored.
+- `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
+  the service. The wiring must mount `Fetch` only behind the worker listener's mutual TLS, and
+  decide who may read `GET /v1/releases` where it mounts the router.
+
 ## `UNAVAILABLE` from a storage node that is catching up
 
 Also gRPC, not HTTP. A storage node that is rebuilding its index (it registered with

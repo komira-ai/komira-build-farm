@@ -1,11 +1,17 @@
 # Updating a split-mode farm without failing a build
 
-Status: design, nothing in this document is built. It is read against `feature/arch-v2` and these pull requests, fetched
+Status: design for the sequence. The pull updater it relies on is partly built: `kbf-installer` (merged), `kbf-update` (the node's client, #908) and
+`kbf-helper` (the root helper, #929) are built or in review; the controller, the node gates, the Envoy switch and the poller are not.
+Planned-down (#914) is built. It is read against `feature/arch-v2` and these pull requests, fetched
 when this was written: #857, #879 and #887 (the frontend handover, open, stacked), #803 (the rollout state machine, open), #886
 (merged: a restarted node whose index is whole registers `Active`) and #860 (open: a wiped node rebuilds its index while
 `CatchingUp`). Labels as in `architecture-v2.md`: **[F]** read in code or a PR, **[I]** inference, **[V]** verify before
 building on it, **[D]** a design choice made here, **[U]** a claim about a program we do not own, proved only by the
 end-to-end test named beside it. **[owner]** marks a decision that is the owner's.
+
+Companion: [pull-updates.md](pull-updates.md) is the authority for the wire (`kbf.update.v1`, frozen), the release store, the desired
+release rows, the host's helper verbs and the trust model. This document is the authority for the order, the per-host step, the
+idle and parallelism policy, the schema rule and the frontend's own update, and it supersedes the matching parts of that one.
 
 ## 0. The plan in one page
 
@@ -52,9 +58,9 @@ a cloud daemon group). `architecture-v2.md` section 11 calls this "our farm".
 
 Not here: **all-in-one** (one process holds the frontend, storage and daemon; its handover needs the storage log and the
 in-process daemon handed over too, and has its own design); OS, Xcode, kernel and image updates (`fleet-updates.md`); first
-install of a host. The pull updater (a signed manifest, an unprivileged client and a small root helper per host) is the
-mechanism that delivers a release to a host and restarts a unit; it is specified elsewhere and unbuilt, and this document
-says what it must do for this sequence.
+install of a host. The pull updater (an unprivileged client and a small root helper per host that verifies the GitHub build attestation
+offline; `pull-updates.md`) is the mechanism that delivers a release to a host and restarts a unit; this document says what
+it must do for this sequence.
 
 ## 2. The sequence
 
@@ -76,7 +82,7 @@ Idle
  └─ Preflight ─────────── refused: Idle, nothing touched
      └─ Staging              every host fetches and verifies the release in parallel; nothing is installed
          └─ FrontendPhase    start the new frontend behind Envoy; the old one drains    (2.5)
-             └─ NodePhase    idle → update → rejoin, one host at a time                 (2.6, 2.7)
+             └─ NodePhase    idle → update → rejoin: one storage node + up to max_hosts_out daemon-only hosts                 (2.6, 2.7)
                  └─ Settling the old frontend answers its last streams and exits (runs alongside NodePhase)
                      └─ Done
  any phase ── Held (a person acts) | Paused (between hosts) | Pending (a host or the capacity floor says later)
@@ -91,24 +97,24 @@ The frontend phase is the same on a single box, in split mode and in all-in-one 
 |---|---|---|
 | Poll for a release | frontend: update poller (6.2) | read-only access to the release source |
 | Preflight | frontend: planner (2.4) | `kbf --version --json` of each tarball; build facts of every running host |
-| Staging | each host: update client (`kbf-node`) and root helper, offline verification | session to the frontend |
+| Staging | each host: update client (`kbf-update`) and root helper (`kbf-helper`), offline verification | session to the frontend |
 | Slot, plan, ordering, resume | the **new** frontend: rollout controller (6.1) | `update/*` rows |
 | Start the new frontend, switch, drain | frontend host: the helper starts the idle instance on its own ports; the baton moves (#879); Envoy routes by health; the old process drains | units `kbf-frontend@{a,b}` (#887), Envoy static config naming both |
 | Cordon, lease count | scheduler (`Farm`), `cordon/<node>` rows (#879) | none new |
-| Planned-down, member states | `Members` | operator-settable `down` (2.6, step 3) |
+| Planned-down, member states | `Members` | `{"state":"planned_down"}` (#914; 2.6, step 4) |
 | Open write count, repair debt | storage node: heartbeat fields | not built |
-| Activate, confirm, revert | the host's root helper | a signed order in its inbox |
+| Activate, confirm, revert | the host's root helper | an `UpdateOrder` relayed to its inbox (epoch, monotonic id) |
 | Rejoin | scheduler: first claim by the node | uncordon |
 
 ### 2.4 Preflight
 
 Reads, changes nothing. Any failure ends the run `Idle` with the reasons.
 
-Inputs: the signed manifest per pool and platform, whose `meta` is `kbf --version --json` of the tarball's binary (`commit`,
+Inputs: the desired release (per platform: tarball and attestation in the release store) with the `meta` of `kbf --version --json` of the tarball's binary (`commit`,
 `protocol`, `min_protocol`, `state_schema`, `profile`, `version`; **[F]** `crates/kbf-cli/src/version.rs`) plus the fields of
 3.6; and the same facts of every running host (each reports them in registration). Checks:
 
-1. **Freshness**: the offer's generation is above the newest the host has seen, and an order is newer than the last by (epoch, then id); there is no serial floor (a rollback is the old release offered again with a higher generation).
+1. **Completeness and generation**: every platform the farm runs is complete for the commit (tarball and attestation present), and the desired `generation` is higher than any the hosts have acted on. The **host** verifies the build attestation offline when it stages (pinned `gh` and trusted root, repository, workflow, `main`, source digest equal to the offered commit; `pull-updates.md` section 2); the frontend does not have to. Downgrades are allowed: a higher generation always wins, and there is no floor on commits. **As built**, the installer keeps no floor: an order is newer than the last by (epoch, then id) in the node's client and the helper, a commit downgrade is allowed, and a rollback is the old release offered with a higher generation (which gets a new, higher order id).
 2. **Every host is known and connected.** A host that reports no build halts the plan with its name; it is never skipped.
 3. **Order** (rule in 3.3): the frontend moves first, except a downgrade across a protocol difference, where the nodes move first.
    Refused as a flag day if no order keeps every host inside the frontend's accepted range at every instant.
@@ -224,8 +230,8 @@ is new. Frontends of both releases serve nodes of both, so the contract of 3.2 h
 
 This is what the node-rolling unit implements. The new frontend's controller drives it and the nodes need not be taken in any
 fixed order: the frontend picks whichever candidate is idle or drained first. **At most one storage-and-daemon node is in a step
-at a time** (2.1: with R=2 two nodes down lose blobs). Daemon-only hosts have no storage coupling and may be in a step in parallel,
-up to the capacity floor. Order is free because the frontend is already at the new release and every pair of versions is within
+at a time** (2.1: with R=2 two nodes down lose blobs). Daemon-only hosts and Macs have no storage coupling and may be in a step
+concurrently, **up to `max_hosts_out` (default 1)** and the capacity floor. Order is free because the frontend is already at the new release and every pair of versions is within
 N/N-1 (3.2), including an R=2 pair that spans two releases. (A daemon-only host runs the same steps minus 3, 4 and 7.)
 
 **Selection.** Candidates are hosts at the old release, not `Held`; a storage candidate also needs no other storage node in a step. The controller looks every
@@ -235,10 +241,10 @@ is never idle still drains one node at a time (**D3**, below). Idle nodes are ne
 
 | # | Step | What happens | Leaves the step when | If it fails |
 |---|---|---|---|---|
-| 1 | Claim | CAS `update/slot` to this host, write `update/host/<id>` = `Selected`. Re-check G_S. | slot held | nothing changed |
+| 1 | Claim | CAS a holder in `update/slot` to this host (the storage holder for a storage-and-daemon node, one of up to `max_hosts_out` host holders otherwise), write `update/host/<id>` = `Selected` with `boot_before`. Re-check G_S. | slot held | nothing changed |
 | 2 | Cordon | `POST /v1/nodes/{node}:cordon`, atomic in the scheduler (and the row persists). A node already at zero leases is cordoned in the same step it is picked, so no lease can arrive between "idle" and "cordoned". | placement `cordoned` | nothing changed |
 | 3 | Leases | wait for the node's leases to end by themselves. Idle for the daemon half is zero leases and no claim granted but undelivered. | zero leases | after the limit (15 min Linux): uncordon, `Pending` (capacity beats update) |
-| 4 | Planned-down | `POST /v1/members/{id}` `{"state":"down","reason":"restart"}`: writes the `down/<id>` mark with the dwell and bumps the map in one transaction; every router stops choosing this node as a write primary. Wait for the node's open write sessions and the frontend router's writes in flight to it to reach zero. | writes in flight zero | undo (member returns by its next heartbeat), uncordon, `Pending` |
+| 4 | Planned-down | `POST /v1/members/{id}` `{"state":"planned_down","for_secs":N}` (**[F]** #914; `N` optional, 1 to 86400, default 900; the controller sets it to the restart deadline). Only an `Active` member may be planned down (409 otherwise); a repeat is idempotent (200, no new generation, it moves the end). Gate: `Members::node_idle(node, at_generation)` with `at_generation` the generation the plan call returned, until it reports idle (writes in flight zero; it has 14 not-idle reasons, among them `PlannedDownExpired`, which means wait). | `node_idle` true | undo with `{"state":"active"}`, uncordon, `Pending` |
 | 5 | Gate | re-evaluate G_S with this node out | true | undo as above; `Held` if a second member is `Down` |
 | 6 | Activate | order to the host: the helper writes `pending_confirm`, flips `current`, restarts the unit; the revert timer arms when the new process starts | helper `ACTIVATED_UNCONFIRMED` | the helper reverts itself |
 | 7 | Rejoin storage | the new process registers (boot counter larger): `Active` at once if its meta log has `RebuildDone` (#886), `CatchingUp` if it rebuilds (#860; reads answer `UNAVAILABLE`, never `NOT_FOUND`) | `Active` | intact node not `Active` in the health limit (120 s): revert. Rebuilding node: wait while it makes progress, never revert |
@@ -254,9 +260,13 @@ the dwell to decide. **[V]** how long a start takes on a full node; no measureme
 that is not `Down` in the map, and to that one only". A member goes `Down` after its row's TTL lapses (15 s after the last
 heartbeat). So for up to 15 s after the process stops, writes whose primary is this node fail `UNAVAILABLE`; buck2 retries
 an upload 5 times with 100 ms to 5 s back-off (about 1.5 s) and then fails the action. Reads are fine: a refused connection
-fails over to the next owner at once. Today `Members::set_state` refuses `Down` (`NotSettable`). **[D]** An operator-settable
-`down` with a reason is the smaller change; the alternative, letting the router fail a write over on a refused connection,
-changes the write path's "that one only" guarantee and the repair accounting. It must not be `Draining`: that starts the
+fails over to the next owner at once. **[F]** #914 builds the fix as `planned_down` (step 4). In the map the member is plain `Down`, plus a
+`down/<id>` "planned" mark held for the dwell (no new wire state); the end of the plan is kept in the member's row. Writes skip it at once;
+readers with the new map use the other owner; the node keeps answering and heartbeating. **A heartbeat does not end it.** Three things do:
+the end time (the next beat after it returns the member to `Active`, a generation bump, the mark deleted); `{"state":"active"}` from the
+controller; or a re-register after the restart (`Active`, or `CatchingUp` while it rebuilds). If the node never returns, its row lapses and
+the dwell, counted from the plan call, decides when it leaves the map. The alternative, letting the router fail a write over on a refused
+connection, changes the write path's "that one only" guarantee and the repair accounting and is not taken. It must not be `Draining`: that starts the
 handoff of the node's slice, a movement of the whole shard for a one-minute restart.
 
 **Storage graceful stop. [V]** The storage half should stop accepting, finish open streams to a bound, then exit (the frontend does
@@ -380,7 +390,7 @@ blob; its loss is capacity only.
 ### 2.11 Rollback
 
 **Set the old release as the target; the same mechanism walks back.** The controller offers a new release naming the previous
-artifacts with a higher serial (the old directories are still on the hosts: running, previous, one more), preflight runs, and:
+release as the desired one under a higher generation (the old directories are still on the hosts: running, previous, one more), preflight runs, and:
 
 - frontend: a handover back (the old release is started as the successor); this works only if the contract of 3.2 holds in the
   reverse direction, which is why every row of it says both ways;
@@ -556,7 +566,7 @@ attempts; T1 measures it. An `Execute` queued because capacity is short keeps it
 ### 5.1 Principles
 
 - A host reverts **itself** from local state only: a binary that never becomes healthy is put back by the helper's timer or boot
-  counter (the window starts when the new process starts, not at the flip, and is capped by the helper's own config).
+  counter (**as built**: on Linux the window starts at the new process's first start, from `kbf-helper boot-check --window-secs`, default 900, range 120 to 1800, and the order's `window_s` is ignored; on macOS there is no start hook, so the window is armed at activation and `window_s` is clamped to 120 to 1800).
 - The controller **holds** on any failure and touches nothing else. It never retries a revert by itself (a revert from a frontend
   outage and one from a bad build look alike from the host).
 - An error from the activate order counts as "swapped, maybe": revert, never retry.
@@ -621,10 +631,10 @@ with real processes. IDs are stable so tests and PRs cite them.
 
 **Node:**
 - C20 the controller dies after cordon, after planned-down, after activate, after confirm, before uncordon: resumes at the host's phase; no host activated twice.
-- C21 the helper dies at each boundary of activate: converges to old or new, never a mix.
+- C21 the helper dies at each boundary of activate: the links converge to old or new, never a mix. The restart owed after a revert or window expiry is the part still being fixed in #929 (restart-owed persisted before the link move); until then C21 asserts links only.
 - C22 the node's process dies repeatedly after the restart (boot counter), and once after `Active` before confirm.
-- C23 power loss of the node during the restart; the dwell expires: slice re-replicated; run held; nothing else restarts.
-- C24 a second node killed while the first is planned-down: reads `UNAVAILABLE` not `NOT_FOUND`; controller stops; recovers; no blob lost.
+- C23 power loss of the node during the restart; the plan's end passes (`PlannedDownExpired`: the next beat returns the member to `Active` only if the node is back) and the dwell, counted from the plan call, expires: slice re-replicated; run held; nothing else restarts.
+- C24 a second node killed while the first is planned-down: reads `UNAVAILABLE` not `NOT_FOUND`; `node_idle` for any further node reports a not-idle reason; controller stops; recovers; no blob lost; a heartbeat from the planned node does not end the plan.
 - C25 a lease arrives between "idle" and cordon: impossible by construction (cordon is the pick); the daemon also refuses an activate order with a lease.
 - C26 disk full while staging: installed untouched, `REFUSED`.
 - C27 intact index: `Active` at once; wiped: `CatchingUp`, reads `UNAVAILABLE`, controller waits for the right one.
@@ -656,21 +666,27 @@ metric or a test that asserts on it.
 operator API and the hosts' sessions. The CLI and the UI are its clients. The manual path (a human runs the installer verbs and
 `kbf frontend handover`) stays as the fallback; it calls the same installer code.
 
-State in `kbf-state` (one CAS row each; works on SQLite and Postgres):
-- `update/desired {serial, track, paused}`;
-- `update/slot {holder, order_id, epoch, state}`: no TTL; if the holder dies the slot stays held and the run is `Held`;
-- `update/host/<id> {phase, order_id, serial, since}`: what the controller resumes from;
-- `update/policy {auto_nodes, auto_frontend, idle_wait, min_serving, new_work_only_to_updated, mac_force_after, accept_failing_builds}`;
-- `update/available/<commit>` from the poller.
+State in `kbf-state` (one CAS row each; works on SQLite and Postgres): **one set of rows** with `pull-updates.md` section 6.2.
+That document owns `update/release/<commit>/<platform>/<name>`, `update/desired {generation, commit, set_at}` and
+`update/generation`. This one adds:
+- `update/slot`: **one storage holder plus up to `max_hosts_out` host holders** (daemon-only hosts and Macs), each `{host, order_id, epoch}`, with the run state; no TTL: if a holder dies its entry stays held and the run is `Held`, and a broken host never lets another take its place;
+- `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;
+- `update/policy {auto_nodes (bool), auto_frontend (bool), paused (bool), idle_wait, min_serving, max_hosts_out (default 1), new_work_only_to_updated, mac_force_after, accept_failing_builds}`
+  (`pull-updates.md`'s `update/auto {enabled}` is `auto_nodes`);
+- `update/available/<commit>` from the poller: proposals and preflight results, metadata only.
+
+The release store on disk is the source of truth for bytes; the `update/release/...` rows are metadata over it and are rebuilt
+from the disk index if lost (`pull-updates.md` 6.2).
 
 The controller that runs is the new release's. In A the old frontend's controller is fenced with the rest of the farm; the new
 one starts at the host phase it reads and writes `Settling` at E8, so it never repeats the handover it is the result of.
 
 Orders to a host are files in its helper's inbox, written by its unprivileged `kbf` after an order over its session; the helper
-verifies offline. **[F]** The messages (`UpdateOffer`, `UpdateOrder`, `UpdateStatus`) are not in `worker.proto` yet. Requirements
-added here: an order carries the store epoch and a monotonic id (a restored store cannot replay one; a host refuses a lower id),
-a host refuses an activate order while it holds a lease, and the frontend host's `activate` is "flip and start the other
-instance" (one fixed argument named by the host's own config), not a restart of the serving one.
+verifies offline. **[F]** The messages are in `worker.proto` and frozen in `kbf.update.v1` (`UpdateStatus` is `DaemonMessage` 7,
+`UpdateOffer` and `UpdateOrder` are `ServerMessage` 8 and 9; `pull-updates.md` section 5): an order carries the store epoch and a
+monotonic id, and a host acts on each at most once. The node client refuses an activate order while the host holds a lease
+(`pull-updates.md` section 10). Added here: on the frontend host the helper's `activate` is "flip and start the other instance"
+(one fixed argument named by the host's own config), not a restart of the serving one. **The helper must not run on the frontend host until U5 exists:** today it restarts the one configured service, which for the frontend would be exactly the restart this document forbids.
 
 ### 6.2 The poller
 
@@ -680,15 +696,16 @@ instance" (one fixed argument named by the host's own config), not a restart of 
   the credential, if any, is a read-only token read from a file (a flag, not an environment variable), never logged or stored in a row;
 - it looks for the newest successful run of the artifacts workflow on the main branch, and for each platform the farm needs, the
   tarball, `SHA256SUMS` and the attestation bundle;
-- it verifies the attestation in-process against a pinned repository and workflow identity, and the tarball's hash, before anything
-  is stored; a failure is never offered and an alert names it;
+- it stores the tarball and the attestation bundle in the release store (the hash is computed while streaming). It need not verify the
+  attestation: the host does, offline, when it stages. It may run `gh attestation verify` as an early failure for mistakes, never as trust;
+  a release that cannot be attested is not proposed and an alert names it;
 - it reads `kbf --version --json` from the binary (service user, empty environment, no network, a timeout) and rejects one whose commit differs from the run's;
 - it runs preflight against the live farm and stores the result, so the UI shows blockers without a click;
 - it stores `update/available/<commit>` (hashes, `meta`, attestation time, preflight result, the merge commit subject) and keeps the last few;
-- **it never applies.** `update/policy` decides. `auto_nodes: manual` (default) offers; `auto` runs the whole sequence's node steps when preflight is
-  clean. `auto_frontend` is separate, defaults to `manual`, and cannot be set to `auto` unless `auto_nodes` is `auto` and the last two runs finished
+- **it never applies.** `update/policy` decides. `auto_nodes` false (default) offers; true runs the whole sequence's node steps when preflight is
+  clean. `auto_frontend` is separate, defaults to false, and cannot be set to true unless `auto_nodes` is true and the last two runs finished
   without `Held`. A frontend handover is never started by a timer unless an authenticated operator wrote that row;
-- it refuses a downgrade (by serial), a commit not on main, and a run with a failed or missing attestation;
+- it never proposes a commit older than the running one by itself (an operator may set an older commit as a rollback, and the generation orders it), and it refuses a commit not on main and a run with a failed or missing attestation;
 - failures it survives: the source unreachable (the offer stays; the UI shows the last good poll; an alert after an hour), a rate limit
   (back off), a malformed answer (log once an hour), a restart (state in rows), a handover (the new frontend starts its own poller; a poll in flight is dropped).
 
@@ -697,7 +714,7 @@ instance" (one fixed argument named by the host's own config), not a restart of 
 A server-rendered `kbf-ui` page (**[F]** today read-only, no script, over the read API) with a new write path.
 
 **Shows** (from `GET /v1/update`, the JSON twin):
-- per host: running release (commit, serial, protocol, since), the available release (commit, attested at, polled at), a "mixed" badge;
+- per host: running release (commit, generation, protocol, since), the available release (commit, attested at, polled at), a "mixed" badge;
 - the plan and preflight verdict: order chosen and from which numbers, next host, and **blockers** each with a reason and a fix:
   `schema change needs the cold path`, `release needs node rollback by rebuild`, `repair debt N blobs on <node>`, `a host reports no
   build`, `old frontend still draining 3 streams`, `a member is Down`, `last Mac of its class has work waiting`;
@@ -713,7 +730,7 @@ A server-rendered `kbf-ui` page (**[F]** today read-only, no script, over the re
 | Update | `update/desired` + the whole sequence per policy | `update` | blockers; run active; nothing available |
 | Update frontend only | E0 to E8 | `update` | blockers; old instance still draining |
 | Update nodes only | node steps | `update` | frontend not new; blockers |
-| Pause, Resume | `update/desired.paused` | `update` | no run |
+| Pause, Resume | `update/policy.paused` | `update` | no run |
 | Skip host | marks a `Held` host failed, frees the slot | `admin` | not `Held`; says the host stays cordoned |
 | Roll back | a release naming the previous one | `update` | not reversible (2.11), with the reason |
 | Accept failing builds | the cold path | `admin` | never a default; a typed reason |
@@ -748,7 +765,7 @@ binary and a test-only "N+1" built from the next commit for the mixed-version te
 | T9 | `frontend_crash_matrix` | C1 to C19 and C60 to C62, one test each | each case's own defect |
 | T10 | `mixed_versions_both_ways` | base and N+1 in every window of 3.1, both directions: N+1 frontend with N nodes, N with N+1 (downgrade order), handover N to N+1 and back, with a build in flight | made-required field; repurposed field; `done/` row tag change; handover wire bump; unknown `ServerMessage` arm crashing an old daemon |
 | T11 | `schema_expand_contract` | an N+1 that expands: the N holder still reads, rollback opens the file, the contract release is refused while an N frontend runs | strict-equality open; contract on open |
-| T12 | `preflight_refuses` | table: unsigned, older serial, expired, wrong platform, contract schema, protocol flag day, handover mismatch, absent debt metric, silent member, host with no build: each refused and **no process touched** | gate that fails open (absent metric as zero) |
+| T12 | `preflight_refuses` | table: missing or wrong attestation (digest, repository, ref), incomplete platform, lower generation, contract schema, protocol flag day, handover mismatch, absent debt metric, silent member, host with no build: each refused and **no process touched** | gate that fails open (absent metric as zero) |
 | T13 | `controller_restart_resumes` | kill the frontend cold after cordon, after planned-down, after activate, after confirm: resume at the host's phase, nothing activated twice | engine starting from the top |
 | T14 | `second_loss_stops_the_run` | an unplanned node killed while another is planned-down: stop, restart nothing, `UNAVAILABLE`, recover | continuing; counting only planned members |
 | T15 | `mac_and_last_of_class` | a busy daemon-only host is deferred; the last of a class with work waiting is not picked | killing a lease; stalling a class |
@@ -773,13 +790,17 @@ T5, T6 and E1 prove the model's one unproven step: if either cannot be made reli
 - **D2 [owner]** dispatch to not-yet-updated nodes (2.6). **Lean yes**, knob for the literal behaviour.
 - **D4 [owner]** where Envoy runs and how it updates (2.5.4): hot restart with a raised `--parent-shutdown-time-s` on the frontend host; the Kubernetes kit has no hot restart. **Lean: single box under the hot restarter; Kubernetes with a long grace period; Envoy updates are never part of the frontend run.**
 - **D3 [owner]** forced drain of the least-loaded node after `idle_wait` (2.6). **Lean yes**, one node at a time, `Pending` at the limit; without it a never-idle farm never updates.
-- **Q1 [owner] Who signs.** The pull updater has an operator sign each release offline and hosts verify against a pinned root, so a compromised frontend cannot install anything unsigned. The direction here has the frontend poll and apply on a click, which needs a signer: (a) the frontend verifies the attestation and signs with a key it holds (one click; a frontend compromise is a fleet compromise); (b) the operator signs on their machine (strongest; "available" means attested, not signed, one command); (c) a separate signer. **Lean: (b) ships first; (a) opt-in per deployment.** A signed binary runs as the service user, which on a storage-and-daemon node holds the cold-store credential.
+- **Q1 Who signs: decided.** Hosts trust the GitHub build attestation of the `artifacts` workflow for `main`, verified offline on the host with
+  a pinned `gh` and trusted root; no operator signing for now; the frontend only stores and distributes (`pull-updates.md` section 2). The
+  residuals there stand (no branch protection on `main`; the binary holds the cold-store credential on a storage-and-daemon node). A
+  release key held off CI stays a documented later option. The temporary test-farm switch (attestation off in the held installer, to be
+  added back) is a test-farm setting only.
 - **Q2 [owner]** `auto_frontend`. **Lean: manual until T5, T6 and C1 to C16 have been green nightly for a month**; the poller never changes it.
 - **Q3 [owner]** Macs deferred when busy so one long UI test cannot hold the run (2.10). **Lean yes.**
 - **Q4** State-schema migration (3.4) is a `kbf-state` change of a few days and is on the critical path of the first release that changes a column. Until then the planner refuses such a release.
-- **Q5** Planned-down member state (2.6, step 4): **lean add it**; the router-failover alternative changes the write guarantee.
+- **Q5** Planned-down member state: **decided and built** (#914, `planned_down` with `for_secs`; 2.6 step 4); the router-failover alternative is not taken.
 - **Q6** Node graceful stop and a `Leave` call. **Lean yes.**
-- **Q7 [owner]** `auto_nodes` default `manual` until two click-through runs are clean.
+- **Q7 [owner]** `auto_nodes` default false until two click-through runs are clean.
 - **Q8** One rollout record (K11). **Lean durable `update/*` rows.**
 - **Q9** A nightly mixed-version job against the release before the last tag (T10), a precondition for auto.
 - **Q10** The handover wire frozen at 1 (K12); say so in the doc that owns `handover.rs`.
@@ -793,8 +814,8 @@ Each lands a test that fails first. Sizes (S under 1 day, M 1 to 3, L 3 to 5 day
 |---|---|---|---|
 | U0 | Land #857, #879, #887, #860; bring #803's engine into the controller's crate | merge | review |
 | U1 | The probes first: E1, E2 and T6 (Envoy, GOAWAY and buck2), then T5 and T7 | S-M | U14 |
-| U2 | `--version --json` fields (3.6); manifest `meta`; planner (order rule, refusals) | M | U0 |
-| U3 | `open_writes` and `repair_debt` in the heartbeat; frontend aggregate and G_S; operator `down` (step 4); node graceful stop | M-L | U0 |
+| U2 | `--version --json` fields (3.6); offered-release `meta`; planner (order rule, refusals) | M | U0 |
+| U3 | `open_writes` and `repair_debt` in the heartbeat; frontend aggregate and G_S; `planned_down` (#914, step 4: built); node graceful stop | M-L | U0 |
 | U4 | `update/*` rows, the controller with resume, the real transport, the node step 2.6 and idle 2.7 (**the node-rolling unit**) | L | U2, U3 |
 | U5 | Frontend phase on the helper: `activate` for two instances, E0 to E8, Settling | M | U4, pull-updater helper |
 | U6 | Handover-gap metric and alert; the capacity floor and wait-limit rule (2.8) | S | U4 |
@@ -809,4 +830,4 @@ Each lands a test that fails first. Sizes (S under 1 day, M 1 to 3, L 3 to 5 day
 
 What this document does not claim: that any of it is built; that buck2 retries a request that races a GOAWAY (T6); that a node's
 stop is graceful (Q6); that the repair gate has a metric to read (U3); that a restart fits inside the dwell (C30); or that the
-pull updater exists.
+controller, the node gates, the Envoy switch or the poller exist (the installer is merged; the node client and the helper are in review).

@@ -61,11 +61,12 @@ fn running(exec: &ScratchHost, layout: &Layout, commit: &str, also: &[&str]) {
         .expect("state");
 }
 
-fn order(commit: &str, id: &str, serial: u64) -> Order {
+/// An order for `commit`. The third argument is only a label for the reader of a test
+/// (the number of the order in the story); an order carries no serial.
+fn order(commit: &str, id: &str, _label: u64) -> Order {
     Order {
         commit: c(commit),
         order_id: id.to_owned(),
-        serial,
     }
 }
 
@@ -142,12 +143,12 @@ impl Exec for Killed<'_> {
 
 /// Catches an activation that does not install the new release on trial as the design
 /// says: `current` and `previous` both moved (a rollback target exists), the staged
-/// slot cleared, the serial taken as the floor, the order, the start budget and an
+/// slot cleared, the order, the start budget and an
 /// unstarted window recorded. It also catches a swap that touches a release's files:
 /// the binary of the release that was running keeps its bytes and its inode, so a
 /// process running it is undisturbed.
 ///
-/// Mutants seen red: `previous` not moved; `staged` left; the floor not raised.
+/// Mutants seen red: `previous` not moved; `staged` left.
 #[test]
 fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
     let (mut exec, layout) = host("swap");
@@ -181,7 +182,7 @@ fn an_order_swaps_a_staged_release_in_on_trial_and_changes_no_release_file() {
                 order_id: Some("o1".to_owned()),
                 starts_left: Some(3),
             }),
-            order_floor: 5,
+            order_floor: 0,
         }
     );
     assert_eq!(fs::read_to_string(&old).expect("read"), A);
@@ -210,12 +211,13 @@ fn a_release_that_is_not_installed_is_refused_and_nothing_changes() {
     assert_eq!(link_steps(&exec), 0);
 }
 
-/// Catches a downgrade by a replayed old order: below the floor is refused, the floor
-/// itself is allowed (a retry of the order that set it).
+/// Catches a floor that refuses a rollback: a release is ordered down by ordering the old
+/// release again, so an order whose number is below anything recorded is carried out, and
+/// the recorded floor (an old build's field) is left as it was.
 ///
-/// Mutants seen red: the floor not checked; `<` written `<=`.
+/// Mutant seen red: the old floor check put back (the order below 7 is refused).
 #[test]
-fn an_order_below_the_floor_is_refused_and_one_at_the_floor_is_not() {
+fn an_order_is_never_refused_for_its_number_and_the_floor_stays() {
     let (mut exec, layout) = host("floor");
     running(&exec, &layout, A, &[B]);
     let mut was = state_of(&layout);
@@ -224,17 +226,8 @@ fn an_order_below_the_floor_is_refused_and_one_at_the_floor_is_not() {
         .expect("lock")
         .write(&was)
         .expect("w");
-
-    let err = go(&mut exec, &layout, &order(B, "o1", 6), START).expect_err("below");
-    assert!(
-        err.contains("serial 6 is below this host's floor 7"),
-        "{err}"
-    );
-    assert_eq!(state_of(&layout), was);
-    assert_eq!(link_steps(&exec), 0);
-
     assert_eq!(
-        go(&mut exec, &layout, &order(B, "o1", 7), START),
+        go(&mut exec, &layout, &order(B, "o1", 6), START),
         Ok(Activated::Swapped)
     );
     assert_eq!(state_of(&layout).order_floor, 7);
@@ -388,8 +381,7 @@ fn a_revert_puts_the_previous_release_back_and_keeps_the_release_it_left() {
         (state.current, state.previous, state.pending_confirm),
         (Some(c(A)), None, None)
     );
-    // The floor stays: the reverted order's serial is not taken back.
-    assert_eq!(state.order_floor, 5);
+    assert_eq!(state.order_floor, 0);
     assert!(
         exec.at(&format!("/usr/local/kbf/releases/{B}/kbf"))
             .exists()

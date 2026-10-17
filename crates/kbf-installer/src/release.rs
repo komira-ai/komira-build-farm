@@ -85,10 +85,6 @@ pub enum ReleaseError {
     PreviousGone(CommitId),
     #[error("release {0} is not installed (no binary at its directory): stage it first")]
     NotInstalled(CommitId),
-    #[error(
-        "order serial {serial} is below this host's floor {floor}: a release is never ordered down"
-    )]
-    BelowFloor { serial: u64, floor: u64 },
     #[error("the pending swap of {commit} was made by {pending}, not by order {got:?}")]
     OtherOrder {
         commit: CommitId,

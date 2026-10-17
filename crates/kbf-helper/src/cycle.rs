@@ -367,7 +367,6 @@ impl<E: Exec> Helper<E> {
             // The epoch is part of the name: a restored store counts ids again, and an activation
             // under the same id as a pending one would be taken for its repeat.
             order_id: format!("{}-{}", order.epoch, order.id),
-            serial: order.id,
         };
         let arm = self.arm(order);
         match activate::activate(

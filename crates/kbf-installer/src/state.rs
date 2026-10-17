@@ -38,7 +38,9 @@ pub struct State {
     pub staged: Option<CommitId>,
     /// A release swapped in and not yet confirmed.
     pub pending_confirm: Option<PendingConfirm>,
-    /// The order number below which this host takes no release. Only stored here.
+    /// Not used: an order's place in the order of orders is the frontend's and the helper's
+    /// (epoch, then id), and a release may be ordered down (a rollback is the old release
+    /// ordered again). Kept so that a state file written by an older build still reads.
     pub order_floor: u64,
 }
 
