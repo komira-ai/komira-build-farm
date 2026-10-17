@@ -441,8 +441,12 @@ impl ReleaseStore {
                     components.extend(self.component(&key).await?);
                 }
                 if !components.is_empty() {
-                    let complete = components.len() == Component::ALL.len()
-                        && components.iter().all(|c| c.attested);
+                    // Complete: every tarball this platform's hosts need is stored, attested.
+                    let complete = platform.components().iter().all(|name| {
+                        components
+                            .iter()
+                            .any(|c| c.component.as_str() == *name && c.attested)
+                    });
                     platforms.push(PlatformListing {
                         platform,
                         components,

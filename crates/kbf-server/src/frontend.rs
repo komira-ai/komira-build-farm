@@ -813,7 +813,13 @@ impl<'a> Prepared<'a> {
             Arc::clone(&drain),
             members.clone(),
         )
-        .merge(crate::release::router(releases.clone(), token))
+        .merge(crate::release::router(releases.clone(), token.clone()))
+        .merge(crate::release::desired::router(
+            releases.clone(),
+            state_store.clone().map(crate::update::Rows::new),
+            token,
+            Arc::clone(&farm),
+        ))
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(
             backend.clone(),

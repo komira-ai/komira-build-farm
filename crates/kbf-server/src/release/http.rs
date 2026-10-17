@@ -123,7 +123,7 @@ async fn list(State(releases): State<Arc<Releases>>) -> Response {
 
 /// The `GET /v1/releases` body: commits with, per platform, the components stored and
 /// whether the platform is complete.
-fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
+pub(super) fn listing_view(listing: &[CommitListing]) -> serde_json::Value {
     let releases: Vec<_> = listing
         .iter()
         .map(|commit| {

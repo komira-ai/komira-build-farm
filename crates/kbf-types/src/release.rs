@@ -43,6 +43,17 @@ impl ReleasePlatform {
         }
     }
 
+    /// The tarballs a host of this platform needs for a release: `kbf` on Linux, `kbf-daemon`
+    /// on a Mac (`docs/design/pull-updates.md` section 5). The release store calls a platform
+    /// complete when it holds each of these with its attestation.
+    #[must_use]
+    pub const fn components(self) -> &'static [&'static str] {
+        match self {
+            Self::LinuxX86_64 | Self::LinuxArm64 => &["kbf"],
+            Self::DarwinArm64 => &["kbf-daemon"],
+        }
+    }
+
     /// The platform [`ReleasePlatform::as_str`] names `name` for; `None` for any other
     /// text (the match is exact: no case folding, no trimming).
     #[must_use]

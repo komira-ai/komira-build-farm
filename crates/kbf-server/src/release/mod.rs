@@ -7,6 +7,8 @@
 //! - The router, [`http::router`], serves `PUT /v1/releases/{commit}/{platform}/{name}` and
 //!   `GET /v1/releases`.
 //! - The service, [`grpc::service`], is `ReleaseService.Fetch`.
+//! - The desired release, [`desired::router`]: `GET /v1/update`, `POST /v1/update/desired`,
+//!   `pause` and `resume`, over the `update/desired` row.
 //!
 //! `GET /v1/releases` and `Fetch` carry no authentication of their own: the wiring puts `Fetch`
 //! behind the worker listener's mutual TLS.
@@ -15,6 +17,7 @@
 //! service to its worker listener where it starts. Trust is the host's: the store neither
 //! opens a tarball nor checks an attestation.
 
+pub mod desired;
 pub mod grpc;
 pub mod http;
 pub mod key;

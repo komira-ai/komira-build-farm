@@ -328,7 +328,7 @@ impl Farm {
     }
 
     /// Farm time: milliseconds since this farm was built.
-    fn now(&self) -> FarmTime {
+    pub(crate) fn now(&self) -> FarmTime {
         let millis = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         FarmTime::from_millis(millis)
     }
