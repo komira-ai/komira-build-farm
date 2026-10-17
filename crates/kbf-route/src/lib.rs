@@ -23,11 +23,18 @@
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
 //!   per primary, and puts the answers back in the order asked.
 //! - **Writes** ([`Router::put`], [`Router::commit_action_record`]) go to the first
-//!   write owner that is not `Down` in the map, and to that one only: the router does not
-//!   write to the others or retry on another owner (the storage side's chain replication
-//!   is av2-11). An action-cache entry is committed where its action is, and a node
-//!   checks an entry against the blobs it holds itself: [`Router::commit_with_closure`]
-//!   first copies the entry's blobs to that node, from wherever the map has them.
+//!   write owner that is not `Down` in the map, and to that one alone while it answers
+//!   (the storage side's chain replication is av2-11). An owner that **cannot be
+//!   reached** (dead, but not yet marked `Down`: that takes the member lease) is followed
+//!   by the next write owner that is not `Down`, which is sent the write whole and from
+//!   the start; only UNAVAILABLE moves on, never an answer (`Invalid`, a refused
+//!   action-cache write, `STALE_MAP`, which has its own rule below), and the router keeps
+//!   no memory of the owner that failed. (The plain [`Router::commit_action_record`] does
+//!   not fail over: the next owner lacks the entry's blobs.) An action-cache entry is committed where its
+//!   action is, and a node checks an entry against the blobs it holds itself:
+//!   [`Router::commit_with_closure`] first copies the entry's blobs to that node, from
+//!   wherever the map has them (and does it again at the next owner if the first cannot
+//!   be reached).
 //! - **`STALE_MAP`**: a node that holds a newer map answers [`StorageError::StaleMap`].
 //!   The router fetches the newer map through the [`MapSource`] and runs the call again,
 //!   once; a second answer, or a fetch that brings no newer map, is `UNAVAILABLE`.

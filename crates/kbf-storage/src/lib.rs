@@ -119,8 +119,8 @@ pub trait Storage: Send + Sync {
     /// place the blob here: the blobs of an action-cache entry, which the node checks
     /// against what it holds itself. A node that serves a chain stores the blob as one
     /// copy (nothing is forwarded, nobody owes a replica) where [`Storage::put`] would be
-    /// refused as not the primary; a node that is the blob's primary treats it as
-    /// [`Storage::put`]. The default is [`Storage::put`].
+    /// refused as not the primary; a node that is one of the blob's write owners treats it
+    /// as [`Storage::put`]. The default is [`Storage::put`].
     ///
     /// # Errors
     /// As [`Storage::put`].

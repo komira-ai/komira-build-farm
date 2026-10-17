@@ -328,8 +328,8 @@ async fn a_map_that_turns_during_the_write_is_checked_before_the_answer() {
 }
 
 /// Catches the copy an action-cache commit needs on the action's owner being refused: the
-/// owner of an action is not the primary of the blobs of its entry, a plain write there is
-/// "not the primary", and the commit failed (a repeat of an action ran again on a farm of
+/// owner of an action is usually not an owner of the blobs of its entry, a plain write
+/// there is refused as "not the primary", and the commit failed (a repeat of an action ran again on a farm of
 /// three). An unowned write to a node that owns nothing stores one copy there and none is
 /// forwarded or owed; to the blob's primary it is a plain write (the replica holds it
 /// too). Mutants: the unowned marker ignored by the node (refused); taken as local at the
@@ -401,9 +401,10 @@ async fn an_unowned_copy_is_honoured_only_for_the_frontends_identity() {
     assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
 }
 
-/// Catches a write taken by the wrong node: a client write to the replica (not the
-/// primary), to a node that owns nothing, or a copy sent to a node that owns nothing or
-/// by the node to itself, and a leg header that is not a member id; none stores anything.
+/// Catches a write taken by the wrong node: a client write to a node that owns nothing, or
+/// a copy sent to a node that owns nothing or by the node to itself, and a leg header that
+/// is not a member id; none stores anything. (A client write to the second owner is
+/// served: `the_second_owner_takes_a_write_while_the_map_has_the_first_up`.)
 #[tokio::test]
 async fn a_write_is_served_only_where_the_map_places_it() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -416,8 +417,6 @@ async fn a_write_is_served_only_where_the_map_places_it() {
         assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
         status.message().to_owned()
     };
-    let replica = invalid(raw(farm.channel(1), &digest, parts, 1, None).await);
-    assert!(replica.contains("not the primary"), "{replica}");
     let third = invalid(raw(farm.channel(2), &digest, parts, 1, None).await);
     assert!(third.contains("not the primary"), "{third}");
     let to_third = invalid(raw(farm.storage_channel(2), &digest, parts, 1, Some(1)).await);

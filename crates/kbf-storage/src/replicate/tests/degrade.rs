@@ -288,6 +288,51 @@ async fn with_the_primary_down_the_next_owner_takes_the_write() {
     assert_eq!(farm.nodes[0].mem.knobs.chunks.load(Ordering::SeqCst), 0);
 }
 
+/// Catches the second owner refusing a client write because the map has not marked the
+/// first down yet (a frontend whose write to a dead owner failed goes on to the next
+/// owner, `kbf_route::Router::put`, and gets INVALID_ARGUMENT "not the primary"): with the
+/// first owner's connections cut and the map still naming it active, the write to the
+/// second is answered, the second holds the blob, and it owes the first its copy.
+/// Mutant: the plan's `(None, Some(1), ..)` arm guarded by the first owner being down.
+#[tokio::test]
+async fn the_second_owner_takes_a_write_whose_primary_is_dead_but_not_yet_down() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 46);
+    let digest = sha(&bytes);
+    farm.nodes[0].switch.cut();
+    let answered = within(farm.client(1, 1).put(Bytes::from(bytes)))
+        .await
+        .expect("answered");
+    assert_eq!(answered, digest);
+    assert!(held(&farm, 1, &digest) && !held(&farm, 0, &digest));
+    assert_eq!(
+        owed(&farm, 1),
+        [RepairRecord {
+            digest,
+            replica: farm.nodes[0].id,
+            generation: 1
+        }]
+    );
+}
+
+/// Catches the second owner taking a client write and keeping it to itself: with the
+/// first owner up and the map naming it active, the write to the second lands on both and
+/// nothing is owed. Mutant: the second owner's plan having no copy to send.
+#[tokio::test]
+async fn the_second_owner_takes_a_write_while_the_map_has_the_first_up() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 47);
+    let digest = sha(&bytes);
+    let answered = within(farm.client(1, 1).put(Bytes::from(bytes)))
+        .await
+        .expect("answered");
+    assert_eq!(answered, digest);
+    assert!(held(&farm, 0, &digest) && held(&farm, 1, &digest));
+    assert!(owed(&farm, 1).is_empty() && owed(&farm, 0).is_empty());
+}
+
 /// The build of [`an_owner_killed_mid_build_does_not_stop_it`]: 30 blobs written through
 /// the owners the map names, the first live one as primary; a third of the way in node 1
 /// dies (the map has not noticed), and two thirds in the map turns and names it down.

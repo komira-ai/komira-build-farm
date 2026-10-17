@@ -8,13 +8,14 @@
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Body as _, Frame};
 use kbf_types::Digest;
 use tonic::body::Body;
+use tonic::codegen::http::HeaderMap;
 use tonic::{Code, Status};
 
 use super::owners::Owners;
@@ -51,11 +52,15 @@ pub(super) enum Probe {
     Failed(Status),
 }
 
-/// Ends an upload whose primary is no longer the node it began at.
+/// Ends an upload whose writer is no longer the node it is being sent to.
 pub(super) struct Guard {
     pub owners: Owners,
     pub digest: Digest,
     pub owner: Arc<str>,
+    /// The nodes this upload has already failed to reach and gone on from
+    /// ([`Owners::writer_after`]): the writer is the first owner that is not down and not
+    /// one of these.
+    pub skipped: Vec<Arc<str>>,
     /// The refusal, kept so that the call answers it rather than what the broken body
     /// made the node say.
     pub failed: Arc<Mutex<Option<Status>>>,
@@ -65,7 +70,7 @@ impl Guard {
     fn check(&self) -> Result<(), Status> {
         if self
             .owners
-            .writer(&self.digest)
+            .writer_after(&self.digest, &self.skipped)
             .is_ok_and(|writer| writer.id() == &*self.owner)
         {
             return Ok(());
@@ -74,11 +79,168 @@ impl Guard {
             "the owner of {} changed from {} during the upload; start it again",
             self.digest, self.owner
         ));
-        *self
-            .failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refusal.clone());
+        *self.failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(refusal.clone());
         Err(refusal)
+    }
+}
+
+/// A frame of the client's request, kept to send again.
+enum Kept {
+    Data(Bytes),
+    Trailers(HeaderMap),
+}
+
+impl Kept {
+    fn of(frame: &Frame<Bytes>) -> Self {
+        // A frame is data or trailers, nothing else.
+        frame.data_ref().map_or_else(
+            || Self::Trailers(frame.trailers_ref().cloned().unwrap_or_default()),
+            |data| Self::Data(data.clone()),
+        )
+    }
+
+    fn frame(&self) -> Frame<Bytes> {
+        match self {
+            Self::Data(data) => Frame::data(data.clone()),
+            Self::Trailers(trailers) => Frame::trailers(trailers.clone()),
+        }
+    }
+}
+
+/// The client's request body and what has been taken from it.
+struct Source {
+    inner: Body,
+    /// The frames read before [`Upload::seal`], which held the resource name, and the
+    /// ones after them that carry no byte of the upload. Dropped when the first frame with
+    /// bytes past them is read.
+    prefix: Vec<Kept>,
+    sealed: bool,
+    /// A frame past the prefix has been read: bytes of the client's upload have gone
+    /// somewhere that cannot be sent again.
+    streamed: bool,
+    ended: bool,
+    broken: Option<Status>,
+    /// The attempt that may read now: an earlier one's body is cut off.
+    attempt: u32,
+}
+
+/// The client's upload of one blob, which more than one attempt at a storage node may
+/// send, as long as no byte of it went anywhere but the first frames, which are kept.
+///
+/// An attempt reads the request through a [`Body`] of its own ([`Upload::first`],
+/// [`Upload::again`]); a later attempt reads what the earlier ones read of the prefix,
+/// then the rest of the client's body. What the earlier attempt read past the prefix is
+/// gone (a stream is not held), and [`Upload::again`] says so by giving nothing.
+pub(super) struct Upload {
+    source: Arc<Mutex<Source>>,
+}
+
+impl Upload {
+    pub fn new(inner: Body) -> Self {
+        Self {
+            source: Arc::new(Mutex::new(Source {
+                inner,
+                prefix: Vec::new(),
+                sealed: false,
+                streamed: false,
+                ended: false,
+                broken: None,
+                attempt: 0,
+            })),
+        }
+    }
+
+    fn source(&self) -> std::sync::MutexGuard<'_, Source> {
+        self.source.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The body of the first attempt.
+    pub fn first(&self) -> Body {
+        Body::new(Resend {
+            source: Arc::clone(&self.source),
+            attempt: 0,
+            replay: VecDeque::new(),
+        })
+    }
+
+    /// The frames read so far are the prefix: every frame read after this is a byte the
+    /// upload has passed on.
+    pub fn seal(&self) {
+        self.source().sealed = true;
+    }
+
+    /// The body of the next attempt, which cuts off the one before it; `None` if a frame
+    /// past the prefix has been read, so that the upload cannot be sent again.
+    pub fn again(&self) -> Option<Body> {
+        let mut source = self.source();
+        if source.streamed {
+            return None;
+        }
+        source.attempt += 1;
+        Some(Body::new(Resend {
+            attempt: source.attempt,
+            replay: source.prefix.iter().map(Kept::frame).collect(),
+            source: Arc::clone(&self.source),
+        }))
+    }
+}
+
+/// One attempt's reading of an [`Upload`].
+struct Resend {
+    source: Arc<Mutex<Source>>,
+    attempt: u32,
+    /// The prefix, for an attempt after the first.
+    replay: VecDeque<Frame<Bytes>>,
+}
+
+impl http_body::Body for Resend {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+        let this = self.get_mut();
+        if let Some(frame) = this.replay.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        let mut source = this.source.lock().unwrap_or_else(PoisonError::into_inner);
+        if source.attempt != this.attempt {
+            return Poll::Ready(Some(Err(Status::aborted(
+                "the upload went on to another storage node",
+            ))));
+        }
+        if let Some(broken) = &source.broken {
+            return Poll::Ready(Some(Err(broken.clone())));
+        }
+        if source.ended {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut source.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                source.ended = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(status))) => {
+                source.broken = Some(status.clone());
+                Poll::Ready(Some(Err(status)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                // A frame with bytes of the upload, past the prefix, is passed on for
+                // good. One without (the empty data frame that ends a stream, trailers)
+                // joins the prefix, to be sent again with it.
+                let bytes = frame.data_ref().is_some_and(|data| !data.is_empty());
+                if source.sealed && bytes {
+                    source.streamed = true;
+                    source.prefix.clear();
+                } else if !source.streamed {
+                    source.prefix.push(Kept::of(&frame));
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+        }
     }
 }
 
@@ -396,6 +558,29 @@ mod tests {
         }
     }
 
+    /// A body that yields these results, one at a time, answering `None` entries with
+    /// `Pending` (and a wake, so the reader polls again), then ends.
+    struct Paced(VecDeque<Option<Result<Frame<Bytes>, Status>>>);
+
+    impl http_body::Body for Paced {
+        type Data = Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+            match self.0.pop_front() {
+                Some(None) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Some(frame)) => Poll::Ready(Some(frame)),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
     fn data(n: usize) -> Result<Frame<Bytes>, Status> {
         Ok(Frame::data(Bytes::from(vec![7; n])))
     }
@@ -562,6 +747,7 @@ mod tests {
             owners: owners.clone(),
             digest,
             owner: Arc::from("a"),
+            skipped: Vec::new(),
             failed: Arc::clone(&failed),
         };
         let (p, _) = pass(vec![data(1), data(2), data(3)], Direction::ToStorage);
@@ -583,6 +769,148 @@ mod tests {
         assert!(
             next(&mut p).await.unwrap().is_err(),
             "no primary at all is a change too"
+        );
+    }
+
+    /// The lengths of the data in the next `n` frames of `body`.
+    async fn read_n(body: &mut Body, n: usize) -> Vec<usize> {
+        let mut lens = Vec::new();
+        for _ in 0..n {
+            let frame = poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await;
+            lens.push(frame.unwrap().unwrap().data_ref().map_or(0, Bytes::len));
+        }
+        lens
+    }
+
+    /// Catches an upload that cannot be sent again when it can (a failed first node would
+    /// fail the call), and one sent again with bytes missing: after the first two frames
+    /// (the prefix) the next attempt reads the same two, then what the client still has
+    /// (the rest of the body, once), then its end; and it reads the end of a body that
+    /// was already read to its end.
+    #[tokio::test]
+    async fn an_upload_is_sent_again_from_its_prefix() {
+        let upload = Upload::new(Body::new(Script(
+            vec![data(3), data(4), data(5), trailers(&Status::ok(""))].into(),
+        )));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 2).await, [3, 4]);
+        upload.seal();
+
+        let mut second = upload.again().expect("nothing was passed on");
+        assert_eq!(read_n(&mut second, 3).await, [3, 4, 5]);
+        // The client's body has been read past the prefix: a third attempt cannot be.
+        assert!(upload.again().is_none());
+        drop(second);
+
+        // A body that ends inside the prefix is sent again with its end.
+        let upload = Upload::new(Body::new(Script(vec![data(2)].into())));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 1).await, [2]);
+        assert!(
+            poll_fn(|cx| Pin::new(&mut first).poll_frame(cx))
+                .await
+                .is_none()
+        );
+        upload.seal();
+        let mut second = upload.again().expect("only the end was read");
+        assert_eq!(read_n(&mut second, 1).await, [2]);
+        assert!(
+            poll_fn(|cx| Pin::new(&mut second).poll_frame(cx))
+                .await
+                .is_none()
+        );
+    }
+
+    /// Catches an attempt that has been given up on still reading the client's body (it
+    /// would take bytes the next attempt needs): once the next attempt begins, the earlier
+    /// one's body reads an error and takes nothing.
+    #[tokio::test]
+    async fn an_attempt_given_up_on_reads_nothing_more() {
+        let upload = Upload::new(Body::new(Script(vec![data(3), data(4), data(5)].into())));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 1).await, [3]);
+        upload.seal();
+        let mut second = upload.again().expect("the prefix only");
+        let stale = poll_fn(|cx| Pin::new(&mut first).poll_frame(cx)).await;
+        assert_eq!(stale.unwrap().unwrap_err().code(), Code::Aborted);
+        // The frame it did not take is the next attempt's.
+        assert_eq!(read_n(&mut second, 2).await, [3, 4]);
+    }
+
+    /// Catches a client that broke mid-upload read as a clean end by the next attempt:
+    /// the error is kept and the attempt after it reads the same one.
+    #[tokio::test]
+    async fn a_client_that_broke_is_a_failure_for_every_attempt() {
+        let upload = Upload::new(Body::new(Script(
+            vec![data(3), Err(Status::cancelled("reset"))].into(),
+        )));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 1).await, [3]);
+        upload.seal();
+        let broke = poll_fn(|cx| Pin::new(&mut first).poll_frame(cx)).await;
+        assert_eq!(broke.unwrap().unwrap_err().code(), Code::Cancelled);
+        // A frame past the prefix was not read, so another attempt may begin, and it fails
+        // the same way.
+        let mut second = upload.again().expect("no byte was passed on");
+        assert_eq!(read_n(&mut second, 1).await, [3]);
+        let broke = poll_fn(|cx| Pin::new(&mut second).poll_frame(cx)).await;
+        assert_eq!(broke.unwrap().unwrap_err().code(), Code::Cancelled);
+    }
+
+    /// Catches frames that follow the bytes passed on being kept to send again (the upload
+    /// can no longer be sent again, so they would be held for nothing), and a client body
+    /// that is not ready read as an end: a wait is passed on as a wait, the bytes past the
+    /// prefix end any resend, and the empty frame and trailers after them are passed on
+    /// and not kept. Mutant: frames without bytes kept after the upload streamed.
+    #[tokio::test]
+    async fn frames_after_the_bytes_passed_on_are_not_kept() {
+        let upload = Upload::new(Body::new(Paced(
+            vec![
+                None,
+                Some(data(3)),
+                Some(data(4)),
+                None,
+                Some(data(0)),
+                Some(trailers(&Status::ok(""))),
+            ]
+            .into(),
+        )));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 1).await, [3]);
+        upload.seal();
+        assert_eq!(read_n(&mut first, 3).await, [4, 0, 0]);
+        assert!(
+            poll_fn(|cx| Pin::new(&mut first).poll_frame(cx))
+                .await
+                .is_none()
+        );
+        assert!(
+            upload.again().is_none(),
+            "bytes past the prefix were passed on"
+        );
+        let source = upload.source.lock().expect("lock");
+        assert!(source.prefix.is_empty(), "frames after the bytes were kept");
+    }
+
+    /// Catches an upload given up on because the stream's end arrived as a frame (an empty
+    /// data frame, which HTTP/2 uses to carry END_STREAM): it carries no byte, so it does
+    /// not stop the upload being sent again, and it is part of what is sent again. Mutant:
+    /// every frame past the prefix counted as passed on.
+    #[tokio::test]
+    async fn a_frame_without_bytes_does_not_stop_a_resend() {
+        let upload = Upload::new(Body::new(Script(
+            vec![data(3), data(0), trailers(&Status::ok(""))].into(),
+        )));
+        let mut first = upload.first();
+        assert_eq!(read_n(&mut first, 1).await, [3]);
+        upload.seal();
+        assert_eq!(read_n(&mut first, 2).await, [0, 0]);
+        let mut second = upload.again().expect("no byte was passed on");
+        assert_eq!(read_n(&mut second, 3).await, [3, 0, 0]);
+        assert!(
+            poll_fn(|cx| Pin::new(&mut second).poll_frame(cx))
+                .await
+                .is_none()
         );
     }
 }

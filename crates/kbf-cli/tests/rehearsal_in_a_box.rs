@@ -216,6 +216,9 @@ struct Farm {
     storage_nodes: usize,
     /// The ids the frontend must list as connected, sorted.
     node_ids: Vec<String>,
+    /// The processes (by index) a test has killed: [`Farm::wait`] does not take their
+    /// exit for a crash.
+    killed: Vec<usize>,
 }
 
 impl Farm {
@@ -252,6 +255,7 @@ impl Farm {
             node_ids: std::iter::once(DAEMON.to_owned())
                 .chain((1..=storage_nodes).map(node_id))
                 .collect(),
+            killed: Vec::new(),
         };
 
         // The frontend: its unit as rendered, a state directory made.
@@ -338,7 +342,11 @@ impl Farm {
     fn wait<T>(&mut self, what: &str, mut ready: impl FnMut(&Farm) -> Option<T>) -> T {
         let deadline = Instant::now() + HANG;
         loop {
-            let ended = self.procs.iter_mut().find_map(|p| {
+            let killed = &self.killed;
+            let ended = self.procs.iter_mut().enumerate().find_map(|(i, p)| {
+                if killed.contains(&i) {
+                    return None;
+                }
                 p.exited()
                     .map(|s| format!("{} exited ({s}) while waiting for {what}", p.name))
             });
@@ -355,6 +363,12 @@ impl Farm {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// SIGKILL to process `which`, as a host losing power would take it.
+    fn kill(&mut self, which: usize) {
+        self.procs[which].kill();
+        self.killed.push(which);
     }
 
     fn logs(&self) -> String {
@@ -620,40 +634,225 @@ fn three_storage_nodes_run_an_action() {
     farm.stop();
 }
 
-/// Reads every blob back through the frontend after one storage node is killed.
+/// How many actions the kill test runs before the kill: enough that the killed node
+/// has committed some action's cache entry (it commits those of which it is the first
+/// owner not marked down, a third of them), so the miss-and-rerun path runs.
+const ACTIONS: usize = 6;
+
+/// Writes the blobs numbered `range` through `cas` and reads each back.
+async fn write_blobs(cas: &Transfers, range: std::ops::Range<usize>) -> Vec<Vec<u8>> {
+    let blobs: Vec<Vec<u8>> = range.map(blob).collect();
+    for bytes in &blobs {
+        let digest = cas
+            .put(bytes.clone())
+            .await
+            .expect("a write after the kill goes on to the blob's other owner");
+        assert_eq!(digest, digest_of(bytes));
+    }
+    for bytes in &blobs {
+        let read = cas.get(&digest_of(bytes)).await.expect("read back");
+        assert_eq!(&read, bytes);
+    }
+    blobs
+}
+
+/// Runs an action whose input is `blob(input)` and returns its digest and result.
+async fn run_action(
+    channel: &Channel,
+    cas: &Transfers,
+    image: &str,
+    input: usize,
+) -> (Digest, ActionResult) {
+    let action = upload_action(cas, image, &blob(input)).await;
+    let response = tokio::time::timeout(HANG, execute(channel.clone(), action.clone()))
+        .await
+        .expect("the action answered in time");
+    let result = response
+        .result
+        .clone()
+        .unwrap_or_else(|| panic!("no result: {response:?}"));
+    assert_eq!(result.exit_code, 0, "{response:?}");
+    let [file] = &result.output_files[..] else {
+        panic!("one output file: {response:?}");
+    };
+    assert_eq!(file.digest.as_ref(), Some(&digest_of(OUTPUT)));
+    (action, result)
+}
+
+/// What the client asks of the frontend after the kill, `round` numbering the asking
+/// (fresh blobs are numbered from it). `before` is what was written before it.
 ///
-/// NOT RUN until the real binaries wire R=2 (`with_chain` in `kbf storage-and-daemon`,
-/// the open R=2 glue change; the frontend routes by the map already, see
-/// [`three_storage_nodes_run_an_action`]): at R=1 the killed node is the only owner of
-/// its blobs, so this fails by construction. Remove the `ignore` when R=2 is in; the
-/// flags the units render are the ones R=2 reads, so it needs no other change.
+/// Every blob and the actions' output read back. Each action's cache entry either
+/// answers as it did before (`GetActionResult`, and a repeat `Execute` with
+/// `cached_result` set) or is a miss (NOT_FOUND, never another error), and the repeat
+/// `Execute` of a miss runs the action again to the same output and its entry is back.
+/// Then writes: 24 fresh blobs and a new action. Returns the fresh blobs and the number
+/// of entries that were a miss.
+async fn survivors(
+    channel: &Channel,
+    cas: &Transfers,
+    image: &str,
+    before: (&[Vec<u8>], &[(Digest, ActionResult)]),
+    round: usize,
+) -> (Vec<Vec<u8>>, usize) {
+    let (blobs, actions) = before;
+    for bytes in blobs {
+        let read = cas
+            .get(&digest_of(bytes))
+            .await
+            .expect("a blob lost with the node");
+        assert_eq!(&read, bytes);
+    }
+    let read = cas
+        .get(&digest_of(OUTPUT))
+        .await
+        .expect("the actions' output lost with the node");
+    assert_eq!(read, OUTPUT);
+    let lookup = async |action: &Digest| {
+        ActionCacheClient::new(channel.clone())
+            .get_action_result(GetActionResultRequest {
+                action_digest: Some(action.clone()),
+                ..GetActionResultRequest::default()
+            })
+            .await
+    };
+    let mut reruns = 0;
+    for (action, result) in actions {
+        let hit = match lookup(action).await {
+            Ok(entry) => Some(entry.into_inner()),
+            // A miss costs the action a rerun; any other answer is a failure of the farm.
+            Err(status) if status.code() == tonic::Code::NotFound => None,
+            Err(status) => panic!("GetActionResult after the kill: {status:?}"),
+        };
+        if let Some(entry) = &hit {
+            assert_eq!(&entry.output_files, &result.output_files);
+        }
+        let again = tokio::time::timeout(HANG, execute(channel.clone(), action.clone()))
+            .await
+            .expect("the repeat answered in time");
+        let ran = again.result.as_ref().expect("a result");
+        assert_eq!(ran.exit_code, 0, "{again:?}");
+        assert_eq!(ran.output_files, result.output_files, "{again:?}");
+        assert_eq!(again.cached_result, hit.is_some(), "{again:?}");
+        reruns += usize::from(hit.is_none());
+        // Whichever it was, the entry is there now.
+        let entry = lookup(action).await.expect("the entry after the repeat");
+        assert_eq!(entry.into_inner().output_files, result.output_files);
+    }
+    // Writes: fresh blobs, then a fresh action (its input a fresh blob too).
+    let fresh = 1000 * round;
+    let written = write_blobs(cas, fresh..fresh + 24).await;
+    run_action(channel, cas, image, fresh + 500).await;
+    (written, reruns)
+}
+
+/// No blob is lost with a storage node, and the farm keeps taking writes.
+///
+/// A frontend, three storage-and-daemon nodes and a daemon, from the rendered units
+/// (R=2: the map is the one the frontend and the nodes share). The client writes 24
+/// blobs and `Execute`s six actions (six action cache entries, each committed with its
+/// output at its owners). Once every blob is on two storage nodes, the node holding
+/// most of them is killed with SIGKILL, and the frontend is asked, with the node dead
+/// and not yet marked down anywhere the client can see:
+/// - every blob written before the kill reads back, and so does the actions' output;
+/// - each action's cache entry either answers as before (`GetActionResult` and a repeat
+///   `Execute` agree, `cached_result` set) or is a miss (NOT_FOUND), in which case the
+///   repeat `Execute` runs it again to the same output and the entry is back. An entry is
+///   committed at one owner and not replicated (the design's "AC miss, rerun"), so the
+///   entries the dead node committed are misses; a miss costs a rerun and never a wrong
+///   or failed answer;
+/// - writes after the kill succeed: 24 more blobs, whose first owner is the dead node
+///   for about a third of them, go on to the other owner, and a new action runs to a
+///   result committed at an owner that is alive;
+/// - the same holds once the frontend lists the dead node's daemon as gone (the
+///   frontend's connection list, not the map: the member's lease outlives this test, so
+///   the map still has the node up and a `Down` owner is not reached here), and then
+///   every entry is a hit: what the reruns committed is on a live node.
+///
+/// Catches a farm that writes a blob once (a primary that does not send its copy, a
+/// copy that is owed and never made: the replica check before the kill, then the read
+/// after it, fail), a frontend that fails a write because the first owner is dead
+/// instead of going on to the next, and a commit that fails because its first owner is
+/// dead. It reaches the write failover of the frontend's raw upload and of
+/// `Router::commit_with_closure`; `Router::put` and skipping a `Down` owner are covered
+/// by the `kbf-route` tests (`a_write_goes_on_to_the_next_owner_when_the_first_cannot_be_reached`,
+/// `a_write_skips_an_owner_that_is_down`), not here. Planted to see it fail: `Chain::plan` answering `Plan::Local` for the primary
+/// (no copy is written, so the blobs are on one node each).
 #[test]
-#[ignore = "needs R=2 wired in the real binaries"]
 fn a_killed_storage_node_loses_no_blob() {
     let mut farm = Farm::start("kill", 3);
     farm.wait_ready();
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
-    let (cas, blobs) = tokio.block_on(async {
-        let cas = Transfers::over(farm.channel().await, TransferConfig::default());
+    let (channel, cas, blobs, actions) = tokio.block_on(async {
+        let channel = farm.channel().await;
+        let cas = Transfers::over(channel.clone(), TransferConfig::default());
         let blobs = write_and_read(&cas).await;
-        (cas, blobs)
+        let mut actions = Vec::new();
+        for input in 100..100 + ACTIONS {
+            actions.push(run_action(&channel, &cas, &farm.image, input).await);
+        }
+        (channel, cas, blobs, actions)
     });
-    // Node 2 holds some of them (and the partner's copies are in place) before it dies.
-    farm.wait("blobs on node 2", |f| {
+    // Every blob is on two storage nodes before the node dies: the primary sent the
+    // partner's copy before it answered, or owes it and the repair worker makes it.
+    farm.wait("every blob on two storage nodes", |f| {
+        blobs.iter().all(|b| f.holders(b).len() >= 2).then_some(())
+    });
+    let held = |n: usize| {
         blobs
             .iter()
-            .flat_map(|b| f.holders(b))
-            .any(|n| n == 2)
-            .then_some(())
+            .filter(|b| farm.holders(b).contains(&n))
+            .count()
+    };
+    let victim = (1..=farm.storage_nodes)
+        .max_by_key(|n| held(*n))
+        .expect("a node");
+    assert!(held(victim) > 0, "no blob on any node");
+    eprintln!("killing node {victim}, which holds {} blobs", held(victim));
+    farm.kill(victim);
+
+    let check = |farm: &Farm, round: usize| {
+        tokio.block_on(survivors(
+            &channel,
+            &cas,
+            &farm.image,
+            (&blobs, &actions),
+            round,
+        ))
+    };
+    let (first, reruns) = check(&farm, 1);
+    eprintln!("{reruns} of {ACTIONS} cache entries were gone with the node: rerun");
+    // The farm is fixed (its map, the digests, the image), so the node holding most blobs
+    // also committed at least one entry: without this a farm where the dead node
+    // committed none would pass with the commit failover never exercised.
+    assert!(
+        reruns > 0,
+        "no cache entry was committed by the killed node: the commit failover is unexercised"
+    );
+
+    // The frontend lists the killed node's daemon as gone; the same again.
+    let gone: Vec<String> = farm
+        .node_ids
+        .iter()
+        .filter(|id| **id != node_id(victim))
+        .cloned()
+        .collect();
+    farm.wait("the frontend to list the killed node as gone", |f| {
+        (connected(f.api)? == gone).then_some(())
     });
-    farm.procs[2].kill();
-    tokio.block_on(async {
-        for bytes in &blobs {
-            let read = cas
-                .get(&digest_of(bytes))
-                .await
-                .expect("a blob lost with the node");
-            assert_eq!(&read, bytes);
-        }
-    });
+    let (second, reruns) = check(&farm, 2);
+    assert_eq!(reruns, 0, "an entry rewritten after the kill is gone again");
+    // What was written after the kill is on the live nodes, whole.
+    for bytes in first.iter().chain(&second) {
+        let live = farm.holders(bytes).into_iter().filter(|n| *n != victim);
+        assert!(
+            live.count() > 0,
+            "a write after the kill is on no live node"
+        );
+    }
+    // The killed process is already gone; the others stop cleanly.
+    for i in (0..farm.procs.len()).rev().filter(|i| *i != victim) {
+        let status = farm.procs[i].term();
+        assert!(status.success(), "{status}\n{}", farm.logs());
+    }
 }

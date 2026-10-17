@@ -55,6 +55,11 @@ pub struct Placement {
     /// The member a write goes to: the first owner that is not down. `None` when every
     /// owner is down.
     pub write: Option<Member>,
+    /// Every owner a write may go to, in the order [`Router::put`] tries them: this
+    /// generation's write owners that are not down, primary first (so `write` is the first
+    /// of them). A caller that passes a write through itself and wants to do what the
+    /// router does when the primary fails goes on to the next of these.
+    pub writers: Vec<Member>,
 }
 
 impl Router {
@@ -100,10 +105,15 @@ impl Router {
     /// No map has arrived yet.
     pub fn place(&self, digest: &Digest) -> Result<Placement, StorageError> {
         let view = self.view()?;
+        let writers: Vec<Member> = write_order(&view.map, digest)
+            .into_iter()
+            .cloned()
+            .collect();
         Ok(Placement {
             generation: view.map.generation(),
             read: read_order(&view, digest).into_iter().cloned().collect(),
-            write: write_order(&view.map, digest).first().map(|m| (*m).clone()),
+            write: writers.first().cloned(),
+            writers,
         })
     }
 

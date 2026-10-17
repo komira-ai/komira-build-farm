@@ -982,3 +982,83 @@ async fn a_down_primary_is_gone_around() {
     let read = read(&front, &[blobs[0].1]).await;
     assert_eq!(read, vec![(OK, blobs[0].0.clone())]);
 }
+
+/// Catches a CAS write failed for the whole member lease (15 s) by a writer that is dead but
+/// not yet marked down: node 3 is a closed port and the map has it active, and each blob of
+/// a batch whose first owner it is lands on the blob's other owner, with an OK status. The
+/// blobs whose owners are other nodes are written as before. Mutant: the router's write
+/// ends at the first owner's failure (UNAVAILABLE for every blob owned first by node 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_update_goes_on_to_the_next_owner_when_the_writer_is_dead_but_active() {
+    let farm = Farm::new(None);
+    let map = farm.set(1, &ALL_ACTIVE, 2);
+    let blobs: Vec<_> = (0..40).map(blob).collect();
+    let dead_first = blobs
+        .iter()
+        .filter(|(_, d)| map.write_owners(d)[0] == MemberId(3))
+        .count();
+    assert!(dead_first >= 4, "blobs that node 3 owns first");
+    farm.plain.take_down(3);
+    let front = farm.front();
+
+    assert_eq!(update(&front, &blobs).await, vec![OK; blobs.len()]);
+
+    for (_, digest) in &blobs {
+        let owners = map.write_owners(digest);
+        let writer = owners
+            .iter()
+            .find(|id| id.0 != 3)
+            .expect("an owner that is up")
+            .0;
+        let held = farm.holders(digest).await;
+        assert_eq!(
+            held,
+            BTreeSet::from([writer]),
+            "{digest:?} owners {owners:?}"
+        );
+    }
+}
+
+/// Catches an entry committed nowhere because the action's owner is dead and the map has
+/// not marked it down: node 3 (the action's first owner) is a closed port, and the
+/// backend's prepare and commit go to the action's other owner, which receives the blobs the
+/// entry names, commits, and a client's GetActionResult through the proxy finds the entry
+/// (the dead owner is passed over by the read). Mutant: the commit ends at the first owner.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entry_is_committed_at_the_next_owner_when_the_actions_owner_is_dead() {
+    let farm = Farm::new(None);
+    let map = farm.set(1, &ALL_ACTIVE, 2);
+    let case = case(&map);
+    let second = map.write_owners(&case.action)[1].0;
+    for owner in map.write_owners(&case.output.1) {
+        farm.nodes[&owner.0]
+            .put(Bytes::from(case.output.0.clone()))
+            .await
+            .expect("stored");
+    }
+    farm.plain.take_down(3);
+    let backend = farm.backend();
+
+    let record = backend
+        .prepare_action_result(&case.result)
+        .await
+        .expect("prepared");
+    backend
+        .commit_action_record(case.action, record)
+        .await
+        .expect("committed at the action's other owner");
+
+    let through_the_proxy = ActionCacheClient::new(farm.front())
+        .get_action_result(GetActionResultRequest {
+            action_digest: Some(proto(&case.action)),
+            ..GetActionResultRequest::default()
+        })
+        .await
+        .expect("GetActionResult")
+        .into_inner();
+    assert_eq!(through_the_proxy, case.result);
+    assert!(
+        farm.holders(&case.output.1).await.contains(&second),
+        "the output is on the action's other owner"
+    );
+}

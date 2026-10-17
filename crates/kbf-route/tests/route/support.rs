@@ -125,6 +125,10 @@ pub struct Node {
     actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
     /// The next calls other than reads fail with these.
     fail: Mutex<VecDeque<StorageError>>,
+    /// The next puts fail with these, after the node's other checks pass.
+    fail_puts: Mutex<VecDeque<StorageError>>,
+    /// The next commits fail with these, after the node's other checks pass.
+    fail_commits: Mutex<VecDeque<StorageError>>,
     /// What the next reads do.
     plans: Mutex<VecDeque<Plan>>,
     /// Every call fails while set.
@@ -141,7 +145,8 @@ pub struct Node {
     pub action_gets: AtomicUsize,
     /// What `put` answers instead of the digest, if set.
     put_answer: Mutex<Option<Digest>>,
-    /// A plain `put` is refused as a node in a chain refuses a blob it is not the primary of.
+    /// A plain `put` is refused, as a node in a chain refuses a blob it does not own (the mock
+    /// refuses every plain put, owner or not).
     chain_rule: AtomicBool,
     /// A commit is refused as `Absent` unless the node holds the entry's result blob and
     /// closure, as a storage node does.
@@ -155,6 +160,8 @@ impl Node {
             huge: Mutex::default(),
             actions: Mutex::default(),
             fail: Mutex::default(),
+            fail_puts: Mutex::default(),
+            fail_commits: Mutex::default(),
             plans: Mutex::default(),
             down: AtomicBool::new(false),
             gate: Mutex::default(),
@@ -226,6 +233,16 @@ impl Node {
         self.fail.lock().expect("lock").push_back(error);
     }
 
+    /// The next put fails with `error`, while FindMissing and a commit still answer.
+    pub fn fail_next_put(&self, error: StorageError) {
+        self.fail_puts.lock().expect("lock").push_back(error);
+    }
+
+    /// The next commit fails with `error`, while FindMissing and a put still answer.
+    pub fn fail_next_commit(&self, error: StorageError) {
+        self.fail_commits.lock().expect("lock").push_back(error);
+    }
+
     /// The next read, after the ones already planned, fails before its first byte.
     pub fn fail_read(&self, error: StorageError) {
         self.plans
@@ -283,14 +300,23 @@ impl Node {
         self.puts.lock().expect("lock").clone()
     }
 
+    /// The next planned put failure, if any, as an error: a put or an unowned put each
+    /// consume one, after the node's other checks pass.
+    fn take_put_failure(&self) -> Result<(), StorageError> {
+        match self.fail_puts.lock().expect("lock").pop_front() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn store(&self, bytes: Bytes) -> Digest {
         let digest = self.hold(&bytes);
         self.puts.lock().expect("lock").push(digest);
         self.put_answer.lock().expect("lock").unwrap_or(digest)
     }
 
-    /// Plain writes are refused from now on, as a chain's node refuses a blob it is not the
-    /// primary of; [`Storage::put_unowned`] still stores.
+    /// Plain writes are refused from now on, as a chain's node refuses a blob it does not
+    /// own (every plain put, owner or not); [`Storage::put_unowned`] still stores.
     pub fn refuse_plain_puts(&self) {
         self.chain_rule.store(true, Ordering::SeqCst);
     }
@@ -393,6 +419,7 @@ impl Storage for Node {
             if self.chain_rule.load(Ordering::SeqCst) {
                 return Err(StorageError::Invalid("not the primary of the blob".into()));
             }
+            self.take_put_failure()?;
             Ok(self.store(bytes))
         })
     }
@@ -400,6 +427,7 @@ impl Storage for Node {
     fn put_unowned(&self, bytes: Bytes) -> Answer<'_, Digest> {
         Box::pin(async move {
             self.check()?;
+            self.take_put_failure()?;
             Ok(self.store(bytes))
         })
     }
@@ -435,6 +463,9 @@ impl Storage for Node {
     ) -> Answer<'_, ()> {
         Box::pin(async move {
             self.check()?;
+            if let Some(error) = self.fail_commits.lock().expect("lock").pop_front() {
+                return Err(error);
+            }
             if self.check_closure.load(Ordering::SeqCst) {
                 let blobs = self.blobs.lock().expect("lock");
                 let lacking: Vec<Digest> = std::iter::once(&record.result)

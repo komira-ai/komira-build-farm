@@ -17,7 +17,9 @@
 //! generation it was routed by; a node that holds a newer map answers `STALE_MAP`, the map
 //! is fetched once and the call run again, and a second answer is UNAVAILABLE; a blob read
 //! whole is hashed against its digest at every owner; a read fails over to the next owner;
-//! a write goes to the first owner that is not down.
+//! a write goes to the first owner that is not down, and to the next if that one cannot be
+//! reached (dead before the map says so; the raw ByteStream upload does the same while none
+//! of its bytes past the request's first frames has been passed on).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

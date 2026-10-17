@@ -27,11 +27,26 @@
 //! it does, a Read or QueryWriteStatus here (whose request is held) can be run again once
 //! the map is fetched, and a Write (whose body is not) cannot.
 //!
-//! **Write** goes to the writer alone: the first owner of the blob that the map does not
-//! say is down (not always the owner a read asks first). If the blob's writer changes
-//! during the upload it ends UNAVAILABLE and the client starts the upload again: the
-//! frontend holds no bytes it could send to the new one. Nothing here hashes what passes:
-//! a node checks the blob it is sent and the blob it sends.
+//! **Write** goes to the writer: the first owner of the blob that the map does not say is
+//! down (not always the owner a read asks first). If the blob's writer changes during the
+//! upload it ends UNAVAILABLE and the client starts the upload again: the frontend holds no
+//! bytes it could send to the new one. Nothing here hashes what passes: a node checks the
+//! blob it is sent and the blob it sends.
+//!
+//! **A writer that cannot be reached** (dead, but the map has not marked it down yet, which
+//! takes the member lease) does not fail the upload if the upload can still be sent whole:
+//! when the node refuses the connection or fails with UNAVAILABLE before the call went on
+//! (nothing was passed to it but the first frames of the request, which the proxy keeps
+//! until the first frame past them is read), the same upload is sent to the next write
+//! owner that is not down (`kbf-route`'s `Router::put` does the same for a blob it
+//! holds), which takes it as the primary and owes the first owner its copy. Once the
+//! client's bytes past the first frames have been read by an attempt, they are gone (the
+//! proxy holds no blob), so an attempt that fails after that ends the call with the
+//! node's own answer and the client starts again. Only UNAVAILABLE moves on, never an
+//! answer from a node that was reached (INVALID_ARGUMENT, a map generation that is stale,
+//! a digest that does not match), and nothing is remembered of the node that failed: the
+//! next upload of a blob it owns tries it first again. If every owner fails, the first
+//! one's failure is the client's. Without a map there is one writer, and no next one.
 //!
 //! **QueryWriteStatus** asks the writer.
 //!
@@ -53,7 +68,7 @@ use tonic::codegen::{Service, http};
 use tonic::server::NamedService;
 use tonic::{Code, Status};
 
-use super::body::{Guard, Pass, Probe, collect, compressed, name_in};
+use super::body::{Guard, Pass, Probe, Upload, collect, compressed, name_in};
 use super::owners::{Owner, Owners, no_storage};
 use super::{Direction, Meter, Method, name};
 
@@ -140,30 +155,66 @@ impl RawByteStream {
         parts: &http::request::Parts,
         body: Body,
     ) -> Result<http::Response<Body>, Status> {
-        let mut up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
+        let upload = Upload::new(body);
+        let mut up = Pass::new(
+            upload.first(),
+            &self.meter,
+            Method::Write,
+            Direction::ToStorage,
+        );
         let name = up.peek_name().await?;
+        // What was read to find the name is the part of the upload that can be sent again.
+        upload.seal();
         let resource = self.authorized(parts, Method::Write, &name).await?;
-        let owner = self.owners.writer(&resource.digest)?;
-        let failed = Arc::new(Mutex::new(None));
-        let up = up.guarded(Guard {
-            owners: self.owners.clone(),
-            digest: resource.digest,
-            owner: Arc::from(owner.id()),
-            failed: Arc::clone(&failed),
-        });
-        let answer = send(&owner, parts, up).await;
-        // The upload ended because its primary changed: that is the answer, whatever the
-        // node said of the body that broke.
-        let refusal = failed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(refusal) = refusal {
-            return Err(refusal);
+        let mut owner = self.owners.writer(&resource.digest)?;
+        // The nodes this upload could not reach, and the first failure.
+        let mut skipped: Vec<Arc<str>> = Vec::new();
+        let mut first_failure: Option<Status> = None;
+        loop {
+            let failed = Arc::new(Mutex::new(None));
+            let guarded = up.guarded(Guard {
+                owners: self.owners.clone(),
+                digest: resource.digest,
+                owner: Arc::from(owner.id()),
+                skipped: skipped.clone(),
+                failed: Arc::clone(&failed),
+            });
+            let answer = send(&owner, parts, guarded).await;
+            // The upload ended because its writer changed: that is the answer, whatever
+            // the node said of the body that broke.
+            let refusal = failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
+            let unreached = match &answer {
+                Ok(response) => Status::from_header_map(response.headers())
+                    .filter(|status| status.code() == Code::Unavailable),
+                Err(status) => (status.code() == Code::Unavailable).then(|| status.clone()),
+            };
+            if let Some(unreached) = unreached {
+                // The node could not take the upload (a refused connection, a reset, an
+                // UNAVAILABLE before it read anything). If none of the client's bytes
+                // went past the first frames, the next owner is sent the same upload.
+                skipped.push(Arc::from(owner.id()));
+                let next = self.owners.writer_after(&resource.digest, &skipped);
+                if let (Ok(next), Some(body)) = (next, upload.again()) {
+                    tracing::warn!(node = owner.id(), status = %unreached, "storage node could not take the upload; sending it to the next owner");
+                    first_failure.get_or_insert(unreached);
+                    owner = next;
+                    up = Pass::new(body, &self.meter, Method::Write, Direction::ToStorage);
+                    continue;
+                }
+                if let Some(first) = first_failure {
+                    return Err(first);
+                }
+            }
+            let (head, down) = answer?.into_parts();
+            let down = Pass::new(down, &self.meter, Method::Write, Direction::FromStorage);
+            return Ok(http::Response::from_parts(head, Body::new(down)));
         }
-        let (head, down) = answer?.into_parts();
-        let down = Pass::new(down, &self.meter, Method::Write, Direction::FromStorage);
-        Ok(http::Response::from_parts(head, Body::new(down)))
     }
 
     /// `Read` and `QueryWriteStatus`: one small request message, replayed to each owner

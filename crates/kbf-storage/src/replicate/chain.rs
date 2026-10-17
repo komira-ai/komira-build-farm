@@ -158,10 +158,16 @@ impl Chain {
     /// What this node does with a write of `digest` under `view`, `leg_from` being the
     /// member that sent it as a replica's copy, if one did.
     ///
+    /// Any write owner takes a client write as the primary, with the other owner as the
+    /// copy to send or owe: blobs are content-addressed, so a duplicate is harmless, and
+    /// the debt covers an owner that cannot be reached. A writer goes past the first owner
+    /// when the map names it down or it cannot be reached before the map says so; the
+    /// node need not tell the two apart.
+    ///
     /// # Errors
     /// [`StorageError::Invalid`] if this node is not where the map says the write goes: a
-    /// client write to a node that is not the primary, a copy sent to a node that does not
-    /// own the blob or by the node itself, or a replication factor above 2;
+    /// client write to a node outside the blob's write owners, a copy sent to a node that
+    /// does not own the blob or by the node itself, or a replication factor above 2;
     /// [`StorageError::Unavailable`] if the map has fewer owners than its factor.
     pub(crate) fn plan(
         &self,
@@ -199,13 +205,12 @@ impl Chain {
             (None, Some(0), [_, replica]) => Ok(Plan::Primary {
                 replica: member(*replica)?,
             }),
-            // The primary is down: the next owner takes its place for the write, and the
-            // primary is the copy owed.
-            (None, Some(1), [first, _]) if member(*first)?.state == MemberState::Down => {
-                Ok(Plan::Primary {
-                    replica: member(*first)?,
-                })
-            }
+            // The second owner takes a client write as the primary, and the first owner
+            // is the copy: owed at once if the map says it is down, else sent like a
+            // replica's (see above).
+            (None, Some(1), [first, _]) => Ok(Plan::Primary {
+                replica: member(*first)?,
+            }),
             (None, Some(0), _) => Ok(Plan::Local),
             (None, _, _) => Err(StorageError::Invalid(format!(
                 "{} is not the primary of {digest}",

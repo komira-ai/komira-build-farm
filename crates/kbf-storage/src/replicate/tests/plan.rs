@@ -47,11 +47,16 @@ async fn each_node_has_one_part_in_a_write() {
             .chain
             .plan(&view(&farm, &map, node), &digest, leg)
     };
-    for node in [replica, 2] {
-        assert!(
-            matches!(refused(node, None), Err(StorageError::Invalid(m)) if m.contains("not the primary"))
-        );
-    }
+    // The third node owns nothing of the blob; the second owner takes a client write as
+    // the primary, with the first owner as the copy.
+    assert!(
+        matches!(refused(2, None), Err(StorageError::Invalid(m)) if m.contains("not the primary"))
+    );
+    let Plan::Primary { replica: copy_to } = refused(replica, None).expect("the second owner")
+    else {
+        panic!("the second owner does not take a client write");
+    };
+    assert_eq!(copy_to.id, farm.nodes[primary].id);
     assert_eq!(
         refused(replica, Some(farm.nodes[primary].id)).expect("a copy"),
         Plan::Local
@@ -155,7 +160,9 @@ async fn a_placement_is_confirmed_only_if_the_new_map_keeps_it() {
 
 /// Catches a down primary leaving its blobs unwritable, or the wrong node taking over: with
 /// the primary down in the map, the next owner plans the write with the primary as the
-/// copy owed (not called); while the primary is up the next owner refuses a client write.
+/// copy owed (not called); while the primary is up the next owner plans it the same way,
+/// with the primary as the copy to send (a frontend whose write to a dead primary the map
+/// has not marked down yet goes to the next owner).
 #[tokio::test]
 async fn the_next_owner_takes_a_write_whose_primary_is_down() {
     let farm = Farm::start(3, ChainConfig::default()).await;
@@ -173,12 +180,19 @@ async fn the_next_owner_takes_a_write_whose_primary_is_down() {
         (owed.id, owed.state),
         (farm.nodes[primary].id, MemberState::Down)
     );
-    let refused = farm.nodes[replica]
+    // While the map has the primary up the next owner still takes it: a client that
+    // could not reach the primary has not been told by the map yet, and the primary is
+    // then the copy that goes to it, owed if it cannot be reached.
+    let plan = farm.nodes[replica]
         .chain
-        .plan(&view(&farm, &up, replica), &digest, None);
-    assert!(
-        matches!(refused, Err(StorageError::Invalid(_))),
-        "{refused:?}"
+        .plan(&view(&farm, &up, replica), &digest, None)
+        .expect("the second owner takes a client write");
+    let Plan::Primary { replica: copy_to } = plan else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(
+        (copy_to.id, copy_to.state),
+        (farm.nodes[primary].id, MemberState::Active)
     );
 }
 

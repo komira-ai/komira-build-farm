@@ -110,6 +110,10 @@ pub struct Fake {
     pub slow: bool,
     /// Treats every Read as a blob of this kind, whatever its name says.
     pub force: Option<char>,
+    /// Answers every Write with this status at once, reading none of it.
+    pub refuse_writes: Option<tonic::Code>,
+    /// Answers a Write UNAVAILABLE after reading this many of its messages.
+    pub fail_writes_after: Option<usize>,
 }
 
 struct DropFlag(Arc<AtomicBool>);
@@ -138,6 +142,22 @@ impl Fake {
     pub fn forcing(kind: char) -> Arc<Self> {
         Arc::new(Self {
             force: Some(kind),
+            ..Self::default()
+        })
+    }
+
+    /// A node that answers every Write with `code` before it reads a byte of it.
+    pub fn refusing_writes(code: tonic::Code) -> Arc<Self> {
+        Arc::new(Self {
+            refuse_writes: Some(code),
+            ..Self::default()
+        })
+    }
+
+    /// A node that reads `messages` messages of a Write and then answers UNAVAILABLE.
+    pub fn failing_writes_after(messages: usize) -> Arc<Self> {
+        Arc::new(Self {
+            fail_writes_after: Some(messages),
             ..Self::default()
         })
     }
@@ -212,11 +232,18 @@ impl ByteStream for Fake {
         r: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let metadata = r.metadata().clone();
+        if let Some(code) = self.refuse_writes {
+            self.note("Write", "", &metadata);
+            return Err(Status::new(code, "refused"));
+        }
         let mut s = r.into_inner();
         let (mut i, mut total) = (0usize, 0i64);
         while let Some(m) = s.message().await? {
             if i == 0 {
                 self.note("Write", &m.resource_name, &metadata);
+            }
+            if self.fail_writes_after == Some(i) {
+                return Err(Status::unavailable("going away mid-upload"));
             }
             // The first, middle and last byte of the message stand for all of it.
             let at = [0, m.data.len() / 2, m.data.len().saturating_sub(1)];

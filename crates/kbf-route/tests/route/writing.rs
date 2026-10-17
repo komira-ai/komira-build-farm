@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_map::{MemberId, MemberState};
-use kbf_meta::{ActionRecord, Closure, Role};
+use kbf_meta::{ActionRecord, ActionWriteError, Closure, Role};
 use kbf_storage::StorageError;
 
 use kbf_types::Digest;
@@ -88,6 +88,280 @@ async fn a_write_returns_the_nodes_failure_and_checks_its_answer() {
         .await
         .expect_err("wrong digest");
     assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
+}
+
+/// A failure of a node that could not be reached, naming `who`.
+fn gone(who: &str) -> StorageError {
+    StorageError::Unavailable(Arc::new(std::io::Error::other(format!("{who} is gone"))))
+}
+
+/// Catches a write failed for the whole member lease (15 s) by an owner that is dead but
+/// not yet marked down: the primary of the blob cannot be reached, the map still has it
+/// active, and the write goes to the next owner and is answered, once there. The first
+/// owner is tried first (and only dialled for the failed attempt), the next is dialled
+/// with the same generation. Mutant: `at_a_write_owner` ends at the first owner's failure.
+#[tokio::test]
+async fn a_write_goes_on_to_the_next_owner_when_the_first_cannot_be_reached() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    let (blob, digest) = blob_written_to(&map, &[2, 3]);
+    cluster.node(2).set_down(true);
+
+    assert_eq!(router.put(Bytes::from(blob)).await.expect("stored"), digest);
+    assert!(cluster.node(2).put_log().is_empty());
+    assert_eq!(cluster.node(3).put_log(), [digest]);
+    assert!(cluster.node(1).put_log().is_empty());
+    assert_eq!(cluster.dialled(), [(2, 1), (3, 1)]);
+}
+
+/// Pins that the router keeps no memory of a failed owner (the map's member lease is the
+/// only authority on who is down): the owner that failed is tried first by the next write,
+/// and answers it when it is back. Fails too without the retry, at the first write.
+#[tokio::test]
+async fn the_owner_that_failed_is_tried_first_by_the_next_write() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    let (blob, digest) = blob_written_to(&map, &[2, 3]);
+    cluster.node(2).fail_next(unavailable());
+
+    router.put(Bytes::from(blob.clone())).await.expect("stored");
+    assert_eq!(cluster.node(3).put_log(), [digest]);
+    router.put(Bytes::from(blob)).await.expect("stored");
+    assert_eq!(cluster.node(2).put_log(), [digest]);
+    assert_eq!(cluster.node(3).put_log(), [digest]);
+}
+
+/// Catches an answer from a node that was reached passed over for the next owner: a node
+/// that declines the write (the request is invalid, or it is broken) is the answer and the
+/// next owner is not dialled; so is STALE_MAP, which is the map's rule (fetched, once)
+/// rather than the next owner's. Mutant: every failure moves on.
+#[tokio::test]
+async fn a_write_an_owner_answered_is_not_tried_at_the_next() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, cell) = router(&map, &cluster);
+    let (blob, _) = blob_written_to(&map, &[2, 3]);
+
+    for refusal in [
+        StorageError::Invalid("a blob over the largest".to_owned()),
+        StorageError::Internal("a disk".to_owned()),
+        StorageError::ActionWrite(ActionWriteError::NotDaemon),
+    ] {
+        let said = format!("{refusal:?}");
+        cluster.node(2).fail_next(refusal);
+        let error = router
+            .put(Bytes::from(blob.clone()))
+            .await
+            .expect_err("refused");
+        assert_eq!(format!("{error:?}"), said);
+    }
+    cluster
+        .node(2)
+        .fail_next(StorageError::StaleMap { current: 7 });
+    let error = router
+        .put(Bytes::from(blob))
+        .await
+        .expect_err("no newer map");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert_eq!(cell.fetched(), [7]);
+    assert!(cluster.node(3).put_log().is_empty());
+    assert!(cluster.dialled().iter().all(|(member, _)| *member == 2));
+}
+
+/// Catches a write failed with the last owner's failure, or with a failure that is not the
+/// owners': when no owner can be reached the caller is told what the first one said, and
+/// both were tried. Mutant: the last failure returned.
+#[tokio::test]
+async fn a_write_no_owner_can_take_fails_with_the_first_owners_failure() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    let (blob, _) = blob_written_to(&map, &[2, 3]);
+    cluster.node(2).fail_next(gone("node two"));
+    cluster.node(3).fail_next(gone("node three"));
+
+    let error = router.put(Bytes::from(blob)).await.expect_err("both gone");
+    assert!(
+        matches!(&error, StorageError::Unavailable(why) if why.to_string() == "node two is gone"),
+        "{error:?}"
+    );
+    assert_eq!(cluster.dialled(), [(2, 1), (3, 1)]);
+}
+
+/// Catches a write that goes on to a member that does not own the blob: the owner a write
+/// goes on to is the other one the map names, never a member outside the write owners.
+/// With a farm of three, R = 2 and both owners failing, the third node is never called.
+#[tokio::test]
+async fn a_write_goes_on_to_the_blobs_other_owner_only() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    let (blob, _) = blob_written_to(&map, &[3, 2]);
+    cluster.node(3).set_down(true);
+    cluster.node(2).set_down(true);
+
+    router
+        .put(Bytes::from(blob))
+        .await
+        .expect_err("both owners gone");
+    assert_eq!(cluster.dialled(), [(3, 1), (2, 1)]);
+    assert!(cluster.node(1).put_log().is_empty());
+}
+
+/// Catches a member whose address is not one stopping the write: the member cannot be
+/// dialled (the test cluster has no node for it), as a read passes it over, so does a
+/// write. Mutant: the dial error returned.
+#[tokio::test]
+async fn a_member_that_cannot_be_dialled_is_passed_over_by_a_write() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Arc::new(Cluster::default());
+    cluster.add(2);
+    cluster.add(3);
+    let (router, _) = router(&map, &cluster);
+    let (blob, digest) = blob_written_to(&map, &[1, 2]);
+
+    router.put(Bytes::from(blob)).await.expect("stored");
+    assert_eq!(cluster.node(2).put_log(), [digest]);
+}
+
+/// Catches a plain commit that fails over: the caller put the entry's blobs at the
+/// action's first owner, the next owner holds none of them and would refuse the entry as
+/// `Absent`, so when the first cannot be reached the caller must see UNAVAILABLE (which it
+/// can retry), and the next owner must be asked nothing.
+/// Mutant: `commit_in` goes through `at_a_write_owner`.
+#[tokio::test]
+async fn a_plain_commit_does_not_go_to_an_owner_that_lacks_the_blobs() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    cluster.node(1).check_closure();
+    let (_, action) = blob_written_to(&map, &[3, 1]);
+    let record = ActionRecord {
+        result: sha(b"the result blob"),
+        closure: Closure::new(),
+    };
+    cluster.node(3).set_down(true);
+
+    let error = router
+        .commit_action_record(Role::Daemon, action, record)
+        .await
+        .expect_err("the action's owner is down");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(cluster.node(1).commits.lock().expect("lock").is_empty());
+}
+
+/// Catches a commit with a closure that ends at the action's owner when it cannot be
+/// reached: the blobs the next owner lacks are copied to it (and only the ones it lacks),
+/// and the entry is committed there. Mutant: `commit_with_closure` ends at the first owner.
+#[tokio::test]
+async fn a_commit_with_closure_goes_on_to_the_next_owner_and_copies_there() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    cluster.node(1).check_closure();
+    let e = entry(&map);
+    cluster.node(1).hold(&e.output.0);
+    cluster.node(2).hold(&e.result.0);
+    cluster.node(3).set_down(true);
+
+    router
+        .commit_with_closure(Role::Daemon, e.action, e.record)
+        .await
+        .expect("committed at the next owner");
+    assert_eq!(cluster.node(1).put_log(), [e.result.1]);
+    assert_eq!(
+        cluster.node(1).commits.lock().expect("lock").clone(),
+        [e.action]
+    );
+    assert!(cluster.node(3).commits.lock().expect("lock").is_empty());
+    let found = router.action_result(&e.action).await.expect("an answer");
+    assert_eq!(found.map(|(d, _)| d), Some(e.result.1));
+}
+
+/// Catches a commit that ends when the action's owner answers FindMissing and then fails
+/// to take a copy: the failure is the owner's, so the next owner is asked what it lacks,
+/// is copied that, and commits. Mutant: the copy's `put` failure counted as not the
+/// owner's (`Tried::Elsewhere`).
+#[tokio::test]
+async fn a_commit_goes_on_when_the_owner_fails_to_take_a_copy() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    cluster.node(1).check_closure();
+    let e = entry(&map);
+    cluster.node(1).hold(&e.output.0);
+    cluster.node(2).hold(&e.result.0);
+    cluster.node(2).hold(&e.output.0);
+    cluster.node(3).fail_next_put(unavailable());
+
+    router
+        .commit_with_closure(Role::Daemon, e.action, e.record)
+        .await
+        .expect("committed at the next owner");
+    // The first owner was reached (it answered FindMissing) and failed at the copy.
+    assert!(!cluster.node(3).find_log().is_empty());
+    assert!(cluster.node(3).commits.lock().expect("lock").is_empty());
+    assert_eq!(cluster.node(1).put_log(), [e.result.1]);
+    assert_eq!(
+        cluster.node(1).commits.lock().expect("lock").clone(),
+        [e.action]
+    );
+}
+
+/// Catches a commit that ends when the action's owner holds every blob of the entry (so
+/// there is nothing to copy) and then fails the commit itself: the next owner is copied
+/// what it lacks and commits. Mutant: the commit's failure counted as not the owner's
+/// (`Tried::Elsewhere`).
+#[tokio::test]
+async fn a_commit_goes_on_when_the_owner_fails_the_commit_itself() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    cluster.node(1).check_closure();
+    let e = entry(&map);
+    cluster.node(1).hold(&e.output.0);
+    cluster.node(2).hold(&e.result.0);
+    cluster.node(3).hold(&e.result.0);
+    cluster.node(3).hold(&e.output.0);
+    cluster.node(3).fail_next_commit(unavailable());
+
+    router
+        .commit_with_closure(Role::Daemon, e.action, e.record)
+        .await
+        .expect("committed at the next owner");
+    assert!(cluster.node(3).put_log().is_empty());
+    assert!(cluster.node(3).commits.lock().expect("lock").is_empty());
+    assert_eq!(cluster.node(1).put_log(), [e.result.1]);
+    assert_eq!(
+        cluster.node(1).commits.lock().expect("lock").clone(),
+        [e.action]
+    );
+}
+
+/// Catches a commit retried for a failure that is not the owner's: when a blob of the entry
+/// cannot be read from the farm (its holders cannot be reached), the next owner of the
+/// action would read it no better, so the commit ends with that read's failure and the next
+/// owner is not asked a thing. Mutant: a failed read counted as the owner's failure.
+#[tokio::test]
+async fn a_closure_blob_that_cannot_be_read_does_not_move_the_commit_on() {
+    let map = map(1, 2, active(&[1, 2, 3]));
+    let cluster = Cluster::of(3);
+    let (router, _) = router(&map, &cluster);
+    cluster.node(3).check_closure();
+    let e = entry(&map);
+    cluster.node(2).hold(&e.result.0);
+    // The output's owners are 1 and 2: 1 is gone, and 2 does not hold it.
+    cluster.node(1).set_down(true);
+
+    let error = router
+        .commit_with_closure(Role::Daemon, e.action, e.record)
+        .await
+        .expect_err("the output cannot be read");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(cluster.node(3).commits.lock().expect("lock").is_empty());
+    assert!(cluster.node(1).find_log().is_empty());
 }
 
 /// Catches a commit sent anywhere but the action's primary, or the entry then not read
@@ -427,6 +701,13 @@ async fn a_commit_with_closure_needs_an_owner_and_checks_each_copy() {
     };
     let error = nowhere
         .commit_with_closure(Role::Daemon, sha(b"action"), record.clone())
+        .await
+        .expect_err("every owner is down");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(cluster.dialled().is_empty());
+    // A plain commit, which never goes past the first owner, needs one as much.
+    let error = nowhere
+        .commit_action_record(Role::Daemon, sha(b"action"), record.clone())
         .await
         .expect_err("every owner is down");
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");

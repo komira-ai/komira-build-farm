@@ -94,6 +94,17 @@ fn one_message(name: String) -> impl futures::Stream<Item = WriteRequest> {
     }])
 }
 
+/// An upload of one message small enough to be one HTTP/2 data frame: all of it is the
+/// part of the request the proxy keeps to send again.
+fn small_message(name: String) -> impl futures::Stream<Item = WriteRequest> {
+    stream::iter([WriteRequest {
+        resource_name: name,
+        write_offset: 0,
+        finish_write: true,
+        data: vec![pattern(0); 1000],
+    }])
+}
+
 /// Which of the nodes were called, by member number.
 fn called(t: &Trio) -> Vec<usize> {
     t.fakes
@@ -226,8 +237,9 @@ async fn a_call_carries_the_frontends_generation_not_the_clients() {
 
 /// Catches a member the frontend cannot dial taking the call down with it, or a blob given
 /// to a node the map did not name: a read passes over the owner it has no connection to and
-/// is served by the next, and an upload whose writer it cannot dial is UNAVAILABLE rather
-/// than sent to another node.
+/// is served by the next, and an upload whose writer it cannot dial goes to the blob's
+/// other write owner (as the router's write passes over a member it cannot dial), never to
+/// a member that does not own the blob.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_that_cannot_be_dialled_is_passed_over() {
     let map = map([MemberState::Active; 3]);
@@ -249,17 +261,184 @@ async fn a_member_that_cannot_be_dialled_is_passed_over() {
     while stream.message().await.expect("a message").is_some() {}
     assert_eq!(fakes.iter().map(|f| f.calls.load(SeqCst)).sum::<usize>(), 1);
 
+    let before: Vec<_> = fakes.iter().map(|f| f.calls.load(SeqCst)).collect();
     let (kind, size) = blob_where(|d| map.write_owners(d)[0] == MemberId(3));
-    let refused = client(&front)
+    let next = map.write_owners(&digest_of(kind, size))[1].0 as usize;
+    client(&front)
         .write(Request::new(one_message(upload("main", kind, size))))
         .await
-        .expect_err("the writer cannot be dialled");
-    assert_eq!(refused.code(), tonic::Code::Unavailable);
+        .expect("the writer cannot be dialled: the other owner takes the upload");
+    let after: Vec<_> = fakes.iter().map(|f| f.calls.load(SeqCst)).collect();
+    let took: Vec<_> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+    let mut want = vec![0, 0];
+    want[next - 1] = 1;
+    assert_eq!(took, want, "the upload went to the blob's other owner only");
+}
+
+/// A trio whose fakes are `fakes` and where member `dead` (1 to 3) is a closed port: a
+/// node that is dead but that the map still names active.
+async fn trio_with(
+    fakes: Vec<Arc<Fake>>,
+    dead: Option<usize>,
+) -> (Vec<Arc<Fake>>, Arc<Map>, harness::Front) {
+    let mut addrs = Vec::new();
+    for (i, fake) in fakes.iter().enumerate() {
+        addrs.push(if dead == Some(i + 1) {
+            ([127, 0, 0, 1], 1).into()
+        } else {
+            node(fake).await
+        });
+    }
+    let map = map([MemberState::Active; 3]);
+    let front = front_over(routed_owners(&map, &addrs), Authorizers::allow_all(), None).await;
+    (fakes, map, front)
+}
+
+fn calls(fakes: &[Arc<Fake>]) -> Vec<usize> {
+    fakes.iter().map(|f| f.calls.load(SeqCst)).collect()
+}
+
+/// Catches an upload that fails for the whole member lease (15 s) when its writer is dead
+/// and the map has not marked it down: the writer is a closed port, active in the map, and
+/// the upload is answered by the blob's other write owner (and by nobody else), with the
+/// bytes intact (the fake checks them) and the frontend's map generation. Mutant: the
+/// retry loop in `RawByteStream::write` removed (`continue` dropped).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_goes_to_the_next_owner_when_the_writer_cannot_be_reached() {
+    let probe = map([MemberState::Active; 3]);
+    let (kind, size) = blob_where(|d| probe.write_owners(d)[0] == MemberId(2));
+    let owners = probe.write_owners(&digest_of(kind, size));
+    let (writer, next) = (owners[0].0 as usize, owners[1].0 as usize);
+    let fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    let (fakes, _, front) = trio_with(fakes, Some(writer)).await;
+
+    client(&front)
+        .write(Request::new(one_message(upload("main", kind, size))))
+        .await
+        .expect("the next owner takes the upload");
+    let mut want = vec![0, 0, 0];
+    want[next - 1] = 1;
+    assert_eq!(calls(&fakes), want);
+    let seen = fakes[next - 1].seen.lock().expect("lock").clone();
+    assert_eq!(seen[0].name, upload("main", kind, size));
     assert_eq!(
-        fakes.iter().map(|f| f.calls.load(SeqCst)).sum::<usize>(),
-        1,
-        "the upload went to no other node"
+        seen[0]
+            .metadata
+            .get("kbf-map-generation")
+            .map(|v| v.to_str().expect("text")),
+        Some("7")
     );
+}
+
+/// Catches a retry that only handles a refused connection: a writer that is reached and
+/// answers UNAVAILABLE before it reads anything (a node going away) is gone around too,
+/// while the upload is still only the part of the request the proxy keeps (a small one).
+/// The writer was called once, the other owner once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_a_writer_answers_unavailable_is_sent_to_the_next_owner() {
+    let probe = map([MemberState::Active; 3]);
+    let (kind, size) = blob_where(|d| probe.write_owners(d)[0] == MemberId(1));
+    let owners = probe.write_owners(&digest_of(kind, size));
+    let (writer, next) = (owners[0].0 as usize, owners[1].0 as usize);
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[writer - 1] = Fake::refusing_writes(tonic::Code::Unavailable);
+    let (fakes, _, front) = trio_with(fakes, None).await;
+
+    client(&front)
+        .write(Request::new(small_message(upload("main", kind, size))))
+        .await
+        .expect("the next owner takes the upload");
+    let mut want = vec![0, 0, 0];
+    want[writer - 1] = 1;
+    want[next - 1] = 1;
+    assert_eq!(calls(&fakes), want);
+}
+
+/// Catches an answer passed over for the next owner: a writer that is reached and refuses
+/// the upload (INVALID_ARGUMENT, as a node refuses a write it is not the primary of, or one
+/// whose blob is wrong) is the answer, and the other owner is not called. Mutant: every
+/// code retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_that_refuses_an_upload_is_not_gone_around() {
+    let probe = map([MemberState::Active; 3]);
+    let (kind, size) = blob_where(|d| probe.write_owners(d)[0] == MemberId(1));
+    let writer = probe.write_owners(&digest_of(kind, size))[0].0 as usize;
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[writer - 1] = Fake::refusing_writes(tonic::Code::InvalidArgument);
+    let (fakes, _, front) = trio_with(fakes, None).await;
+
+    let refused = client(&front)
+        .write(Request::new(small_message(upload("main", kind, size))))
+        .await
+        .expect_err("refused by the writer");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    let mut want = vec![0, 0, 0];
+    want[writer - 1] = 1;
+    assert_eq!(calls(&fakes), want);
+}
+
+/// Catches an upload failed with the last owner's failure, or one that never tries the
+/// second: both owners dead gives the first writer's failure (it names the node), no third
+/// node is called. Mutant: the last failure returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_no_owner_can_take_fails_with_the_first_writers_failure() {
+    let probe = map([MemberState::Active; 3]);
+    let (kind, size) = blob_where(|d| probe.write_owners(d)[0] == MemberId(1));
+    let owners = probe.write_owners(&digest_of(kind, size));
+    let (writer, next) = (owners[0].0 as usize, owners[1].0 as usize);
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[writer - 1] = Fake::refusing_writes(tonic::Code::Unavailable);
+    // The other owner is a closed port.
+    let (fakes, _, front) = trio_with(fakes, Some(next)).await;
+
+    let refused = client(&front)
+        .write(Request::new(small_message(upload("main", kind, size))))
+        .await
+        .expect_err("no owner takes it");
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    // The first writer answered with its own message; the dead one would name its node.
+    assert_eq!(refused.message(), "refused");
+    let mut want = vec![0, 0, 0];
+    want[writer - 1] = 1;
+    assert_eq!(calls(&fakes), want);
+}
+
+/// Catches an upload sent on after bytes of it went to the first owner: the writer reads
+/// the first message of a three-message upload, then fails UNAVAILABLE. The proxy no
+/// longer has the bytes it passed, so the call ends with that failure (the client starts it
+/// again), and the other owner is never called with half a blob. Mutant: `Upload::again`
+/// ignoring that a frame past the first ones was read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_that_was_passed_on_is_not_sent_to_another_owner() {
+    let probe = map([MemberState::Active; 3]);
+    let (kind, size) = blob_where(|d| probe.write_owners(d)[0] == MemberId(1));
+    let writer = probe.write_owners(&digest_of(kind, size))[0].0 as usize;
+    let mut fakes: Vec<_> = (0..3).map(|_| Fake::new(false)).collect();
+    fakes[writer - 1] = Fake::failing_writes_after(1);
+    let (fakes, _, front) = trio_with(fakes, None).await;
+
+    let message = |i: usize, last: bool| WriteRequest {
+        resource_name: if i == 0 {
+            upload("main", kind, size)
+        } else {
+            String::new()
+        },
+        write_offset: (i * CHUNK) as i64,
+        finish_write: last,
+        data: vec![pattern(i); CHUNK],
+    };
+    let failed = client(&front)
+        .write(Request::new(stream::iter([
+            message(0, false),
+            message(1, false),
+            message(2, true),
+        ])))
+        .await
+        .expect_err("the writer failed mid-upload");
+    assert_eq!(failed.code(), tonic::Code::Unavailable);
+    let mut want = vec![0, 0, 0];
+    want[writer - 1] = 1;
+    assert_eq!(calls(&fakes), want);
 }
 
 /// Catches a frontend that loses its map between deciding to route and routing and then

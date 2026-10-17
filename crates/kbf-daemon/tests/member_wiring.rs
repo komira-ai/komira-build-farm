@@ -262,32 +262,43 @@ async fn a_daemon_half_behind_its_node_is_told_so_by_its_own_node() {
 }
 
 /// A plane with the map of `source`'s node held in a holder of its own, and the local
-/// member `local` served in-process by `node`.
+/// member `local` served in-process by `node`; and the dialler it calls other members
+/// through, which counts.
 fn plane_over(
     daemon_map: Option<&kbf_map::Map>,
     local: &Process,
     node: InProcess,
     tls: &TlsFiles,
-) -> Arc<RoutedCas> {
+) -> (Arc<RoutedCas>, Arc<Counted>) {
     let held = Arc::new(MapHolder::new());
     if let Some(map) = daemon_map {
         assert!(held.offer(map.clone()));
     }
     let member = LocalMember::new(local.node.addr.to_string(), node);
-    let nodes = kbf_daemon::storage_nodes(tls, kbf_daemon::Liveness::default()).expect("TLS files");
-    member_cas(held, member, nodes, &TransferConfig::default())
+    let dialled = Arc::new(Counted {
+        inner: kbf_daemon::storage_nodes(tls, kbf_daemon::Liveness::default()).expect("TLS files"),
+        dialled: Mutex::default(),
+    });
+    let cas = member_cas(
+        held,
+        member,
+        Arc::clone(&dialled) as Arc<dyn Nodes>,
+        &TransferConfig::default(),
+    );
+    (cas, dialled)
 }
 
 /// Catches the no-map rule not holding. Until the daemon half holds a map, a write fails
 /// UNAVAILABLE and reaches no node, its own included (the defect: a daemon with no map
 /// wrote to its own node as if it were the owner). Until the storage half holds a map,
 /// its own member is refused by the storage service's own check, as its listener refuses
-/// every call (the node here is a service that holds none), and a blob owned by another
-/// member goes on to its owner.
+/// every call (the node here is a service that holds none): a blob it owns is taken by the
+/// blob's other owner (the router goes on to the next owner when one cannot answer) and
+/// never reaches it, and a blob owned by another member goes on to its owner.
 ///
 /// Mutants: the service's map check skipped on the in-process path (the second write is
-/// taken by the node with an empty map); the router asked for a local write when no map is held (the first
-/// write lands on A).
+/// taken in-process by the node with an empty map and B is never dialled); the router asked
+/// for a local write when no map is held (the first write lands on A).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_half_writes_nowhere_until_it_and_its_node_hold_a_map() {
     let (a, b, map, _front) = farm("member-no-map").await;
@@ -296,28 +307,37 @@ async fn a_daemon_half_writes_nowhere_until_it_and_its_node_hold_a_map() {
     let own_digest = digest(&own);
 
     // No map for the daemon half: nothing is written, not even to its own node.
-    let cas = plane_over(None, &a, a.node.in_process.clone(), &tls);
+    let (cas, dialled) = plane_over(None, &a, a.node.in_process.clone(), &tls);
     let refused = cas.put(own.clone()).await.expect_err("no map");
     assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
     assert!(!a.node.holds(&own_digest).await, "nothing reached A");
+    assert!(dialled.dialled().is_empty());
 
-    // A map for the daemon half, none for its node: its own member is refused ...
-    let cas = plane_over(Some(&map), &a, unmapped_in_process(), &tls);
-    let refused = cas.put(own.clone()).await.expect_err("the node has no map");
-    assert!(matches!(refused, CasError::Unavailable(..)), "{refused:?}");
-    assert!(
-        refused.to_string().contains("has not been given a map"),
-        "{refused}"
+    // A map for the daemon half, none for its node: its own member is refused by the
+    // service's own check, as its listener refuses every call, so the write goes on to the
+    // blob's other owner, B, over the network, and B takes it as the primary (and copies it
+    // to A, whose listener does hold a map) ...
+    let (cas, dialled) = plane_over(Some(&map), &a, unmapped_in_process(), &tls);
+    cas.put(own.clone())
+        .await
+        .expect("B takes it as the next owner");
+    assert_eq!(
+        dialled.dialled(),
+        [b.node.addr.to_string()],
+        "the daemon's own member was refused and B was dialled"
     );
-    // ... and a blob another member owns is not.
+    assert!(b.node.holds(&own_digest).await, "B took it");
+    // ... and a blob another member owns is not affected.
     let theirs = blob_owned_by(&map, b.id, "theirs");
     cas.put(theirs.clone()).await.expect("B takes it");
     assert!(b.node.holds(&digest(&theirs)).await);
 
-    // The node holds a map: its own member is used.
-    let cas = plane_over(Some(&map), &a, a.node.in_process.clone(), &tls);
-    cas.put(own).await.expect("A takes it");
-    assert!(a.node.holds(&own_digest).await);
+    // The node holds a map: its own member is used, in-process.
+    let (cas, dialled) = plane_over(Some(&map), &a, a.node.in_process.clone(), &tls);
+    let again = blob_owned_by(&map, a.id, "own again");
+    cas.put(again.clone()).await.expect("A takes it");
+    assert!(a.node.holds(&digest(&again)).await);
+    assert!(dialled.dialled().is_empty(), "in-process, no network");
 }
 
 /// Catches a write answered with one copy and nothing owed. The partner B of A's chain is
