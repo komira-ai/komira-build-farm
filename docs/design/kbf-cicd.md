@@ -13,10 +13,11 @@ under-replicated blobs back to zero.
 
 A commit that passes beta may be offered to the operator's own farm: **gamma**. The farm's pull updater applies it. The
 deploy is itself a test (no build failed because a connection was dropped), and then a 24 hour **bake** runs with the
-operator's real usage as the canary. The bake ends in a signed verdict.
+operator's real usage as the canary. The bake ends in a verdict document.
 
 A commit with a passing bake can be published: **prod** is the existing attested-artifact release (tag, files, notes), gated
-on the verdict. **Rollback** is the updater walking back through the same mechanism it walked forward with.
+in GitHub on the verdict. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
+desired commit is set to the older release under a higher generation.
 
 ```
  merge ──> artifacts (build once, attest) ──> beta (Actions, ephemeral farm)
@@ -25,15 +26,17 @@ on the verdict. **Rollback** is the updater walking back through the same mechan
                           gamma: operator's farm, pull updater, deploy-as-test
                                                   │ 24 h bake, real usage
                                                   v
-                              signed verdict ──> prod: tag, attested files, notes
-          any gate red ──> rollback: a newer signed set naming the old artifacts
+                                 verdict ──> prod: tag, attested files, notes
+          any gate red ──> rollback: desired = the old commit, higher generation
 ```
 
-Three rules hold in every stage, and each is a rule that exists in the project already: **one frontend update process
+Four rules hold in every stage, and each is a rule that exists in the project already: **one frontend update process
 everywhere** (a new instance on other ports behind Envoy, the old one drains, in-flight `Execute` streams are kept; the
-Buck2 client never re-sends a broken `Execute`), **nodes are updated by the frontend when idle or drained, one storage node
-at a time, within N and N-1**, and **the farm pulls**: no stage pushes to a host and no stage holds a way into the
-operator's network.
+Buck2 client never re-sends a broken `Execute`; the serving frontend is never restarted), **nodes are updated in any order
+when idle or drained, within N and N-1**, and on an upgrade the frontend goes first, only through Envoy, never waiting for
+`open_executions == 0` (the order of `split-mode-updates.md`); **the farm pulls**: no stage pushes to a host and no stage
+holds a way into the operator's network; and **hosts trust the build, not the operator**: a host verifies the GitHub
+artifact attestation of what it installs, and there is no operator signing for now.
 
 ## 1. Goals and non-goals
 
@@ -77,12 +80,13 @@ Where kbf differs, and why:
 1. **There is a beta stage; kci has none.** Beta is new: an ephemeral farm per merge that
    publishes nothing. It is closest to kci's build-plus-validation, not to a channel.
 2. **Gamma is not a publish destination.** kci's channels are places bytes are pushed, permanent and never overwritten.
-   Gamma is a farm that pulls: "the desired release" is an entry in a signed feed, and the entry moves. A moving pointer is
-   the opposite of never-overwrite, so the feed carries a monotonic serial (the updater already keeps a serial floor,
-   `crates/kbf-updater` **[F]**), and a rollback is a higher serial naming older artifacts.
+   Gamma is a farm that pulls: "the desired release" is the `update/desired {generation, commit, set_at}` row in the
+   operator's frontend state store, and it moves. A moving pointer is the opposite of never-overwrite, so every move bumps a
+   generation that only grows, and a rollback is the older commit under a higher generation. Downgrades are allowed; the
+   generation is the guard (`pull-updates.md`, `split-mode-updates.md` 2.3).
 3. **Gamma and its bake run outside Actions.** A hosted runner on a public repository must not reach the operator's farm, so
    the farm's metrics cannot be read from a workflow. kci's farm-connected jobs are not adopted. The operator side runs the
-   evaluator and returns a signed verdict (section 7).
+   evaluator and returns a verdict (section 7).
 4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
@@ -143,14 +147,15 @@ What the stages add:
 - **The beta result is attested.** A last job, the only one in beta with `id-token: write` and `attestations: write`, attests
   `beta-result.json` (commit, set hash, harness commit, every gate with its measured value). No repository code runs in that
   job, as in `attest` today.
-- **The feed entry** (section 6) names the set hash and carries a pointer to the artifact attestations and to the beta-result
-  attestation. A node never sees a beta result; the operator's signer checks it (section 6.1).
+- **The offer** (section 6) sets the desired commit, and the hosts fetch the release and verify its artifact attestation. A
+  node never sees a beta result; `kbf release offer` checks it before it sets anything (section 5.1).
 - **A previous release for N-1.** Beta also fetches the last released set (or, before there is one, the newest earlier
   commit with an attested build on the same branch) and verifies it the same way. This is how the N/N-1 jobs of section 9 have
   an N-1.
 
-A branch gap to settle before prod works for this branch: `release.yml` requires the commit to be on main, while this
-line of work lands on feature/arch-v2 (section 13, Q1).
+Releases are cut from main only (decided, #961). Development continues on feature/arch-v2 until the farm works; the branch
+then merges to main (#753), and from then on every release is cut from main. Beta and gamma run on the feature branch
+meanwhile; nothing is published from it.
 
 ## 4. Stage 1: beta
 
@@ -263,8 +268,8 @@ scenario (the mutant is listed; a gate never seen red is not a gate).
 | B7 | `kill_frontend_cold` | the crash matrix, wired as a required job (#900) | each case's own defect |
 | B8 | `roll_all_in_one` | the all-in-one process updated by the same handover (`aio-handover.md`) | a second update path for the small topology |
 | B9 | `mixed_versions` | N and N-1 in both directions, with and without a build in flight (section 9) | a made-required field; a repurposed field |
-| B10 | `rollback_walks_back` | after B4, offer N-1 as a newer signed set and walk back (T16) | rollback restarting the frontend |
-| B11 | `rollback_mid_roll` | a rollback entry issued (a) after the first node step and (b) after the frontend handover, from that half-rolled state, with a build in flight; N and N-1 mixed in the reverse order | a walk back that assumes a clean farm; a node mid-step abandoned instead of finished or reverted |
+| B10 | `rollback_walks_back` | after B4, set the desired commit to N-1 under a higher generation and walk back (T16) | rollback restarting the frontend |
+| B11 | `rollback_mid_roll` | a rollback (desired set to the older commit) issued (a) after the first node step and (b) after the frontend handover, from that half-rolled state, with a build in flight; N and N-1 mixed in the reverse order | a walk back that assumes a clean farm; a node mid-step abandoned instead of finished or reverted |
 
 The gate expressions common to B1 to B6, B8 and B10, read from the scraped metrics and the builds' event logs:
 
@@ -316,23 +321,25 @@ host or account, so the same text is right for anyone who runs kbf and chooses t
 
 ### 5.1 The offer
 
-A commit becomes offerable when the operator's signer has checked, offline from the farm:
+A commit becomes offerable when `kbf release offer` ([P], run on the operator's side) has checked, from outside the farm:
 
 1. the artifacts' provenance and SBOM attestations for the commit and set hash (`verify-assets attestations`);
 2. the beta-result attestation for the same commit and set hash, with every gate green and its measured values inside the
    thresholds of section 4.4;
-3. that the serial is higher than the last offered one.
+3. that every platform the farm runs is complete for the commit in the frontend's release store (tarball and attestation).
 
-The signer then signs a manifest (set hash, per-artifact digests, serial, platform rows) and puts it in the feed. This is the
-design of the pull updater: the operator signs once after verifying; hosts do not verify Sigstore, they verify the operator's
-signature against a pinned root, offline. **[F in the design, unbuilt]** (`fleet-updates-security.md`; #908 node client,
-#929 root helper.) The residual stays as stated there: hosts trust the operator's signature, not the attestation.
+On a red or missing beta result, or an incomplete release, the command refuses and changes nothing. Otherwise it promotes the
+commit by setting `update/desired` (`POST /v1/update/desired {commit}`, compare-and-set; the generation moves only when the
+commit differs). It signs nothing. Each host's root helper verifies the GitHub build attestation offline when it stages, and
+the frontend does not have to **[F in the design, unbuilt]** (`pull-updates.md` section 2; #908 node client, #929 root helper).
+Hosts trust the attestation of the build, not the operator. The only exception is the held installer of a test farm, which
+runs with attestation verification off; that is a test-farm setting, not a default and not part of this contract.
 
 Offering is dry-run by default (`--plan`): it prints what would change and which gates it read.
 
 ### 5.2 The deploy is a test
 
-The pull updater, the frontend-ordered node steps and the frontend handover (`split-mode-updates.md`) run on the real farm
+The pull updater, the node steps and the frontend handover in the order of `split-mode-updates.md` run on the real farm
 with real builds in flight. The deploy is a test because it is checked as one:
 
 - **No build failed from a dropped connection**: `kbf_frontend_relay_lost_total` delta is 0 over the deploy, and every
@@ -361,24 +368,36 @@ Real usage (builds nobody scripted), real devices and hosts, systemd, the real c
 Beta covers the update logic; gamma covers the environment. A defect that only the operator's environment shows becomes a
 beta scenario in the same change that fixes it (section 11).
 
-## 6. The feed
+## 6. Promotion: the frontend's desired state
 
-Gamma and prod are not channels; the pull updater reads a feed.
+Gamma and prod are not channels and there is no feed. The pull updater reads the state the operator's frontend already
+keeps (`pull-updates.md` is the authority for the rows; `split-mode-updates.md` for the order of the rollout).
 
-- A feed entry per release: serial, set hash, artifact digests, platform rows, a `stage` field (`gamma` or `prod`), and the
-  operator's signature. Entries are only ever appended; the latest entry of a stage is what that farm should run.
-- **The serial is monotonic and never reused.** A rollback is a new entry with a higher serial naming older artifacts (as
-  the updater already specifies: "a rollback is a newer signed set naming old artifacts" **[F]**), so the floor never
-  needs lowering and a replayed old entry is refused.
-- A farm follows one stage. The operator's farm follows `gamma`; any farm that follows the public release follows `prod`.
-- The feed is a static signed file set; nothing about it needs a server that can reach a farm. Hosts poll it (a conditional
-  request, free when unchanged). Where it is hosted is not decided here (section 13, Q3).
+- **One set of rows in the frontend's state store**: the release rows (`update/release/<commit>/<platform>/<name>`);
+  `update/desired {generation, commit, set_at}`; `update/slot` (the rollout slot); `update/host/<id>` (per-host progress); and
+  `update/policy`. The disk release index is the source of truth for the bytes; the rows say what is wanted and how far the
+  rollout has got.
+- **Promotion is setting the desired commit.** Gamma is promoted by setting the desired commit (and so a new generation) on
+  the operator's frontend, after beta passed and the offer checks of 5.1 passed. Nothing else in this page moves a farm.
+- **The generation is monotonic and never reused.** It is the guard: hosts act on a generation higher than any they have
+  acted on, so a replayed older order is refused. Downgrades are allowed; there is no floor on commits. A rollback is the
+  older commit under a higher generation (section 8.2).
+- **Rollout order is split-mode's.** Nodes update in any order when idle or drained. On an upgrade the frontend goes first,
+  and only through Envoy; across a protocol difference on a downgrade the nodes go first. The updater never waits for
+  `open_executions == 0` and never restarts the serving frontend.
+- **Which release a farm follows is that farm's own desired state.** The operator's farm is promoted by `offer` after beta.
+  A farm that runs the public release has its operator set the desired commit to the published one (by hand, or by its
+  `update/policy`); no stage reaches into it.
+- Nothing here needs a server that can reach a farm: the frontend polls GitHub for new attested releases and only ever
+  proposes them (`pull-updates.md`); the operator or the offer command decides.
 
-### 6.1 Who signs, and what the signer checks
+### 6.1 What the offer checks, and who runs it
 
-The operator holds the signing key. The signer is a command (`kbf release offer`, [P]) that refuses on any failed check of
-5.1 and signs nothing. It is run by the operator or by the operator's own scheduled job on the operator's side; it is never
-run by a public workflow, because that would put the key in Actions.
+`kbf release offer` ([P]) is run by the operator or by the operator's own scheduled job on the operator's side; it is never
+run by a public workflow, because that would put a way into the farm in Actions. It refuses on any failed check of 5.1 and
+sets nothing. It holds no signing key and no key is needed: the host-side trust is the GitHub attestation of the build.
+Signing operator-authored manifests for hosts to verify is deliberately not done for now; if it returns it is a new decision
+with its own page.
 
 ## 7. The 24 hour bake
 
@@ -388,7 +407,7 @@ its state in a file (so a restart does not restart the clock), and writes the ve
 
 **A bake with no usage is not a pass.** Real usage is the canary, so the bake has a minimum-load condition: at least
 **[P]** 1000 executed actions and 10 builds across the window, and at least 3 distinct hours with load. Below that the
-bake extends (it does not pass); the operator may waive it with a signed waiver that the verdict records.
+bake extends (it does not pass); the operator may waive it with a waiver that the verdict records.
 
 Gates, evaluated continuously (a hard gate failing ends the bake red at once) and at the end:
 
@@ -413,9 +432,9 @@ The evaluator is deliberately not a dashboard: a person reading a graph is not a
 
 ### 7.1 The verdict
 
-`gamma-verdict.json`: commit, set hash, serial, deploy start and end, bake start and end, each gate with measured value and
-threshold, the minimum-load numbers, any waiver, and the operator's signature. A red verdict triggers section 8; a green one
-makes the commit promotable.
+`gamma-verdict.json`: commit, set hash, desired generation, deploy start and end, bake start and end, each gate with measured value and
+threshold, the minimum-load numbers and any waiver. It is a record, not a credential: no host reads it. A red verdict triggers
+section 8; a green one makes the commit publishable (the tag of 8.1 carries it).
 
 ## 8. Stage 3: prod, and rollback
 
@@ -428,23 +447,19 @@ and no dependency on any earlier stage.
 
 The additions:
 
-1. **A verdict check in `verify`.** The tag is an annotated, signed tag, created by the operator, whose message carries the
-   gamma verdict. A tag push by anyone with write access starts `release.yml` today, so the check is the gate. `verify`
-   checks the tag signature (ssh signature format, `ssh-keygen -Y verify`) against the operator's public key **read from the
-   default branch's tip, never from the tagged tree**: the tagged commit controls the workflow and its files, and a committer
-   could otherwise replace the key in the very commit being tagged. The signed verdict binds the set hash and the tag name
-   as well as the commit, so a verdict cannot be moved to another tag. `verify` also checks that every gate is green, that
-   the bake lasted at least 24 hours, and that nothing was waived without a recorded waiver. No new channel back from the
-   operator's network is needed: the tag is the channel. A tag with no verdict, or a red one, fails `verify`.
-   *Key lifecycle.* The key file changes only by a reviewed pull request that the owner approves (a code-owner rule); a
-   rotation adds the new key, then removes the old after one release; a compromised key is revoked by removing it, and the
-   verdicts signed by it are re-issued. A tag-protection ruleset restricting who may create `v*` tags is required (M19).
+1. **A verdict check in `verify`.** This is a release-process check in GitHub; it is **not host-update trust** (hosts never
+   read the tag or the verdict, and verify only the artifact attestation). The tag is an annotated git tag on main whose
+   message carries the gamma verdict (`gamma-verdict.json`). `verify` checks that the verdict names this commit, this set
+   hash and this tag, that every gate is green, that the bake lasted at least 24 hours, and that nothing was waived without
+   a recorded waiver. A tag with no verdict, or a red one, fails `verify`. **No signing key**: who may push a `v*` tag is
+   limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
+   required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job.
 3. **Release notes**: generated from the commits between the previous release and this one, plus the gamma verdict's summary
    (bake length, load, the gate values) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
    the `verify` job, so a dry run shows them before anyone approves.
-4. **The prod feed entry**: after `publish`, the operator signs a `prod` entry with the same set hash. Farms that follow the
-   public release pull it.
+4. **Nothing is pushed to farms.** After `publish` the release is the attested files on the GitHub release. A farm that runs
+   the public release finds them through its frontend's release poller, and its operator sets the desired commit (section 6).
 
 Prod publishes the bytes gamma ran. If anything is rebuilt, `verify` fails: the set hash is the only thing it accepts.
 
@@ -453,23 +468,26 @@ Prod publishes the bytes gamma ran. If anything is rebuilt, `verify` fails: the 
 Rollback is the updater walking back, and it is the forward mechanism with the old release as the target.
 (`split-mode-updates.md` section 2.11 **[F]**.)
 
-- The feed gets a new entry with a higher serial naming the previous artifacts. The old directories are still on the hosts
-  (running, previous, one more).
-- Preflight runs; the frontend goes by a handover back (the old release started as the successor); nodes by the node step,
-  idle by idle; across a protocol difference the order reverses (nodes first).
+- A rollback sets `update/desired` to the older release's commit, which takes a higher generation. Downgrades are allowed, and
+  the generation is what stops a replayed older order. The old directories are still on the hosts (running, previous, one
+  more), and the release rows and the disk release index still name the old bytes, which the host re-verifies against the
+  attestation as for any release.
+- Preflight runs; the frontend goes by a handover back (the old release started as the successor, only through Envoy, never
+  restarting the serving one); nodes by the node step, idle or drained, in any order; across a protocol difference the order
+  reverses (nodes first).
 - **Triggers.** Local and fast: the commit-confirm auto-revert of a process that never becomes active (minutes, on the host,
   no controller needed). During a deploy: any gate of 5.2 halts and walks back what was changed. During a bake: a hard gate
-  red makes the evaluator write a red verdict and **offer the rollback entry automatically** when the release is reversible
+  red makes the evaluator write a red verdict and **set the rollback automatically** when the release is reversible
   (8.3); when it is not, it pages and offers nothing. A soft gate never rolls back by itself.
-- **Prod rollback** is the same entry in the `prod` feed. The GitHub release is not rewritten (the published files are
-  permanent, as kci's names are); the notes of the next release say what was withdrawn, and a withdrawn release is marked in
-  the feed so no farm selects it.
-- **When a rollback entry lands mid-roll [P].** A process mid-step is not interrupted: the updater finishes that step to its
+- **Prod rollback** is the same move on each farm that runs the public release: its desired commit goes to the older release
+  under a higher generation. The GitHub release is not rewritten (the published files are permanent, as kci's names are);
+  the notes of the next release say what was withdrawn, and the release poller does not propose a withdrawn commit.
+- **When a rollback lands mid-roll [P].** A process mid-step is not interrupted: the updater finishes that step to its
   phase boundary (T13), then walks back from the current state. The first node step and the frontend handover are each a
   place a rollback can arrive; B11 tests both, with N and N-1 mixed in the reverse order.
-- **Who decides when the evaluator is down.** The evaluator that notices a red gate and the signer that signs the entry are
-  separate commands. If the evaluator is down the bake extends and pages (it never passes), and automatic rollback is
-  unavailable; a person can run the signer's rollback form directly, which does not depend on the evaluator. The only
+- **Who decides when the evaluator is down.** The evaluator that notices a red gate and the command that sets the desired
+  commit are separate. If the evaluator is down the bake extends and pages (it never passes), and automatic rollback is
+  unavailable; a person can set the older commit directly (`POST /v1/update/desired`), which does not depend on the evaluator. The only
   guarantee with both down is the host's own commit-confirm auto-revert, which is per process and minutes-scale.
 - A rollback is tested in beta (B10, B11) and its result belongs to the same attested record.
 
@@ -477,7 +495,7 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
 
 From `split-mode-updates.md` **[F]**: a release that changed the schema beyond expand (the contract step of expand then
 contract), and a node whose log version was raised (an older binary cannot open it; the walk-back wipes that node's meta
-directory and rebuilds from segment footers). A release containing either is flagged at the offer: the signer prints it, the
+directory and rebuilds from segment footers). A release containing either is flagged at the offer: the offer command prints it, the
 notes carry it, the evaluator's automatic rollback is off for it, and the contract step ships one release after the expand
 step, never in it.
 
@@ -537,21 +555,21 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 |  #944 |
 | M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 |  #945 |
 | M5 | One frontend update process wired end to end (staged drain, relay, Envoy box, all-in-one) | B2 and B8 green | #937, #930, #925, #934, #938, #901 wiring PR |  #946 |
-| M6 | Pull updater end to end: poller, signed feed client, node-side verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 |  #947 |
-| M7 | Signed feed and `offer`: stage entries, monotonic serial, beta-result check, plan mode | `offer` refuses on a red or missing beta result and on a non-increasing serial | |  #948 |
+| M6 | Pull updater end to end: release poller, desired-state rows, host-side attestation verification, no SSH push | the updater replaces the stand-in in B1 to B4 | #908, #929, M7 |  #947 |
+| M7 | `offer`: promotion by setting the desired commit, beta-result check, plan mode (no operator-signed feed) | `offer` refuses on a red or missing beta result and on an incomplete release; the generation only rises | |  #948 |
 | M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 |  #949 |
-| M9 | Bake evaluator: baseline, minimum load, state file, signed verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 |  #950 |
+| M9 | Bake evaluator: baseline, minimum load, state file, verdict | a restart keeps the clock; an absent metric fails; thin usage extends | M10, M13 |  #950 |
 | M10 | Metric: failed actions by failure class | counter present, labelled by class | |  #951 |
 | M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
-| M12 | Release workflow: verdict check (key from the default branch tip, set hash and tag bound), approval environment, notes, prod feed entry | a tag with no or red verdict, or a forged key in the tagged tree, fails `verify` | M7, M9, M19 |  #953 |
+| M12 | Release workflow: verdict check on the release tag (commit, set hash and tag bound; no signing key), approval environment, notes | a tag with no verdict, a red one, or a verdict naming another commit, set or tag fails `verify` | M7, M9, M19 |  #953 |
 | M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | |  #954 |
 | M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | |  #955 |
-| M15 | Updater walk-back: automatic offer on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
+| M15 | Updater walk-back: automatic desired-commit set on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
 | M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | |  #957 |
 | M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | |  #958 |
 | M18 | Rollout engine (#803) push transport replaced by the pull updater's, or retired | no push transport left | #803 |  #959 |
-| M19 | Repo settings: required checks on feature/arch-v2, tag-protection ruleset for `v*` | settings in place | M1 |  #960 |
-| M20 | Decision: how releases are cut from feature/arch-v2 (Q1) | decision recorded | |  #961 |
+| M19 | Repo settings: required checks and merge rules on feature/arch-v2 (the maintainers' choice); the tag-protection ruleset for `v*` on main once release cuts start | settings in place | M1 |  #960 |
+| M20 | Decision: releases are cut from main only, after feature/arch-v2 merges to main (Q1, decided) | decision recorded | |  #961 (closed) |
 | M21 | Measure the whole farm on a standard hosted runner (peak memory, wall time, safe concurrency) | numbers recorded here | |  #962 |
 | M22 | Result documents, flake classification and history file | one shape, flaky recorded, history written | M1 |  #963 |
 | M23 | crun with cgroup v2 delegation on a hosted runner **[V]** | a real container action runs under crun in CI | #936 |  #964 |
@@ -561,23 +579,24 @@ dependencies of every "0 failed actions" gate).
 
 ## 13. Open questions, with recommendations
 
-1. **Branch convergence for prod.** `release.yml` takes only commits on main; this line of work is on feature/arch-v2.
-   Options: (a) tag only after the branch merges to main; (b) allow a release from the feature branch with its own
-   attestation ref. *Recommend (a)*: prod stays main-only, gamma and beta run on both. The merge makes a new commit, so bytes
-   attested on the feature branch are never what prod publishes: **the first release is rebuilt on main and must re-run beta
-   and gamma on that commit.** Choose (b) if that delay is unacceptable.
-2. **Required checks.** Make the smoke a required check on feature/arch-v2 (merge on green Linux checks) and the full run
-   non-blocking for merge but blocking for the offer. *Recommend yes*, via a ruleset, as part of M18.
-3. **Where the feed lives.** A signed static file set in a release asset of the repository, or a bucket the operator
-   controls. *Recommend a release asset on a dedicated tag for the public feed and an operator-hosted copy for gamma*, so
-   gamma does not depend on the public repository being reachable. Owner decision.
-4. **Verdict channel.** The signed tag carrying the verdict (section 8.1) versus an operator-posted check or comment.
-   *Recommend the tag*, verified against the key at the default branch's tip: no token for the operator's side to hold in
-   Actions, and it is already the trigger of `release.yml`. Its weakness is the key's own change path (reviewed PR, section 8.1).
+1. **Branch convergence for prod. Decided (#961): main only.** No release is cut from feature/arch-v2. Development
+   continues there until the farm works, then the branch merges to main (#753), and every release from then on is cut from
+   main. The merge makes a new commit, so bytes attested on the feature branch are never what prod publishes: the first
+   release is built on main and runs beta and gamma on that commit.
+2. **Required checks. Decided (#960): the maintainers choose the feature branch's required checks and merge rules.**
+   The recommendation stands as input: the smoke as a required check on feature/arch-v2 (merges on green Linux checks), the
+   full run non-blocking for merge but blocking for the offer. The tag-protection ruleset for `v*` applies to main once
+   release cuts start.
+3. **Where the bytes live for gamma.** Decided with the pull updater (#927): the frontend's release store and disk release
+   index hold the bytes, filled by its release poller from the GitHub release; there is no feed to host. Whether gamma
+   should keep working when GitHub is unreachable is answered by that store (a release already stored is deployable).
+4. **Verdict channel. Decided: the release tag's message, unsigned.** The verdict travels in the annotated `v*` tag on main;
+   the tag-protection ruleset limits who can push it and the `prod` environment reviewer gates `publish`. No signing key
+   (it would add custody with no new protection).
 5. **Does the operator's farm need to be the only gamma?** One farm's usage can be too thin to be a canary. The minimum-load
    rule makes that visible (the bake extends). *Recommend keeping one gamma now*, and revisiting if bakes routinely extend.
 6. **Automatic rollback during a bake.** *Recommend automatic offer for hard gates on a reversible release, a page otherwise*,
-   with a person able to cancel before the serial is signed (a short, **[P]** 10 minute hold). Owner decision.
+   with a person able to cancel before the desired commit is set (a short, **[P]** 10 minute hold). Owner decision.
 7. **Hosted runner capacity.** *Recommend measuring B-0 first* (peak memory and wall time of the whole farm on a standard
    runner) and deciding on a larger hosted runner only on that number. Self-hosted only under the conditions of 4.2.
 8. **Baseline for the error-rate gate** over 7 days versus the previous release's bake. *Recommend 7 days*, since the
@@ -585,10 +604,10 @@ dependencies of every "0 failed actions" gate).
 9. **Where the harness sits when #936 lands.** The stand-in runtime goes. *Recommend B-0 on the stand-in with the weakening
    stated (section 4.2)*, and a crun-with-delegation check on `ubuntu-24.04` as its own item, so beta is not delayed by #936.
 10. **Length.** The page is about 590 lines against a 300 to 500 target. Review asked for fixes that add content (the
-    missing-metric rows, the rollback cases, the key lifecycle), so the minor request to trim was only partly taken (sections 10
+    missing-metric rows, the rollback cases), so the minor request to trim was only partly taken (sections 10
     and 11 were folded). *Recommend accepting the length*; the table in section 12 is most of it.
 
 ## 14. What this page changes in other documents
 
-None yet. When the pieces land: `docs/artifacts.md` (the deployment verify job it says is planned becomes the signer's check),
+None yet. When the pieces land: `docs/artifacts.md` (the deployment verify job it says is planned becomes the host's attestation check and the offer's),
 `split-mode-updates.md` (section 7's test IDs get the CI job that runs them), and the workflow lints (section 2.1).
