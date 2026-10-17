@@ -296,6 +296,33 @@ impl Gate {
         spawned
     }
 
+    /// [`Gate::spawn`], started again while the program is busy (ETXTBSY: a file just
+    /// written is held open for writing by any child another thread forks before it
+    /// execs) until `wait` is up; any other failure is returned at once.
+    ///
+    /// # Errors
+    /// As [`Gate::spawn`]; ETXTBSY if the program stays busy past `wait`.
+    pub async fn spawn_unbusy(
+        &self,
+        command: &mut Command,
+        record: &Path,
+        keeper: KeeperFor,
+        wait: std::time::Duration,
+    ) -> io::Result<Spawned> {
+        let give_up = std::time::Instant::now() + wait;
+        loop {
+            match self.spawn(command, record, keeper) {
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < give_up =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                spawned => return spawned,
+            }
+        }
+    }
+
     fn attempt(
         &self,
         command: &mut Command,
@@ -502,6 +529,10 @@ fn after_poll(ready: libc::c_int, errno: i32, parent_now: i32, parent: i32) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Long enough for any descriptor a test holds to be closed.
+    const BUSY_WAIT: Duration = Duration::from_secs(2);
 
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::current_exe()
@@ -723,11 +754,72 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         let (mut command, gate) = gated(&script, &[]);
+        // The script was just written: a child another test thread forks holds the
+        // write descriptor until it execs (ETXTBSY), so the spawn waits for that.
         let error = gate
-            .spawn(&mut command, &record, KeeperFor::Group)
+            .spawn_unbusy(&mut command, &record, KeeperFor::Group, BUSY_WAIT)
+            .await
             .expect_err("no executable");
         assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC), "{error}");
         assert!(!marker.exists(), "run through /bin/sh");
+    }
+
+    /// Catches a spawn that gives up on a program still open for writing (the hazard
+    /// `no_record_no_run` met): the plain spawn fails with ETXTBSY while the write
+    /// descriptor is open, `spawn_unbusy` waits for it to close and runs the program,
+    /// and it gives up with ETXTBSY if the descriptor outlives `wait`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_busy_program_is_waited_for() {
+        let dir = dir("busy");
+        let record = dir.join("lease-1-3");
+        let script = dir.join("busy-program");
+        // Its interpreter is the act steps' link: run, it echoes its own path.
+        std::fs::write(
+            &script,
+            format!("#!{} echo\n", crate::xcode::tests::act().display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let held = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script)
+            .expect("open");
+        let (mut command, gate) = gated(&script, &[]);
+        command.stdout(std::process::Stdio::piped());
+        let error = gate
+            .spawn(&mut command, &record, KeeperFor::Group)
+            .expect_err("busy");
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+        let error = gate
+            .spawn_unbusy(
+                &mut command,
+                &record,
+                KeeperFor::Group,
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("still busy");
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+        assert!(!record.exists(), "a failed spawn leaves no run record");
+
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(held);
+        });
+        let Spawned { child, .. } = gate
+            .spawn_unbusy(&mut command, &record, KeeperFor::Group, BUSY_WAIT)
+            .await
+            .expect("spawned once closed");
+        closer.await.expect("closer");
+        let out = child.wait_with_output().await.expect("wait");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}\n", script.display()),
+            "not the program that was busy"
+        );
     }
 
     /// Catches a recorder that writes a record, and lets the program run, for a child

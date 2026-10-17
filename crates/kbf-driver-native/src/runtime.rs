@@ -1015,15 +1015,7 @@ async fn spawn(
     keeper: KeeperFor,
 ) -> std::io::Result<Spawned> {
     let gate = crate::record::Gate::install(command, exec);
-    let give_up = Instant::now() + BUSY_WAIT;
-    loop {
-        match gate.spawn(command, record, keeper) {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < give_up => {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            spawned => return spawned,
-        }
-    }
+    gate.spawn_unbusy(command, record, keeper, BUSY_WAIT).await
 }
 
 /// Answers `refused` as the action's result without running anything: empty stdout,
