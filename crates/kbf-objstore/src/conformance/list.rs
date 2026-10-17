@@ -5,7 +5,7 @@
 
 use futures::TryStreamExt as _;
 
-use super::{CheckResult, Outcome, child, key, pattern, put};
+use super::{CheckResult, Outcome, Written, child, key, pattern, put};
 use crate::listing;
 use crate::{KeyPrefix, ObjectStore, PageSize};
 
@@ -90,12 +90,16 @@ async fn lists_exactly<S: ObjectStore>(
     Ok(())
 }
 
-pub(super) async fn list_page_sizes<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+pub(super) async fn list_page_sizes<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let dir = child(prefix, "sizes/")?;
     let mut want = Vec::new();
     for i in 0..SIZED {
         let k = key(&dir, &format!("s{i}"))?;
-        put(store, &k, &pattern(i + 1, 6)).await?;
+        put(store, w, &k, &pattern(i + 1, 6)).await?;
         want.push((k.as_str().to_owned(), i as u64 + 1));
     }
     for page in SIZES {
@@ -104,10 +108,14 @@ pub(super) async fn list_page_sizes<S: ObjectStore>(store: &S, prefix: &KeyPrefi
     Ok(Outcome::Passed)
 }
 
-pub(super) async fn list_no_match<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+pub(super) async fn list_no_match<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     // Keys either side of `<prefix>nothing/` in key order, neither under it.
-    put(store, &key(prefix, "nothing")?, &pattern(1, 1)).await?;
-    put(store, &key(prefix, "nothinh")?, &pattern(1, 2)).await?;
+    put(store, w, &key(prefix, "nothing")?, &pattern(1, 1)).await?;
+    put(store, w, &key(prefix, "nothinh")?, &pattern(1, 2)).await?;
     let dir = child(prefix, "nothing/")?;
     for page in [1, PageSize::MAX.get()] {
         lists_exactly(store, &dir, page, &[]).await?;
@@ -124,12 +132,16 @@ const NESTED: [&str; 10] = [
     "a/b/c/d", "a~", "a/c", "A", "a/b/x", "a0", "a.b", "a/b/c/e", "B/x", "a-b",
 ];
 
-pub(super) async fn list_nested<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+pub(super) async fn list_nested<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let dir = child(prefix, "nested/")?;
     let mut all = Vec::new();
     for name in NESTED {
         let k = key(&dir, name)?;
-        put(store, &k, &pattern(1, 7)).await?;
+        put(store, w, &k, &pattern(1, 7)).await?;
         all.push(k);
     }
     // Byte order, which is S3's: `ObjectKey` orders by its text's bytes.
@@ -154,17 +166,18 @@ const AHEAD: [&str; 2] = ["k4", "k8"];
 
 pub(super) async fn list_during_writes<S: ObjectStore>(
     store: &S,
+    w: &Written,
     prefix: &KeyPrefix,
 ) -> CheckResult {
     let dir = child(prefix, "moving/")?;
     for name in STEADY.iter().chain(&BEHIND).chain(&AHEAD) {
-        put(store, &key(&dir, name)?, &pattern(1, 8)).await?;
+        put(store, w, &key(&dir, name)?, &pattern(1, 8)).await?;
     }
     // After page n: a key after every steady key is written, and the n-th key already
     // listed and the n-th not yet listed are deleted. A failed delete leaves a key this
     // check allows either way, so its outcome is not checked.
     let writes = async |n: usize| {
-        put(store, &key(&dir, &format!("z{n}"))?, &pattern(1, 8)).await?;
+        put(store, w, &key(&dir, &format!("z{n}"))?, &pattern(1, 8)).await?;
         for doomed in [BEHIND.get(n - 1), AHEAD.get(n - 1)].into_iter().flatten() {
             let _ = store.delete(&key(&dir, doomed)?).await;
         }

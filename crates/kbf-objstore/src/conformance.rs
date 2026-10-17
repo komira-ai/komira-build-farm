@@ -10,8 +10,12 @@
 //! object and keep it readable, and a store not claiming Object Lock must refuse a
 //! retention date rather than store the object unlocked.
 //!
-//! Objects written under Object Lock cannot be removed until their date (one hour), so
-//! give each run a fresh prefix when running against a real store.
+//! When the checks are done, [`run`] deletes exactly the objects it wrote (it records each
+//! key as a check writes it and never lists to find them), also when a check failed, and
+//! reports it in [`Report::cleanup`]. Any prefix is safe, the empty one and one without a
+//! trailing `/` included: no other key is touched. Objects written under Object Lock
+//! cannot be removed until their date (one hour): they are listed as retained, not
+//! failed, so give each run a fresh prefix when running against a real store.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,12 +27,17 @@ use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_segments::{SegmentWriter, layout::footer_len};
 use kbf_types::Digest;
 
+pub use cleanup::Cleanup;
+use cleanup::Written;
+
 use crate::footers::{self, FooterRead, FooterReads};
 use crate::{
     BodyStream, ByteRange, Capabilities, KeyPrefix, ListToken, ObjectInfo, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
 
+/// The name of the one object the suite retains, under the run's prefix.
+const LOCK_KEY: &str = "locked";
 /// How long the Object Lock check retains its object.
 const LOCK_FOR: Duration = Duration::from_secs(3600);
 /// Objects the list check writes; with pages of [`LIST_PAGE`], the last page is short.
@@ -109,13 +118,16 @@ pub enum Outcome {
 pub struct Report {
     /// One entry per [`Check`].
     pub results: Vec<(Check, Outcome)>,
+    /// What deleting the run's objects did.
+    pub cleanup: Cleanup,
 }
 
 impl Report {
-    /// Whether no check failed.
+    /// Whether no check failed and the run's objects could be deleted (objects the
+    /// store keeps under retention do not count against it).
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.failures().next().is_none()
+        self.failures().next().is_none() && self.cleanup.failed.is_empty()
     }
 
     /// The checks that failed, with what went wrong.
@@ -152,55 +164,79 @@ impl fmt::Display for Report {
                 Outcome::Failed(why) => writeln!(f, "FAIL {check:?}: {why}")?,
             }
         }
+        let c = &self.cleanup;
+        writeln!(f, "cleanup: deleted {}", c.deleted)?;
+        for k in &c.retained {
+            writeln!(f, "cleanup: retained {k} (under Object Lock)")?;
+        }
+        for why in &c.failed {
+            writeln!(f, "FAIL cleanup: {why}")?;
+        }
         Ok(())
     }
 }
 
-/// Runs every check against `store`, writing only under `prefix`.
+/// Runs every check against `store`, writing only under `prefix`, then deletes the
+/// objects it wrote, and no others.
 pub async fn run<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Report {
     let caps = store.capabilities();
+    let w = &Written::default();
     let mut results = Vec::new();
     let mut record = |check, r: Result<Outcome, String>| {
         results.push((check, r.unwrap_or_else(Outcome::Failed)));
     };
-    record(Check::RoundTrip, round_trip(store, prefix).await);
+    record(Check::RoundTrip, round_trip(store, w, prefix).await);
     record(
         Check::RangeBoundaries,
-        range_boundaries(store, prefix).await,
+        range_boundaries(store, w, prefix).await,
     );
     record(Check::MissingObject, missing_object(store, prefix).await);
     record(
         Check::DeleteIdempotent,
-        delete_idempotent(store, prefix).await,
+        delete_idempotent(store, w, prefix).await,
     );
-    record(Check::ListPagination, list_pagination(store, prefix).await);
-    record(Check::ListStartAfter, list_start_after(store, prefix).await);
+    record(
+        Check::ListPagination,
+        list_pagination(store, w, prefix).await,
+    );
+    record(
+        Check::ListStartAfter,
+        list_start_after(store, w, prefix).await,
+    );
     record(
         Check::ListPastPageCap,
-        list_past_page_cap(store, prefix).await,
+        list_past_page_cap(store, w, prefix).await,
     );
     record(
         Check::ListEmptyPrefix,
-        list_empty_prefix(store, prefix).await,
+        list_empty_prefix(store, w, prefix).await,
     );
     record(
         Check::ListPageSizes,
-        list::list_page_sizes(store, prefix).await,
+        list::list_page_sizes(store, w, prefix).await,
     );
-    record(Check::ListNoMatch, list::list_no_match(store, prefix).await);
-    record(Check::ListNested, list::list_nested(store, prefix).await);
+    record(
+        Check::ListNoMatch,
+        list::list_no_match(store, w, prefix).await,
+    );
+    record(Check::ListNested, list::list_nested(store, w, prefix).await);
     record(
         Check::ListDuringWrites,
-        list::list_during_writes(store, prefix).await,
+        list::list_during_writes(store, w, prefix).await,
     );
-    record(Check::FooterReads, footer_reads(store, prefix).await);
+    record(Check::FooterReads, footer_reads(store, w, prefix).await);
     record(
         Check::PutNewRefusesOverwrite,
-        refuses_overwrite(store, prefix, caps).await,
+        refuses_overwrite(store, w, prefix, caps).await,
     );
-    record(Check::ObjectLock, object_lock(store, prefix, caps).await);
-    record(Check::StreamedPut, streamed_put(store, prefix, caps).await);
-    Report { results }
+    record(Check::ObjectLock, object_lock(store, w, prefix, caps).await);
+    record(
+        Check::StreamedPut,
+        streamed_put(store, w, prefix, caps).await,
+    );
+    // After every check, whatever they said: a failed check leaves objects too.
+    let cleanup = cleanup::sweep(store, prefix, w).await;
+    Report { results, cleanup }
 }
 
 type CheckResult = Result<Outcome, String>;
@@ -213,6 +249,7 @@ macro_rules! ensure {
     };
 }
 
+mod cleanup;
 mod list;
 
 fn key(prefix: &KeyPrefix, name: &str) -> Result<ObjectKey, String> {
@@ -240,9 +277,13 @@ fn pattern(len: usize, seed: u8) -> Bytes {
         .into()
 }
 
-async fn put<S: ObjectStore>(store: &S, key: &ObjectKey, body: &Bytes) -> Result<(), String> {
-    store
-        .put_new(key, body.clone(), None)
+async fn put<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    key: &ObjectKey,
+    body: &Bytes,
+) -> Result<(), String> {
+    w.put_new(store, key, body.clone(), None)
         .await
         .map_err(|e| format!("put_new {key}: {e}"))
 }
@@ -254,11 +295,11 @@ async fn read<S: ObjectStore>(store: &S, key: &ObjectKey, r: ByteRange) -> Resul
         .map_err(|e| format!("get_range {key} {r:?}: {e}"))
 }
 
-async fn round_trip<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn round_trip<S: ObjectStore>(store: &S, w: &Written, prefix: &KeyPrefix) -> CheckResult {
     for (name, len) in [("round-trip-1", 1), ("round-trip-big", 300_000)] {
         let k = key(prefix, name)?;
         let body = pattern(len, 7);
-        put(store, &k, &body).await?;
+        put(store, w, &k, &body).await?;
         let got = read(store, &k, range(0, len as u64)).await?;
         ensure!(
             got == body,
@@ -269,11 +310,15 @@ async fn round_trip<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResul
     Ok(Outcome::Passed)
 }
 
-async fn range_boundaries<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn range_boundaries<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     const SIZE: u64 = 1000;
     let k = key(prefix, "ranges")?;
     let body = pattern(SIZE as usize, 3);
-    put(store, &k, &body).await?;
+    put(store, w, &k, &body).await?;
     // (offset, len, the bytes the store must return)
     let cases = [
         (0, 1, 0..1),
@@ -322,9 +367,13 @@ async fn missing_object<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckR
     }
 }
 
-async fn delete_idempotent<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn delete_idempotent<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let k = key(prefix, "deleted")?;
-    put(store, &k, &pattern(10, 1)).await?;
+    put(store, w, &k, &pattern(10, 1)).await?;
     for attempt in ["first", "second"] {
         store
             .delete(&k)
@@ -348,16 +397,20 @@ async fn delete_idempotent<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Che
     Ok(Outcome::Passed)
 }
 
-async fn list_pagination<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn list_pagination<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let dir = child(prefix, "list/")?;
     let mut want = BTreeSet::new();
     for i in 0..LIST_OBJECTS {
         let k = key(&dir, &format!("k{i}"))?;
-        put(store, &k, &pattern(i + 1, 9)).await?;
+        put(store, w, &k, &pattern(i + 1, 9)).await?;
         want.insert((k, i as u64 + 1));
     }
     // Shares the text `<prefix>list` but not `<prefix>list/`: must not be listed.
-    put(store, &key(prefix, "list-outside")?, &pattern(1, 0)).await?;
+    put(store, w, &key(prefix, "list-outside")?, &pattern(1, 0)).await?;
 
     let (seen, pages) = list_from(store, &dir, None, LIST_PAGE, usize::MAX).await?;
     let keys: Vec<&ObjectKey> = seen.iter().map(|o| &o.key).collect();
@@ -417,12 +470,16 @@ async fn list_from<S: ObjectStore>(
     Ok((keys, pages))
 }
 
-async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn list_start_after<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let dir = child(prefix, "after/")?;
     let mut all = Vec::new();
     for i in 0..LIST_OBJECTS {
         let k = key(&dir, &format!("k{i}"))?;
-        put(store, &k, &pattern(1, 3)).await?;
+        put(store, w, &k, &pattern(1, 3)).await?;
         all.push(k);
     }
     // After a key that exists, and after one that does not but sorts between k2 and k3.
@@ -439,14 +496,18 @@ async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Chec
     Ok(Outcome::Passed)
 }
 
-async fn list_past_page_cap<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn list_past_page_cap<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let dir = child(prefix, "many/")?;
     let mut want = Vec::with_capacity(PAST_PAGE_CAP);
     for i in 0..PAST_PAGE_CAP {
         want.push(key(&dir, &format!("m{i:04}"))?);
     }
     let body = pattern(1, 5);
-    stream::iter(want.iter().map(|k| put(store, k, &body)))
+    stream::iter(want.iter().map(|k| put(store, w, k, &body)))
         .buffer_unordered(PAST_PAGE_CAP_PUTS)
         .try_collect::<()>()
         .await?;
@@ -463,12 +524,16 @@ async fn list_past_page_cap<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Ch
     Ok(Outcome::Passed)
 }
 
-async fn list_empty_prefix<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn list_empty_prefix<S: ObjectStore>(
+    store: &S,
+    w: &Written,
+    prefix: &KeyPrefix,
+) -> CheckResult {
     let dir = child(prefix, "empty/")?;
     let mut want = Vec::new();
     for i in 0..5 {
         let k = key(&dir, &format!("e{i}"))?;
-        put(store, &k, &pattern(1, 4)).await?;
+        put(store, w, &k, &pattern(1, 4)).await?;
         want.push(k);
     }
     // `<prefix>empty` sorts just before `<prefix>empty/e0`, and no key of this run lies
@@ -487,7 +552,7 @@ async fn list_empty_prefix<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Che
 /// (1108 bytes), shorter than the nine-record one's (1524), which takes a second read.
 const FOOTER_TAIL: u64 = 1200;
 
-async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
+async fn footer_reads<S: ObjectStore>(store: &S, w: &Written, prefix: &KeyPrefix) -> CheckResult {
     let dir = child(prefix, "footers/")?;
     // What the segments hold, as their writer laid them out: records back to back.
     let mut want: BTreeMap<Digest, (ObjectKey, u64)> = BTreeMap::new();
@@ -512,10 +577,10 @@ async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckRes
             want.extend(index);
             footers_len.insert(k.clone(), footer_len(records as u64));
         }
-        put(store, &k, &bytes.into()).await?;
+        put(store, w, &k, &bytes.into()).await?;
     }
-    put(store, &key(&dir, "foreign")?, &pattern(4096, 8)).await?;
-    put(store, &key(&dir, "short")?, &pattern(10, 9)).await?;
+    put(store, w, &key(&dir, "foreign")?, &pattern(4096, 8)).await?;
+    put(store, w, &key(&dir, "short")?, &pattern(10, 9)).await?;
 
     let reads = FooterReads {
         concurrency: NonZeroUsize::new(2).expect("not zero"),
@@ -574,6 +639,7 @@ async fn footer_reads<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckRes
 
 async fn refuses_overwrite<S: ObjectStore>(
     store: &S,
+    w: &Written,
     prefix: &KeyPrefix,
     caps: Capabilities,
 ) -> CheckResult {
@@ -584,7 +650,7 @@ async fn refuses_overwrite<S: ObjectStore>(
     }
     let k = key(prefix, "put-once")?;
     let first = pattern(64, 1);
-    put(store, &k, &first).await?;
+    put(store, w, &k, &first).await?;
     match store.put_new(&k, pattern(64, 2), None).await {
         Err(ObjectStoreError::AlreadyExists(_)) => {}
         other => {
@@ -601,14 +667,15 @@ async fn refuses_overwrite<S: ObjectStore>(
 
 async fn object_lock<S: ObjectStore>(
     store: &S,
+    w: &Written,
     prefix: &KeyPrefix,
     caps: Capabilities,
 ) -> CheckResult {
-    let k = key(prefix, "locked")?;
+    let k = key(prefix, LOCK_KEY)?;
     let body = pattern(32, 5);
     let until = SystemTime::now() + LOCK_FOR;
     if !caps.object_lock {
-        return match store.put_new(&k, body, Some(until)).await {
+        return match w.put_new(store, &k, body, Some(until)).await {
             Err(ObjectStoreError::Unsupported(_)) => Ok(Outcome::Passed),
             other => Err(format!(
                 "a retention date on a store without Object Lock: expected Unsupported, got {}",
@@ -616,8 +683,7 @@ async fn object_lock<S: ObjectStore>(
             )),
         };
     }
-    store
-        .put_new(&k, body.clone(), Some(until))
+    w.put_new(store, &k, body.clone(), Some(until))
         .await
         .map_err(|e| format!("put_new {k} with retention: {e}"))?;
     if store.delete(&k).await.is_ok() {
@@ -664,13 +730,14 @@ fn streamed(bytes: &Bytes, tail: Option<ObjectStoreError>) -> BodyStream {
 
 async fn streamed_put<S: ObjectStore>(
     store: &S,
+    w: &Written,
     prefix: &KeyPrefix,
     caps: Capabilities,
 ) -> CheckResult {
     let body = pattern(STREAMED_LEN, 11);
     let len = body.len() as u64;
     let k = key(prefix, "streamed")?;
-    let wrote = store.put_stream(&k, len, streamed(&body, None)).await;
+    let wrote = w.put_stream(store, &k, len, streamed(&body, None)).await;
     ensure!(wrote.is_ok(), "put_stream {k}: {wrote:?}");
     const WINDOW: usize = 4 << 20;
     for at in (0..body.len()).step_by(WINDOW) {
@@ -684,14 +751,14 @@ async fn streamed_put<S: ObjectStore>(
     }
     let failed = key(prefix, "streamed-failed")?;
     let broke = ObjectStoreError::Body("the source broke".into());
-    let wrote = store
-        .put_stream(&failed, len, streamed(&body, Some(broke)))
+    let wrote = w
+        .put_stream(store, &failed, len, streamed(&body, Some(broke)))
         .await;
     ensure!(wrote.is_err(), "{failed}: a body that failed was written");
     absent(store, &failed).await?;
     let short = key(prefix, "streamed-short")?;
-    let wrote = store
-        .put_stream(&short, len + 1, streamed(&body, None))
+    let wrote = w
+        .put_stream(store, &short, len + 1, streamed(&body, None))
         .await;
     let refused = matches!(wrote, Err(ObjectStoreError::Body(_)));
     ensure!(refused, "{short}: a short body answered {wrote:?}");
@@ -700,7 +767,7 @@ async fn streamed_put<S: ObjectStore>(
         return Ok(Outcome::Passed);
     }
     let other = pattern(STREAMED_LEN, 12);
-    let again = store.put_stream(&k, len, streamed(&other, None)).await;
+    let again = w.put_stream(store, &k, len, streamed(&other, None)).await;
     let refused = matches!(again, Err(ObjectStoreError::AlreadyExists(_)));
     ensure!(refused, "{k}: a streamed overwrite answered {again:?}");
     let kept = read(store, &k, range(0, 64)).await?;

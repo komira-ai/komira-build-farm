@@ -54,6 +54,12 @@ async fn passes_conformance_with_conditional_writes() {
     let report = conformance::run(&store, &prefix).await;
     assert!(report.passed(), "{report}");
     assert_eq!(report.skipped().count(), 0, "{report}");
+    // The run deleted what it wrote: the bucket is empty.
+    let left = store
+        .list(&KeyPrefix::default(), None, PageSize::MAX)
+        .await
+        .expect("list");
+    assert!(left.objects.is_empty(), "{:?}", left.objects);
     drop(store);
     std::fs::remove_dir_all(&dir).expect("remove");
 }
