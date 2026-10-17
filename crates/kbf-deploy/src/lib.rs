@@ -40,6 +40,11 @@
 //! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
 //!   user (`pilot server-install`), and the buck2 overlay that points one linked
 //!   worktree at it, which never replaces a file it did not write (`pilot buckconfig`).
+//! - [`rollout`]: a new commit put on the whole fleet one host at a time (`rollout`):
+//!   the state-store backup, the storage nodes, the frontend, then the daemons with the
+//!   Macs last, each drained, swapped, checked and undrained; the host that fails is
+//!   rolled back and nothing after it is touched. It reaches hosts only through the
+//!   [`rollout::Transport`] trait.
 
 pub mod cli;
 pub mod config;
@@ -51,6 +56,7 @@ pub mod log;
 pub mod mdm;
 pub mod minio;
 pub mod pilot;
+pub mod rollout;
 pub mod template;
 pub mod unit;
 

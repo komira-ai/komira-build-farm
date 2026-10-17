@@ -37,6 +37,8 @@
 //! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
 //! kbf-deploy pilot buckconfig --config FILE --worktree DIR [--remove] [--apply]
 //! kbf-deploy log (--log-dir DIR | --hot-store DIR) [--lines N]
+//! kbf-deploy rollout --inventory FILE --commit SHA --run-id ID
+//!                    [--idle-timeout SECONDS] [--pause-file FILE] [--apply]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -68,6 +70,9 @@
 //! durable log, across `kbf-server.log` and its rotated files, oldest first, and exits 0,
 //! or 2 refused (`REFUSED: ...` on stderr: no such directory, or no log in it)
 //! ([`crate::log`]).
+//! `rollout` plans by default as the `minio` subcommands do, and exits 0 done (or planned),
+//! 1 a host failed, 2 refused, or 3 stopped with nothing wrong (paused, or a host still
+//! busy) ([`crate::rollout`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -100,6 +105,7 @@ use crate::mdm::verify::Verify;
 use crate::mdm::{self, MdmConfig, MdmError, Pins, Tool};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
 use crate::pilot;
+use crate::rollout;
 use kbf_host::exec::{Exec, HostExec};
 use kbf_host::path::{HostPath, Root};
 use kbf_host::plan::{Mode, RunAs, execute};
@@ -140,6 +146,9 @@ enum Kit {
     /// one worktree at it.
     #[command(subcommand)]
     Pilot(pilot::cli::Pilot),
+    /// A new commit put on the whole fleet, one host at a time: planned by default,
+    /// carried out with --apply.
+    Rollout(rollout::cli::RolloutArgs),
     /// The last lines of a kbf-server's durable log, across its rotated files, oldest
     /// first. Only reads.
     Log(log::LogArgs),
@@ -557,6 +566,7 @@ pub fn run<E: Exec>(
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
         Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
         Kit::Log(a) => return log::run(&a, out, err),
+        Kit::Rollout(a) => return rollout::cli::run(a, None, out, err),
         Kit::Pilot(p) => {
             return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
         }

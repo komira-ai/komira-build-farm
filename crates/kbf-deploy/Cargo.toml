@@ -8,15 +8,16 @@ repository.workspace = true
 publish.workspace = true
 
 # The deploy tool: its kits as subcommands. A kit that changes a host does it through
-# kbf-host's plan of steps, printed by default and carried out with `--apply`. Five
+# kbf-host's plan of steps, printed by default and carried out with `--apply`. Six
 # kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
 # (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
 # (fetch the pinned upstream archives; as root install the MDM services, the TLS
 # certificate, the push certificate and the enrollment profile, and link NanoDEP to
 # Apple Business Manager; verify them; sign an operator's erase request), `envoy`
-# (render, check a render, and apply it to a cluster through kubectl) and `pilot`
+# (render, check a render, and apply it to a cluster through kubectl), `pilot`
 # (server-install, a kbf-server as a systemd user service, and buckconfig, a
-# worktree's buck2 overlay).
+# worktree's buck2 overlay) and `rollout` (a commit put on a fleet one host at a time;
+# it needs nothing beyond std, and reaches hosts through a trait).
 # rustls (ring), httparse and rustls-native-certs make the HTTPS client of `mdm fetch`,
 # `mdm verify` and `mdm tls --check-godaddy`; rustls loads the push certificate's key
 # to match it to the certificate, and checks `pilot server-install`'s server

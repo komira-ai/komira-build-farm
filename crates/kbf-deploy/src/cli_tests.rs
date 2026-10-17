@@ -1272,3 +1272,39 @@ fn envoy_check_takes_the_operator_namespace_from_the_config() {
         "FAIL netpol-from: the NetworkPolicy admits [{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"tailscale\"}}}], not the operator's namespace ts-operator\n"
     );
 }
+
+/// Catches the `rollout` kit missing from the command line: a dry run through the
+/// binary's own entry point prints the plan, and an apply is refused because this
+/// build has no transport to the hosts.
+#[test]
+fn rollout_is_a_subcommand_that_plans_and_refuses_to_apply_without_a_transport() {
+    let dir = kbf_host::testkit::scratch("cli-rollout");
+    let inventory = dir.join("inventory");
+    std::fs::write(&inventory, "front frontend\ns1 storage-and-daemon\n").expect("inventory");
+    let inventory = inventory.to_str().expect("utf-8").to_owned();
+    let base = [
+        "rollout",
+        "--inventory",
+        &inventory,
+        "--commit",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--run-id",
+        "run-1",
+    ];
+    let mut exec = FakeExec::new(501);
+    let (code, out, err) = cli(&mut exec, &no_env, &base);
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""));
+    assert!(
+        out.starts_with("DRY-RUN: lock the fleet as run run-1\n"),
+        "{out}"
+    );
+    assert!(exec.log.is_empty(), "a dry run runs nothing on this host");
+
+    let apply: Vec<&str> = base.iter().copied().chain(["--apply"]).collect();
+    let (code, _, err) = cli(&mut exec, &no_env, &apply);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(
+        err.starts_with("REFUSED: this build has no transport"),
+        "{err}"
+    );
+}
