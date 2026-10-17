@@ -321,8 +321,13 @@ fn runs_until_sigterm_logged_then(
         .iter()
         .find(|l| l.contains(FIRST_ATTEMPT))
         .expect("seen");
+    // The cause is whatever the OS reports for the dead port: "refused" on Linux, a
+    // reset on macOS. Only its presence is the contract, not its wording.
+    let cause = ended
+        .split_once("connect: transport error: ")
+        .map(|(_, rest)| rest.split(" attempts").next().unwrap_or(rest));
     assert!(
-        ended.contains("connect: transport error: ") && ended.contains("refused"),
+        cause.is_some_and(|c| !c.trim_matches(|ch: char| ch == ' ' || ch == '"').is_empty()),
         "no cause: {ended}"
     );
     let all = all.into_iter().cloned().collect();
