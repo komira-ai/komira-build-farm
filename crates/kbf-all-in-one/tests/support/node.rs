@@ -6,8 +6,10 @@
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair, SanType};
@@ -109,13 +111,28 @@ pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
     ]
 }
 
-/// A port nothing listens on now.
-pub(crate) fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+/// An address nothing listens on now, for a worker listener the binary binds itself,
+/// that no other test or process is likely to take before the binary does. The port
+/// cannot be left to the binary (the daemon half dials it by the `--server` flag), and a
+/// port number probed on `127.0.0.1` is free only until a test binding `127.0.0.1:0`, or
+/// a connection's source port, takes it. So the address is a loopback address of this
+/// call's own (`127.x.y.z`; all of `127.0.0.0/8` is the host's own on Linux) that nothing
+/// else binds, with a port probed on it: the one thing that could take it is a process
+/// that chose the same address.
+pub(crate) fn worker_addr() -> SocketAddr {
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    assert!(call < 15, "more addresses than one process can tell apart");
+    // 23 bits of process and call number under a leading 1 bit: never 127.0.x.y, so
+    // never 127.0.0.1, and with a call number under 15, never 127.255.255.255.
+    let host = ((std::process::id().wrapping_mul(16) + call) & 0x7F_FFFF) | 0x80_0000;
+    let [_, a, b, c] = host.to_be_bytes();
+    let port = std::net::TcpListener::bind(SocketAddr::from(([127, a, b, c], 0)))
         .expect("bind")
         .local_addr()
         .expect("addr")
-        .port()
+        .port();
+    SocketAddr::from(([127, a, b, c], port))
 }
 
 /// `PATH` with `bin`, where [`podman`] put the stand-in, first.

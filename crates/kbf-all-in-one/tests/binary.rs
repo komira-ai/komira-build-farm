@@ -28,8 +28,8 @@ use tonic::transport::{Channel, Endpoint};
 mod node;
 
 use node::{
-    PROMPT, Running, cgroup_tree, files_holding, free_port, id_files, image_path, input_bytes, pki,
-    podman,
+    PROMPT, Running, cgroup_tree, files_holding, id_files, image_path, input_bytes, pki, podman,
+    worker_addr,
 };
 
 // The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
@@ -51,20 +51,20 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The flags of a one-node farm in `dir`: the server's worker listener on `port` under
+/// The flags of a one-node farm in `dir`: the server's worker listener on `worker` under
 /// mutual TLS, a cold store and a hot store (the write tier, holding the metadata log),
 /// and the daemon half's container driver dialling it.
-fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
+fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
     let at = |name: &str| dir.join(name).display().to_string();
     vec![
         "--listen=127.0.0.1:0".to_owned(),
-        format!("--worker-listen=127.0.0.1:{port}"),
+        format!("--worker-listen={worker}"),
         format!("--worker-tls-cert={}", at("server.pem")),
         format!("--worker-tls-key={}", at("server.key")),
         format!("--worker-client-ca={}", at("ca.pem")),
         format!("--cold-store=file://{}", at("cold")),
         format!("--hot-store=file://{}", at("hot")),
-        format!("--server=https://127.0.0.1:{port}"),
+        format!("--server=https://{worker}"),
         "--tls-server-name=localhost".to_owned(),
         format!("--ca-cert={}", at("ca.pem")),
         format!("--cert={}", at("node.pem")),
@@ -154,7 +154,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "to stderr",
     ];
     let image = podman(&bin, FAKE_PODMAN, &steps);
-    let flags = farm_flags(&dir, free_port());
+    let flags = farm_flags(&dir, worker_addr());
     let mut child = farm(&dir, &bin, &image_path(&bin), flags)
         .stdout(Stdio::piped())
         .spawn()
@@ -250,11 +250,16 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_flags() {
 /// Runs the binary with a one-node farm's flags in a fresh directory, `extra` taking the
 /// place of any it names again, and returns its exit status and stderr.
 fn refused(name: &str, extra: &[&str]) -> (Option<i32>, String) {
+    refused_at(name, extra, worker_addr())
+}
+
+/// [`refused`] with the worker listener on `worker`.
+fn refused_at(name: &str, extra: &[&str], worker: SocketAddr) -> (Option<i32>, String) {
     let dir = scratch(name);
     pki(&dir);
     let name = |flag: &str| flag.split('=').next().unwrap_or(flag).to_owned();
     let named: Vec<String> = extra.iter().map(|flag| name(flag)).collect();
-    let farm = farm_flags(&dir, free_port());
+    let farm = farm_flags(&dir, worker);
     let output = Command::new(BIN)
         .args(farm.iter().filter(|flag| !named.contains(&name(flag))))
         .args(extra)
@@ -285,6 +290,21 @@ fn a_start_either_half_refuses_says_which() {
     assert!(stderr.contains("container driver only"), "{stderr}");
 }
 
+/// Catches a worker listener address the test reserves and hands to the binary being
+/// taken in between: another test binding `127.0.0.1:0`, or a connection's source port,
+/// takes any port number a probe socket gave back. The port number the reservation chose
+/// is taken here on `127.0.0.1` (the thief) while the binary starts; the daemon half's
+/// refusal must still be what the start ends with (exit 1), not the server half's
+/// "Address already in use" (exit 2).
+#[test]
+fn a_port_taken_after_it_was_reserved_does_not_change_which_half_refuses() {
+    let worker = worker_addr();
+    let _thief = std::net::TcpListener::bind(("127.0.0.1", worker.port()));
+    let (code, stderr) = refused_at("thief", &["--id-files=/nonexistent/ids"], worker);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("kbf-all-in-one: daemon: "), "{stderr}");
+}
+
 /// Catches the start-up pass or the evictor not run over the all-in-one's `file://`
 /// cold store (mutants: `kbf_server::start`'s `file://` arm passes no pass; the
 /// evictor loop removed): a single-voter farm is this binary's main use, and the pass
@@ -302,7 +322,7 @@ fn the_start_up_pass_and_the_evictor_run_over_a_file_cold_store() {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
     podman(&bin, FAKE_PODMAN, &["true"]);
-    let mut flags: Vec<String> = farm_flags(&dir, free_port())
+    let mut flags: Vec<String> = farm_flags(&dir, worker_addr())
         .into_iter()
         .filter(|flag| !flag.starts_with("--hot-store="))
         .collect();
@@ -525,7 +545,7 @@ fn an_input_is_on_the_nodes_disk_once() {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
     let image = podman(&bin, FAKE_PODMAN, &["echo", "ran"]);
-    let mut flags = farm_flags(&dir, free_port());
+    let mut flags = farm_flags(&dir, worker_addr());
     flags.extend([
         "--api-listen=127.0.0.1:0".to_owned(),
         "--write-own-segment-bytes=1".to_owned(),
