@@ -2047,6 +2047,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-spike-aio"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kbf-caps",
+ "kbf-front",
+ "kbf-meta",
+ "kbf-proto",
+ "kbf-sched",
+ "kbf-server",
+ "kbf-state",
+ "kbf-store",
+ "kbf-types",
+ "serde_json",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [

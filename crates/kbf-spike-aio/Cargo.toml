@@ -1,0 +1,34 @@
+[package]
+name = "kbf-spike-aio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# THROWAWAY SPIKE (PR 0 of docs/design/aio-handover.md). Never merged. It measures the
+# questions of that note's section 12 and prints evidence; it asserts nothing.
+
+[[bin]]
+name = "spike-envoy"
+path = "src/bin/spike-envoy.rs"
+
+[[bin]]
+name = "spike-switch"
+path = "src/bin/spike-switch.rs"
+
+[dependencies]
+futures.workspace = true
+kbf-caps.workspace = true
+kbf-front.workspace = true
+kbf-proto.workspace = true
+kbf-sched.workspace = true
+kbf-server.workspace = true
+kbf-state.workspace = true
+kbf-store.workspace = true
+kbf-types.workspace = true
+kbf-meta.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync", "process", "fs"] }
+tonic.workspace = true
