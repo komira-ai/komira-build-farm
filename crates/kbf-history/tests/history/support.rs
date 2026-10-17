@@ -177,6 +177,9 @@ impl ObjectStore for Objects {
     }
 }
 
+/// A call made on the real store, once, before a transaction applies.
+pub type Hook = Box<dyn FnOnce(&dyn Store) + Send>;
+
 /// An index that fails on demand, over any store.
 pub struct Index {
     pub inner: Arc<dyn Store>,
@@ -193,6 +196,11 @@ pub struct Index {
     pub txns: AtomicU64,
     pub gets: AtomicU64,
     pub scans: AtomicU64,
+    /// Rows the scans have returned (a bounded read returns few, a whole prefix many).
+    pub rows_read: AtomicU64,
+    /// Runs once, with the real store, just before the next transaction applies: another
+    /// writer's write landing between this writer's read and its write.
+    pub before_txn: Mutex<Option<Hook>>,
     /// A call on this thread panics: the thread that polls the writer and reader.
     pub forbid: Mutex<Option<ThreadId>>,
 }
@@ -209,6 +217,8 @@ impl Index {
             txns: AtomicU64::new(0),
             gets: AtomicU64::new(0),
             scans: AtomicU64::new(0),
+            rows_read: AtomicU64::new(0),
+            before_txn: Mutex::new(None),
             forbid: Mutex::new(None),
         })
     }
@@ -266,6 +276,9 @@ impl Store for Index {
         if take_one(&self.fail_txns) {
             return Err(failed("transaction"));
         }
+        if let Some(hook) = self.before_txn.lock().unwrap().take() {
+            hook(self.inner.as_ref());
+        }
         let mut out = self.inner.apply_batch(batch)?;
         if take_one(&self.lose_acks) {
             return Err(failed("acknowledgement"));
@@ -290,13 +303,19 @@ impl Store for Index {
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.check_thread();
         self.scans.fetch_add(1, Ordering::SeqCst);
-        self.inner.scan_prefix(prefix)
+        let rows = self.inner.scan_prefix(prefix)?;
+        self.rows_read
+            .fetch_add(rows.len() as u64, Ordering::SeqCst);
+        Ok(rows)
     }
 
     fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
         self.check_thread();
         self.scans.fetch_add(1, Ordering::SeqCst);
-        self.inner.scan_range(scan)
+        let page = self.inner.scan_range(scan)?;
+        self.rows_read
+            .fetch_add(page.rows.len() as u64, Ordering::SeqCst);
+        Ok(page)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
@@ -429,7 +448,8 @@ impl Life {
         for i in 0..n {
             self.step(now_ms);
             let w = &self.writer;
-            if w.pending_rows() == 0 && w.kept_objects() == 0 && w.unwritten_chunks() == 0 {
+            let rows = w.pending_rows() + w.index_owed();
+            if rows == 0 && w.kept_objects() == 0 && w.unwritten_chunks() == 0 {
                 return i + 1;
             }
         }

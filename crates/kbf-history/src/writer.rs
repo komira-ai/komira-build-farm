@@ -29,6 +29,11 @@
 //!   never replaces the stored header with a fresh count. A header row that did not
 //!   commit is written again from the writer's state, and its invocation held until
 //!   one does: a closed invocation gets no later chunk to carry it.
+//! - **Catalog and status rows.** A run of a shape the writer has not seen puts the
+//!   shape's `ui/shape` row once; a run of a test shape adds to its `ui/status` row by
+//!   read-modify-write with the by-status entry in the same transaction (see
+//!   [`DerivedLimits`] and the module `derived`). A header row carries the `ui/inv` list
+//!   entry of each instance it is first to name.
 //!
 //! TODO: mark the index transactions background once the `kbf-state` trait has the
 //! mark (the C7 background lane); until then they are ordinary transactions, sent at
@@ -43,16 +48,19 @@ use kbf_state::{Cond, Txn, Versioned};
 use prost::Message;
 
 use crate::container::{self, Encoded, Header};
+use crate::derived::{Derived, DerivedLimits, TestId};
 use crate::index::HistoryIndex;
 use crate::keys::{Day, Family, HistoryRoot, InvKey, WriterId};
-use crate::pending::{Kept, KeptObject, Pending, PendingLimits, Row};
+use crate::pending::{Also, Kept, KeptObject, Pending, PendingLimits, Row};
 use crate::queue::{Event, EventQueue, InvRef};
 use crate::records::{
     ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, DigestRow, FailedRun, HitRecord, InvState,
     InvocationHeader, MAX_INSTANCES, RunRecord, Slow, StreamRow,
 };
+use crate::rows::{ShapeKind, ShapeRow};
 use crate::run_id::{Minter, StreamId};
 use crate::scoped::Scoped;
+use crate::status::{self, Observed};
 
 const MS_PER_DAY: u64 = 86_400_000;
 
@@ -89,6 +97,8 @@ pub struct Limits {
     /// Stored headers read per step at most, for invocations the writer has just
     /// opened (one index read each).
     pub header_reads_per_step: usize,
+    /// The shape and status rows' bounds.
+    pub derived: DerivedLimits,
 }
 
 impl Default for Limits {
@@ -105,6 +115,7 @@ impl Default for Limits {
             reinserts_per_step: 64,
             invocations: 4096,
             header_reads_per_step: 256,
+            derived: DerivedLimits::default(),
         }
     }
 }
@@ -187,6 +198,9 @@ struct Inv {
     /// one key and value for every chunk of the stream, so only the first chunk queues
     /// it; were it dropped, it comes back from that chunk's object.
     stream_rows: BTreeSet<(u32, u32)>,
+    /// The instances whose `ui/inv` list entry for this invocation committed with a
+    /// header row. An instance not in it has its entry put with the next header row.
+    listed: BTreeSet<String>,
 }
 
 /// The history writer core. See the module docs.
@@ -213,6 +227,7 @@ struct Core {
     held: usize,
     pending: Pending,
     kept: Kept,
+    derived: Derived,
     drops: Drops,
     /// An index transaction failed this step: the index is not draining.
     index_failed: bool,
@@ -249,6 +264,7 @@ impl<O: ObjectStore> Writer<O> {
                 held: 0,
                 pending: Pending::new(limits.pending),
                 kept: Kept::new(limits.kept),
+                derived: Derived::new(limits.derived),
                 drops: Drops::default(),
                 index_failed: false,
                 refill_failed: false,
@@ -267,6 +283,7 @@ impl<O: ObjectStore> Writer<O> {
         let budget = budget - usize::from(self.refill_streams(budget).await);
         self.core.take_events(now_ms);
         self.read_headers().await;
+        self.read_statuses().await;
         self.core.cut_due(now_ms);
         let mut failed = VecDeque::new();
         while let Some(cut) = self.core.ready.pop_front() {
@@ -277,6 +294,7 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.ready = failed;
+        self.core.queue_derived();
         self.apply_pending(budget).await;
         for _ in 0..self.core.reinsert_budget() {
             let Some(object) = self.core.kept.pop() else {
@@ -288,6 +306,7 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.requeue_headers();
+        self.core.queue_derived();
         self.core.prune(now_ms);
     }
 
@@ -324,6 +343,19 @@ impl<O: ObjectStore> Writer<O> {
         }
     }
 
+    /// Reads the stored status rows of up to [`DerivedLimits::reads_per_step`] test
+    /// keys with runs waiting, and queues each key's write. A failed read stops the
+    /// reads of this step and writes nothing: the stored row is not known, and writing
+    /// without it would reset the status.
+    async fn read_statuses(&mut self) {
+        for key in self.core.derived.to_read() {
+            let Ok(stored) = self.core.index.get(key.clone()).await else {
+                return;
+            };
+            self.core.status_read(&key, stored);
+        }
+    }
+
     /// Sends at most `budget` index transactions (what is left of
     /// [`Limits::txns_per_step`]), retries included.
     async fn apply_pending(&mut self, mut budget: usize) {
@@ -351,21 +383,21 @@ impl<O: ObjectStore> Writer<O> {
                 return 0;
             }
             budget -= 1;
-            let txn = batch.iter().fold(Txn::new(), |t, (key, row)| {
-                t.put(key.clone(), row.value.clone(), row.cond)
-            });
+            let (txn, owner) = Row::txn(&batch);
             match self.core.index.txn(txn).await {
                 Ok(Ok(_)) => {
                     self.core.committed(&batch);
                     return budget;
                 }
                 Ok(Err(conflict)) => {
-                    batch.remove(conflict.index.min(batch.len() - 1));
+                    let at = owner[conflict.index.min(owner.len() - 1)];
+                    let (key, _) = batch.remove(at);
+                    self.core.conflicted(&key);
                 }
                 Err(_) => {
                     self.core.index_failed = true;
-                    for (_, row) in batch {
-                        self.core.dropped_row(row);
+                    for (key, row) in batch {
+                        self.core.dropped_row(&key, row);
                     }
                     return budget;
                 }
@@ -397,6 +429,20 @@ impl<O: ObjectStore> Writer<O> {
     #[must_use]
     pub fn pending_rows(&self) -> usize {
         self.core.pending.len()
+    }
+
+    /// Shape and status keys the writer holds, each map's count: the keys it is
+    /// bounded by ([`DerivedLimits::keys`]).
+    #[must_use]
+    pub fn index_keys(&self) -> (usize, usize) {
+        self.core.derived.keys()
+    }
+
+    /// Catalog and status rows owed to the index: shape rows not known to exist and
+    /// status keys with runs not yet written.
+    #[must_use]
+    pub fn index_owed(&self) -> usize {
+        self.core.derived.owed()
     }
 
     /// Objects whose rows are waiting to be restored.
@@ -512,12 +558,46 @@ impl Core {
             return;
         }
         state.unsaved = true;
-        let value = state.header.encode_to_vec();
-        self.queue_row(self.index.root().invid(inv), value, Cond::Any, origin);
+        let mut row = self.header_row(inv);
+        row.origin = origin;
+        self.enqueue(self.index.root().invid(inv), row);
+    }
+
+    /// `inv`'s header row as the writer holds it, with the list entry of each instance
+    /// not yet listed: the entry commits in the header's transaction, so a header never
+    /// lands without its entries and a restart that rewrites an existing one costs no
+    /// transaction of its own. The entry's time is the header's `list_ms`, which a
+    /// stored header fixed before the first write (the header rule), so it is the same
+    /// entry whatever the writer has forgotten. An id-less pseudo-invocation is listed
+    /// nowhere.
+    fn header_row(&self, inv: &InvKey) -> Row {
+        let state = &self.invs[inv];
+        let root = self.index.root();
+        let mut row = Row::new(state.header.encode_to_vec(), Cond::Any, None);
+        if !state.header.idless {
+            let list_ms = state.header.list_ms;
+            let unlisted = state
+                .header
+                .instances
+                .iter()
+                .filter(|i| !state.listed.contains(*i));
+            row.also = unlisted
+                .map(|i| Also::Put(root.inv_list(i, list_ms, inv), Vec::new()))
+                .collect();
+        }
+        row
     }
 
     /// Notes that the header rows (the [`Cond::Any`] rows) of `batch` committed.
     fn committed(&mut self, batch: &[(String, Row)]) {
+        for (key, row) in batch {
+            self.derived.committed(key);
+            for also in &row.also {
+                if let Also::Put(entry, _) = also {
+                    self.listed(entry);
+                }
+            }
+        }
         let saved: BTreeSet<&str> = batch
             .iter()
             .filter(|(_, row)| row.cond == Cond::Any)
@@ -540,17 +620,99 @@ impl Core {
             return;
         }
         let rows = self.index.root().clone();
-        for (key, s) in self.invs.iter().filter(|(_, s)| s.unsaved) {
-            let row = rows.invid(key);
+        let unsaved: Vec<InvKey> = (self.invs.iter())
+            .filter(|(_, s)| s.unsaved)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in unsaved {
+            let row = rows.invid(&key);
             if !self.pending.contains(&row) {
-                let header = Row {
-                    value: s.header.encode_to_vec(),
-                    cond: Cond::Any,
-                    origin: None,
-                };
-                let _refused = self.pending.insert(row, header);
+                let _refused = self.pending.insert(row, self.header_row(&key));
             }
         }
+    }
+
+    /// Notes that the list entry `key`, if it is one, committed: its invocation, if the
+    /// writer holds it, needs no more puts of it.
+    fn listed(&mut self, key: &str) {
+        let parsed = self.index.root().parse_inv_list(key);
+        let held = parsed
+            .and_then(|(instance, _, inv)| self.invs.get_mut(&inv).map(|state| (state, instance)));
+        if let Some((state, instance)) = held {
+            state.listed.insert(instance);
+        }
+    }
+
+    /// The write of `key` failed its precondition. A pointer row and a shape row that
+    /// exist already are the same row; a status row lost a race.
+    fn conflicted(&mut self, key: &str) {
+        self.derived.conflicted(key);
+    }
+
+    /// Queues the shape rows still owed, and takes the stored status rows read.
+    fn queue_derived(&mut self) {
+        if self.index_failed {
+            return;
+        }
+        let owed: Vec<(String, Row)> = self
+            .derived
+            .unsaved_shapes()
+            .filter(|(key, _)| !self.pending.contains(key))
+            .map(|(key, row)| (key.to_owned(), row))
+            .collect();
+        for (key, row) in owed {
+            let _refused = self.pending.insert(key, row);
+        }
+    }
+
+    /// Takes the stored status row of `key` and queues the write of the row that the
+    /// runs waiting make of it.
+    fn status_read(&mut self, key: &str, stored: Option<Versioned>) {
+        let root = self.index.root().clone();
+        if let Some(row) = self.derived.read(&root, key, stored) {
+            self.enqueue(key.to_owned(), row);
+        }
+    }
+
+    /// Notes what `record` says of its shape and, for a test, of the test's status.
+    fn observe(&mut self, inv: &InvRef, record: &RunRecord) {
+        if record.shape == 0 {
+            return;
+        }
+        let id = TestId {
+            instance: record.instance.clone(),
+            shape: record.shape,
+            cfg: record.cfg.clone(),
+        };
+        let root = self.index.root().clone();
+        let kind = if record.test {
+            ShapeKind::Test
+        } else {
+            ShapeKind::Other
+        };
+        let shape = ShapeRow {
+            kind: kind.into(),
+            first_seen_ms: record.time_ms,
+            last_seen_ms: record.time_ms,
+            target: record.target.clone(),
+        };
+        let mut taken = self.derived.shape(&root, &id, &shape);
+        let result = record.test.then(|| status::classify(record)).flatten();
+        if let Some(status) = result {
+            let run = Observed {
+                status,
+                run_id: record.run_id().to_bytes().to_vec(),
+                time_ms: record.time_ms,
+                execution_ms: u32::try_from(record.execution_us() / 1000).unwrap_or(u32::MAX),
+                digest16: record.action.as_ref().map_or(0, |d| d.prefix16()),
+                inv_key: inv
+                    .record_id
+                    .as_ref()
+                    .map_or_else(String::new, |_| inv.key.to_string()),
+            };
+            taken &= self.derived.test(&root, &id, run);
+        }
+        self.drops.index += u64::from(!taken);
     }
 
     /// How many kept objects to read back this step: none while rows are pending or
@@ -610,6 +772,7 @@ impl Core {
             } => {
                 let day = Day::from_ms(record.time_ms);
                 self.break_if(&inv, day, Some(record.stream), now_ms);
+                self.observe(&inv, &record);
                 let state = self.state(&inv.key);
                 note(&mut state.header, &record.instance, record.time_ms);
                 state.header.runs += 1;
@@ -855,23 +1018,19 @@ impl Core {
     }
 
     fn queue_row(&mut self, key: String, value: Vec<u8>, cond: Cond, origin: Option<KeptObject>) {
-        let row = Row {
-            value,
-            cond,
-            origin,
-        };
-        self.enqueue(key, row);
+        self.enqueue(key, Row::new(value, cond, origin));
     }
 
     /// Puts `row` in [`Pending`], or drops and counts it past its bounds.
     fn enqueue(&mut self, key: String, row: Row) {
-        if let Err(row) = self.pending.insert(key, row) {
-            self.dropped_row(row);
+        if let Err(row) = self.pending.insert(key.clone(), row) {
+            self.dropped_row(&key, row);
         }
     }
 
-    fn dropped_row(&mut self, row: Row) {
+    fn dropped_row(&mut self, key: &str, row: Row) {
         self.drops.index += 1;
+        self.derived.dropped(key);
         if let Some(origin) = row.origin {
             self.kept.push(origin);
         }
@@ -968,6 +1127,9 @@ fn start(b: &mut Building, day: Day, now_ms: u64) -> &mut Building {
 /// it if it was closed.
 fn note(h: &mut InvocationHeader, instance: &str, time_ms: u64) {
     h.state = InvState::Open.into();
+    if h.list_ms == 0 {
+        h.list_ms = time_ms;
+    }
     add_instance(h, instance);
     h.first_seen_ms = earliest(h.first_seen_ms, time_ms);
     h.last_seen_ms = h.last_seen_ms.max(time_ms);
@@ -1011,6 +1173,10 @@ fn merge(stored: InvocationHeader, added: &InvocationHeader) -> InvocationHeader
     h.last_seen_ms = h.last_seen_ms.max(added.last_seen_ms);
     h.last_chunk_ms = h.last_chunk_ms.max(added.last_chunk_ms);
     h.state = added.state;
+    // The stored time keys the entries that exist: it is never moved.
+    if h.list_ms == 0 {
+        h.list_ms = added.list_ms;
+    }
     h
 }
 

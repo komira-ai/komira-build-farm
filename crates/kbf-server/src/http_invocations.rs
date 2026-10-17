@@ -40,7 +40,7 @@ use serde_json::Value;
 
 use crate::history::HistoryReads;
 use crate::http_blobs::{error, off, refusal};
-use crate::http_history::{Durable, run_router};
+use crate::http_history::{Durable, cross_router, run_router};
 
 mod pages;
 mod views;
@@ -101,9 +101,10 @@ where
     O: ObjectStore + 'static,
 {
     let durable = history.map(|reads| Arc::new(Durable::new(reads)));
-    let runs = durable
-        .as_ref()
-        .map(|d| run_router(recorder.clone(), readers.clone(), Arc::clone(d)));
+    let history = durable.as_ref().map(|d| {
+        run_router(recorder.clone(), readers.clone(), Arc::clone(d))
+            .merge(cross_router(readers.clone(), Arc::clone(d)))
+    });
     let state = Arc::new(PagesState {
         recorder,
         cache,
@@ -115,8 +116,8 @@ where
         .route("/v1/invocations/{id}", get(page::<M, O>))
         .route("/v1/invocations/{id}/{*rest}", get(page::<M, O>))
         .with_state(state);
-    match runs {
-        Some(runs) => pages.merge(runs),
+    match history {
+        Some(history) => pages.merge(history),
         None => pages,
     }
 }

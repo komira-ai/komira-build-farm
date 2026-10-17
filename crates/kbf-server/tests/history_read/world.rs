@@ -48,6 +48,7 @@ pub struct ObjectsInner {
     /// Reads that start at the first byte (a whole chunk) fail.
     fail_chunk_reads: AtomicBool,
     puts: AtomicU64,
+    gets: AtomicU64,
 }
 
 impl Objects {
@@ -61,6 +62,7 @@ impl Objects {
             fail_gets: AtomicBool::new(false),
             fail_chunk_reads: AtomicBool::new(false),
             puts: AtomicU64::new(0),
+            gets: AtomicU64::new(0),
         }))
     }
 
@@ -79,6 +81,11 @@ impl Objects {
     /// Writes that succeeded.
     pub fn puts(&self) -> u64 {
         self.0.puts.load(Ordering::SeqCst)
+    }
+
+    /// Reads asked of the store, whatever they answered.
+    pub fn gets(&self) -> u64 {
+        self.0.gets.load(Ordering::SeqCst)
     }
 }
 
@@ -108,6 +115,7 @@ impl ObjectStore for Objects {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
+        self.0.gets.fetch_add(1, Ordering::SeqCst);
         let chunk = range.offset() == 0 && self.0.fail_chunk_reads.load(Ordering::SeqCst);
         if chunk || self.0.fail_gets.load(Ordering::SeqCst) {
             return Err(ObjectStoreError::Protocol("planted cause".into()));

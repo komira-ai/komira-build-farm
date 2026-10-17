@@ -483,6 +483,35 @@ is 24 lowercase hex digits, which the attempts of the build pages give as `run_i
 `run_href` (only with `--history-objects`). Not here yet: the `envelope`, `end`, tails and
 transfer counters.
 
+**Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
+any unknown path). They are read from the index rows the history writer keeps, never from
+an object, so they answer the same after a restart and cost no object read
+(`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
+`authenticationPolicy`, then `invocations.getAuthorizer` (`404` with `"off"` when it is not
+named). The authorizer is asked once per request about each instance the request would
+touch, and every answer holds only rows of allowed instances; an invocation is listed only
+when every instance it used is allowed. `?instance=` names one instance; one the caller
+may not read is `403`. Lists are paged as above (`page_size` 1 to 200, 100 by default;
+`next_page` is the link to follow; a token names its route and filters and stays valid
+across restarts). An answer over more instances than the index reads at once (256) says
+`"partial": true`. Times are RFC 3339 and a `+` in an offset is `%2B` in a query.
+
+| Route | Answers |
+|---|---|
+| `GET /v1/invocations` | `{"invocations": [...]}`, newest first by the time of the first record; `?instance=`, `?since=`, `?until=`, `?state=open\|closed`. Each item: `id`, `first_seen`, `last_seen`, `state`, `complete`, `counts` (`ran`, `hits`, `failed`), `instances`, `href`. `?commit=` is `400` `needs_report` (no commit is kept before the client report), `?tool=` is `400` `unsupported_filter` |
+| `GET /v1/shapes` | `{"shapes": [...]}`, by instance then shape key; `?kind=test\|other`, `?status=passing\|failing\|flaky\|oom_killed`, `?instance=`. `?status=slower` is `400` `unsupported_status` (it needs the day-close fold) and `?target=`, `?program=` are `400` `unsupported_filter` (the catalog keeps no body yet) |
+| `GET /v1/tests` | the same with `kind=test` |
+| `GET /v1/shapes/{key}?instance=&cfg=` | one `(instance, cfg)` of the key, with `previous_keys: null`; with either absent, `{"shapes": [...]}` of the key's rows (paged) |
+| `GET /v1/shapes/{key}/runs?instance=&cfg=` | the last 16 runs of a test, newest first, each `{run_id, run_href, class, execution_ms, source: "run", digest16}` (`run_href` is `GET /v1/runs/{run_id}`), with `complete: false`, `covers: "recent_16"` (`"none"` for a shape that is not a test) and `needs: "day_index"`: older runs are not answered yet. Both parameters are required |
+
+A shape row is `{instance, key, cfg, kind, target, first_seen, last_seen, href, runs_href}`
+and, for a test, `status` (`passing`, `failing`, `flaky`, `oom_killed`, or `null` while the
+runs seen were all infrastructure), `flaky` (`{proven, proof_digest, since}`: the first 16
+hex digits of the action digest seen both passing and failing, and the run that completed
+the proof), `last_pass` and `first_fail` (`{at, run_id, run_href}`, `null` for none). `key`
+is 16 lowercase hex digits. A key no instance the caller may read has is `404`
+`{"error": "no_shape"}`.
+
 **The invocation:**
 
 ```json

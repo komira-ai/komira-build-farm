@@ -10,10 +10,14 @@
 //! workers already and for tests.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kbf_state::{Commit, Conflict, Store, StoreError, Txn, Versioned};
+use kbf_state::{
+    Commit, Conflict, Direction, ScanPage, ScanRange, Store, StoreError, Txn, Versioned,
+};
 
 use crate::keys::IndexRoot;
 
@@ -94,6 +98,28 @@ impl HistoryIndex {
         prefix: String,
     ) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.call(move |s| s.scan_prefix(&prefix)).await
+    }
+
+    /// One page of at most `limit` rows under `prefix` between `lower` and `upper`, in
+    /// `direction` (C8): a bounded read, unlike [`HistoryIndex::scan_prefix`].
+    pub(crate) async fn scan_range(
+        &self,
+        prefix: String,
+        bounds: (Bound<String>, Bound<String>),
+        direction: Direction,
+        limit: NonZeroUsize,
+    ) -> Result<ScanPage, StoreError> {
+        self.call(move |s| {
+            let (lower, upper) = &bounds;
+            s.scan_range(ScanRange {
+                prefix: &prefix,
+                lower: lower.as_ref().map(String::as_str),
+                upper: upper.as_ref().map(String::as_str),
+                direction,
+                limit,
+            })
+        })
+        .await
     }
 
     pub(crate) async fn txn(&self, txn: Txn) -> Result<Result<Commit, Conflict>, StoreError> {

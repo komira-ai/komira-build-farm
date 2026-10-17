@@ -8,7 +8,9 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_history::{
-    Allow, ChunkCursor, InvKey, InvocationView, ReadError, Reader, RecordsPage, RunId, RunView,
+    Allow, ChunkCursor, InstanceList, InvKey, InvocationPage, InvocationView, ListQuery,
+    PageCursor, ReadError, Reader, RecordsPage, RunId, RunView, ShapeEntry, ShapePage, StatusEntry,
+    StatusKind, StatusPage,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
@@ -95,6 +97,55 @@ trait Source: Send + Sync {
         id: RunId,
         allow: Allow<'a>,
     ) -> BoxFuture<'a, Result<Option<RunView>, ReadError>>;
+
+    fn instance_names(&self) -> BoxFuture<'_, Result<InstanceList, ReadError>>;
+
+    fn list_invocations<'a>(
+        &'a self,
+        q: &'a ListQuery<'a>,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<InvocationPage, ReadError>>;
+
+    fn shapes<'a>(
+        &'a self,
+        instance: &'a str,
+        after: Option<&'a PageCursor>,
+        limit: usize,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<ShapePage, ReadError>>;
+
+    fn shape_cfgs<'a>(
+        &'a self,
+        instance: &'a str,
+        shape: u64,
+        after: Option<&'a PageCursor>,
+        limit: usize,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<ShapePage, ReadError>>;
+
+    fn shape<'a>(
+        &'a self,
+        instance: &'a str,
+        shape: u64,
+        cfg: &'a str,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<Option<ShapeEntry>, ReadError>>;
+
+    fn status<'a>(
+        &'a self,
+        instance: &'a str,
+        shape: u64,
+        cfg: &'a str,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<Option<StatusEntry>, ReadError>>;
+
+    fn by_status<'a>(
+        &'a self,
+        kind: StatusKind,
+        after: Option<&'a PageCursor>,
+        limit: usize,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<StatusPage, ReadError>>;
 }
 
 impl<O: ObjectStore> Source for Reader<O> {
@@ -129,6 +180,71 @@ impl<O: ObjectStore> Source for Reader<O> {
         allow: Allow<'a>,
     ) -> BoxFuture<'a, Result<Option<RunView>, ReadError>> {
         Box::pin(Reader::run(self, id, allow))
+    }
+
+    fn instance_names(&self) -> BoxFuture<'_, Result<InstanceList, ReadError>> {
+        Box::pin(self.instances(&|_| true))
+    }
+
+    fn list_invocations<'a>(
+        &'a self,
+        q: &'a ListQuery<'a>,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<InvocationPage, ReadError>> {
+        Box::pin(Reader::list_invocations(self, q, allow))
+    }
+
+    fn shapes<'a>(
+        &'a self,
+        instance: &'a str,
+        after: Option<&'a PageCursor>,
+        limit: usize,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<ShapePage, ReadError>> {
+        Box::pin(Reader::shapes(self, instance, after, limit, allow))
+    }
+
+    fn shape_cfgs<'a>(
+        &'a self,
+        instance: &'a str,
+        shape: u64,
+        after: Option<&'a PageCursor>,
+        limit: usize,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<ShapePage, ReadError>> {
+        Box::pin(Reader::shape_cfgs(
+            self, instance, shape, after, limit, allow,
+        ))
+    }
+
+    fn shape<'a>(
+        &'a self,
+        instance: &'a str,
+        shape: u64,
+        cfg: &'a str,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<Option<ShapeEntry>, ReadError>> {
+        Box::pin(Reader::shape(self, instance, shape, cfg, allow))
+    }
+
+    fn status<'a>(
+        &'a self,
+        instance: &'a str,
+        shape: u64,
+        cfg: &'a str,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<Option<StatusEntry>, ReadError>> {
+        Box::pin(Reader::status(self, instance, shape, cfg, allow))
+    }
+
+    fn by_status<'a>(
+        &'a self,
+        kind: StatusKind,
+        after: Option<&'a PageCursor>,
+        limit: usize,
+        allow: Allow<'a>,
+    ) -> BoxFuture<'a, Result<StatusPage, ReadError>> {
+        Box::pin(Reader::by_status(self, kind, after, limit, allow))
     }
 }
 
@@ -192,6 +308,99 @@ impl HistoryReads {
     /// [`ReadError`].
     pub async fn run(&self, id: RunId, allow: Allow<'_>) -> Result<Option<RunView>, ReadError> {
         self.source.run(id, allow).await
+    }
+
+    /// Every instance that has an invocation list, whatever a caller may read.
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn instance_names(&self) -> Result<InstanceList, ReadError> {
+        self.source.instance_names().await
+    }
+
+    /// [`Reader::list_invocations`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn list_invocations(
+        &self,
+        q: &ListQuery<'_>,
+        allow: Allow<'_>,
+    ) -> Result<InvocationPage, ReadError> {
+        self.source.list_invocations(q, allow).await
+    }
+
+    /// [`Reader::shapes`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn shapes(
+        &self,
+        instance: &str,
+        after: Option<&PageCursor>,
+        limit: usize,
+        allow: Allow<'_>,
+    ) -> Result<ShapePage, ReadError> {
+        self.source.shapes(instance, after, limit, allow).await
+    }
+
+    /// [`Reader::shape_cfgs`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn shape_cfgs(
+        &self,
+        instance: &str,
+        shape: u64,
+        after: Option<&PageCursor>,
+        limit: usize,
+        allow: Allow<'_>,
+    ) -> Result<ShapePage, ReadError> {
+        self.source
+            .shape_cfgs(instance, shape, after, limit, allow)
+            .await
+    }
+
+    /// [`Reader::shape`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn shape(
+        &self,
+        instance: &str,
+        shape: u64,
+        cfg: &str,
+        allow: Allow<'_>,
+    ) -> Result<Option<ShapeEntry>, ReadError> {
+        self.source.shape(instance, shape, cfg, allow).await
+    }
+
+    /// [`Reader::status`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn status(
+        &self,
+        instance: &str,
+        shape: u64,
+        cfg: &str,
+        allow: Allow<'_>,
+    ) -> Result<Option<StatusEntry>, ReadError> {
+        self.source.status(instance, shape, cfg, allow).await
+    }
+
+    /// [`Reader::by_status`].
+    ///
+    /// # Errors
+    /// [`ReadError`].
+    pub async fn by_status(
+        &self,
+        kind: StatusKind,
+        after: Option<&PageCursor>,
+        limit: usize,
+        allow: Allow<'_>,
+    ) -> Result<StatusPage, ReadError> {
+        self.source.by_status(kind, after, limit, allow).await
     }
 }
 

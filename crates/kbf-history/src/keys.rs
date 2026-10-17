@@ -15,6 +15,9 @@ use crate::run_id::StreamId;
 
 const MS_PER_DAY: u64 = 86_400_000;
 
+/// The largest time a list key holds: twelve hex digits.
+const MAX_LIST_MS: u64 = 0xffff_ffff_ffff;
+
 /// A UTC calendar day, as the number `yyyymmdd`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Day(u32);
@@ -346,6 +349,182 @@ impl IndexRoot {
         format!("{}stream/{day}/{stream}/{first_ms:012x}", self.0)
     }
 
+    /// `text` as one segment of a row key. Instance names and configuration hashes are
+    /// the client's, and an instance such as `projects/p/instances/i` holds `/`, which
+    /// would move a row into another instance's range. Letters, digits, `.`, `_` and
+    /// `-` stand for themselves, every other byte is `%` and two uppercase hex digits,
+    /// and the empty text is `~` (never produced otherwise: `~` itself is escaped), so
+    /// a segment never holds `/` and is never empty.
+    #[must_use]
+    pub fn segment(text: &str) -> String {
+        if text.is_empty() {
+            return "~".to_owned();
+        }
+        let mut out = String::with_capacity(text.len());
+        for b in text.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+                out.push(char::from(b));
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    /// The text a [`IndexRoot::segment`] stands for; `None` for text it cannot have made.
+    #[must_use]
+    pub fn unsegment(segment: &str) -> Option<String> {
+        if segment == "~" {
+            return Some(String::new());
+        }
+        let bytes = segment.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let b = bytes[at];
+            if b == b'%' {
+                let hex = segment.get(at + 1..at + 3)?;
+                let byte = u8::from_str_radix(hex, 16).ok()?;
+                // Only the form `segment` writes: two uppercase digits (not `+4` or `4f`).
+                if format!("{byte:02X}") != hex {
+                    return None;
+                }
+                out.push(byte);
+                at += 3;
+            } else if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+                out.push(b);
+                at += 1;
+            } else {
+                return None;
+            }
+        }
+        String::from_utf8(out).ok().filter(|s| !s.is_empty())
+    }
+
+    /// The prefix of every list entry, `ui/inv/`.
+    #[must_use]
+    pub fn inv_list_root(&self) -> String {
+        format!("{}inv/", self.0)
+    }
+
+    /// The prefix of `instance`'s list entries, in first-seen order.
+    #[must_use]
+    pub fn inv_list_prefix(&self, instance: &str) -> String {
+        format!("{}inv/{}/", self.0, IndexRoot::segment(instance))
+    }
+
+    /// The list entry of `inv` under `instance`, keyed by the time the invocation was
+    /// listed at (its header's `list_ms`). The time is fixed-width hex, so keys sort by
+    /// it.
+    #[must_use]
+    pub fn inv_list(&self, instance: &str, listed_ms: u64, inv: &InvKey) -> String {
+        format!(
+            "{}{}",
+            self.inv_list_prefix(instance),
+            IndexRoot::inv_list_tail(listed_ms, inv)
+        )
+    }
+
+    /// `<time>/<inv-key>`: what follows an instance in a list entry's key.
+    #[must_use]
+    pub fn inv_list_tail(listed_ms: u64, inv: &InvKey) -> String {
+        format!("{:012x}/{inv}", listed_ms.min(MAX_LIST_MS))
+    }
+
+    /// The instance, time and invocation a list entry's key names, if it is one of
+    /// this root's.
+    #[must_use]
+    pub fn parse_inv_list(&self, key: &str) -> Option<(String, u64, InvKey)> {
+        let rest = key.strip_prefix(self.0.as_str())?.strip_prefix("inv/")?;
+        let mut parts = rest.split('/');
+        let (instance, time, inv) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() || time.len() != 12 {
+            return None;
+        }
+        Some((
+            IndexRoot::unsegment(instance)?,
+            u64::from_str_radix(time, 16).ok()?,
+            InvKey::parse(inv).ok()?,
+        ))
+    }
+
+    /// The shape and configuration a `<shape>/<cfg>` tail names.
+    #[must_use]
+    pub fn parse_shape_tail(tail: &str) -> Option<(u64, String)> {
+        let (shape, cfg) = tail.split_once('/')?;
+        if shape.len() != 16 {
+            return None;
+        }
+        Some((
+            u64::from_str_radix(shape, 16).ok()?,
+            IndexRoot::unsegment(cfg)?,
+        ))
+    }
+
+    /// The prefix of every shape catalog row, `ui/shape/`.
+    #[must_use]
+    pub fn shape_root(&self) -> String {
+        format!("{}shape/", self.0)
+    }
+
+    /// The prefix of `instance`'s shape catalog rows.
+    #[must_use]
+    pub fn shape_prefix(&self, instance: &str) -> String {
+        format!("{}shape/{}/", self.0, IndexRoot::segment(instance))
+    }
+
+    /// What follows an instance in a shape or status row's key: `<shape>/<cfg>`.
+    #[must_use]
+    pub fn shape_tail(shape: u64, cfg: &str) -> String {
+        format!("{shape:016x}/{}", IndexRoot::segment(cfg))
+    }
+
+    /// The catalog row of (`instance`, `shape`, `cfg`).
+    #[must_use]
+    pub fn shape(&self, instance: &str, shape: u64, cfg: &str) -> String {
+        format!(
+            "{}{}",
+            self.shape_prefix(instance),
+            IndexRoot::shape_tail(shape, cfg)
+        )
+    }
+
+    /// The status row of a test (`instance`, `shape`, `cfg`) on its branch. No farm
+    /// source names a branch before the client report, so the branch is `_`.
+    #[must_use]
+    pub fn status(&self, instance: &str, shape: u64, cfg: &str) -> String {
+        format!(
+            "{}status/{}/{}/_",
+            self.0,
+            IndexRoot::segment(instance),
+            IndexRoot::shape_tail(shape, cfg)
+        )
+    }
+
+    /// The prefix of `instance`'s status rows.
+    #[must_use]
+    pub fn status_prefix(&self, instance: &str) -> String {
+        format!("{}status/{}/", self.0, IndexRoot::segment(instance))
+    }
+
+    /// The by-status index row of a test whose status is `status` (a name from
+    /// [`StatusKind::name`](crate::StatusKind::name)).
+    #[must_use]
+    pub fn statusx(&self, status: &str, instance: &str, shape: u64, cfg: &str) -> String {
+        format!(
+            "{}{}/{}",
+            self.statusx_prefix(status),
+            IndexRoot::segment(instance),
+            IndexRoot::shape_tail(shape, cfg)
+        )
+    }
+
+    /// The prefix of the by-status index rows of `status`.
+    #[must_use]
+    pub fn statusx_prefix(&self, status: &str) -> String {
+        format!("{}statusx/{status}/", self.0)
+    }
+
     /// The open time of a stream row's key, if it is one.
     #[must_use]
     pub fn stream_first_ms(key: &str) -> Option<u64> {
@@ -506,6 +685,13 @@ mod tests {
             rows.ichunk(&inv, WriterId(1), 0),
             rows.stream_prefix(day, StreamId(1)),
             rows.stream(day, StreamId(1), 0),
+            rows.inv_list_root(),
+            rows.inv_list("a", 1, &inv),
+            rows.shape_root(),
+            rows.shape("a", 1, "c"),
+            rows.status("a", 1, "c"),
+            rows.status_prefix("a"),
+            rows.statusx("failing", "a", 1, "c"),
         ];
         assert!(
             keys.iter().all(|k| k.starts_with("tenant-a/ui/")),
@@ -514,5 +700,102 @@ mod tests {
         assert_eq!(IndexRoot::under("").unwrap(), IndexRoot::default());
         let err = IndexRoot::under("tenant-a").unwrap_err();
         assert!(err.to_string().contains("not an index prefix"), "{err}");
+    }
+
+    #[test]
+    fn segments_never_hold_a_slash_and_read_back() {
+        // Catches: an instance or configuration used raw in a key (a `/` would move a
+        // row into another instance's range), an empty segment, and a segment that does
+        // not decode to what went in.
+        for text in [
+            "main",
+            "projects/p/instances/i",
+            "50%",
+            "~",
+            "a b",
+            "é",
+            "-._",
+        ] {
+            let segment = IndexRoot::segment(text);
+            assert!(!segment.contains('/'), "{segment}");
+            assert!(!segment.is_empty(), "{segment}");
+            assert_eq!(IndexRoot::unsegment(&segment).as_deref(), Some(text));
+        }
+        assert_eq!(IndexRoot::segment(""), "~");
+        assert_eq!(IndexRoot::segment("a/b"), "a%2Fb");
+        assert_eq!(IndexRoot::segment("~"), "%7E");
+        assert_eq!(IndexRoot::unsegment("~").as_deref(), Some(""));
+        // What no segment can be.
+        for bad in ["", "a/b", "a%", "a%4", "a%zz", "a%4f", "%FF", "a b", "é"] {
+            assert_eq!(IndexRoot::unsegment(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn list_and_shape_keys_name_their_parts_and_refuse_other_keys() {
+        // Catches: a list key that does not sort by time, a key read back as another
+        // (instance, time, invocation), and a foreign key taken for a list entry.
+        let rows = IndexRoot::default();
+        let inv = InvKey::parse("0123456789abcdef").unwrap();
+        let key = rows.inv_list("a/b", 0x1a2b, &inv);
+        assert_eq!(key, "ui/inv/a%2Fb/000000001a2b/0123456789abcdef");
+        assert_eq!(
+            rows.parse_inv_list(&key),
+            Some(("a/b".to_owned(), 0x1a2b, inv.clone()))
+        );
+        assert!(rows.inv_list("a", 9, &inv) < rows.inv_list("a", 10, &inv));
+        assert!(key.starts_with(&rows.inv_list_prefix("a/b")));
+        // Past the largest time a key holds, the time saturates rather than widening.
+        assert!(
+            rows.inv_list("a", u64::MAX, &inv)
+                .contains("/ffffffffffff/")
+        );
+        let other = IndexRoot::under("t/").unwrap();
+        for bad in [
+            "ui/invid/0123456789abcdef".to_owned(),
+            "ui/inv/a".to_owned(),
+            "ui/inv/a/000000001a2b".to_owned(),
+            "ui/inv/a/000000001a2b/0123456789abcdef/x".to_owned(),
+            "ui/inv/a/1a2b/0123456789abcdef".to_owned(),
+            "ui/inv/a/00000000zzzz/0123456789abcdef".to_owned(),
+            "ui/inv/a/000000001a2b/nope".to_owned(),
+            "ui/inv//000000001a2b/0123456789abcdef".to_owned(),
+            key.clone(),
+        ] {
+            let root = if bad == key { &other } else { &rows };
+            assert_eq!(root.parse_inv_list(&bad), None, "{bad}");
+        }
+        let tail = IndexRoot::shape_tail(255, "c/f");
+        assert_eq!(tail, "00000000000000ff/c%2Ff");
+        assert_eq!(
+            IndexRoot::parse_shape_tail(&tail),
+            Some((255, "c/f".to_owned()))
+        );
+        for bad in [
+            "",
+            "ff/cfg",
+            "00000000000000ff",
+            "000000000000zzzz/cfg",
+            "00000000000000ff/a/b",
+        ] {
+            assert_eq!(IndexRoot::parse_shape_tail(bad), None, "{bad:?}");
+        }
+        assert_eq!(rows.shape("i", 1, "c"), "ui/shape/i/0000000000000001/c");
+        assert_eq!(rows.status("i", 1, "c"), "ui/status/i/0000000000000001/c/_");
+        assert_eq!(
+            rows.statusx("failing", "i", 1, "c"),
+            "ui/statusx/failing/i/0000000000000001/c"
+        );
+        assert!(
+            rows.status("i", 1, "c")
+                .starts_with(&rows.status_prefix("i"))
+        );
+        assert!(rows.shape("i", 1, "c").starts_with(&rows.shape_root()));
+        // `status/` and `statusx/` do not share a prefix.
+        assert!(
+            !rows
+                .statusx("failing", "i", 1, "c")
+                .starts_with(&rows.status_prefix("i"))
+        );
     }
 }

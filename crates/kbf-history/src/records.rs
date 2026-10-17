@@ -643,6 +643,11 @@ pub struct InvocationHeader {
     /// list them all. A reader cannot check every instance, so it answers no caller.
     #[prost(bool, tag = "13")]
     pub instances_truncated: bool,
+    /// The time the invocation's `ui/inv` list entries are keyed by: its first record's
+    /// time when the writer first listed it, never moved, so a list has one entry per
+    /// instance. An entry whose key time is not this one is stale and is not shown.
+    #[prost(uint64, tag = "14")]
+    pub list_ms: u64,
 }
 
 /// The `ui/ichunk/<inv-key>/<writer>/<seq>` row: where one chunk is and what it holds.
@@ -957,5 +962,29 @@ mod tests {
             ..ChunkRow::default()
         };
         assert!(!hits_only.holds(0, 0));
+    }
+
+    #[test]
+    fn the_target_and_the_list_time_have_their_own_field_numbers() {
+        // Catches: a field renumbered or dropped from the wire, and a record written
+        // before the fields existed failing to decode or reading them set.
+        use prost::Message as _;
+        let run = RunRecord {
+            target: "//a:t".into(),
+            ..RunRecord::default()
+        };
+        // Tag 37, length-delimited: key 298 (0xaa 0x02).
+        assert_eq!(
+            run.encode_to_vec(),
+            [0xaa, 0x02, 5, b'/', b'/', b'a', b':', b't']
+        );
+        let header = InvocationHeader {
+            list_ms: 5,
+            ..InvocationHeader::default()
+        };
+        // Tag 14, varint: key 112.
+        assert_eq!(header.encode_to_vec(), [112, 5]);
+        assert_eq!(RunRecord::decode(&[][..]).unwrap().target, "");
+        assert_eq!(InvocationHeader::decode(&[][..]).unwrap().list_ms, 0);
     }
 }
