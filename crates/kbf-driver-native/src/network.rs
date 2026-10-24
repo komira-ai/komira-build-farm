@@ -132,6 +132,30 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow network* (remote ip \"localhost:*\"))\n\
 (allow network* (remote unix-socket))\n";
 
+/// The data-vault folders under `/private/var/protected` where a GPU framework's first
+/// use in a process of a uid leaves files (analytics and trust stores, one folder per
+/// uid). They are OS-owned and out of the clean's scope (it has no Full Disk Access and
+/// neither lists nor removes in them). A lease may not read or write them anyway, which
+/// costs nothing: system daemons write there for the uid on its behalf, and a later
+/// lease of the same uid would read what an earlier one left. The slot profile shuts
+/// them ([`SLOT_PROFILE`]).
+pub const PROTECTED_STORES: [&str; 2] = [
+    "/private/var/protected/sfanalytics",
+    "/private/var/protected/trustd/private",
+];
+
+/// The slot profile's deny of [`PROTECTED_STORES`], one line (the canary
+/// `read-protected` stands for it); a macro so that `concat!` can build the profiles from
+/// it. Last among the write rules: a later rule wins in a sandbox profile.
+macro_rules! protected_deny {
+    () => {
+        "(deny file-read* file-write* (subpath \"/private/var/protected/sfanalytics\") (subpath \"/private/var/protected/trustd/private\"))"
+    };
+}
+
+/// The deny line of [`PROTECTED_STORES`] in the slot profiles.
+pub const PROTECTED_DENY: &str = protected_deny!();
+
 /// The profile of an action that runs as a slot user of the lease-user pool
 /// ([`crate::slots`]): [`BASE_PROFILE`] without its `job-creation` and
 /// `user-preference-write` denies, and with `mach-register` and `file-mount` denied
@@ -140,6 +164,10 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 /// home, and what it hands launchd runs as its uid, which the end of the lease kills
 /// (docs/design/macos-end-state.md, section 1, "Sandbox"). The write rule stays, as a
 /// hermeticity aid.
+///
+/// Plus the deny of [`PROTECTED_STORES`], read and write, after the write allows: the
+/// clean does not touch those folders, so a lease may not either (docs/design/macos-end-state.md,
+/// "GPU state"). The canary `read-protected` stands for it.
 ///
 /// Three denies shut what the clean does not reach (each was open without the sandbox,
 /// closed with the rule and open again with the rule removed, on a hosted macOS runner;
@@ -156,27 +184,35 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 /// attach` with no mount point, which still mounts under `/Volumes` through
 /// `diskimages-helper` even with `file-mount` denied (the clean's unmount and the
 /// helper's death remove it).
-pub const SLOT_PROFILE: &str = "(version 1)\n\
-(allow default)\n\
-(deny mach-register)\n\
-(deny lsopen)\n\
-(deny file-mount)\n\
-(deny file-write*)\n\
-(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
+pub const SLOT_PROFILE: &str = concat!(
+    "(version 1)\n",
+    "(allow default)\n",
+    "(deny mach-register)\n",
+    "(deny lsopen)\n",
+    "(deny file-mount)\n",
+    "(deny file-write*)\n",
+    "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n",
+    protected_deny!(),
+    "\n"
+);
 
 /// [`SLOT_PROFILE`] for an action without the network: [`NO_NETWORK_PROFILE`] with the
 /// same denies as [`SLOT_PROFILE`].
-pub const SLOT_NO_NETWORK_PROFILE: &str = "(version 1)\n\
-(allow default)\n\
-(deny mach-register)\n\
-(deny lsopen)\n\
-(deny file-mount)\n\
-(deny file-write*)\n\
-(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
-(deny network*)\n\
-(allow network-inbound (local ip \"localhost:*\"))\n\
-(allow network* (remote ip \"localhost:*\"))\n\
-(allow network* (remote unix-socket))\n";
+pub const SLOT_NO_NETWORK_PROFILE: &str = concat!(
+    "(version 1)\n",
+    "(allow default)\n",
+    "(deny mach-register)\n",
+    "(deny lsopen)\n",
+    "(deny file-mount)\n",
+    "(deny file-write*)\n",
+    "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n",
+    protected_deny!(),
+    "\n",
+    "(deny network*)\n",
+    "(allow network-inbound (local ip \"localhost:*\"))\n",
+    "(allow network* (remote ip \"localhost:*\"))\n",
+    "(allow network* (remote unix-socket))\n"
+);
 
 /// The profile of a slot user's action under `network`: [`SLOT_PROFILE`] or
 /// [`SLOT_NO_NETWORK_PROFILE`].
@@ -409,7 +445,7 @@ mod tests {
     /// the `lsopen` deny lost).
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_slot_profile_is_the_shared_one_without_two_denies_and_with_two_more() {
+    fn a_slot_profile_is_the_shared_one_without_two_denies_and_with_three_more() {
         let without = |profile: &str| {
             let gone = ["(deny job-creation)", "(deny user-preference-write)"];
             let mut kept: Vec<&str> = profile.lines().filter(|l| !gone.contains(l)).collect();
@@ -424,6 +460,11 @@ mod tests {
                 .expect("lsopen");
             kept.splice(at..at, ["(deny mach-register)"]);
             kept.splice(at + 2..at + 2, ["(deny file-mount)"]);
+            let after = kept
+                .iter()
+                .position(|l| l.starts_with("(allow file-write*"))
+                .expect("write allow");
+            kept.splice(after + 1..after + 1, [PROTECTED_DENY]);
             kept.join("\n") + "\n"
         };
         assert_eq!(SLOT_PROFILE, without(BASE_PROFILE));
@@ -706,6 +747,7 @@ mod tests {
             "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))",
             false,
         ),
+        (PROTECTED_DENY, false),
         (
             "(allow file-write* (subpath \"/h/slot\") (subpath \"/v/f/xx/yyyy\"))",
             false,
@@ -790,6 +832,34 @@ mod tests {
                 let before = whole.lines().filter(|l| *l == rule).count();
                 assert_eq!(whole.lines().count() - lines.len(), before, "{rule}");
             }
+        }
+    }
+
+    /// Catches a protected-store deny that does not shut what the canary
+    /// names (it lists one store, or reads and not writes), or one a later allow undoes (a
+    /// later rule wins in a sandbox profile, so it must come after the lease's write allow):
+    /// the line names both stores of [`PROTECTED_STORES`] and both operations, and follows
+    /// the allow of the lease directory, in both profiles.
+    #[test]
+    fn the_protected_stores_are_denied_read_and_write_after_the_lease_allow() {
+        assert_eq!(PROTECTED_STORES.len(), 2);
+        for store in PROTECTED_STORES {
+            assert!(
+                PROTECTED_DENY.contains(&format!("(subpath \"{store}\")")),
+                "{store}"
+            );
+        }
+        assert!(PROTECTED_DENY.starts_with("(deny file-read* file-write* "));
+        for network in [Network::On, Network::Off] {
+            let text = generated(network, None);
+            let lines: Vec<&str> = text.lines().collect();
+            let at = |want: &str| lines.iter().position(|l| *l == want).expect(want);
+            let lease_allow = lines
+                .iter()
+                .position(|l| l.starts_with("(allow file-write* (subpath (param"))
+                .expect("lease allow");
+            assert!(at(PROTECTED_DENY) > lease_allow, "{network:?}:\n{text}");
+            assert_eq!(lines.iter().filter(|l| **l == PROTECTED_DENY).count(), 1);
         }
     }
 

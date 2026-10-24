@@ -281,12 +281,63 @@ pub fn sandbox_denies(operation: &str) -> io::Result<bool> {
     }
     /// `SANDBOX_FILTER_NONE`: the operation alone, no object.
     const FILTER_NONE: c_int = 0;
+    /// `SANDBOX_CHECK_NO_REPORT`: a denial found by the check is not logged as a violation.
+    const NO_REPORT: c_int = 0x4000_0000;
     let operation = CString::new(operation).map_err(io::Error::other)?;
     // SAFETY: `operation` is a NUL-terminated string that outlives the call, the filter
-    // `SANDBOX_FILTER_NONE` takes no further argument, and the pid is our own.
-    let answer = unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE) };
+    // `SANDBOX_FILTER_NONE` takes no further argument (the report flag is a modifier of the
+    // filter word), and the pid is our own.
+    let answer =
+        unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE | NO_REPORT) };
     let errno = io::Error::last_os_error();
     read_sandbox_answer(answer, errno)
+}
+
+/// Whether this process's sandbox denies `operation` on `path` (`sandbox_check` with a
+/// path filter). The profile is asked, not the file system: the answer does not depend
+/// on whether `path` exists, nor on a data-vault protection that refuses a user anyway.
+///
+/// # Errors
+/// The operation name or the path cannot be passed; elsewhere there is no sandbox to ask.
+#[cfg(target_os = "macos")]
+pub fn sandbox_denies_path(operation: &str, path: &std::path::Path) -> io::Result<bool> {
+    use std::ffi::{CString, c_char, c_int};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    unsafe extern "C" {
+        fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
+    }
+    /// `SANDBOX_FILTER_PATH`: the object is a path, passed as a C string.
+    const FILTER_PATH: c_int = 1;
+    /// `SANDBOX_CHECK_NO_REPORT`: a denial found by the check is not logged as a violation.
+    const NO_REPORT: c_int = 0x4000_0000;
+    let operation = CString::new(operation).map_err(io::Error::other)?;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: `operation` and `path` are NUL-terminated strings that outlive the call, the
+    // filter `SANDBOX_FILTER_PATH` takes exactly one `const char *` after it, and the pid
+    // is our own.
+    let answer = unsafe {
+        sandbox_check(
+            libc::getpid(),
+            operation.as_ptr(),
+            FILTER_PATH | NO_REPORT,
+            path.as_ptr(),
+        )
+    };
+    let errno = io::Error::last_os_error();
+    read_sandbox_answer(answer, errno)
+}
+
+/// Whether this process's sandbox denies `operation` on `path`.
+///
+/// # Errors
+/// Always: there is no sandbox to ask off a Mac.
+#[cfg(not(target_os = "macos"))]
+pub fn sandbox_denies_path(_operation: &str, _path: &std::path::Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the sandbox can be asked on macOS only",
+    ))
 }
 
 /// What `sandbox_check` answered: 1 denied, 0 allowed, anything else (it answers -1
@@ -328,6 +379,25 @@ pub fn ls_open(fs: &dyn Fs) -> Seen {
         Ok(false) => Seen::Allowed,
         Err(e) => Seen::Failed(e.to_string()),
     }
+}
+
+/// Asks the sandbox whether this process may read or write each of the protected stores
+/// ([`crate::network::PROTECTED_STORES`]): refused only if every one of the four
+/// questions is denied. As for `lsopen`, the question is asked of the profile instead of
+/// opening a folder: the stores are data-vault folders that refuse a user whatever the
+/// profile says, and may not exist on a fresh Mac, so an open would be refused with the
+/// rule dropped as with it kept.
+pub fn read_protected(fs: &dyn Fs) -> Seen {
+    for store in crate::network::PROTECTED_STORES {
+        for operation in ["file-read-data", "file-write-data"] {
+            match fs.sandbox_denies_path(operation, Path::new(store)) {
+                Ok(true) => {}
+                Ok(false) => return Seen::Allowed,
+                Err(e) => return Seen::Failed(e.to_string()),
+            }
+        }
+    }
+    Seen::Refused(Refusal::Sandbox(1))
 }
 
 /// Mounts a `devfs` on the new directory `mount`, which a user may do on a directory

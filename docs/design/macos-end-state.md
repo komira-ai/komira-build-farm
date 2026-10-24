@@ -298,6 +298,66 @@ Open:
 - **D6. SIP off as the fallback.** If U5 shows one-click grants do not last: is SIP off on farm
   Macs (one recoveryOS visit each) acceptable, with the health check as the guard?
 
+## GPU state of a pool lease
+
+A pool user with no GUI session gets a Metal device, compiles shaders at run time and runs compute
+kernels and MLX under the slot profile. What such a lease leaves, measured on a hosted macOS runner
+(a virtual machine with a paravirtual GPU, not a Mac Studio), and where the clean removes it:
+
+| what | where | removed by |
+|---|---|---|
+| Metal shader caches (`com.apple.metal`, `com.apple.metalfe`, `com.apple.gpuarchiver`) and the front-end module cache of MLX | `C/` of the uid's `/var/folders` entry | C7 |
+| `com.apple.MTLCompilerService` and Launch Services caches | `T/` and `0/` of the same entry | C7 |
+| Keychain, container-manager and quarantine files | the home | C7 |
+| I/O Registry user clients of the uid's processes | the kernel | C3: they end with the processes |
+
+There is no GPU step: C7 already empties the three folders that hold every Metal and MLX cache, and
+the lease's `HOME` keeps `~/Library/Caches` inside the lease. Shader cache reuse exists only inside a
+lease; the next lease on the uid compiles again (first compile 180 to 270 ms for a small kernel, 1 s
+for an MLX `mx.compile`).
+
+**Out of scope: the OS-owned protected stores.** The clean has no Full Disk Access, and none
+is granted. Three stores are the operating system's, and the clean never tries to delete in them,
+never lists them as residue and never sets a slot dirty because of them:
+`/private/var/protected/trustd/private`, `/private/var/protected/sfanalytics` and
+`/private/var/db/mds/messages`. A lease that imports a GPU framework can cause system daemons to
+write files for its uid there (measured on a hosted runner, whose agent has Full Disk Access); on a
+Mac Studio the daemon's context is refused (`EPERM`) in the first two, and `trustd/private` refuses
+root even with Full Disk Access. Everything a build can write stays wiped and asserted: the home,
+the temporary folders, the caches, the processes and the GPU state in the table above.
+
+Revisit the protected stores (a VM per lease, or MDM-granted Full Disk Access) before running
+untrusted code.
+
+**The slot profile still denies the first two stores.** `SLOT_PROFILE` and
+`SLOT_NO_NETWORK_PROFILE` carry `(deny file-read* file-write* (subpath ".../sfanalytics") (subpath
+".../trustd/private"))` after the write allows, so a lease cannot read what a system daemon left
+there for the same uid while an earlier lease ran. This is cheap isolation and does not conflict
+with the decision: it keeps the deny and its canary. The daemons are not sandboxed by the lease's
+profile and keep writing for the uid. `mds/messages` has no deny. The `read-protected` canary asserts
+the deny ([slot profile canaries](#slot-profile-canaries)); it is the only proof of it, as the test
+of this section plants nothing there. The deny is not in the list of known GPU-breaking denies
+(`tests/gpu_profile.rs`); `tests/slot_gpu_clean.rs` runs the Metal probe under the profile. Security
+framework trust evaluation (`trustd`, a certificate chain or a TLS handshake) under the deny is
+**unmeasured**: no test runs an evaluation under the profile.
+
+Known limits:
+
+- Wired memory and GPU driver memory cannot be cleaned per uid. On the runner the holders added 40
+  to 50 MiB of wired memory and about 50 MiB of driver allocation; both returned to within the noise
+  of the VM (about 20 MiB) after the processes ended, and did not grow over three leases. A residue
+  below that noise cannot be seen there; it is not measured on a Mac Studio.
+- System-wide growth under `/private/var/db` (time zone, uuidtext and diagnostics data, hundreds of
+  paths during a run) is not owned by the uid and was not attributed to GPU use. The clean leaves it.
+- Two defunct processes (zombies whose parent is not the lease) stayed after the kill. They hold
+  nothing and the clean's process check passes.
+- Files that system daemons write for the uid in the protected stores stay after a clean and
+  accumulate per uid (out of scope above). The profile deny keeps a later lease from reading the
+  first two; a system daemon can still read them for the same uid. Whether they grow without bound
+  is not measured.
+- The test of this section runs on the VM. Whether a Mac Studio leaves other state (a different
+  GPU driver, a persistent shader cache outside the user's folders) is not known.
+
 ## Slot profile canaries
 
 Before a lease is handed a slot, the daemon runs one probe per row below as the slot's user,
@@ -311,6 +371,7 @@ A row not refused in its own form sets the slot aside. The profile rows are
 | `link-outside` | `(deny file-write*)` | hard-link `/etc/hosts` into the lease | `EPERM` or `EACCES` |
 | `mach-register` | `(deny mach-register)` | `bootstrap_check_in` of a service name no job declares | `kern_return` 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) |
 | `lsopen` | `(deny lsopen)` | `sandbox_check` of `lsopen`, the question Launch Services asks before it starts an application | denied (`sandbox=1`) |
+| `read-protected` | `(deny file-read* file-write* (subpath ...))` of the two stores under `/private/var/protected` | `sandbox_check` of `file-read-data` and `file-write-data` on each store (the profile is asked: the stores refuse a user whatever it says, and may not exist) | denied (`sandbox=1`) for all four |
 | `file-mount` | `(deny file-mount)` | `mount(2)` of a `devfs` on a directory of the lease | `EPERM` |
 | `launchd-bootstrap` | none: `(allow default)` | `launchctl bootstrap user/<uid>` of a `Background` `KeepAlive` agent whose file is in the lease | `Bootstrap failed: 5` |
 

@@ -1,10 +1,11 @@
 //! The profile canaries for real: a pool user, under the exact profile generated for a
 //! lease, is refused a write outside the four allowed paths, a hard link of a
 //! root-owned file into the lease directory, a Mach service name, the sandbox's answer
-//! for Launch Services (`lsopen`), a `devfs` mounted on a directory of the lease, and a launchd agent
+//! for Launch Services (`lsopen`), the sandbox's answer for reading or writing the
+//! protected stores under `/private/var/protected` (`read-protected`), a `devfs` mounted on a directory of the lease, and a launchd agent
 //! bootstrapped from a file of the lease; a profile that lacks `(deny file-write*)`
 //! fails the first, one that only lets a link through fails the link canary alone, one
-//! that lacks `(deny mach-register)`, `(deny lsopen)` or `(deny file-mount)` fails its
+//! that lacks `(deny mach-register)`, `(deny lsopen)`, the protected-store deny or `(deny file-mount)` fails its
 //! canary alone, and the launchd canary is refused even under a profile with no deny at
 //! all but the write rules; a slot that fails is set aside.
 //!
@@ -255,6 +256,21 @@ async fn a_profile_without_its_file_mount_deny_fails_that_canary_alone() {
     assert_eq!(seen, [["file-mount"], ["file-mount"]]);
 }
 
+/// Catches a protected-store canary that cannot fail, or a profile in which dropping the
+/// deny of `/private/var/protected/sfanalytics` and `trustd/private` goes unseen: the
+/// sandbox then allows reading and writing them, so that canary alone must be reported as
+/// not refused.
+#[ignore = "needs root and real users: cargo xtask sudo-test"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_profile_without_its_protected_store_deny_fails_that_canary_alone() {
+    let seen = failing_under(
+        "canary-no-protected",
+        WeakenedProfile::Drop(kbf_driver_native::network::PROTECTED_DENY),
+    )
+    .await;
+    assert_eq!(seen, [["read-protected"], ["read-protected"]]);
+}
+
 /// Catches a launchd canary that depends on a rule of the profile (it must hold whatever
 /// the profile says, as launchd refuses a job from any sandboxed process) and the other
 /// canaries passing without their rules: with every deny removed but the profile's
@@ -268,6 +284,7 @@ async fn the_launchd_canary_is_refused_under_a_profile_that_is_only_allow_defaul
         "(deny lsopen)",
         "(deny file-mount)",
         "(deny file-write*)",
+        kbf_driver_native::network::PROTECTED_DENY,
     ]);
     let seen = failing_under("canary-bare", bare).await;
     let others = [
@@ -275,6 +292,7 @@ async fn the_launchd_canary_is_refused_under_a_profile_that_is_only_allow_defaul
         "link-outside",
         "mach-register",
         "lsopen",
+        "read-protected",
         "file-mount",
     ];
     assert_eq!(seen, [others, others]);

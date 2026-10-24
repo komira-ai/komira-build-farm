@@ -34,12 +34,45 @@ pub const HOMES: &str = "/private/var/kbf-ci-homes.noindex";
 /// Stops a test run as the runner's user, where every check would fail for the wrong
 /// reason. Asks the kernel, not the code under test.
 pub fn assert_root(test: &str) {
+    log_to_stderr();
     // SAFETY: geteuid takes no arguments and cannot fail.
     let euid = unsafe { libc::geteuid() };
     assert_eq!(
         euid, 0,
         "not root: run `cargo xtask sudo-test -p kbf-driver-native --test {test}`"
     );
+}
+
+/// Sends the driver's log to stderr, once per test binary, so a failed clean shows its
+/// reason (the book logs "slot dirty ... why=..." and nothing else says why). `RUST_LOG`
+/// takes target directives (`kbf_driver_native=debug,warn`); without it, kbf crates log
+/// at warn and above.
+fn log_to_stderr() {
+    use std::str::FromStr;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let filter = std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|spec| Targets::from_str(&spec).ok())
+            .unwrap_or_else(|| {
+                Targets::new()
+                    .with_target("kbf_driver_native", LevelFilter::WARN)
+                    .with_target("kbf_daemon", LevelFilter::WARN)
+            });
+        // A subscriber already set by the binary stays; this one then does nothing.
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
+            .try_init();
+    });
 }
 
 /// A scratch directory under `/private/tmp`, root's, mode 0755 (every pool user may
