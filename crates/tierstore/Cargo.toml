@@ -1,0 +1,29 @@
+[package]
+name = "tierstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# A generic hot/cold object store over S3-compatible backends. It knows nothing of kbf and
+# depends on no kbf crate, so it can move to a repository of its own
+# (crates/kbf-integration-test/tests/layering.rs keeps it that way).
+[dependencies]
+# The backend trait is used as `dyn Backend`, so its async methods are boxed.
+async-trait.workspace = true
+bytes.workspace = true
+# The content tag of the in-memory backend: the hex of the body's SHA-256.
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# `rt` for the background task, `sync` for its wake-up and the per-key turn, `time` for the
+# retry interval and the injected delays.
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
+
+[lints]
+workspace = true

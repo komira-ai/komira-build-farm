@@ -52,7 +52,11 @@
 //!   `SETUP_MAY_NAME_THE_PROXY` naming `kbf_proxy`;
 //! - the `kbf` binary (`kbf-cli`) linking the proxy: `kbf setup` is built on the setup library
 //!   without its `proxy` feature (`kbf-installer` turns it on), so the tree of
-//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`.
+//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`;
+//! - the hot/cold object store library (`tierstore`) depending, directly or through another
+//!   crate, on any other crate of this workspace, which would stop it from moving to a
+//!   repository of its own; and a walk that cannot see its dependencies, which would make
+//!   that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -477,6 +481,35 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
     assert!(
         violations.is_empty(),
         "kbf-route reaches a frontend or daemon crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Asserts that the normal dependencies of the object store library (`tierstore`), direct
+/// and through other crates, include no other crate of this workspace, and that the walk
+/// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
+#[test]
+fn tierstore_reaches_no_other_workspace_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("tierstore")
+        .expect("tierstore is a workspace member");
+    assert!(root.is_some(), "tierstore must have a library target");
+    assert!(
+        !reaches(&g, "tierstore", &["tokio"]).is_empty(),
+        "tierstore's closure must reach tokio, or this walk proves nothing"
+    );
+    let others: Vec<&str> = g
+        .members
+        .keys()
+        .map(String::as_str)
+        .filter(|name| *name != "tierstore")
+        .collect();
+    let violations = reaches(&g, "tierstore", &others);
+    assert!(
+        violations.is_empty(),
+        "tierstore reaches another crate of this workspace:\n{}",
         violations.join("\n")
     );
 }
