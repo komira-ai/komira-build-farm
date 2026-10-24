@@ -61,8 +61,13 @@ again.
 disk image, writes the Setup Assistant marker, a mount point and five launch daemons into
 the guest's Data volume, and detaches. The daemons are a root daemon that mounts the
 automount share itself at `/private/var/kbf-mnt` (so the guest side needs no logged-in
-user), a probe as root, a probe as `nobody`, a marker when the guest's launchd runs, and a
-marker when the login window exists. Every marker JSON records how long the guest waited
+user), a probe as root, a probe as `nobody`, a marker when the guest's launchd runs, a
+marker when the login window exists, and a local marker (`com.kbf.probe.local`): `sysctl`
+run by launchd with its output going to `/private/var/log/kbf-probe-local` on the guest's
+own disk (the boot time and OS version), depending on nothing else, not even a shell. The
+Data volume is chosen by what each mounted volume holds (a volume with `private/var/db`
+that is not the sealed System volume, which has an empty one too), never by mount order;
+if no volume or several qualify the step fails and lists what each volume holds. Every marker JSON records how long the guest waited
 for the share (`share_wait_ms`); "boot to system ready" includes that wait. If the image
 was built without the step, or the step failed, apply it to the existing base:
 
@@ -108,16 +113,83 @@ sudo launchctl bootout system/com.kbf.probe.g5
 sudo rm /Library/LaunchDaemons/com.kbf.probe.g5.plist
 ```
 
+## E1: why a booted guest never reaches its userspace
+
+G1 and the other guest gates can say that a clone booted (the framework reported
+"running") and that no marker came; they cannot say why. `probe e1` is one run that tells
+the causes apart. It starts two clones of the base at once, `e1-x` headless and `e1-y`
+with a graphics device (`--graphics`), and for the whole guest wait (320 seconds) records
+every helper event with its arrival time, samples every 10 seconds the helper's CPU
+time, the CPU time of every `com.apple.Virtualization.VirtualMachine` service process
+(the one whose CPU rises belongs to the guest that executes) and the clone's `disk.img`
+allocation, and looks for the system marker. A stop or error event ends that arm's wait at
+once and is reported. `--keep` leaves both clones and their shares in the work directory.
+Then `image harvest` reads the guest's own logs off each kept disk.
+
+Run it as the console user that ran `image base` (a root run or an ssh run has no
+session and fails to start a guest), then as root for the setup and the harvest. Each
+harvest writes a new directory and refuses one that exists.
+
+```sh
+# 1. as root, once: put the current daemons (including the local marker) in the base
+sudo $D/kbf-vmm image setup --base $W/base | tee $W/e1-setup.json
+# 2. as the console user, from Terminal on the Mac (not sudo, not ssh): about 6 minutes
+$D/kbf-vmm probe e1 --work-dir $W --guest-binary $D/kbf-guest --graphics --keep | tee $W/e1.json
+# 3. as root: copy the allowlisted files off each kept clone's disk
+sudo $D/kbf-vmm image harvest --bundle $W/e1-x --out $W/e1-x-harvest | tee $W/e1-harvest-x.json
+sudo $D/kbf-vmm image harvest --bundle $W/e1-y --out $W/e1-y-harvest | tee $W/e1-harvest-y.json
+sudo chown -R "$(id -un)" $W/e1-x-harvest $W/e1-y-harvest
+```
+
+`image harvest` attaches the disk read-only, picks the Data volume as `image setup` does,
+and copies only: `private/var/log/kbf-probe-local`, `private/var/log/com.kbf.probe.*.log`,
+and everything under `private/var/db/diagnostics`, `private/var/db/uuidtext`,
+`private/var/db/timesync` and `Library/Logs/DiagnosticReports`. A symbolic link, anywhere
+on the way or inside a tree, is listed and not followed; a pipe, device or directory where
+a file belongs is listed; a file over 256 MiB, a total over 2 GiB, more than 50000 entries
+or a tree deeper than 8 levels stops the copy of the rest of that part and is listed. The
+JSON lists what was copied (`copied`), what was refused and why (`skipped`), which
+allowlisted paths the guest never made (`absent`), and the times of the Setup Assistant
+marker and the log directory (`stats`).
+
+To read the guest's log, make an archive from the copied files and ask `log` about the
+boot (this assembly has not been tried on a real copy; if `log` refuses the directory,
+`log show --file <file>.tracev3 --info --debug` reads the files one at a time):
+
+```sh
+A=$W/e1-x.logarchive; mkdir -p $A
+cp -R $W/e1-x-harvest/private/var/db/diagnostics/. $A/
+cp -R $W/e1-x-harvest/private/var/db/uuidtext/. $A/
+cp -R $W/e1-x-harvest/private/var/db/timesync $A/ 2>/dev/null
+log show --archive $A --info --debug --predicate 'process == "launchd" OR process == "mount_virtiofs" OR process CONTAINS "kbf" OR eventMessage CONTAINS "AMFI"' | tail -200
+```
+
+Read the report (`e1.json`, per arm under `details.arms`) and the harvest together:
+
+| observation | cause |
+|---|---|
+| In `activity`, `disk_blocks_512_grown` is 0 or stops growing within seconds (`disk_last_growth_ms`), `helper_cpu_ms_gained` and `vm_service_max_cpu_ms_gained_between_samples` are small; or `trace.ended` names a stop or error; and the harvest has no `kbf-probe-local` and no diagnostics newer than the setup | The guest never runs launchd to a steady state: it stalls or powers off early. If only the headless arm is like this and the graphics arm differs, the missing display is the cause |
+| CPU and disk writes keep going, `kbf-probe-local` is absent, and the diagnostics show launchd running | launchd did not load our plists: the plists are ignored, or the setup wrote to a volume the guest does not boot from. The log lines name the reason; `stats` shows the marker time |
+| `kbf-probe-local` is present, `com.kbf.probe.mount.log` holds a `mount_virtiofs` error, or `com.kbf.probe.system.log` says the binary under `/private/var/kbf-mnt` does not exist | The share never mounted: the hand mount of the automount tag fails |
+| `kbf-probe-local` is present, `com.kbf.probe.mount.log` is empty, and `com.kbf.probe.system.log` shows a permission or `Killed: 9` error (or the unified log shows AMFI killing the process) | The guest binary cannot run from the share: `nobody` cannot traverse it, the mount is `noexec`, or code signing kills the binary |
+| Everything is present and `guest_marker_ms` is set, or the marker appeared only in the graphics arm | The guest is only slow (beyond 320 seconds), or it needs the graphics device |
+
+`kbf-probe-local` in the manifest's `copied` list has the guest's own modification time
+(`mtime_unix`): that is when launchd ran the daemon, to compare with the boot time the file
+holds and with the setup marker's time in `stats`. Compare the two arms: a file in one and
+not the other points at the graphics device.
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did
 not start is in `*.helper.log`; the tail of the log is also in the JSON failure text):
 
 ```sh
-tar -czf kbf-vmm-results.tgz -C $W *.json *.err *.helper.log 2>/dev/null
+tar -czf kbf-vmm-results.tgz -C $W *.json *.err *.helper.log e1-x-harvest e1-y-harvest 2>/dev/null
 ```
 
-Send `kbf-vmm-results.tgz`, the output of `sw_vers` and `sysctl hw.model hw.memsize`, and
+(`e1-*-harvest` are the E1 copies; the other names exist after the other commands.) Send
+`kbf-vmm-results.tgz`, the output of `sw_vers` and `sysctl hw.model hw.memsize`, and
 `shasum -a 256 $D/kbf-vmm`.
 
 ## What is not known until a Mac runs it

@@ -46,6 +46,10 @@ pub enum Gate {
     /// Start a VM from a launch-daemon child, nobody logged in, as a throwaway uid.
     #[value(alias = "p5")]
     G5,
+    /// Why a booted guest never reaches its own userspace: two guests at once, every
+    /// helper event timed, CPU and disk writes sampled, the clones kept for `image
+    /// harvest` (give `--guest-binary`, `--graphics`, `--keep`).
+    E1,
     /// Whether a root offline write into a guest volume works.
     P0,
     /// The third-VM limit error, and the slot after SIGKILL of a helper.
@@ -78,6 +82,13 @@ pub struct ProbeArgs {
     /// The user id G5 starts the helper as (default 59001); needs root.
     #[arg(long)]
     pub run_as_uid: Option<u32>,
+    /// Give the second VM of the pair a graphics device (E1: the first stays headless).
+    #[arg(long)]
+    pub graphics: bool,
+    /// Leave the clones and their shares in the work directory when the probe ends, so
+    /// `image harvest` can read the guest's disk.
+    #[arg(long)]
+    pub keep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -116,5 +127,16 @@ pub enum ImageCmd {
         /// The base bundle directory.
         #[arg(long)]
         base: PathBuf,
+    },
+    /// As root, copy a fixed allowlist of diagnostics (the probe daemons' logs, the local
+    /// marker, the unified log's data files, crash reports) out of a stopped guest's disk
+    /// into a new directory. The disk is attached read-only; nothing else is read.
+    Harvest {
+        /// The bundle (a clone kept by `probe e1 --keep`).
+        #[arg(long)]
+        bundle: PathBuf,
+        /// The new directory to copy into; it must not exist.
+        #[arg(long)]
+        out: PathBuf,
     },
 }

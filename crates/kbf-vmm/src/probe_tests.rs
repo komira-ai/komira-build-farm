@@ -333,3 +333,86 @@ fn the_start_time_is_the_started_event_and_an_existing_clone_is_kept() {
     );
     assert!(work.join("taken/keep").exists());
 }
+
+/// Catches a file wait that ignores a stop or error event and waits out the whole time
+/// (the 320 s of a guest that powered off at 30 s), and one that forgets why it ended.
+#[test]
+fn a_stop_event_ends_the_file_wait_and_says_why() {
+    let work = work_with_base("probe-file-stop");
+    let sys = FakeSystem::new();
+    let t = Duration::from_millis(1);
+    for (script, why) in [
+        (
+            Script::booted().then(Poll::Event(Event::Stopped { ms: 9 })),
+            "the VM stopped",
+        ),
+        (
+            Script::booted().then(Poll::Event(Event::State {
+                state: "error".into(),
+                ms: 9,
+            })),
+            "the VM went to state error",
+        ),
+        (
+            Script::booted().then(Poll::Event(Event::Error {
+                stage: "run".into(),
+                message: "guest panicked".into(),
+                code: None,
+            })),
+            "guest panicked",
+        ),
+    ] {
+        sys.script(script);
+        let mut v = vm(&sys, &work);
+        let began = std::time::Instant::now();
+        assert!(
+            v.wait_file(&work.join("never"), Duration::from_secs(60), t)
+                .is_none()
+        );
+        assert!(began.elapsed() < Duration::from_secs(10), "{why}");
+        assert_eq!(v.ended.as_deref(), Some(why));
+        // A second wait on the same VM does not start the time over.
+        let again = std::time::Instant::now();
+        assert!(
+            v.wait_file(&work.join("never"), Duration::from_secs(60), t)
+                .is_none()
+        );
+        assert!(again.elapsed() < Duration::from_secs(10));
+    }
+    // A file written before the stop is still found.
+    sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 9 })));
+    let mut v = vm(&sys, &work);
+    v.watch(Duration::from_millis(20), t, false);
+    assert!(v.ended.is_some());
+    assert!(
+        v.wait_file(&work.join("base/disk.img"), Duration::from_secs(60), t)
+            .is_some()
+    );
+}
+
+/// Catches a trace that loses an event, pairs it with the wrong time, or reports a run
+/// that never ended as ended.
+#[test]
+fn the_trace_lists_every_event_with_its_arrival_time() {
+    let work = work_with_base("probe-trace");
+    let sys = FakeSystem::new();
+    sys.script(
+        Script::booted()
+            .then(Poll::Event(Event::State {
+                state: "running".into(),
+                ms: 5,
+            }))
+            .then(Poll::Event(Event::Vsock { port: 5000 })),
+    );
+    let mut v = vm(&sys, &work);
+    v.watch(Duration::from_millis(20), Duration::from_millis(1), false);
+    let trace = v.trace_json();
+    let events = trace["events"].as_array().expect("events");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["event"]["event"], "started");
+    assert_eq!(events[1]["event"]["state"], "running");
+    assert_eq!(events[2]["event"]["port"], 5000);
+    assert!(events.iter().all(|e| e["host_ms"].is_u64()));
+    assert_eq!(v.event_ms.len(), v.events.len());
+    assert!(trace["ended"].is_null());
+}

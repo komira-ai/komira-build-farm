@@ -46,6 +46,14 @@ pub const USER_RESULT: &str = "guest-probe-user.json";
 pub const READY_SYSTEM: &str = "ready-system";
 pub const READY_LOGIN: &str = "ready-login";
 pub const READY_AQUA: &str = "ready-aqua";
+/// The label of the daemon that needs nothing else in the payload.
+pub const LOCAL_LABEL: &str = "com.kbf.probe.local";
+/// The file launchd writes the output of the `com.kbf.probe.local` daemon to, on the
+/// guest's own disk. The daemon is one system tool and depends on nothing else in the
+/// payload (no mount, no share, no kbf-guest, no shell), so the file's presence after a
+/// boot proves launchd loaded our plists, its modification time says when, and `image
+/// harvest` reads it.
+pub const LOCAL_MARKER: &str = "/private/var/log/kbf-probe-local";
 
 /// The host side of the share for one VM.
 #[derive(Debug, Clone)]
@@ -209,7 +217,12 @@ fn escape(s: &str) -> String {
 /// A launch daemon plist that runs `args` at load, as `user` when given, restarting
 /// itself every few seconds until the share is mounted and the command succeeds.
 #[must_use]
-pub fn daemon_plist(label: &str, user: Option<&str>, args: &[String]) -> String {
+pub fn daemon_plist(
+    label: &str,
+    user: Option<&str>,
+    args: &[String],
+    stdout: Option<&str>,
+) -> String {
     let args: String = args
         .iter()
         .map(|a| format!("    <string>{}</string>\n", escape(a)))
@@ -217,10 +230,18 @@ pub fn daemon_plist(label: &str, user: Option<&str>, args: &[String]) -> String 
     let user = user
         .map(|u| format!("  <key>UserName</key>\n  <string>{}</string>\n", escape(u)))
         .unwrap_or_default();
+    let stdout = stdout
+        .map(|p| {
+            format!(
+                "  <key>StandardOutPath</key>\n  <string>{}</string>\n",
+                escape(p)
+            )
+        })
+        .unwrap_or_default();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n{user}  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  <key>ThrottleInterval</key>\n  <integer>3</integer>\n  <key>StandardErrorPath</key>\n  <string>/var/log/{label}.log</string>\n</dict>\n</plist>\n"
+<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n{user}  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  <key>ThrottleInterval</key>\n  <integer>3</integer>\n  <key>StandardErrorPath</key>\n  <string>/var/log/{label}.log</string>\n{stdout}</dict>\n</plist>\n"
     )
 }
 
@@ -231,8 +252,9 @@ fn guest_args(sub: &[&str]) -> Vec<String> {
 }
 
 /// The files the offline write puts into the guest: the Setup Assistant marker, the mount
-/// point directory, and five launch daemons (the share mounter, a probe as root, a probe
-/// as `nobody`, the system marker, the login marker).
+/// point directory, and six launch daemons (the share mounter, a probe as root, a probe
+/// as `nobody`, the system marker, the login marker, and the local marker that needs
+/// none of the others).
 #[must_use]
 pub fn offline_payload() -> Vec<OfflineFile> {
     let out = |name: &str| format!("{GUEST_SHARE}/{RESULTS}/{name}");
@@ -250,7 +272,7 @@ pub fn offline_payload() -> Vec<OfflineFile> {
             mode: 0o644,
         },
     ];
-    let daemons: [(&str, Option<&str>, Vec<String>); 5] = [
+    let daemons: [(&str, Option<&str>, Vec<String>); 6] = [
         (
             "com.kbf.probe.mount",
             None,
@@ -326,11 +348,29 @@ pub fn offline_payload() -> Vec<OfflineFile> {
                 &out(READY_LOGIN),
             ]),
         ),
+        (
+            LOCAL_LABEL,
+            None,
+            [
+                "/usr/sbin/sysctl",
+                "kern.boottime",
+                "kern.osversion",
+                "kern.osproductversion",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ),
     ];
     for (label, user, args) in daemons {
         files.push(OfflineFile {
             path: format!("Library/LaunchDaemons/{label}.plist"),
-            contents: daemon_plist(label, user, &args).into_bytes(),
+            contents: daemon_plist(
+                label,
+                user,
+                &args,
+                (label == LOCAL_LABEL).then_some(LOCAL_MARKER),
+            )
+            .into_bytes(),
             mode: 0o644,
         });
     }
@@ -353,7 +393,12 @@ mod tests {
     /// for the root control.
     #[test]
     fn a_daemon_plist_escapes_and_names_its_user() {
-        let user = daemon_plist("com.kbf.x", Some("nobody"), &["/a&b".into(), "<c>".into()]);
+        let user = daemon_plist(
+            "com.kbf.x",
+            Some("nobody"),
+            &["/a&b".into(), "<c>".into()],
+            None,
+        );
         assert!(
             holds(&[
                 user.contains("<string>/a&amp;b</string>"),
@@ -366,8 +411,13 @@ mod tests {
             "{user}"
         );
         assert!(user.contains("<string>/var/log/com.kbf.x.log</string>"));
-        let root = daemon_plist("com.kbf.y", None, &["/bin/true".into()]);
+        let root = daemon_plist("com.kbf.y", None, &["/bin/true".into()], Some("/o&p"));
         assert!(!root.contains("UserName"), "{root}");
+        assert!(
+            root.contains("<key>StandardOutPath</key>\n  <string>/o&amp;p</string>"),
+            "{root}"
+        );
+        assert!(!user.contains("StandardOutPath"), "{user}");
     }
 
     /// Catches a payload that lacks the marker that skips Setup Assistant, the mount point
@@ -375,12 +425,12 @@ mod tests {
     /// the guest would never start, a daemon that waits for a path the mounter does not
     /// make, or a root control that runs as nobody (the G3 verdict compares the two users).
     #[test]
-    fn the_offline_payload_holds_the_marker_the_mount_point_and_five_daemons() {
+    fn the_offline_payload_holds_the_marker_the_mount_point_and_six_daemons() {
         let files = offline_payload();
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths[0], "private/var/db/.AppleSetupDone");
         assert_eq!(paths[1], "private/var/kbf-mnt/.keep");
-        assert_eq!(paths.len(), 7);
+        assert_eq!(paths.len(), 8);
         assert!(paths[2..].iter().all(|p| holds(&[
             p.starts_with("Library/LaunchDaemons/com.kbf.probe."),
             p.ends_with(".plist")
@@ -406,12 +456,56 @@ mod tests {
             text(6).contains("loginwindow"),
             text(6).contains(READY_LOGIN)
         ]));
+        assert_eq!(paths[7], "Library/LaunchDaemons/com.kbf.probe.local.plist");
         assert!(files.iter().all(|f| f.mode == 0o644));
         // The daemons run the binary from, and wait for, the path the mounter provides.
         assert!(GUEST_SHARE.starts_with(GUEST_MOUNT));
         for i in 3..7 {
             assert!(text(i).contains(&format!("<string>{GUEST_SHARE}/{GUEST_BIN}</string>")));
             assert!(text(i).contains(&format!("<string>{GUEST_SHARE}</string>")));
+        }
+    }
+
+    /// Catches a local-marker daemon that depends on the share or a shell (it must run
+    /// when the mount never happens), runs as a user that cannot write the log directory,
+    /// writes somewhere the harvest allowlist does not read, or would be restarted forever
+    /// (the plist restarts a daemon that exits non-zero), and a log name the harvest's
+    /// pattern would miss.
+    #[test]
+    fn the_local_daemon_needs_nothing_and_writes_where_harvest_reads() {
+        let files = offline_payload();
+        let plist = String::from_utf8(files[7].contents.clone()).expect("utf8");
+        assert!(
+            holds(&[
+                plist.contains("<string>com.kbf.probe.local</string>"),
+                plist.contains("<string>/usr/sbin/sysctl</string>"),
+                plist.contains("<string>kern.boottime</string>"),
+                // The label, the tool and its three keys, and the two log paths: no shell.
+                plist.matches("<string>").count() == 7,
+                !plist.contains("UserName"),
+                !plist.contains(GUEST_SHARE),
+                !plist.contains(GUEST_BIN),
+                plist.contains(&format!(
+                    "<key>StandardOutPath</key>\n  <string>{LOCAL_MARKER}</string>"
+                )),
+                plist.contains("<key>RunAtLoad</key>"),
+            ]),
+            "{plist}"
+        );
+        // Only the local daemon has its output redirected.
+        for f in &files[2..7] {
+            let text = String::from_utf8(f.contents.clone()).expect("utf8");
+            assert!(!text.contains("StandardOutPath"), "{}", f.path);
+        }
+        assert_eq!(
+            crate::harvest::ALLOWLIST[0],
+            crate::harvest::Item::File(LOCAL_MARKER.trim_start_matches('/'))
+        );
+        // Every daemon log the others write is read by the harvest's name pattern.
+        for f in &files[2..8] {
+            let name = f.path.trim_start_matches("Library/LaunchDaemons/");
+            let label = name.trim_end_matches(".plist");
+            assert!(label.starts_with("com.kbf.probe."), "{label}");
         }
     }
 

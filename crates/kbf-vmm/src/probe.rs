@@ -24,6 +24,8 @@ pub struct Timing {
     pub tick: Duration,
     /// How long to retry a start that the two-guest limit refuses.
     pub retry_window: Duration,
+    /// How often the host samples a running guest (CPU, disk writes).
+    pub sample_every: Duration,
 }
 
 impl Timing {
@@ -35,6 +37,7 @@ impl Timing {
             guest_timeout: Duration::from_secs(320),
             tick: Duration::from_millis(100),
             retry_window: Duration::from_secs(60),
+            sample_every: Duration::from_secs(10),
         }
     }
 
@@ -47,6 +50,7 @@ impl Timing {
             guest_timeout: z,
             tick: Duration::from_millis(1),
             retry_window: z,
+            sample_every: Duration::from_millis(2),
         }
     }
 }
@@ -60,6 +64,11 @@ pub struct Ctx<'a> {
     pub base: PathBuf,
     /// A `kbf-guest` built for the guest, copied into the shared folder.
     pub guest_binary: Option<PathBuf>,
+    /// Leave the clones and shares on disk when the probe ends (`--keep`), for
+    /// `image harvest`.
+    pub keep: bool,
+    /// Give the second VM of a pair a graphics device (`--graphics`).
+    pub graphics: bool,
     pub timing: Timing,
 }
 
@@ -68,6 +77,11 @@ pub struct Vm {
     pub name: String,
     pub proc: Box<dyn VmProcess>,
     pub events: Vec<Event>,
+    /// When each of `events` arrived, in milliseconds after the spawn (same order).
+    pub event_ms: Vec<u64>,
+    /// Why the helper's run ended before it was asked to, if it did: the terminal event
+    /// or the helper's exit. A wait for the guest stops as soon as this is set.
+    pub ended: Option<String>,
     pub began: Instant,
     gone: bool,
 }
@@ -119,6 +133,8 @@ impl Vm {
             name: name.to_owned(),
             proc,
             events: Vec::new(),
+            event_ms: Vec::new(),
+            ended: None,
             began: Instant::now(),
             gone: false,
         })
@@ -139,7 +155,9 @@ impl Vm {
                     let failed = terminal(&e);
                     let started = matches!(e, Event::Started { .. });
                     self.events.push(e);
+                    self.event_ms.push(self.ms());
                     if let Some(t) = failed {
+                        self.ended = t.failure.clone();
                         return Step::Failed(t);
                     }
                     if started && until_started {
@@ -154,17 +172,35 @@ impl Vm {
                         .filter(|t| !t.trim().is_empty())
                         .map(|t| format!("; helper log: {}", t.trim()))
                         .unwrap_or_default();
+                    let failure = format!("helper ended (code {code:?}, signal {signal:?}){log}");
+                    self.ended = Some(failure.clone());
                     return Step::Failed(Boot {
                         booted: false,
                         started_ms: self.started_ms(),
-                        failure: Some(format!(
-                            "helper ended (code {code:?}, signal {signal:?}){log}"
-                        )),
+                        failure: Some(failure),
                         code: None,
                     });
                 }
             }
         }
+    }
+
+    /// Milliseconds since the spawn.
+    #[must_use]
+    pub fn ms(&self) -> u64 {
+        u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Every helper event with the time it arrived, and why the run ended if it did.
+    #[must_use]
+    pub fn trace_json(&self) -> Value {
+        let events: Vec<Value> = self
+            .events
+            .iter()
+            .zip(&self.event_ms)
+            .map(|(e, ms)| json!({"host_ms": ms, "event": serde_json::to_value(e).unwrap_or(Value::Null)}))
+            .collect();
+        json!({"events": events, "ended": self.ended})
     }
 
     /// The `started` event's time, if it came.
@@ -201,7 +237,9 @@ impl Vm {
         }
     }
 
-    /// Waits for the file `path` to exist, up to `wait`; the time it took.
+    /// Waits for the file `path` to exist, up to `wait`; the time it took. The wait ends
+    /// early, with `None`, when the VM stops or errors or the helper exits (the guest
+    /// will write nothing more): [`ended`](Self::ended) says why.
     pub fn wait_file(&mut self, path: &Path, wait: Duration, tick: Duration) -> Option<Duration> {
         let began = Instant::now();
         loop {
@@ -209,7 +247,7 @@ impl Vm {
             if std::fs::symlink_metadata(path).is_ok() {
                 return Some(began.elapsed());
             }
-            if began.elapsed() >= wait || self.gone {
+            if began.elapsed() >= wait || self.gone || self.ended.is_some() {
                 return None;
             }
             // Events keep arriving while the guest boots: keep them.

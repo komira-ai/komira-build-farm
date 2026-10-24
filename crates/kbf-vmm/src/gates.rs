@@ -13,7 +13,7 @@ use crate::report::Report;
 use crate::spec::{LIMIT_EXCEEDED, TaggedShare, VmSpec};
 
 /// A report for a base bundle that is not there, or `None` when it is.
-fn base_missing(ctx: &Ctx<'_>, probe: &str) -> Option<Report> {
+pub(crate) fn base_missing(ctx: &Ctx<'_>, probe: &str) -> Option<Report> {
     bundle::check(&ctx.base).err().map(|e| {
         Report::needs_manual(
             probe,
@@ -23,10 +23,14 @@ fn base_missing(ctx: &Ctx<'_>, probe: &str) -> Option<Report> {
     })
 }
 
-/// Stops every VM and removes its clone and share directories.
-fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
+/// Stops every VM and removes its clone and share directories, unless `--keep` asked for
+/// them to stay.
+pub(crate) fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
     for vm in vms.iter_mut() {
         vm.stop(&ctx.timing);
+    }
+    if ctx.keep {
+        return;
     }
     for vm in vms.iter() {
         for suffix in ["", "-share", "-tagged"] {
@@ -37,13 +41,13 @@ fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
 
 /// Which guest-to-host channel devices a probe VM gets.
 #[derive(Debug, Clone, Copy)]
-struct Channels {
+pub(crate) struct Channels {
     vsock: bool,
     console: bool,
 }
 
 impl Channels {
-    const NONE: Self = Self {
+    pub(crate) const NONE: Self = Self {
         vsock: false,
         console: false,
     };
@@ -59,7 +63,7 @@ impl Channels {
 
 /// Points `spec` at `share`: the automount share and the tagged share, and the channel
 /// devices asked for.
-fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
+pub(crate) fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
     spec.automount_dir = Some(share.dir.clone());
     spec.tagged = Some(TaggedShare {
         tag: guest::TAG.to_owned(),
@@ -74,7 +78,7 @@ fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
 }
 
 /// Starts a clone of the base with a share and the channel devices asked for.
-fn start_guest_clone(
+pub(crate) fn start_guest_clone(
     ctx: &Ctx<'_>,
     name: &str,
     identity: Identity,
@@ -159,9 +163,12 @@ fn clone_arm(
         "vms": boots
             .iter()
             .zip(&userspace)
-            .map(|(b, u)| {
+            .zip(&vms)
+            .map(|((b, u), vm)| {
                 let mut j = b.json();
                 j["guest_marker_ms"] = json!(u);
+                // Every helper event with its time, and why the wait ended early, if it did.
+                j["trace"] = vm.trace_json();
                 j
             })
             .collect::<Vec<_>>(),
@@ -646,6 +653,7 @@ pub fn run(ctx: &Ctx<'_>, gate: Gate, run_as: Option<u32>) -> Report {
         Gate::G2 => g2(ctx),
         Gate::G3 => g3(ctx),
         Gate::G5 => g5(ctx, run_as),
+        Gate::E1 => crate::e1::e1(ctx),
         Gate::P0 => p0(ctx),
         Gate::P2 => p2(ctx),
         Gate::P6 => p6(ctx),

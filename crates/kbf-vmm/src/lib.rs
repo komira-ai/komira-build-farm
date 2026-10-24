@@ -9,15 +9,19 @@ pub mod app;
 pub mod bench;
 pub mod bundle;
 pub mod cli;
+pub mod e1;
 pub mod gates;
 pub mod guest;
+pub mod harvest;
 pub mod hostfs;
 pub mod image;
 pub mod probe;
 pub mod report;
+pub mod sampler;
 pub mod signature;
 pub mod spec;
 pub mod system;
+pub mod volume;
 
 #[cfg(target_os = "macos")]
 mod offline;

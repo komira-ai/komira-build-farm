@@ -250,6 +250,7 @@ fn the_command_line_parses_gates_in_any_case_and_defaults_to_twenty_runs() {
         ("g3", Gate::G3),
         ("P5", Gate::G5),
         ("g5", Gate::G5),
+        ("E1", Gate::E1),
         ("p0", Gate::P0),
         ("P2", Gate::P2),
         ("p6", Gate::P6),
@@ -333,4 +334,55 @@ fn image_setup_runs_the_offline_write_and_disk_size_is_bounded() {
             "{good}"
         );
     }
+}
+
+/// Catches `--graphics` and `--keep` not reaching the probe context (the second VM would
+/// stay headless and the clones would be removed), and a harvest whose two paths are
+/// swapped on the way to the system.
+#[test]
+fn e1_flags_and_the_harvest_verb_reach_their_steps() {
+    let work = work_with_base("app-e1");
+    let sys = FakeSystem::new();
+    let bin = work.join("guest-src");
+    std::fs::write(&bin, "bin").expect("bin");
+    let (code, out, _) = go(
+        Some(&sys),
+        &[
+            "probe",
+            "e1",
+            "--work-dir",
+            work.to_str().expect("p"),
+            "--guest-binary",
+            bin.to_str().expect("p"),
+            "--graphics",
+            "--keep",
+        ],
+    );
+    assert_eq!(code, OK, "{out}");
+    let v: Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["probe"], "e1");
+    assert_eq!(v["details"]["clones_kept"], true);
+    assert!(sys.starts.borrow()[1].0.graphics);
+    assert!(work.join("e1-x").is_dir());
+    let cli = Cli::parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w"]);
+    assert!(matches!(&cli.command, Cmd::Probe(a) if !a.graphics && !a.keep));
+    let bundle = work.join("e1-x");
+    let harvested = work.join("h");
+    sys.uid.set(0);
+    let (code, out, _) = go(
+        Some(&sys),
+        &[
+            "image",
+            "harvest",
+            "--bundle",
+            bundle.to_str().expect("p"),
+            "--out",
+            harvested.to_str().expect("p"),
+        ],
+    );
+    assert_eq!(code, OK, "{out}");
+    assert_eq!(
+        sys.harvest_calls.borrow()[0],
+        (bundle.join("disk.img"), harvested)
+    );
 }

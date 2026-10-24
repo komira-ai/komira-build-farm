@@ -20,7 +20,12 @@ fn name_of(cmd: &Cmd) -> &'static str {
     }
 }
 
-fn context<'a>(sys: &'a dyn System, common: &Common, timing: Timing) -> Result<Ctx<'a>, String> {
+fn context<'a>(
+    sys: &'a dyn System,
+    common: &Common,
+    timing: Timing,
+    (keep, graphics): (bool, bool),
+) -> Result<Ctx<'a>, String> {
     std::fs::create_dir_all(&common.work_dir)
         .map_err(|e| format!("create {}: {e}", common.work_dir.display()))?;
     // Absolute, because a helper started as another user need not share the directory.
@@ -31,19 +36,21 @@ fn context<'a>(sys: &'a dyn System, common: &Common, timing: Timing) -> Result<C
         work,
         base,
         guest_binary: common.guest_binary.clone(),
+        keep,
+        graphics,
         timing,
     })
 }
 
 fn probe(sys: &dyn System, args: &ProbeArgs, timing: Timing) -> Report {
-    match context(sys, &args.common, timing) {
+    match context(sys, &args.common, timing, (args.keep, args.graphics)) {
         Ok(ctx) => gates::run(&ctx, args.gate, args.run_as_uid),
         Err(e) => Report::error("probe", e),
     }
 }
 
 fn bench_cmd(sys: &dyn System, args: &BenchArgs, timing: Timing) -> Report {
-    match context(sys, &args.common, timing) {
+    match context(sys, &args.common, timing, (false, false)) {
         Ok(ctx) => bench::run(&ctx, args.runs),
         Err(e) => Report::error("probe-bench", e),
     }
@@ -87,6 +94,7 @@ pub fn run(
             },
         ),
         Cmd::Image(ImageCmd::Setup { base }) => image::setup(sys, base),
+        Cmd::Image(ImageCmd::Harvest { bundle, out }) => image::harvest(sys, bundle, out),
     };
     let failed = report.status == Status::Error;
     let _ = writeln!(out, "{}", report.on_host(sys.host_facts()).to_line());

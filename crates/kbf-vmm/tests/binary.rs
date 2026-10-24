@@ -47,7 +47,7 @@ fn help_lists_the_commands_and_hides_the_helper_mode() {
     assert!(!text.contains("vm-run"), "{text}");
     let probe = run(&["probe", "--help"]);
     let text = String::from_utf8_lossy(&probe.stdout);
-    for gate in ["g1", "g2", "g3", "g5", "p0", "p2", "p6"] {
+    for gate in ["g1", "g2", "g3", "g5", "e1", "p0", "p2", "p6"] {
         assert!(text.contains(gate), "{gate}: {text}");
     }
 }
@@ -85,6 +85,10 @@ fn every_vm_command_refuses_off_macos() {
             "image",
         ),
         (vec!["image", "setup", "--base", w], "image"),
+        (
+            vec!["image", "harvest", "--bundle", w, "--out", "o"],
+            "image",
+        ),
         (vec!["vm-run", "--spec", "s.json"], "vm-run"),
     ] {
         let out = run(&args);
@@ -110,7 +114,7 @@ fn every_vm_command_refuses_off_macos() {
 #[test]
 fn a_gate_without_a_base_prints_needs_manual() {
     let dir = scratch("nobase");
-    for gate in ["g1", "g2", "g3", "g5", "p0", "p2", "p6"] {
+    for gate in ["g1", "g2", "g3", "g5", "e1", "p0", "p2", "p6"] {
         let out = run(&["probe", gate, "--work-dir", dir.to_str().expect("path")]);
         assert!(out.status.success(), "{gate}: {out:?}");
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");

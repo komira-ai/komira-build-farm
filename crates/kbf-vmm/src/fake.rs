@@ -138,6 +138,9 @@ pub struct FakeSystem {
     pub sig: RefCell<Result<Signature, String>>,
     pub offline: RefCell<Result<Value, String>>,
     pub offline_calls: RefCell<Vec<(PathBuf, Vec<String>)>>,
+    pub harvest: RefCell<Result<Value, String>>,
+    pub harvest_calls: RefCell<Vec<(PathBuf, PathBuf)>>,
+    pub table: RefCell<Result<String, String>>,
     pub fetch: RefCell<Result<(), String>>,
     pub fetch_body: RefCell<Vec<u8>>,
     pub fetched: RefCell<Vec<String>>,
@@ -168,6 +171,9 @@ impl FakeSystem {
             sig: RefCell::new(Ok(good_signature())),
             offline: RefCell::new(Ok(json!({"written": 5}))),
             offline_calls: RefCell::new(Vec::new()),
+            harvest: RefCell::new(Ok(json!({"copied": []}))),
+            harvest_calls: RefCell::new(Vec::new()),
+            table: RefCell::new(Ok(String::new())),
             fetch: RefCell::new(Ok(())),
             fetch_body: RefCell::new(b"ipsw-bytes".to_vec()),
             fetched: RefCell::new(Vec::new()),
@@ -275,6 +281,15 @@ impl System for FakeSystem {
         ));
         self.offline.borrow().clone()
     }
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String> {
+        self.harvest_calls
+            .borrow_mut()
+            .push((disk.to_owned(), out.to_owned()));
+        self.harvest.borrow().clone()
+    }
+    fn process_table(&self) -> Result<String, String> {
+        self.table.borrow().clone()
+    }
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {
         self.fetched.borrow_mut().push(url.to_owned());
         let r = self.fetch.borrow().clone();
@@ -324,6 +339,8 @@ pub fn ctx<'a>(sys: &'a FakeSystem, work: &Path) -> crate::probe::Ctx<'a> {
         work: work.to_owned(),
         base: work.join("base"),
         guest_binary: None,
+        keep: false,
+        graphics: false,
         timing: crate::probe::Timing::instant(),
     }
 }

@@ -101,6 +101,17 @@ pub trait System {
     /// # Errors
     /// A step failed; the message names it.
     fn offline_write(&self, disk: &Path, files: &[OfflineFile]) -> Result<Value, String>;
+    /// Attaches the raw disk image `disk` read-only, copies the harvest allowlist out of
+    /// its Data volume into the new directory `out`, detaches, and returns the manifest.
+    ///
+    /// # Errors
+    /// A step failed; the message names it.
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String>;
+    /// The process table as text, one `pid cputime command` row per line (`ps`).
+    ///
+    /// # Errors
+    /// The table could not be read.
+    fn process_table(&self) -> Result<String, String>;
     /// Downloads `url` to `dest`.
     ///
     /// # Errors

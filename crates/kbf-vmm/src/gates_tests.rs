@@ -26,6 +26,7 @@ fn every_gate_without_a_base_needs_a_person() {
         Gate::G2,
         Gate::G3,
         Gate::G5,
+        Gate::E1,
         Gate::P0,
         Gate::P2,
         Gate::P6,
@@ -662,4 +663,27 @@ fn p6_needs_the_signature_it_asks_about() {
     *sys.sig.borrow_mut() = Ok(good_signature());
     sys.clone_fails_on.replace(Some("disk.img"));
     assert_eq!(p6(&ctx(&sys, &work)).status, Status::Error);
+}
+
+/// Catches a G1 report that drops what the helper said: a clone whose VM stopped carries
+/// the stop in its trace with the reason the run ended, and a clone that stayed up carries
+/// its started event.
+#[test]
+fn g1_reports_every_helper_event_of_each_clone() {
+    let work = work_with_base("g1-trace");
+    let bin = work.join("guest-bin");
+    std::fs::write(&bin, "x").expect("bin");
+    let sys = FakeSystem::new();
+    sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 30 })))
+        .script(Script::booted());
+    let mut c = ctx(&sys, &work);
+    c.guest_binary = Some(bin);
+    let r = g1(&c);
+    let vms = &r.details["same_identifier"]["vms"];
+    assert_eq!(vms[0]["trace"]["events"][0]["event"]["event"], "started");
+    assert_eq!(vms[0]["trace"]["events"][1]["event"]["event"], "stopped");
+    assert_eq!(vms[0]["trace"]["ended"], "the VM stopped");
+    assert_eq!(vms[0]["booted"], false);
+    assert_eq!(vms[1]["trace"]["events"][0]["event"]["event"], "started");
+    assert!(vms[1]["trace"]["ended"].is_null());
 }

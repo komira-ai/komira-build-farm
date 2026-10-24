@@ -288,6 +288,41 @@ pub fn setup(sys: &dyn System, base: &Path) -> Report {
     }
 }
 
+/// `image harvest`: copies the allowlisted diagnostics out of a kept clone's disk into the
+/// new directory `out`, with the disk attached read-only.
+#[must_use]
+pub fn harvest(sys: &dyn System, bundle: &Path, out: &Path) -> Report {
+    let probe = "image-harvest";
+    if sys.uid() != 0 {
+        return Report::needs_manual(
+            probe,
+            "needs root: attaching a guest disk image with its ownership honoured; run with sudo",
+            json!({"uid": sys.uid()}),
+        );
+    }
+    if let Err(e) = crate::bundle::check(bundle) {
+        return Report::error(probe, e.to_string());
+    }
+    if std::fs::symlink_metadata(out).is_ok() {
+        return Report::error(
+            probe,
+            format!("{} exists; harvest writes a new directory", out.display()),
+        );
+    }
+    match sys.offline_harvest(&bundle.join(crate::bundle::DISK), out) {
+        Ok(observed) => Report::ok(
+            probe,
+            format!(
+                "the allowlisted files of {} are in {}",
+                bundle.display(),
+                out.display()
+            ),
+            json!({"bundle": bundle, "out": out, "offline_read": observed}),
+        ),
+        Err(e) => Report::error(probe, format!("harvest: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +631,39 @@ mod tests {
         assert_eq!(sys.offline_calls.borrow()[0].0, base_dir.join("disk.img"));
         *sys.offline.borrow_mut() = Err("no volume".into());
         let r = setup(&sys, &base_dir);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("no volume"));
+    }
+
+    /// Catches `image harvest` running as a non-root user, on a directory that is not a
+    /// bundle, into a directory that exists, against the wrong disk, or hiding a failure.
+    #[test]
+    fn harvest_reads_the_disk_of_a_bundle_as_root_into_a_new_directory() {
+        let work = crate::fake::work_with_base("image-harvest");
+        let bundle = work.join("base");
+        let out = work.join("harvested");
+        let sys = FakeSystem::new();
+        let r = harvest(&sys, &bundle, &out);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("root"));
+        sys.uid.set(0);
+        let r = harvest(&sys, &work.join("none"), &out);
+        assert_eq!(r.status, Status::Error);
+        std::fs::create_dir(&out).expect("out");
+        let r = harvest(&sys, &bundle, &out);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("exists"));
+        assert!(sys.harvest_calls.borrow().is_empty());
+        std::fs::remove_dir(&out).expect("rm");
+        let r = harvest(&sys, &bundle, &out);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(r.details["offline_read"]["copied"], serde_json::json!([]));
+        assert_eq!(
+            sys.harvest_calls.borrow()[0],
+            (bundle.join("disk.img"), out.clone())
+        );
+        *sys.harvest.borrow_mut() = Err("no volume".into());
+        let r = harvest(&sys, &bundle, &out);
         assert_eq!(r.status, Status::Error);
         assert!(r.reason.expect("reason").contains("no volume"));
     }

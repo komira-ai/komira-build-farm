@@ -257,6 +257,23 @@ impl System for RealSystem {
         offline::write(disk, files)
     }
 
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String> {
+        offline::harvest(disk, out)
+    }
+
+    fn process_table(&self) -> Result<String, String> {
+        let out = Command::new("/bin/ps")
+            .args(["-axo", "pid=,cputime=,comm="])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("run ps: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!("ps failed ({})", out.status))
+        }
+    }
+
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {
         let status = Command::new("/usr/bin/curl")
             .args(crate::image::FETCH_FLAGS)
