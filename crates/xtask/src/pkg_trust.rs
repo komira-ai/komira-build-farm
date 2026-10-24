@@ -73,8 +73,10 @@ pub fn root_problems(bytes: &[u8]) -> Vec<String> {
     problems
 }
 
-/// The `pkg-trust` verb: writes the three trust files into `out` (created when missing;
-/// an existing file of those names is refused) and returns the lines to print.
+/// The `pkg-trust` verb: writes the three trust files into `out` and returns the lines to
+/// print. The directory is always built fresh: an existing `out` (a leftover of an earlier
+/// run, or a restored build cache) is emptied first, so nothing stale survives; a path
+/// that exists but is not a plain directory (a file, a symlink) is refused.
 ///
 /// # Errors
 /// An input is refused (the ref, an empty `gh`, a trusted root that is not JSON lines)
@@ -103,6 +105,20 @@ pub fn write(
     );
     if !problems.is_empty() {
         return Err(Error::Refused(problems));
+    }
+    match std::fs::symlink_metadata(out) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(out)
+            .map_err(Error::spawn(format!("empty {}", out.display())))?,
+        Ok(_) => {
+            return Err(Error::Refused(vec![format!(
+                "{} exists and is not a directory pkg-trust may replace",
+                out.display()
+            )]));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::Refused(vec![format!("{}: {e}", out.display())]));
+        }
     }
     std::fs::create_dir_all(out).map_err(Error::spawn(format!("create {}", out.display())))?;
     let conf = conf(source_ref);

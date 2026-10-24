@@ -35,7 +35,7 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
-Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+19 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
 `kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
 ([below](#the-kbf-package-deb)), one frontend container image per Linux architecture
@@ -44,7 +44,7 @@ Thirteen tarballs, each with its SBOM and (once the push is attested) its proven
 
 | Asset | Runner | Target |
 |---|---|---|
-| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
+| `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
 | `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-installer-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
 | `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-installer-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
@@ -65,11 +65,12 @@ update itself (the design's section 1).
 `kbf-host-install` is the root side of the host-driven update: the forced command of the
 key `kbf-updater` holds, which installs a release on the host it runs on
 ([deploy/host-install.md](deploy/host-install.md)). `kbf-updater` is the daemon that
-drives it over ssh from the operator's Linux box, so it has Linux tarballs only. Neither
+drives it over ssh from the operator's Linux box, and, as `kbf-updater agent`, the host agent a
+Mac runs, so it has Linux and macOS tarballs. Neither
 is a package, and neither is a component of a release: a host or an operator takes the
 tarball by digest, verifies it as every tarball is (below), and places the binary where
 the guide says. Each tarball holds one member, the binary under its own name. The macOS
-`kbf-host-install` is signed and checked like the other macOS binaries. `kbf-host-install
+`kbf-host-install` and `kbf-updater` are signed and checked like the other macOS binaries. `kbf-host-install
 --version` prints its name and package version, which is all the release asks of it.
 
 The packages are the two Linux jobs' debs (two each) and frontend images, and the macOS job's `.pkg`:
@@ -740,14 +741,14 @@ fails.
 ## macOS signing: what ad hoc with the hardened runtime gives
 
 `cargo xtask sign-darwin` (crates/xtask/src/darwin.rs) signs each macOS binary the job
-builds (`kbf`, `kbf-deploy`, `kbf-installer` and `kbf-host-install`, one step each) with `codesign --force
+builds (`kbf`, `kbf-deploy`, `kbf-installer`, `kbf-host-install` and `kbf-updater`, one step each) with `codesign --force
 --sign - --options runtime`: an ad-hoc signature (no certificate) with the hardened
 runtime. That works without an Apple Developer account, and the job checks it every
 run: `codesign --verify --strict` passes, the signed binary runs (`<binary> --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
 exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
 list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf`,
-`kbf-deploy`, `kbf-installer` or `kbf-host-install`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
+`kbf-deploy`, `kbf-installer`, `kbf-host-install` or `kbf-updater`; only the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
 [macos-vm-guests.md](design/macos-vm-guests.md) section 7), and the binary's minimum
 macOS is 14.0. After packaging, `cargo xtask darwin-asset` takes the binary back out
 of its tarball, the bytes that ship (refusing a tarball that is not exactly the one
@@ -792,7 +793,7 @@ What it constrains:
 - **Only Apple-signed libraries load.** The hardened runtime turns on library
   validation, and with no Team ID of its own the binary may load only libraries Apple
   signed. That is fine for a binary that links and loads only system libraries, as
-  `kbf` does; `kbf-deploy`, `kbf-installer` and `kbf-host-install` are signed the same way,
+  `kbf` does; `kbf-deploy`, `kbf-installer`, `kbf-host-install` and `kbf-updater` are signed the same way,
   and CI does not list the libraries they load. On a Mac with System Integrity Protection on, a library it linked at start-up that
   Apple did not sign would stop it from starting. CI does not show this: the hosted
   runners have SIP off and library validation off (`vm.cs_library_validation` 0), so

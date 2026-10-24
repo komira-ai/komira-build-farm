@@ -151,19 +151,63 @@ fn an_empty_gh_and_a_trusted_root_that_is_not_json_lines_are_refused() {
 }
 
 #[test]
-fn a_trust_file_already_there_is_not_replaced() {
-    // Catches: a second run (or a stale directory) silently overwriting a file the
-    // package was meant to be built from.
-    let dir = scratch("exists");
-    let (gh, root) = inputs(&dir, b"gh", ROOT);
+fn a_leftover_trust_directory_is_replaced_whole() {
+    // Catches: a restored build cache (or an earlier run) that already holds the trust
+    // directory failing the step, or surviving into the package: the old conf, an old
+    // `gh`, and any stray file or subdirectory must be gone after the run.
+    let dir = scratch("leftover");
+    let (gh, root) = inputs(&dir, b"new-gh", ROOT);
     let out = dir.join("trust");
     write(&gh, &root, "refs/heads/main", &out).expect("first");
-    let err = write(&gh, &root, "refs/heads/feature/x", &out).expect_err("second");
-    assert!(err.to_string().starts_with("write "), "{err}");
+    std::fs::write(out.join("stale"), b"old").expect("stale file");
+    std::fs::create_dir_all(out.join("sub")).expect("stale dir");
+    std::fs::write(out.join("sub").join("x"), b"old").expect("stale nested");
+    write(&gh, &root, "refs/heads/feature/x", &out).expect("second");
+    let mut names: Vec<_> = std::fs::read_dir(&out)
+        .expect("ls")
+        .map(|e| e.expect("entry").file_name().into_string().expect("utf8"))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["gh", "installer.conf", "trusted_root.jsonl"]);
     assert_eq!(
         std::fs::read_to_string(out.join("installer.conf")).expect("conf"),
-        "SOURCE_REFS=refs/heads/main\n"
+        "SOURCE_REFS=refs/heads/feature/x\n"
     );
+    assert_eq!(mode(&out.join("gh")), 0o755);
+}
+
+#[test]
+fn an_out_path_that_is_not_a_directory_is_refused_and_left_alone() {
+    // Catches: pkg-trust deleting a file or following a symlink at `--out`.
+    let dir = scratch("notdir");
+    let (gh, root) = inputs(&dir, b"gh", ROOT);
+    let file = dir.join("file");
+    std::fs::write(&file, b"keep").expect("file");
+    let p = refused(write(&gh, &root, "refs/heads/main", &file));
+    assert!(p[0].contains("not a directory"), "{p:?}");
+    assert_eq!(std::fs::read(&file).expect("kept"), b"keep");
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(target.join("keep"), b"keep").expect("keep");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    refused(write(&gh, &root, "refs/heads/main", &link));
+    assert!(target.join("keep").exists());
+}
+
+#[test]
+fn an_out_path_that_cannot_be_inspected_is_refused_with_the_os_error() {
+    // Catches: a stat failure other than "not there" (here a parent that is a file) being
+    // treated as an absent directory and then failing later in create_dir_all, or being
+    // swallowed.
+    let dir = scratch("unstatable");
+    let (gh, root) = inputs(&dir, b"gh", ROOT);
+    let parent = dir.join("file");
+    std::fs::write(&parent, b"keep").expect("file");
+    let out = parent.join("trust");
+    let p = refused(write(&gh, &root, "refs/heads/main", &out));
+    assert!(p[0].starts_with(&format!("{}: ", out.display())), "{p:?}");
+    assert_eq!(std::fs::read(&parent).expect("kept"), b"keep");
 }
 
 #[test]

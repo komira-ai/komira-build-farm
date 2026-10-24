@@ -8,10 +8,10 @@
 //! to the same set.
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
-//!   [`ASSETS`] (binary and platform): `kbf`, `kbf-installer` and `kbf-host-install` for the
-//!   three platforms, `kbf-daemon`, `kbf-server`, `kbf-deploy` and `kbf-updater` for Linux
-//!   (the updater drives hosts from an operator's Linux box), `kbf-deploy` for macOS (a Mac
-//!   runs `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
+//!   [`ASSETS`] (binary and platform): `kbf`, `kbf-installer`, `kbf-host-install` and
+//!   `kbf-updater` for the three platforms (a Mac runs the host agent), `kbf-daemon`,
+//!   `kbf-server` and `kbf-deploy` for Linux, `kbf-deploy` for macOS (a Mac runs `kbf daemon`;
+//!   there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
@@ -81,6 +81,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-deploy", "darwin-arm64"),
     ("kbf-installer", "darwin-arm64"),
     ("kbf-host-install", "darwin-arm64"),
+    ("kbf-updater", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
@@ -840,6 +841,7 @@ fn the_docs_describe_the_release_set() {
     // builds (the doc is what an operator verifies against), or no longer saying that
     // pushes to the development branch are attested, what `--version --json` is, and
     // how a tarball is verified offline with its bundle.
+    // Also catches a tarball count in the doc that is not the size of `ASSETS`.
     let doc = std::fs::read_to_string(super::repo_root().join("docs/artifacts.md"))
         .expect("docs/artifacts.md");
     let mut missing = Vec::new();
@@ -848,6 +850,10 @@ fn the_docs_describe_the_release_set() {
         if !doc.contains(&file) {
             missing.push(format!("docs/artifacts.md does not list {file}"));
         }
+    }
+    let count = format!("\n{} tarballs, each", ASSETS.len());
+    if !doc.contains(&count) {
+        missing.push(format!("docs/artifacts.md does not open its list with `{}`: the count of tarballs is not the size of the release set", count.trim()));
     }
     for platform in PACKAGES {
         for file in [

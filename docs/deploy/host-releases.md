@@ -63,7 +63,7 @@ another schema is refused, and the backup is not tried.
 
 The root helper that applies a pulled update, `kbf-host-install`, and the daemon that drives it
 over ssh, `kbf-updater`, are release assets too (`kbf-host-install-<commit>-<platform>.tar.gz`
-for Linux and macOS, `kbf-updater-<commit>-linux-<arch>.tar.gz`), attested like every tarball.
+for Linux and macOS, `kbf-updater-<commit>-<platform>.tar.gz`), attested like every tarball.
 How to fetch and verify them: [host-install.md](host-install.md#getting-the-binary).
 
 ## The verbs

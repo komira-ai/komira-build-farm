@@ -18,8 +18,9 @@ the same run as every other asset ([../artifacts.md](../artifacts.md)):
 No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
 host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
 `<commit>` is the commit of the release the host is on or going to. The updater,
-`kbf-updater`, is the same kind of asset for the operator's Linux box
-(`kbf-updater-<commit>-linux-<arch>.tar.gz`, one member `kbf-updater`).
+`kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
+(`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
+member `kbf-updater`; the Mac one is ad hoc signed with the hardened runtime).
 
 Fetch the tarball with its bundle and check the bundle before the binary is placed anywhere
 (the flags are those of [../artifacts.md](../artifacts.md#provenance-bundles-verifying-a-tarball-offline)):
