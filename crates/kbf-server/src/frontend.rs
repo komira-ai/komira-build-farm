@@ -59,6 +59,13 @@
 //! still accepted so a unit or `kbf.toml` written before the removal starts; they do
 //! nothing, each one given logs a warning ([`RetiredHandoverFlags`]).
 //!
+//! **Draining.** A frontend over a state store is taken out of any load balancer by the
+//! drain sequence of [`crate::sequence`], which `POST /v1/frontend/drain` and a stop signal
+//! begin alike: `/readyz` answers 503 at once while everything is still served,
+//! `--drain-lb-wait` later new Execute calls are refused and every listener is sent GOAWAY,
+//! the open executions run until they are done or `--drain-deadline`, and the process exits
+//! 0. Without a state store (tests) the drain is the plain one of [`crate::drain`].
+//!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
 //! av2-08), the build pages and the blob route of the operator API (they read a local
@@ -110,9 +117,10 @@ use crate::proxy_auth::ProxyAuthLayer;
 use crate::ready::Ready;
 use crate::retire::Retire;
 use crate::retired::RetiredHandoverFlags;
+use crate::sequence::{DrainTiming, Sequence, stopped};
 use crate::serve::{
-    AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
-    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
+    AbortOnDrop, ServeError, cold_store, flow_control, keepalive, log_state, map_of, members_of,
+    membership, serve_api_goaway, stop_api, sweeping, worker_peers,
 };
 use crate::stand::{QUIESCE_WAIT, Stand};
 use crate::start::{Escalation, escalating, interruptions};
@@ -199,6 +207,9 @@ pub struct FrontendFlags {
     /// filled ([`crate::members::Members::with_handoff`]); `None` without the flag, where only
     /// an operator promotes one.
     pub handoff: Option<Handoff>,
+    /// `--drain-lb-wait` and `--drain-deadline`: the two waits of the drain sequence a
+    /// frontend over a state store runs ([`crate::sequence`]).
+    pub drain: DrainTiming,
     /// The flags of the removed handover and admin port, which are accepted and ignored
     /// ([`RetiredHandoverFlags`]).
     pub retired: RetiredHandoverFlags,
@@ -253,6 +264,7 @@ pub fn command() -> Command {
     ))
     .args(crate::enroll::flags::args())
     .args(handoff::args())
+    .args(drain_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -315,6 +327,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         enroll,
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
         handoff: handoff::from_matches(m),
+        drain: drain_flags::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
     })
 }
@@ -489,7 +502,9 @@ impl FrontendHandle {
 
     /// Serves every listener until the shutdown future given to [`start_frontend`]
     /// completes and the open Execute streams finish or `--shutdown-timeout-secs` runs
-    /// out (the drain `kbf-server` runs: [`crate::serve::drain_and_stop`]).
+    /// out (the drain `kbf-server` runs: [`crate::serve::drain_and_stop`]); or, over a state
+    /// store, until the drain sequence of [`crate::sequence`] is over, which the shutdown
+    /// future and `POST /v1/frontend/drain` begin alike.
     ///
     /// # Errors
     /// A listener fails while serving.
@@ -736,6 +751,9 @@ impl<'a> Prepared<'a> {
         let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
         let drain = Arc::new(drain);
         let worker_stop = Stop::new();
+        // Sends the operator API's connections GOAWAY when the drain sequence refuses new
+        // work; the listener goes on accepting ([`serve_api_goaway`]).
+        let api_stop = Stop::new();
         let Bound {
             reapi,
             worker,
@@ -749,7 +767,7 @@ impl<'a> Prepared<'a> {
         drain.begins().closes(reapi_latch);
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
-        let api_listener = api_socket.map(Socket::http).transpose()?;
+        let api_listeners = api_socket.map(Socket::http_pair).transpose()?;
         let token = api.and_then(|api| api.token);
         // The enroll listener (which is closed the moment the drain begins, like the
         // others) and the operator API's enrollment routes, which need the CA's pin: both
@@ -871,8 +889,13 @@ impl<'a> Prepared<'a> {
             sweeper,
             wait: QUIESCE_WAIT,
         });
-        // Set once, here: nothing has called the retire route before the listeners serve.
-        let _ = stand.map(|stand| retire.set(Retire::new(stand)));
+        // Set once, here: nothing has called the retire or the drain route before the
+        // listeners serve. A frontend over a state store drains by the sequence of
+        // [`crate::sequence`], and its stop signal begins it.
+        let _ = stand.map(|stand| {
+            let sequence = Sequence::new(stand.clone(), api_stop.clone(), flags.drain);
+            retire.set(Retire::new(stand, sequence))
+        });
         background.extend(enroll_renewal);
 
         let shutdown = shutdown()?;
@@ -880,11 +903,20 @@ impl<'a> Prepared<'a> {
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-            let reapi_serve = reapi_server
+            let reapi_listening = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {
                     let _ = goaway.await;
                 });
+            // A drain sequence ends with its own last step (the worker streams end
+            // UNAVAILABLE), not when the REAPI listener has nothing left to answer.
+            let reapi_serve = async {
+                let served = reapi_listening.await;
+                if stopper.is_sequenced() {
+                    stopper.sequence_finished().await;
+                }
+                served
+            };
             let worker_stopped = worker_stop.fired();
             let worker_serve = worker_server
                 .add_service(worker_service)
@@ -893,9 +925,10 @@ impl<'a> Prepared<'a> {
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
-            let api_serve = serve_api(
-                api_listener,
+            let api_serve = serve_api_goaway(
+                api_listeners,
                 api_routes,
+                api_stop.clone(),
                 async {
                     let _ = api_stopped.await;
                 },
@@ -913,10 +946,15 @@ impl<'a> Prepared<'a> {
             };
             // What the other frontends of a shared state store did (`Farm::intake`).
             let intaking = farm.poll_intake();
+            // The stop signal: the drain sequence of a frontend over a state store, else the
+            // plain drain.
             let stopping = async {
                 shutdown.await;
-                drain_and_stop(&stopper, listeners.shutdown_timeout).await;
+                stopped(&stopper, &retire, listeners.shutdown_timeout).await;
             };
+            // The drain sequence begun by `POST /v1/frontend/drain` ends the frontend too;
+            // never, when none runs.
+            let drained = stopper.sequence_finished();
             let mut reapi_done = false;
             // A listener that ends without an error does not end the frontend: the worker
             // listener ends when a retire stops it, and the frontend goes on answering the
@@ -934,8 +972,12 @@ impl<'a> Prepared<'a> {
                 () = intaking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
+                () = drained => Ok(()),
             };
             if reapi_done {
+                // The operator API ends with the REAPI listener: its connections are sent
+                // GOAWAY, finish what they answer, and it stops (`serve::stop_api`).
+                api_stop.fire();
                 stop_api(api_stop_when_done, api_serve).await;
             }
             crate::history::finish(history).await;
@@ -1087,6 +1129,7 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     })
 }
 
+mod drain_flags;
 mod handoff;
 
 #[cfg(test)]

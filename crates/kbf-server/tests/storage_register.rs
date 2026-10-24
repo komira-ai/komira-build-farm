@@ -725,6 +725,8 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         format!("--state-store={uri}"),
         "--member-ttl-secs=600".to_owned(),
         "--member-dwell-secs=600".to_owned(),
+        // Stopped at the end of the test: no load balancer to wait for.
+        "--drain-lb-wait=0".to_owned(),
     ];
     let front = kbf_server::frontend::parse(
         &kbf_server::frontend::command()

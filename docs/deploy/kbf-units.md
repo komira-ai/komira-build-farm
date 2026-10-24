@@ -265,11 +265,46 @@ nothing to a frontend that would fail every blob call while another is ready, an
 keeps its listeners and its state, so it is in rotation again as soon as the node is back, with
 no restart.
 
+### Draining a frontend behind a load balancer
+
+A frontend over a state store drains on SIGTERM, and on `POST /v1/frontend/drain`, in an
+order that needs nothing of kbf in front of it: Envoy, HAProxy or a Kubernetes Service takes
+it out on its own health check and its connections' GOAWAY (the order and each phase are in
+[api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain)).
+
+1. `/readyz` answers `503` at once; everything is still served.
+2. For `--drain-lb-wait` seconds (default 10, 0 allowed) nothing more happens. Set it to at
+   least the load balancer's check interval times its unhealthy threshold, plus the time
+   its routes take to change. For Envoy that is `interval` times `unhealthy_threshold` and a
+   second or two (1 s times 2, so 10 s has margin); for a pod, the readiness probe's
+   `periodSeconds` times `failureThreshold` plus the endpoints' propagation. Unary calls
+   have no client retry, which is why they are served here.
+3. New Execute calls are refused `UNAVAILABLE` (Buck2 retries them), the frontend takes no
+   more queued work from the state store and places none on its nodes, and the REAPI,
+   worker and operator API listeners are sent GOAWAY.
+4. The frontend waits until no execution is open, at most `--drain-deadline` seconds
+   (default 900, at least 1).
+5. The worker streams that are left end `UNAVAILABLE` (daemons dial another frontend through
+   the load balancer, which keeps their leases), the streams still open end `UNAVAILABLE`,
+   and the process exits 0. It is not undone: what starts in its place is a new process.
+
+A build whose action runs longer than the deadline fails when the deadline comes (Buck2
+never re-attaches). Update in a quiet window, or raise `--drain-deadline` above the longest
+action. The stop timeout of whatever runs the process must be longer than the two waits and
+is never what ends the drain: `TimeoutStopSec=infinity` for the unit (below); for a Docker
+container `stop_grace_period`, and for a pod `terminationGracePeriodSeconds`, set to
+`--drain-lb-wait` plus `--drain-deadline` plus 5 minutes (a pod needs no `preStop` sleep: the
+wait is the frontend's own, from the SIGTERM). A frontend that is the only one has nothing
+to hand its work to: its queued operations that have not started wait with the rest.
+
 ### Stopping a frontend: TimeoutStopSec=infinity
 
-On SIGTERM kbf's frontend (and `all-in-one`'s) drains: it refuses new Execute calls,
-which Buck2 retries elsewhere, and keeps every open Execute and WaitExecution stream
-until its action is done; `--shutdown-timeout-secs` is 0, no deadline, by default.
+On SIGTERM kbf's frontend drains (the sequence above; `all-in-one`'s drains at once: it
+refuses new Execute calls, which Buck2 retries elsewhere, and keeps every open Execute and
+WaitExecution stream until its action is done); `--shutdown-timeout-secs` is 0, no
+deadline, by default, and a frontend over a state store is bounded by `--drain-deadline`. A
+`--shutdown-timeout-secs` above 0 ends a drain that a signal began when it runs out, as a
+second signal does, even if that is before the wait or the deadline: leave it at 0.
 Buck2 never recovers a stream that breaks mid-action, so a stop that ends the drain
 fails every build in flight. systemd kills a unit with SIGKILL when `TimeoutStopSec=`
 runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both units have

@@ -33,12 +33,16 @@
 //!   is a DNS name, written in lower case (a certificate's names are compared up to ASCII
 //!   case); one that is an IP address or has a colon is `400`, since it would name nothing.
 //!
-//! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
-//!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
-//!   `POST /v1/frontend/drain` begins the drain ([`crate::drain`]) and answers the same
-//!   status: new Execute calls are refused, `/readyz` goes false, the REAPI listener is
-//!   sent GOAWAY, open streams run until their action is done, and the server exits
-//!   when they have. It is not undone: a drained frontend is restarted.
+//! - `GET /v1/frontend/drain`: whether the frontend is draining and in which phase, the
+//!   Execute and WaitExecution streams open and the operations queued ([`DrainStatus`]).
+//!   `POST /v1/frontend/drain` begins the drain and answers the same status. A frontend over
+//!   a state store runs the drain sequence ([`crate::sequence`]): `/readyz` goes false at
+//!   once while everything is still served, new Execute calls are refused after
+//!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions run until they are
+//!   done or `--drain-deadline`, and the process exits 0. Any other server drains at once
+//!   ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
+//!   listener is sent GOAWAY, open streams run until their action is done, and the server
+//!   exits when they have. It is not undone: a drained frontend is restarted.
 //!
 //! - `GET /v1/frontend/retire` reads the retire mode of a frontend over a state store, and
 //!   `POST /v1/frontend/retire` begins it ([`crate::retire`]); any other server answers `409`.
@@ -83,7 +87,7 @@ use kbf_state::{Store, StoreError};
 use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
-use crate::drain::{Drain, DrainStatus};
+use crate::drain::{Drain, DrainStatus, Phase};
 use crate::enroll::api::EnrollApi;
 use crate::farm::{EpochBump, Farm, NodeAction, StateError};
 use crate::fleet::ProtocolSummary;
@@ -205,8 +209,10 @@ pub fn router(
 
 /// The drain as it is now.
 fn status(api: &ApiState) -> DrainStatus {
+    let phase = api.drain.phase();
     DrainStatus {
-        draining: api.drain.is_draining(),
+        draining: phase != Phase::Serving,
+        phase,
         open_executions: api.farm.open_executions(),
         queued_operations: api.farm.queued_operations(),
     }
@@ -236,7 +242,12 @@ async fn begin_drain(
         let why = format!("a frontend drain takes no body, or {{}}: {e}");
         return error(StatusCode::BAD_REQUEST, &why);
     }
-    if api.drain.begin() {
+    // A frontend over a state store runs the drain sequence; any other server drains at once.
+    let began = match api.retire.get() {
+        Some(retire) => retire.drain(),
+        None => api.drain.begin(),
+    };
+    if began {
         tracing::info!("frontend drain begun by the operator API");
     }
     json(StatusCode::OK, &status(&api))

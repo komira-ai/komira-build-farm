@@ -99,6 +99,22 @@ async fn an_http_listener_is_the_socket_bound() {
     assert!(TcpStream::connect(addr).is_ok());
 }
 
+/// Asserts that the twin listeners of the operator API are two handles on the socket bound:
+/// both report its address, and it goes on accepting when one is dropped, until the other
+/// is too.
+#[tokio::test]
+async fn the_twin_http_listeners_share_one_socket() {
+    let socket = Socket::bind(any(), &Binder::new()).expect("bind");
+    let addr = socket.local;
+    let (first, second) = socket.http_pair().expect("registered");
+    assert_eq!(first.local_addr().expect("address"), addr);
+    assert_eq!(second.local_addr().expect("address"), addr);
+    drop(first);
+    assert!(TcpStream::connect(addr).is_ok(), "closed with one handle");
+    drop(second);
+    assert!(TcpStream::connect(addr).is_err(), "open with no handle");
+}
+
 /// Catches: a socket error that does not say which address it was for.
 #[test]
 fn a_socket_error_names_its_address() {

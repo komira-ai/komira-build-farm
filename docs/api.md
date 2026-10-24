@@ -548,16 +548,23 @@ unredacted. Written up in [api-scheduler.md](api-scheduler.md).
 Draining the frontend itself, for a rollout that restarts it (the nodes are drained
 with `:drain` above). Buck2 does not recover an Execute stream that breaks after it
 started, so a restart that cuts a stream fails its action: the frontend is drained, and
-restarted when it has no stream left.
+restarted when it has no stream left. The drain works behind any load balancer (Envoy,
+HAProxy, a Kubernetes Service) with nothing of kbf in front: it is a sequence that the
+load balancer's own health check follows, and `POST` and SIGTERM (a container's stop, a
+pod's deletion) begin the same one.
 
 **`GET /v1/frontend/drain`**: a read, open like `GET /v1/nodes`:
 
 ```json
-{ "draining": false, "open_executions": 3, "queued_operations": 1 }
+{ "draining": false, "phase": "serving", "open_executions": 3, "queued_operations": 1 }
 ```
 
-- `draining`: a drain has begun, by this endpoint or by SIGTERM or SIGINT. It is not
-  undone.
+- `draining`: a drain has begun, by this endpoint or by SIGTERM or SIGINT: the phase is any
+  but `serving`. It is not undone.
+- `phase`: where the drain is. `serving`: none has begun. `lb_wait`: `/readyz` answers `503`
+  and everything is still served. `draining`: new Execute calls are refused and every
+  listener has been sent GOAWAY; the open executions run on. `closing`: the streams that
+  are left are being closed, and the process exits within a few seconds.
 - `open_executions`: Execute and WaitExecution operation streams open now
   (`kbf_front_open_executions`: a stream counts from the moment it is made, before its
   first operation is read, until it ends or its client leaves).
@@ -569,22 +576,58 @@ restarted when it has no stream left.
 
 **`POST /v1/frontend/drain`**: begins the drain, a write that passes every gate of
 [Who may write](#who-may-write) and takes no body (or `{}`), and answers the same status
-with `draining` true. Calling it again changes nothing; SIGTERM or SIGINT after it
-changes nothing either. The drain:
+with `draining` true and the phase `lb_wait`. Calling it again changes nothing; SIGTERM or
+SIGINT after it changes nothing either, and the other way round. The drain of a frontend
+over a state store (`kbf frontend` requires one):
 
-- turns `/readyz` to `503` (`stopping`) and the health service to `NOT_SERVING`;
-- refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
-- sends the REAPI listener GOAWAY, so it takes no new connection;
-- keeps every open Execute and WaitExecution stream until its action is done;
-- ends the server, exit 0, when the REAPI connections have closed. The worker listener
-  and this API stay up until then, so daemons go on reporting results.
+1. **Not ready, serving on.** `/readyz` turns to `503` (`stopping`) and the health service to
+   `NOT_SERVING` before the request is answered, and everything is still served: unary
+   calls (FindMissingBlobs, BatchUpdateBlobs, the action cache), ByteStream, the streams
+   that are open and new Execute calls. Phase `lb_wait`.
+2. **The load balancer's wait.** For `--drain-lb-wait` seconds (default 10, 0 allowed) the
+   frontend does nothing more, so that the load balancer's health check sees the `503`: set
+   it to at least its check interval times its unhealthy threshold, plus the time its routes
+   take to change (for a Kubernetes pod, the readiness probe's period times its failure
+   threshold, plus the endpoints' propagation). Unary calls carry no client retry, which is
+   why they are served here.
+3. **Refuse, stop taking work, GOAWAY.** New Execute calls are refused `UNAVAILABLE`, which
+   Buck2 retries when it opens a call. The frontend stops taking queued work from the
+   state store and stops placing work on its nodes (they read `cordoned` in `GET /v1/nodes`
+   of this frontend; nothing is written to the store), so the other frontends take what it
+   holds queued; what a node of this frontend is running goes on. The REAPI listener, the
+   worker listener and the operator API are sent HTTP/2 GOAWAY, so a load balancer
+   drains their connections: calls in flight on a connection finish and new ones open
+   elsewhere. The REAPI and worker listeners stop accepting; this API goes on answering, so
+   the drain can be read. Phase `draining`.
+4. **Wait for the executions.** Until `open_executions` is 0, at most `--drain-deadline`
+   seconds (default 900, at least 1). An execution running on a node of this frontend
+   finishes here: the node's result is taken and the caller is answered. An execution
+   another frontend took is answered from the result it records in the state store.
+5. **Close and exit.** The frontend stands down as a retire does (below): the farm is
+   fenced, and the worker streams that are left end `UNAVAILABLE`, so each daemon dials
+   another frontend through the load balancer, which keeps its leases (the state store's
+   owner rows are authoritative). The Execute and WaitExecution streams still open end
+   `UNAVAILABLE` (an action that was still running fails, as Buck2 does not recover a
+   stream). Phase `closing`, a few seconds long, and the process exits 0. For a worker
+   listener behind a load balancer that passes TCP through, GOAWAY reaches the daemon's
+   connection and nothing else: this is the step that closes it.
 
-A frontend that has nothing open exits at once, after answering the request. What ends
-a drain that waits too long: `--shutdown-timeout-secs` when a signal began it (the
-default waits for ever), or a second SIGTERM or SIGINT, which ends every open stream
-`UNAVAILABLE` (the action fails) and stops the server within a few seconds. Under
-systemd that means `TimeoutStopSec=infinity` in the unit: a stop timeout would SIGKILL
-the drain, and the unit templates in `kbf-deploy` set it.
+The drain is not undone: the process exits, and what starts in its place is a new
+process. A frontend that has nothing open exits as soon as the wait is over. A second
+SIGTERM or SIGINT skips the waits of steps 2 and 4 and goes on to step 5, and
+`--shutdown-timeout-secs` (default 0, none), when a signal began the drain, does the
+same when it runs out. A server with no state store (`kbf-server`; a frontend started by a
+test) drains at once instead: `/readyz` `503`, new Execute calls refused, the REAPI
+listener sent GOAWAY, the open streams kept until their action is done, and the server
+exits when the REAPI connections have closed, bounded by `--shutdown-timeout-secs`.
+
+The stop timeout of what runs the frontend must exceed `--drain-lb-wait` plus
+`--drain-deadline`, and is never the bound of the drain: under systemd that means
+`TimeoutStopSec=infinity` in the unit, and the unit templates in `kbf-deploy` set it; for
+a container, `stop_grace_period` (Docker) or `terminationGracePeriodSeconds`
+(Kubernetes) is set to the sum plus five minutes, and the `preStop` hook of a pod needs no
+sleep, since the wait is the frontend's own. See
+[kbf-units.md](deploy/kbf-units.md#draining-a-frontend-behind-a-load-balancer).
 
 `kbf cluster` (on the frontend's host) calls this API: `kbf cluster status [--frontend]`,
 `kbf cluster drain <node> [--deadline-secs N] --token-file F`, `kbf cluster drain
@@ -599,8 +642,10 @@ restart it. `kbf cluster member <id> --state active|draining|planned-down [--for
 ## `GET /v1/frontend/retire` and `POST /v1/frontend/retire`
 
 Taking one frontend out of service while other frontends share its state store, for a
-rollout that restarts it. A drain (above) lets the frontend keep its worker streams and its
-queue; a retire moves them to the others.
+rollout that restarts it. A drain (above) serves on while the load balancer sees it go,
+waits for the open executions and then exits, the worker streams and the queue moving to the
+others at its end (its last step is a retire's); a retire moves them at once and keeps the
+process answering the callers it holds, which is what an updater uses.
 
 **`GET /v1/frontend/retire`**: a read, open like `GET /v1/frontend/drain`:
 
@@ -1167,7 +1212,7 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the drain deadline (`--drain-deadline`, on a frontend over a state store), the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 

@@ -4,10 +4,14 @@
 //! frontend presents a certificate that names its role and verifies the node's against
 //! its CA and the host in the `--storage` URL (docs/design/architecture-v2.md, section 9),
 //! over a real node (`kbf_server::storage_node`), the proxy's raw HTTP/2 path (ByteStream)
-//! and its tonic path (FindMissing, the action cache), and the certificate rules of the
-//! membership service on its worker listener (`frontend/membership_tls.rs`).
+//! and its tonic path (FindMissing, the action cache), the certificate rules of the
+//! membership service on its worker listener (`frontend/membership_tls.rs`), and the drain
+//! sequence of a frontend over a state store (`frontend/drain.rs`).
 
 mod support;
+
+#[path = "frontend/drain.rs"]
+mod drain;
 
 #[path = "frontend/membership_tls.rs"]
 mod membership_tls;
@@ -833,7 +837,7 @@ async fn a_frontend_over_external_storage_keeps_the_size_key_in_its_state_store(
         let url = format!("--storage=http://{}", node.addr);
         let store = format!("--state-store=sqlite://{}", state.display());
         let sizes = format!("--learned-sizes={mode}");
-        let f = flags(&[&url, &store, &sizes]).expect("flags");
+        let f = flags(&[&url, &store, &sizes, "--drain-lb-wait=0"]).expect("flags");
         let front = Front::start(&f).await;
         let client = front.client().await;
         let job = Job::new("keyed", &[]);
@@ -1549,7 +1553,12 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .expect("the call runs")
     };
     let status = call(None, false).await;
-    let want = serde_json::json!({"draining": false, "open_executions": 1, "queued_operations": 1});
+    let want = serde_json::json!({
+        "draining": false,
+        "phase": "serving",
+        "open_executions": 1,
+        "queued_operations": 1
+    });
     assert_eq!(
         serde_json::from_str::<Value>(&status.body).expect("JSON"),
         want

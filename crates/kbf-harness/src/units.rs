@@ -427,6 +427,13 @@ impl Unit {
 /// that names no architecture with no worker on an aarch64 host.
 const ONE_HOST_PLATFORM: &str = "--default-platform=none";
 
+/// The flag that ends a farm's frontend without the wait a load balancer needs: a stop
+/// (SIGTERM) keeps `/readyz` at 503 and serves on for `--drain-lb-wait` (10 s) so that a
+/// load balancer's health check sees it, and the farm has none, while its stop is bounded
+/// ([`crate::procs::HANG`]). Only a frontend of this release is given it: an older release
+/// does not know the flag.
+const NO_LB_WAIT: &str = "--drain-lb-wait=0";
+
 /// What the container driver's nodes get from the box: the stand-in `crun`
 /// (`--oci-runtime=`), the planted cgroup tree and the id files.
 pub struct Container {
@@ -473,9 +480,16 @@ fn driven(unit: Unit, driver: Driver) -> Unit {
 #[must_use]
 pub fn frontend(s: &Settings, uid: u32, topo: &Topology) -> Unit {
     let state = format!("--state-store=sqlite://{}/state/state.db", s.root.display());
+    // A frontend of an older release has no such flag, and its start fails on one it does not
+    // know: it is given none, and its stop has no wait to skip.
+    let mut older = topo.binaries.iter().map(|(role, _)| *role);
+    let mut flags = vec![ONE_HOST_PLATFORM.to_owned()];
+    if !older.any(|role| role == Role::Frontend) {
+        flags.push(NO_LB_WAIT.to_owned());
+    }
     let unit = Unit::new(Mode::Frontend, s, uid)
         .replace(&[state])
-        .set(&[ONE_HOST_PLATFORM.to_owned()])
+        .set(&flags)
         .set(&topo.limits.frontend);
     overrides(topo, Role::Frontend, unit)
 }

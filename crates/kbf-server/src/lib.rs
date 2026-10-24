@@ -26,7 +26,10 @@
 //!   same listener, on by default (`--ui=false` turns it off), the read-only, open web UI under
 //!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
-//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
+//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`]. A
+//!   frontend over a state store runs it as a sequence that works behind any load balancer
+//!   ([`sequence`]): not ready first, then refusing and GOAWAY, then the open executions
+//!   run out, then the process exits.
 //! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
 //!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
 //!   steps them: updates are OS packages, driven by `kbf-updater`.
@@ -122,7 +125,10 @@ pub mod replication;
 pub mod retire;
 pub mod retired;
 mod run_record;
+pub mod sequence;
 pub mod serve;
+#[cfg(test)]
+mod serve_goaway_tests;
 #[cfg(test)]
 mod serve_remote_tests;
 mod size_key;

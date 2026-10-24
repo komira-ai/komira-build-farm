@@ -64,6 +64,8 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "advertise-addr",
             "api-listen",
+            "drain-deadline",
+            "drain-lb-wait",
             "http2-keepalive-interval-secs",
             "http2-keepalive-timeout-secs",
             "listen",

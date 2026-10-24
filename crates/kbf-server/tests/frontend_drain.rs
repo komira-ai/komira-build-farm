@@ -58,7 +58,12 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
     let result = output(&cell, "the build output", 0).await;
     assert_eq!(
         status(&cell).await,
-        json!({"draining": false, "open_executions": 0, "queued_operations": 0})
+        json!({
+            "draining": false,
+            "phase": "serving",
+            "open_executions": 0,
+            "queued_operations": 0
+        })
     );
 
     let mut ops = cell.execute(&job.action).await;
@@ -66,7 +71,12 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
     assert_eq!(stage(&queued), ExecStage::Queued as i32);
     assert_eq!(
         status(&cell).await,
-        json!({"draining": false, "open_executions": 1, "queued_operations": 1}),
+        json!({
+            "draining": false,
+            "phase": "serving",
+            "open_executions": 1,
+            "queued_operations": 1
+        }),
         "an open stream whose operation waits for a worker"
     );
 
@@ -82,7 +92,12 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
 
     let begun = begin(&cell, true, "").await;
     assert_eq!(begun.status, 200, "{begun:?}");
-    let want = json!({"draining": true, "open_executions": 1, "queued_operations": 1});
+    let want = json!({
+        "draining": true,
+        "phase": "draining",
+        "open_executions": 1,
+        "queued_operations": 1
+    });
     assert_eq!(
         serde_json::from_str::<Value>(&begun.body).expect("JSON"),
         want

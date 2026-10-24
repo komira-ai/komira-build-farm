@@ -61,6 +61,23 @@ impl Socket {
         let registered = tokio::net::TcpListener::from_std(self.listener);
         registered.map_err(bind_error(self.local))
     }
+
+    /// The listener for the operator API twice over: two handles on the one socket, one for
+    /// the server that is sent GOAWAY and one for the server that goes on accepting when it
+    /// is ([`crate::serve::serve_api_goaway`]). Dropping a handle leaves the socket open
+    /// while the other is.
+    ///
+    /// # Errors
+    /// The socket cannot be duplicated, or the runtime cannot register it.
+    pub fn http_pair(
+        self,
+    ) -> Result<(tokio::net::TcpListener, tokio::net::TcpListener), ServeError> {
+        let registered = self.listener.try_clone().and_then(|twin| {
+            let first = tokio::net::TcpListener::from_std(self.listener)?;
+            Ok((first, tokio::net::TcpListener::from_std(twin)?))
+        });
+        registered.map_err(bind_error(self.local))
+    }
 }
 
 /// How long binds that fail with `AddrNotAvailable` are retried, all of them together,

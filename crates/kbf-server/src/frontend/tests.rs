@@ -206,6 +206,34 @@ fn auto_promote_is_off_by_default_and_its_companions_need_it() {
     }
 }
 
+/// Asserts that with no drain flag given the waits are the defaults (ten seconds and
+/// fifteen minutes, which `DrainTiming::default` says too), that values are read as
+/// seconds, that a wait of zero is allowed and a deadline of zero, a word and a negative
+/// number are refused, and that both flags are in the command's help.
+#[test]
+fn the_drain_flags_have_their_defaults_and_bounds() {
+    use crate::sequence::DrainTiming;
+    use std::time::Duration;
+
+    let drain = |more: &[&str]| parsed(more).expect("parses").drain;
+    assert_eq!(drain(&[]), DrainTiming::default());
+    let set = drain(&["--drain-lb-wait=3", "--drain-deadline=45"]);
+    let (lb_wait, deadline) = (Duration::from_secs(3), Duration::from_secs(45));
+    assert_eq!(set, DrainTiming { lb_wait, deadline });
+    assert_eq!(drain(&["--drain-lb-wait=0"]).lb_wait, Duration::ZERO);
+    for refused in [
+        "--drain-deadline=0",
+        "--drain-lb-wait=soon",
+        "--drain-deadline=-1",
+    ] {
+        assert!(parsed(&[refused]).is_err(), "{refused}");
+    }
+    let help = super::command().render_long_help().to_string();
+    for flag in ["--drain-lb-wait", "--drain-deadline"] {
+        assert!(help.contains(flag), "{flag}");
+    }
+}
+
 /// Catches: the setting parsed and dropped before the members that use it (the frontend
 /// would take the flag and never promote), or given to members when none is asked for.
 #[test]

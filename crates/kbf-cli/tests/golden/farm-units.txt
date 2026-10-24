@@ -3,6 +3,7 @@ mode frontend
 --api-listen=127.0.0.1:41002
 --api-token-file=/farm/frontend/etc/api-token
 --default-platform=none
+--drain-lb-wait=0
 --listen={host}:41000
 --reapi-tls-cert=/farm/frontend/etc/reapi.pem
 --reapi-tls-key=/farm/frontend/etc/reapi.key
@@ -92,6 +93,7 @@ mode frontend
 --api-listen=127.0.0.1:41002
 --api-token-file=/farm/frontend/etc/api-token
 --default-platform=none
+--drain-lb-wait=0
 --listen={host}:41000
 --reapi-tls-cert=/farm/frontend/etc/reapi.pem
 --reapi-tls-key=/farm/frontend/etc/reapi.key
@@ -186,6 +188,7 @@ mode frontend
 --api-listen=127.0.0.1:41002
 --api-token-file=/farm/frontend/etc/api-token
 --default-platform=none
+--drain-lb-wait=0
 --listen={host}:41000
 --reapi-tls-cert=/farm/frontend/etc/reapi.pem
 --reapi-tls-key=/farm/frontend/etc/reapi.key
@@ -275,6 +278,7 @@ mode frontend
 --api-listen=127.0.0.1:41002
 --api-token-file=/farm/frontend/etc/api-token
 --default-platform=none
+--drain-lb-wait=0
 --listen={host}:41000
 --reapi-tls-cert=/farm/frontend/etc/reapi.pem
 --reapi-tls-key=/farm/frontend/etc/reapi.key
@@ -367,6 +371,7 @@ mode frontend
 --api-listen=127.0.0.1:41002
 --api-token-file=/farm/frontend/etc/api-token
 --default-platform=none
+--drain-lb-wait=0
 --listen={host}:41000
 --reapi-tls-cert=/farm/frontend/etc/reapi.pem
 --reapi-tls-key=/farm/frontend/etc/reapi.key

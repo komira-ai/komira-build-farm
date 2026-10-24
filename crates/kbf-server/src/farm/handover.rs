@@ -97,6 +97,18 @@ impl Farm {
         self.lock().fenced = false;
     }
 
+    /// Closes this farm's intake, the step of a drain (`crate::sequence`) before the fence:
+    /// from now on it takes in no operation another frontend queued, and places none on its
+    /// nodes (each is cordoned in the scheduler, with no row written to the state store, so
+    /// no other frontend sees it), so the operations it holds queued are taken by the other
+    /// frontends. It goes on with everything else: a `Result` and a heartbeat of a lease it
+    /// holds are taken, and its callers are answered, from its own nodes and from what the
+    /// other frontends write ([`Farm::intake`]). Unlike [`Farm::fence`] it refuses nothing a
+    /// node reports, so the executions that are running finish here. Nothing undoes it.
+    pub fn close_intake(&self) {
+        self.lock().closed = true;
+    }
+
     /// Whether the state store has refused a write of this farm because a newer writer
     /// holds it.
     #[must_use]
@@ -213,6 +225,35 @@ pub(super) enum Flushed {
 }
 
 impl State {
+    /// Cordons, in the scheduler alone, every node this farm has heard from once its intake
+    /// is closed ([`Farm::close_intake`]), so that placement gives none of them work. Before
+    /// every input: a node that registers after the intake closed is cordoned before the
+    /// placement round that follows its registration. A farm whose intake is open does
+    /// nothing. A node that is cordoned already (by this or by an operator) is left as it
+    /// is.
+    pub(super) fn hold_placements(&mut self, now: FarmTime) {
+        if !self.closed {
+            return;
+        }
+        let open = |worker: &&WorkerId| self.sched.cordon(worker).is_none();
+        let nodes: Vec<WorkerId> = self.machine.nodes().filter(open).cloned().collect();
+        for worker in nodes {
+            let none = self.sched.apply(Input::new(now, Event::Cordon { worker }));
+            debug_assert!(none.is_empty(), "a cordon has no effect: {none:?}");
+        }
+    }
+
+    /// The input to feed in place of `event`: on a farm whose intake is closed an uncordon
+    /// is a tick, since the scheduler places work on the node inside the uncordon itself,
+    /// which would give a node this farm was told not to use work. Any other event, and
+    /// every event of a farm whose intake is open, is returned as it is.
+    pub(super) fn held_event(&self, event: Event) -> Event {
+        match event {
+            Event::Uncordon { .. } if self.closed => Event::Tick,
+            event => event,
+        }
+    }
+
     /// Writes the requeues the state store has not taken, and the ones the scheduler has
     /// given up since the last feed, once. Works on a fenced farm: this is the one thing
     /// a fenced farm writes, because the successor's recovery depends on it (see

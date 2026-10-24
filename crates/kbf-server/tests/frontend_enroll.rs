@@ -81,6 +81,8 @@ async fn a_frontend_with_enroll_listen_enrolls_a_node_with_a_token_from_its_api(
         "--ca-dev-file-signer".to_owned(),
         "--enroll-allow-unenforced-deny".to_owned(),
         "--frontend-name=localhost".to_owned(),
+        // Stopped at the end of the test: no load balancer to wait for.
+        "--drain-lb-wait=0".to_owned(),
     ]);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let handle = start_frontend(&f, || {

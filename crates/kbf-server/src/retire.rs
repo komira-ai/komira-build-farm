@@ -16,6 +16,11 @@
 //!
 //! The REAPI and operator API listeners keep serving, so the open Execute and WaitExecution
 //! streams are answered. A retire is not undone: the unit is restarted.
+//!
+//! The frontend's drain ([`crate::sequence`], `POST /v1/frontend/drain`) ends in the same
+//! stand-down ([`Stand::release`]) and then exits. It is the mode of this struct too, since
+//! it needs the same pieces and exists on the same frontends (those over a state store); a
+//! retire is the shorter one, which an updater uses and which keeps the process answering.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use crate::farm::FOLLOW_EVERY;
+use crate::sequence::Sequence;
 use crate::stand::Stand;
 
 /// What `GET /v1/frontend/retire` answers, and what a retire answers after it ends.
@@ -41,6 +47,8 @@ pub struct RetireStatus {
 /// The retire mode of one frontend: what it stops, and whether it has.
 pub struct Retire {
     stand: Stand,
+    /// The frontend's drain, over the same pieces ([`Retire::drain`]).
+    sequence: Sequence,
     /// The once flag of the follower ([`crate::farm::Farm::follow_every`]): set when the
     /// retire has run, and so what [`Retire::status`] reports.
     retired: Arc<AtomicBool>,
@@ -50,13 +58,20 @@ pub struct Retire {
 }
 
 impl Retire {
-    /// The retire mode of the frontend `stand` gives up.
-    pub(crate) fn new(stand: Stand) -> Self {
+    /// The retire mode of the frontend `stand` gives up, and its drain `sequence`.
+    pub(crate) fn new(stand: Stand, sequence: Sequence) -> Self {
         Self {
             stand,
+            sequence,
             retired: Arc::new(AtomicBool::new(false)),
             moving: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Begins the frontend's drain ([`crate::sequence`]) unless it has begun, and returns
+    /// whether this call began it. Call it inside a Tokio runtime.
+    pub(crate) fn drain(&self) -> bool {
+        self.sequence.begin()
     }
 
     /// Retires the frontend: the steps in the module docs. Every step is idempotent, and a

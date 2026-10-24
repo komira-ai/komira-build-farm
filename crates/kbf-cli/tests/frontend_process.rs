@@ -100,6 +100,8 @@ fn frontend(storage: &str, more: &[&str]) -> Proc {
         "--listen=127.0.0.1:0",
         "--worker-listen=127.0.0.1:0",
         "--api-listen=127.0.0.1:0",
+        // A stop is bounded here (`Proc::stop`), and no load balancer needs the wait.
+        "--drain-lb-wait=0",
         storage.as_str(),
     ];
     args.extend_from_slice(more);

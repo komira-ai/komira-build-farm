@@ -1,7 +1,7 @@
 //! The unit of a farm's process: the mode's spelling on the command line, the settings
 //! a mode starts with, and the strict edits to them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -297,6 +297,38 @@ fn the_file_is_each_setting_under_the_table_of_its_group_as_text() {
     }
 }
 
+/// Asserts that a farm gives `--drain-lb-wait=0` to a frontend of this release, whether the
+/// farm runs an older release's `kbf` on no role or on a node only, and gives it to a
+/// frontend that runs an older release's `kbf` never, since that release does not know the
+/// flag and fails its start on it.
+#[test]
+fn only_a_frontend_of_this_release_is_given_the_drain_wait() {
+    let w = wiring();
+    let place = Settings {
+        root: Path::new("/R"),
+        host: "127.0.0.1",
+        node_id: "n-1",
+        storage_port: 5555,
+        wiring: &w,
+        image: "",
+    };
+    let older = |roles: &[Role]| {
+        let mut topo = Topology::rehearsal(2);
+        topo.binaries = roles
+            .iter()
+            .map(|role| (*role, PathBuf::from("/older/kbf")))
+            .collect();
+        frontend(&place, 1000, &topo)
+    };
+
+    assert!(has(&older(&[]), "--drain-lb-wait=0"));
+    assert!(has(&older(&[Role::Node(1)]), "--drain-lb-wait=0"));
+    assert!(!has(&older(&[Role::Frontend]), "--drain-lb-wait=0"));
+    let both = older(&[Role::Node(1), Role::Frontend]);
+    assert!(!has(&both, "--drain-lb-wait=0"));
+    assert!(has(&both, "--default-platform=none"));
+}
+
 #[test]
 fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
     // Catches: an edit of the farm that goes missing or lands on the wrong role: the
@@ -320,6 +352,7 @@ fn the_compositions_apply_the_edits_of_a_farm_to_the_units_defaults() {
     let front: Unit = frontend(&place(""), 1000, &topo);
     assert!(has(&front, "--state-store=sqlite:///R/state/state.db"));
     assert!(has(&front, "--default-platform=none"));
+    assert!(has(&front, "--drain-lb-wait=0"));
     assert!(has(&front, "--api-listen=127.0.0.1:1"));
     let nodes = |n| -> Unit { node((&place(""), 1000), n, 9999, &topo, None) };
     let first = nodes(1);

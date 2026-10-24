@@ -483,7 +483,12 @@ async fn a_second_sigterm_ends_the_drain() {
     let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
-        serde_json::json!({"draining": true, "open_executions": 1, "queued_operations": 1}),
+        serde_json::json!({
+            "draining": true,
+            "phase": "draining",
+            "open_executions": 1,
+            "queued_operations": 1
+        }),
         "the first signal drains and keeps the stream"
     );
 
@@ -541,7 +546,12 @@ async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_
     let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
-        serde_json::json!({"draining": true, "open_executions": 1, "queued_operations": 1}),
+        serde_json::json!({
+            "draining": true,
+            "phase": "draining",
+            "open_executions": 1,
+            "queued_operations": 1
+        }),
         "the refused Execute was queued"
     );
     assert!(

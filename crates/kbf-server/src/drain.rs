@@ -15,12 +15,17 @@
 //! | [`Drain::hand_over`] | the server has given its roles away; readiness stays ready and stops asking its probes ([`Readiness::set_handed_over`]) | nothing |
 //! | [`Drain::unready`] | `/readyz` and the health service answer not ready | nothing |
 //! | [`Drain::goaway`] | the REAPI listener is sent GOAWAY and stops accepting | nothing |
+//! | [`Drain::announce`] | `/readyz` and the health service answer not ready; everything is still served ([`Phase::LbWait`]) | nothing |
 //!
 //! [`Drain::begin`] is the stop signal's path: `unready`, `refuse` and `goaway`, once.
 //! The second and later calls change nothing, so a signal that arrives after the
 //! endpoint (or the endpoint called twice) is a no-op. [`Drain::close`] is the
 //! escalation: it ends every stream that is not done UNAVAILABLE, and is what the
 //! shutdown timeout and a second signal call.
+//!
+//! A frontend over a state store does not call [`Drain::begin`] at once: it runs the drain
+//! as a sequence ([`crate::sequence`]), which [`Drain::announce`]s first, waits for the load
+//! balancer to see it, and only then begins. [`Drain::phase`] says where it is.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -32,6 +37,22 @@ use tokio::sync::{oneshot, watch};
 use crate::health::Readiness;
 use crate::stop::Stop;
 
+/// Where a drain is, as `GET /v1/frontend/drain` reports it (`phase`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// No drain has begun.
+    Serving,
+    /// `/readyz` answers 503 and everything is still served: calls, uploads, open streams
+    /// and new Execute calls, until the load balancer's health check has seen the 503.
+    LbWait,
+    /// New Execute calls are refused, the frontend takes no more work, and every listener
+    /// has been sent GOAWAY; open executions run on until they are done or the deadline.
+    Draining,
+    /// The streams that are left are being closed UNAVAILABLE; the process exits next.
+    Closing,
+}
+
 /// What `GET /v1/frontend/drain` answers, and what a drain reports after it begins.
 ///
 /// `open_executions` and `queued_operations` together tell an orchestrator which kind of
@@ -39,8 +60,11 @@ use crate::stop::Stop;
 /// worker to run it is waiting, not running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct DrainStatus {
-    /// A drain has begun (by a signal or the endpoint) and will not be undone.
+    /// A drain has begun (by a signal or the endpoint) and will not be undone: the phase
+    /// is any but `serving`.
     pub draining: bool,
+    /// Where the drain is.
+    pub phase: Phase,
     /// Execute and WaitExecution operation streams open (`kbf_front_open_executions`).
     pub open_executions: u64,
     /// Operations in the scheduler's queue, not yet leased to a worker.
@@ -62,6 +86,12 @@ pub struct Drain {
     readiness: std::sync::Arc<Readiness>,
     stages: Mutex<Stages>,
     began: AtomicBool,
+    /// [`Drain::announce`] has been called: the phase is `lb_wait` until GOAWAY is sent.
+    announced: AtomicBool,
+    /// A frontend's drain sequence runs, or has run ([`Drain::sequence_began`]).
+    sequenced: AtomicBool,
+    /// Given when the drain sequence is over ([`Drain::sequence_ended`]).
+    finished: Stop,
     /// Given by the first [`Drain::goaway`]: [`Drain::begun`] completes on it, and the
     /// listeners registered with [`Drain::begins`] are closed by it.
     started: Stop,
@@ -85,6 +115,9 @@ impl Drain {
                 goaway: Some(goaway),
             }),
             began: AtomicBool::new(false),
+            announced: AtomicBool::new(false),
+            sequenced: AtomicBool::new(false),
+            finished: Stop::new(),
             started: Stop::new(),
             closed: watch::Sender::new(false),
         };
@@ -133,6 +166,53 @@ impl Drain {
     #[must_use]
     pub fn is_unready(&self) -> bool {
         self.readiness.is_stopping()
+    }
+
+    /// The first step of a frontend's drain sequence ([`crate::sequence`]): `/readyz` and the
+    /// health service answer not ready and [`Drain::phase`] reads [`Phase::LbWait`], while
+    /// everything is still served, so that a load balancer's health check sees the 503
+    /// before any call is refused. Returns whether this call was the first.
+    pub fn announce(&self) -> bool {
+        self.readiness.stop();
+        !self.announced.swap(true, Ordering::SeqCst)
+    }
+
+    /// Where the drain is: [`Phase::Closing`] once [`Drain::close`] has been called, else
+    /// [`Phase::Draining`] once GOAWAY has been sent, else [`Phase::LbWait`] once
+    /// [`Drain::announce`] has been called, else [`Phase::Serving`].
+    #[must_use]
+    pub fn phase(&self) -> Phase {
+        if *self.closed.borrow() {
+            Phase::Closing
+        } else if self.is_draining() {
+            Phase::Draining
+        } else if self.announced.load(Ordering::SeqCst) {
+            Phase::LbWait
+        } else {
+            Phase::Serving
+        }
+    }
+
+    /// Marks that a frontend's drain sequence runs. Returns whether this call was the
+    /// first, which is the one that runs it.
+    pub(crate) fn sequence_began(&self) -> bool {
+        !self.sequenced.swap(true, Ordering::SeqCst)
+    }
+
+    /// Whether a drain sequence runs, or has run.
+    pub(crate) fn is_sequenced(&self) -> bool {
+        self.sequenced.load(Ordering::SeqCst)
+    }
+
+    /// Says the drain sequence is over: its last step has run.
+    pub(crate) fn sequence_ended(&self) {
+        self.finished.fire();
+    }
+
+    /// Completes once the drain sequence is over ([`Drain::sequence_ended`]), and never if
+    /// none runs.
+    pub(crate) async fn sequence_finished(&self) {
+        self.finished.fired().await;
     }
 
     /// Sends the REAPI listener GOAWAY: it stops accepting and the serving future
@@ -506,6 +586,67 @@ mod tests {
         assert!(!drain.begin(), "GOAWAY was sent twice");
         assert!(closing.draining());
         assert!(readiness.is_stopping());
+    }
+
+    /// Asserts that the phase follows the stages of the drain: serving until `announce`;
+    /// `lb_wait` after it, with `/readyz` not ready and nothing refused or sent GOAWAY;
+    /// draining once GOAWAY is sent; closing once `close` is called. A second `announce` is
+    /// not a first.
+    #[test]
+    fn the_phase_follows_the_stages_of_the_drain() {
+        let (drain, closing, readiness, mut goaway) = fresh();
+        assert_eq!(drain.phase(), Phase::Serving);
+        assert!(drain.announce());
+        assert_eq!(drain.phase(), Phase::LbWait);
+        assert!(readiness.is_stopping(), "announced and still ready");
+        assert!(!closing.draining(), "announcing refused calls");
+        assert!(goaway.try_recv().is_err(), "announcing sent GOAWAY");
+        assert!(!drain.announce(), "a second announce was a first");
+        assert!(drain.begin());
+        assert_eq!(drain.phase(), Phase::Draining);
+        drain.close();
+        assert_eq!(drain.phase(), Phase::Closing);
+    }
+
+    /// Asserts that a drain begun with no announcement (a signal on a server with no state
+    /// store, or `POST` on one) is draining at once, and that a close is closing whatever
+    /// came before it.
+    #[test]
+    fn a_drain_that_was_not_announced_is_draining_at_once() {
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        assert!(drain.begin());
+        assert_eq!(drain.phase(), Phase::Draining);
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        drain.close();
+        assert_eq!(drain.phase(), Phase::Closing);
+    }
+
+    /// Asserts that the phase is written as the operator API documents it: in lower case
+    /// with an underscore.
+    #[test]
+    fn the_phases_are_named_as_the_api_documents_them() {
+        let name = |phase: Phase| serde_json::to_string(&phase).expect("JSON");
+        assert_eq!(name(Phase::Serving), "\"serving\"");
+        assert_eq!(name(Phase::LbWait), "\"lb_wait\"");
+        assert_eq!(name(Phase::Draining), "\"draining\"");
+        assert_eq!(name(Phase::Closing), "\"closing\"");
+    }
+
+    /// Asserts that the sequence marks are what the frontend relies on: only the first
+    /// `sequence_began` is a first, `is_sequenced` follows it, and `sequence_finished`
+    /// completes after `sequence_ended` and not before.
+    #[tokio::test(start_paused = true)]
+    async fn the_sequence_is_marked_once_and_finishes_when_it_ends() {
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        assert!(!drain.is_sequenced());
+        assert!(drain.sequence_began());
+        assert!(!drain.sequence_began(), "a second trigger began it again");
+        assert!(drain.is_sequenced());
+        let one = std::time::Duration::from_secs(1);
+        let waiting = tokio::time::timeout(one, drain.sequence_finished());
+        assert!(waiting.await.is_err(), "finished before the end");
+        drain.sequence_ended();
+        drain.sequence_finished().await;
     }
 
     /// Catches a `stop` or `set_handed_over` that reports "first" every time, and one

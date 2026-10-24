@@ -42,6 +42,7 @@ use crate::members_rpc::MembershipService;
 use crate::object_store::delivery::Delivery;
 use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
+use crate::stop::Stop;
 use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
@@ -145,7 +146,7 @@ impl Default for StreamTiming {
 
 /// How long, after the shutdown timeout ends the open streams UNAVAILABLE, the server
 /// waits for the clients to take it before it stops.
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
 /// (see [`crate::identity`]).
@@ -286,6 +287,34 @@ where
             Ok(())
         }),
     }
+}
+
+/// [`serve_api`] for an operator API that is sent GOAWAY and goes on answering. When
+/// `goaway` is fired every connection open is sent GOAWAY and finishes the requests it is
+/// answering, while the listener keeps accepting: a second server takes over the socket
+/// (`listeners` are two handles on one, [`crate::listen::Socket::http_pair`]) and serves
+/// until `stop`, so that a drain stays readable (`GET /v1/frontend/drain`, `/readyz`) until
+/// the process ends. A connection accepted in the moment of the change may be sent GOAWAY at
+/// once. The first server ends only at `goaway`, so what ends the operator API fires `goaway`
+/// as well as `stop`. Without a listener it only waits for `stop`.
+pub(crate) async fn serve_api_goaway(
+    listeners: Option<(tokio::net::TcpListener, tokio::net::TcpListener)>,
+    routes: axum::Router,
+    goaway: Stop,
+    stop: impl Future<Output = ()> + Send + 'static,
+    proxy: Option<Arc<ProxySecret>>,
+) -> std::io::Result<()> {
+    let Some((first, second)) = listeners else {
+        stop.await;
+        return Ok(());
+    };
+    let before = serve_api(Some(first), routes.clone(), goaway.fired(), proxy.clone());
+    let after = async {
+        goaway.fired().await;
+        serve_api(Some(second), routes, stop, proxy).await
+    };
+    let (before, after) = tokio::join!(before, after);
+    before.and(after)
 }
 
 /// Turns Nagle's algorithm off on a connection the operator API accepted, as [`bind`]

@@ -84,6 +84,10 @@ invocation-memory = 268435456
 [listener]
 # The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
 # api-listen = "API_LISTEN"
+# The longest, in seconds, a drain waits for the open executions to finish after it has refused new ones. Those still open then are ended UNAVAILABLE, the daemons' worker streams end and the process exits. Buck2 does not recover a stream that breaks mid-action, so an action that runs longer than this fails: update in a quiet window, or set it above the longest action. At least 1.
+drain-deadline = 900
+# How long, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) keeps serving everything after `/readyz` has begun to answer 503, so that the load balancer's health check sees it before any call is refused: at least its check interval times its unhealthy threshold, and the time its routes take to change. Then new Execute calls are refused UNAVAILABLE and every listener is sent GOAWAY. 0 goes on at once. The container's stop timeout must exceed this and --drain-deadline.
+drain-lb-wait = 10
 # How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
 http2-keepalive-interval-secs = 30
 # How long, in seconds, a PING may go unanswered before the connection is closed

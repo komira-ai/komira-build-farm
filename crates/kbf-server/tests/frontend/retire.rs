@@ -17,7 +17,7 @@ use tonic::Code;
 use super::*;
 
 /// Waits until `look` says yes, for at most twenty seconds.
-async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
+pub(super) async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
     for _ in 0..1000 {
         if look().await {
             return;
@@ -27,13 +27,13 @@ async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
     panic!("never happened: {what}");
 }
 
-async fn readyz(api: SocketAddr) -> u16 {
+pub(super) async fn readyz(api: SocketAddr) -> u16 {
     get(api, "/readyz").await.0
 }
 
 /// One request and its answer, bounded: a process that never answers fails the test
 /// instead of hanging it.
-async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
+pub(super) async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
     let exchanged = async {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         stream.write_all(request.as_bytes()).await.expect("send");
@@ -80,7 +80,7 @@ async fn refused(addr: SocketAddr) -> bool {
 }
 
 /// The code an Execute is refused with, however it is surfaced.
-async fn execute_refused(client: &Client, job: &Job) -> Option<Code> {
+pub(super) async fn execute_refused(client: &Client, job: &Job) -> Option<Code> {
     match client.execute_with(&job.action, false).await {
         Err(status) => Some(status.code()),
         Ok(mut ops) => match ops.message().await {
@@ -90,13 +90,13 @@ async fn execute_refused(client: &Client, job: &Job) -> Option<Code> {
     }
 }
 
-/// A frontend serving in this test, until `stop` is dropped.
-struct Member {
-    reapi: SocketAddr,
-    worker: SocketAddr,
-    api: SocketAddr,
-    stop: oneshot::Sender<()>,
-    served: JoinHandle<Result<(), ServeError>>,
+/// A frontend serving in this test, until its stop signal is given.
+pub(super) struct Member {
+    pub(super) reapi: SocketAddr,
+    pub(super) worker: SocketAddr,
+    pub(super) api: SocketAddr,
+    stop: Option<oneshot::Sender<()>>,
+    pub(super) served: JoinHandle<Result<(), ServeError>>,
 }
 
 impl Member {
@@ -114,14 +114,19 @@ impl Member {
             reapi,
             worker,
             api: api.expect("the operator API"),
-            stop,
+            stop: Some(stop),
             served: tokio::spawn(handle.serve()),
         }
     }
 
+    /// Gives the frontend its stop signal, as SIGTERM does, and goes on at once.
+    pub(super) fn signal(&mut self) {
+        drop(self.stop.take());
+    }
+
     /// Stops the frontend and waits until it has ended.
-    async fn stop(self) {
-        drop(self.stop);
+    async fn stop(mut self) {
+        self.signal();
         let ended = tokio::time::timeout(Duration::from_secs(30), self.served).await;
         let served = ended.expect("the frontend ends").expect("its task");
         served.expect("served without an error");
@@ -164,9 +169,9 @@ impl Drop for Database {
 
 /// Two frontends started over one Postgres database, a storage node they share, and a handle
 /// of the test's own on the database.
-struct Pair {
-    a: Member,
-    b: Member,
+pub(super) struct Pair {
+    pub(super) a: Member,
+    pub(super) b: Member,
     store: Arc<PostgresStore>,
     _node: Node,
     _scratch: Scratch,
@@ -175,13 +180,23 @@ struct Pair {
 }
 
 impl Pair {
+    /// Two frontends that drain without the load balancer's wait (`--drain-lb-wait=0`), as a
+    /// test that stops them has no load balancer to wait for.
     async fn start(name: &str) -> Self {
+        Self::start_with(name, &["--drain-lb-wait=0"]).await
+    }
+
+    /// Two frontends given the flags `more` besides the ones every test gives.
+    pub(super) async fn start_with(name: &str, more: &[&str]) -> Self {
         let node = Node::start().await;
         let scratch = Scratch::new(name);
         let token = scratch.token_flag();
         let database = Database::new();
         let storage = format!("--storage=http://{}", node.addr);
-        let mut given = flags(&[&storage, &token, "--heartbeat-interval-ms=100"]).expect("flags");
+        let mut argv = vec![storage.as_str(), token.as_str()];
+        argv.push("--heartbeat-interval-ms=100");
+        argv.extend_from_slice(more);
+        let mut given = flags(&argv).expect("flags");
         // The flag refuses a URL that carries a password, which the test server's does.
         let uri: StateStoreUri = database.url().parse().expect("a state store URL");
         given.server.state_store = Some(uri);
@@ -199,12 +214,12 @@ impl Pair {
     }
 
     /// How many rows the schema holds under `prefix`.
-    fn count(&self, prefix: &str) -> usize {
+    pub(super) fn count(&self, prefix: &str) -> usize {
         self.store.scan_prefix(prefix).expect("scan").len()
     }
 
     /// Stops both frontends.
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         for member in [self.a, self.b] {
             member.stop().await;
         }
@@ -212,7 +227,7 @@ impl Pair {
 }
 
 /// The header that carries the operator API's token.
-fn bearer() -> String {
+pub(super) fn bearer() -> String {
     format!("Authorization: Bearer {TOKEN}\r\n")
 }
 
@@ -239,7 +254,7 @@ async fn retire(api: SocketAddr) -> (u16, Value) {
 }
 
 /// The operations in the scheduler's queue of the frontend at `api`.
-async fn queued(api: SocketAddr) -> u64 {
+pub(super) async fn queued(api: SocketAddr) -> u64 {
     let (_, drain) = get(api, "/v1/frontend/drain").await;
     drain["queued_operations"].as_u64().expect("a count")
 }

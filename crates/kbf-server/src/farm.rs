@@ -314,6 +314,10 @@ struct State {
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
+    /// A drain closed this farm's intake ([`Farm::close_intake`]): it takes in no queued
+    /// work of the other frontends and places none on its nodes, and goes on with what it
+    /// holds.
+    closed: bool,
     /// For each operation this farm's callers wait on ([`Farm::follow`]) that the last
     /// looks found neither unfinished nor ended, how many looks in a row. Only logged:
     /// no look count ends a caller's wait.
@@ -429,6 +433,7 @@ impl Farm {
                 session_ok: BTreeMap::new(),
                 unclaimed: BTreeMap::new(),
                 fenced: false,
+                closed: false,
                 untraced_kept: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
                 unwritten_floors: Vec::new(),
@@ -1291,6 +1296,7 @@ impl State {
     /// placement follows at once), and carries out the effects in order. Returns the
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+        self.hold_placements(now);
         self.watch_store(now);
         self.claim_pending(now);
         self.reserve_seqs();
@@ -1301,6 +1307,7 @@ impl State {
             event,
             Event::Tick | Event::Heartbeat { .. } | Event::Report { .. }
         );
+        let event = self.held_event(event);
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
         self.log_requeues();
