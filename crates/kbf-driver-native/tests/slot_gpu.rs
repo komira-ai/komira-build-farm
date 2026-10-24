@@ -121,6 +121,8 @@ async fn a_pool_user_under_the_slot_profile_runs_a_compute_kernel() {
 /// for every lease; this shows a GPU run does not put anything where it does not. (On the
 /// hosted runner the run left three entries in the cache folder and one in the temporary
 /// folder, so the check is not vacuous there.)
+/// A directory the system placed there (Metal's own cache folders carry `sunlnk`) is kept
+/// by the clean, emptied, so the folders must hold no file or link at any depth, not no name.
 /// The test covers the user's home, cache and temporary folders only: not a Metal process
 /// left running after the lease (the kill at the lease's end is `slot_term`'s), nor a
 /// shader cache kept outside those folders.
@@ -158,8 +160,20 @@ async fn a_gpu_lease_leaves_nothing_in_the_slot_users_folders() {
         .filter_map(|l| l.split_whitespace().nth(2).map(PathBuf::from))
         .collect();
     assert_eq!(folders.len(), 2, "the cache and temporary folders: {out}");
-    support::pool::wait_until("the slot's folders are empty again", || {
-        folders.iter().all(|f| held(f).is_empty())
+    // Every file, link and other non-directory below `dir`: what the clean must remove.
+    fn files_below(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => found.extend(files_below(&path)),
+                _ => found.push(path),
+            }
+        }
+        found
+    }
+    support::pool::wait_until("the slot's folders hold no file again", || {
+        folders.iter().all(|f| files_below(f).is_empty())
     });
     assert_eq!(held(&home), home_before, "the home");
 }

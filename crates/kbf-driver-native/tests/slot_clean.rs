@@ -479,6 +479,8 @@ async fn lease_planting<T>(
     (ran.expect("the lease ran"), planted)
 }
 
+#[path = "slot_clean/keychain.rs"]
+mod keychain;
 #[path = "slot_clean/single_pass.rs"]
 mod single_pass;
 #[path = "slot_clean/steps_needed.rs"]

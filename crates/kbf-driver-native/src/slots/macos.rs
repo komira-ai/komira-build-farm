@@ -251,6 +251,7 @@ fn mac_cleaner(
             grace,
             pool: pool.clone(),
             judged: probe::OwnLabels::default(),
+            program: &program,
         };
         let run = || match skipped {
             None => clean::clean(&slot),

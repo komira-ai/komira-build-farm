@@ -145,3 +145,28 @@ pub(crate) fn clear_dir_flags(dir: &OwnedFd, mask: u32) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Whether the directory `name` of `dir` (not followed if it is a link) has the extended
+/// attribute `attr`; false if it cannot be opened.
+pub(crate) fn dir_has_xattr(dir: &OwnedFd, name: &std::ffi::OsStr, attr: &std::ffi::CStr) -> bool {
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK
+        | rustix::fs::OFlags::CLOEXEC;
+    let Ok(child) = rustix::fs::openat(dir, name, flags, rustix::fs::Mode::empty()) else {
+        return false;
+    };
+    // SAFETY: `child` is an open descriptor this function owns; `attr` is NUL-terminated; a
+    // null buffer of size 0 only asks for the size.
+    unsafe {
+        libc::fgetxattr(
+            child.as_raw_fd(),
+            attr.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        ) >= 0
+    }
+}

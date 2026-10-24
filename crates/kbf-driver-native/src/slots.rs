@@ -62,6 +62,10 @@ pub mod clean;
 pub(crate) mod crash;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod domain;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod entry;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod keychain;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -504,6 +508,7 @@ impl Runner {
 pub fn dispatch() -> Option<std::process::ExitCode> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     canary_exit(&args)
+        .or_else(|| entry_exit(&args))
         .map(|code| std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)))
         .or_else(|| as_user_mode(&args))
 }
@@ -529,6 +534,29 @@ fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
     canary::dispatch(args, &canary::RealFs, &mut std::io::stdout())
 }
 
+/// The `/var/folders` entry mode ([`entry::ARG`]) for `args`: its exit code when they
+/// select it. It drops to the pool user inside this process.
+fn entry_exit(args: &[std::ffi::OsString]) -> Option<i32> {
+    entry::dispatch(
+        args,
+        &mut drop_to_pool_user,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// Drops this process to the pool user `uid`:`gid`, with no supplementary groups.
+#[cfg(target_os = "macos")]
+fn drop_to_pool_user(uid: u32, gid: u32) -> Result<(), String> {
+    kbf_mac_session::macos::gui::drop_to(uid, gid)
+}
+
+/// Drops this process to the pool user: only macOS has pool users.
+#[cfg(not(target_os = "macos"))]
+fn drop_to_pool_user(_uid: u32, _gid: u32) -> Result<(), String> {
+    Err("pool users exist on macOS only".to_owned())
+}
+
 /// [`dispatch`] for a test binary, which has no `main` of its own: when the arguments
 /// ask for the mode, runs it and exits (with 127 whatever went wrong: the mode returns
 /// only when it did not execute the program, and has said why on stderr). Called by
@@ -537,6 +565,7 @@ fn canary_exit(args: &[std::ffi::OsString]) -> Option<i32> {
 pub fn hook() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let _ = canary_exit(&args).map(|code| std::process::exit(code));
+    let _ = entry_exit(&args).map(|code| std::process::exit(code));
     let _ = as_user_mode(&args).map(|_| std::process::exit(127));
 }
 
@@ -565,6 +594,18 @@ macro_rules! as_user_test_hook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off macOS the entry mode is selected and the drop to a pool user refuses.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_entry_mode_refuses_to_drop_to_a_pool_user_off_macos() {
+        let args: Vec<std::ffi::OsString> = ["kbf-daemon", entry::ARG, "empty", "5", "5", "/x"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(entry_exit(&args), Some(126));
+        assert_eq!(entry_exit(&args[..1]), None);
+    }
 
     fn user(name: &str, uid: u32, gid: u32) -> SlotUser {
         SlotUser {

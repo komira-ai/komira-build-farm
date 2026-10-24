@@ -654,10 +654,10 @@ pub(crate) fn entry_lines(
         if facts.uid != uid {
             lines.push(format!("{name}: owned by {}", facts.uid));
         }
-        if probe::unrestored(facts.flags) {
-            lines.push(format!("{name}: flags {:#x}", facts.flags));
-        }
-        lines.extend(facts.acl.iter().map(|a| format!("{name}: acl {a}")));
+        // The flags and ACLs of a folder are the system's (root without Full Disk Access
+        // cannot change them, nor the user): recorded like the mode, not asked to be none.
+        lines.push(format!(". {name} flags {:#x}", facts.flags));
+        lines.extend(facts.acl.iter().map(|a| format!(". {name} acl {a}")));
         lines.extend(facts.entries.iter().map(|e| format!("{name}: entry {e}")));
     }
     lines

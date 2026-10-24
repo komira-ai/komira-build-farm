@@ -141,6 +141,15 @@ jobs:
       - run: rustup toolchain install
       - name: The slot clean and its mutants, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      # The test binary, for a run of it on a Mac Studio: a launch daemon without Full
+      # Disk Access, which the hosted runner's agent is not.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: slot-clean-test-darwin-arm64
+          path: target/debug/deps/slot_clean-*
+          retention-days: 14
+          if-no-files-found: error
 
   # SIGTERM before SIGKILL (crates/kbf-driver-native/tests/slot_term.rs): a pool lease whose
   # workload keeps POSIX shared memory and semaphores through a tracker process, ended while

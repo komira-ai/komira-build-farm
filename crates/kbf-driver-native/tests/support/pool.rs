@@ -31,9 +31,36 @@ pub const GID: u32 = 20;
 /// the clean's check would find after the kill. Made if missing, root's, mode 0755.
 pub const HOMES: &str = "/private/var/kbf-ci-homes.noindex";
 
+/// Writes the driver's log to stderr, so a failed clean on a machine prints its reason
+/// (the slot's dirty step and what it found). `RUST_LOG` picks the filter; without it,
+/// warnings of the `kbf` crates.
+pub fn log_to_stderr() {
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{Layer as _, fmt, registry};
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|spec| spec.parse::<Targets>().ok())
+        .unwrap_or_else(|| {
+            Targets::new()
+                .with_target("kbf_driver_native", tracing::Level::WARN)
+                .with_target("kbf_daemon", tracing::Level::WARN)
+                .with_target("kbf_mac_session", tracing::Level::WARN)
+        });
+    let _ = registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        )
+        .try_init();
+}
+
 /// Stops a test run as the runner's user, where every check would fail for the wrong
 /// reason. Asks the kernel, not the code under test.
 pub fn assert_root(test: &str) {
+    log_to_stderr();
     // SAFETY: geteuid takes no arguments and cannot fail.
     let euid = unsafe { libc::geteuid() };
     assert_eq!(

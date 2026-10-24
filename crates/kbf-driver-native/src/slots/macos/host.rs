@@ -19,11 +19,16 @@
 //! - System V IPC: every message queue, shared memory segment and semaphore set
 //!   `ipcs` lists with the user as owner or creator is removed (`ipcrm`). POSIX named
 //!   semaphores and shared memory are not reached: macOS lists them nowhere.
-//! - C6 clears the flags on the home and the entry **first** (`sweep::clear_flags` opens
-//!   each root and clears it before it looks below), removes ACLs of the uid's entries
-//!   (`find -x ... -user <uid> -exec chmod -N`, so a hard link to another owner's file
-//!   keeps its ACL) and sets the owner's `u+rwx`. C7 then empties the home, whoever owns
-//!   what is in it, and the entry, keeping `0`, `C`, `T` and `X` ([`probe::SKELETON`]).
+//! - C6 clears the flags on the home **first** (`sweep::clear_flags` opens each root and
+//!   clears it before it looks below), removes ACLs of the uid's entries (`find -x ...
+//!   -user <uid> -exec chmod -N`, so a hard link to another owner's file keeps its ACL)
+//!   and sets the owner's `u+rwx`. C7 then empties the home, whoever owns what is in it.
+//! - The `/var/folders` entry is cleaned **as the slot's uid**, never as root
+//!   ([`crate::slots::entry`]): the daemon is a launch daemon without Full Disk Access,
+//!   and root cannot clear the flags or ACLs of the entry's `0`, `C`, `T` and `X` nor
+//!   list them, while their owner can. C6 does for the entry what it does for the home,
+//!   by a child that drops to the uid; C7 empties the entry that way, keeping `0`, `C`,
+//!   `T` and `X` ([`probe::SKELETON`]); the check looks at it that way too.
 //! - C10 gives the home back to the user, mode 0700, no flags (made anew if it is gone),
 //!   and the entry's roots what they had when the slot was resolved
 //!   ([`super::Entry`]), without a lock or `hidden`.
@@ -46,7 +51,7 @@ use super::Ready;
 use crate::slots::assertion;
 use crate::slots::clean::{Left, Os, Step};
 use crate::slots::domain::{self, Launchd, Said};
-use crate::slots::{crash, probe};
+use crate::slots::{crash, entry, probe};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const DISKUTIL: &str = "/usr/sbin/diskutil";
@@ -82,6 +87,9 @@ pub struct MacSlot<'a> {
     /// What this clean has judged of launchd's services ([`probe::OwnLabels`]); a clean
     /// reads each service's plist once.
     pub(super) judged: probe::OwnLabels,
+    /// The daemon's binary: the `/var/folders` entry is cleaned by it, as the slot's user
+    /// ([`entry`]).
+    pub(super) program: &'a Path,
 }
 
 /// `launchctl`, run for real: each call is killed at its alarm.
@@ -179,27 +187,25 @@ impl Os for MacSlot<'_> {
                 }
                 joined(failed)
             }
-            Step::Flags => {
-                let mut failed = Vec::new();
-                // The roots first, inside `clear_flags`, then below them.
-                for root in [&ready.home, &ready.folders] {
-                    failed.extend(sweep::clear_flags(root, user.uid).errors);
-                    if let Err(why) = remove_acls(root, user.uid) {
-                        failed.push(why);
-                    }
-                }
-                joined(failed)
-            }
-            Step::Contents => {
-                let mut failed = sweep::empty(&ready.home, user.uid).errors;
-                failed.extend(
-                    sweep::empty_keeping(&ready.folders, user.uid, &probe::SKELETON).errors,
-                );
-                joined(failed)
-            }
+            Step::Flags => entry::flags_step(
+                &self.as_uid(),
+                (&ready.home, &ready.folders),
+                // The home, as root, the root first, then below it.
+                &mut |home| {
+                    let mut failed = sweep::clear_flags(home, user.uid).errors;
+                    failed.extend(remove_acls(home, user.uid).err());
+                    failed
+                },
+                &mut run_child,
+            ),
+            Step::Contents => entry::contents_step(
+                &self.as_uid(),
+                (&ready.home, &ready.folders),
+                &mut run_child,
+            ),
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
             Step::Crashes => joined(crash::sweep(&crash_dirs(), &self.crash_scope())),
-            Step::Restore => restore(ready),
+            Step::Restore => restore(ready, &self.as_uid()),
             Step::Look => {
                 for look in 0..2 {
                     if look > 0 {
@@ -263,35 +269,17 @@ impl Os for MacSlot<'_> {
             Ok(objects) => note(Step::Ipc, format!("{objects:?}")),
             Err(why) => note(Step::Ipc, why),
         }
-        if let Err(why) = home_is_empty(self.ready) {
+        if let Err(why) = home_is_empty(self.ready, &self.as_uid()) {
             note(Step::Contents, why);
         }
-        match list(&self.ready.folders) {
-            Ok(names) => {
-                for name in names
-                    .iter()
-                    .filter(|n| !probe::SKELETON.contains(&n.as_str()))
-                {
-                    note(
-                        Step::Contents,
-                        format!("{}: {name}", self.ready.folders.display()),
-                    );
-                }
-                for folder in names
-                    .iter()
-                    .filter(|n| probe::SKELETON.contains(&n.as_str()))
-                {
-                    let folder = self.ready.folders.join(folder);
-                    let entries = list(&folder);
-                    if !matches!(&entries, Ok(names) if names.is_empty()) {
-                        note(Step::Contents, format!("{}: {entries:?}", folder.display()));
-                    }
+        // As the uid: root cannot look inside the entry's folders.
+        match entry::left(&self.as_uid(), &self.ready.folders, &mut run_child) {
+            Ok(lines) => {
+                for line in lines {
+                    note(Step::Contents, line);
                 }
             }
-            Err(why) => note(
-                Step::Contents,
-                format!("{}: {why}", self.ready.folders.display()),
-            ),
+            Err(why) => note(Step::Contents, why),
         }
         let crashes = crash::found(&crash_dirs(), &self.crash_scope());
         if !crashes.is_empty() {
@@ -309,6 +297,15 @@ impl Os for MacSlot<'_> {
 }
 
 impl MacSlot<'_> {
+    /// The slot's user, as [`entry`] runs the `/var/folders` entry's clean.
+    fn as_uid(&self) -> entry::AsUid<'_> {
+        entry::AsUid {
+            program: self.program,
+            uid: self.ready.user.uid,
+            gid: self.ready.user.gid,
+        }
+    }
+
     /// C9's scope: this slot's uid, and the pool's.
     fn crash_scope(&self) -> crash::Scope {
         crash::Scope {
@@ -360,8 +357,9 @@ pub(super) fn crash_dirs() -> Vec<PathBuf> {
 }
 
 /// C10: the home the user's (made anew where it is gone), mode 0700, no flags; the
-/// entry's root and folders as they were found at the start, with no lock or `hidden`.
-fn restore(ready: &Ready) -> Result<(), String> {
+/// entry's four folders narrowed to the system's modes, as the uid (see [`entry::restore`]). The flags
+/// and ACLs of the entry and its folders are the system's and are never touched.
+fn restore(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let (uid, gid) = (ready.user.uid, ready.user.gid);
     let mut failed = Vec::new();
     let home = match open_dir(&ready.home) {
@@ -372,41 +370,31 @@ fn restore(ready: &Ready) -> Result<(), String> {
     if let Err(why) = home {
         failed.push(format!("{}: {why}", ready.home.display()));
     }
-    match open_dir(&ready.folders) {
-        Ok(root) => {
-            if let Err(why) = set_flags(&root, probe::kept_flags(ready.entry.flags)) {
-                failed.push(format!("{}: {why}", ready.folders.display()));
-            }
-        }
-        Err(why) => failed.push(format!("{}: {why}", ready.folders.display())),
-    }
-    for (name, folder_gid, flags) in &ready.entry.folders {
-        let path = ready.folders.join(name);
-        let result = match open_dir(&path) {
-            Ok(dir) => own(&dir, (uid, *folder_gid, 0o700), probe::kept_flags(*flags)),
-            // The system makes it again, as the user, when it is next asked for.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
-        if let Err(why) = result {
-            failed.push(format!("{}: {why}", path.display()));
-        }
-    }
+    failed.extend(entry::restore(me, &ready.folders, &mut run_child).err());
     joined(failed)
 }
 
-/// Whether the entry's root and folders are as C10 leaves them.
+/// Whether the entry's four folders are as C10 leaves them: the pool user's, and no wider
+/// than the system makes them (`0` and `X` 0755, `C` and `T` 0700).
 fn entry_is_restored(ready: &Ready) -> Result<(), String> {
-    let root = rustix::fs::lstat(&ready.folders)
-        .map_err(|e| format!("{}: {e}", ready.folders.display()))?;
-    if probe::unrestored(root.st_flags) {
-        return Err(format!(
-            "{}: flags {:#x}",
-            ready.folders.display(),
-            root.st_flags
-        ));
+    let mut wrong = Vec::new();
+    for name in probe::SKELETON {
+        let path = ready.folders.join(name);
+        // One the system has not made yet is made, as the user, when it is asked for.
+        let Ok(meta) = rustix::fs::lstat(&path) else {
+            continue;
+        };
+        let has = (meta.st_uid, u32::from(meta.st_mode));
+        if probe::folder_fix(has, ready.user.uid, probe::folder_ceiling(name)) != (false, None) {
+            wrong.push(format!(
+                "{}: owner {} mode {:o}",
+                path.display(),
+                has.0,
+                has.1 & 0o7777
+            ));
+        }
     }
-    Ok(())
+    joined(wrong)
 }
 
 /// The mounts under the home or the entry, unmounted (`diskutil unmount force`, then
@@ -454,6 +442,28 @@ fn remove_acls(root: &Path, uid: u32) -> Result<(), String> {
             "-x", &root, "-user", &uid, "!", "-type", "l", "-exec", CHMOD, "-N", "{}", "+",
         ],
     )
+}
+
+/// [`entry::Run`], for real: `program` with `args`, a plain environment and no input;
+/// what it printed, or why it failed (its status and what it said, the first 4000
+/// characters of it).
+pub(super) fn run_child(program: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
+    let out = Command::new(program)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(format!(
+        "{}: {}: {}",
+        program.display(),
+        out.status,
+        said.trim().chars().take(4000).collect::<String>()
+    ))
 }
 
 /// Whether a sweep was complete.
@@ -542,7 +552,7 @@ fn ipc_of(name: &str, uid: u32) -> Result<Vec<(Ipc, String)>, String> {
 }
 
 /// Whether the home is an empty directory of the user's, mode 0700, without flags.
-fn home_is_empty(ready: &Ready) -> Result<(), String> {
+fn home_is_empty(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let home = &ready.home;
     let want = (ready.user.uid, ready.user.gid, 0o700, 0);
     let found = rustix::fs::lstat(home)
@@ -561,9 +571,11 @@ fn home_is_empty(ready: &Ready) -> Result<(), String> {
             home.display()
         ));
     }
-    match list(home) {
-        Ok(names) if names.is_empty() => Ok(()),
-        entries => Err(format!("{}: {entries:?}", home.display())),
+    // As the uid: root without Full Disk Access cannot look inside the home's `Library`.
+    match entry::left_home(me, home, &mut run_child) {
+        Ok(lines) if lines.is_empty() => Ok(()),
+        Ok(lines) => Err(format!("{}: {lines:?}", home.display())),
+        Err(why) => Err(why),
     }
 }
 
@@ -585,12 +597,21 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 fn own(dir: &OwnedFd, (uid, gid, mode): (u32, u32, u32), flags: u32) -> io::Result<()> {
     set_flags(dir, flags)?;
     strip_xattrs(dir)?;
-    rustix::fs::fchown(
-        dir,
-        Some(rustix::fs::Uid::from_raw(uid)),
-        Some(rustix::fs::Gid::from_raw(gid)),
-    )?;
-    rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    // Only what differs is changed: the entry's folders are the user's already after the
+    // uid-side clean, and root, with no Full Disk Access, may not change them.
+    let now = rustix::fs::fstat(dir)?;
+    let has = (now.st_uid, now.st_gid, u32::from(now.st_mode));
+    let (owner, mode_differs) = probe::ownership_to_change(has, (uid, gid, mode));
+    if owner {
+        rustix::fs::fchown(
+            dir,
+            Some(rustix::fs::Uid::from_raw(uid)),
+            Some(rustix::fs::Gid::from_raw(gid)),
+        )?;
+    }
+    if mode_differs {
+        rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    }
     Ok(())
 }
 

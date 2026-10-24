@@ -617,12 +617,13 @@ async fn a_file_in_an_entry_folder_is_seen_then_cleaned() {
         let file = getconf(user, "DARWIN_USER_TEMP_DIR").join("kbf-assert-leak");
         std::fs::write(&file, b"left").expect("file");
         std::os::unix::fs::chown(&file, Some(user.uid), Some(user.gid)).expect("chown");
-        "T: entry kbf-assert-leak".to_owned()
+        "T: [\"kbf-assert-leak\"]".to_owned()
     })
     .await;
 }
 
-/// Catches an entry probe that does not record the mode of a folder: `0` is made 755.
+/// Catches an entry probe that does not record the mode of a folder: `0` (the system
+/// makes it 755) is made 775, wider than the system's, and the clean narrows it back.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_mode_of_an_entry_folder_is_seen_then_cleaned() {
@@ -634,8 +635,8 @@ async fn a_changed_mode_of_an_entry_folder_is_seen_then_cleaned() {
     };
     red_then_green(control, |user, _| {
         let folder = getconf(user, "DARWIN_USER_DIR");
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        ". 0 mode 755".to_owned()
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+        ". 0 mode 775".to_owned()
     })
     .await;
 }

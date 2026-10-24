@@ -40,7 +40,7 @@ use crate::network::{Isolation, Network};
 use crate::slots::assertion::{self, Facts, Job, Lines, Probe, Reader, Snapshot};
 use crate::slots::clean::Outcome;
 use crate::slots::tool::run_within;
-use crate::slots::{crash, probe};
+use crate::slots::{crash, entry, probe};
 
 const PS: &str = "/bin/ps";
 const LS: &str = "/bin/ls";
@@ -86,6 +86,8 @@ const WARM_UP_LEASE: &str = "/private/var/empty";
 /// Reads one user's probes from the Mac.
 pub(super) struct MacReader<'a> {
     ready: &'a Ready,
+    /// This binary: the home and the entry are looked at by it, as the user.
+    program: &'a Path,
     /// The lease directory, while the slot has one.
     lease: Option<&'a Path>,
     /// launchd's jobs for the uid, read once for the processes and the domain.
@@ -93,11 +95,21 @@ pub(super) struct MacReader<'a> {
 }
 
 impl<'a> MacReader<'a> {
-    pub(super) fn new(ready: &'a Ready, lease: Option<&'a Path>) -> Self {
+    pub(super) fn new(ready: &'a Ready, program: &'a Path, lease: Option<&'a Path>) -> Self {
         Self {
             ready,
+            program,
             lease,
             jobs: OnceLock::new(),
+        }
+    }
+
+    /// The slot's user, as [`entry`] runs its looks.
+    fn as_uid(&self) -> entry::AsUid<'_> {
+        entry::AsUid {
+            program: self.program,
+            uid: self.ready.user.uid,
+            gid: self.ready.user.gid,
         }
     }
 
@@ -171,7 +183,9 @@ impl<'a> MacReader<'a> {
 
     fn home(&self) -> Result<Lines, String> {
         let ready = self.ready;
-        let facts = facts_of(&ready.home)?;
+        let mut facts = facts_without_names(&ready.home)?;
+        // As the user: root without Full Disk Access cannot look inside its `Library`.
+        facts.entries = entry::left_home(&self.as_uid(), &ready.home, &mut host::run_child)?;
         Ok(assertion::home_lines(
             &facts,
             (ready.user.uid, ready.user.gid),
@@ -180,7 +194,7 @@ impl<'a> MacReader<'a> {
 
     fn entry(&self) -> Result<Lines, String> {
         let folders = &self.ready.folders;
-        let (root, names) = facts_and_names(folders)?;
+        let (root, names) = facts_and_names(folders, true)?;
         let mut children = Vec::new();
         for name in names {
             let path = folders.join(&name);
@@ -188,18 +202,19 @@ impl<'a> MacReader<'a> {
                 .map_err(|e| format!("{}: {e}", path.display()))?
                 .is_dir();
             let facts = if is_dir {
-                facts_of(&path)?
+                facts_without_names(&path)?
             } else {
                 Facts::default()
             };
             children.push((name, is_dir, facts));
         }
-        Ok(assertion::entry_lines(
-            &root,
-            &children,
-            &probe::SKELETON,
-            self.ready.user.uid,
-        ))
+        let mut lines =
+            assertion::entry_lines(&root, &children, &probe::SKELETON, self.ready.user.uid);
+        // What is left inside the four folders, as the user (it alone can look, and what it
+        // cannot open is not left).
+        let left = entry::left(&self.as_uid(), folders, &mut host::run_child)?;
+        lines.extend(left.into_iter().map(|l| format!("left {l}")));
+        Ok(lines)
     }
 
     fn shared(&self) -> Result<Lines, String> {
@@ -342,22 +357,22 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 /// What is read of the directory `path` (not following a link): everything through one
 /// descriptor, so that a link put in its place after the open is not followed to list some
 /// other directory.
-fn facts_of(path: &Path) -> Result<Facts, String> {
-    facts_and_names(path).map(|(facts, names)| Facts {
-        entries: names,
-        ..facts
-    })
+fn facts_without_names(path: &Path) -> Result<Facts, String> {
+    facts_and_names(path, false).map(|(facts, _)| facts)
 }
 
-/// [`facts_of`] without the names, and the names of the directory apart.
-fn facts_and_names(path: &Path) -> Result<(Facts, Vec<String>), String> {
+/// [`facts_without_names`] with the names too, if asked, and the names of the directory apart.
+fn facts_and_names(path: &Path, list: bool) -> Result<(Facts, Vec<String>), String> {
     let at = |e: io::Error| format!("{}: {e}", path.display());
     let fd = open_dir(path).map_err(at)?;
     let file = std::fs::File::from(fd);
     let meta = file.metadata().map_err(at)?;
     let fd = OwnedFd::from(file);
     let mut names = Vec::new();
-    for entry in Dir::read_from(&fd).map_err(|e| at(e.into()))? {
+    for entry in Dir::read_from(&fd)
+        .map_err(|e| at(e.into()))?
+        .take_while(|_| list)
+    {
         let entry = entry.map_err(|e| at(e.into()))?;
         let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
@@ -445,7 +460,7 @@ pub(super) fn xattrs_of(fd: &OwnedFd) -> io::Result<Vec<String>> {
 pub(super) fn after_clean(ready: &Ready, program: &Path, clean: &dyn Fn() -> Outcome) -> Outcome {
     let dirty = |why: String| Outcome::Dirty { why };
     if let Some(baseline) = ready.baseline.get() {
-        let reader = MacReader::new(ready, None);
+        let reader = MacReader::new(ready, program, None);
         let red = assertion::assert(&reader, Some(baseline), &assertion::ALL, (&|| false, None));
         return if red.is_empty() {
             Outcome::Clean
@@ -503,8 +518,8 @@ fn warm_up(ready: &Ready, program: &Path, clean: &dyn Fn() -> Outcome) -> Result
     if let Outcome::Dirty { why } = clean() {
         return Err(format!("the clean after {TRUE}: {why}"));
     }
-    let snapshot =
-        assertion::record(&MacReader::new(ready, None)).map_err(|wrong| wrong.join("; "))?;
+    let snapshot = assertion::record(&MacReader::new(ready, program, None))
+        .map_err(|wrong| wrong.join("; "))?;
     tracing::debug!(
         uid = ready.user.uid,
         took = ?started.elapsed(),
@@ -577,10 +592,11 @@ impl Slot {
         (cancel, until): (&Arc<AtomicBool>, Option<Duration>),
     ) -> Result<Lines, RuntimeError> {
         let (book, index) = (Arc::clone(&self.book), self.index);
+        let program = self.program.clone();
         let cancel = Arc::clone(cancel);
         let red = tokio::task::spawn_blocking(move || {
             let ready = book.ready(index);
-            let reader = MacReader::new(ready, lease.as_deref());
+            let reader = MacReader::new(ready, &program, lease.as_deref());
             let stopped = || cancel.load(Ordering::SeqCst);
             let until = until.map(|within| Instant::now() + within);
             assertion::assert(&reader, ready.baseline.get(), probes, (&stopped, until))

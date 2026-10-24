@@ -246,27 +246,43 @@ garbage line
     assert_eq!(mounts_under("", &[home]), Vec::<PathBuf>::new());
 }
 
-/// Catches a check stricter than the restore (a root the system gave `nodump` or `opaque`
-/// restored with them and then found wrong, so every clean of that slot failed), a
-/// restore that gives back a lock or `hidden`, and one that drops the other flags: the
-/// restore and the check agree on the same three bits.
+/// Catches a restore that touches a folder within the system's layout (0 and X at 755 or
+/// narrower, C and T at 700 or narrower), one that widens a folder, and one that leaves a
+/// group or other bit on C or T, or a group or other write on 0 or X.
 #[test]
-fn the_restore_and_its_check_agree_on_the_flags_they_never_leave() {
-    const NODUMP: u32 = 0x1;
-    const UCHG: u32 = 0x2;
-    const UAPPND: u32 = 0x4;
-    const OPAQUE: u32 = 0x8;
-    const HIDDEN: u32 = 0x8000;
-    const ARCHIVED: u32 = 0x10000;
-    let recorded = NODUMP | UCHG | UAPPND | OPAQUE | HIDDEN | ARCHIVED;
-    assert_eq!(kept_flags(recorded), NODUMP | OPAQUE | ARCHIVED);
-    for flags in [NODUMP, OPAQUE, ARCHIVED, 0, kept_flags(recorded)] {
-        assert!(!unrestored(flags), "{flags:#x}");
+fn a_folder_is_narrowed_only_when_it_is_wider_than_the_systems_layout() {
+    assert_eq!((folder_ceiling("0"), folder_ceiling("X")), (0o755, 0o755));
+    assert_eq!((folder_ceiling("C"), folder_ceiling("T")), (0o700, 0o700));
+    // Within: no change, and the file-type bits of a stat mode are not part of the mode.
+    for (name, mode) in [
+        ("0", 0o755),
+        ("0", 0o40755),
+        ("X", 0o700),
+        ("X", 0o750),
+        ("C", 0o700),
+        ("T", 0o500),
+        ("0", 0o655),
+        ("T", 0o40700),
+    ] {
+        let want = folder_fix((501, mode), 501, folder_ceiling(name));
+        assert_eq!(want, (false, None), "{name} {mode:o}");
     }
-    for flags in [UCHG, UAPPND, HIDDEN, recorded] {
-        assert!(unrestored(flags), "{flags:#x}");
-        assert!(!unrestored(kept_flags(flags)), "{flags:#x}");
+    // Wider: narrowed to the bits the ceiling allows, never widened.
+    for (name, mode, to) in [
+        ("0", 0o775, 0o755),
+        ("0", 0o757, 0o755),
+        ("X", 0o777, 0o755),
+        ("C", 0o755, 0o700),
+        ("T", 0o710, 0o700),
+        ("T", 0o770, 0o700),
+        ("C", 0o4700, 0o700),
+    ] {
+        let got = folder_fix((501, mode), 501, folder_ceiling(name));
+        assert_eq!(got, (false, Some(to)), "{name} {mode:o}");
     }
+    // A wrong owner is reported whatever the mode.
+    assert_eq!(folder_fix((0, 0o700), 501, 0o700), (true, None));
+    assert_eq!(folder_fix((0, 0o777), 501, 0o700), (true, Some(0o700)));
 }
 
 /// A scripted uid: `scans` are what the successive scans find (then nothing).
@@ -370,4 +386,19 @@ fn the_program_of_a_job_is_the_line_one_level_in() {
     assert_eq!(program_path(printed), Some("/usr/sbin/cfprefsd"));
     assert_eq!(program_path("x = {\n\t\tprogram = /deeper\n}\n"), None);
     assert_eq!(program_path("x = {\n\tpath = /p\n}\n"), None);
+}
+
+#[test]
+fn the_restore_changes_only_what_differs() {
+    let want = (501, 20, 0o700);
+    assert_eq!(ownership_to_change(want, want), (false, false));
+    // The file-type bits of a stat mode are not part of the mode.
+    assert_eq!(
+        ownership_to_change((501, 20, 0o40700), want),
+        (false, false)
+    );
+    assert_eq!(ownership_to_change((0, 20, 0o700), want), (true, false));
+    assert_eq!(ownership_to_change((501, 0, 0o700), want), (true, false));
+    assert_eq!(ownership_to_change((501, 20, 0o755), want), (false, true));
+    assert_eq!(ownership_to_change((0, 0, 0o755), want), (true, true));
 }

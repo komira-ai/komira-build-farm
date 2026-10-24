@@ -371,8 +371,11 @@ fn the_entry_keeps_its_four_folders_empty_and_nothing_else() {
         lines(&[
             ". owned by 61001:20 mode 755 flags 0x0",
             ". 0 mode 700",
+            ". 0 flags 0x0",
             ". C mode 700",
+            ". C flags 0x0",
             ". T mode 700",
+            ". T flags 0x0",
         ])
     );
     let full = (
@@ -405,13 +408,15 @@ fn the_entry_keeps_its_four_folders_empty_and_nothing_else() {
         lines(&[
             ". owned by 61001:20 mode 755 flags 0x0",
             ". T mode 700",
+            ". T flags 0x0",
             "T: entry leak",
             "stray: not part of the entry",
             "Z: not part of the entry",
             ". 0 mode 700",
             "0: owned by 0",
+            ". 0 flags 0x0",
             ". C mode 700",
-            "C: flags 0x2",
+            ". C flags 0x2",
         ])
     );
 }
