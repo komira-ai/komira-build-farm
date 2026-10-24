@@ -52,6 +52,8 @@ fn blob_path(bytes: &[u8]) -> String {
 struct Fix {
     kbf: Vec<u8>,
     kbf_mode: u32,
+    /// Where the layer holds the program.
+    program: &'static str,
     arch: &'static str,
     os: &'static str,
     user: &'static str,
@@ -71,6 +73,7 @@ impl Fix {
         Fix {
             kbf: b"\x7fELF the kbf built for the commit".to_vec(),
             kbf_mode: 0o755,
+            program: "usr/bin/kbf",
             arch: "amd64",
             os: "linux",
             user: "65532:65532",
@@ -86,7 +89,7 @@ impl Fix {
     fn image(&self) -> Vec<u8> {
         let mut layers = vec![tar_of(&[
             ("etc/ssl/certs/ca-certificates.crt", 0o644, b"roots"),
-            ("usr/bin/kbf", self.kbf_mode, &self.kbf),
+            (self.program, self.kbf_mode, &self.kbf),
         ])];
         for (path, mode, bytes) in &self.later {
             layers.push(tar_of(&[(path, *mode, bytes)]));
@@ -161,10 +164,16 @@ fn world(name: &str, fix: &Fix, kbf: &[u8], platform: Platform) -> (PathBuf, Pat
     (dir, image, tarball)
 }
 
+/// The file name of the frontend image asset.
+fn file_name(commit: &str, platform: Platform) -> String {
+    Image::Frontend.file_name(commit, platform)
+}
+
 fn check(platform: Platform, tarball: &Path) -> Check<'_> {
     Check {
+        image: Image::Frontend,
         platform,
-        kbf_tarball: tarball,
+        reference: Some(Reference::KbfTarball(tarball)),
     }
 }
 
@@ -505,5 +514,125 @@ fn an_image_with_no_kbf_is_named_and_a_truncated_tar_is_refused() {
     assert_eq!(
         problems_of("nokbf", &raw),
         vec!["holds no usr/bin/kbf".to_owned()]
+    );
+}
+
+/// A coordinator image: the program at its own path, its own entrypoint.
+fn coordinator() -> Fix {
+    let mut fix = Fix::new();
+    fix.kbf = b"\x7fELF the kbf-coordinator built for the commit".to_vec();
+    fix.program = "usr/bin/kbf-coordinator";
+    fix.entrypoint = vec!["/usr/bin/kbf-coordinator"];
+    fix
+}
+
+/// The problems of `fix` as the coordinator image for x86_64, held to `reference` when given.
+fn coordinator_problems(name: &str, fix: &Fix, reference: Option<&[u8]>) -> Vec<String> {
+    let dir = scratch(name);
+    let binary = dir.join("kbf-coordinator");
+    std::fs::write(&binary, reference.unwrap_or_default()).expect("binary");
+    let c = Check {
+        image: Image::Coordinator,
+        platform: Platform::LinuxX86_64,
+        reference: reference.map(|_| Reference::Binary(&binary)),
+    };
+    problems(&fix.image(), &c).expect("problems")
+}
+
+/// Asserts that a coordinator image holding the built `kbf-coordinator`, run as a non-root
+/// user with the coordinator's entrypoint, is accepted and written as
+/// `kbf-coordinator-image-<commit>-<platform>.oci.tar` with its line in the sums, and that
+/// one holding other bytes, run as root or started as `kbf` is refused with its own line.
+#[test]
+fn a_coordinator_image_of_the_built_binary_is_accepted_and_another_is_refused() {
+    let fix = coordinator();
+    let dir = scratch("coordinator-good");
+    let binary = dir.join("kbf-coordinator");
+    std::fs::write(&binary, &fix.kbf).expect("binary");
+    let image = dir.join("image.oci.tar");
+    std::fs::write(&image, fix.image()).expect("image");
+    let c = Check {
+        image: Image::Coordinator,
+        platform: Platform::LinuxX86_64,
+        reference: Some(Reference::Binary(&binary)),
+    };
+    let out = dir.join("dist");
+    let printed = asset(&image, COMMIT, &Mode::Add(&out), &c).expect("asset");
+    let name = format!("kbf-coordinator-image-{COMMIT}-linux-x86_64.oci.tar");
+    assert_eq!(
+        std::fs::read(out.join(&name)).expect("asset"),
+        std::fs::read(&image).expect("image")
+    );
+    assert_eq!(printed.first(), Some(&format!("packaged {name}:")));
+    let sums = std::fs::read_to_string(out.join("SHA256SUMS.linux-x86_64")).expect("sums");
+    assert!(sums.ends_with(&format!("  {name}\n")), "{sums}");
+
+    let good = fix.kbf.clone();
+    assert!(coordinator_problems("coordinator-ok", &fix, Some(&good)).is_empty());
+
+    let mut other = coordinator();
+    *other.kbf.last_mut().expect("byte") ^= 1;
+    let got = coordinator_problems("coordinator-differs", &other, Some(&good));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(
+        got[0].starts_with("usr/bin/kbf-coordinator (sha256:")
+            && got[0].contains("is not the built kbf-coordinator"),
+        "{got:?}"
+    );
+
+    let mut root = coordinator();
+    root.user = "0";
+    assert_eq!(
+        coordinator_problems("coordinator-root", &root, Some(&good)).len(),
+        1
+    );
+
+    let mut as_kbf = coordinator();
+    as_kbf.entrypoint = vec!["/usr/bin/kbf", "--mode=frontend"];
+    let got = coordinator_problems("coordinator-entry", &as_kbf, Some(&good));
+    assert_eq!(
+        got,
+        vec![
+            "entrypoint is [\"/usr/bin/kbf\", \"--mode=frontend\"], not [\"/usr/bin/kbf-coordinator\"]"
+                .to_owned()
+        ]
+    );
+}
+
+/// Asserts that the frontend image does not pass as the coordinator's (no
+/// `usr/bin/kbf-coordinator`) nor the coordinator's as the frontend's, and that checking a
+/// coordinator image with no reference (the verify job) still makes the structural checks.
+#[test]
+fn each_image_is_refused_as_the_other_and_a_coordinator_without_a_file_is_checked_alone() {
+    let got = coordinator_problems("frontend-as-coordinator", &Fix::new(), None);
+    assert!(
+        got.contains(&"holds no usr/bin/kbf-coordinator".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        got.iter().any(|g| g.starts_with("entrypoint is")),
+        "{got:?}"
+    );
+
+    let fix = coordinator();
+    let (_, image, tarball) = world(
+        "coordinator-as-frontend",
+        &fix,
+        &fix.kbf,
+        Platform::LinuxX86_64,
+    );
+    let got = problems(
+        &std::fs::read(&image).expect("image"),
+        &check(Platform::LinuxX86_64, &tarball),
+    )
+    .expect("problems");
+    assert!(got.contains(&"holds no usr/bin/kbf".to_owned()), "{got:?}");
+
+    assert!(coordinator_problems("coordinator-alone", &coordinator(), None).is_empty());
+    let mut root = coordinator();
+    root.user = "root";
+    assert_eq!(
+        coordinator_problems("coordinator-alone-root", &root, None).len(),
+        1
     );
 }

@@ -38,8 +38,8 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
 `kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
-([below](#the-kbf-package-deb)), one frontend container image per Linux architecture
-([below](#the-frontend-image-oci)) and one macOS package of `kbf-installer`
+([below](#the-kbf-package-deb)), one frontend and one update coordinator container image per
+Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
 ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
@@ -72,7 +72,7 @@ the guide says. Each tarball holds one member, the binary under its own name. Th
 `kbf-host-install` is signed and checked like the other macOS binaries. `kbf-host-install
 --version` prints its name and package version, which is all the release asks of it.
 
-The packages are the two Linux jobs' debs (two each) and frontend images, and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (two each) and container images (two each), and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -82,6 +82,8 @@ The packages are the two Linux jobs' debs (two each) and frontend images, and th
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job | the same for arm64 |
 | `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf` of the tarball of the same name, which runs `kbf --mode=frontend` as a user that is not root |
 | `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
+| `kbf-coordinator-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf-coordinator` the job built, which runs it as a user that is not root |
+| `kbf-coordinator-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
@@ -476,12 +478,13 @@ needs `kbf-installer` installed first, or both files given to one `apt install .
 sudo apt install ./kbf-installer-<commit>-linux-x86_64.deb ./kbf-<commit>-linux-x86_64.deb
 ```
 
-## The frontend image (OCI)
+## The frontend and coordinator images (OCI)
 
-The frontend ships as a container image for each Linux architecture, a release asset like the
-packages: `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` and
-`kbf-frontend-image-<commit>-linux-arm64.oci.tar`. Each is an OCI image layout in one tar. Nothing
-is pushed to a registry: load the file where the image is to run.
+The frontend and the update coordinator ship as container images for each Linux architecture,
+release assets like the packages: `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` and
+`kbf-frontend-image-<commit>-linux-arm64.oci.tar`, and the same two for `kbf-coordinator-image`.
+Each is an OCI image layout in one tar. Nothing is pushed to a registry: load the file where the
+image is to run.
 
 ```text
 docker image load --input kbf-frontend-image-<commit>-linux-x86_64.oci.tar
@@ -489,30 +492,42 @@ docker image load --input kbf-frontend-image-<commit>-linux-x86_64.oci.tar
 ctr images import kbf-frontend-image-<commit>-linux-x86_64.oci.tar
 ```
 
-The loaded image is named `kbf-frontend:<commit>`. It holds the `kbf` binary the job built and
-attested, unpacked from `kbf-<commit>-<platform>.tar.gz` into the build context, never a rebuild,
-on a distroless `cc` base pinned by digest (`packaging/container/frontend/Dockerfile` says why
-that base). It runs as uid 65532, its entrypoint is `kbf --mode=frontend`, and the configuration
-is a `/etc/kbf/kbf.toml` you mount; the image holds no secret and no address. It declares the ports
-8980, 8981 and 8982 (the defaults of `docs/deploy/kbf-modes.md`). The deployment guide for it will
-be its own page under `docs/deploy/`.
+The loaded images are named `kbf-frontend:<commit>` and `kbf-coordinator:<commit>`. Each holds one
+binary the job built and checked to name the commit, never a rebuild, on a distroless `cc` base
+pinned by digest (`packaging/container/frontend/Dockerfile` says why that base). Each runs as uid
+65532 and holds no secret and no address.
 
-The build is reproducible: the job builds the image twice from the commit's time
+- **Frontend.** The `kbf` unpacked from `kbf-<commit>-<platform>.tar.gz` into the build context.
+  Its entrypoint is `kbf --mode=frontend` and its configuration is a `/etc/kbf/kbf.toml` you
+  mount. It declares the ports 8980, 8981 and 8982 (the defaults of `docs/deploy/kbf-modes.md`).
+- **Coordinator.** The `kbf-coordinator` the job built (it has no tarball of its own), copied
+  into the build context after `build-commit check` showed it names the commit.
+  Its entrypoint is `kbf-coordinator`, with the flags of its mounted files as the default command
+  (`packaging/container/kbf-coordinator/Dockerfile`), and it declares the ports 8443 and 8444.
+
+Both are run as `docs/deploy/containers.md` says.
+
+The build is reproducible: the job builds each image twice from the commit's time
 (`SOURCE_DATE_EPOCH`, with BuildKit's own provenance and SBOM attachments off) and the two files
 must be the same bytes. `cargo xtask pkg-image-asset` lists the image in `SHA256SUMS`, refusing it
 unless:
 
-- `usr/bin/kbf` is, in the layers as they stack, byte for byte the `kbf` in the tarball
-  `kbf-<commit>-<platform>.tar.gz` that `build-commit check-asset` checked for the commit, mode 0755;
+- `usr/bin/kbf` (frontend) is, in the layers as they stack, byte for byte the `kbf` in the tarball
+  `kbf-<commit>-<platform>.tar.gz` that `build-commit check-asset` checked for the commit, mode
+  0755; `usr/bin/kbf-coordinator` is byte for byte the `kbf-coordinator` the job built (`--binary`),
+  mode 0755;
 - its config says Linux and the architecture of the platform, the entrypoint
-  `/usr/bin/kbf --mode=frontend` and a user that is not root;
+  `/usr/bin/kbf --mode=frontend` (frontend) or `/usr/bin/kbf-coordinator`, and a user that is not
+  root;
 - every blob it names is present and hashes to its digest.
 
 It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
-with its bundle `kbf-frontend-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
-and **no SBOM attestation**; the `kbf` it carries has the SBOM of its tarball. The verify job checks
-both offline and runs `cargo xtask pkg-image-asset --verify-only` on the signed file. Verify one
-before loading it, as for the installer's deb above:
+with its bundle `kbf-<service>-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
+and **no SBOM attestation**. The `kbf` of the frontend image has the SBOM of its tarball. The
+coordinator has no tarball and so no SBOM asset yet. The verify job checks both
+offline and runs `cargo xtask pkg-image-asset --verify-only` on each signed file (for the
+coordinator that makes the checks of the image alone: the verify job has not the binary the build
+compared it with). Verify one before loading it, as for the installer's deb above:
 
 ```text
 gh attestation trusted-root > trusted_root.jsonl
@@ -528,8 +543,9 @@ gh attestation verify kbf-frontend-image-<commit>-linux-x86_64.oci.tar \
   --deny-self-hosted-runners
 ```
 
-`beta.yml` loads the x86_64 image of each push into Docker, runs its `kbf --version` and checks
-that the `kbf` in it names the commit and a release build.
+`beta.yml` loads the x86_64 image of each push into Docker, runs its `kbf --version` (and the
+coordinator's `kbf-coordinator --version`) and checks that the binary in it names the commit (and,
+for `kbf`, a release build).
 
 ## The kbf-installer package (pkg, macOS)
 

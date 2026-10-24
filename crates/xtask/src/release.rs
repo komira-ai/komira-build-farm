@@ -253,7 +253,7 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend image,
+/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend or coordinator image,
 /// [`crate::pkg_image_asset`], which exists for the Linux platforms only; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
 /// not one), or the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]).
@@ -274,7 +274,7 @@ fn is_asset_of(name: &str, commit: &str) -> bool {
         !binary.is_empty()
             && platform.is_some()
             && (!is_image
-                || (binary == pkg_image_asset::BINARY
+                || (pkg_image_asset::Image::named(binary).is_some()
                     && matches!(platform, Some(Platform::LinuxX86_64 | Platform::LinuxArm64))))
     })
 }

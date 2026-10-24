@@ -35,7 +35,10 @@ const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `kbf-coordinator`: tells each host's updater which version to run, within per-role limits.
 #[derive(Clone, Debug, Parser)]
-#[command(name = "kbf-coordinator", version)]
+#[command(
+    name = "kbf-coordinator",
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"))
+)]
 pub struct Cli {
     /// Where updaters dial (mutual TLS).
     #[arg(long)]

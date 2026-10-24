@@ -6,7 +6,9 @@
 # tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files. The kbf of each
 # platform also comes with `kbf-<commit>-<platform>.version.json`, the exact bytes its
 # `--version --json` printed on the runner that built it (only a runner of the platform can
-# run its binary).
+# run its binary). The Linux jobs also ship the frontend and the update coordinator as OCI
+# images, `kbf-frontend-image-<commit>-<platform>.oci.tar` and
+# `kbf-coordinator-image-<commit>-<platform>.oci.tar` (docs/artifacts.md).
 #
 # A pull request runs none of it unless it carries the label `needs-artifacts` (add the
 # label to get the files; every build and sums job carries the same condition, so an unlabelled
@@ -249,8 +251,10 @@ jobs:
       - run: cargo cyclonedx --version
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-coordinator --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
+      - name: kbf-coordinator names the commit
+        run: cargo xtask build-commit check "target/$TARGET/release/kbf-coordinator" "$GITHUB_SHA"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: kbf-installer names the commit and a release build
@@ -337,7 +341,22 @@ jobs:
       - name: The two builds of the frontend image are the same bytes
         run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar
       - name: The frontend image is the attested kbf, and is an asset
-        run: cargo xtask pkg-image-asset --image target/image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
+        run: cargo xtask pkg-image-asset --service frontend --image target/image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" --out dist
+      # The coordinator image (packaging/container/kbf-coordinator/Dockerfile) is made the same
+      # way from the `kbf-coordinator` built above, which `build-commit check` has shown names the
+      # commit. It has no tarball of its own, so the image is held to that file.
+      - name: The coordinator image directories
+        run: mkdir -p target/coordinator-image target/coordinator-image-out
+      - name: The coordinator image context holds the built kbf-coordinator
+        run: cp "target/$TARGET/release/kbf-coordinator" target/coordinator-image/kbf-coordinator
+      - name: Build the coordinator image, build 1 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/1.oci.tar,rewrite-timestamp=true" target/coordinator-image
+      - name: Build the coordinator image, build 2 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/2.oci.tar,rewrite-timestamp=true" target/coordinator-image
+      - name: The two builds of the coordinator image are the same bytes
+        run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
+      - name: The coordinator image is the built kbf-coordinator, and is an asset
+        run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -391,8 +410,10 @@ jobs:
       - run: cargo cyclonedx --version
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-coordinator --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
+      - name: kbf-coordinator names the commit
+        run: cargo xtask build-commit check "target/$TARGET/release/kbf-coordinator" "$GITHUB_SHA"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: kbf-installer names the commit and a release build
@@ -476,7 +497,22 @@ jobs:
       - name: The two builds of the frontend image are the same bytes
         run: cmp target/image-out/1.oci.tar target/image-out/2.oci.tar
       - name: The frontend image is the attested kbf, and is an asset
-        run: cargo xtask pkg-image-asset --image target/image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
+        run: cargo xtask pkg-image-asset --service frontend --image target/image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --out dist
+      # The coordinator image (packaging/container/kbf-coordinator/Dockerfile) is made the same
+      # way from the `kbf-coordinator` built above, which `build-commit check` has shown names the
+      # commit. It has no tarball of its own, so the image is held to that file.
+      - name: The coordinator image directories
+        run: mkdir -p target/coordinator-image target/coordinator-image-out
+      - name: The coordinator image context holds the built kbf-coordinator
+        run: cp "target/$TARGET/release/kbf-coordinator" target/coordinator-image/kbf-coordinator
+      - name: Build the coordinator image, build 1 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/1.oci.tar,rewrite-timestamp=true" target/coordinator-image
+      - name: Build the coordinator image, build 2 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-coordinator:$GITHUB_SHA" --file packaging/container/kbf-coordinator/Dockerfile --output "type=oci,dest=target/coordinator-image-out/2.oci.tar,rewrite-timestamp=true" target/coordinator-image
+      - name: The two builds of the coordinator image are the same bytes
+        run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
+      - name: The coordinator image is the built kbf-coordinator, and is an asset
+        run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -744,6 +780,22 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-deb-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-x86_64.deb.sigstore.json"
+      - id: provenance-kbf-frontend-image-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-frontend-image-${{ github.sha }}-linux-x86_64.oci.tar
+      - name: Name the bundle of the frontend image for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-frontend-image-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-frontend-image-${GITHUB_SHA}-linux-x86_64.oci.tar.sigstore.json"
+      - id: provenance-kbf-coordinator-image-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-coordinator-image-${{ github.sha }}-linux-x86_64.oci.tar
+      - name: Name the bundle of the coordinator image for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-coordinator-image-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-coordinator-image-${GITHUB_SHA}-linux-x86_64.oci.tar.sigstore.json"
       - id: provenance-kbf-daemon-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -816,6 +868,22 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-deb-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-${GITHUB_SHA}-linux-arm64.deb.sigstore.json"
+      - id: provenance-kbf-frontend-image-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-frontend-image-${{ github.sha }}-linux-arm64.oci.tar
+      - name: Name the bundle of the frontend image for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-frontend-image-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-frontend-image-${GITHUB_SHA}-linux-arm64.oci.tar.sigstore.json"
+      - id: provenance-kbf-coordinator-image-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-coordinator-image-${{ github.sha }}-linux-arm64.oci.tar
+      - name: Name the bundle of the coordinator image for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-coordinator-image-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-coordinator-image-${GITHUB_SHA}-linux-arm64.oci.tar.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundles-linux
@@ -969,11 +1037,15 @@ jobs:
       - name: The signed linux-x86_64 kbf package holds the attested kbf and the units of the modes
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-x86_64.deb" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
       - name: The signed linux-x86_64 frontend image holds the attested kbf
-        run: cargo xtask pkg-image-asset --verify-only --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
+        run: cargo xtask pkg-image-asset --verify-only --service frontend --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
+      - name: The signed linux-x86_64 coordinator image runs the coordinator as a user that is not root
+        run: cargo xtask pkg-image-asset --verify-only --service coordinator --image "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
       - name: The signed linux-arm64 kbf package holds the attested kbf and the units of the modes
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
       - name: The signed linux-arm64 frontend image holds the attested kbf
-        run: cargo xtask pkg-image-asset --verify-only --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
+        run: cargo xtask pkg-image-asset --verify-only --service frontend --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
+      - name: The signed linux-arm64 coordinator image runs the coordinator as a user that is not root
+        run: cargo xtask pkg-image-asset --verify-only --service coordinator --image "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch

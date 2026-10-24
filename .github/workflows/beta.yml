@@ -112,6 +112,16 @@ jobs:
         run: docker cp kbf-frontend:/usr/bin/kbf "$RUNNER_TEMP/image-bin/kbf"
       - name: The image's kbf names this commit and a release build
         run: cargo xtask build-commit check --json "$RUNNER_TEMP/image-bin/kbf" "$GITHUB_SHA"
+      - name: Load the coordinator image, the release asset
+        run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      - name: The image's kbf-coordinator runs in the image
+        run: docker run --rm "kbf-coordinator:$GITHUB_SHA" --version
+      - name: A container of the coordinator image, to take its kbf-coordinator out of
+        run: docker create --name kbf-coordinator "kbf-coordinator:$GITHUB_SHA"
+      - name: The image's kbf-coordinator, out of the container
+        run: docker cp kbf-coordinator:/usr/bin/kbf-coordinator "$RUNNER_TEMP/image-bin/kbf-coordinator"
+      - name: The image's kbf-coordinator names this commit
+        run: cargo xtask build-commit check "$RUNNER_TEMP/image-bin/kbf-coordinator" "$GITHUB_SHA"
       - name: The program the sample project's actions run, built here
         run: cp target/debug/kbf-m2-act "$RUNNER_TEMP/bin/kbf-m2-act"
       - name: Fetch buck2 (pinned version, checked by SHA-256)

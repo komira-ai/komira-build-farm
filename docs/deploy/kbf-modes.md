@@ -80,7 +80,8 @@ a frontend or all-in-one host, the state database's schema, and the mode's units
 enrollment token and enrolls itself at its first start. A `frontend` or `all-in-one` host
 does not enroll; its certificates and addresses are the operator's, and `setup` takes them as
 flags. A host from the packages can run the same verb as `kbf setup --mode=<mode>` (without the
-proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md).
+proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md). A frontend can also run as
+a container image, with no installer: [containers.md](containers.md).
 
 ## Ports and who dials whom
 

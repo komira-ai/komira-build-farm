@@ -153,6 +153,28 @@ fn the_flags_are_parsed_and_refused_as_the_usage_says() {
     assert_eq!(run(&flags).0, 2);
 }
 
+/// Catches: `--version` not naming the commit the binary was built from, which is what an
+/// image carrying the binary is checked against: the line is `kbf-coordinator
+/// <package version>+<12 hex digits of the commit>` (or `unknown` for a source archive).
+#[test]
+fn the_version_names_the_commit_it_was_built_from() {
+    let (code, out, _) = run(&["--version".to_owned()]);
+    assert_eq!(code, 0);
+    let line = out.trim_end();
+    let rest = line
+        .strip_prefix("kbf-coordinator ")
+        .unwrap_or_else(|| panic!("not `kbf-coordinator <version>`: {line:?}"));
+    let (package, stamp) = rest
+        .split_once('+')
+        .unwrap_or_else(|| panic!("no `+<commit>` after the package version: {line:?}"));
+    assert_eq!(package, env!("CARGO_PKG_VERSION"), "{line:?}");
+    let hex = stamp.len() == 12
+        && stamp
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    assert!(hex || stamp == "unknown", "the stamp is {stamp:?}");
+}
+
 /// Catches: a start that goes on with a file it cannot use: a missing certificate, an
 /// operator token file others can read, a bad allow-list, a state file that is not a state,
 /// and an address in use each stop it with exit 1 and a reason that names the file or flag.

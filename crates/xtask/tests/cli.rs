@@ -726,6 +726,8 @@ fn pkg_image_asset_refuses_a_file_that_is_not_an_image_both_when_adding_and_when
             "pkg-image-asset".to_owned(),
             "--image".to_owned(),
             path(&image),
+            "--service".to_owned(),
+            "frontend".to_owned(),
             "--platform".to_owned(),
             "linux-x86_64".to_owned(),
             "--commit".to_owned(),
@@ -740,4 +742,63 @@ fn pkg_image_asset_refuses_a_file_that_is_not_an_image_both_when_adding_and_when
         assert!(err.contains("holds no kbf"), "{err}");
     }
     assert!(!out.join("SHA256SUMS.linux-x86_64").exists());
+}
+
+#[test]
+fn pkg_image_asset_wants_the_reference_of_its_service_and_no_other() {
+    // Catches: a coordinator image checked against nothing when adding (the build's file
+    // forgotten), a frontend image checked against a bare binary and not the attested
+    // tarball, and `--verify-only` of a coordinator image given a file the verify job lacks.
+    let root = scratch("image-asset-flags");
+    let image = root.join("image.oci.tar");
+    std::fs::write(&image, b"not a tar").expect("image");
+    let file = root.join("file");
+    std::fs::write(&file, b"x").expect("file");
+    let path = |p: &Path| p.to_str().expect("utf8").to_owned();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let out = path(&root.join("dist"));
+    let (image, file) = (path(&image), path(&file));
+    let base = |service: &'static str| {
+        vec![
+            "pkg-image-asset",
+            "--image",
+            image.as_str(),
+            "--service",
+            service,
+            "--platform",
+            "linux-x86_64",
+            "--commit",
+            commit,
+        ]
+    };
+    let run = |extra: &[&str], service: &'static str| {
+        let mut args = base(service);
+        args.extend_from_slice(extra);
+        outcome(xtask(&root, &args).output().expect("run"))
+    };
+    let (code, _, err) = run(&["--binary", &file, "--out", &out], "frontend");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the frontend image is checked against --kbf-tarball"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--out", &out], "coordinator");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the coordinator image is checked against --binary"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--kbf-tarball", &file, "--out", &out], "coordinator");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the coordinator image is checked against --binary"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--binary", &file, "--verify-only"], "coordinator");
+    assert_eq!(code, Some(2), "clap refuses the pair: {err}");
+    // A coordinator image with its binary reaches the check, which refuses a non-image.
+    let (code, _, err) = run(&["--binary", &file, "--out", &out], "coordinator");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("not an OCI image tar"), "{err}");
+    assert!(!root.join("dist").join("SHA256SUMS.linux-x86_64").exists());
 }

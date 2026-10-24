@@ -1,36 +1,36 @@
-# The image of the update coordinator (docs/design/updates.md): the `kbf-coordinator` binary and
-# nothing else. No installer, no updater and no CA key: the coordinator holds only its own
-# certificate and key, the farm CA certificate it checks updaters against, and the desired-state
-# file it writes.
+# The image of the update coordinator (docs/design/updates.md): the `kbf-coordinator` binary the
+# release pipeline built, and nothing else. No installer, no updater and no CA key: the
+# coordinator holds only its own certificate and key, the farm CA certificate it checks updaters
+# against, and the desired-state file it writes.
 #
-# The build context holds the binary, built for the image's platform:
+# The release pipeline builds it for each Linux arch (.github/workflows/artifacts.yml) as the
+# asset `kbf-coordinator-image-<commit>-<platform>.oci.tar`, from the `kbf-coordinator` it built
+# for the commit and checked names it. `cargo xtask pkg-image-asset --service coordinator` refuses
+# the image unless /usr/bin/kbf-coordinator is byte for byte that file. A build by hand, for one
+# arch, from a binary built for it:
 #
-#   cargo build --release --locked -p kbf-coordinator
-#   cp target/release/kbf-coordinator packaging/container/kbf-coordinator/
-#   docker build packaging/container/kbf-coordinator
+#   cp target/release/kbf-coordinator ctx/
+#   docker buildx build --platform linux/<amd64|arm64> -f packaging/container/kbf-coordinator/Dockerfile ctx
 #
-# Nothing builds or publishes this image yet: the release workflow does not package the
-# coordinator (packaging/README.md). The base is pinned by its image index digest, as the
-# images of the package install tests are (packaging/linux/test).
+# The base is the frontend image's (packaging/container/frontend/Dockerfile): distroless `cc` on
+# Debian 13, pinned by its image index digest, with the CA roots the coordinator's https client
+# reads (the OIDC key fetch), no shell and no package manager. Its `nonroot` user, uid 65532, is
+# the user below. The coordinator's DNS name is not in the image: it is the name in the
+# certificate mounted below, and the agents that dial it are given it (`kbf-updater agent
+# --coordinator`, required, no default).
 #
 # Files the orchestrator mounts (the default flags below name them; every flag may be replaced):
 #   /etc/kbf-coordinator/tls.pem, tls.key   the coordinator's certificate (role `coordinator`)
 #   /etc/kbf-coordinator/ca.pem             the farm CA certificate
 #   /etc/kbf-coordinator/oidc.toml          the allow-list of CI's OIDC token
-#   /etc/kbf-coordinator/operator.token     the operator token, owned by uid 10001, mode 0600 or
+#   /etc/kbf-coordinator/operator.token     the operator token, owned by uid 65532, mode 0600 or
 #                                           0400 (the coordinator refuses any other mode)
 #   /var/lib/kbf-coordinator                a volume the coordinator may write: the desired state
-#                                           (a mounted volume replaces the ownership set below:
-#                                           make it uid 10001, mode 0750)
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
-ENV DEBIAN_FRONTEND=noninteractive
-# CI's OIDC keys are fetched over https with the system roots.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin kbf-coordinator \
-    && install -d -o 10001 -m 0750 /var/lib/kbf-coordinator
-COPY kbf-coordinator /usr/bin/kbf-coordinator
-USER 10001
+#                                           (owned by uid 65532, mode 0750)
+# The image holds none of them and no secret.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
+COPY --chmod=0755 kbf-coordinator /usr/bin/kbf-coordinator
+USER 65532:65532
 EXPOSE 8443 8444
 ENTRYPOINT ["/usr/bin/kbf-coordinator"]
 CMD ["--heartbeat-listen=0.0.0.0:8443", "--control-listen=0.0.0.0:8444", \
