@@ -8,7 +8,7 @@ mod support;
 
 use std::time::Duration;
 
-use kbf_tls::{Outcome, Reloads, TlsError, TlsSource, render_metrics};
+use kbf_tls::{Alpn, Outcome, Reloads, TlsError, TlsSource, render_metrics};
 use support::{
     Files, ca, client_leaf, connect, dir, echo, echo_with, ping, put, served, server_leaf, tcp,
     until,
@@ -524,4 +524,46 @@ async fn a_fixed_source_serves_a_replacement_to_new_handshakes() {
     .expect("a source with a client CA");
     let guarded = with_ca.replace(new.cert.as_bytes(), new.key.as_bytes());
     assert!(matches!(guarded, Err(TlsError::Config(_))), "{guarded:?}");
+}
+
+/// A source offers `h2` only unless it is made to offer `http/1.1` too, a fixed one and a
+/// file one alike, and a file source goes on offering what it was made to offer after the
+/// files are replaced.
+#[tokio::test]
+async fn a_source_offers_h2_only_unless_made_to_offer_http1_too() {
+    let ca = ca("alpn CA");
+    let (old, new) = (server_leaf(&ca), server_leaf(&ca));
+    let offered = |source: &TlsSource| source.config().alpn_protocols.clone();
+    let h2 = vec![b"h2".to_vec()];
+    let both = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let plain = TlsSource::fixed("test", old.cert.as_bytes(), old.key.as_bytes(), None)
+        .expect("a fixed source");
+    assert_eq!(offered(&plain), h2);
+    let wide = TlsSource::fixed_alpn(
+        "test",
+        old.cert.as_bytes(),
+        old.key.as_bytes(),
+        None,
+        Alpn::H2AndHttp1,
+    )
+    .expect("a fixed source");
+    assert_eq!(offered(&wide), both);
+    wide.replace(new.cert.as_bytes(), new.key.as_bytes())
+        .expect("a matching pair");
+    assert_eq!(offered(&wide), both);
+
+    let files = Files::write(&dir("alpn-files"), &old, None);
+    assert_eq!(offered(&files.source()), h2);
+    let watched = TlsSource::files_alpn(
+        "test",
+        files.files.clone(),
+        Duration::ZERO,
+        Alpn::H2AndHttp1,
+    )
+    .expect("a file source");
+    assert_eq!(offered(&watched), both);
+    files.install(&new);
+    assert_eq!(watched.reload(), Outcome::Applied);
+    assert_eq!(offered(&watched), both);
 }

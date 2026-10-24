@@ -558,7 +558,7 @@ fn member_answer(
 }
 
 /// The status a failed member write answers with.
-const fn member_failure(e: &MembershipError) -> StatusCode {
+pub(crate) const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
@@ -852,17 +852,27 @@ pub fn write_request(
     let action = match verb {
         "cordon" => NodeAction::Cordon,
         "uncordon" => NodeAction::Uncordon,
-        "drain" if body.is_empty() => NodeAction::Drain(DRAIN_DEADLINE),
-        "drain" => {
-            let drain: DrainBody = serde_json::from_slice(body).map_err(|e| {
-                let why = format!("a drain body is {{\"deadline_secs\": N}}: {e}");
-                (StatusCode::BAD_REQUEST, why)
-            })?;
-            NodeAction::Drain(Duration::from_secs(drain.deadline_secs))
-        }
+        "drain" => drain_action(body)?,
         _ => return Err(unknown()),
     };
     Ok((WorkerId::new(node), action))
+}
+
+/// The drain a request body asks for: [`DRAIN_DEADLINE`] for no body, else the
+/// `{"deadline_secs": N}` it holds.
+///
+/// # Errors
+/// 400 for a body that is not `{"deadline_secs": N}`.
+pub(crate) fn drain_action(body: &[u8]) -> Result<NodeAction, (StatusCode, String)> {
+    if body.is_empty() {
+        return Ok(NodeAction::Drain(DRAIN_DEADLINE));
+    }
+    serde_json::from_slice::<DrainBody>(body)
+        .map(|drain| NodeAction::Drain(Duration::from_secs(drain.deadline_secs)))
+        .map_err(|e| {
+            let why = format!("a drain body is {{\"deadline_secs\": N}}: {e}");
+            (StatusCode::BAD_REQUEST, why)
+        })
 }
 
 /// Whether a `Content-Type` value is `application/json`, in any case, with or without

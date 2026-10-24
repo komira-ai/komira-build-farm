@@ -14,7 +14,6 @@ use crate::daemon::{
     parse_operator_url, run_config, start, start_with, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
-use crate::inventory::{Host, Member, Role};
 use crate::listener::{Activation, Listen};
 use crate::record::RollStore;
 use crate::server::{Recent, Settings};
@@ -74,7 +73,6 @@ fn the_flags_are_required_and_exact() {
         (cfg.proxy_uid, cfg.inventory_owner, cfg.operator_api.port()),
         (993, 0, 8080)
     );
-    assert_eq!(cfg.operator_proxy_auth_file, None);
     assert_eq!(
         (
             cfg.ssh_key_file.to_str(),
@@ -176,16 +174,14 @@ fn the_socket_is_a_flag_or_an_activated_descriptor_and_never_both() {
     );
 }
 
-/// Catches the optional proxy secret file being unread or required.
+/// Asserts that `--operator-proxy-auth-file`, the flag of the secret a frontend behind the
+/// proxy asked for, is an unknown argument now: the roll sends no such secret.
 #[test]
-fn the_operator_proxy_auth_file_is_an_optional_flag() {
+fn the_operator_proxy_auth_file_flag_is_gone() {
     let with = [&FLAGS[..], &["--operator-proxy-auth-file", "/p"]].concat();
-    let cfg = parse(&with).expect("flags");
     assert_eq!(
-        cfg.operator_proxy_auth_file
-            .as_deref()
-            .and_then(|p| p.to_str()),
-        Some("/p")
+        parse(&with).expect_err("gone"),
+        "unknown argument --operator-proxy-auth-file"
     );
 }
 
@@ -406,29 +402,15 @@ fn the_operator_api_must_be_a_loopback_address() {
     }
 }
 
-/// Asserts that `--proxy-admin` is an optional flag that takes a loopback URL as `--operator-api`
-/// does and names itself when it refuses one: absent it is none, given it is read in both
-/// forms, and a non-loopback address, a name and `https` are refused.
+/// Asserts that `--proxy-admin`, the flag of the pool step this roll once had, is an unknown
+/// argument now.
 #[test]
-fn the_proxy_admin_is_an_optional_loopback_flag() {
-    assert_eq!(parse(&FLAGS).expect("flags").proxy_admin, None);
+fn the_proxy_admin_flag_is_gone() {
     let with = [&FLAGS[..], &["--proxy-admin", "http://127.0.0.1:18090"]].concat();
-    let cfg = parse(&with).expect("flags");
-    assert_eq!(cfg.proxy_admin.map(|a| a.port()), Some(18090));
-    let with = [&FLAGS[..], &["--proxy-admin=http://[::1]:18091/"]].concat();
-    let cfg = parse(&with).expect("= form");
-    assert_eq!(cfg.proxy_admin.map(|a| a.port()), Some(18091));
-    let refused = [
-        ("http://192.0.2.5:18090", "loopback"),
-        ("http://localhost:18090", "IP address"),
-        ("https://127.0.0.1:18090", "http://"),
-    ];
-    for (bad, why) in refused {
-        let with = [&FLAGS[..], &["--proxy-admin", bad]].concat();
-        let e = parse(&with).expect_err(bad);
-        assert!(e.starts_with("--proxy-admin must "), "{bad}: {e}");
-        assert!(e.contains(why), "{bad}: {e}");
-    }
+    assert_eq!(
+        parse(&with).expect_err("gone"),
+        "unknown argument --proxy-admin"
+    );
 }
 
 /// A config over a scratch directory with `inventory` and a good token file.
@@ -444,8 +426,6 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         proxy_uid: own_uid(),
         operator_api: api.addr,
         token_file: file(&dir, "token", TOKEN, 0o600),
-        operator_proxy_auth_file: None,
-        proxy_admin: None,
         ssh_key_file: file(&dir, "id_updater", KEY_TEXT, 0o600),
         ssh_user: "kbf".to_owned(),
         channel: "stable".to_owned(),
@@ -496,7 +476,6 @@ fn quick() -> Timing {
         safe_bound: Duration::from_millis(300),
         install_bound: Duration::from_millis(300),
         query_bound: Duration::from_millis(300),
-        healthy_frontend: Duration::from_millis(300),
         healthy_storage: Duration::from_millis(300),
         healthy_daemon: Duration::from_millis(300),
         drain_deadline: Duration::from_millis(300),
@@ -535,14 +514,13 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
     call(socket, "POST", "/v1/updater/rolls", &body.to_string())
 }
 
-/// Asserts that ssh is never run for a frontend that is no pool member: with the binary's own
-/// ports, an all-hosts roll (frontend, storage, daemon) is accepted (202) and fails at the
-/// frontend, before its installer, with the reason that says to list an instance and a base in
-/// the failure. The recording `Exec` is never called (the recorded calls are empty), no later
+/// Asserts that ssh is never run for a frontend: with the binary's own ports, an all-hosts roll
+/// (frontend, storage, daemon) is accepted (202) and fails at the frontend, before its
+/// installer, with the reason that says frontends are not rolled here. The recording `Exec` is never called (the recorded calls are empty), no later
 /// host is asked about (the fake operator API sees no request at all) and the later hosts stay
 /// pending.
 #[test]
-fn an_all_hosts_roll_never_runs_ssh_for_a_frontend_that_is_no_member() {
+fn an_all_hosts_roll_never_runs_ssh_for_a_frontend() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
@@ -565,7 +543,9 @@ fn an_all_hosts_roll_never_runs_ssh_for_a_frontend_that_is_no_member() {
         ("fe", ErrorCode::SwapAbandoned)
     );
     assert!(
-        failure.detail.contains("instance=<name> and base=<port>"),
+        failure
+            .detail
+            .contains(crate::node_health::FRONTEND_REFUSAL),
         "{}",
         failure.detail
     );
@@ -678,62 +658,18 @@ fn an_unknown_role_is_refused_by_the_inventory() {
     }
 }
 
-/// Asserts that an inventory that lists frontend pool members is refused at start-up without
-/// `--proxy-admin`, with the flag named and nothing bound, that it is accepted with the flag,
-/// and that an inventory without members needs no flag.
+/// Asserts that an inventory that still lists a frontend as a pool member (`instance=`,
+/// `base=`) is refused at start-up with the line named and nothing bound.
 #[test]
-fn pool_members_need_the_proxy_admin_flag() {
+fn an_inventory_with_pool_members_is_refused_at_start() {
     let api = fake_api(vec![Some(http(200, "{}"))]);
-    let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n\
-                   fe-b fe.farm.example frontend KEY instance=b base=18010\n";
-    let mut cfg = config("members", members, &api);
-    let e = start(&cfg).err().expect("no admin");
-    assert!(e.contains("--proxy-admin"), "{e}");
-    assert!(e.contains("frontend pool members"), "{e}");
+    let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n";
+    let cfg = config("members", members, &api);
+    let e = start(&cfg).err().expect("refused");
+    assert!(e.starts_with("inventory "), "{e}");
+    assert!(e.contains("line 1"), "{e}");
+    assert!(e.contains("no longer rolls frontends"), "{e}");
     assert!(!sock(&cfg).exists());
-    cfg.proxy_admin = Some(api.addr);
-    let daemon = start(&cfg).expect("start with the flag");
-    daemon.stopper().stop();
-    daemon.wait();
-    let plain = config("no-members", "st1 st1.farm.example storage KEY\n", &api);
-    let daemon = start(&plain).expect("start without members");
-    daemon.stopper().stop();
-    daemon.wait();
-}
-
-/// Asserts that the binary's pool is the proxy's admin API when `--proxy-admin` names it, asked
-/// without the operator token, and a pool that says the flag is missing when it does not, and
-/// that its frontend port is the member's own operator API, asked with the token.
-#[test]
-fn the_binarys_pool_and_frontend_ports_reach_the_proxy_and_the_member() {
-    let admin = fake_api(vec![Some(http(200, "[]"))]);
-    let operator = fake_api(vec![Some(http(200, "{\"commit\":\"0123456789ab\"}"))]);
-    let mut cfg = config("pool", "st1 st1.farm.example storage KEY\n", &operator);
-    let ports = build_ports(&cfg).expect("ports");
-    let e = ports.pool.view().expect_err("no pool");
-    assert!(e.to_string().contains("--proxy-admin"), "{e}");
-    cfg.proxy_admin = Some(admin.addr);
-    let ports = build_ports(&cfg).expect("ports");
-    assert_eq!(ports.pool.view(), Ok(Vec::new()));
-    let asked = admin.requests().remove(0);
-    assert!(asked.starts_with("GET /v1/proxy/upstreams HTTP/1.1\r\n"));
-    assert!(!asked.contains(TOKEN), "{asked}");
-    let host = Host {
-        alias: "fe-a".to_owned(),
-        address: "fe.farm.example".to_owned(),
-        role: Role::Frontend,
-        host_key: KEY.to_owned(),
-        node_id: None,
-        member: Some(Member {
-            instance: "a".to_owned(),
-            base_port: operator.addr.port() - 2,
-        }),
-    };
-    let commit = ports.frontend.commit(&host);
-    assert_eq!(commit, Ok("0123456789ab".to_owned()));
-    let asked = operator.requests().remove(0);
-    assert!(asked.starts_with("GET /healthz HTTP/1.1\r\n"));
-    assert!(asked.contains(&format!("Bearer {TOKEN}")), "{asked}");
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the
@@ -797,8 +733,6 @@ fn the_driver_loop_audits_what_it_cannot_drive_and_goes_on() {
         drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
-        pool: Box::new(crate::fakes::FakePool::new(&log)),
-        frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = Updater::open(
         crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),

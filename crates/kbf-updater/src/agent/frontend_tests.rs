@@ -11,7 +11,7 @@ use std::time::Duration;
 use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
-use super::build::{NO_CREDENTIAL, STORAGE_NEEDS_TOKEN, node_ports};
+use super::build::{NO_CREDENTIAL, node_ports};
 use super::coordinator::{Endpoint, TlsFiles};
 use super::coordinator_tests::{Plan, Seen, http, ok, serve, server_config};
 use super::flags::{Config, NodeApi, Timing};
@@ -23,6 +23,9 @@ use crate::inventory::Role;
 use crate::operator::OperatorApi;
 use crate::ports::PortErrorKind;
 use crate::version::Version;
+
+/// A storage host's own view: its member active on the commit `aaaaaaaaaaaa`, nothing owed.
+const OWN: &str = r#"{"node":"n1","half":"member","member":{"id":1,"state":"active","build_commit":"aaaaaaaaaaaa"},"storage":{"members_active":3,"under_replicated_blobs":0}}"#;
 
 const NODE: &str = r#"{"placement":{"state":"draining"},"leases":["a","b"],"connected":true}"#;
 
@@ -72,6 +75,7 @@ impl Rig {
             channel: "stable".to_owned(),
             helper_socket: self.dir.join("no-helper.sock"),
             frontend: addr.map(|a| Endpoint::parse(&format!("localhost:{}", a.port())).unwrap()),
+            enroll_frontend: None,
             state_dir: None,
             node_api: None,
             timing: Timing::DEFAULT,
@@ -128,7 +132,7 @@ fn the_agent_drains_reads_and_undrains_its_node_with_its_certificate_and_no_toke
         for line in &lines {
             let lower = line.to_ascii_lowercase();
             assert!(
-                !lower.starts_with("authorization") && !lower.contains("x-kbf-proxy-auth"),
+                !lower.starts_with("authorization") && !lower.starts_with("x-kbf-"),
                 "{line}"
             );
         }
@@ -163,8 +167,7 @@ fn a_daemon_hosts_health_is_read_from_its_own_node_through_the_frontend() {
 
 /// What the agent builds from its flags: the token, if it was given, is the way to the frontend
 /// (the opt-in fallback); without it the certificate and `--frontend` are; with neither the
-/// agent refuses. A storage host is never drained and, without the token, cannot judge its
-/// health.
+/// agent refuses.
 #[test]
 fn the_ports_follow_the_flags_the_agent_was_given() {
     let rig = Rig::new("fe-ports");
@@ -192,15 +195,25 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     assert_eq!(drain.drain(&h, Duration::from_secs(1)), Ok(()));
     assert_eq!(server.join().unwrap().len(), 1);
 
+    // A storage host is built the same way: its drain and its health are calls to the frontend
+    // too, and it refuses nothing for want of the token.
+    let (addr, server) = rig.frontend(vec![http("404 Not Found", "", "{}"), ok(OWN)]);
+    let with_frontend = rig.config(Some(addr));
     let (storage_drain, storage_health) =
         node_ports(&with_frontend, &rig.identity(), Role::Storage, &local).unwrap();
+    let st = host(Role::Storage);
+    assert_eq!(storage_health.refusal(&st), None);
+    assert_eq!(storage_drain.drain(&st, Duration::from_secs(1)), Ok(()));
+    let target = Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap();
     assert_eq!(
-        storage_drain.drain(&host(Role::Storage), Duration::from_secs(1)),
-        Ok(())
+        storage_health.check_held(&st, &target),
+        Ok(crate::ports::Health::Healthy)
     );
+    let seen = server.join().unwrap();
+    assert_eq!(head_of(&seen[0]).0[0], "POST /v1/nodes/n1:drain HTTP/1.1");
     assert_eq!(
-        storage_health.refusal(&host(Role::Storage)).unwrap(),
-        STORAGE_NEEDS_TOKEN
+        head_of(&seen[1]).0[0],
+        "GET /v1/nodes/n1/storage-health HTTP/1.1"
     );
 
     // The token, given, wins: the drain goes to the loopback address and the frontend is never
@@ -213,7 +226,6 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     with_token.node_api = Some(NodeApi {
         addr: "127.0.0.1:1".parse().unwrap(),
         token_file: token,
-        proxy_auth_file: None,
     });
     let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, &local).unwrap();
     let err = drain.drain(&h, Duration::from_secs(1)).unwrap_err();

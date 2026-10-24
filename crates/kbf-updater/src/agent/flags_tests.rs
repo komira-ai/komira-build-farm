@@ -55,7 +55,6 @@ fn the_required_flags_make_a_config_with_the_defaults() {
         Some(NodeApi {
             addr: "127.0.0.1:18002".parse::<SocketAddr>().unwrap(),
             token_file: PathBuf::from("/etc/kbf/updater/token"),
-            proxy_auth_file: None,
         })
     );
     assert_eq!(config.helper_socket, PathBuf::from(DEFAULT_HELPER_SOCKET));
@@ -70,8 +69,7 @@ fn the_required_flags_make_a_config_with_the_defaults() {
     assert_eq!(parse_flags(&inline).unwrap(), config);
 }
 
-/// Every optional flag is read: the proxy's secret file, the helper's socket and each of the
-/// times.
+/// Every optional flag is read: the helper's socket and each of the times.
 #[test]
 fn the_optional_flags_are_read() {
     let config = parse_flags(&with(&[
@@ -79,8 +77,6 @@ fn the_optional_flags_are_read() {
         "http://127.0.0.1:18002",
         "--token-file",
         "/etc/kbf/updater/token",
-        "--operator-proxy-auth-file",
-        "/etc/kbf/updater/proxy",
         "--helper-socket",
         "/run/other.sock",
         "--heartbeat-secs",
@@ -95,10 +91,6 @@ fn the_optional_flags_are_read() {
         "60",
     ]))
     .unwrap();
-    assert_eq!(
-        config.node_api.unwrap().proxy_auth_file,
-        Some(PathBuf::from("/etc/kbf/updater/proxy"))
-    );
     assert_eq!(config.helper_socket, PathBuf::from("/run/other.sock"));
     let secs = Duration::from_secs;
     assert_eq!(config.timing.heartbeat, secs(20));
@@ -129,9 +121,13 @@ fn flags_that_are_missing_or_wrong_are_refused_by_name() {
             assert_eq!(err, format!("{flag} is required"));
         }
     }
-    let cases: [(&[&str], &str); 13] = [
+    let cases: [(&[&str], &str); 14] = [
         (&["--frontend", "203.0.113.5:443"], "--frontend:"),
         (&["--frontend", "frontend"], "--frontend:"),
+        (
+            &["--enroll-frontend", "203.0.113.5:443"],
+            "--enroll-frontend:",
+        ),
         (
             &["--state-dir", "/var/lib/kbf-updater"],
             "give --state-dir, or all of",
@@ -175,19 +171,17 @@ fn flags_that_are_missing_or_wrong_are_refused_by_name() {
 }
 
 /// With neither `--operator-api` nor `--token-file` the config has no node API: the agent is
-/// given no credential for the frontend. Giving one without the other, or the proxy secret
-/// alone, is refused.
+/// given no credential for the frontend. Giving one without the other is refused, and the flag
+/// of the proxy secret that once went with them is unknown.
 #[test]
 fn the_operator_credential_is_given_whole_or_not_at_all() {
     assert_eq!(parse_flags(&args(&REQUIRED)).unwrap().node_api, None);
-    for half in [
-        &NODE_API[..2],
-        &NODE_API[2..],
-        &["--operator-proxy-auth-file", "/p"],
-    ] {
+    for half in [&NODE_API[..2], &NODE_API[2..]] {
         let err = parse_flags(&with(half)).unwrap_err();
         assert!(err.contains("given together"), "{half:?}: {err}");
     }
+    let err = parse_flags(&with(&["--operator-proxy-auth-file", "/p"])).unwrap_err();
+    assert_eq!(err, "unknown argument --operator-proxy-auth-file");
 }
 
 const STATE: [&str; 6] = [
@@ -200,11 +194,17 @@ const STATE: [&str; 6] = [
 ];
 
 /// With `--state-dir` the certificate, the key and the CA are the files the enrollment wrote
-/// there, and the agent renews them at the frontend it was told; nothing is placed by hand.
+/// there, and the agent renews them at the enroll listener it was told; nothing is placed by
+/// hand. The node calls go to the worker listener, which is the other address.
 #[test]
-fn a_state_directory_names_the_files_and_the_frontend_renews_them() {
+fn a_state_directory_names_the_files_and_the_enroll_listener_renews_them() {
     let mut words = args(&STATE);
-    words.extend(args(&["--frontend", "frontend.farm.example:443"]));
+    words.extend(args(&[
+        "--frontend",
+        "frontend.farm.example:8981",
+        "--enroll-frontend",
+        "frontend.farm.example:8983",
+    ]));
     let config = parse_flags(&words).unwrap();
     assert_eq!(
         config.state_dir,
@@ -225,26 +225,41 @@ fn a_state_directory_names_the_files_and_the_frontend_renews_them() {
     let frontend = config.frontend.unwrap();
     assert_eq!(
         (frontend.host.as_str(), frontend.port),
-        ("frontend.farm.example", 443)
+        ("frontend.farm.example", 8981)
+    );
+    let enroll = config.enroll_frontend.unwrap();
+    assert_eq!(
+        (enroll.host.as_str(), enroll.port),
+        ("frontend.farm.example", 8983)
     );
     assert_eq!(config.node_api, None, "no token, as shipped");
 }
 
-/// A state directory without a frontend would be a certificate nothing renews, and files placed
-/// by hand beside a state directory would be two answers to where the certificate is: both are
-/// refused. A frontend alone, with placed files, is the drain without a renewal.
+/// A state directory without an enroll listener would be a certificate nothing renews, and
+/// files placed by hand beside a state directory would be two answers to where the certificate
+/// is: both are refused. A frontend alone, with placed files, is the drain without a renewal,
+/// and a state directory with the enroll listener alone is a renewal without the drain.
 #[test]
-fn the_state_directory_goes_with_the_frontend_and_not_with_placed_files() {
+fn the_state_directory_goes_with_the_enroll_listener_and_not_with_placed_files() {
     let err = parse_flags(&args(&STATE)).unwrap_err();
     assert_eq!(
         err,
-        "--state-dir needs --frontend: the certificate is renewed there"
+        "--state-dir needs --enroll-frontend: the certificate is renewed there"
     );
     let mut both = args(&STATE);
-    both.extend(args(&["--frontend", "f.example:443"]));
+    both.extend(args(&["--enroll-frontend", "f.example:8983"]));
+    let renew_only = parse_flags(&both).unwrap();
+    assert_eq!(
+        (
+            renew_only.frontend.is_some(),
+            renew_only.enroll_frontend.is_some()
+        ),
+        (false, true)
+    );
+    both.extend(args(&["--frontend", "f.example:8981"]));
     both.extend(args(&["--ca", "/etc/kbf/updater/ca.pem"]));
     let err = parse_flags(&both).unwrap_err();
     assert!(err.starts_with("give --state-dir, or all of"), "{err}");
-    let placed = parse_flags(&with(&["--frontend", "f.example:443"])).unwrap();
+    let placed = parse_flags(&with(&["--frontend", "f.example:8981"])).unwrap();
     assert_eq!((placed.state_dir, placed.frontend.is_some()), (None, true));
 }

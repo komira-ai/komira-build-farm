@@ -23,7 +23,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::auth::Refusal as AuthRefusal;
 use crate::body::ProxyBody;
 use crate::control::{MAX_UPDATE_BODY, UPDATE_DEADLINE, UpdateHandler, UpdateReply, UpdateRequest};
 use crate::core::{Core, now};
@@ -32,7 +31,6 @@ use crate::metrics::Metrics;
 use crate::pool::BoxIo;
 use crate::reply::{from_update, is_grpc, method_not_allowed, refused, text, unknown};
 use crate::route::{Route, Target, auth_class, route_of, ui_method_allowed};
-use crate::security::Admitted;
 use crate::stream::proxy_child;
 use crate::tls::{Acceptor, Peer, Proto};
 
@@ -107,7 +105,7 @@ impl<U: UpdateHandler + 'static> Service<U> {
         peer: &Peer,
     ) -> Response<ProxyBody> {
         // HTTP/1.1 is checked, and made to look like HTTP/2, before anything reads the request.
-        let mut request = if peer.h1 {
+        let request = if peer.h1 {
             match crate::h1::admit(request) {
                 Ok(request) => request,
                 Err(answer) => return *answer,
@@ -126,7 +124,7 @@ impl<U: UpdateHandler + 'static> Service<U> {
             return method_not_allowed();
         }
         // Who may call it, before the call is counted or forwarded.
-        if let Err(refused) = admit(&self.core, route, &mut request, peer) {
+        if let Err(refused) = admit(&self.core, route, &request, peer) {
             return *refused;
         }
         // Counted from accept: a stream the proxy answers itself is one for its whole life, a
@@ -201,52 +199,23 @@ impl<U: UpdateHandler + 'static> Service<U> {
 fn admit(
     core: &Core,
     route: Route,
-    request: &mut Request<Incoming>,
+    request: &Request<Incoming>,
     peer: &Peer,
 ) -> Result<(), Box<Response<ProxyBody>>> {
     let Some(class) = auth_class(route) else {
         return Ok(());
     };
-    let call = (request.method(), request.uri());
-    let verdict = core.security.authorize_call(
+    let verdict = core.security.authorize(
         class,
-        call,
         request.headers(),
         peer.identity.as_ref(),
         peer.ip,
         now(),
     );
-    match verdict {
-        Ok(Admitted::Credential) => return Ok(()),
-        Ok(Admitted::SelfNode(node)) => {
-            tracing::info!(%node, method = %request.method(), path = request.uri().path(),
-                "host updater: admitted for its own node");
-        }
-        Err(refusal) => {
-            Metrics::inc(&core.metrics.auth_refused);
-            return Err(Box::new(refused(route.grpc(), refusal)));
-        }
-    }
-    // A host updater's call for its node carries the operator token from here on: the child's
-    // gate takes no other credential, and whatever the host sent goes no further than this
-    // proxy.
-    let operator = core
-        .security
-        .tokens
-        .operator
-        .as_ref()
-        .and_then(crate::auth::Token::bearer_header);
-    let Some(operator) = operator else {
+    verdict.map_err(|refusal| {
         Metrics::inc(&core.metrics.auth_refused);
-        return Err(Box::new(refused(
-            route.grpc(),
-            AuthRefusal::PermissionDenied,
-        )));
-    };
-    request
-        .headers_mut()
-        .insert(header::AUTHORIZATION, operator);
-    Ok(())
+        Box::new(refused(route.grpc(), refusal))
+    })
 }
 
 /// The per-connection limits: total, and per client address.

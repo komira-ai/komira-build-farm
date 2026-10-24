@@ -30,13 +30,9 @@ pub struct HttpSafeToStop {
 
 impl HttpSafeToStop {
     /// An adapter for the API at `addr`; see [`OperatorApi::new`] for the files.
-    pub fn new(
-        addr: SocketAddr,
-        token_file: PathBuf,
-        proxy_auth_file: Option<PathBuf>,
-    ) -> Result<HttpSafeToStop, String> {
+    pub fn new(addr: SocketAddr, token_file: PathBuf) -> Result<HttpSafeToStop, String> {
         Ok(HttpSafeToStop {
-            api: OperatorApi::new(addr, token_file, proxy_auth_file)?,
+            api: OperatorApi::new(addr, token_file)?,
         })
     }
 

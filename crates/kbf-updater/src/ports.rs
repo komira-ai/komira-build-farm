@@ -1,8 +1,6 @@
 //! The ports of the roll: everything the state machine asks of the outside world. The real
 //! adapters are [`crate::safe_http`] (safe-to-stop), [`crate::ssh_installer`] (install),
-//! [`crate::node_drain`] (drain), [`crate::node_health`] (health), [`crate::pool_http`] (the
-//! proxy's pool) and [`crate::frontend_http`] (a frontend member's own API).
-//! [`crate::fakes`] has one scripted fake per port.
+//! [`crate::node_drain`] (drain) and [`crate::node_health`] (health). [`crate::fakes`] has one scripted fake per port.
 //!
 //! The traits are synchronous: a roll is one host at a time and waits on each answer, so
 //! there is nothing to overlap, and a caller runs [`crate::Updater::drive`] on its own thread.
@@ -158,13 +156,6 @@ pub trait Installer: Send + Sync {
     fn query(&self, host: &Host) -> Result<Installed, PortError> {
         self.report(host).map(|r| r.installed)
     }
-    /// Restart the frontend unit `name` on a Linux host and return when it is active: `-` is
-    /// the plain frontend unit, anything else an instance name. A package install restarts
-    /// no `kbf` unit, so this is asked for after one. An installer that cannot do it says so,
-    /// and `Err` carries one line for a person otherwise.
-    fn restart_frontend(&self, _host: &Host, _name: &str) -> Result<(), PortError> {
-        Err(PortError::other("unsupported: restart_frontend"))
-    }
 }
 
 /// A shared installer is an installer: the health check asks the host what it runs through
@@ -176,10 +167,6 @@ impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
 
     fn report(&self, host: &Host) -> Result<Report, PortError> {
         (**self).report(host)
-    }
-
-    fn restart_frontend(&self, host: &Host, name: &str) -> Result<(), PortError> {
-        (**self).restart_frontend(host, name)
     }
 }
 
@@ -195,66 +182,6 @@ pub trait Drain: Send + Sync {
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
 }
 
-/// One member of the kbf-proxy pool, as the proxy's admin API lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolMember {
-    /// The name the proxy knows it by: the `instance` of its inventory line.
-    pub name: String,
-    /// It takes no new stream: it was drained, or is in a state this build does not know.
-    pub draining: bool,
-    /// The proxy's probe of it passes.
-    pub ready: bool,
-    /// Streams open on its REAPI listener.
-    pub reapi_streams: u64,
-    /// Streams open on its operator listener.
-    pub operator_streams: u64,
-}
-
-impl PoolMember {
-    /// Whether the proxy gives it new streams and expects them answered: up and ready.
-    pub fn serves(&self) -> bool {
-        !self.draining & self.ready
-    }
-
-    /// The streams a restart would cut: those open on its REAPI and operator listeners.
-    pub fn streams(&self) -> u64 {
-        self.reapi_streams + self.operator_streams
-    }
-}
-
-/// The pool of frontends that kbf-proxy balances over, through its loopback admin API.
-pub trait Pool: Send + Sync {
-    /// Every member, as the proxy sees it now.
-    fn view(&self) -> Result<Vec<PoolMember>, PortError>;
-    /// Take the member `name` out of the pool: it takes no new stream, and the streams it has
-    /// go on. Doing it again changes nothing.
-    fn drain(&self, name: &str) -> Result<(), PortError>;
-    /// Put the member `name` back. Doing it again changes nothing.
-    fn undrain(&self, name: &str) -> Result<(), PortError>;
-}
-
-/// What a frontend says of its retire: `GET` and `POST /v1/frontend/retire`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-pub struct RetireStatus {
-    /// The retire has completed and will not be undone.
-    pub retired: bool,
-    /// Execute and WaitExecution streams open on it now.
-    pub open_streams: u64,
-    /// Worker sessions it holds.
-    pub open_sessions: u64,
-}
-
-/// A frontend pool member's own operator API, reached on loopback at the member's ports.
-pub trait FrontendControl: Send + Sync {
-    /// Begin the member's retire and return when it has ended, with the status then. Doing it
-    /// again answers the same status. A retire is not undone: the unit is restarted after it.
-    fn retire(&self, host: &Host) -> Result<RetireStatus, PortError>;
-    /// The member's retire as it is now.
-    fn retire_status(&self, host: &Host) -> Result<RetireStatus, PortError>;
-    /// The commit the member's binary was built from.
-    fn commit(&self, host: &Host) -> Result<String, PortError>;
-}
-
 /// Whether a host runs the target yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Health {
@@ -268,7 +195,7 @@ pub enum Health {
     Abandoned(String),
 }
 
-/// The health of a host, by its role (frontend or node).
+/// The health of a host, by its role.
 pub trait HealthCheck: Send + Sync {
     /// Why `host` must not be installed on at all, if the adapter could not judge it after:
     /// asked before the installer is called for the host, and a reason fails the roll there.
@@ -364,7 +291,6 @@ mod tests {
             role: crate::inventory::Role::Daemon,
             host_key: "ssh-ed25519 AAAA".to_owned(),
             node_id: None,
-            member: None,
         };
         let v = Version::parse("2.0").expect("v");
         shared.install(&host, &v).expect("install");
@@ -388,28 +314,9 @@ mod tests {
         }
     }
 
-    /// An installer that does only the restart, and answers success to it.
-    struct Restarts;
-
-    impl Installer for Restarts {
-        fn install(&self, _host: &Host, _version: &Version) -> Result<InstallAnswer, PortError> {
-            Err(PortError::other("install"))
-        }
-
-        fn report(&self, _host: &Host) -> Result<Report, PortError> {
-            Err(PortError::other("report"))
-        }
-
-        fn restart_frontend(&self, _host: &Host, _name: &str) -> Result<(), PortError> {
-            Ok(())
-        }
-    }
-
-    /// Asserts that an installer that does not implement `restart_frontend` answers that it is
-    /// unsupported, and that a shared installer passes the call on to the one it holds, whether
-    /// that one answers the default or its own answer.
+    /// Asserts that a shared installer passes every call on to the one it holds.
     #[test]
-    fn restarting_a_frontend_is_unsupported_unless_the_installer_does_it() {
+    fn a_shared_installer_passes_the_calls_on() {
         let shared: std::sync::Arc<dyn Installer> = std::sync::Arc::new(Plain);
         let host = Host {
             alias: "a".to_owned(),
@@ -417,39 +324,14 @@ mod tests {
             role: crate::inventory::Role::Daemon,
             host_key: "ssh-ed25519 AAAA".to_owned(),
             node_id: None,
-            member: None,
         };
-        assert_eq!(
-            shared.restart_frontend(&host, "-"),
-            Err(PortError::other("unsupported: restart_frontend"))
-        );
         let v = Version::parse("2.0").expect("v");
         fn refused<T>(what: &str) -> Result<T, PortError> {
             Err(PortError::other(what))
         }
         assert_eq!(shared.install(&host, &v), refused("install"));
         assert_eq!(shared.report(&host), refused("report"));
-        let own: std::sync::Arc<dyn Installer> = std::sync::Arc::new(Restarts);
-        assert_eq!(own.restart_frontend(&host, "-"), Ok(()));
-        assert_eq!(own.install(&host, &v), refused("install"));
-        assert_eq!(own.report(&host), refused("report"));
-    }
-
-    /// Asserts that a pool member serves only when it is up and ready, whichever of the two
-    /// is missing, and that its streams are those of its REAPI and operator listeners.
-    #[test]
-    fn a_pool_member_serves_when_up_and_ready_and_counts_two_listeners() {
-        let member = |draining, ready| PoolMember {
-            name: "a".to_owned(),
-            draining,
-            ready,
-            reapi_streams: 2,
-            operator_streams: 3,
-        };
-        assert!(member(false, true).serves());
-        assert!(!member(true, true).serves());
-        assert!(!member(false, false).serves());
-        assert_eq!(member(false, true).streams(), 5);
+        assert_eq!(shared.query(&host), refused("report"));
     }
 
     /// Catches a kind that is lost or shown wrongly: the tuple-style call is `Other`, the

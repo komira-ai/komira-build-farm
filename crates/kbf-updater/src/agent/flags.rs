@@ -4,9 +4,8 @@
 //! ```text
 //! kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
-//!                   [--frontend <dns name>:<port>]
-//!                   [--operator-api http://IP:PORT --token-file FILE
-//!                   [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
+//!                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
+//!                   [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
@@ -14,24 +13,29 @@
 //! - `--coordinator`: where the coordinator is; its certificate must be for that name.
 //! - `--state-dir`: the directory `kbf-updater enroll` filled (the key, the certificate and the
 //!   CA are its files, [`kbf_enroll::store::Store`]'s). The agent renews the certificate at half
-//!   its life and writes the new one there; it needs `--frontend` for that.
+//!   its life and writes the new one there; it needs `--enroll-frontend` for that.
 //! - `--client-cert`, `--client-key`, `--ca`: instead, files an operator placed: this host's
 //!   updater certificate and key, and the farm CA that signed the coordinator's certificate.
 //!   Nothing renews them. The certificate says which node this is and what the host runs;
 //!   neither is a flag.
-//! - `--frontend`: the frontend's public address, the kbf-proxy. The node's drain, its undrain
-//!   and its status are three calls there, made with the updater's own certificate and no
-//!   token: the proxy admits them for the node in the certificate and for no other, and
-//!   admits nothing else from an updater. Renewals go there too.
+//! - `--frontend`: the frontend's worker listener, `<dns name>:<port>` (its `--worker-listen`;
+//!   the name must be one its certificate covers). The node's drain, its undrain, its status
+//!   and, for a storage host, its own storage health are four calls there, made over mutual
+//!   TLS with the updater's own certificate and no token: the frontend serves them for the node
+//!   in the certificate and for no other, and refuses everything else from an updater.
+//! - `--enroll-frontend`: the frontend's enroll listener (its `--enroll-listen`), the address
+//!   `kbf-updater enroll --frontend` was given. The agent renews its certificate there, with
+//!   the key it enrolled with; the listener asks for no client certificate, so a host whose
+//!   certificate lapsed during an outage still recovers.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default
 //!   `/run/kbf-host-install/local.sock`).
-//! - `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: the frontend's loopback
+//! - `--operator-api`, `--token-file`: the frontend's loopback
 //!   operator API, as in the roll mode, as an **opt-in fallback** for the drain and the
 //!   node's health: the credential is the full operator token, which the design keeps off
 //!   hosts. Giving it to an agent is a choice of the operator, made by giving both
-//!   `--operator-api` and `--token-file` (the proxy secret needs them), and it is then used
+//!   `--operator-api` and `--token-file`, and it is then used
 //!   instead of the updater's certificate for those calls. Without either way (no `--frontend`
 //!   and no token) the agent heartbeats and refuses every update order, before it fetches
 //!   anything. The packaged units give no token.
@@ -53,7 +57,8 @@ use crate::daemon::parse_operator_url;
 
 pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --channel NAME \
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
-[--operator-api http://IP:PORT --token-file FILE [--operator-proxy-auth-file FILE]] \
+[--enroll-frontend DNSNAME:PORT] \
+[--operator-api http://IP:PORT --token-file FILE] \
 [--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
@@ -61,13 +66,13 @@ const FLAGS: [&str; 16] = [
     "--coordinator",
     "--state-dir",
     "--frontend",
+    "--enroll-frontend",
     "--client-cert",
     "--client-key",
     "--ca",
     "--channel",
     "--operator-api",
     "--token-file",
-    "--operator-proxy-auth-file",
     "--helper-socket",
     "--heartbeat-secs",
     "--drain-deadline-secs",
@@ -118,8 +123,11 @@ pub struct Config {
     pub files: TlsFiles,
     pub channel: String,
     pub helper_socket: PathBuf,
-    /// The frontend's public address: where the node's own drain is made and renewals go.
+    /// The frontend's worker listener: where the node's own drain, status and storage health
+    /// are asked.
     pub frontend: Option<Endpoint>,
+    /// The frontend's enroll listener: where the certificate is renewed.
+    pub enroll_frontend: Option<Endpoint>,
     /// The enrollment's state directory, if the certificate is the agent's to renew.
     pub state_dir: Option<PathBuf>,
     /// The frontend's operator API for the drain and the health, if the operator gave the agent
@@ -133,7 +141,6 @@ pub struct Config {
 pub struct NodeApi {
     pub addr: SocketAddr,
     pub token_file: PathBuf,
-    pub proxy_auth_file: Option<PathBuf>,
 }
 
 /// The `--flag value` and `--flag=value` pairs of `args`, each flag of `known` given at most
@@ -199,6 +206,10 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         .remove("--frontend")
         .map(|text| Endpoint::parse(&text).map_err(|why| format!("--frontend: {why}")))
         .transpose()?;
+    let enroll_frontend = found
+        .remove("--enroll-frontend")
+        .map(|text| Endpoint::parse(&text).map_err(|why| format!("--enroll-frontend: {why}")))
+        .transpose()?;
     let state_dir = found.remove("--state-dir").map(PathBuf::from);
     let files = tls_files(
         state_dir.as_deref(),
@@ -208,26 +219,22 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
             found.remove("--ca"),
         ],
     )?;
-    if state_dir.is_some() && frontend.is_none() {
-        return Err("--state-dir needs --frontend: the certificate is renewed there".to_owned());
+    if state_dir.is_some() && enroll_frontend.is_none() {
+        return Err(
+            "--state-dir needs --enroll-frontend: the certificate is renewed there".to_owned(),
+        );
     }
     let api = found.remove("--operator-api");
     let token = found.remove("--token-file");
-    let proxy_auth_file = found
-        .remove("--operator-proxy-auth-file")
-        .map(PathBuf::from);
     let node_api = match (api, token) {
         (Some(api), Some(token)) => Some(NodeApi {
             addr: parse_operator_url(&api)?,
             token_file: PathBuf::from(token),
-            proxy_auth_file,
         }),
-        (None, None) if proxy_auth_file.is_none() => None,
+        (None, None) => None,
         _ => {
             return Err(
-                "--operator-api and --token-file are given together (and the proxy secret \
-                 file only with them), or not at all"
-                    .to_owned(),
+                "--operator-api and --token-file are given together, or not at all".to_owned(),
             );
         }
     };
@@ -252,6 +259,7 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         channel,
         helper_socket,
         frontend,
+        enroll_frontend,
         state_dir,
         node_api,
         timing,

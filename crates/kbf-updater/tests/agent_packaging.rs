@@ -72,13 +72,18 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
         config.node_api, None,
         "the shipped unit carries no operator token"
     );
-    assert!(!unit_value(&agent, "ExecStart").contains("token"));
-    // The certificate is the enrollment's, in the unit's own state directory, and the frontend
-    // is where the node's drain is made and the certificate is renewed.
+    let exec = unit_value(&agent, "ExecStart");
+    for word in ["token", "operator", "proxy"] {
+        assert!(!exec.contains(word), "{word}: {exec}");
+    }
+    // The certificate is the enrollment's, in the unit's own state directory; the frontend is
+    // where the node's drain is made (its worker listener) and the enroll listener is where the
+    // certificate is renewed.
     let state = config
         .state_dir
         .expect("the unit names the enrollment's directory");
     assert!(config.frontend.is_some());
+    assert_ne!(config.frontend, config.enroll_frontend);
     assert_eq!(
         state,
         Path::new("/var/lib").join(unit_value(&agent, "StateDirectory"))
@@ -88,12 +93,12 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
     assert_eq!(config.files.key, state.join("pki/updater.key"));
 
     // The enrollment command of the README is the program's, for this unit's host: the same
-    // frontend and the same directory, with the token in a file inside it.
+    // enroll listener and the same directory, with the token in a file inside it.
     let example = read("enroll-example.txt");
     let enroll = words(example.trim());
     assert_eq!(enroll[1], "enroll");
     let flags = parse_enroll(&enroll[2..]).expect("the enrollment's flags");
-    assert_eq!(Some(flags.frontend), config.frontend);
+    assert_eq!(Some(flags.frontend), config.enroll_frontend);
     assert_eq!(flags.state_dir, state);
     assert!(flags.token_file.starts_with(&state));
     assert_eq!(config.helper_socket, Path::new(DEFAULT_HELPER_SOCKET));
@@ -140,8 +145,11 @@ fn the_macos_jobs_agree_with_the_programs_and_with_each_other() {
         config.node_api, None,
         "the shipped job carries no operator token"
     );
-    assert!(!agent.contains("--token-file</string>"));
+    for word in ["--token-file", "--operator-api", "proxy"] {
+        assert!(!agent.contains(&format!("{word}</string>")), "{word}");
+    }
     assert!(config.frontend.is_some());
+    assert!(config.enroll_frontend.is_some());
     assert_eq!(config.state_dir, Some(PathBuf::from("/var/db/kbf-updater")));
     let user = plist_value(&agent, "UserName");
     assert_ne!(user, "root");

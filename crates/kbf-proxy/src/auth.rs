@@ -10,9 +10,7 @@
 //!   certificate of any role; `bearer` needs the right token and nothing else stands in for
 //!   it (a certificate is neither needed nor enough, and a wrong token is a refusal even
 //!   next to a good certificate: one mechanism per mode, no fallback).
-//! - Operator and update classes: the operator token, whatever the certificate says, except
-//!   for a host updater's certificate ([`decide_updater`]): it makes the three calls about its
-//!   own node and no others, and the proxy then presents the operator token itself.
+//! - Operator and update classes: the operator token, whatever the certificate says.
 //! - Enroll class: open. A node enrolling has no certificate yet; the child checks the
 //!   enrollment token (or, for a renewal, the key the registry holds).
 //! - Probe class: open.
@@ -96,13 +94,10 @@ impl Refusal {
 }
 
 /// A token as the proxy keeps it: its SHA-256, so the comparison is over equal-length
-/// digests, and the bytes themselves. The bytes are kept only for the operator token, which
-/// the proxy presents to the child on behalf of a host updater it admitted for its own node
-/// (the child's operator API takes no other credential); nothing else reads them.
+/// digests. The bytes themselves are not kept.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token {
     digest: [u8; 32],
-    secret: Vec<u8>,
 }
 
 impl std::fmt::Debug for Token {
@@ -117,20 +112,7 @@ impl Token {
     pub fn new(secret: &[u8]) -> Self {
         Self {
             digest: Sha256::digest(secret).into(),
-            secret: secret.to_vec(),
         }
-    }
-
-    /// `Authorization: Bearer <this token>`, marked sensitive so it is not logged. `None` if
-    /// the token has a byte a header cannot hold (a token file's content never does).
-    #[must_use]
-    pub fn bearer_header(&self) -> Option<http::HeaderValue> {
-        let mut value = Vec::with_capacity(7 + self.secret.len());
-        value.extend_from_slice(b"Bearer ");
-        value.extend_from_slice(&self.secret);
-        let mut value = http::HeaderValue::from_bytes(&value).ok()?;
-        value.set_sensitive(true);
-        Some(value)
     }
 
     /// Whether `presented` is this token, in constant time. The caller rate limits before
@@ -237,27 +219,6 @@ fn token_ok(expected: Option<&Token>, presented: Presented<'_>) -> Result<(), Re
     }
 }
 
-/// Decides a call whose verified certificate has the role `updater`: a host's updater may make
-/// the three calls about its own node that [`crate::route::self_node_of`] names, and the calls
-/// anyone may make (probes, the UI, enrollment); nothing else, whatever token it presents.
-/// `self_node` is the node the call is a self-node call for, if it is one.
-///
-/// # Errors
-/// [`Refusal::PermissionDenied`]: the peer is known and may not make this call.
-pub fn decide_updater(
-    class: AuthClass,
-    node_id: &str,
-    self_node: Option<&str>,
-) -> Result<(), Refusal> {
-    match class {
-        AuthClass::Probe | AuthClass::Enroll | AuthClass::Ui => Ok(()),
-        AuthClass::Operator if self_node == Some(node_id) => Ok(()),
-        AuthClass::Operator | AuthClass::Update | AuthClass::Worker | AuthClass::Reapi => {
-            Err(Refusal::PermissionDenied)
-        }
-    }
-}
-
 /// Decides one call.
 ///
 /// # Errors
@@ -278,8 +239,8 @@ pub fn decide(
         },
         AuthClass::Reapi => match mode {
             Buck2Auth::None => Ok(()),
-            // A certificate of any farm role but a host updater's, which is for its own
-            // node's calls and the coordinator's.
+            // A certificate of any farm role but a host updater's, which is for the
+            // coordinator and its frontend's worker listener, and no build-cache credential.
             Buck2Auth::Mtls
                 if presented
                     .identity
@@ -435,7 +396,7 @@ mod tests {
             let i = id(role);
             let p = Presented {
                 identity: Some(&i),
-                bearer: Some(b"op-key"),
+                bearer: Some(b"op-key".as_slice()),
             };
             let want = if ok {
                 Ok(())
@@ -485,7 +446,7 @@ mod tests {
         // The operator token is not the Buck2 key.
         let op = Presented {
             identity: None,
-            bearer: Some(b"op-key"),
+            bearer: Some(b"op-key".as_slice()),
         };
         assert_eq!(
             call(AuthClass::Reapi, Buck2Auth::Bearer, op),
@@ -498,7 +459,7 @@ mod tests {
         let i = id(PeerRole::Storage);
         let good = Presented {
             identity: None,
-            bearer: Some(b"op-key"),
+            bearer: Some(b"op-key".as_slice()),
         };
         let cert_only = Presented {
             identity: Some(&i),
@@ -711,36 +672,8 @@ mod tests {
         assert!(Tokens::from_files(&good, Some(&open)).is_err());
     }
 
-    /// A host's updater makes the calls about its own node and the calls anyone may make, and
-    /// nothing else, whatever token it carries: another node's call, an operator call that is
-    /// not a node call, the update API, and the worker and build-cache paths are refused as
-    /// known-but-not-allowed.
-    #[test]
-    fn an_updater_may_call_only_its_own_node() {
-        for class in [AuthClass::Probe, AuthClass::Enroll, AuthClass::Ui] {
-            assert_eq!(decide_updater(class, "host-1", None), Ok(()), "{class:?}");
-        }
-        assert_eq!(
-            decide_updater(AuthClass::Operator, "host-1", Some("host-1")),
-            Ok(())
-        );
-        for (class, own) in [
-            (AuthClass::Operator, Some("host-2")),
-            (AuthClass::Operator, None),
-            (AuthClass::Update, Some("host-1")),
-            (AuthClass::Worker, Some("host-1")),
-            (AuthClass::Reapi, Some("host-1")),
-        ] {
-            assert_eq!(
-                decide_updater(class, "host-1", own),
-                Err(Refusal::PermissionDenied),
-                "{class:?} {own:?}"
-            );
-        }
-    }
-
     /// With `buck2_auth = "mtls"` a certificate of the farm's own roles opens the build cache and
-    /// a host updater's does not: it is for its node's calls.
+    /// a host updater's does not: it is for the update calls.
     #[test]
     fn an_updater_certificate_is_no_build_cache_credential() {
         let updater = id(PeerRole::Updater);
@@ -760,5 +693,37 @@ mod tests {
             };
             assert_eq!(call(AuthClass::Reapi, Buck2Auth::Mtls, presented), Ok(()));
         }
+    }
+
+    /// A host updater's certificate opens none of the operator or update paths at the proxy: those
+    /// take the operator token whatever the certificate says, and the frontend serves an updater
+    /// its own-node calls itself.
+    #[test]
+    fn an_updater_certificate_is_no_operator_credential() {
+        let updater = id(PeerRole::Updater);
+        let presented = Presented {
+            identity: Some(&updater),
+            bearer: None,
+        };
+        for class in [AuthClass::Operator, AuthClass::Update] {
+            assert_eq!(
+                call(class, Buck2Auth::Mtls, presented),
+                Err(Refusal::Unauthenticated),
+                "{class:?}"
+            );
+        }
+        let wrong = Presented {
+            identity: Some(&updater),
+            bearer: Some(b"not-the-token".as_slice()),
+        };
+        assert_eq!(
+            call(AuthClass::Operator, Buck2Auth::Mtls, wrong),
+            Err(Refusal::Unauthenticated)
+        );
+        let right = Presented {
+            identity: Some(&updater),
+            bearer: Some(b"op-key".as_slice()),
+        };
+        assert_eq!(call(AuthClass::Operator, Buck2Auth::Mtls, right), Ok(()));
     }
 }

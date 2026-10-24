@@ -17,14 +17,13 @@ fn dm(node_id: Option<&str>) -> Host {
         role: Role::Daemon,
         host_key: KEY.to_owned(),
         node_id: node_id.map(str::to_owned),
-        member: None,
     }
 }
 
 fn adapter(server: &FakeApi, name: &str) -> NodeDrain {
     let token = file(&scratch(name), "token", TOKEN, 0o600);
     NodeDrain::with_api(
-        OperatorApi::new(server.addr, token, None)
+        OperatorApi::new(server.addr, token)
             .expect("api")
             .with_timeout(Duration::from_millis(500)),
     )
@@ -168,7 +167,6 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
         OperatorApi::new(
             closed_port(),
             file(&scratch("nd-dead"), "token", TOKEN, 0o600),
-            None,
         )
         .expect("api"),
     );
@@ -202,4 +200,63 @@ fn a_host_without_a_usable_node_id_is_refused_without_a_call() {
         }
     }
     assert!(server.requests().is_empty());
+}
+
+fn adapter_if_present(server: &FakeApi, name: &str) -> NodeDrain {
+    let token = file(&scratch(name), "token", TOKEN, 0o600);
+    NodeDrain::if_present(
+        OperatorApi::new(server.addr, token)
+            .expect("api")
+            .with_timeout(Duration::from_millis(500)),
+    )
+}
+
+/// A storage host that runs a daemon has it drained, counted and given back like any daemon's:
+/// the same three routes.
+#[test]
+fn a_daemon_the_frontend_knows_is_drained_counted_and_given_back() {
+    let server = answering(200, &node("draining", &["1.1", "1.2"]));
+    let drain = adapter_if_present(&server, "nd-present");
+    let host = dm(Some("dm-node"));
+    drain.drain(&host, Duration::from_secs(60)).expect("drain");
+    assert_eq!(drain.leases(&host), Ok(2));
+    drain.undrain(&host).expect("undrain");
+    let sent = server.requests();
+    let lines: Vec<&str> = sent
+        .iter()
+        .map(|r| r.lines().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "POST /v1/nodes/dm-node:drain HTTP/1.1",
+            "GET /v1/nodes/dm-node HTTP/1.1",
+            "POST /v1/nodes/dm-node:uncordon HTTP/1.1",
+        ]
+    );
+}
+
+/// A storage host with no daemon is not a failure: the frontend does not know the node (404),
+/// so there is nothing to drain, no lease and nothing to give back. Any other answer is still
+/// the failure it is.
+#[test]
+fn a_storage_host_with_no_daemon_has_nothing_to_drain() {
+    let server = answering(404, "{\"error\":\"no_node\"}");
+    let drain = adapter_if_present(&server, "nd-absent");
+    let host = dm(Some("dm-node"));
+    assert_eq!(drain.drain(&host, Duration::from_secs(60)), Ok(()));
+    assert_eq!(drain.leases(&host), Ok(0));
+    assert_eq!(drain.undrain(&host), Ok(()));
+    assert_eq!(server.requests().len(), 3);
+
+    for status in [401, 403, 503] {
+        let server = answering(status, "{}");
+        let drain = adapter_if_present(&server, "nd-absent-errors");
+        assert!(
+            drain.drain(&host, Duration::from_secs(1)).is_err(),
+            "{status}"
+        );
+        assert!(drain.leases(&host).is_err(), "{status}");
+        assert!(drain.undrain(&host).is_err(), "{status}");
+    }
 }

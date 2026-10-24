@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use kbf_front::WriteConfig;
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use kbf_tls::{TlsError, TlsFiles, TlsSource};
+use kbf_tls::{Alpn, TlsError, TlsFiles, TlsSource};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 use kbf_front::SegmentsConfig;
@@ -777,7 +777,9 @@ impl Args {
             &self.worker_client_ca,
         ) {
             (Some(cert), Some(key), Some(ca)) => Some(WorkerTls {
-                server: TlsSource::files(
+                // HTTP/1.1 as well as h2: a host's updater makes its node calls over it
+                // (`crate::node_self`).
+                server: TlsSource::files_alpn(
                     "worker",
                     TlsFiles {
                         cert: cert.clone(),
@@ -785,6 +787,7 @@ impl Args {
                         client_ca: Some(ca.clone()),
                     },
                     reload,
+                    Alpn::H2AndHttp1,
                 )?,
                 deny_list: deny_list.clone(),
             }),

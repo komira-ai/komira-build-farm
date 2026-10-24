@@ -304,6 +304,131 @@ pub fn operator_api(
     (addr, handle)
 }
 
+/// The frontend's worker listener as an updater meets it: mutual TLS with the farm's frontend
+/// certificate, and the node calls of node `n1` (and no other) answered as the real frontend
+/// answers them, with the node's placement kept. Each call is an event: `api:drain`,
+/// `api:uncordon`, `api:node <placement>`, `api:client <node id of the client certificate>`
+/// before it, and `api:credential` if the request carried an `Authorization` header.
+pub fn frontend_worker(
+    pki: &Pki,
+    events: &Events,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let (pair, public) = key_pair();
+    let issued = pki
+        .ca
+        .issue_frontend(
+            &["localhost", "127.0.0.1"],
+            &public,
+            now(),
+            &mut SystemEntropy,
+        )
+        .unwrap();
+    let key = pair.serialize_der();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(pki.ca.root_der().to_vec()))
+        .unwrap();
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()
+        .unwrap();
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![CertificateDer::from(issued.der)],
+            PrivateKeyDer::from_pem_slice(pem_of("PRIVATE KEY", &key).as_bytes()).unwrap(),
+        )
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let config = Arc::new(config);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (events, stop) = (events.clone(), Arc::clone(stop));
+    let handle = std::thread::spawn(move || {
+        let mut placement = "serving";
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok((tcp, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            tcp.set_nonblocking(false).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut tls =
+                StreamOwned::new(ServerConnection::new(Arc::clone(&config)).unwrap(), tcp);
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while let Ok(n) = tls.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&raw[..end]).into_owned();
+            let who = tls
+                .conn
+                .peer_certificates()
+                .and_then(<[_]>::first)
+                .and_then(|leaf| kbf_updater::identity::identity_of(leaf.as_ref()).ok())
+                .map_or_else(|| "none".to_owned(), |id| id.node_id.to_string());
+            events.push(format!("api:client {who}"));
+            if head.to_ascii_lowercase().contains("\r\nauthorization:") {
+                events.push("api:credential");
+            }
+            let mut words = head.lines().next().unwrap_or("").split_whitespace();
+            let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+            let (status, text) = if who != "n1" {
+                (403, "{}".to_owned())
+            } else if method == "POST" && target == "/v1/nodes/n1:drain" {
+                events.push("api:drain");
+                placement = "drained";
+                (200, "{}".to_owned())
+            } else if method == "POST" && target == "/v1/nodes/n1:uncordon" {
+                events.push("api:uncordon");
+                placement = "serving";
+                (200, "{}".to_owned())
+            } else if method == "GET" && target == "/v1/nodes/n1" {
+                events.push(format!("api:node {placement}"));
+                (
+                    200,
+                    format!(
+                        r#"{{"connected":true,"placement":{{"state":"{placement}"}},"leases":[]}}"#
+                    ),
+                )
+            } else {
+                (403, "{}".to_owned())
+            };
+            let reason = if status == 200 { "OK" } else { "Forbidden" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+            let _ = tls.write_all(response.as_bytes());
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+    });
+    (addr, handle)
+}
+
 /// The helper: the real protocol's answers (the types of `kbf-host-install`), for a host that
 /// runs release A, is offered B, and goes through the A/B as a helper would.
 pub fn helper(

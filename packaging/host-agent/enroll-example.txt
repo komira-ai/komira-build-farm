@@ -1,1 +1,1 @@
-/usr/libexec/kbf/kbf-updater enroll --frontend frontend.farm.example:443 --node-id host-1 --token-file /var/lib/kbf-updater/enroll.token --state-dir /var/lib/kbf-updater
+/usr/libexec/kbf/kbf-updater enroll --frontend frontend.farm.example:8444 --node-id host-1 --token-file /var/lib/kbf-updater/enroll.token --state-dir /var/lib/kbf-updater

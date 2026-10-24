@@ -223,6 +223,50 @@ is a write's path, and a read of it is never a node (an id that holds another co
 The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
 `--history-objects`.
 
+## Own-node calls of a host's updater
+
+A host's updater ([deploy/kbf-updater.md](deploy/kbf-updater.md#the-boundary)) drains and reads its
+own node without a token. The calls are served by the frontend on its **worker listener**
+(`--worker-listen`, mutual TLS against `--worker-client-ca`, the listener daemons dial), not on the
+operator API, and only to a certificate with the role `updater` whose one DNS name is the `{id}` of
+the call:
+
+| Call | Answer |
+|---|---|
+| `POST /v1/nodes/{id}:drain` | as the operator API's drain: cordons the node and waits for its leases; the body is `{"deadline_secs": N}` or none (30 minutes) |
+| `POST /v1/nodes/{id}:uncordon` | as the operator API's uncordon |
+| `GET /v1/nodes/{id}` | as `GET /v1/nodes/{id}` above |
+| `GET /v1/nodes/{id}/storage-health` | below |
+
+Everything else is `403`: another node's id, `:cordon`, any other path (the whole operator API
+included), and every call of a certificate that is not an updater's (a daemon's, a storage node's, a
+frontend's), whatever the path; a call with no client certificate does not get past the handshake.
+The id is compared as written: it is 1 to 63 of `a-z`, `0-9` and `-` (not first or last), nothing
+is decoded, and a query string makes the call none of the four. A node on the listener's deny list
+(`--worker-deny-list`) is refused. `404` for a node the frontend has not seen since it started
+(a storage host without a daemon part has none). The listener offers `h2` and `http/1.1`; the
+updater's client speaks HTTP/1.1 with one request per connection.
+
+**`GET /v1/nodes/{id}/storage-health`** is a storage host's own storage health and nothing else of
+the storage:
+
+```json
+{ "node": "linux-1", "half": "member",
+  "member": { "id": 1, "state": "active", "build_commit": "0123456789ab" },
+  "storage": { "members_active": 3, "under_replicated_blobs": 0 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `half` | how the node stands to the storage members: `member` (its storage half is the member whose address it enrolled with, joined as safe-to-stop joins them), `no_storage` (it enrolled with no storage address), `unknown_node` (the enrollment registry does not know it), `unlinked` (no member, or more than one, has its address) |
+| `why` | for `unknown_node` and `unlinked` only: a sentence saying which; it may repeat the address the node itself enrolled with |
+| `member` | for `member` only: that member's own `id`, `state` and `build_commit` (`null` if it said none). No other member is named |
+| `storage.members_active` | the storage members that are `active`, as `GET /v1/storage` counts them |
+| `storage.under_replicated_blobs` | blobs known to be owed a copy; `null` while that is unknown, never zero for unknown |
+
+A read of the members and the registry: it changes nothing, and a frontend with no state store
+answers `404`.
+
 ## `GET /v1/members`
 
 The storage members of the current map, as the `Membership` service keeps them

@@ -23,29 +23,6 @@ use crate::operator::OperatorApi;
 use crate::ports::{Drain, Health, HealthCheck, PortError, SystemClock};
 use crate::version::Version;
 
-/// A host whose node is never drained (a storage host): the drain and the undrain are done
-/// already, and it holds no leases.
-pub struct NoDrain;
-
-impl Drain for NoDrain {
-    fn drain(&self, _host: &Host, _deadline: Duration) -> Result<(), PortError> {
-        Ok(())
-    }
-
-    fn leases(&self, _host: &Host) -> Result<usize, PortError> {
-        Ok(0)
-    }
-
-    fn undrain(&self, _host: &Host) -> Result<(), PortError> {
-        Ok(())
-    }
-}
-
-/// [`NoDrain`], as a port.
-pub fn no_drain() -> Arc<dyn Drain> {
-    Arc::new(NoDrain)
-}
-
 /// The ports of an agent that cannot reach what it needs of the frontend: it refuses every
 /// update before it fetches anything, and drains nothing. The text says why.
 pub struct NoCredential(pub &'static str);
@@ -54,12 +31,6 @@ pub struct NoCredential(pub &'static str);
 pub const NO_CREDENTIAL: &str = "this agent was given neither --frontend (to drain its node with \
      its own certificate) nor an operator API credential, so it cannot drain its node and \
      updates nothing";
-
-/// Why a storage host's agent without a token refuses: the frontend lets a host's certificate
-/// reach its own node's calls, and a storage host's health is read from routes that are not those.
-pub const STORAGE_NEEDS_TOKEN: &str = "a storage host's health is read from the operator API, \
-     which a host's certificate cannot reach; give --operator-api and --token-file, or update \
-     it with the roll";
 
 impl HealthCheck for NoCredential {
     fn refusal(&self, _host: &Host) -> Option<String> {
@@ -96,10 +67,9 @@ type NodePorts = (Arc<dyn Drain>, Arc<dyn HealthCheck>);
 /// frontend:
 ///
 /// - the operator token (`--operator-api`, `--token-file`), the opt-in fallback, if it was given;
-/// - else the host's own certificate through the frontend's proxy (`--frontend`): the drain of
-///   a daemon or Mac, and the node's status for its health. A storage host is never drained,
-///   and its health is read from routes the certificate cannot reach, so it refuses
-///   ([`STORAGE_NEEDS_TOKEN`]);
+/// - else the host's own certificate on the frontend's worker listener (`--frontend`): the drain of
+///   the node, and the node's status for a daemon's health or its own storage view for a
+///   storage host's ([`NodeHealth::for_updater`]);
 /// - else the refusals of [`NoCredential`].
 pub(super) fn node_ports(
     cfg: &Config,
@@ -109,11 +79,7 @@ pub(super) fn node_ports(
 ) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
     if let Some(api) = &cfg.node_api {
-        let api = OperatorApi::new(
-            api.addr,
-            api.token_file.clone(),
-            api.proxy_auth_file.clone(),
-        )?;
+        let api = OperatorApi::new(api.addr, api.token_file.clone())?;
         let drain = drain_for(role, &api);
         let health = Arc::new(NodeHealth::with_api(api, installer()));
         return Ok((drain, health));
@@ -124,12 +90,9 @@ pub(super) fn node_ports(
             Arc::new(NoCredential(NO_CREDENTIAL)),
         ));
     };
-    if role == Role::Storage {
-        return Ok((no_drain(), Arc::new(NoCredential(STORAGE_NEEDS_TOKEN))));
-    }
     let api = OperatorApi::as_updater(frontend.clone(), cfg.files.clone(), identity.clone());
     let drain = drain_for(role, &api);
-    let health = Arc::new(NodeHealth::with_api(api, installer()));
+    let health = Arc::new(NodeHealth::for_updater(api, installer()));
     Ok((drain, health))
 }
 
@@ -146,20 +109,22 @@ pub fn identity_of_files(files: &TlsFiles) -> Result<Identity, String> {
     identity_of(leaf.as_ref()).map_err(|e| format!("{}: {e}", files.cert.display()))
 }
 
-/// The drain of a host of `role`: none for a storage host (the roll never drains one, a daemon
-/// on it included), the frontend's cordon, drain and uncordon for the rest.
+/// The drain of a host of `role`: the frontend's cordon, drain and uncordon of its node. A
+/// storage host may run a daemon too (`storage-and-daemon`), which its restart would cut off
+/// from its leases, so it drains that if the frontend knows the node, and has nothing to drain
+/// if it does not ([`NodeDrain::if_present`]).
 pub fn drain_for(role: Role, api: &OperatorApi) -> Arc<dyn Drain> {
     if role == Role::Storage {
-        no_drain()
+        Arc::new(NodeDrain::if_present(api.clone()))
     } else {
         Arc::new(NodeDrain::with_api(api.clone()))
     }
 }
 
 /// The renewer of the certificate in the state directory, if the agent was given one
-/// (`--state-dir`, which comes with `--frontend`).
+/// (`--state-dir`, which comes with `--enroll-frontend`).
 fn renewer_for(cfg: &Config) -> Result<Option<Arc<dyn Renewer>>, String> {
-    let (Some(dir), Some(frontend)) = (&cfg.state_dir, &cfg.frontend) else {
+    let (Some(dir), Some(frontend)) = (&cfg.state_dir, &cfg.enroll_frontend) else {
         return Ok(None);
     };
     let store = Store::open(dir).map_err(|e| e.to_string())?;
@@ -217,7 +182,6 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         role,
         host_key: String::new(),
         node_id: Some(node_id),
-        member: None,
     };
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
     let (drain, health) = node_ports(cfg, &identity, host.role, &local)?;

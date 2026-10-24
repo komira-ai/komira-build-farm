@@ -11,7 +11,7 @@ use rustls::ServerConfig;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::config::{Built, Material, TlsError, TlsFiles, build, digest, read};
+use crate::config::{Alpn, Built, Material, TlsError, TlsFiles, build, digest, read};
 
 /// What one look at the files did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +57,8 @@ struct Shared {
     files: TlsFiles,
     /// Whether `files` are there to be read again (not for a fixed source).
     watch: bool,
+    /// The application protocols every configuration of this source offers.
+    alpn: Alpn,
     interval: Duration,
     state: Mutex<State>,
     applied: AtomicU64,
@@ -104,8 +106,21 @@ impl TlsSource {
         files: TlsFiles,
         interval: Duration,
     ) -> Result<Self, TlsError> {
+        Self::files_alpn(listener, files, interval, Alpn::H2)
+    }
+
+    /// [`TlsSource::files`], offering the application protocols `alpn` says.
+    ///
+    /// # Errors
+    /// As [`TlsSource::files`].
+    pub fn files_alpn(
+        listener: &'static str,
+        files: TlsFiles,
+        interval: Duration,
+        alpn: Alpn,
+    ) -> Result<Self, TlsError> {
         let material = read(&files)?;
-        Self::of(listener, files, true, interval, &material)
+        Self::of(listener, files, true, interval, &material, alpn)
     }
 
     /// The source for the listener called `listener` over PEM text given here: it has no
@@ -120,6 +135,20 @@ impl TlsSource {
         key: &[u8],
         client_ca: Option<&[u8]>,
     ) -> Result<Self, TlsError> {
+        Self::fixed_alpn(listener, cert, key, client_ca, Alpn::H2)
+    }
+
+    /// [`TlsSource::fixed`], offering the application protocols `alpn` says.
+    ///
+    /// # Errors
+    /// As [`TlsSource::fixed`].
+    pub fn fixed_alpn(
+        listener: &'static str,
+        cert: &[u8],
+        key: &[u8],
+        client_ca: Option<&[u8]>,
+        alpn: Alpn,
+    ) -> Result<Self, TlsError> {
         let named = |name: &str| PathBuf::from(format!("<{name}>"));
         let files = TlsFiles {
             cert: named("certificate"),
@@ -131,7 +160,7 @@ impl TlsSource {
             key: key.to_vec(),
             client_ca: client_ca.map(<[u8]>::to_vec),
         };
-        Self::of(listener, files, false, Duration::ZERO, &material)
+        Self::of(listener, files, false, Duration::ZERO, &material, alpn)
     }
 
     fn of(
@@ -140,14 +169,16 @@ impl TlsSource {
         watch: bool,
         interval: Duration,
         material: &Material,
+        alpn: Alpn,
     ) -> Result<Self, TlsError> {
-        let Built { config, not_after } = build(&files, material, false)?;
+        let Built { config, not_after } = build(&files, material, false, alpn)?;
         let seen = Seen::Files(digest(material));
         Ok(Self {
             shared: Arc::new(Shared {
                 listener,
                 files,
                 watch,
+                alpn,
                 interval,
                 state: Mutex::new(State {
                     config,
@@ -184,7 +215,7 @@ impl TlsSource {
             key: key.to_vec(),
             client_ca: None,
         };
-        let built = build(&shared.files, &material, true)?;
+        let built = build(&shared.files, &material, true, shared.alpn)?;
         let mut state = shared.state();
         state.config = built.config;
         state.not_after = built.not_after;
@@ -220,7 +251,7 @@ impl TlsSource {
         // Remembered whether or not it applies, so a bad state is reported once and a
         // second look at it does no work.
         state.seen = seen;
-        match material.and_then(|m| build(&shared.files, &m, true)) {
+        match material.and_then(|m| build(&shared.files, &m, true, shared.alpn)) {
             Ok(built) => {
                 state.config = built.config;
                 state.not_after = built.not_after;

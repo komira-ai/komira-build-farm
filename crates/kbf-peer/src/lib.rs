@@ -46,8 +46,8 @@ pub enum PeerRole {
     Storage,
     /// A build node.
     Daemon,
-    /// A host's updater: it dials the update coordinator, and calls the frontend (through
-    /// the proxy) for its own node only. Its certificate also names the host's role
+    /// A host's updater: it dials the update coordinator, and calls the frontend's worker
+    /// listener for its own node only. Its certificate also names the host's role
     /// (`urn:kbf:host-role:<name>`, read with [`uri_values_of`]).
     Updater,
 }

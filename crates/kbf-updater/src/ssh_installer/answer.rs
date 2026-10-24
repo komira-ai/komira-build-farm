@@ -4,8 +4,7 @@
 //! `query` answers with the report on exit 0. The exit status and the shape must agree, so
 //! an answer that is plausible JSON from the wrong place (a banner, a shell that printed
 //! a line of its own) is not taken for one. A Mac's `install` answers `apply_started`, and its
-//! `query` carries one more field, `apply`. A `restart` answers `restarted` and the unit it
-//! restarted, which must be the one asked for. Nothing the host sent is passed on except a
+//! `query` carries one more field, `apply`. Nothing the host sent is passed on except a
 //! reason code, held to `[a-z_]`, and an installed version, held to the version alphabet:
 //! a [`PortError`] never carries free text from the other side.
 
@@ -91,21 +90,6 @@ enum StartedResult {
 #[serde(rename_all = "snake_case")]
 enum StartedApply {
     Running,
-}
-
-/// The host's answer to `restart`: the unit is restarted and active.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Restarted {
-    #[serde(rename = "result")]
-    _result: RestartedResult,
-    unit: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RestartedResult {
-    Restarted,
 }
 
 #[derive(Deserialize)]
@@ -208,24 +192,6 @@ pub fn install_answer(
                 }
             }
         },
-        2 | 3 => Err(reason_line(line, code)?),
-        _ => Err(bad_answer()),
-    }
-}
-
-/// The answer of `restart` of the unit `unit`: on exit 0 the host's `restarted` line naming
-/// that unit and no other, else the error to report.
-pub fn restart_answer(code: i32, stdout: &[u8], unit: &str) -> Result<(), PortError> {
-    let line = one_line(stdout).ok_or_else(bad_answer)?;
-    match code {
-        0 => {
-            let got: Restarted = parse(line)?;
-            if got.unit == unit {
-                Ok(())
-            } else {
-                Err(bad_answer())
-            }
-        }
         2 | 3 => Err(reason_line(line, code)?),
         _ => Err(bad_answer()),
     }

@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 # The optional package that rolls a new kbf version over the hosts of a farm, one host at a
-# time, behind kbf-proxy's local socket. This crate is the core: the API model, the host
+# time, behind a local socket. This crate is the core: the API model, the host
 # inventory, the roll state machine over ports (safe-to-stop, install, health, clock) and
 # the durable roll record. On top of it: the API on a unix socket (`server`), the safe-to-stop
 # adapter (an HTTP client of the frontend's loopback operator API) and the binary's wiring

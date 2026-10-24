@@ -1,6 +1,6 @@
 //! The agent mode of `kbf-updater`: an unprivileged updater on every host that dials the
 //! coordinator and owns that host's update (`docs/design/updates.md`). The roll mode of the
-//! crate (the roll API behind kbf-proxy, ssh to `kbf-host-install`'s forced command) is
+//! crate (the roll API behind a front door, ssh to `kbf-host-install`'s forced command) is
 //! untouched and keeps working.
 //!
 //! - [`flags`]: the flags of `kbf-updater agent`;
@@ -23,9 +23,7 @@ pub mod update;
 
 mod build;
 
-pub use build::{
-    NO_CREDENTIAL, NoCredential, STORAGE_NEEDS_TOKEN, no_drain, run_agent, run_config,
-};
+pub use build::{NO_CREDENTIAL, NoCredential, run_agent, run_config};
 pub use run::{Agent, Stop, World};
 
 #[cfg(test)]

@@ -7,16 +7,13 @@
 use std::net::IpAddr;
 use std::time::Instant;
 
-use http::{HeaderMap, Method, Uri};
-
-use kbf_peer::PeerRole;
+use http::HeaderMap;
 
 use crate::auth::{
     Buck2Auth, FailureLimit, Presented, Refusal, Tokens, bearer_of, checks_token, decide,
-    decide_updater,
 };
 use crate::identity::{Identity, ProxySecret};
-use crate::route::{AuthClass, self_node_of};
+use crate::route::AuthClass;
 
 /// The mode, the tokens, the secret the children are told and the limit on wrong tokens.
 #[derive(Debug)]
@@ -27,16 +24,6 @@ pub(crate) struct Security {
     pub(crate) failures: FailureLimit,
 }
 
-/// What admitted a call.
-#[derive(Debug)]
-pub(crate) enum Admitted {
-    /// The credential the class takes: a certificate, the operator token or the Buck2 key.
-    Credential,
-    /// A host updater's certificate, for a call about its own node (the node's id): the
-    /// caller puts the operator token in place of whatever the host sent.
-    SelfNode(String),
-}
-
 impl Security {
     pub(crate) fn new(mode: Buck2Auth, tokens: Tokens, secret: ProxySecret) -> Self {
         Self {
@@ -45,32 +32,6 @@ impl Security {
             secret,
             failures: FailureLimit::new(),
         }
-    }
-
-    /// [`Security::authorize`] for a call that may be a host updater's, about its own node.
-    ///
-    /// An updater certificate is decided by [`decide_updater`]: the three calls about its own
-    /// node pass as [`Admitted::SelfNode`], anything else the updater may not make is refused.
-    /// Every other caller is [`Security::authorize`].
-    pub(crate) fn authorize_call(
-        &self,
-        class: AuthClass,
-        call: (&Method, &Uri),
-        headers: &HeaderMap,
-        identity: Option<&Identity>,
-        ip: IpAddr,
-        now: Instant,
-    ) -> Result<Admitted, Refusal> {
-        if let Some(updater) = identity.filter(|id| id.role == PeerRole::Updater) {
-            let own = self_node_of(call.0, call.1);
-            decide_updater(class, &updater.node_id, own)?;
-            return Ok(match (class, own) {
-                (AuthClass::Operator, Some(node)) => Admitted::SelfNode(node.to_owned()),
-                _ => Admitted::Credential,
-            });
-        }
-        self.authorize(class, headers, identity, ip, now)
-            .map(|()| Admitted::Credential)
     }
 
     /// Decides a call from `ip` that presented `identity` (the verified certificate, if any)

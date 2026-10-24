@@ -4,16 +4,16 @@
 #
 # The certificate and key are the host's own: `kbf-updater enroll` (README.md, "Enrolling a host")
 # makes them in the state directory with a one-time token, and the agent renews them there at half
-# their life through the frontend. The state directory is the agent's alone (mode 0700). Edit the
-# names to the farm's.
+# their life at the frontend's enroll listener (--enroll-frontend). The state directory is the
+# agent's alone (mode 0700). Edit the names to the farm's.
 #
 # This unit gives the agent NO operator token. The drain of the node, its undrain and its status
-# are three calls to the frontend (--frontend, the public proxy) made with the host's own
-# certificate: the proxy admits them for this node and for no other. A host's token is an
+# (a storage host's: its own storage health) are calls to the frontend's worker listener
+# (--frontend) made over mutual TLS with the host's own certificate: the frontend serves exactly
+# those for the node in that certificate and refuses everything else. A host's token is an
 # opt-in fallback the design keeps off hosts: adding `--operator-api http://127.0.0.1:18002
 # --token-file FILE` makes the agent use it instead, and anything running as kbf-updater can
-# then read it. A storage host's health is read from routes a certificate cannot reach, so a
-# storage host needs the token or is updated by the roll.
+# then read it.
 [Unit]
 Description=kbf-updater agent, this host's update agent
 Documentation=https://github.com/komira-ai/kbf/blob/main/docs/design/updates.md
@@ -25,7 +25,7 @@ Type=simple
 User=kbf-updater
 StateDirectory=kbf-updater
 StateDirectoryMode=0700
-ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --frontend frontend.farm.example:443 --state-dir /var/lib/kbf-updater --channel stable
+ExecStart=/usr/libexec/kbf/kbf-updater agent --coordinator coordinator.farm.example:8443 --frontend frontend.farm.example:8981 --enroll-frontend frontend.farm.example:8444 --state-dir /var/lib/kbf-updater --channel stable
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes

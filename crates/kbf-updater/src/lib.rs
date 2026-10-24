@@ -5,29 +5,25 @@
 //! - [`api`]: the request, the roll as a poller sees it, the closed set of error codes;
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
 //! - [`inventory`]: the root-owned host file, and the order a roll touches the hosts in;
-//! - [`ports`]: safe-to-stop, install and query, health, the proxy's pool, a frontend member's
-//!   own API, and the clock, as traits;
+//! - [`ports`]: safe-to-stop, install and query, drain, health and the clock, as traits;
 //! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
 //! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontends
 //!   first, the first failure stops it, a restart asks the host before it installs again; a
-//!   `mac-daemon` host's install starts an apply that the roll polls until it is done; a
-//!   frontend that is a member of the kbf-proxy pool is drained, retired, installed on,
-//!   restarted and put back, one at a time and never the last one that is up;
+//!   `mac-daemon` host's install starts an apply that the roll polls until it is done;
 //! - [`fakes`]: a scripted fake of every port.
 //!
 //! And around it:
 //!
-//! - [`server`] and [`http`]: the roll API on a unix socket behind kbf-proxy;
+//! - [`server`] and [`http`]: the roll API on a unix socket;
 //! - [`listener`]: where that socket comes from (systemd socket activation in production);
 //! - [`operator`], [`reply`] and [`secret`]: the client of the frontend's loopback operator
 //!   API, and the token files it reads;
 //! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
 //! - [`node_drain`]: the real drain of a daemon host's node, over the operator API;
 //! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
-//!   the operator API; a frontend that is no pool member is refused;
-//! - [`pool_http`] and [`frontend_http`]: the real pool, over the admin API of kbf-proxy, and
-//!   the real control of a frontend member, over its own operator API;
+//!   the operator API; a frontend is refused (it is a container that `kbf-host-install`
+//!   drains and recreates);
 //! - [`daemon`]: the flags and the wiring of all of it.
 //!
 //! And for the coordinator that tells each host's updater what to run
@@ -37,7 +33,6 @@ pub mod agent;
 pub mod api;
 pub mod daemon;
 pub mod fakes;
-pub mod frontend_http;
 pub mod health;
 pub mod http;
 pub mod identity;
@@ -46,7 +41,6 @@ pub mod listener;
 pub mod node_drain;
 pub mod node_health;
 pub mod operator;
-pub mod pool_http;
 pub mod ports;
 pub mod record;
 pub mod reply;
@@ -61,12 +55,10 @@ mod timing;
 mod updater;
 
 pub use timing::Timing;
-pub use updater::{Ports, STREAMS_BOUND, Started, Updater};
+pub use updater::{Ports, Started, Updater};
 
 #[cfg(test)]
 mod daemon_tests;
-#[cfg(test)]
-mod frontend_http_tests;
 #[cfg(test)]
 mod identity_tests;
 // The activated descriptor tests use an abstract socket address, which is Linux's.
@@ -75,9 +67,9 @@ mod listener_tests;
 #[cfg(test)]
 mod node_drain_tests;
 #[cfg(test)]
-mod node_health_tests;
+mod node_health_own_tests;
 #[cfg(test)]
-mod pool_http_tests;
+mod node_health_tests;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
@@ -92,8 +84,6 @@ mod updater_drain_tests;
 mod updater_followup_tests;
 #[cfg(test)]
 mod updater_fresh_host_tests;
-#[cfg(test)]
-mod updater_frontend_tests;
 #[cfg(test)]
 mod updater_mac_tests;
 #[cfg(test)]

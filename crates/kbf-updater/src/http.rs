@@ -1,5 +1,5 @@
 //! Just enough HTTP/1.1 for the updater's unix socket: read one request, write one answer,
-//! close. The only peer is kbf-proxy, which sends one request per connection here, so there is
+//! close. The only peer is the front door of the socket, which sends one request per connection, so there is
 //! no keep-alive, no chunked body, no `Expect`, no pipelining: a request that needs any of that
 //! is refused, not guessed at.
 

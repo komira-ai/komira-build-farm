@@ -14,19 +14,46 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 use support::{Events, OPERATOR_TOKEN, Pki, VB};
 
+/// How the agent reaches the frontend in a run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Way {
+    /// The opt-in fallback: the operator token over the frontend's loopback API.
+    Token,
+    /// The shipped way: the host's certificate on the frontend's worker listener, no token.
+    Certificate,
+}
+
 /// A daemon host is told to update to B and does: the helper installs it, the node is drained
 /// at the frontend before the helper switches, the node's health is read, B is confirmed, and
 /// the node is given back; and the heartbeats say all along who is not named (no node id, no
 /// role), that an update is running, and at the end that it succeeded.
 #[test]
 fn a_daemon_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
+    an_update_by(Way::Token);
+}
+
+/// The same update with no token anywhere: the agent is given `--frontend` and its certificate
+/// and nothing else, the frontend sees the node's own certificate on every call and no
+/// `Authorization` header, and the drain, the health reads and the undrain happen in the same
+/// order around the helper's switch.
+#[test]
+fn a_daemon_host_updates_with_its_certificate_alone_and_no_token() {
+    an_update_by(Way::Certificate);
+}
+
+fn an_update_by(way: Way) {
     let dir = TestDir::under(std::env::temp_dir(), "agent-e2e");
     let pki = Pki::new();
     let leaf = pki.updater("n1", HostRole::Daemon);
     pki.write_updater_files(&dir, &leaf);
     let token = dir.join("operator-token");
-    std::fs::write(&token, OPERATOR_TOKEN).unwrap();
-    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    if way == Way::Token {
+        std::fs::write(&token, OPERATOR_TOKEN).unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+    } else {
+        assert!(!token.exists(), "no token file is made for this run");
+    }
 
     let events = Events::default();
     let beats = Arc::new(Mutex::new(Vec::new()));
@@ -45,7 +72,10 @@ fn a_daemon_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
         },
         &stop,
     );
-    let (api_addr, api) = support::operator_api(&events, &stop);
+    let (api_addr, api) = match way {
+        Way::Token => support::operator_api(&events, &stop),
+        Way::Certificate => support::frontend_worker(&pki, &events, &stop),
+    };
     let socket = dir.join("local.sock");
     let helper = support::helper(&socket, &events, &stop);
 
@@ -62,10 +92,6 @@ fn a_daemon_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
         &dir.join("ca.pem").display().to_string(),
         "--channel",
         "stable",
-        "--operator-api",
-        &format!("http://{api_addr}"),
-        "--token-file",
-        &token.display().to_string(),
         "--helper-socket",
         &socket.display().to_string(),
         "--heartbeat-secs",
@@ -75,6 +101,18 @@ fn a_daemon_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
     ]
     .iter()
     .map(|s| (*s).to_owned())
+    .chain(match way {
+        Way::Token => vec![
+            "--operator-api".to_owned(),
+            format!("http://{api_addr}"),
+            "--token-file".to_owned(),
+            token.display().to_string(),
+        ],
+        Way::Certificate => vec![
+            "--frontend".to_owned(),
+            format!("localhost:{}", api_addr.port()),
+        ],
+    })
     .collect();
 
     let watched = Arc::clone(&beats);
@@ -98,6 +136,24 @@ fn a_daemon_host_updates_from_the_order_to_the_heartbeat_that_says_it_worked() {
     api.join().unwrap();
     helper.join().unwrap();
     assert_eq!((code, text.as_str()), (0, ""));
+    if way == Way::Certificate {
+        let all = events.all();
+        let calls = all.iter().filter(|e| e.starts_with("api:client")).count();
+        assert!(calls >= 3, "{all:?}");
+        for event in &all {
+            assert_ne!(
+                event, "api:credential",
+                "a call carried a credential: {all:?}"
+            );
+            assert_ne!(event, "api:client none", "{all:?}");
+        }
+        assert!(
+            all.iter()
+                .filter(|e| e.starts_with("api:client"))
+                .all(|e| e == "api:client n1"),
+            "{all:?}"
+        );
+    }
 
     // The A/B, in order, across the three.
     let all = events.all();

@@ -410,6 +410,51 @@ fn the_coordinator_and_the_updater_hold_no_ca_code() {
     );
 }
 
+/// A host's updater has no tie to the front-door proxy (`kbf-proxy`, which is being retired):
+/// the frontend serves the updater's calls itself (`kbf_server::node_self`), and the roll no
+/// longer drains a pool. The crate's normal closure holds no `kbf-proxy`, its manifest names
+/// none (the dev-dependencies the closure walk does not see), and no source or test file of it
+/// names the crate or its identity headers.
+#[test]
+fn the_updater_has_no_tie_to_the_proxy() {
+    let g = load_graph();
+    let (_, root) = g.members.get("kbf-updater").expect("a workspace member");
+    assert!(root.is_some(), "kbf-updater must have a library target");
+    let violations = reaches(&g, "kbf-updater", &["kbf-proxy"]);
+    assert!(
+        violations.is_empty(),
+        "kbf-updater reaches the proxy:\n{}",
+        violations.join("\n")
+    );
+    // The walk proves something: a crate that does link the proxy is seen to reach it.
+    assert!(
+        !reaches(&g, "kbf-installer", &["kbf-proxy"]).is_empty(),
+        "the installer's closure must reach kbf-proxy, or this walk proves nothing"
+    );
+
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-updater");
+    let manifest = std::fs::read_to_string(base.join("Cargo.toml")).expect("the manifest");
+    assert!(
+        !manifest.contains("kbf-proxy") && !manifest.contains("kbf_proxy"),
+        "kbf-updater's Cargo.toml names the proxy"
+    );
+    let mut files = Vec::new();
+    rust_files(&base, &base.join("src"), &mut files);
+    rust_files(&base, &base.join("tests"), &mut files);
+    assert!(
+        files.iter().any(|f| f == "src/agent/build.rs") && files.iter().any(|f| f == "src/lib.rs"),
+        "kbf-updater's files were not found under {}",
+        base.display()
+    );
+    for file in &files {
+        let text =
+            std::fs::read_to_string(base.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        for word in ["kbf-proxy", "kbf_proxy"] {
+            assert!(!text.contains(word), "{file} names {word}");
+        }
+    }
+}
+
 /// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
 /// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
 /// and so are in its closure.

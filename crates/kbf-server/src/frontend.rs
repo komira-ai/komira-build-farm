@@ -817,6 +817,13 @@ impl<'a> Prepared<'a> {
         )
         .layer(ProxyAuthLayer::new(proxy_secret.clone()));
         let membership = membership(members.clone(), &peers, delivery.as_ref());
+        // The four calls a host's updater makes about its own node.
+        let node_calls = crate::node_self::routes(
+            Arc::clone(&farm),
+            members.clone(),
+            state_store.clone(),
+            peers.clone(),
+        );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
         let sessions = WorkerService::new(
             Arc::clone(&farm),
@@ -887,6 +894,7 @@ impl<'a> Prepared<'a> {
                 });
             let worker_stopped = worker_stop.fired();
             let worker_serve = worker_server
+                .add_routes(node_calls)
                 .add_service(worker_service)
                 .add_optional_service(membership)
                 .add_optional_service(cold_store)

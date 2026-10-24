@@ -14,9 +14,9 @@
 //! - `FILE` is a 0600 file in a fresh 0700 directory holding the one line
 //!   `ADDRESS KEY` from the inventory, so the only key that is trusted is the pinned one; both
 //!   are removed when the call ends.
-//! - `COMMAND` is exactly `install kbf=<version> from <channel>`, `restart frontend=<name>`
-//!   or `query`. The version, the channel and the frontend name are checked here against the
-//!   grammar the host applies, and a request the host would refuse never starts a process.
+//! - `COMMAND` is exactly `install kbf=<version> from <channel>` or `query`. The version and
+//!   the channel are checked here against the grammar the host applies, and a request the host
+//!   would refuse never starts a process.
 //! - The environment is `PATH`, `HOME` (ssh wants it) and `LANG=C`; nothing else is passed,
 //!   so no agent socket, no `SSH_ASKPASS`, no proxy variable.
 //!
@@ -109,30 +109,6 @@ fn host_accepts(version: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b".+~-".contains(&b))
         && !version.ends_with('-')
-}
-
-/// The longest frontend instance name, in bytes (the host's bound).
-const MAX_FRONTEND_LEN: usize = 32;
-
-/// Whether `name` is one the host accepts in `restart frontend=<name>`, restated here on the
-/// text so that a loosening of either side is caught by the contract test: `-` for the plain
-/// unit, else `[a-z][a-z0-9-]{0,31}`.
-pub(crate) fn frontend_name_ok(name: &str) -> bool {
-    let lower_or_digit = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    let mut bytes = name.bytes();
-    let instance = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
-        && name.len() <= MAX_FRONTEND_LEN
-        && bytes.all(|b| lower_or_digit(b) || b == b'-');
-    name == "-" || instance
-}
-
-/// The unit the host restarts for the frontend `name` (already checked).
-fn frontend_unit(name: &str) -> String {
-    if name == "-" {
-        "kbf-frontend.service".to_owned()
-    } else {
-        format!("kbf-frontend@{name}.service")
-    }
 }
 
 fn user_ok(user: &str) -> bool {
@@ -315,15 +291,6 @@ impl Installer for SshInstaller {
         let done = self.call(host, "query")?;
         let (code, stdout) = answer::checked(&done)?;
         answer::query_answer(code, stdout)
-    }
-
-    fn restart_frontend(&self, host: &Host, name: &str) -> Result<(), PortError> {
-        if !frontend_name_ok(name) {
-            return Err(PortError::other("refused: bad_frontend"));
-        }
-        let done = self.call(host, &format!("restart frontend={name}"))?;
-        let (code, stdout) = answer::checked(&done)?;
-        answer::restart_answer(code, stdout, &frontend_unit(name))
     }
 }
 

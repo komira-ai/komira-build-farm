@@ -9,9 +9,9 @@ use std::time::Duration;
 use crate::inventory::{Host, Role};
 use crate::ports::{PortErrorKind, SafeToStop, Stop, Verdict};
 use crate::safe_http::HttpSafeToStop;
-use crate::secret::{file_rule, read_proxy_secret, read_token};
+use crate::secret::{file_rule, read_token};
 use crate::testutil::{
-    FakeApi, KEY, TOKEN, closed_port, eventually, fake_api, fake_api_by, file, http, scratch,
+    FakeApi, KEY, TOKEN, closed_port, eventually, fake_api, file, http, scratch,
 };
 
 fn host(alias: &str) -> Host {
@@ -21,13 +21,12 @@ fn host(alias: &str) -> Host {
         role: Role::Storage,
         host_key: KEY.to_owned(),
         node_id: None,
-        member: None,
     }
 }
 
 fn adapter(addr: SocketAddr) -> (HttpSafeToStop, PathBuf) {
     let token_file = file(&scratch("tok"), "token", &format!("{TOKEN}\n"), 0o600);
-    let a = HttpSafeToStop::new(addr, token_file.clone(), None).expect("adapter");
+    let a = HttpSafeToStop::new(addr, token_file.clone()).expect("adapter");
     (a.with_timeout(Duration::from_millis(400)), token_file)
 }
 
@@ -222,7 +221,7 @@ fn the_token_file_is_held_to_the_servers_rule() {
     }
     assert_eq!(read_token(&exact).map(|t| t.len()), Ok(4096));
     // The adapter checks the file when it is made, so a bad file fails the start-up.
-    assert!(HttpSafeToStop::new(closed_port(), short, None).is_err());
+    assert!(HttpSafeToStop::new(closed_port(), short).is_err());
 }
 
 /// Catches a token cached for ever (a rotation would need a restart) or a token file that
@@ -277,128 +276,4 @@ fn the_file_rule_wants_a_regular_file_of_mine_with_mode_0600_or_0400() {
             "{mode:o}"
         );
     }
-}
-
-/// A secret of 32 bytes that are not text, and its 64 hex digits.
-const SECRET: [u8; 32] = [
-    0x00, 0x01, 0x7f, 0x80, 0xff, 0xfe, 0x10, 0xab, 0xcd, 0xef, 0x0a, 0x0d, 0x20, 0x41, 0x5a, 0x61,
-    0x7a, 0x30, 0x39, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78, 0x9a,
-];
-const SECRET_HEX: &str = "00017f80fffe10abcdef0a0d20415a617a3039deadbeefcafebabe123456789a";
-
-fn secret_file(dir: &std::path::Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, bytes).expect("write");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
-}
-
-/// A fake operator API of a frontend behind kbf-proxy: it answers 403 unless the request
-/// carries `x-kbf-proxy-auth: <hex>` for the secret now in `expected`.
-fn gated_api(expected: std::sync::Arc<std::sync::Mutex<String>>) -> FakeApi {
-    fake_api_by(move |_, head| {
-        let want = format!(
-            "\r\nx-kbf-proxy-auth: {}\r\n",
-            expected.lock().expect("lock")
-        );
-        let verdict = if head.contains(&want) { 200 } else { 403 };
-        Some(http(verdict, SAFE))
-    })
-}
-
-/// Catches the frontend's operator API behind kbf-proxy (which answers 403 to a call without
-/// the proxy's secret, `kbf-server` `operator_gate`) being called without it, or with the
-/// secret in the wrong form: with `--operator-proxy-auth-file` the header is
-/// `x-kbf-proxy-auth` with the 32 bytes as 64 lower-case hex digits, the file is read on every
-/// call (the secret changes at each proxy boot), and without the file no such header is sent.
-#[test]
-fn the_proxy_secret_is_sent_as_hex_and_read_on_every_call() {
-    let expected = std::sync::Arc::new(std::sync::Mutex::new(SECRET_HEX.to_owned()));
-    let api = gated_api(std::sync::Arc::clone(&expected));
-    let dir = scratch("pauth");
-    let token = file(&dir, "token", TOKEN, 0o600);
-    let secret = secret_file(&dir, "secret", &SECRET, 0o600);
-    let a = HttpSafeToStop::new(api.addr, token.clone(), Some(secret.clone()))
-        .expect("adapter")
-        .with_timeout(Duration::from_millis(400));
-    assert!(matches!(a.check(&host("st1")), Ok(Stop::Answer(_))));
-    // The secret changes (a proxy restart): the next call sends the new one.
-    let mut next = SECRET;
-    next[0] = 0xaa;
-    std::fs::write(&secret, next).expect("rewrite");
-    *expected.lock().expect("lock") = format!("aa{}", &SECRET_HEX[2..]);
-    assert!(matches!(a.check(&host("st1")), Ok(Stop::Answer(_))));
-    // The bearer token is still sent beside it.
-    assert!(api.requests()[1].contains(&format!("Authorization: Bearer {TOKEN}\r\n")));
-    // Without the file the gate refuses, and no such header is sent.
-    let bare = HttpSafeToStop::new(api.addr, token, None).expect("adapter");
-    let e = bare.check(&host("st1")).expect_err("403");
-    assert!(e.to_string().contains("(403)"), "{e}");
-    assert!(
-        !api.requests()[2]
-            .to_lowercase()
-            .contains("x-kbf-proxy-auth")
-    );
-}
-
-/// Catches a proxy secret file accepted that is not the 32 bytes the server reads (31, 33,
-/// empty), or held to a weaker rule than the token's (mode, symlink), or an error text that
-/// names the file's path or holds the secret; a file that goes bad after start-up fails the
-/// call with no connection made.
-#[test]
-fn the_proxy_secret_file_is_held_to_the_rule_and_errors_name_the_flag() {
-    let dir = scratch("pasecret");
-    let good = secret_file(&dir, "good", &SECRET, 0o400);
-    assert_eq!(read_proxy_secret(&good).as_deref(), Ok(SECRET_HEX));
-    let link = dir.join("link");
-    symlink(&good, &link).expect("symlink");
-    for (path, why) in [
-        (
-            secret_file(&dir, "short", &SECRET[..31], 0o600),
-            "exactly 32 bytes",
-        ),
-        (
-            secret_file(&dir, "long", &[SECRET.as_slice(), &[1]].concat(), 0o600),
-            "exactly 32 bytes",
-        ),
-        (secret_file(&dir, "empty", b"", 0o600), "exactly 32 bytes"),
-        (secret_file(&dir, "open", &SECRET, 0o644), "mode must be"),
-        (dir.join("missing"), "not found"),
-        (link, "symbolic"),
-    ] {
-        let e = read_proxy_secret(&path).expect_err(why);
-        assert!(e.starts_with("--operator-proxy-auth-file: "), "{e}");
-        assert!(!e.contains(&path.display().to_string()), "path in {e}");
-        assert!(!e.contains(SECRET_HEX), "{e}");
-        assert!(
-            e.to_lowercase().contains(why) || why == "symbolic",
-            "{why} not in {e}"
-        );
-    }
-    // A bad file fails the start-up, naming the flag.
-    let e = HttpSafeToStop::new(
-        closed_port(),
-        file(&dir, "t", TOKEN, 0o600),
-        Some(dir.join("nope")),
-    )
-    .err()
-    .expect("start-up");
-    assert!(e.starts_with("--operator-proxy-auth-file: "), "{e}");
-    // A file that goes bad later fails the call, and no connection is made.
-    let api = fake_api(vec![Some(http(200, SAFE))]);
-    let secret = secret_file(&dir, "later", &SECRET, 0o600);
-    let a = HttpSafeToStop::new(
-        api.addr,
-        file(&dir, "t2", TOKEN, 0o600),
-        Some(secret.clone()),
-    )
-    .expect("adapter");
-    std::fs::write(&secret, &SECRET[..5]).expect("shorten");
-    let e = a.check(&host("st1")).expect_err("bad later");
-    assert_eq!(e.kind(), PortErrorKind::Other);
-    assert!(
-        e.to_string().starts_with("--operator-proxy-auth-file: "),
-        "{e}"
-    );
-    assert!(api.requests().is_empty());
 }

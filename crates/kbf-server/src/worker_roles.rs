@@ -31,6 +31,13 @@
 //! each connection: its daemon half's connection is a daemon's, its storage half's a
 //! storage node's.
 //!
+//! **Node calls.** Four HTTP/JSON calls about its own node are the exception to the table: a
+//! host's updater makes them with an `updater` certificate ([`crate::node_self`]), and the
+//! layer judges them by their shape and the certificate's node, not by the table. They are the
+//! only calls of the updater role the listener serves. Every call whose path starts with
+//! `/v1/` (no gRPC method does) is HTTP, and one that is not admitted as a node call is
+//! answered with a plain 403, never a gRPC status.
+//!
 //! The services keep their own checks behind this one: the worker stream and the blob
 //! calls bind the certificate's node name and read the deny list ([`crate::identity`]),
 //! and `Membership` takes the storage role alone again ([`crate::members_rpc`]).
@@ -44,6 +51,7 @@ use tonic::codegen::{Service, http};
 use tower_layer::Layer;
 
 use crate::identity::{Presented, presented};
+use crate::node_self::{admit as admit_node_call, node_call};
 
 const DAEMON: &[PeerRole] = &[PeerRole::Daemon];
 const STORAGE: &[PeerRole] = &[PeerRole::Storage];
@@ -215,7 +223,31 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
+        // The HTTP namespace of the listener: no gRPC method starts with `/v1/`. A call there
+        // is one of the four node calls of a host's updater, admitted by its certificate, or it
+        // is refused with a plain status, never a gRPC one.
+        if request.uri().path().starts_with("/v1/") {
+            let admitted = node_call(request.method(), request.uri()).map(|call| {
+                admit_node_call(self.admission, &call, &presented(request.extensions()))
+            });
+            return match admitted {
+                Some(Ok(updater)) => {
+                    request.extensions_mut().insert(updater);
+                    Either::Right(self.inner.call(request))
+                }
+                refused => {
+                    let code = refused
+                        .and_then(Result::err)
+                        .unwrap_or(http::StatusCode::FORBIDDEN);
+                    let path = request.uri().path();
+                    tracing::warn!(call = path, %code, "worker listener HTTP call refused");
+                    let mut answer = http::Response::new(R::default());
+                    *answer.status_mut() = code;
+                    Either::Left(ready(Ok(answer)))
+                }
+            };
+        }
         let path = request.uri().path();
         match admit_presented(self.admission, path, &presented(request.extensions())) {
             Ok(()) => Either::Right(self.inner.call(request)),

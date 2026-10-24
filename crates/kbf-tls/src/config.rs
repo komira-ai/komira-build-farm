@@ -55,6 +55,27 @@ pub enum TlsError {
     },
 }
 
+/// The application protocols a listener's handshake offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Alpn {
+    /// `h2` only: gRPC (what tonic's own acceptor offers).
+    #[default]
+    H2,
+    /// `h2`, then `http/1.1`: gRPC, and plain HTTP/1.1 requests on the same port (the node
+    /// calls of a host's updater on the worker listener).
+    H2AndHttp1,
+}
+
+impl Alpn {
+    /// The protocol names, in the order they are offered.
+    fn protocols(self) -> Vec<Vec<u8>> {
+        match self {
+            Self::H2 => vec![b"h2".to_vec()],
+            Self::H2AndHttp1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        }
+    }
+}
+
 /// The bytes of the files, as read at one moment.
 #[derive(Debug)]
 pub(crate) struct Material {
@@ -147,6 +168,7 @@ pub(crate) fn build(
     files: &TlsFiles,
     material: &Material,
     reject_expired: bool,
+    alpn: Alpn,
 ) -> Result<Built, TlsError> {
     let chain = certificates(&files.cert, &material.cert)?;
     let key = PrivateKeyDer::from_pem_slice(&material.key).map_err(|e| pem_error(&files.key, e))?;
@@ -179,8 +201,8 @@ pub(crate) fn build(
             .with_single_cert(chain, key)
         })
         .map_err(|e| TlsError::Config(e.to_string()))?;
-    // What tonic's own acceptor offers: gRPC runs over HTTP/2 only.
-    config.alpn_protocols = vec![b"h2".to_vec()];
+    // By default what tonic's own acceptor offers: gRPC runs over HTTP/2 only.
+    config.alpn_protocols = alpn.protocols();
     Ok(Built {
         config: Arc::new(config),
         not_after,

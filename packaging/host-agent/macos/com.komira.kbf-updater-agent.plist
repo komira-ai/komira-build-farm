@@ -5,14 +5,16 @@
   heartbeats to the coordinator over mutual TLS and runs this host's update through the local
   socket of com.komira.kbf-host-install-local. It listens on nothing. The certificate and key are
   the host's own: `kbf-updater enroll` (README.md, "Enrolling a host") makes them in the state
-  directory with a one-time token, and the agent renews them there at half their life through the
-  frontend. The state directory is owned by _kbf-updater, mode 0700. Edit the values to the farm's.
+  directory with a one-time token, and the agent renews them there at half their life at the
+  frontend's enroll listener (--enroll-frontend). The state directory is owned by _kbf-updater,
+  mode 0700. Edit the values to the farm's.
 
   This job gives the agent NO operator token. The drain of the node, its undrain and its status
-  are three calls to the frontend (--frontend, the public proxy) made with the host's own
-  certificate: the proxy admits them for this node and for no other. A token is an opt-in
-  fallback: adding --operator-api and --token-file (and their values) to ProgramArguments makes
-  the agent use it instead, and anything running as _kbf-updater can then read it.
+  are calls to the frontend's worker listener (--frontend) made over mutual TLS with the host's
+  own certificate: the frontend serves exactly those for the node in that certificate and
+  refuses everything else. A token is an opt-in fallback: adding --operator-api and --token-file
+  (and their values) to ProgramArguments makes the agent use it instead, and anything running
+  as _kbf-updater can then read it.
 -->
 <plist version="1.0">
 <dict>
@@ -25,7 +27,9 @@
 		<string>--coordinator</string>
 		<string>coordinator.farm.example:8443</string>
 		<string>--frontend</string>
-		<string>frontend.farm.example:443</string>
+		<string>frontend.farm.example:8981</string>
+		<string>--enroll-frontend</string>
+		<string>frontend.farm.example:8444</string>
 		<string>--state-dir</string>
 		<string>/var/db/kbf-updater</string>
 		<string>--channel</string>

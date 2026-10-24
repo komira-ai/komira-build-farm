@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::inventory::Role;
 
 /// How long the roll waits for each thing. The defaults are the package-update design's
-/// (node health 300 s, daemon 780 s, no answer 120 s); the frontend's bound, the safe-to-stop
+/// (node health 300 s, daemon 780 s, no answer 120 s); the safe-to-stop
 /// bound and the cap on an install in progress are this crate's choices.
 #[derive(Clone, Debug)]
 pub struct Timing {
@@ -18,7 +18,6 @@ pub struct Timing {
     pub install_bound: Duration,
     /// How long a restart waits for a host that does not answer a query at all.
     pub query_bound: Duration,
-    pub healthy_frontend: Duration,
     pub healthy_storage: Duration,
     pub healthy_daemon: Duration,
     /// How long a daemon host's node is given to finish its leases once it is drained. When
@@ -38,7 +37,6 @@ impl Default for Timing {
             safe_bound: Duration::from_secs(300),
             install_bound: Duration::from_secs(900),
             query_bound: Duration::from_secs(120),
-            healthy_frontend: Duration::from_secs(300),
             healthy_storage: Duration::from_secs(300),
             healthy_daemon: Duration::from_secs(780),
             drain_deadline: Duration::from_secs(600),
@@ -51,8 +49,7 @@ impl Default for Timing {
 impl Timing {
     pub(crate) fn healthy(&self, role: Role) -> Duration {
         match role {
-            Role::Frontend => self.healthy_frontend,
-            Role::Storage => self.healthy_storage,
+            Role::Frontend | Role::Storage => self.healthy_storage,
             Role::Daemon | Role::MacDaemon => self.healthy_daemon,
         }
     }

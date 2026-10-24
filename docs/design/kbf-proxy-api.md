@@ -232,7 +232,7 @@ operator token and the Buck2 key are read at start; only the TLS files reload.
 |---|---|---|
 | Worker | `/kbf.worker.*`, `/kbf.map.v1.Membership/`, `/kbf.update.*`, `/kbf.enroll.v1.ColdStore/` | verified certificate with role Daemon or Storage; none: `UNAUTHENTICATED`; other role: `PERMISSION_DENIED` |
 | Reapi | REAPI services, ByteStream, `google.longrunning.Operations` | `none`: open; `mtls`: any verified certificate but a host updater's; `bearer`: the right token |
-| Operator | other `/v1/*`, `/metrics` | operator token; a certificate with the role `updater` instead makes `POST /v1/nodes/{id}:drain`, `POST /v1/nodes/{id}:uncordon` and `GET /v1/nodes/{id}` for its own node id (`route::self_node_of`), the proxy putting the operator token in itself, and nothing else: any other call of an `updater` certificate is `PERMISSION_DENIED` whatever the class, the probes, the UI and enrollment excepted |
+| Operator | other `/v1/*`, `/metrics` | operator token; a certificate with the role `updater` is no credential here (the frontend serves an updater its own-node calls) |
 | Update | `/v1/update/frontend*` | operator token; then the built-in handler answers 503 |
 | Probe | `/healthz`, `/readyz` | open |
 | Ui | `/ui`, `/ui/...` | open: no certificate, no token; `GET` and `HEAD` only |

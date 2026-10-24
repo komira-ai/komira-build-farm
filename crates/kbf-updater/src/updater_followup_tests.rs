@@ -211,8 +211,6 @@ fn open_over(rig: &Rig, rec: &crate::record::Record) -> Result<Updater, StoreErr
             drain: Box::new(rig.drain.clone()),
             health: Box::new(rig.health.clone()),
             clock: Box::new(rig.clock.clone()),
-            pool: Box::new(rig.pool.clone()),
-            frontend: Box::new(rig.front.clone()),
         },
         Timing::default(),
     )

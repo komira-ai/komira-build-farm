@@ -10,8 +10,8 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NO_CREDENTIAL, NoCredential, NoDrain, build, drain_for, identity_of_files, no_drain, run_agent,
-    run_config, unix_now,
+    NO_CREDENTIAL, NoCredential, build, drain_for, identity_of_files, run_agent, run_config,
+    unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
 use super::flags::{Config, NodeApi, Timing};
@@ -45,11 +45,11 @@ impl Rig {
             channel: "stable".to_owned(),
             helper_socket: dir.join("no-helper.sock"),
             frontend: None,
+            enroll_frontend: None,
             state_dir: None,
             node_api: Some(NodeApi {
                 addr: "127.0.0.1:1".parse().unwrap(),
                 token_file: token,
-                proxy_auth_file: None,
             }),
             timing: Timing {
                 heartbeat: Duration::from_millis(20),
@@ -150,31 +150,21 @@ fn an_agent_is_built_for_every_host_but_a_frontend() {
     assert!(build(&rig.config).is_err());
 }
 
-/// A storage host's node is never drained (the roll never drains one, a daemon on it
-/// included): its drain, its leases and its undrain are done already. A daemon host's node is
-/// drained through the frontend, which here cannot be reached.
+/// Every host's node is drained through the frontend, a storage host's too (it may run a
+/// daemon): with the frontend out of reach, the drain of a storage host fails as a daemon's
+/// does and is not taken for done.
 #[test]
-fn a_storage_host_is_not_drained_and_a_daemon_host_is() {
+fn every_host_is_drained_through_the_frontend() {
     let rig = Rig::new("bd-drain", HostRole::Daemon);
     let node = rig.config.node_api.clone().unwrap();
-    let api = OperatorApi::new(node.addr, node.token_file, None)
+    let api = OperatorApi::new(node.addr, node.token_file)
         .unwrap()
         .with_timeout(Duration::from_millis(200));
-    let storage = drain_for(Role::Storage, &api);
-    let h = host(Role::Storage);
-    assert_eq!(storage.drain(&h, Duration::from_secs(1)), Ok(()));
-    assert_eq!(storage.leases(&h), Ok(0));
-    assert_eq!(storage.undrain(&h), Ok(()));
-    assert_eq!(NoDrain.leases(&h), Ok(0));
-    assert_eq!(no_drain().undrain(&h), Ok(()));
-
-    for role in [Role::Daemon, Role::MacDaemon] {
-        let daemon = drain_for(role, &api);
+    for role in [Role::Storage, Role::Daemon, Role::MacDaemon] {
+        let drain = drain_for(role, &api);
         let h = host(role);
-        assert!(
-            daemon.drain(&h, Duration::from_secs(1)).is_err(),
-            "{role:?}"
-        );
+        assert!(drain.drain(&h, Duration::from_secs(1)).is_err(), "{role:?}");
+        assert!(drain.undrain(&h).is_err(), "{role:?}");
     }
 }
 
@@ -302,6 +292,7 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
         channel: "stable".to_owned(),
         helper_socket: dir.join("no-helper.sock"),
         frontend: Some(Endpoint::parse("localhost:1").unwrap()),
+        enroll_frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         state_dir: Some(state.clone()),
         node_api: None,
         timing: Timing {

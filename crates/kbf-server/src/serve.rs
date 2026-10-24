@@ -327,6 +327,9 @@ pub(crate) fn worker_peers(
 ) -> (WorkerListener, Peers, Option<TlsSource>) {
     let secret = behind.map(|behind| Arc::clone(&behind.secret));
     let proxy = ProxyAuthLayer::new(secret);
+    // HTTP/1.1 is accepted beside h2 for the node calls of a host's updater
+    // (`crate::node_self`); the role table refuses every other call that is not gRPC.
+    let server = server.accept_http1(true);
     match (tls, behind) {
         (Some(tls), _) => (
             server
@@ -750,6 +753,7 @@ where
     let map = map_of(map, members.as_ref())?;
     // The API reads the same store, whose handle is shared.
     let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
+    let node_store = api_store.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -851,6 +855,13 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let membership = membership(members.clone(), &peers, None);
+    // The four calls a host's updater makes about its own node.
+    let node_calls = crate::node_self::routes(
+        Arc::clone(&farm),
+        members.clone(),
+        node_store,
+        peers.clone(),
+    );
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -919,6 +930,7 @@ where
                 let _ = goaway.await;
             });
         let worker_serve = worker_server
+            .add_routes(node_calls)
             .add_service(worker_service)
             .add_service(worker_blobs)
             .add_service(worker_cas)

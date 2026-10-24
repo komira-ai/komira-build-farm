@@ -1,6 +1,7 @@
 //! The roll API on a unix socket.
 //!
-//! The only peer is kbf-proxy, and the trust boundary is narrow on purpose:
+//! The only peer is the front door that forwards operators' requests (the user
+//! `--proxy-uid` names), and the trust boundary is narrow on purpose:
 //!
 //! - A connection whose `SO_PEERCRED` uid is not the configured proxy uid is closed without a
 //!   byte read or written ([`peer_allowed`]).

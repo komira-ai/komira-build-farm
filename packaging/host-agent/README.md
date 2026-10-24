@@ -30,7 +30,7 @@ the operator makes the token for this host (`POST /v1/enroll/tokens`, `docs/api.
 ```sh
 install -d -o kbf-updater -m 0700 /var/lib/kbf-updater
 sudo -u kbf-updater sh -c 'umask 077; cat > /var/lib/kbf-updater/enroll.token'   # paste the token, end with ^D
-sudo -u kbf-updater /usr/libexec/kbf/kbf-updater enroll --frontend frontend.farm.example:443 --node-id host-1 --token-file /var/lib/kbf-updater/enroll.token --state-dir /var/lib/kbf-updater
+sudo -u kbf-updater /usr/libexec/kbf/kbf-updater enroll --frontend frontend.farm.example:8444 --node-id host-1 --token-file /var/lib/kbf-updater/enroll.token --state-dir /var/lib/kbf-updater
 ```
 
 The key is made on the host and stays there (mode 0600, the account's); only a request signed
@@ -49,14 +49,16 @@ command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the 
   renews them.)
 - **A configuration for the helper's channels**: on Linux `/etc/kbf/host-install-releases.toml`,
   on a Mac the existing `host-install.toml`. See `docs/deploy/host-install.md`, "The local socket".
-- **No operator token, as shipped.** The drain of the node, its undrain and its status are three
-  calls to the frontend (`--frontend`) made with the host's own certificate. The frontend's
-  proxy admits exactly those three, for the node in the certificate and no other, and puts the
-  operator token in itself, so the host never holds it (`docs/design/updates.md`, "Trust"). An
-  operator who wants the full token on a host adds `--operator-api` and `--token-file` to the
-  agent's command line (the API is on the frontend's loopback), knowing that the agent's account
-  can then read it; the agent uses it instead of the certificate.
-- **A storage host's health** is read from operator routes a certificate cannot reach, so a
-  storage host needs the token above or is updated by the roll: its agent heartbeats and
-  refuses update orders until then.
-- **A frontend host is not served**: its certificate is refused. The roll updates frontends.
+- **No operator token, as shipped.** The drain of the node, its undrain and its status (a storage
+  host's: its own storage health) are calls to the frontend's worker listener (`--frontend`, the
+  address daemons dial) made over mutual TLS with the host's own certificate. The frontend
+  serves exactly those four, for the node in the certificate and no other, and nothing else from
+  an updater's certificate; no token is involved (`docs/design/updates.md`, "Trust"). The
+  worker listener must offer `http/1.1` beside `h2`, which `--worker-tls-*` does. An operator who
+  wants the full token on a host adds `--operator-api` and `--token-file` to the agent's command
+  line (the API is on the frontend's loopback), knowing that the agent's account can then read it;
+  the agent uses it instead of the certificate.
+- **Where the certificate is renewed**: `--enroll-frontend`, the frontend's enroll listener
+  (`--enroll-listen`), which is the address the enrollment above was given.
+- **A frontend host is not served**: its certificate is refused. A frontend is a container
+  that `kbf-host-install` drains and recreates; the updater does not update one.

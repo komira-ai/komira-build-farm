@@ -308,6 +308,74 @@ async fn the_layer_answers_a_refusal_itself_and_passes_an_admitted_call_on() {
     assert_eq!(format!("{open:?}"), "WorkerRolesLayer { admission: Open }");
 }
 
+async fn through_http(
+    layer: WorkerRolesLayer,
+    inner: &Inner,
+    method: &str,
+    path: &str,
+) -> http::Response<String> {
+    let mut service = layer.layer(inner.clone());
+    std::future::poll_fn(|cx| service.poll_ready(cx))
+        .await
+        .expect("ready");
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .body(())
+        .expect("request");
+    service.call(request).await.expect("infallible")
+}
+
+/// Catches an HTTP call under `/v1/` (no gRPC method starts there) answered as a gRPC call
+/// would be, with a 200 and a status in the headers that an HTTP client reads as success: it is
+/// a plain 403 for everything that is not one of the four node calls of an updater, a plain 401
+/// for one of the four with no certificate (plain text, or no TLS connection), and the service
+/// is never reached.
+#[tokio::test]
+async fn an_http_call_under_v1_is_refused_with_a_plain_status_and_never_reaches_the_service() {
+    let inner = Inner::default();
+    for admission in [Admission::Open, Admission::Certified] {
+        let layer = WorkerRolesLayer::new(admission);
+        for (method, path, want) in [
+            ("GET", "/v1/nodes", 403),
+            ("GET", "/v1/members", 403),
+            ("GET", "/v1/enroll/nodes", 403),
+            ("POST", "/v1/nodes/node-a:cordon", 403),
+            ("POST", "/v1/nodes/node-a", 403),
+            ("GET", "/v1/nodes/node-a?x=1", 403),
+            ("GET", "/v1/nodes/Node-A", 403),
+            ("GET", "/v1/", 403),
+            ("GET", "/v1/nodes/node-a", 401),
+            ("GET", "/v1/nodes/node-a/storage-health", 401),
+            ("POST", "/v1/nodes/node-a:drain", 401),
+            ("POST", "/v1/nodes/node-a:uncordon", 401),
+        ] {
+            let answer = through_http(layer, &inner, method, path).await;
+            assert_eq!(
+                answer.status().as_u16(),
+                want,
+                "{admission:?} {method} {path}"
+            );
+            assert!(
+                Status::from_header_map(answer.headers()).is_none(),
+                "{method} {path} was answered with a gRPC status"
+            );
+            assert!(answer.body().is_empty());
+        }
+    }
+    assert_eq!(inner.0.load(Ordering::SeqCst), 0);
+    // The namespace is `/v1/` and no other: a gRPC method keeps its gRPC refusal.
+    let refused = through_http(
+        WorkerRolesLayer::new(Admission::Open),
+        &inner,
+        "GET",
+        UNLISTED[0],
+    )
+    .await;
+    let status = Status::from_header_map(refused.headers()).expect("a gRPC status");
+    assert_eq!(status.code(), Code::PermissionDenied);
+}
+
 /// A client certificate and what a deny list line spells about it.
 struct Client {
     identity: Identity,

@@ -218,45 +218,6 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
     }
 }
 
-/// The node a host's updater may act on by this call, if the call is one of the three the
-/// proxy lets an updater certificate make for its own node (`docs/design/updates.md`):
-///
-/// - `POST /v1/nodes/{id}:drain`
-/// - `POST /v1/nodes/{id}:uncordon`
-/// - `GET /v1/nodes/{id}`
-///
-/// The shapes are exact. The id is a node id as the farm spells it (1 to 63 of `a-z`, `0-9`
-/// and `-`, not starting or ending with `-`), so a `.`, a `/`, a `%` or any other byte makes
-/// the call none of the three: nothing is percent-decoded or normalized, and what the proxy
-/// compares with the certificate is what the child will read. A query string makes it none of
-/// them, as does any other verb (`:cordon` included) or method.
-#[must_use]
-pub fn self_node_of<'a>(method: &http::Method, uri: &'a http::Uri) -> Option<&'a str> {
-    if uri.query().is_some() {
-        return None;
-    }
-    let rest = uri.path().strip_prefix("/v1/nodes/")?;
-    let (id, verb) = match rest.split_once(':') {
-        Some((id, verb)) => (id, Some(verb)),
-        None => (rest, None),
-    };
-    let shape = matches!(
-        (method, verb),
-        (&http::Method::GET, None) | (&http::Method::POST, Some("drain" | "uncordon"))
-    );
-    (shape && is_node_label(id)).then_some(id)
-}
-
-/// Whether `id` is a node id: a lower-case DNS label.
-fn is_node_label(id: &str) -> bool {
-    (1..=63).contains(&id.len())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !id.starts_with('-')
-        && !id.ends_with('-')
-}
-
 /// The idle timeout of `path`. Execute and WaitExecution are matched by their full method
 /// path, so a generic route table needs no per-stream state.
 #[must_use]
@@ -510,70 +471,5 @@ mod tests {
         );
         assert!(is_bytestream("/google.bytestream.ByteStream/Write"));
         assert!(!is_bytestream(&format!("{exec}Execute")));
-    }
-    fn node_call(method: &str, uri: &str) -> Option<String> {
-        let method: http::Method = method.parse().expect("a method");
-        let uri: http::Uri = uri.parse().expect("a uri");
-        self_node_of(&method, &uri).map(str::to_owned)
-    }
-
-    /// The three calls a host's updater may make about its node, and only those shapes: the
-    /// node's id is returned, and nothing else (another verb, method, query, spelling or
-    /// extra segment) names a node.
-    #[test]
-    fn the_node_calls_of_an_updater_are_three_exact_shapes() {
-        for (method, uri) in [
-            ("POST", "/v1/nodes/host-1:drain"),
-            ("POST", "/v1/nodes/host-1:uncordon"),
-            ("GET", "/v1/nodes/host-1"),
-            ("GET", "http://frontend.test/v1/nodes/host-1"),
-        ] {
-            assert_eq!(
-                node_call(method, uri).as_deref(),
-                Some("host-1"),
-                "{method} {uri}"
-            );
-        }
-        assert_eq!(
-            node_call("GET", &format!("/v1/nodes/{}", "a".repeat(63))).map(|id| id.len()),
-            Some(63)
-        );
-        assert_eq!(node_call("GET", "/v1/nodes/9").as_deref(), Some("9"));
-        let long = format!("/v1/nodes/{}", "a".repeat(64));
-        for (method, uri) in [
-            ("GET", "/v1/nodes"),
-            ("GET", "/v1/nodes/"),
-            ("GET", "/v1/nodes/host-1/"),
-            ("GET", "/v1/nodes/host-1/leases"),
-            ("POST", "/v1/nodes/host-1"),
-            ("GET", "/v1/nodes/host-1:drain"),
-            ("PUT", "/v1/nodes/host-1"),
-            ("DELETE", "/v1/nodes/host-1"),
-            ("HEAD", "/v1/nodes/host-1"),
-            ("POST", "/v1/nodes/host-1:cordon"),
-            ("POST", "/v1/nodes/host-1:Drain"),
-            ("POST", "/v1/nodes/host-1:drain:drain"),
-            ("POST", "/v1/nodes/host-1:"),
-            ("POST", "/v1/nodes/:drain"),
-            ("GET", "/v1/nodes/host-1?x=1"),
-            ("POST", "/v1/nodes/host-1:drain?x=1"),
-            ("GET", "/v1/nodes/HOST-1"),
-            ("GET", "/v1/nodes/host_1"),
-            ("GET", "/v1/nodes/host.1"),
-            ("GET", "/v1/nodes/-host"),
-            ("GET", "/v1/nodes/host-"),
-            ("GET", "/v1/nodes/host%2D1"),
-            ("POST", "/v1/nodes/host-1%3Adrain"),
-            ("GET", "/v1/nodes/host-1/../host-2"),
-            ("GET", "/v1/nodes/../host-2"),
-            ("GET", "/v1/nodes/.."),
-            ("GET", "//v1/nodes/host-1"),
-            ("GET", "/v1/nodesx/host-1"),
-            ("GET", "/v1/node/host-1"),
-            ("GET", "/v1/members/host-1"),
-            ("GET", long.as_str()),
-        ] {
-            assert_eq!(node_call(method, uri), None, "{method} {uri}");
-        }
     }
 }

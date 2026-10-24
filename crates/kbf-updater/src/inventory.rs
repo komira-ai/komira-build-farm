@@ -8,7 +8,7 @@
 //! mac1      mac1.farm.example     mac-daemon ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  mac1
 //! ```
 //!
-//! The roles are `frontend`, `storage`, `daemon` (a Linux host that runs only a daemon) and
+//! The roles are `frontend` (refused when a roll reaches it), `storage`, `daemon` (a Linux host that runs only a daemon) and
 //! `mac-daemon` (a Mac that runs a daemon). A `mac-daemon` host is rolled like a `daemon`
 //! host (it needs a node id, and its node is drained and given back) except for the
 //! install: its `kbf-host-install` starts the apply and answers at once, and the roll then
@@ -21,24 +21,13 @@
 //! before it drains the node, and a daemon host without one is refused. The updater never
 //! learns a host key by asking the host: the pinned key here is the one ssh must see.
 //!
-//! # Frontend pool members
+//! # Frontends
 //!
-//! A frontend that runs as a member of the kbf-proxy pool is one `frontend` line with two more
-//! words after the key (and after the node id, if the line has one), in any order:
-//!
-//! ```text
-//! fe-a      fe.farm.example       frontend  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  instance=a base=18000
-//! fe-b      fe.farm.example       frontend  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample  instance=b base=18010
-//! ```
-//!
-//! `instance=<name>` is the name the proxy knows the member by and the unit instance the
-//! host restarts (`kbf-frontend@<name>.service`; `-` is the plain unit), and `base=<port>` is
-//! the first of the member's five ports, as in the proxy's `[[proxy.frontend]]` table: the
-//! member's operator API is at `base + 2` on loopback. Every member of the file is on the host
-//! the updater runs on, so every member lists the same address and host key, and no two share a
-//! name or have overlapping ports (bases at least five apart). A `frontend` line with neither
-//! word is a frontend that is not in a pool: it parses, and the real health check refuses
-//! it. The two words belong to a `frontend` line only.
+//! A `frontend` line parses, and the real health check refuses it before the installer is
+//! called (see [`crate::node_health`]): a frontend is a container that `kbf-host-install`
+//! drains and recreates, and the updater does not roll one. The words `instance=` and
+//! `base=`, which listed a frontend as a pool member in earlier builds, are
+//! refused with the line number.
 //!
 //! The file decides which machines a roll may touch and as whom ssh logs in, so it is read
 //! only if it is owned by the expected uid (root) and writable by no one else, and any
@@ -51,28 +40,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use crate::api::{ApiError, ErrorCode, Hosts};
-use crate::ssh_installer::frontend_name_ok;
-
-/// The ports a pool member uses from its base port up: REAPI, worker, operator, admin calls
-/// and enrollment (kbf-proxy's `FRONTEND_SPAN`). The bases of two members are at least this
-/// far apart.
-pub const MEMBER_PORTS: u16 = 5;
-
-/// The offset of a member's operator listener from its base port.
-pub const OPERATOR_OFFSET: u16 = 2;
-
-/// The lowest base port a member may have (kbf-proxy's rule).
-const MIN_BASE: u16 = 1024;
-
-/// The highest base port a member may have: its last port must still be a port.
-const MAX_BASE: u16 = u16::MAX - (MEMBER_PORTS - 1);
 
 /// What a host runs, which decides its turn and its health bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// A frontend: rolled before the other hosts, no safe-to-stop. One that is a pool
-    /// [`Member`] is taken out of the pool, retired, updated, restarted and put back; one that
-    /// is not is refused by the real health check.
+    /// A frontend: ordered before the other hosts, no safe-to-stop, and refused by the real
+    /// health check, which a roll asks before it installs.
     Frontend,
     /// A storage node, possibly with a daemon.
     Storage,
@@ -113,40 +86,6 @@ pub struct Host {
     /// The id the frontend knows the node by: what the host's `query` must report before the
     /// node is drained. Absent on a line that lists none.
     pub node_id: Option<String>,
-    /// The pool member a `frontend` line stands for; absent on every other line.
-    pub member: Option<Member>,
-}
-
-/// A frontend that is a member of the kbf-proxy pool, as its inventory line lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Member {
-    /// The name the proxy knows it by, and the unit instance the host restarts for it.
-    pub instance: String,
-    /// The first of its [`MEMBER_PORTS`] ports.
-    pub base_port: u16,
-}
-
-impl Member {
-    /// The port of the member's operator API, on loopback.
-    pub fn operator_port(&self) -> u16 {
-        self.base_port + OPERATOR_OFFSET
-    }
-
-    /// Why this member cannot share the host with `other`, if it cannot: the same name, or
-    /// ports that overlap.
-    fn clash(&self, other: &Member) -> Option<String> {
-        if self.instance == other.instance {
-            return Some(format!("instance {} is listed twice", self.instance));
-        }
-        if self.base_port.abs_diff(other.base_port) < MEMBER_PORTS {
-            return Some(format!(
-                "base {} overlaps the ports of instance {} (base {}); bases must be at least \
-                 {MEMBER_PORTS} apart",
-                self.base_port, other.instance, other.base_port
-            ));
-        }
-        None
-    }
 }
 
 /// Why an inventory was refused.
@@ -178,8 +117,7 @@ const KEY_TYPES: &[&str] = &[
     "ssh-rsa",
 ];
 
-/// The parsed inventory: hosts in file order, aliases unique, and either one frontend that is
-/// no pool member or any number of members.
+/// The parsed inventory: hosts in file order, aliases unique, and at most one frontend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inventory {
     hosts: Vec<Host>,
@@ -231,8 +169,8 @@ impl Inventory {
             if hosts.iter().any(|h| h.alias == host.alias) {
                 return Err(at(format!("alias {} is listed twice", host.alias)));
             }
-            if let Some(why) = conflicts(&host, &hosts) {
-                return Err(at(why));
+            if host.role == Role::Frontend && hosts.iter().any(|h| h.role == Role::Frontend) {
+                return Err(at("a second frontend".to_owned()));
             }
             hosts.push(host);
         }
@@ -244,11 +182,6 @@ impl Inventory {
 
     pub fn host(&self, alias: &str) -> Option<&Host> {
         self.hosts.iter().find(|h| h.alias == alias)
-    }
-
-    /// Whether some host is a pool member: the roll then needs the proxy's admin API.
-    pub fn has_members(&self) -> bool {
-        self.hosts.iter().any(|h| h.member.is_some())
     }
 
     /// The hosts of a roll in the order they are touched: the frontend first, then the rest
@@ -303,84 +236,18 @@ fn check_owner_and_mode(
     Ok(())
 }
 
-/// Why `host` cannot be listed after `before`, if it cannot: a frontend that is no pool member
-/// is the only frontend, a pool member goes with members only, members list the same address
-/// and host key, and do not share a name or ports.
-fn conflicts(host: &Host, before: &[Host]) -> Option<String> {
-    let mut frontends = before.iter().filter(|h| h.role == Role::Frontend);
-    let Some(member) = &host.member else {
-        let second = host.role == Role::Frontend && frontends.next().is_some();
-        return second.then(|| "a second frontend".to_owned());
-    };
-    if frontends.any(|h| h.member.is_none()) {
-        let why = "a pool member beside a frontend that lists no instance and base";
-        return Some(why.to_owned());
-    }
-    // The retire and the commit go to the member on loopback, the install and the restart over
-    // ssh to the address: they must be the one machine.
-    let ours = (&host.address, &host.host_key);
-    let apart = before
-        .iter()
-        .filter(|h| h.member.is_some())
-        .find(|h| (&h.address, &h.host_key) != ours);
-    if let Some(other) = apart {
-        return Some(format!(
-            "{} lists another address or host key than {}; every member runs on the host the \
-             updater runs on, so every member lists the same",
-            host.alias, other.alias
-        ));
-    }
-    before
-        .iter()
-        .filter_map(|h| h.member.as_ref())
-        .find_map(|other| member.clash(other))
-}
-
-/// The `instance=` and `base=` words of a line, checked for a `frontend` line only.
-fn parse_member(role: Role, fields: &[&str]) -> Result<Option<Member>, String> {
-    let (mut instance, mut base) = (None, None);
-    for field in fields {
-        let (key, value) = field.split_once('=').unwrap_or((*field, ""));
-        let slot = match key {
-            "instance" => &mut instance,
-            "base" => &mut base,
-            _ => return Err(format!("{field:?} is not instance=<name> or base=<port>")),
-        };
-        if slot.replace(value).is_some() {
-            return Err(format!("{key}= is given twice"));
-        }
-    }
-    match (role == Role::Frontend, instance, base) {
-        (_, None, None) => Ok(None),
-        (false, _, _) => Err("instance= and base= belong to a frontend line".to_owned()),
-        (true, Some(_), None) => Err("instance= needs base=".to_owned()),
-        (true, None, Some(_)) => Err("base= needs instance=".to_owned()),
-        (true, Some(instance), Some(base)) => {
-            if !frontend_name_ok(instance) {
-                return Err(format!(
-                    "instance {instance:?} must be - or 1..=32 of a-z, 0-9 and -, from a letter"
-                ));
-            }
-            let in_range = |port: &u16| (MIN_BASE..=MAX_BASE).contains(port);
-            let Some(base_port) = base.parse().ok().filter(in_range) else {
-                return Err(format!(
-                    "base {base:?} must be a port from {MIN_BASE} to {MAX_BASE}"
-                ));
-            };
-            Ok(Some(Member {
-                instance: instance.to_owned(),
-                base_port,
-            }))
-        }
-    }
-}
-
 fn parse_line(line: &str) -> Result<Host, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     // The five words and the node id come first. The key, the fifth, may end in `=` as base64
-    // does, so the `name=value` words are looked for after it.
+    // does, so the `name=value` words an earlier build read are looked for after it.
     let named = words.iter().skip(5).position(|w| w.contains('='));
     let (words, fields) = words.split_at(named.map_or(words.len(), |i| i + 5));
+    if let Some(field) = fields.first() {
+        return Err(format!(
+            "{field:?}: instance= and base= listed a frontend as a pool member, and the updater \
+             no longer rolls frontends; remove them (and the frontend line)"
+        ));
+    }
     let (head, node_id) = match words[..] {
         [a, b, c, d, e] => ([a, b, c, d, e], None),
         [a, b, c, d, e, id] => ([a, b, c, d, e], Some(id)),
@@ -426,7 +293,6 @@ fn parse_line(line: &str) -> Result<Host, String> {
         role,
         host_key: format!("{key_type} {key}"),
         node_id: node_id.map(str::to_owned),
-        member: parse_member(role, fields)?,
     })
 }
 
@@ -641,143 +507,30 @@ mod tests {
         ));
     }
 
-    fn member_line(alias: &str, fields: &str) -> String {
-        format!("{alias} fe.farm.example frontend {KEY} {fields}")
-    }
-
-    /// The refusal of a file of a member `a` and a second member with `fields`.
-    fn second_error(fields: &str) -> String {
-        let a = member_line("fe-a", "instance=a base=18000");
-        line_error(&format!("{a}\n{}", member_line("fe-b", fields)))
-    }
-
-    /// Asserts that frontend lines with `instance=` and `base=` are pool members that read
-    /// their name and ports in either order, that members may share an address, that the
-    /// operator port is the base plus two, that members are rolled before the other hosts, and
-    /// that a host key ending in `=` (base64 padding) is not taken for a field.
+    /// Asserts that the words that listed a frontend as a pool member are refused with the line
+    /// number and a reason, on a frontend line or any other, and that a host key ending in `=`
+    /// (base64 padding) is not taken for one.
     #[test]
-    fn frontend_lines_with_an_instance_and_a_base_are_pool_members() {
-        let inv = Inventory::parse(&file(&[
-            &format!("st1 st1.farm.example storage {KEY}"),
-            &member_line("fe-a", "instance=a base=18000"),
-            &member_line("fe-b", "base=18010 instance=b"),
-            "padded fe.farm.example storage ssh-rsa AAAAB3NzaC1yc2E= padded-node",
-        ]))
-        .expect("inventory");
-        assert!(inv.has_members());
-        let a = inv.host("fe-a").expect("fe-a");
-        let b = inv.host("fe-b").expect("fe-b");
-        assert_eq!(a.address, b.address);
-        let want = Member {
-            instance: "a".to_owned(),
-            base_port: 18000,
-        };
-        assert_eq!(a.member.as_ref(), Some(&want));
-        assert_eq!(b.member.as_ref().map(Member::operator_port), Some(18012));
-        assert_eq!(inv.host("st1").expect("st1").member, None);
-        let padded = inv.host("padded").expect("padded");
+    fn the_pool_member_words_are_refused() {
+        for fields in [
+            "instance=a base=18000",
+            "base=18000 instance=a",
+            "instance=a",
+            "base=18000",
+            "port=1",
+        ] {
+            for role in ["frontend", "storage"] {
+                let got = line_error(&format!("f f.farm.example {role} {KEY} {fields}"));
+                assert!(got.starts_with("line 1: "), "{fields}: {got}");
+                assert!(got.contains("no longer rolls frontends"), "{fields}: {got}");
+            }
+        }
+        let padded =
+            Inventory::parse("padded fe.farm.example storage ssh-rsa AAAAB3NzaC1yc2E= padded-node")
+                .expect("a key with padding");
+        let padded = padded.host("padded").expect("padded");
         assert_eq!(padded.host_key, "ssh-rsa AAAAB3NzaC1yc2E=");
         assert_eq!(padded.node_id.as_deref(), Some("padded-node"));
-        let all = inv.plan(&Hosts::All(All::All)).expect("all");
-        assert_eq!(aliases(&all), ["fe-a", "fe-b", "st1", "padded"]);
-        assert!(!sample().has_members());
-    }
-
-    /// Asserts that two members cannot share a name or overlap in ports: the same instance
-    /// twice, the same base, and a base less than five above another are refused with the line
-    /// number, and a base exactly five above is taken.
-    #[test]
-    fn members_that_share_a_name_or_ports_are_refused() {
-        let cases = [
-            ("instance=a base=18010", "instance a is listed twice"),
-            ("instance=b base=18000", "overlaps the ports"),
-            ("instance=b base=18004", "at least 5 apart"),
-            ("instance=b base=17996", "at least 5 apart"),
-        ];
-        for (fields, want) in cases {
-            let got = second_error(fields);
-            assert!(got.starts_with("line 2: "), "{got}");
-            assert!(got.contains(want), "{got}");
-        }
-        let a = member_line("fe-a", "instance=a base=18000");
-        let b = member_line("fe-b", "instance=b base=18005");
-        assert!(Inventory::parse(&format!("{a}\n{b}")).is_ok());
-    }
-
-    /// Asserts that a member that lists another address, or another host key, than an earlier
-    /// member is refused with the line number, because every member runs on the one host.
-    #[test]
-    fn members_that_list_another_address_or_host_key_are_refused() {
-        let a = member_line("fe-a", "instance=a base=18000");
-        let fields = "instance=b base=18010";
-        let other_address = format!("fe-b fe2.farm.example frontend {KEY} {fields}");
-        let other_key = format!("fe-b fe.farm.example frontend ssh-rsa AAAAB3NzaC1yc2E= {fields}");
-        let why = "every member runs on the host the updater runs on";
-        for line in [other_address, other_key] {
-            let got = line_error(&format!("{a}\n{line}"));
-            assert!(got.starts_with("line 2: "), "{got}");
-            assert!(got.contains(why), "{got}");
-        }
-    }
-
-    /// Asserts that a member line is refused when its words are incomplete, repeated, unknown,
-    /// out of range or on a line that is not a frontend's, and that the edges of the ranges
-    /// (a base of 1024 and of 65531, a one-letter and a 32-letter instance, and `-` for the
-    /// plain unit) are taken.
-    #[test]
-    fn a_malformed_member_word_refuses_the_file() {
-        let cases = [
-            ("instance=a", "instance= needs base="),
-            ("base=18000", "base= needs instance="),
-            ("instance=a instance=b", "instance= is given twice"),
-            ("base=1024 base=2048", "base= is given twice"),
-            ("instance=a port=1", "is not instance="),
-            ("instance=a dm", "is not instance="),
-            ("instance=A base=18000", "instance \"A\" must be"),
-            ("instance=1a base=18000", "instance \"1a\" must be"),
-            ("instance=a base=1023", "must be a port from"),
-            ("instance=a base=65532", "must be a port from"),
-            ("instance=a base=x", "must be a port from"),
-        ];
-        for (fields, want) in cases {
-            let got = line_error(&member_line("f", fields));
-            assert!(got.starts_with("line 1: "), "{fields}: {got}");
-            assert!(got.contains(want), "{fields}: {got}");
-        }
-        let long = format!("instance={} base=18000", "a".repeat(33));
-        let got = line_error(&member_line("f", &long));
-        assert!(got.contains("must be - or 1..=32"), "{got}");
-        let storage = format!("st1 st1.farm.example storage {KEY}");
-        for fields in ["instance=a base=18000", "base=18000"] {
-            let got = line_error(&format!("{storage} {fields}"));
-            assert!(got.contains("belong to a frontend line"), "{got}");
-        }
-        let edges = [
-            "instance=a base=1024".to_owned(),
-            "instance=- base=65531".to_owned(),
-            format!("instance={} base=18000", "a".repeat(32)),
-        ];
-        for fields in edges {
-            let ok = Inventory::parse(&member_line("f", &fields));
-            assert!(ok.is_ok(), "{fields}: {ok:?}");
-        }
-    }
-
-    /// Asserts that a frontend that lists no instance and base is still the only frontend, and
-    /// that it does not go with pool members, whichever comes first.
-    #[test]
-    fn a_frontend_that_is_no_member_is_alone() {
-        let plain = format!("fe0 fe0.farm.example frontend {KEY}");
-        let member = member_line("fe-a", "instance=a base=18000");
-        let before = line_error(&format!("{plain}\n{member}"));
-        assert!(before.starts_with("line 2: "), "{before}");
-        assert!(before.contains("a pool member beside"), "{before}");
-        let after = line_error(&format!("{member}\n{plain}"));
-        assert!(after.starts_with("line 2: "), "{after}");
-        assert!(after.contains("a second frontend"), "{after}");
-        let alone = Inventory::parse(&plain).expect("alone");
-        assert_eq!(alone.host("fe0").expect("fe0").member, None);
-        assert!(!alone.has_members());
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

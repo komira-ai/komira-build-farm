@@ -7,7 +7,7 @@ use kbf_host_install::contract::{
     Failure, FailureCode, Outcome, QueryReport, Refusal, install_request, is_query,
 };
 
-use super::answer::{install_answer, query_answer, restart_answer};
+use super::answer::{install_answer, query_answer};
 use super::*;
 use crate::ports::{Apply, InstallAnswer, Installed};
 
@@ -328,87 +328,6 @@ fn the_channel_rule_agrees_with_the_host() {
     for c in cases {
         let host_says = install_request(&format!("install kbf={version} from {c}")).is_some();
         assert_eq!(Channel::parse(&c).is_ok(), host_says, "{c:?}");
-    }
-}
-
-/// Asserts that the host's own `restarted` line is read as success for the unit asked for and
-/// for no other, with both ways of naming a frontend; and that every refusal and every failure
-/// code the host can print is read as `refused: <code>` / `failed: <code>` and nothing else.
-#[test]
-fn every_restart_outcome_of_the_host_is_read() {
-    for name in ["-", "a1"] {
-        let (code, out) = printed(&Outcome::Restarted {
-            unit: frontend_unit(name),
-        });
-        assert_eq!(restart_answer(code, &out, &frontend_unit(name)), Ok(()));
-        let other = restart_answer(code, &out, "kbf-frontend@b2.service");
-        assert_eq!(other, Err(PortError::other("bad answer")), "{name}");
-    }
-    let unit = "kbf-frontend.service";
-    for refusal in refusals() {
-        let (code, out) = printed(&Outcome::Refused(refusal));
-        let got = restart_answer(code, &out, unit).expect_err("refused");
-        assert_eq!(
-            got,
-            PortError::other(format!("refused: {}", refusal.code()))
-        );
-    }
-    for failure in failures() {
-        let outcome = Outcome::Failed(Failure {
-            code: failure,
-            detail: "raw systemctl words".into(),
-        });
-        let (code, out) = printed(&outcome);
-        let got = restart_answer(code, &out, unit).expect_err("failed");
-        assert_eq!(got, PortError::other(format!("failed: {}", failure.code())));
-        assert!(!got.to_string().contains("raw systemctl"));
-    }
-}
-
-/// Asserts that an install answer is no restart answer and a restart answer is no install
-/// answer or query report.
-#[test]
-fn an_answer_of_the_other_verb_is_not_a_restart() {
-    let (code, out) = printed(&Outcome::Installed {
-        version: "1".into(),
-    });
-    assert_eq!(
-        restart_answer(code, &out, "kbf-frontend.service"),
-        Err(PortError::other("bad answer"))
-    );
-    let (code, out) = printed(&Outcome::Restarted {
-        unit: "kbf-frontend.service".into(),
-    });
-    assert_eq!(
-        install_answer(code, &out, &v1()),
-        Err(PortError::other("bad answer"))
-    );
-    assert_eq!(
-        query_answer(code, &out),
-        Err(PortError::other("bad answer"))
-    );
-}
-
-/// Asserts that the frontend name rule here and the host's agree, in both directions, over
-/// the plain name, instance names, and the edges: the first character, the characters
-/// after it, the length bound.
-#[test]
-fn the_frontend_name_rule_agrees_with_the_host() {
-    let mut cases: Vec<String> = [
-        "", "-", "--", "-a", "a", "a1", "a-", "a-1", "A", "aB", "1a", "a b", "a/b", "a_b", "a.b",
-        "a@b", "a\nb", "a\0", "a;b", "../x", "*", "\u{ff41}",
-    ]
-    .map(str::to_owned)
-    .to_vec();
-    cases.extend(["a".repeat(31), "a".repeat(32), "a".repeat(33)]);
-    for name in cases {
-        let command = format!("restart frontend={name}");
-        let unit = kbf_host_install::contract::restart_request(&command);
-        assert_eq!(frontend_name_ok(&name), unit.is_some(), "{name:?}");
-        // The unit the host restarts is the one the answer is checked against.
-        if frontend_name_ok(&name) {
-            assert_eq!(unit, Some(frontend_unit(&name)), "{name:?}");
-        }
     }
 }
 

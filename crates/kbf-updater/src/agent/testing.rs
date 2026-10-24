@@ -29,7 +29,6 @@ pub fn host(role: Role) -> Host {
         role,
         host_key: String::new(),
         node_id: Some("n1".to_owned()),
-        member: None,
     }
 }
 

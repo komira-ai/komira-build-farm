@@ -10,6 +10,11 @@
 //!   is not drained (somebody returned it), and that is an error, not zero leases.
 //! - **undrain**: `POST /v1/nodes/<node>:uncordon`.
 //!
+//! A storage host runs a daemon only sometimes (`storage-and-daemon` does; `storage` does not),
+//! and the host's role does not say which: [`NodeDrain::if_present`] drains the daemon if the
+//! frontend knows the node, and takes a 404 for "no daemon here" (nothing to drain, no leases,
+//! nothing to give back) instead of failing.
+//!
 //! The node is the host's `node_id` from the inventory, a DNS label, so it stands as one path
 //! segment as it is. A host without one, or with one that is not a label, is refused here
 //! as well as by the roll's identity check, so that no path is built from free text.
@@ -26,6 +31,8 @@ use crate::reply::Reply;
 /// Draining over the operator API.
 pub struct NodeDrain {
     api: OperatorApi,
+    /// A node the frontend does not know is no daemon here, not a failure.
+    if_present: bool,
 }
 
 #[derive(Deserialize)]
@@ -41,7 +48,19 @@ struct Placement {
 
 impl NodeDrain {
     pub fn with_api(api: OperatorApi) -> NodeDrain {
-        NodeDrain { api }
+        NodeDrain {
+            api,
+            if_present: false,
+        }
+    }
+
+    /// As [`NodeDrain::with_api`], for a host that may run no daemon: a node the frontend does
+    /// not know (404) is drained, counted and given back as nothing.
+    pub fn if_present(api: OperatorApi) -> NodeDrain {
+        NodeDrain {
+            api,
+            if_present: true,
+        }
     }
 
     fn node(host: &Host) -> Result<&str, PortError> {
@@ -51,11 +70,13 @@ impl NodeDrain {
             .ok_or_else(|| PortError::other(format!("{} has no usable node id", host.alias)))
     }
 
-    /// A 200 is `Ok`; a 404 says the frontend does not know the node; anything else is the
+    /// A 200 is the reply; a 404 says the frontend does not know the node, which is `None` for
+    /// a host that may run no daemon and a failure for any other; anything else is the
     /// failure of the status.
-    fn judged(reply: Reply, node: &str) -> Result<Reply, PortError> {
+    fn judged(&self, reply: Reply, node: &str) -> Result<Option<Reply>, PortError> {
         match reply.status {
-            200 => Ok(reply),
+            200 => Ok(Some(reply)),
+            404 if self.if_present => Ok(None),
             404 => Err(PortError::other(format!(
                 "{WHAT} does not know node {node} (it has not registered since the frontend started)"
             ))),
@@ -69,12 +90,14 @@ impl Drain for NodeDrain {
         let node = Self::node(host)?;
         let body = serde_json::json!({ "deadline_secs": deadline.as_secs() }).to_string();
         let reply = self.api.post(&format!("/v1/nodes/{node}:drain"), &body)?;
-        Self::judged(reply, node).map(drop)
+        self.judged(reply, node).map(drop)
     }
 
     fn leases(&self, host: &Host) -> Result<usize, PortError> {
         let node = Self::node(host)?;
-        let reply = Self::judged(self.api.get(&format!("/v1/nodes/{node}"))?, node)?;
+        let Some(reply) = self.judged(self.api.get(&format!("/v1/nodes/{node}"))?, node)? else {
+            return Ok(0);
+        };
         let read: Node = serde_json::from_slice(&reply.body).map_err(|_| {
             PortError::other(format!(
                 "{WHAT}'s answer for node {node} is not what it should be"
@@ -91,6 +114,6 @@ impl Drain for NodeDrain {
     fn undrain(&self, host: &Host) -> Result<(), PortError> {
         let node = Self::node(host)?;
         let reply = self.api.post(&format!("/v1/nodes/{node}:uncordon"), "")?;
-        Self::judged(reply, node).map(drop)
+        self.judged(reply, node).map(drop)
     }
 }

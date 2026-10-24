@@ -510,3 +510,41 @@ fn a_retired_releases_dir_is_neither_opened_nor_made() {
     args(&absent).api().expect("usable").expect("an API");
     assert!(!absent.exists());
 }
+
+/// Catches: the worker listener's handshake offering `h2` alone, which refuses the HTTP/1.1
+/// client of a host's updater, or the other TLS listeners offering `http/1.1` too: the worker
+/// listener's files make a source that offers both, and the REAPI listener's offers `h2` only.
+#[test]
+fn only_the_worker_listener_offers_http1_beside_h2() {
+    let dir = crate::test_dir::scratch_dir("config-alpn");
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert = params.self_signed(&key).expect("cert");
+    let write = |name: &str, text: String| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert_path, key_path) = (
+        write("cert.pem", cert.pem()),
+        write("key.pem", key.serialize_pem()),
+    );
+    let args = Args::parse_from([
+        "kbf-server",
+        &format!("--worker-tls-cert={cert_path}"),
+        &format!("--worker-tls-key={key_path}"),
+        &format!("--worker-client-ca={cert_path}"),
+        &format!("--reapi-tls-cert={cert_path}"),
+        &format!("--reapi-tls-key={key_path}"),
+    ]);
+    let listeners = args.listeners().expect("listeners");
+    let offered = |source: &kbf_tls::TlsSource| source.config().alpn_protocols.clone();
+    let worker = listeners.worker_tls.expect("worker TLS");
+    assert_eq!(
+        offered(&worker.server),
+        [b"h2".to_vec(), b"http/1.1".to_vec()]
+    );
+    let reapi = listeners.reapi_tls.expect("REAPI TLS");
+    assert_eq!(offered(&reapi), [b"h2".to_vec()]);
+}

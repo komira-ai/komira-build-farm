@@ -28,7 +28,7 @@ mod sni;
 mod source;
 
 pub use config::{
-    TlsError, TlsFiles, server_config_optional_client, server_config_optional_client_sni,
+    Alpn, TlsError, TlsFiles, server_config_optional_client, server_config_optional_client_sni,
 };
 pub use incoming::{
     Conn, ConnInfo, HANDSHAKE_TIMEOUT, Incoming, peer_certs, peer_certs_of, remote_addr,
