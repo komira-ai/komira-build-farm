@@ -375,7 +375,19 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
             .map(|l| l.split_whitespace().map(str::to_owned).collect())
             .collect()
     };
-    let entries = lines("sysusers.d/kbf-installer.conf");
+    let all = lines("sysusers.d/kbf-installer.conf");
+    // The signer's socket group: made, with the signer (which gives files to it) and the
+    // frontend's user (which connects as a member) in it, and no other member.
+    let (entries, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|f| f[0] == "u");
+    let want_others: Vec<Vec<String>> = [
+        ["g", "kbf-signer-clients", "-"],
+        ["m", "kbf-signer", "kbf-signer-clients"],
+        ["m", "kbf-server", "kbf-signer-clients"],
+    ]
+    .iter()
+    .map(|f| f.iter().map(|x| (*x).to_owned()).collect())
+    .collect();
+    assert_eq!(others, want_others);
     // Design section 3: `kbf-signer` owns the CA key and has no home, no login and a
     // system id with a group of its own name; there is no `kbf-verify` user.
     let signer: Vec<&Vec<String>> = entries.iter().filter(|f| f[1] == "kbf-signer").collect();

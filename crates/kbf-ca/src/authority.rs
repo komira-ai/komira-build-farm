@@ -343,7 +343,19 @@ impl Authority {
     /// # Errors
     /// [`CaError`].
     pub fn load_dir_owned_by(dir: &Path, policy: Policy, uid: u32) -> Result<Self, CaError> {
-        let signer = FileSigner::load_owned_by(dir, uid)?;
+        Self::load_with(dir, policy, FileSigner::load_owned_by(dir, uid)?)
+    }
+
+    /// Loads the CA directory of the running account when the directory is shared with a
+    /// group (`FileSigner::load_in_shared_dir`): the key is as private as ever.
+    ///
+    /// # Errors
+    /// [`CaError`].
+    pub fn load_dir_shared(dir: &Path, policy: Policy) -> Result<Self, CaError> {
+        Self::load_with(dir, policy, FileSigner::load_in_shared_dir(dir)?)
+    }
+
+    fn load_with(dir: &Path, policy: Policy, signer: FileSigner) -> Result<Self, CaError> {
         let pem = keyfile::read_public(&dir.join(Self::CERT_FILE))?;
         let bundle = Bundle::from_pem(&pem)?;
         Self::import(Arc::new(signer), policy, &bundle.certs()[0])

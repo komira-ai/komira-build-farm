@@ -757,13 +757,38 @@ carries the SHA-256 of the root, and pins it.
 |---|---|
 | `--enroll-listen=ADDR` | serve `Enroll` and `Renew` here; needs `--state-store`, `--ca-dir`, `--frontend-name` and a signer flag |
 | `--ca-dir=DIR` | the CA directory (`ca.key` mode `0600`, `ca.pem`). Empty or missing: a new CA is made once. Holding a CA: it is loaded and **nothing is overwritten**. Holding anything else, or half a CA: refused, untouched |
-| `--ca-signer=SOCKET` | **production.** The CA key lives in a `kbf-signer` process; this process holds none. `--ca-dir` must hold the `ca.pem` the signer made, and the signer's public key must match it |
+| `--ca-signer=SOCKET` | **production.** The CA key lives in a `kbf-signer` process; this process holds none. `--ca-dir` must hold the `ca.pem` the signer made (readable by this account: see "The signer's socket" below), and the signer's public key must match it |
 | `--ca-dev-file-signer` | development and tests only: the key is a file in this process. A start with neither signer flag fails, so production cannot end up holding the key by default |
 | `--frontend-name=NAME` | a DNS name or address this frontend serves (repeat). The listener's certificate carries them; no node may advertise one, or a host under one |
 | `--enroll-cert-lifetime-secs=N` | certificate life, 3600 to 2592000 (default 604800); nodes renew at half. The signer's own `--lifetime-secs` must be at least this |
 | `--enroll-rate-per-minute=N`, `--enroll-rate-burst=N`, `--enroll-max-in-flight=N` | the limits below (defaults 60, 30, 64) |
 | `--enroll-worker-endpoint`, `--enroll-cas-endpoint`, `--enroll-storage-port` | what every node is told (`NodeConfig`) |
 | `--enroll-allow-unenforced-deny` | see the start gate |
+
+**The signer's socket.** `kbf-signer` runs as its own account and, alone, serves its Unix
+socket to `--frontend-uid` (the kernel's `SO_PEERCRED` user id of each connection; any other
+peer is closed on without a byte). By default the socket is mode `0600` in a directory of
+mode `0700` and `--ca-dir` is `0700`, so a frontend running as another account (another
+user, or a container) can neither connect nor read `ca.pem`. `--client-group=NAME` shares
+both with a group:
+
+| What | Without the flag | With `--client-group=NAME` |
+|---|---|---|
+| socket directory | `0700` | `0750`, group `NAME` |
+| socket | `0600` | `0660`, group `NAME` |
+| `--ca-dir` | `0700` | `0750`, group `NAME` |
+| `ca.pem` | `0644` | `0640`, group `NAME` |
+| `ca.key` | `0600` | `0600`, not given to the group |
+| peers served | the user id of `--frontend-uid` | that user id, and any peer whose effective group is `NAME` or whose account has `NAME` as its primary group or is listed as one of its members (`/etc/passwd` and `/etc/group`, read at every connection) |
+
+The signer must itself be a member of `NAME` (a process can only give a file to a group it
+belongs to), and the frontend's account a member too; the package's sysusers file makes
+group `kbf-signer-clients` with `kbf-signer` and `kbf-server` in it. The start is refused,
+with nothing written, when `NAME` is not in `/etc/group`; an existing socket directory that
+others can enter, or the group can write, is refused, as is a `--ca-dir` that others can
+enter or the group can write, or whose `ca.key` is readable by group or others (it is never
+repaired). A container reaches the socket by mounting the socket's directory and being run
+with that group's id as a supplementary group.
 
 
 **Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked

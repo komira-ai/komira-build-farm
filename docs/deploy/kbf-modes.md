@@ -268,7 +268,8 @@ the `Planned:` paragraph.
    `storage` or `daemon`, as `urn:kbf:role:<role>`). The frontend runs the enrollment
    listener: `--enroll-listen`, `--ca-dir`, `--frontend-name` (repeatable) and `--ca-signer`
    (the socket of the `kbf-signer` process that holds the CA key; `--ca-dev-file-signer` is
-   for development). The operator makes a token with `POST /v1/enroll/tokens`, and a node
+   for development; a frontend that runs as another account than the signer needs the
+   signer's `--client-group`, see the signer's socket in [api.md](../api.md)). The operator makes a token with `POST /v1/enroll/tokens`, and a node
    enrolls with it at its first start and renews at half of its certificate's life (7 days by
    default, `--enroll-cert-lifetime-secs`). A node host needs no hand-issued certificate. The
    table of what each certificate must contain is in [kbf-units.md](kbf-units.md).

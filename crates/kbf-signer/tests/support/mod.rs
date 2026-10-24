@@ -333,3 +333,49 @@ pub fn path_str(p: &Path) -> &str {
 pub fn another_key() -> FileSigner {
     FileSigner::generate().expect("key")
 }
+
+// ---- groups ---------------------------------------------------------------------------
+
+/// The test's effective group id.
+pub fn egid() -> u32 {
+    rustix::process::getegid().as_raw()
+}
+
+/// A group this account may give files to: one of its supplementary groups other than its
+/// effective group if it has one (so a hand-over is visible), else the effective group.
+pub fn a_group_to_share_with() -> u32 {
+    rustix::process::getgroups()
+        .expect("getgroups")
+        .into_iter()
+        .map(|g| g.as_raw())
+        .find(|g| *g != egid())
+        .unwrap_or_else(egid)
+}
+
+/// The name in `/etc/group` of a group this account belongs to, with its id: what a
+/// started binary can resolve by `--client-group`.
+pub fn a_named_group_of_mine() -> (String, u32) {
+    let mut mine: Vec<u32> = rustix::process::getgroups()
+        .expect("getgroups")
+        .into_iter()
+        .map(|g| g.as_raw())
+        .collect();
+    mine.push(egid());
+    std::fs::read_to_string("/etc/group")
+        .expect("/etc/group")
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            Some((f.first()?.to_string(), f.get(2)?.parse::<u32>().ok()?))
+        })
+        .find(|(_, gid)| mine.contains(gid))
+        .expect("this account belongs to a group that /etc/group names")
+}
+
+/// `passwd` and `group` files in `dir` with exactly these lines.
+pub fn accounts(dir: &Path, passwd: &[&str], group: &[&str]) -> kbf_signer::Accounts {
+    std::fs::create_dir_all(dir).expect("dir");
+    std::fs::write(dir.join("passwd"), passwd.join("\n")).expect("passwd");
+    std::fs::write(dir.join("group"), group.join("\n")).expect("group");
+    kbf_signer::Accounts::in_dir(dir)
+}

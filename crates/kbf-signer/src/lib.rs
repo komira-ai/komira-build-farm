@@ -10,6 +10,11 @@
 //!   byte. The process gives up its dumpable flag first ([`harden`]), so no one reads the
 //!   key out of its memory with ptrace or a core file. Nothing here logs, and no type
 //!   prints key material.
+//!   With a client group ([`ClientGroup`], `--client-group`; [`bind_for_group`] and
+//!   [`ensure_shared`]) the socket is mode 0660 in a directory of mode 0750 and the CA
+//!   directory 0750 with `ca.pem` 0640, all of that group, so a frontend in another
+//!   account can connect and read the root; `ca.key` stays 0600. The peer check stays: a
+//!   peer is served only if its user id is the configured one or it belongs to the group.
 //! - It never signs arbitrary bytes. Each request is the to-be-signed structure of one
 //!   certificate, and [`check_tbs`] parses it and refuses anything but the one shape the
 //!   design's table allows for the route it came in on ([`Route`]): not a CA, not a role
@@ -45,13 +50,15 @@ mod ca_dir;
 mod cli;
 mod client;
 mod error;
+mod group;
 mod server;
 mod validate;
 mod wire;
 
-pub use ca_dir::{Started, ensure};
+pub use ca_dir::{Started, ensure, ensure_shared};
 pub use cli::{Flags, main, run};
 pub use client::SocketSigner;
 pub use error::SignerError;
-pub use server::{Bound, SignerServer, bind, harden};
+pub use group::{Accounts, ClientGroup};
+pub use server::{Bound, SignerServer, bind, bind_for_group, harden};
 pub use validate::{Refusal, Route, check_tbs};

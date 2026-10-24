@@ -49,6 +49,18 @@ pub(crate) fn ensure_dir(dir: &Path, uid: u32) -> Result<(), KeyFileFault> {
 
 /// Checks that `dir` is a real directory owned by `uid` and closed to group and others.
 pub(crate) fn check_dir(dir: &Path, uid: u32) -> Result<(), KeyFileFault> {
+    check_dir_mask(dir, uid, 0o077)
+}
+
+/// Checks that `dir` is a real directory owned by `uid` that others cannot enter and the
+/// group can only read and search (no group write): the shape of a CA directory whose
+/// `ca.pem` is shared with a group while `ca.key` stays private to `uid`.
+pub(crate) fn check_shared_dir(dir: &Path, uid: u32) -> Result<(), KeyFileFault> {
+    check_dir_mask(dir, uid, 0o027)
+}
+
+/// A real directory owned by `uid` with none of the mode bits of `forbidden` set.
+fn check_dir_mask(dir: &Path, uid: u32, forbidden: u32) -> Result<(), KeyFileFault> {
     let meta = fs::symlink_metadata(dir).map_err(io_fault)?;
     if meta.file_type().is_symlink() {
         return Err(KeyFileFault::Symlink);
@@ -56,7 +68,13 @@ pub(crate) fn check_dir(dir: &Path, uid: u32) -> Result<(), KeyFileFault> {
     if !meta.is_dir() {
         return Err(KeyFileFault::NotRegular);
     }
-    check_private(&meta, uid, KeyFileFault::DirMode)
+    if meta.uid() != uid {
+        return Err(KeyFileFault::Owner);
+    }
+    if meta.mode() & forbidden != 0 {
+        return Err(KeyFileFault::DirMode);
+    }
+    Ok(())
 }
 
 /// Writes a file that must not exist, with `mode` from the first byte.

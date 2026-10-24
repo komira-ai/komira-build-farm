@@ -17,6 +17,21 @@ pub enum SignerError {
     /// The socket's directory is not a real directory of mode 0700 owned by the account.
     #[error("the socket's directory must be a directory of mode 0700 owned by this account")]
     SocketDir,
+    /// The socket's directory lets others in and the signer is shared with a group.
+    #[error("{} is accessible to others: with a client group it must be closed to them", .0.display())]
+    WorldAccessible(std::path::PathBuf),
+    /// No group of that name.
+    #[error("--client-group {0}: no such group")]
+    NoSuchGroup(String),
+    /// A path could not be given to the client group or opened to it.
+    #[error("{}: could not be shared with the client group: {source}", .path.display())]
+    Share {
+        /// The path.
+        path: std::path::PathBuf,
+        /// Why; the signer's account must be a member of the group (or root).
+        #[source]
+        source: io::Error,
+    },
     /// The CA directory is neither empty nor exactly `ca.key` and `ca.pem`.
     #[error("{}", ca_dir_message(.dir, .found))]
     CaDirState {

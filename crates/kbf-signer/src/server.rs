@@ -16,6 +16,7 @@ use rustix::fs::{FlockOperation, Mode, OFlags};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::error::SignerError;
+use crate::group::{ClientGroup, share};
 use crate::validate::{Route, check_tbs};
 use crate::wire;
 
@@ -41,30 +42,39 @@ pub fn harden() -> io::Result<()> {
     }
 }
 
-/// The user id of the process at the other end of `stream`, as the kernel recorded it
-/// when the connection was made (`SO_PEERCRED`).
+/// The user id and effective group id of the process at the other end of `stream`, as the
+/// kernel recorded them when the connection was made (`SO_PEERCRED`).
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    Ok(rustix::net::sockopt::socket_peercred(stream)?.uid.as_raw())
+fn peer_ids(stream: &UnixStream) -> io::Result<(u32, u32)> {
+    let cred = rustix::net::sockopt::socket_peercred(stream)?;
+    Ok((cred.uid.as_raw(), cred.gid.as_raw()))
 }
 
 /// Without `SO_PEERCRED` no peer can be told from another: none is admitted.
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> io::Result<u32> {
+fn peer_ids(_stream: &UnixStream) -> io::Result<(u32, u32)> {
     Err(io::Error::from(ErrorKind::Unsupported))
 }
 
 /// Makes the socket's directory (mode 0700) or accepts an existing one that is a real
-/// directory of mode 0700 owned by the running account.
-fn prepare_dir(dir: &Path) -> Result<(), SignerError> {
+/// directory owned by the running account: of mode 0700, or, when the socket is shared
+/// with a group (`shared`), of mode 0700 or 0750. A shared directory that lets others in
+/// is [`SignerError::WorldAccessible`].
+fn prepare_dir(dir: &Path, shared: bool) -> Result<(), SignerError> {
     match DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
     let meta = fs::symlink_metadata(dir)?;
-    let mine = (rustix::process::geteuid().as_raw(), 0o700);
-    if !meta.is_dir() || (meta.uid(), meta.mode() & 0o7777) != mine {
+    let mode = meta.mode() & 0o7777;
+    if !meta.is_dir() || meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(SignerError::SocketDir);
+    }
+    if shared && mode & 0o007 != 0 {
+        return Err(SignerError::WorldAccessible(dir.to_path_buf()));
+    }
+    if mode != 0o700 && !(shared && mode == 0o750) {
         return Err(SignerError::SocketDir);
     }
     Ok(())
@@ -148,7 +158,24 @@ impl Deref for Bound {
 /// [`SignerError::AlreadyServing`] for a live socket or a starter holding the lock;
 /// otherwise other [`SignerError`]s.
 pub fn bind(path: &Path) -> Result<Bound, SignerError> {
-    prepare_dir(path.parent().ok_or(SignerError::SocketPath)?)?;
+    bind_as(path, None)
+}
+
+/// [`bind`] for a socket shared with the group `gid`: the socket is mode 0660 and its
+/// directory mode 0750, both owned by this account and group `gid`, and the directory is
+/// opened to the group only once the socket is in place. A directory that lets others in
+/// is refused ([`SignerError::WorldAccessible`]). The account must be a member of the
+/// group (or root).
+///
+/// # Errors
+/// As [`bind`], and [`SignerError::WorldAccessible`] and [`SignerError::Share`].
+pub fn bind_for_group(path: &Path, gid: u32) -> Result<Bound, SignerError> {
+    bind_as(path, Some(gid))
+}
+
+fn bind_as(path: &Path, gid: Option<u32>) -> Result<Bound, SignerError> {
+    let dir = path.parent().ok_or(SignerError::SocketPath)?;
+    prepare_dir(dir, gid.is_some())?;
     let lock = lock_starters(path)?;
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => remove_if_stale(path)?,
@@ -157,7 +184,13 @@ pub fn bind(path: &Path) -> Result<Bound, SignerError> {
         Err(_) => {}
     }
     let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    match gid {
+        None => fs::set_permissions(path, fs::Permissions::from_mode(0o600))?,
+        Some(gid) => {
+            share(path, gid, 0o660)?;
+            share(dir, gid, 0o750)?;
+        }
+    }
     Ok(Bound {
         listener,
         _lock: lock,
@@ -179,6 +212,7 @@ pub struct SignerServer<S: Signer> {
     key: S,
     root_subject: Vec<u8>,
     allowed_uid: u32,
+    client_group: Option<ClientGroup>,
     policy: Policy,
 }
 
@@ -198,6 +232,25 @@ impl SignerServer<FileSigner> {
         let authority = Authority::load_dir(dir, policy)?;
         Self::new(
             FileSigner::load(dir)?,
+            authority.root_der(),
+            allowed_uid,
+            policy,
+        )
+    }
+
+    /// [`Self::from_dir`] for a CA directory shared with a group (`ensure_shared`): the
+    /// directory may be readable by its group; the key must still be closed to it.
+    ///
+    /// # Errors
+    /// As [`Self::from_dir`].
+    pub fn from_shared_dir(
+        dir: &Path,
+        allowed_uid: u32,
+        policy: Policy,
+    ) -> Result<Self, SignerError> {
+        let authority = Authority::load_dir_shared(dir, policy)?;
+        Self::new(
+            FileSigner::load_in_shared_dir(dir)?,
             authority.root_der(),
             allowed_uid,
             policy,
@@ -226,8 +279,18 @@ impl<S: Signer> SignerServer<S> {
             key,
             root_subject: root.subject().as_raw().to_vec(),
             allowed_uid,
+            client_group: None,
             policy,
         })
+    }
+
+    /// The same server, also serving the members of `group`: a peer is served when its
+    /// user id is the configured one or `group` admits it. Every other peer is closed on
+    /// without a byte, as before.
+    #[must_use]
+    pub fn with_client_group(mut self, group: ClientGroup) -> Self {
+        self.client_group = Some(group);
+        self
     }
 
     /// The same server reading `clock` (Unix seconds) instead of the system clock: for
@@ -257,7 +320,12 @@ impl<S: Signer> SignerServer<S> {
     }
 
     fn answer(&self, stream: &mut UnixStream) -> io::Result<()> {
-        if peer_uid(stream)? != self.allowed_uid {
+        let (uid, gid) = peer_ids(stream)?;
+        let member = self
+            .client_group
+            .as_ref()
+            .is_some_and(|g| g.admits(uid, gid));
+        if uid != self.allowed_uid && !member {
             return Ok(());
         }
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -310,7 +378,7 @@ mod tests {
         // inside the test's own directory, which is removed with it.
         let base = TestDir::under(std::env::temp_dir(), "kbf-signer-unit");
         let dir = base.join("socket-dir");
-        prepare_dir(&dir).expect("a directory of mode 0700");
+        prepare_dir(&dir, false).expect("a directory of mode 0700");
         let socket = dir.join("sock");
         let first = lock_starters(&socket).expect("the first lock");
         let child = ForkedChild::before_exec();

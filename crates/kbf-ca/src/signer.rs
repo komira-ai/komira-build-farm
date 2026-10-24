@@ -125,6 +125,24 @@ impl FileSigner {
     /// for contents that are not a P-256 key.
     pub fn load_owned_by(dir: &Path, uid: u32) -> Result<Self, CaError> {
         keyfile::check_dir(dir, uid)?;
+        Self::load_key(dir, uid)
+    }
+
+    /// Loads `dir/ca.key` for the running account from a directory that is shared with a
+    /// group: [`Self::load_owned_by`] except that the directory may be readable and
+    /// searchable by its group (mode up to 0750). Nothing else is relaxed: the directory
+    /// must not be writable by the group or reachable by others, and the key file must
+    /// still be closed to group and others.
+    ///
+    /// # Errors
+    /// As [`Self::load_owned_by`].
+    pub fn load_in_shared_dir(dir: &Path) -> Result<Self, CaError> {
+        let uid = keyfile::effective_uid();
+        keyfile::check_shared_dir(dir, uid)?;
+        Self::load_key(dir, uid)
+    }
+
+    fn load_key(dir: &Path, uid: u32) -> Result<Self, CaError> {
         let pem = keyfile::read_secret(&dir.join(Self::KEY_FILE), uid)?;
         Self::from_pem(&pem)
     }

@@ -11,7 +11,7 @@ pkg-config` writes (for both packages): this directory holds the inputs, and
 
 | path | what |
 |---|---|
-| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login); installed to `/usr/lib/sysusers.d` |
+| `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-signer` (no login) and the group `kbf-signer-clients` (the signer and `kbf-server` are its members: see `kbf-signer --client-group`); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
 | `needrestart/kbf.conf` | tells needrestart never to restart a unit named `kbf-*`, `kbf.*` or `kbf@*`; installed to `/etc/needrestart/conf.d/kbf.conf` (0644, a config file the host may edit) |
 | `units/` | the unit files (`kbf-*.service`, `kbf-*.socket`, `kbf.slice`), installed to `/usr/lib/systemd/system`: the five mode units go in the `kbf` package, the others in `kbf-installer`; `testdata/units` is the fixture for the unit tests only |

@@ -420,3 +420,60 @@ fn import_takes_only_a_self_signed_ca_for_the_signers_key() {
     );
     assert_eq!(view(ca.root_der()).ca, Some((true, true, Some(0))));
 }
+
+// A directory shared with a group: the group may read and search it, nothing else about the
+// key's protection is relaxed, and the plain load still refuses it.
+#[test]
+fn a_shared_directory_admits_the_group_to_read_and_nothing_more() {
+    let (_root, dir, ca) = init("shared");
+    let key = dir.join("ca.key");
+    let plain_refuses = |dir: &Path| key_fault(FileSigner::load(dir));
+
+    for open in [0o700, 0o750] {
+        chmod(&dir, open);
+        let loaded = Authority::load_dir_shared(&dir, Policy::default()).expect("shared load");
+        assert_eq!(loaded.root_der(), ca.root_der(), "{open:o}");
+        assert!(FileSigner::load_in_shared_dir(&dir).is_ok(), "{open:o}");
+    }
+    assert_eq!(plain_refuses(&dir), KeyFileFault::DirMode);
+
+    for bad in [0o770, 0o760, 0o755, 0o705, 0o701, 0o714] {
+        chmod(&dir, bad);
+        assert_eq!(
+            key_fault(FileSigner::load_in_shared_dir(&dir)),
+            KeyFileFault::DirMode,
+            "{bad:o}"
+        );
+        assert_eq!(
+            key_fault(Authority::load_dir_shared(&dir, Policy::default())),
+            KeyFileFault::DirMode,
+            "{bad:o}"
+        );
+    }
+
+    // The key stays the account's own: a group-readable key is refused in a shared directory.
+    chmod(&dir, 0o750);
+    for bad in [0o640, 0o660, 0o604] {
+        chmod(&key, bad);
+        assert_eq!(
+            key_fault(FileSigner::load_in_shared_dir(&dir)),
+            KeyFileFault::Mode,
+            "{bad:o}"
+        );
+    }
+    chmod(&key, 0o600);
+
+    // A link in place of the directory is refused, and so is a directory of another account.
+    let link = dir.parent().expect("parent").join("link");
+    symlink(&dir, &link).expect("link");
+    assert_eq!(
+        key_fault(FileSigner::load_in_shared_dir(&link)),
+        KeyFileFault::Symlink
+    );
+    let file = dir.parent().expect("parent").join("file");
+    fs::write(&file, b"x").expect("file");
+    assert_eq!(
+        key_fault(FileSigner::load_in_shared_dir(&file)),
+        KeyFileFault::NotRegular
+    );
+}
